@@ -1239,7 +1239,7 @@ passive detached は通常どおり release で窓を activate するが、選�
   | --- | --- | --- |
   | 1 | **判定** — 球面メタデータ + 2:1 フォールバック + ステレオ排除 | **完了** (2026-08-24) |
   | 2 | **描画** — presenter へ投影パスを足す | **完了** (2026-08-24、実機未確認) |
-  | 3 | **入力と導線** — 見回しドラッグ / FOV / 投影方式 / HUD | 未着手 |
+  | 3 | **入力と導線** — 見回しドラッグ / FOV / 投影方式 / HUD | **完了** (2026-08-27、実機未確認) |
 
 - **第 1 段 (完了)**: [spherical_metadata.rs](../src/video/spherical_metadata.rs)。
   `display_metadata.rs` と同じ形で、FFmpeg の side data をこのモジュールだけで型に直す。
@@ -1333,6 +1333,15 @@ passive detached は通常どおり release で窓を activate するが、選�
   - 受け入れる副作用: Hint (2:1 のみ) の通常動画へ ↑/↓ で移ると、その動画も投影表示になる。
     **静止画側が既にそう振る舞っており出荷済み**なので、動画だけ別の境界にはしない。
     利用者が迷ったら明示 OFF で抜けられる。
+- **第 3 段 (完了、2026-08-27)**: 静止画と共通の `App::panorama_state` を正本として、
+  native presenter へ pose を同期する。動画キャンバスのマウス / タッチドラッグ、修飾キー不問の
+  FOV ホイール、`FsPanorama` / `FsPanoramaProjection`、上バーの固定 360 スロット・投影方式・
+  視点リセットを実装した。ホイールは FOV 上下限でも消費し、タッチは 12 logical pt の
+  ownership latch で DOWN からの全移動量を初回ドラッグへ含め、2 本目で pending tap を取り消す。
+  ダブルタップは既存のタップ操作のままでリセットには使わない。動画の × は常に close のまま。
+  タイル一覧は 360 ON 時に閉じて再入場を抑止し、動画スケーラーは実効描画だけ休止して
+  `VideoScaleFilter` の保存値を変更しない。音声モード中は入力だけを休止し、映像へ戻ると同じ
+  pose を再開する。自動テスト済み、Windows native presenter の実機確認は残る。
 - **自動判定は可能だが、それだけでは足りない**。FFmpeg は `AV_SPHERICAL_EQUIRECTANGULAR` を
   出す ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いに
   できる。ただし**実素材を集めて測った結果、次の 3 点が分かった** (2026-08-24、

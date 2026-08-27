@@ -647,6 +647,16 @@ pub enum NativeVideoOutputEvent {
         delta_secs: f64,
     },
     TouchChromeLearned,
+    PanoramaDrag {
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    },
+    PanoramaWheel {
+        delta: i32,
+    },
+    TogglePanorama,
+    CyclePanoramaProjection,
+    ResetPanorama,
     TileSeek {
         target_secs: f64,
     },
@@ -3604,6 +3614,17 @@ fn send_native_overlay_command(
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
         Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
+        Command::PanoramaDrag {
+            delta_points,
+            viewport_height_points,
+        } => NativeVideoOutputEvent::PanoramaDrag {
+            delta_points,
+            viewport_height_points,
+        },
+        Command::PanoramaWheel { delta } => NativeVideoOutputEvent::PanoramaWheel { delta },
+        Command::TogglePanorama => NativeVideoOutputEvent::TogglePanorama,
+        Command::CyclePanoramaProjection => NativeVideoOutputEvent::CyclePanoramaProjection,
+        Command::ResetPanorama => NativeVideoOutputEvent::ResetPanorama,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
@@ -4508,10 +4529,11 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetPanoramaPose { panorama_pose } => {
                     let changed = cur_panorama_pose != panorama_pose;
+                    let activation_changed = cur_panorama_pose.is_some() != panorama_pose.is_some();
                     cur_panorama_pose = panorama_pose;
                     match presenter.set_panorama_pose(cur_panorama_pose) {
                         Ok(()) => {
-                            if changed
+                            if activation_changed
                                 && source
                                     .video_scale_state
                                     .invalidate_preparation_and_keep_desired()
@@ -5449,6 +5471,49 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::TouchChromeLearned,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::PanoramaDrag {
+                                delta_points,
+                                viewport_height_points,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::PanoramaDrag {
+                                        delta_points,
+                                        viewport_height_points,
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::PanoramaWheel {
+                                delta,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::PanoramaWheel { delta },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TogglePanorama => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TogglePanorama,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CyclePanoramaProjection => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CyclePanoramaProjection,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ResetPanorama => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ResetPanorama,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
@@ -6973,6 +7038,8 @@ impl VideoPlayer {
             d3d11va_supported: false,
             d3d11va_config: String::new(),
             orientation: crate::video::display_metadata::VideoOrientation::IDENTITY,
+            spherical_mapping: None,
+            stereo_layout: crate::video::spherical_metadata::VideoStereoLayout::Mono,
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 128_000,
             has_audio: true,
@@ -6994,6 +7061,30 @@ impl VideoPlayer {
             sar_den: 1,
         });
         player
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_panorama_metadata_for_test(
+        &mut self,
+        width: u32,
+        height: u32,
+        sar_num: u32,
+        sar_den: u32,
+        orientation: crate::video::display_metadata::VideoOrientation,
+        spherical_mapping: Option<crate::video::spherical_metadata::VideoSphericalMapping>,
+        stereo_layout: crate::video::spherical_metadata::VideoStereoLayout,
+    ) {
+        let info = self
+            .info
+            .as_mut()
+            .expect("stream-ready test player must have VideoInfo");
+        info.width = width;
+        info.height = height;
+        info.sar_num = sar_num;
+        info.sar_den = sar_den;
+        info.orientation = orientation;
+        info.spherical_mapping = spherical_mapping;
+        info.stereo_layout = stereo_layout;
     }
 
     #[cfg(test)]
@@ -8895,6 +8986,39 @@ impl VideoPlayer {
             .as_ref()
             .filter(|info| info.has_video)
             .map(|info| (info.width, info.height, info.avg_fps))
+    }
+
+    /// Returns the normalized 360-video decision once stream information is ready.
+    /// The aspect-ratio fallback uses display dimensions after SAR and orientation.
+    pub(crate) fn panorama_detection(
+        &self,
+    ) -> Option<
+        Result<
+            spherical_metadata::VideoPanoramaTrigger,
+            spherical_metadata::VideoPanoramaRejection,
+        >,
+    > {
+        let info = self.info.as_ref()?;
+        if !info.has_video {
+            return None;
+        }
+        let (display_width, display_height) = display_metadata::display_pixel_dimensions(
+            info.width,
+            info.height,
+            info.sar_num,
+            info.sar_den,
+            info.orientation,
+        );
+        Some(spherical_metadata::detect(
+            info.spherical_mapping.as_ref(),
+            info.stereo_layout,
+            display_width,
+            display_height,
+        ))
+    }
+
+    pub(crate) fn panorama_mapping(&self) -> Option<spherical_metadata::VideoSphericalMapping> {
+        self.info.as_ref()?.spherical_mapping
     }
 
     #[cfg(windows)]

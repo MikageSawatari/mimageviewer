@@ -352,6 +352,32 @@ impl PanoramaState {
         PanoPose::new(self.yaw, self.pitch, self.fov_y, self.projection)
     }
 
+    /// Applies an incremental viewer drag using the shared still/video sensitivity.
+    pub fn apply_drag_delta(&mut self, delta: egui::Vec2, viewport_height: f32) -> bool {
+        if !delta.is_finite() || delta.length_sq() <= 0.0 {
+            return false;
+        }
+        let sensitivity = self.fov_y / viewport_height.max(1.0);
+        self.yaw = (self.yaw + delta.x * sensitivity + std::f32::consts::PI)
+            .rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
+        self.pitch = (self.pitch + delta.y * sensitivity).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        self.sanitize();
+        true
+    }
+
+    /// Applies an incremental wheel delta to vertical FOV.
+    pub fn apply_wheel_delta(&mut self, wheel_y: f32) -> bool {
+        if !wheel_y.is_finite() || wheel_y.abs() < 0.5 {
+            return false;
+        }
+        let before = self.fov_y;
+        let factor = (-wheel_y * 0.0015).exp();
+        self.fov_y = self.projection.clamp_fov(self.fov_y * factor);
+        self.sanitize();
+        self.fov_y != before
+    }
+
     /// 入力ハンドラ (drag / wheel) 経由で yaw / pitch / fov_y が変更された後に
     /// 呼び、**NaN / Inf を含まない有限値**であることを保証する。
     /// Codex P2 第 5 ラウンド (2026-05) 対策: drag delta や wheel exp が NaN に化けても、

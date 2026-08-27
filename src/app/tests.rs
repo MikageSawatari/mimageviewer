@@ -26949,6 +26949,32 @@ mod pipeline_cache_refactor_tests {
         pixels
     }
 
+    #[cfg(windows)]
+    fn insert_panorama_video(
+        app: &mut App,
+        path: &str,
+        width: u32,
+        height: u32,
+        orientation: crate::video::display_metadata::VideoOrientation,
+        mapping: Option<crate::video::spherical_metadata::VideoSphericalMapping>,
+        stereo: crate::video::spherical_metadata::VideoStereoLayout,
+    ) -> usize {
+        let idx = app.items.len();
+        let path = PathBuf::from(path);
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(width, height, 1, 1, orientation, mapping, stereo);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        idx
+    }
+
     fn insert_pano_final_source(
         app: &mut App,
         ctx: &egui::Context,
@@ -29555,6 +29581,128 @@ mod pipeline_cache_refactor_tests {
         assert!(
             !app.panorama_projection_popup_open,
             "the projection list must not outlive the button that owns it"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn panorama_detection_has_one_entry_for_stills_and_display_oriented_video() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let still = push_image(&mut app, "C:/pics/pano-detect.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            still,
+            "pano_detect_still",
+            egui::Color32::BLACK,
+        );
+        let video = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-rotated.mp4",
+            1920,
+            3840,
+            crate::video::display_metadata::VideoOrientation::new(90, false),
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+
+        assert_eq!(
+            app.detect_panorama(still),
+            Some(crate::panorama::PanoramaTrigger::Hint)
+        );
+        assert_eq!(
+            app.detect_panorama(video),
+            Some(crate::panorama::PanoramaTrigger::Hint),
+            "video fallback must use dimensions after orientation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_panorama_lifecycle_wheel_audio_pause_and_tile_exclusion_share_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-a.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let flat = insert_panorama_video(
+            &mut app,
+            "C:/clips/flat.mp4",
+            1920,
+            1080,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let second = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-b.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        app.fullscreen_idx = Some(first);
+        app.video_tile_mode_active = true;
+        app.settings.video_scale_filter = crate::settings::VideoScaleFilter::Anime;
+
+        app.toggle_panorama_mode(first);
+        assert!(app.is_panorama_mode_active(first));
+        assert!(!app.video_tile_mode_active);
+        assert_eq!(
+            app.settings.video_scale_filter,
+            crate::settings::VideoScaleFilter::Anime,
+            "360 must not rewrite the selected video scale filter"
+        );
+        {
+            let state = app.panorama_state.as_mut().unwrap();
+            state.yaw = 0.75;
+            state.pitch = -0.25;
+            state.fov_y = state.projection.fov_max();
+        }
+        let retained_pose = app.panorama_state.as_ref().unwrap().pose();
+        assert!(
+            app.apply_native_video_panorama_wheel(&ctx, first, -120),
+            "wheel remains consumed when FOV is already at its upper limit"
+        );
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.fullscreen_idx = Some(flat);
+        assert!(!app.is_panorama_mode_active(flat));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.fullscreen_idx = Some(second);
+        assert!(app.is_panorama_mode_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.video_audio_mode = Some(second);
+        assert!(!app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.video_audio_mode = None;
+        assert!(app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.toggle_panorama_mode(second);
+        assert!(
+            app.panorama_state.is_none(),
+            "explicit OFF discards the state"
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.close_fullscreen();
+        assert!(
+            app.panorama_state.is_none(),
+            "fullscreen exit discards the shared panorama state"
         );
     }
 

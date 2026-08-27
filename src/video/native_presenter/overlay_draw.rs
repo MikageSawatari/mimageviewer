@@ -2198,6 +2198,9 @@ pub(super) enum NativeTopButtonGlyph {
     },
     /// 音符 (♪): 動画→音声モードのトグルボタン (Inc 7)。
     AudioMode,
+    Panorama,
+    PanoramaProjection(crate::panorama::PanoProjection),
+    PanoramaReset,
 }
 
 pub(super) fn draw_native_top_button(
@@ -2215,9 +2218,36 @@ pub(super) fn draw_native_top_button(
     command: NativeOverlayCommand,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    draw_native_top_button_enabled(
+        ui, painter, x, y, width, height, gap, id, glyph, active, true, tooltip, command, commands,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_native_top_button_enabled(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    x: &mut f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    gap: f32,
+    id: &'static str,
+    glyph: NativeTopButtonGlyph,
+    active: bool,
+    enabled: bool,
+    tooltip: &str,
+    command: NativeOverlayCommand,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
     let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
-    draw_overlay_button_bg(painter, rect, resp.hovered(), active);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let resp = ui.interact(rect, egui::Id::new(id), sense);
+    draw_overlay_button_bg(painter, rect, enabled && resp.hovered(), active);
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::TileColumnsLess => draw_overlay_grid_density_icon(painter, rect, 3),
@@ -2230,12 +2260,68 @@ pub(super) fn draw_native_top_button(
             draw_overlay_info_icon(painter, rect, click_to_show)
         }
         NativeTopButtonGlyph::AudioMode => draw_overlay_music_note_icon(painter, rect),
+        NativeTopButtonGlyph::Panorama if enabled => {
+            crate::ui_fullscreen::draw_icons::draw_panorama_icon(
+                painter,
+                rect.center(),
+                rect.width().min(rect.height()) * 0.28,
+            )
+        }
+        NativeTopButtonGlyph::Panorama => {
+            crate::ui_fullscreen::draw_icons::draw_panorama_icon_disabled(
+                painter,
+                rect.center(),
+                rect.width().min(rect.height()) * 0.28,
+            )
+        }
+        NativeTopButtonGlyph::PanoramaProjection(projection) => {
+            crate::ui_fullscreen::draw_icons::draw_panorama_projection_icon(
+                painter,
+                rect.center(),
+                rect.width().min(rect.height()) * 0.28,
+                projection,
+            )
+        }
+        NativeTopButtonGlyph::PanoramaReset => {
+            draw_overlay_panorama_reset_icon(painter, rect, enabled)
+        }
     }
     let resp = resp.hover_tip_dark(tooltip);
-    if resp.clicked() {
+    if enabled && resp.clicked() {
         commands.push(command);
     }
     *x -= width + gap;
+}
+
+fn draw_overlay_panorama_reset_icon(painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
+    let color = if enabled {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgba_unmultiplied(180, 180, 180, 140)
+    };
+    let radius = rect.width().min(rect.height()) * 0.25;
+    let center = rect.center();
+    let points = (1..=13)
+        .map(|step| {
+            let angle =
+                -std::f32::consts::PI * 0.75 + std::f32::consts::TAU * 0.82 * step as f32 / 13.0;
+            center + egui::vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
+    let tip = center
+        + egui::vec2(
+            (-std::f32::consts::PI * 0.75).cos(),
+            (-std::f32::consts::PI * 0.75).sin(),
+        ) * radius;
+    painter.line_segment(
+        [tip, tip + egui::vec2(1.0, 5.0)],
+        egui::Stroke::new(1.8, color),
+    );
+    painter.line_segment(
+        [tip, tip + egui::vec2(5.0, 0.5)],
+        egui::Stroke::new(1.8, color),
+    );
 }
 
 pub(super) fn draw_native_bar_lock_button(
@@ -3859,6 +3945,7 @@ pub(super) fn draw_native_top_bar(
     position_secs: f64,
     duration_secs: f64,
     metadata: Option<&NativeOverlayMetadata>,
+    panorama_pose: Option<crate::panorama::PanoPose>,
     fallback_file_name: &str,
     perf_visible: bool,
     vst3_available: bool,
@@ -3981,6 +4068,98 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
+            let panorama_detection = metadata.and_then(|metadata| metadata.panorama_detection);
+            let panorama_enabled = matches!(panorama_detection, Some(Ok(_)));
+            let panorama_active = panorama_enabled && panorama_pose.is_some();
+            let panorama_tooltip = match panorama_detection {
+                None => "360 度動画の情報を読み込み中".to_owned(),
+                Some(Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto)) => {
+                    native_label_with_shortcut(
+                        "360 度表示",
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
+                    )
+                }
+                Some(Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Hint)) => {
+                    native_label_with_shortcut(
+                        "360 度表示 (2:1 候補)",
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
+                    )
+                }
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::UnsupportedProjection(
+                        _,
+                    ),
+                )) => "この球面投影方式には対応していません".to_owned(),
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::Stereoscopic(_),
+                )) => "立体視 360 度動画には対応していません".to_owned(),
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic,
+                )) => "360 度動画ではありません".to_owned(),
+            };
+            draw_native_top_button_enabled(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_panorama",
+                NativeTopButtonGlyph::Panorama,
+                panorama_active,
+                panorama_enabled,
+                &panorama_tooltip,
+                NativeOverlayCommand::TogglePanorama,
+                commands,
+            );
+            if let Some(pose) = panorama_pose.filter(|_| panorama_active) {
+                let panorama_controls_enabled = !audio_only;
+                let projection_tooltip = if panorama_controls_enabled {
+                    native_label_with_shortcut(
+                        &format!("投影方式: {}", pose.projection.label()),
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama_projection.as_deref()),
+                    )
+                } else {
+                    "音声モード中は投影方式を変更できません".to_owned()
+                };
+                draw_native_top_button_enabled(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_panorama_projection",
+                    NativeTopButtonGlyph::PanoramaProjection(pose.projection),
+                    false,
+                    panorama_controls_enabled,
+                    &projection_tooltip,
+                    NativeOverlayCommand::CyclePanoramaProjection,
+                    commands,
+                );
+                draw_native_top_button_enabled(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_panorama_reset",
+                    NativeTopButtonGlyph::PanoramaReset,
+                    false,
+                    panorama_controls_enabled,
+                    if panorama_controls_enabled {
+                        "初期視点に戻す"
+                    } else {
+                        "音声モード中は視点をリセットできません"
+                    },
+                    NativeOverlayCommand::ResetPanorama,
+                    commands,
+                );
+            }
             let side_panel_mode = side_panel_mode.normalized();
             let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
             let info_tip = format!(
@@ -4025,7 +4204,7 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleAudioMode,
                     commands,
                 );
-                draw_native_top_button(
+                draw_native_top_button_enabled(
                     ui,
                     &painter,
                     &mut x,
@@ -4036,10 +4215,16 @@ pub(super) fn draw_native_top_bar(
                     "native_top_tile",
                     NativeTopButtonGlyph::TileGrid,
                     false,
-                    &native_label_with_shortcut(
-                        "サムネイル一覧",
-                        shortcuts.and_then(|s| s.tile_mode.as_deref()),
-                    ),
+                    panorama_pose.is_none(),
+                    if panorama_pose.is_some() {
+                        "360 度表示中はサムネイル一覧を開けません".to_owned()
+                    } else {
+                        native_label_with_shortcut(
+                            "サムネイル一覧",
+                            shortcuts.and_then(|s| s.tile_mode.as_deref()),
+                        )
+                    }
+                    .as_str(),
                     NativeOverlayCommand::ToggleTileMode,
                     commands,
                 );

@@ -8,7 +8,7 @@ use egui::{Pos2, Rect, Vec2};
 /// A tap may move at most 12 logical points from its start. This is large
 /// enough to absorb normal finger jitter without turning a deliberate drag
 /// into a tap.
-const TAP_MAX_DISTANCE_PT: f32 = 12.0;
+pub(crate) const TAP_MAX_DISTANCE_PT: f32 = 12.0;
 /// A tap may last at most 700 ms. Longer contact is reserved for the existing
 /// long-press/context-menu path instead of firing a viewer tap command.
 const TAP_MAX_DURATION_MS: u64 = 700;

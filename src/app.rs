@@ -2930,11 +2930,19 @@ impl PlayTestState {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-struct NativeVideoPointerDown {
-    fs_idx: usize,
-    x: i32,
-    y: i32,
-    at: std::time::Instant,
+enum NativeVideoPointerDown {
+    PlaybackClick {
+        fs_idx: usize,
+        x: i32,
+        y: i32,
+        at: std::time::Instant,
+    },
+    PanoramaDrag {
+        fs_idx: usize,
+        last_position_points: egui::Pos2,
+        viewport_height_points: f32,
+        pixels_per_point: f32,
+    },
 }
 
 #[cfg(windows)]
@@ -61521,6 +61529,17 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoramaTrigger> {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return match player.panorama_detection()? {
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto) => {
+                    Some(crate::panorama::PanoramaTrigger::Auto)
+                }
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Hint) => {
+                    Some(crate::panorama::PanoramaTrigger::Hint)
+                }
+                Err(_) => None,
+            };
+        }
         let source_key = self.metadata_cache_key(fs_idx)?;
         let pano_info = self
             .xmp_panorama_info
@@ -62725,6 +62744,7 @@ impl App {
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+        let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
         if self.panorama_state.is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
             // Codex P2 第 18 ラウンド)。
@@ -62743,6 +62763,10 @@ impl App {
             for (_, req) in self.pano_high_res_pending.drain() {
                 req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(windows)]
+            if is_video {
+                self.sync_native_video_panorama_state(fs_idx);
+            }
             return;
         }
         // ON: GPano hint があれば初期視点に反映
@@ -62752,6 +62776,19 @@ impl App {
             init_pitch,
             self.settings.panorama_projection,
         ));
+        // Video 360 owns the same native canvas as tile mode, but it is not the
+        // still-viewer's restriction mode. Keep playback and panels intact.
+        if is_video {
+            self.close_video_tile_mode();
+            #[cfg(windows)]
+            {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_tile_overlay(None);
+                }
+                self.sync_native_video_panorama_state(fs_idx);
+            }
+            return;
+        }
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
@@ -62793,6 +62830,13 @@ impl App {
     /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して
     /// 初期視点として返す。XMP が無いか hint が無い場合は (0, 0)。
     fn panorama_initial_pose(&self, fs_idx: usize) -> (f32, f32) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            let Some(mapping) = player.panorama_mapping() else {
+                return (0.0, 0.0);
+            };
+            let to_rad = std::f32::consts::PI / 180.0;
+            return (mapping.yaw_degrees * to_rad, mapping.pitch_degrees * to_rad);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return (0.0, 0.0);
         };
@@ -62818,6 +62862,12 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> crate::panorama::PanoUvTransform {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return player
+                .panorama_mapping()
+                .map(|mapping| mapping.uv_transform)
+                .unwrap_or(crate::panorama::PanoUvTransform::IDENTITY);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return crate::panorama::PanoUvTransform::IDENTITY;
         };

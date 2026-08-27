@@ -4552,7 +4552,8 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
-            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => KeyContext::FsCommon,
+            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
+            | FsPanoramaProjection => KeyContext::FsCommon,
             RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
             | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
             | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
@@ -4584,8 +4585,6 @@ impl KeyAction {
             | FsRotateCcw
             | FsImageAnalysis
             | FsZoomMode
-            | FsPanorama
-            | FsPanoramaProjection
             | FsNavigatorToggle
             | FsNavigatorHold
             | FsPixelGrid

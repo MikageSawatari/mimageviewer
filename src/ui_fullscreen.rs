@@ -27937,22 +27937,7 @@ impl App {
             let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
             if primary_down {
                 let delta = fs_response.drag_delta();
-                if delta.length_sq() > 0.0 {
-                    let sens = pano.fov_y / viewport_h;
-                    pano.yaw += delta.x * sens;
-                    // yaw を [-π, π] に wrap
-                    let two_pi = std::f32::consts::TAU;
-                    while pano.yaw > std::f32::consts::PI {
-                        pano.yaw -= two_pi;
-                    }
-                    while pano.yaw < -std::f32::consts::PI {
-                        pano.yaw += two_pi;
-                    }
-                    // pitch クランプ (極を直視させない)
-                    pano.pitch = (pano.pitch + delta.y * sens)
-                        .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
-                    // pose が NaN / Inf に化けないことを保証 (Codex P2 第 5、2026-05)
-                    pano.sanitize();
+                if pano.apply_drag_delta(delta, viewport_h) {
                     ctx.request_repaint();
                 }
             }
@@ -27983,9 +27968,6 @@ impl App {
         // 元設計 (通常 Wheel は前後送り維持、Ctrl+Wheel のみ FOV) はユーザーが
         // 拡大縮小のつもりでホイールを回して画像が切り替わる事故が多発したため変更。
         // Ctrl 有無に関わらず、360 ON 時は同じ操作を入れる。
-        if wheel_y.abs() < 0.5 {
-            return false;
-        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
@@ -27993,14 +27975,11 @@ impl App {
             return false;
         }
         if let Some(pano) = self.panorama_state.as_mut() {
-            // FOV = fov * exp(-wheel * 0.0015)。ホイール 1 ノッチ ≈ 50px で約 7% 変化。
-            let factor = (-wheel_y * 0.0015).exp();
-            // 上限は投影方式ごとに違う。透視は約 149°、それ以外は約 340° まで引ける。
-            pano.fov_y = pano.projection.clamp_fov(pano.fov_y * factor);
-            // pose が NaN / Inf に化けないことを保証 (Codex P2 第 5、2026-05)
-            pano.sanitize();
-            ctx.request_repaint();
+            if pano.apply_wheel_delta(wheel_y) {
+                ctx.request_repaint();
+            }
         }
+        // Active panorama owns every wheel event, including no-op deltas at FOV limits.
         true
     }
 

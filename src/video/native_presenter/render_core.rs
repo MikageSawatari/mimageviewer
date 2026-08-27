@@ -1288,6 +1288,7 @@ struct NativeEguiOverlay {
     started_at: Instant,
     pending_events: Vec<egui::Event>,
     native_touch: crate::video::native_touch::NativeTouchAdapter,
+    panorama_pose: Option<PanoPose>,
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
@@ -1751,6 +1752,12 @@ pub struct NativeOverlayMetadata {
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
     pub touch_video_chrome_learned: bool,
+    pub panorama_detection: Option<
+        Result<
+            crate::video::spherical_metadata::VideoPanoramaTrigger,
+            crate::video::spherical_metadata::VideoPanoramaRejection,
+        >,
+    >,
     pub shortcuts: NativeOverlayShortcutLabels,
     pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
@@ -1774,6 +1781,8 @@ pub struct NativeOverlayShortcutLabels {
     pub bookmark: Option<String>,
     pub capture: Option<String>,
     pub toggle_audio_mode: Option<String>,
+    pub panorama: Option<String>,
+    pub panorama_projection: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2410,6 +2419,16 @@ pub enum NativeOverlayCommand {
         delta_secs: f64,
     },
     TouchChromeLearned,
+    PanoramaDrag {
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    },
+    PanoramaWheel {
+        delta: i32,
+    },
+    TogglePanorama,
+    CyclePanoramaProjection,
+    ResetPanorama,
     TileSeek {
         target_secs: f64,
     },
@@ -4081,29 +4100,33 @@ impl NativeRenderCore {
         ))
     }
     fn sync_overlay_video_scale_state(&mut self) {
-        let outside_note = self.active_scale_fallback.as_ref().and_then(|fallback| {
-            if fallback.key.filter != self.selected_scale_filter
-                || fallback.key.smoothing_percent != self.downscale_smoothing_percent
-                || fallback.key.anime4k_variant != self.selected_anime4k_variant
-            {
-                return None;
-            }
-            let VideoScaleFallbackReason::DisplaySizeLimitExceeded {
-                max_dimension,
-                max_pixels,
-                ..
-            } = &fallback.reason
-            else {
-                return None;
-            };
-            Some(crate::ui_helpers::processing_size_outside_note_for(
-                "動画",
-                &format!(
-                    "長辺 {}px 以下・総画素数 {}px 以下",
-                    max_dimension, max_pixels
-                ),
-            ))
-        });
+        let outside_note = if self.panorama_pose.is_some() {
+            Some("360 投影中のため一時停止しています".to_owned())
+        } else {
+            self.active_scale_fallback.as_ref().and_then(|fallback| {
+                if fallback.key.filter != self.selected_scale_filter
+                    || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+                    || fallback.key.anime4k_variant != self.selected_anime4k_variant
+                {
+                    return None;
+                }
+                let VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    max_dimension,
+                    max_pixels,
+                    ..
+                } = &fallback.reason
+                else {
+                    return None;
+                };
+                Some(crate::ui_helpers::processing_size_outside_note_for(
+                    "動画",
+                    &format!(
+                        "長辺 {}px 以下・総画素数 {}px 以下",
+                        max_dimension, max_pixels
+                    ),
+                ))
+            })
+        };
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_video_scale_state(
                 self.selected_scale_filter,
@@ -5725,6 +5748,10 @@ impl NativeRenderCore {
         panorama_pose: Option<(PanoPose, PanoUvTransform)>,
     ) -> Result<(), String> {
         self.panorama_pose = panorama_pose;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_panorama_pose(panorama_pose.map(|(pose, _)| pose));
+        }
+        self.sync_overlay_video_scale_state();
         Ok(())
     }
 
@@ -6625,6 +6652,7 @@ impl NativeEguiOverlay {
             started_at: Instant::now(),
             pending_events: Vec::new(),
             native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
+            panorama_pose: None,
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
@@ -6863,7 +6891,7 @@ impl NativeEguiOverlay {
             surface,
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
-                accepts_pinch: false,
+                accepts_pinch: self.panorama_pose.is_some(),
                 tap_zones: true,
             },
         }
@@ -6926,6 +6954,16 @@ impl NativeEguiOverlay {
                     } => {
                         self.pending_overlay_commands
                             .push(NativeOverlayCommand::SeekRelative { delta_secs });
+                    }
+                    crate::video::native_touch::NativeVideoTouchCommand::PanoramaDrag {
+                        delta_points,
+                        viewport_height_points,
+                    } => {
+                        self.pending_overlay_commands
+                            .push(NativeOverlayCommand::PanoramaDrag {
+                                delta_points,
+                                viewport_height_points,
+                            });
                     }
                     crate::video::native_touch::NativeVideoTouchCommand::LearnAndShowChrome => {
                         self.native_touch.show_chrome();
@@ -7292,7 +7330,13 @@ impl NativeEguiOverlay {
                         self.height as f32 / pixels_per_point,
                     )
                     .contains(pos);
-                if let Some(command) = immediate_native_wheel_command(
+                let panorama_wheel = self.panorama_pose.is_some() && !self.audio_only;
+                if panorama_wheel {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::PanoramaWheel {
+                            delta: i32::from(wheel.delta),
+                        });
+                } else if let Some(command) = immediate_native_wheel_command(
                     wheel.delta,
                     wheel.ctrl,
                     self.tile_overlay.is_some(),
@@ -7303,11 +7347,13 @@ impl NativeEguiOverlay {
                     self.pending_overlay_commands.push(command);
                 }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
-                self.pending_events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
-                    modifiers,
-                });
+                if !panorama_wheel {
+                    self.pending_events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
+                        modifiers,
+                    });
+                }
                 self.dirty = true;
             }
             NativeEvent::MouseLeave => {
@@ -7561,6 +7607,15 @@ impl NativeEguiOverlay {
         self.video_downscale_smoothing_percent = smoothing_percent;
         self.video_scale_outside_note = outside_note;
         self.dirty = true;
+    }
+
+    fn set_panorama_pose(&mut self, panorama_pose: Option<PanoPose>) {
+        let changed = self.panorama_pose != panorama_pose;
+        self.panorama_pose = panorama_pose;
+        let touch_changed = self
+            .native_touch
+            .configure_panorama(self.panorama_pose.is_some());
+        self.dirty |= changed || touch_changed;
     }
 
     fn set_video_anime4k_state(
@@ -8283,6 +8338,7 @@ impl NativeEguiOverlay {
                 NativeOverlayCommand::NavigateItem { .. }
                     | NativeOverlayCommand::TileColumnsDelta { .. }
                     | NativeOverlayCommand::StepSeekStripRange { .. }
+                    | NativeOverlayCommand::PanoramaWheel { .. }
             )
         });
         let mut routing = self.input_routing();
@@ -9188,6 +9244,7 @@ impl NativeEguiOverlay {
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
+        let panorama_pose = self.panorama_pose;
         let shortcut_labels = video_metadata.as_ref().map(|metadata| &metadata.shortcuts);
         let mut shortcut_help_open = self.shortcut_help_open;
         let fallback_file_name = self.fallback_file_name.clone();
@@ -9571,6 +9628,7 @@ impl NativeEguiOverlay {
                     position_secs,
                     duration_secs,
                     video_metadata.as_ref(),
+                    panorama_pose,
                     &fallback_file_name,
                     perf_visible,
                     vst3_available,

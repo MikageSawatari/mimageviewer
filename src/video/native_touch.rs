@@ -275,8 +275,29 @@ pub(crate) fn native_touch_command_toggles_chrome_without_video_gestures(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum NativeVideoTouchCommand {
     ToggleChrome,
-    SeekRelative { delta_secs: f64 },
+    SeekRelative {
+        delta_secs: f64,
+    },
+    PanoramaDrag {
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    },
     LearnAndShowChrome,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum PanoramaTouchOwnership {
+    #[default]
+    Inactive,
+    Pending {
+        pointer_id: u32,
+        start: egui::Pos2,
+    },
+    Dragging {
+        pointer_id: u32,
+        last: egui::Pos2,
+    },
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,6 +402,8 @@ pub(crate) struct NativeTouchAdapter {
     video_gestures_enabled: bool,
     learning_state: TouchLearningState,
     first_run_help_phase: Option<FirstRunHelpPhase>,
+    panorama_active: bool,
+    panorama_ownership: PanoramaTouchOwnership,
 }
 
 impl Default for NativeTouchAdapter {
@@ -396,6 +419,8 @@ impl Default for NativeTouchAdapter {
             video_gestures_enabled: true,
             learning_state: TouchLearningState::Unknown,
             first_run_help_phase: None,
+            panorama_active: false,
+            panorama_ownership: PanoramaTouchOwnership::Inactive,
         }
     }
 }
@@ -411,6 +436,15 @@ pub(crate) struct NativeTouchAdapterReset {
 }
 
 impl NativeTouchAdapter {
+    pub(crate) fn configure_panorama(&mut self, active: bool) -> bool {
+        if self.panorama_active == active {
+            return false;
+        }
+        self.panorama_active = active;
+        self.panorama_ownership = PanoramaTouchOwnership::Inactive;
+        true
+    }
+
     /// Applies the App-owned learned snapshot without allowing a stale false
     /// snapshot to resurrect help after this adapter emitted the learn event.
     /// Returns whether the visible help state changed.
@@ -464,6 +498,12 @@ impl NativeTouchAdapter {
             self.primary_start_pos = Some(pos);
             self.primary_pressed = false;
             self.primary_withholds_press = event.suppress_widget_primary;
+            if self.panorama_active && event.source == NativeVideoWindowSource::Presenter {
+                self.panorama_ownership = PanoramaTouchOwnership::Pending {
+                    pointer_id: event.pointer_id,
+                    start: pos,
+                };
+            }
         }
         let is_primary = self.primary_id == Some(event.pointer_id);
         let sample = TouchSample {
@@ -490,6 +530,7 @@ impl NativeTouchAdapter {
                 .handle_widget_passthrough_sample(geometry, sample),
         };
         self.consume_touch_commands(commands);
+        self.consume_panorama_touch(event, pos, geometry.surface.height());
 
         let suppress_primary = self.recognizer.should_suppress_primary();
         let mut egui_events = Vec::new();
@@ -548,6 +589,69 @@ impl NativeTouchAdapter {
         }
 
         NativeTouchAdapterOutput { pos, egui_events }
+    }
+
+    fn consume_panorama_touch(
+        &mut self,
+        event: NativeVideoTouchEvent,
+        pos: egui::Pos2,
+        viewport_height_points: f32,
+    ) {
+        if !self.panorama_active || event.source != NativeVideoWindowSource::Presenter {
+            return;
+        }
+        if self.recognizer.owner() == TouchOwner::Pinch {
+            self.panorama_ownership = PanoramaTouchOwnership::Cancelled;
+            return;
+        }
+        match (self.panorama_ownership, event.phase) {
+            (
+                PanoramaTouchOwnership::Pending { pointer_id, start },
+                NativeVideoTouchPhase::Move | NativeVideoTouchPhase::End,
+            ) if pointer_id == event.pointer_id => {
+                let delta = pos - start;
+                if delta.length_sq()
+                    > crate::touch_input::TAP_MAX_DISTANCE_PT
+                        * crate::touch_input::TAP_MAX_DISTANCE_PT
+                {
+                    if delta.length_sq() > 0.0 {
+                        self.pending_commands
+                            .push(NativeVideoTouchCommand::PanoramaDrag {
+                                delta_points: delta,
+                                viewport_height_points,
+                            });
+                    }
+                    self.panorama_ownership = PanoramaTouchOwnership::Dragging {
+                        pointer_id,
+                        last: pos,
+                    };
+                }
+            }
+            (
+                PanoramaTouchOwnership::Dragging { pointer_id, last },
+                NativeVideoTouchPhase::Move | NativeVideoTouchPhase::End,
+            ) if pointer_id == event.pointer_id => {
+                let delta = pos - last;
+                if delta.length_sq() > 0.0 {
+                    self.pending_commands
+                        .push(NativeVideoTouchCommand::PanoramaDrag {
+                            delta_points: delta,
+                            viewport_height_points,
+                        });
+                }
+                self.panorama_ownership = PanoramaTouchOwnership::Dragging {
+                    pointer_id,
+                    last: pos,
+                };
+            }
+            (_, NativeVideoTouchPhase::Cancel) => {
+                self.panorama_ownership = PanoramaTouchOwnership::Cancelled;
+            }
+            _ => {}
+        }
+        if !self.recognizer.is_active() {
+            self.panorama_ownership = PanoramaTouchOwnership::Inactive;
+        }
     }
 
     fn consume_touch_commands(&mut self, commands: Vec<TouchCommand>) {
@@ -698,6 +802,16 @@ mod tests {
                 accepts_pinch: false,
                 tap_zones: true,
             },
+        }
+    }
+
+    fn panorama_geometry() -> TapZoneGeometry {
+        TapZoneGeometry {
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: true,
+            },
+            ..geometry()
         }
     }
 
@@ -1337,6 +1451,92 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn panorama_drag_latches_and_applies_the_first_full_motion() {
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.configure_panorama(true);
+        let geometry = panorama_geometry();
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::Start),
+            &geometry,
+            0,
+            1.0,
+        );
+        adapter.handle_event(
+            event(1, 113, 400, NativeVideoTouchPhase::Move),
+            &geometry,
+            10,
+            1.0,
+        );
+        assert_eq!(
+            adapter.take_commands(),
+            vec![NativeVideoTouchCommand::PanoramaDrag {
+                delta_points: egui::vec2(13.0, 0.0),
+                viewport_height_points: 800.0,
+            }],
+            "the ownership frame must include motion from DOWN"
+        );
+
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::Move),
+            &geometry,
+            20,
+            1.0,
+        );
+        assert_eq!(
+            adapter.take_commands(),
+            vec![NativeVideoTouchCommand::PanoramaDrag {
+                delta_points: egui::vec2(-13.0, 0.0),
+                viewport_height_points: 800.0,
+            }]
+        );
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::End),
+            &geometry,
+            30,
+            1.0,
+        );
+        assert!(
+            adapter.take_commands().is_empty(),
+            "returning to the start must not turn the latched drag into a tap"
+        );
+    }
+
+    #[test]
+    fn panorama_second_contact_cancels_the_pending_tap() {
+        let mut adapter = NativeTouchAdapter::default();
+        adapter.configure_panorama(true);
+        let geometry = panorama_geometry();
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::Start),
+            &geometry,
+            0,
+            1.0,
+        );
+        adapter.handle_event(
+            event(2, 200, 400, NativeVideoTouchPhase::Start),
+            &geometry,
+            10,
+            1.0,
+        );
+        adapter.handle_event(
+            event(2, 200, 400, NativeVideoTouchPhase::End),
+            &geometry,
+            20,
+            1.0,
+        );
+        adapter.handle_event(
+            event(1, 100, 400, NativeVideoTouchPhase::End),
+            &geometry,
+            30,
+            1.0,
+        );
+        assert!(
+            adapter.take_commands().is_empty(),
+            "a second contact must cancel both the pending tap and panorama drag"
+        );
     }
 
     #[test]
