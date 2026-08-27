@@ -203,7 +203,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 ## 9. 進捗記録
 
-### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認、R2e 分を 2026-08-25 に反映)
+### 9.1 現況 (唯一の進捗表、R2b close を 2026-08-28 に反映)
 
 この表だけを現行ステージ判定に使う。後続のコミット・検収記録は、各時点の実装履歴であり、
 現在の完了判定ではない。コードから実装を確認できた範囲を記載し、7 月 24〜26 日分を含む
@@ -214,7 +214,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
 | R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
 | R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
-| R2b | **部分完了 — 残りは §9.8 で閉じる (2026-08-28 着手)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
+| R2b | **完了 (2026-08-28、§9.8)** | Runtime routing / `ParkedLive` / context registry の所有型化に加え、presentation migration を `PresentationTransitionOwner` の純粋 reducer へ集約した。旧 `pending_detached_video_host_switch` / `native_video_mode_switch` は廃止し、host/native の publish・activation・retire・terminal close と z-order recovery permit を同じ request generation で所有する。R4 の deferred viewport / single render entry / host persistence は含まない |
 | R2c | **完了** | placement は runtime 所有、settings は seed |
 | R2d | **完了** | live-park と active 復帰の直列化を実装済み |
 | R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
@@ -1345,6 +1345,34 @@ typed 集約」そのもの**。R4 の半端な先行実装ではない。
 recover raise には 250ms gate があり、333ms に 7〜9 回を直接発行する経路ではない。
 egui host の `Visible+Focus`、新 presenter の `show_and_raise`、旧 presenter の destroy、
 HUD/VST の raise も同じ遷移に参加している。reducer は**それら全部**を集約する。
+
+#### 実装結果 (2026-08-28、R2b close)
+
+- `PresentationTransitionOwner` を `ViewerContextBundle` と mounted App projection の同じ
+  context-owned field として導入した。状態は `Stable / Preparing / Ready / Committing`、
+  request は current / target / generation / activation intent / outgoing HWND を所有する。
+  F12、detached host resync、source-swap completion、Esc / window close / player end は同じ
+  reducer event/effect 境界へ入る。
+- native host contract は `TargetReady` で publish せず、hidden create + attach + frame prime の
+  後に `Ready`、reducer の `PublishNative` 後に `TargetCommit`、host visibility 確認後に
+  `TargetRetire` とした。失敗/abort は candidate だけを破棄し prior host/core を残す。
+  Ready / Commit / Retire / Abort は request generation と native generation の双方で stale を
+  棄却し、commit/recovery の deadline は置かない。
+- egui host の `Visible` / `Focus` / `Destroy`、native `Publish` / outgoing `Destroy` は reducer
+  effect だけから発行する。transition 中は App と native pump の recovery permit を閉じ、
+  `ensure_native_video_front`、HUD、VST、grid same-media raise、main-focus restore、tray restore が
+  独自の raise / activation を行わない。tray visibility intent は permit 再開時の active epoch へ
+  再束縛する。
+- `[presentation-transition] id=... target=... effect=... hwnd=0x...` で、実際に適用された
+  `Visible / Focus / Publish / Destroy` を記録する。stale contract event は effect が無いため
+  記録されず、transition-owned `Raise` は存在しない。`[ui-frame-gap]` / `[atlas-probe]` は維持した。
+- pure reducer と native contract の回帰テストで、両方向、candidate failure、F12 再入力、
+  Esc、window close、player end、newer request 後の stale Ready / Commit を固定した。
+  自動検証後の実機検収は、両方向で outgoing raise 0、cover change 1、content-ready 前 activation 0
+  を 1 往復の画面キャプチャと上記ログで照合する。
+
+R4 に残すものは契約どおり `show_viewport_deferred`、single render entry、host persistence。
+F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作成を待つ仕様は維持する。
 
 ## 10. 将来候補 (現行仕様では未採用)
 

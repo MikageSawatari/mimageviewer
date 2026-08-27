@@ -72,9 +72,25 @@ enum PumpCommand {
         /// delay so a busy pump is not mistaken for a slow publish (backlog 1.122).
         issued_at: Instant,
     },
+    TargetCommit {
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    },
+    TargetRetire {
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    },
+    TargetAbort {
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    },
     TargetFailed {
         request: u64,
         epoch: u64,
+        transition_id: Option<u64>,
     },
     Visibility {
         epoch: u64,
@@ -90,6 +106,9 @@ enum PumpCommand {
     },
     RaiseHud {
         epoch: u64,
+    },
+    SetZOrderRecoveryPermit {
+        permitted: bool,
     },
     CursorActivity {
         epoch: u64,
@@ -108,6 +127,9 @@ impl PumpCommand {
         match self {
             Self::Open(request) | Self::Switch(request) => Some(request.request),
             Self::TargetReady { request, .. }
+            | Self::TargetCommit { request, .. }
+            | Self::TargetRetire { request, .. }
+            | Self::TargetAbort { request, .. }
             | Self::TargetFailed { request, .. }
             | Self::RenderFault { request, .. }
             | Self::Shutdown { request } => Some(*request),
@@ -115,6 +137,7 @@ impl PumpCommand {
             | Self::Resize { .. }
             | Self::RaisePresenter { .. }
             | Self::RaiseHud { .. }
+            | Self::SetZOrderRecoveryPermit { .. }
             | Self::CursorActivity { .. } => None,
         }
     }
@@ -129,6 +152,7 @@ pub(crate) enum PumpLifecycleEvent {
         height: u32,
         pixels_per_point: f32,
         observation: NativeWindowObservation,
+        presenter_hwnd: u64,
     },
     Published {
         request: u64,
@@ -218,8 +242,56 @@ impl NativeWindowPumpRenderClient {
         })
     }
 
-    pub(crate) fn target_failed(&self, request: u64, epoch: u64) -> Result<(), String> {
-        self.send_control(PumpCommand::TargetFailed { request, epoch })
+    pub(crate) fn target_commit(
+        &self,
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    ) -> Result<(), String> {
+        self.send_control(PumpCommand::TargetCommit {
+            request,
+            epoch,
+            transition_id,
+        })
+    }
+
+    pub(crate) fn target_retire(
+        &self,
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    ) -> Result<(), String> {
+        self.send_control(PumpCommand::TargetRetire {
+            request,
+            epoch,
+            transition_id,
+        })
+    }
+
+    pub(crate) fn target_abort(
+        &self,
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    ) -> Result<(), String> {
+        self.send_control(PumpCommand::TargetAbort {
+            request,
+            epoch,
+            transition_id,
+        })
+    }
+
+    pub(crate) fn target_failed(
+        &self,
+        request: u64,
+        epoch: u64,
+        transition_id: Option<u64>,
+    ) -> Result<(), String> {
+        self.send_control(PumpCommand::TargetFailed {
+            request,
+            epoch,
+            transition_id,
+        })
     }
 
     pub(crate) fn set_visibility(&self, epoch: u64, visible: bool) -> Result<(), String> {
@@ -245,6 +317,10 @@ impl NativeWindowPumpRenderClient {
 
     pub(crate) fn raise_hud(&self, epoch: u64) -> Result<(), String> {
         self.send_control(PumpCommand::RaiseHud { epoch })
+    }
+
+    pub(crate) fn set_z_order_recovery_permit(&self, permitted: bool) -> Result<(), String> {
+        self.send_control(PumpCommand::SetZOrderRecoveryPermit { permitted })
     }
 
     pub(crate) fn mark_cursor_activity(&self, epoch: u64) -> Result<(), String> {
@@ -373,6 +449,8 @@ struct PumpRuntime {
     hosts: HashMap<WindowEpoch, NativeWindowHost>,
     requests: HashMap<WindowEpoch, PumpPlacementRequest>,
     hud_raise_deadlines: VecDeque<(WindowEpoch, Instant)>,
+    z_order_recovery_permitted: bool,
+    deferred_visibility: Option<WindowVisibility>,
     parent_sizes: HashMap<WindowEpoch, (u32, u32)>,
     last_child_reflow: Instant,
     last_observation: Instant,
@@ -418,6 +496,8 @@ impl PumpRuntime {
             hosts: HashMap::new(),
             requests: HashMap::new(),
             hud_raise_deadlines: VecDeque::new(),
+            z_order_recovery_permitted: true,
+            deferred_visibility: None,
             parent_sizes: HashMap::new(),
             last_child_reflow: Instant::now(),
             last_observation: Instant::now(),
@@ -536,24 +616,77 @@ impl PumpRuntime {
                 startup_intents,
                 issued_at,
             } => self.target_ready(request, epoch, topology, startup_intents, issued_at)?,
-            PumpCommand::TargetFailed { request, epoch } => {
-                self.dispatch(WindowHostInput::Event(WindowHostEvent::TargetFailed {
-                    request: WindowRequestId(request),
-                    epoch: WindowEpoch(epoch),
-                    failure: WindowHostFailure::Backend {
-                        operation: WindowBackendOperation::AttachTarget,
-                        code: -1,
-                    },
-                }))?;
+            PumpCommand::TargetCommit {
+                request,
+                epoch,
+                transition_id,
+            } => {
+                self.dispatch_instrumented(
+                    WindowHostInput::Event(WindowHostEvent::TargetCommit {
+                        request: WindowRequestId(request),
+                        epoch: WindowEpoch(epoch),
+                    }),
+                    transition_id.map(|id| (id, epoch, "Publish")),
+                )?;
+            }
+            PumpCommand::TargetRetire {
+                request,
+                epoch,
+                transition_id,
+            } => {
+                self.dispatch_instrumented(
+                    WindowHostInput::Event(WindowHostEvent::TargetRetire {
+                        request: WindowRequestId(request),
+                        epoch: WindowEpoch(epoch),
+                    }),
+                    transition_id.map(|id| (id, epoch, "Destroy")),
+                )?;
+            }
+            PumpCommand::TargetAbort {
+                request,
+                epoch,
+                transition_id,
+            } => {
+                self.dispatch_instrumented(
+                    WindowHostInput::Event(WindowHostEvent::TargetAbort {
+                        request: WindowRequestId(request),
+                        epoch: WindowEpoch(epoch),
+                    }),
+                    transition_id.map(|id| (id, epoch, "Destroy")),
+                )?;
+                self.restore_active_published_handles();
+            }
+            PumpCommand::TargetFailed {
+                request,
+                epoch,
+                transition_id,
+            } => {
+                self.dispatch_instrumented(
+                    WindowHostInput::Event(WindowHostEvent::TargetFailed {
+                        request: WindowRequestId(request),
+                        epoch: WindowEpoch(epoch),
+                        failure: WindowHostFailure::Backend {
+                            operation: WindowBackendOperation::AttachTarget,
+                            code: -1,
+                        },
+                    }),
+                    transition_id.map(|id| (id, epoch, "Destroy")),
+                )?;
             }
             PumpCommand::Visibility { epoch, visible } => {
                 if !visible {
                     self.reset_cursor_for_transition(WindowEpoch(epoch));
                 }
-                self.dispatch(WindowHostInput::Command(WindowHostCommand::SetVisibility {
-                    epoch: WindowEpoch(epoch),
-                    visibility: visibility(visible),
-                }))?;
+                let requested_epoch = WindowEpoch(epoch);
+                let requested_visibility = visibility(visible);
+                if self.z_order_recovery_permitted {
+                    self.dispatch(WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                        epoch: requested_epoch,
+                        visibility: requested_visibility,
+                    }))?;
+                } else {
+                    self.deferred_visibility = Some(requested_visibility);
+                }
             }
             PumpCommand::Resize {
                 epoch,
@@ -573,11 +706,26 @@ impl PumpRuntime {
                 }
             }
             PumpCommand::RaisePresenter { epoch } => {
-                self.dispatch(WindowHostInput::Command(WindowHostCommand::Raise {
-                    epoch: WindowEpoch(epoch),
-                }))?;
+                if self.z_order_recovery_permitted {
+                    self.dispatch(WindowHostInput::Command(WindowHostCommand::Raise {
+                        epoch: WindowEpoch(epoch),
+                    }))?;
+                }
             }
             PumpCommand::RaiseHud { epoch } => self.schedule_hud_raise(WindowEpoch(epoch)),
+            PumpCommand::SetZOrderRecoveryPermit { permitted } => {
+                self.z_order_recovery_permitted = permitted;
+                if !permitted {
+                    self.hud_raise_deadlines.clear();
+                } else if let Some(requested_visibility) = self.deferred_visibility.take()
+                    && let Some(epoch) = active_epoch(self.state)
+                {
+                    self.dispatch(WindowHostInput::Command(WindowHostCommand::SetVisibility {
+                        epoch,
+                        visibility: requested_visibility,
+                    }))?;
+                }
+            }
             PumpCommand::CursorActivity { epoch } => {
                 let key = WindowEpoch(epoch);
                 if cursor_input_epoch(self.state) == Some(key) {
@@ -614,6 +762,14 @@ impl PumpRuntime {
     }
 
     fn dispatch(&mut self, input: WindowHostInput) -> Result<(), String> {
+        self.dispatch_instrumented(input, None)
+    }
+
+    fn dispatch_instrumented(
+        &mut self,
+        input: WindowHostInput,
+        transition_action: Option<(u64, u64, &'static str)>,
+    ) -> Result<(), String> {
         let transition = reduce_window_host(self.state, input);
         if let WindowHostTransitionStatus::Rejected(error) = transition.status {
             return Err(format!(
@@ -622,6 +778,25 @@ impl PumpRuntime {
         }
         self.state = transition.state;
         for effect in transition.effects {
+            if let Some((transition_id, target_epoch, action)) = transition_action {
+                let action_host = match (action, effect) {
+                    ("Publish", WindowHostEffect::Publish { host, .. }) => Some(host),
+                    (
+                        "Destroy",
+                        WindowHostEffect::Destroy { host }
+                        | WindowHostEffect::DestroyOrphan { host },
+                    ) => Some(host),
+                    _ => None,
+                };
+                if let Some(host) = action_host {
+                    self.log_transition_native_action(
+                        transition_id,
+                        target_epoch,
+                        action,
+                        host.epoch.0,
+                    );
+                }
+            }
             self.apply_effect(effect)?;
         }
         Ok(())
@@ -783,6 +958,7 @@ impl PumpRuntime {
             height,
             pixels_per_point: window.os_pixels_per_point(),
             observation: window.observe(),
+            presenter_hwnd: window.hwnd().0 as usize as u64,
         })
     }
 
@@ -814,7 +990,7 @@ impl PumpRuntime {
         crate::logger::log(format!(
             "[native-video] pump target_ready request={request} epoch={epoch} \
              queue={queue_ms:.1}ms topology={topology_ms:.1} intents={intents_ms:.1} \
-             dispatch_with_destroy={:.1} intents_len={}",
+             dispatch_prepare={:.1} intents_len={}",
             dispatch_t0.elapsed().as_secs_f64() * 1000.0,
             startup_intents.len(),
         ));
@@ -990,6 +1166,48 @@ impl PumpRuntime {
         );
     }
 
+    fn log_transition_native_action(
+        &self,
+        request: u64,
+        target_epoch: u64,
+        effect: &str,
+        action_epoch: u64,
+    ) {
+        let target = self
+            .requests
+            .get(&WindowEpoch(target_epoch))
+            .map(|request| match request.placement {
+                NativeVideoPlacement::MainWindowChild => "MainWindow",
+                NativeVideoPlacement::FullscreenBorderless => "Fullscreen",
+                NativeVideoPlacement::DetachedViewerChild
+                | NativeVideoPlacement::DetachedWindow => "DetachedWindow",
+            })
+            .unwrap_or("Unknown");
+        let hwnd = self
+            .hosts
+            .get(&WindowEpoch(action_epoch))
+            .map(|host| host.hwnd().0 as usize as u64)
+            .unwrap_or(0);
+        crate::logger::log(format!(
+            "[presentation-transition] id={request} target={target} effect={effect} hwnd=0x{hwnd:x}"
+        ));
+    }
+
+    fn restore_active_published_handles(&self) {
+        let host = match self.state {
+            WindowHostState::Visible { host, .. } | WindowHostState::Hidden { host, .. } => host,
+            _ => return,
+        };
+        let Some(window) = self.hosts.get(&host.epoch) else {
+            return;
+        };
+        self.hwnd_out
+            .store(window.hwnd().0 as usize as u64, Ordering::Release);
+        self.hud_hwnd_out
+            .store(window.hud_hwnd(), Ordering::Release);
+        self.refresh_window_health();
+    }
+
     fn validate_published_window_owner(&self, hwnd_raw: u64) {
         let expected = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
         let actual = unsafe {
@@ -1163,7 +1381,9 @@ impl PumpRuntime {
                 }
                 NativeVideoWindowEvent::RequestRaiseHud => self.schedule_hud_raise(epoch),
                 NativeVideoWindowEvent::RequestFocusClaim => {
-                    if let Some(window) = self.hosts.get(&epoch) {
+                    if self.z_order_recovery_permitted
+                        && let Some(window) = self.hosts.get(&epoch)
+                    {
                         window.apply_render_intents(&[NativeWindowIntent::ClaimTextInputFocus]);
                     }
                 }
@@ -1255,6 +1475,9 @@ impl PumpRuntime {
     }
 
     fn schedule_hud_raise(&mut self, epoch: WindowEpoch) {
+        if !self.z_order_recovery_permitted {
+            return;
+        }
         let now = Instant::now();
         self.hud_raise_deadlines
             .retain(|(queued_epoch, _)| *queued_epoch != epoch);
@@ -1276,6 +1499,7 @@ impl PumpRuntime {
             .is_some_and(|(_, deadline)| *deadline <= now)
         {
             if let Some((epoch, _)) = self.hud_raise_deadlines.pop_front()
+                && self.z_order_recovery_permitted
                 && let Some(window) = self.hosts.get(&epoch)
             {
                 let _ = window.try_raise_hud_to_top();
@@ -1711,6 +1935,7 @@ mod tests {
                             height,
                             pixels_per_point,
                             observation,
+                            ..
                         } if request == 1 && epoch == 1 => {
                             break (
                                 targets.into_targets(),

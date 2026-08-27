@@ -6,6 +6,121 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[cfg(windows)]
+fn begin_test_video_presentation_transition(
+    app: &mut App,
+    target: ViewerPresentation,
+    announce_main_hint: bool,
+) -> u64 {
+    app.video_presentation_transition
+        .reset_stable(app.viewer_presentation);
+    let ready_host_hwnd = if target == ViewerPresentation::DetachedWindow {
+        0xD371
+    } else {
+        0
+    };
+    let request_id = app.video_presentation_transition.request_transition(
+        target,
+        true,
+        announce_main_hint,
+        0xA117,
+        0xA057,
+        ready_host_hwnd,
+    );
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    request_id
+}
+
+#[cfg(windows)]
+fn clear_test_video_presentation_transition(app: &mut App) {
+    app.video_presentation_transition
+        .reset_stable(app.viewer_presentation);
+}
+
+#[cfg(windows)]
+fn begin_test_detached_host_wait(app: &mut App) -> u64 {
+    app.video_presentation_transition
+        .reset_stable(app.viewer_presentation);
+    let request_id = app.video_presentation_transition.request_transition(
+        ViewerPresentation::DetachedWindow,
+        true,
+        false,
+        0xA117,
+        0,
+        0,
+    );
+    app.video_presentation_transition.take_effects();
+    request_id
+}
+
+#[cfg(windows)]
+fn commit_test_video_presentation_transition(
+    app: &mut App,
+    request_id: u64,
+    target: ViewerPresentation,
+    generation: u64,
+) {
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeReady {
+            request_id,
+            candidate: PresentationCandidate {
+                presenter_hwnd: 0xCA11,
+                native_generation: generation,
+                host_hwnd: if target == ViewerPresentation::DetachedWindow {
+                    0xD371
+                } else {
+                    0
+                },
+                requires_retire: true,
+            },
+        });
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id,
+            candidate_generation: generation,
+        });
+    let ctx = egui::Context::default();
+    for effect in app.video_presentation_transition.take_effects() {
+        if !matches!(
+            effect,
+            PresentationTransitionEffect::PrepareNative { .. }
+                | PresentationTransitionEffect::PublishNative { .. }
+                | PresentationTransitionEffect::AbortNative { .. }
+                | PresentationTransitionEffect::RetireOutgoing { .. }
+        ) {
+            app.execute_video_presentation_host_effect(&ctx, effect);
+        }
+    }
+    if target == ViewerPresentation::DetachedWindow {
+        app.video_presentation_transition
+            .dispatch(PresentationTransitionEvent::HostVisible {
+                request_id,
+                hwnd: 0xD371,
+            });
+        app.video_presentation_transition.take_effects();
+    }
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id,
+            candidate_generation: generation,
+        });
+    for effect in app.video_presentation_transition.take_effects() {
+        if !matches!(
+            effect,
+            PresentationTransitionEffect::PrepareNative { .. }
+                | PresentationTransitionEffect::PublishNative { .. }
+                | PresentationTransitionEffect::AbortNative { .. }
+                | PresentationTransitionEffect::RetireOutgoing { .. }
+        ) {
+            app.execute_video_presentation_host_effect(&ctx, effect);
+        }
+    }
+}
+
+#[cfg(windows)]
 #[cfg(windows)]
 std::thread_local! {
     static METADATA_BUSY_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
@@ -35096,12 +35211,12 @@ mod native_video_rating_key_tests {
         app.settings.video_in_window_mode = true;
         app.native_video_in_window_active = true;
         app.viewer_presentation = ViewerPresentation::MainWindow;
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
 
         app.handle_native_video_key_event(&ctx, idx, native_key(0x7A, false)); // F11
 
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "F11 must not leave a pending switch when no VideoPlayer exists"
         );
     }
@@ -35121,13 +35236,13 @@ mod native_video_rating_key_tests {
 
         app.handle_native_video_key_event(&ctx, idx, native_key(0x7A, false)); // old F11
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "old F11 should no longer trigger after FsToggleWindowMode is customized"
         );
 
         app.handle_native_video_key_event(&ctx, idx, native_key(0x7C, false)); // F13
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "custom F13 follows the same no-player guard and must not create an orphan switch"
         );
     }
@@ -35145,7 +35260,7 @@ mod native_video_rating_key_tests {
         app.handle_native_video_key_event(&ctx, idx, key);
 
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "repeat F11 should not trigger window mode toggle"
         );
     }
@@ -35162,7 +35277,7 @@ mod native_video_rating_key_tests {
 
         assert!(app.settings.detached_viewer_enabled);
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "F12 must not leave a pending switch when no VideoPlayer exists"
         );
     }
@@ -35199,36 +35314,50 @@ mod native_video_rating_key_tests {
         );
     }
 
-    /// 切替中に届いた F12 は、キー経路から入っても二重トグルにならない。
-    ///
-    /// この窓は以前 `GetAsyncKeyState` の物理レベル問い合わせも塞いでいたが、それは
-    /// **早押しの本物も落とす**代用判定だったので撤去した (backlog §1.124)。落とす仕事は
-    /// pending guard が持っている。ここはキー経路を通してそれを固定する
-    /// (`detached_video_f12_does_not_retoggle_during_placement_switch` は
-    /// `toggle_detached_viewer_mode` を直接呼ぶので、arm 自体は通らない)。
+    /// 切替中に届いた2回目の F12 は捨てず、進行中候補を中止して元の表示先へ戻す要求にする。
     #[test]
-    fn native_video_f12_does_not_toggle_while_a_placement_switch_is_pending() {
+    fn native_video_f12_replaces_a_placement_switch_with_the_return_request() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.settings.detached_viewer_enabled = false;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 7,
-            target_presentation: ViewerPresentation::Fullscreen,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
+        let first_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::Fullscreen,
+            false,
+        );
+        let path = match &app.items[idx] {
+            GridItem::Video(path) => path.clone(),
+            _ => unreachable!(),
+        };
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 30.0)),
+                load_seq: 0,
+            },
+        );
 
         app.handle_native_video_key_event(&ctx, idx, native_key(0x7B, false)); // F12
 
         assert!(
-            !app.settings.detached_viewer_enabled,
-            "F12 arriving while a placement switch is in flight must not toggle again"
+            app.settings.detached_viewer_enabled,
+            "a real second F12 must flip the setting back"
         );
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.native_video_mode_switch.is_some());
+        assert!(app.video_presentation_transition.is_transitioning());
+        assert_eq!(
+            app.video_presentation_transition.target(),
+            ViewerPresentation::DetachedWindow,
+            "the replacement request returns to the still-visible outgoing presentation"
+        );
+        assert_ne!(
+            app.video_presentation_transition.request_id(),
+            Some(first_request_id),
+            "the second F12 must own a newer request generation"
+        );
     }
 
     #[test]
@@ -37796,27 +37925,27 @@ mod still_window_mode_key_tests {
     }
 
     /// Sol P2: native 動画のメディア窓→メイン切替の案内トーストは、要求発行時ではなく
-    /// `PlacementSwitched` の**確定時**に出す (presenter 無応答なら出ない)。
+    /// `NativeCommitted` の**確定時**に出す (presenter 無応答なら出ない)。
     #[test]
     #[cfg(windows)]
     fn media_window_main_hint_fires_on_placement_switch_confirmation() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 7,
-            target_presentation: ViewerPresentation::MainWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: true,
-        });
+        let test_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::MainWindow,
+            true,
+        );
         assert!(
             app.fs_feedback_toast.is_none(),
             "no hint before the presenter confirms the switch"
         );
 
-        app.apply_native_video_placement_switch_state(
-            7,
-            crate::video::NativeVideoPlacement::MainWindowChild,
+        commit_test_video_presentation_transition(
+            &mut app,
+            test_request_id,
+            ViewerPresentation::MainWindow,
             1,
         );
 
@@ -37824,7 +37953,7 @@ mod still_window_mode_key_tests {
             app.fs_feedback_toast
                 .as_ref()
                 .is_some_and(|(text, ..)| text.contains("メインウィンドウ表示に切り替えました")),
-            "the hint fires when PlacementSwitched confirms the main-side switch"
+            "the hint fires when NativeCommitted confirms the main-side switch"
         );
         assert_eq!(
             app.fs_feedback_toast_surface,
@@ -37834,15 +37963,15 @@ mod still_window_mode_key_tests {
         // announce フラグなし (F11 等の in-window/全画面切替) では出ない。
         app.fs_feedback_toast = None;
         app.fs_feedback_toast_surface = None;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 8,
-            target_presentation: ViewerPresentation::Fullscreen,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
-        app.apply_native_video_placement_switch_state(
-            8,
-            crate::video::NativeVideoPlacement::FullscreenBorderless,
+        let test_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::Fullscreen,
+            false,
+        );
+        commit_test_video_presentation_transition(
+            &mut app,
+            test_request_id,
+            ViewerPresentation::Fullscreen,
             2,
         );
         assert!(
@@ -38147,7 +38276,17 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Active)
         );
 
-        app.apply_video_presentation_switched(ViewerPresentation::MainWindow);
+        let request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::MainWindow,
+            false,
+        );
+        commit_test_video_presentation_transition(
+            &mut app,
+            request_id,
+            ViewerPresentation::MainWindow,
+            1,
+        );
 
         assert!(
             app.active_detached_session.is_none(),
@@ -38197,61 +38336,68 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let window_id = 201;
         prepare_detached_video_placement_switch(&mut app, window_id);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 41,
-            target_presentation: ViewerPresentation::MainWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let test_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::MainWindow,
+            false,
+        );
 
-        app.apply_native_video_placement_switch_state(
-            41,
-            crate::video::NativeVideoPlacement::MainWindowChild,
+        commit_test_video_presentation_transition(
+            &mut app,
+            test_request_id,
+            ViewerPresentation::MainWindow,
             2,
         );
 
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
         assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
     }
 
     #[test]
     #[cfg(windows)]
-    fn placement_switched_stale_converged_removes_detached_runtime() {
+    fn stale_commit_preserves_the_live_detached_runtime() {
         let mut app = setup_app();
         let window_id = 202;
         prepare_detached_video_placement_switch(&mut app, window_id);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 52,
-            target_presentation: ViewerPresentation::Fullscreen,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
-
-        app.apply_native_video_placement_switch_state(
-            51,
-            crate::video::NativeVideoPlacement::FullscreenBorderless,
-            3,
+        let test_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::Fullscreen,
+            false,
         );
 
-        assert!(app.native_video_mode_switch.is_none());
-        assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
+        app.video_presentation_transition
+            .dispatch(PresentationTransitionEvent::NativeCommitted {
+                request_id: test_request_id.wrapping_sub(1),
+                candidate_generation: 3,
+            });
+
+        assert!(app.video_presentation_transition.is_transitioning());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active),
+            "a stale commit must not retire the outgoing detached presentation"
+        );
     }
 
     #[test]
     #[cfg(windows)]
-    fn placement_switched_without_pending_removes_detached_runtime() {
+    fn commit_without_a_request_preserves_the_live_detached_runtime() {
         let mut app = setup_app();
         let window_id = 203;
         prepare_detached_video_placement_switch(&mut app, window_id);
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
 
-        app.apply_native_video_placement_switch_state(
-            61,
-            crate::video::NativeVideoPlacement::MainWindowChild,
-            4,
+        app.video_presentation_transition
+            .dispatch(PresentationTransitionEvent::NativeCommitted {
+                request_id: 61,
+                candidate_generation: 4,
+            });
+
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active),
+            "an unsolicited commit must not close the detached session"
         );
-
-        assert_video_placement_switch_removed_detached_runtime(&mut app, window_id);
     }
 
     #[test]
@@ -38320,12 +38466,11 @@ mod still_window_mode_key_tests {
         // detached 動画 + placement switch 進行中は switch 完了まで要求を保持する
         // (host 変更を取りこぼさない)。
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 7,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
@@ -38335,7 +38480,7 @@ mod still_window_mode_key_tests {
 
         // テスト player は presenter 未確立 (publish HWND=0) なので再親付け対象はなく、
         // 切替完了後に要求を消費できる。
-        app.native_video_mode_switch = None;
+        clear_test_video_presentation_transition(&mut app);
         app.poll_detached_video_host_resync();
         assert!(
             !app.pending_detached_video_host_resync,
@@ -38378,7 +38523,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.native_video_mode_switch = None;
+        clear_test_video_presentation_transition(&mut app);
 
         app.detached_viewer_host_geometry_settled = false;
         app.pending_detached_video_host_resync = true;
@@ -38389,12 +38534,11 @@ mod still_window_mode_key_tests {
         );
 
         // 切替進行中は (child 生存に関わらず) 保留する。
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 3,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
         app.pending_detached_video_host_resync = true;
         app.poll_detached_video_host_resync();
         assert!(
@@ -38414,7 +38558,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.native_video_mode_switch = None;
+        clear_test_video_presentation_transition(&mut app);
 
         // 音声モード中は resync を消費し、native switch は発行しない。
         app.video_audio_mode = Some(video);
@@ -38430,7 +38574,7 @@ mod still_window_mode_key_tests {
             "try_resync resolves as a no-op during hidden presenter audio mode"
         );
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "hidden presenter audio mode must not issue SwitchPlacement"
         );
 
@@ -38574,7 +38718,7 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.video_audio_mode, Some(video));
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "direct detached host sync must not un-hide or re-place the presenter"
         );
     }
@@ -38863,7 +39007,7 @@ mod still_window_mode_key_tests {
             "F11 must start the detached host borderless transition while tiles are visible"
         );
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "detached F11 resizes the host and must not migrate the presenter"
         );
     }
@@ -38893,7 +39037,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
         assert!(app.settings.video_in_window_mode);
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "audio-mode F11 must not start a native presenter placement switch"
         );
 
@@ -38902,7 +39046,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.video_audio_mode, Some(video));
         assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
         assert!(!app.settings.video_in_window_mode);
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
     }
 
     #[test]
@@ -38924,7 +39068,7 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.video_audio_mode, Some(video));
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
         assert_eq!(
             app.detached_viewer_borderless_transition
                 .as_ref()
@@ -38945,7 +39089,7 @@ mod still_window_mode_key_tests {
             "audio mode must survive the borderless transition settle frame"
         );
         assert!(
-            app.native_video_mode_switch.is_none(),
+            !app.video_presentation_transition.is_transitioning(),
             "settle must not issue a presenter placement switch while audio mode owns display"
         );
     }
@@ -39172,7 +39316,7 @@ mod still_window_mode_key_tests {
 
         // 動画 fullscreen (非 detached, 切替なし) は対象外。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.native_video_mode_switch = None;
+        clear_test_video_presentation_transition(&mut app);
         assert!(!app.detached_video_presentation_active_or_targeted());
 
         // detached で再生中は対象。
@@ -39182,24 +39326,22 @@ mod still_window_mode_key_tests {
         // **切替中 (target=DetachedWindow)** も対象 = initial main→detached 中の host 変更を
         // 取りこぼさないための肝。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 1,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
         assert!(
             app.detached_video_presentation_active_or_targeted(),
             "an in-flight switch toward detached must count so host changes are not missed"
         );
 
         // 切替 target が detached でなければ対象外。
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 2,
-            target_presentation: ViewerPresentation::MainWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::MainWindow,
+            false,
+        );
         assert!(!app.detached_video_presentation_active_or_targeted());
     }
 
@@ -43106,13 +43248,12 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_window_id = Some(120);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 42,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
         app.bind_mounted_context_for_test(120);
+        begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
         app.fs_cache.insert(
             video,
             FsCacheEntry::Video {
@@ -43141,9 +43282,9 @@ mod still_window_mode_key_tests {
                 active.fs_cache.get(&video),
                 Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
             ));
+            assert!(active.video_presentation_transition.is_transitioning());
         })
         .unwrap();
-        assert!(app.native_video_mode_switch.is_some());
     }
 
     #[test]
@@ -43158,13 +43299,7 @@ mod still_window_mode_key_tests {
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_window_id = Some(121);
-        let now = std::time::Instant::now();
-        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
-            target_presentation: ViewerPresentation::DetachedWindow,
-            activate_on_show: true,
-            requested_at: now,
-            deadline: now + std::time::Duration::from_secs(5),
-        });
+        begin_test_detached_host_wait(&mut app);
         app.fs_cache.insert(
             video,
             FsCacheEntry::Video {
@@ -47911,12 +48046,11 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.native_video_in_window_active = false;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 42,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
 
         assert!(
             !app.viewer_session_is_detached(),
@@ -47949,12 +48083,11 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
         app.detached_viewer_window_id = Some(77);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 1,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
 
         assert!(!app.viewer_session_is_detached());
         assert!(app.viewer_session_is_detached_or_switching());
@@ -47988,7 +48121,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         // 失敗後: presentation は非 detached へ戻り、pending も消えている。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.native_video_mode_switch = None;
+        clear_test_video_presentation_transition(&mut app);
         app.detached_viewer_window_id = Some(88);
         // だが detached host は実際に表示済み。
         app.fs_viewport_shown = true;
@@ -48010,15 +48143,9 @@ mod still_window_mode_key_tests {
     fn detached_video_host_wait_counts_as_detached_for_lifecycle() {
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");
-        let now = std::time::Instant::now();
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
-            target_presentation: ViewerPresentation::DetachedWindow,
-            activate_on_show: true,
-            requested_at: now,
-            deadline: now + std::time::Duration::from_secs(1),
-        });
+        begin_test_detached_host_wait(&mut app);
 
         assert!(app.viewer_session_is_detached_or_switching());
         assert!(
@@ -50318,7 +50445,7 @@ mod still_window_mode_key_tests {
         );
         assert!(
             !App::native_video_output_event_is_parked_live_hud_click_activation(
-                &Ev::PlacementSwitched {
+                &Ev::PlacementCommitted {
                     request_id: 1,
                     placement: NativeVideoPlacement::DetachedWindow,
                     generation: 1
@@ -52223,13 +52350,12 @@ mod still_window_mode_key_tests {
         });
         app.transition_detached_window_state(8, DetachedWindowState::ParkedLive, "test_setup");
         app.fullscreen_idx = Some(mounted_video);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 81,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
-        assert!(!app.closing_parked_windows_own_native_video_mode_switch(&[8]));
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
+        assert!(app.video_presentation_transition.is_transitioning());
         app.video_tile_mode_active = true;
         app.video_tile_reopen_pending = true;
         app.video_tile_reopen_deadline =
@@ -52242,7 +52368,7 @@ mod still_window_mode_key_tests {
         assert!(app.video_tile_reopen_pending);
         assert!(app.video_tile_reopen_deadline.is_some());
         assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
-        assert!(app.native_video_mode_switch.is_some());
+        assert!(app.video_presentation_transition.is_transitioning());
     }
 
     #[test]
@@ -52310,19 +52436,18 @@ mod still_window_mode_key_tests {
                 .push(GridItem::Video(PathBuf::from(r"C:\clips\surviving.mp4")));
             surviving.fullscreen_idx = Some(0);
         });
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 621,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
 
         app.teardown_paused_media_bundles_for_window_ids(
             &[621],
             "test_surviving_video_mode_switch",
         );
 
-        assert!(app.native_video_mode_switch.is_some());
+        assert!(app.video_presentation_transition.is_transitioning());
         assert!(
             app.locate_window_context(app.detached_image_windows[0].id)
                 .is_none()
@@ -52386,6 +52511,15 @@ mod still_window_mode_key_tests {
         app.push_window_context_for_test(&ctx, 9, move |bundle| {
             bundle.items = items;
             bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::Fullscreen;
+            bundle.video_presentation_transition.request_transition(
+                ViewerPresentation::DetachedWindow,
+                true,
+                false,
+                0xA117,
+                0,
+                0xD371,
+            );
         });
         app.transition_detached_window_state(9, DetachedWindowState::ParkedLive, "test_setup");
         app.video_tile_mode_active = true;
@@ -52393,20 +52527,13 @@ mod still_window_mode_key_tests {
         app.video_tile_reopen_deadline =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         app.native_video_deferred_nav_delta = Some(1);
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 91,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
-
         app.close_detached_image_windows_by_ids(&ctx, &[9], &[], "test_close", None);
 
         assert!(!app.video_tile_mode_active);
         assert!(!app.video_tile_reopen_pending);
         assert!(app.video_tile_reopen_deadline.is_none());
         assert!(app.native_video_deferred_nav_delta.is_none());
-        assert!(app.native_video_mode_switch.is_none());
+        assert!(!app.video_presentation_transition.is_transitioning());
     }
 
     #[test]
@@ -53597,14 +53724,13 @@ mod still_window_mode_key_tests {
             maximized: false,
         };
         app.fullscreen_idx = Some(idx);
-        // presentation はまだ Fullscreen (PlacementSwitched 未着) = detached "switching"。
+        // presentation はまだ Fullscreen (NativeCommitted 未着) = detached "switching"。
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 7,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
+        let _ = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
         app.settings.detached_viewer_window_placement = Some(previous);
         app.detached_viewer_window_id = Some(12);
         app.begin_active_detached_session(12, DetachedSource::Video);
@@ -53695,28 +53821,46 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_video_f12_does_not_retoggle_during_placement_switch() {
+    fn detached_video_f12_replaces_in_flight_switch_from_root_path() {
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.settings.detached_viewer_enabled = false;
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 7,
-            target_presentation: ViewerPresentation::Fullscreen,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-            announce_main_hint: false,
-        });
+        let first_request_id = begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::Fullscreen,
+            false,
+        );
+        let path = match &app.items[idx] {
+            GridItem::Video(path) => path.clone(),
+            _ => unreachable!(),
+        };
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 30.0)),
+                load_seq: 0,
+            },
+        );
 
         app.toggle_detached_viewer_mode();
 
         assert!(
-            !app.settings.detached_viewer_enabled,
-            "F12 leaked from the main/root path must not toggle detached mode again while migration is pending"
+            app.settings.detached_viewer_enabled,
+            "the root path must accept the second F12 while migration is pending"
         );
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert_eq!(app.fullscreen_idx, Some(idx));
-        assert!(app.native_video_mode_switch.is_some());
+        assert!(app.video_presentation_transition.is_transitioning());
+        assert_eq!(
+            app.video_presentation_transition.target(),
+            ViewerPresentation::DetachedWindow
+        );
+        assert_ne!(
+            app.video_presentation_transition.request_id(),
+            Some(first_request_id)
+        );
     }
 
     #[test]
@@ -62734,7 +62878,7 @@ fn repaint_request_probe() -> (
 
 #[test]
 #[cfg(windows)]
-fn poll_video_schedules_placement_switch_deadline() {
+fn presentation_transition_poll_drives_prepare_without_a_forced_deadline() {
     let mut app = phase_c_support::setup_app();
     install_native_deadline_player(
         &mut app,
@@ -62743,21 +62887,18 @@ fn poll_video_schedules_placement_switch_deadline() {
         30.0,
         false,
     );
-    app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-        request_id: 7,
-        target_presentation: ViewerPresentation::DetachedWindow,
-        deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
-        announce_main_hint: false,
-    });
-    let (ctx, requests) = repaint_request_probe();
+    begin_test_video_presentation_transition(&mut app, ViewerPresentation::DetachedWindow, false);
+    let ctx = egui::Context::default();
 
-    app.poll_video(&ctx);
+    app.poll_video_presentation_transition(&ctx);
 
-    assert!(requests.lock().unwrap().iter().any(|request| {
-        request.viewport_id == egui::ViewportId::ROOT
-            && request.delay > std::time::Duration::from_millis(300)
-            && request.delay <= std::time::Duration::from_millis(400)
-    }));
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            progress: PreparingProgress::AwaitingNative { .. },
+            ..
+        }
+    ));
 }
 
 #[test]

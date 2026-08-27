@@ -14093,7 +14093,15 @@ impl App {
         let detached_activate_on_show = if detached {
             if need_show {
                 self.detached_viewer_focus_requested = false;
-                Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
+                if self.video_presentation_transition.is_transitioning()
+                    && self.video_presentation_transition.target()
+                        == ViewerPresentation::DetachedWindow
+                {
+                    let _ = self.take_detached_viewer_activate_on_show();
+                    Some(false)
+                } else {
+                    Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
+                }
             } else {
                 self.detached_viewer_no_activate_once = false;
                 None
@@ -14427,7 +14435,12 @@ impl App {
                     }
                 }
                 #[cfg(windows)]
-                if detached_focus_existing && self.window_visible {
+                if detached_focus_existing
+                    && self.window_visible
+                    && self
+                        .video_presentation_transition
+                        .z_order_recovery_permitted()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -15877,7 +15890,11 @@ impl App {
                     // this frame has painted either real content (full/thumb/holdover) or the
                     // dark loading surface. This keeps DWM from ever presenting the unpainted
                     // white client area that `open_visibility_probe` caught on first open.
-                    let release = if detached {
+                    let transition_owns_detached_visibility =
+                        detached && self.video_presentation_transition.is_transitioning();
+                    let release = if transition_owns_detached_visibility {
+                        None
+                    } else if detached {
                         detached_initial_visibility_release(detached_open_content_ready, true)
                     } else {
                         Some(DetachedInitialVisibilityRelease::Content)
@@ -17739,7 +17756,12 @@ impl App {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
-            if need_show && self.window_visible {
+            if need_show
+                && self.window_visible
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+            {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -22549,7 +22571,10 @@ impl App {
                 .fs_last_native_focus_claim_at
                 .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
                 .unwrap_or(false);
-            let focus = if should_claim_native_focus && !claim_debounced {
+            let z_order_permitted = self
+                .video_presentation_transition
+                .z_order_recovery_permitted();
+            let focus = if should_claim_native_focus && !claim_debounced && z_order_permitted {
                 self.fs_last_native_focus_claim_at = Some(std::time::Instant::now());
                 claim_native_window_focus(target.target_hwnd)
             } else {
@@ -22579,7 +22604,7 @@ impl App {
                     vst_gui_visible,
                     viewport_focused,
                     focus_restore_click,
-                    should_claim_native_focus && !claim_debounced,
+                    should_claim_native_focus && !claim_debounced && z_order_permitted,
                     claim_debounced,
                     focus.set_foreground_ok,
                     focus.attach_thread_input_ok,
@@ -22588,7 +22613,12 @@ impl App {
                 ));
             }
             if focus_restore_click {
-                if should_claim_native_focus && !claim_debounced {
+                if should_claim_native_focus
+                    && !claim_debounced
+                    && self
+                        .video_presentation_transition
+                        .z_order_recovery_permitted()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
@@ -24915,6 +24945,11 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
+            #[cfg(windows)]
+            let presentation_was_transitioning =
+                self.video_presentation_transition.is_transitioning();
+            #[cfg(not(windows))]
+            let presentation_was_transitioning = false;
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
@@ -24923,7 +24958,7 @@ impl App {
             }
             let detached = self.viewer_session_is_detached();
             self.handle_fullscreen_close_request();
-            if !detached {
+            if !detached && !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
@@ -24939,8 +24974,15 @@ impl App {
                     "ui_fullscreen::handle_fs_navigation:close_to_page_list",
                 );
             }
+            #[cfg(windows)]
+            let presentation_was_transitioning =
+                self.video_presentation_transition.is_transitioning();
+            #[cfg(not(windows))]
+            let presentation_was_transitioning = false;
             self.close_fullscreen();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !presentation_was_transitioning {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             ctx.request_repaint();
         }
         // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が

@@ -40,10 +40,18 @@ impl App {
                 }
             }
         }
+        let transition_owned_viewport = (visible
+            && self.video_presentation_transition.is_transitioning())
+        .then(|| self.fullscreen_viewport_id());
+        let mut commanded = 0;
         for viewport_id in &viewport_ids {
+            if transition_owned_viewport == Some(*viewport_id) {
+                continue;
+            }
             ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
+            commanded += 1;
         }
-        viewport_ids.len()
+        commanded
     }
 
     /// Request the same root viewport close as the main window's [x] button.

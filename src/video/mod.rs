@@ -718,12 +718,25 @@ pub enum NativeVideoOutputEvent {
     },
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
-    PlacementSwitched {
+    PlacementReady {
         request_id: u64,
         placement: NativeVideoPlacement,
-        /// 切替後 (= 現在 live な) presenter window の placement 世代。App は
-        /// `committed_generation` をこの値まで進め、旧世代 close を棄却する。
         generation: u64,
+        presenter_hwnd: u64,
+        host_hwnd: u64,
+        requires_retire: bool,
+    },
+    PlacementCommitted {
+        request_id: u64,
+        placement: NativeVideoPlacement,
+        generation: u64,
+    },
+    PlacementRetired {
+        request_id: u64,
+        generation: u64,
+    },
+    PlacementAborted {
+        request_id: u64,
     },
     PlacementSwitchFailed {
         request_id: u64,
@@ -1147,13 +1160,27 @@ enum NativeVideoOutputCommand {
         payload: Box<SwitchSourcePayload>,
     },
     #[allow(dead_code)]
-    SwitchPlacement {
+    PreparePlacement {
         request_id: u64,
         placement: NativeVideoPlacement,
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
         visible: bool,
+    },
+    CommitPlacement {
+        request_id: u64,
+        generation: u64,
+    },
+    RetirePlacement {
+        request_id: u64,
+        generation: u64,
+    },
+    AbortPlacement {
+        request_id: u64,
+    },
+    SetZOrderRecoveryPermit {
+        permitted: bool,
     },
     /// native presenter HWND の `push_native_event` を経由しない pointer 活動を
     /// 伝搬する。NativeEguiOverlay の cursor auto-hide タイマをリセットして
@@ -1552,7 +1579,11 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
         | NativeVideoOutputCommand::SwitchSource { .. }
-        | NativeVideoOutputCommand::SwitchPlacement { .. }
+        | NativeVideoOutputCommand::PreparePlacement { .. }
+        | NativeVideoOutputCommand::CommitPlacement { .. }
+        | NativeVideoOutputCommand::RetirePlacement { .. }
+        | NativeVideoOutputCommand::AbortPlacement { .. }
+        | NativeVideoOutputCommand::SetZOrderRecoveryPermit { .. }
         | NativeVideoOutputCommand::SetWindowVisible { .. } => None,
     }
 }
@@ -1639,6 +1670,81 @@ impl NativeCommandReceiver {
         }
         commands.sort_unstable_by_key(|command| command.sequence);
         commands.into_iter().map(|queued| queued.command).collect()
+    }
+}
+
+#[cfg(windows)]
+enum PlacementTransitionControl {
+    Commit,
+    Retire,
+    Abort,
+}
+
+#[cfg(windows)]
+fn presentation_prepare_must_wait_for_frame(
+    placement_changes: bool,
+    has_frame: bool,
+    audio_only: bool,
+) -> bool {
+    placement_changes && !has_frame && !audio_only
+}
+
+#[cfg(windows)]
+fn wait_for_placement_transition_control(
+    receiver: &NativeCommandReceiver,
+    deferred: &mut std::collections::VecDeque<NativeVideoOutputCommand>,
+    request_id: u64,
+    generation: u64,
+    retire_phase: bool,
+    cancel: &AtomicBool,
+) -> Result<PlacementTransitionControl, String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("native presentation transition cancelled".to_string());
+        }
+        for command in receiver.drain() {
+            if let Some(control) = placement_transition_control(
+                command,
+                deferred,
+                request_id,
+                generation,
+                retire_phase,
+            ) {
+                return Ok(control);
+            }
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(windows)]
+fn placement_transition_control(
+    command: NativeVideoOutputCommand,
+    deferred: &mut std::collections::VecDeque<NativeVideoOutputCommand>,
+    request_id: u64,
+    generation: u64,
+    retire_phase: bool,
+) -> Option<PlacementTransitionControl> {
+    match command {
+        NativeVideoOutputCommand::CommitPlacement {
+            request_id: actual,
+            generation: actual_generation,
+        } if !retire_phase && actual == request_id && actual_generation == generation => {
+            Some(PlacementTransitionControl::Commit)
+        }
+        NativeVideoOutputCommand::RetirePlacement {
+            request_id: actual,
+            generation: actual_generation,
+        } if retire_phase && actual == request_id && actual_generation == generation => {
+            Some(PlacementTransitionControl::Retire)
+        }
+        NativeVideoOutputCommand::AbortPlacement { request_id: actual } if actual == request_id => {
+            Some(PlacementTransitionControl::Abort)
+        }
+        command => {
+            deferred.push_back(command);
+            None
+        }
     }
 }
 
@@ -1730,12 +1836,15 @@ pub(crate) struct NativeVideoOutput {
     /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
     source_epoch: Arc<AtomicU64>,
-    /// App 側が「信頼する」現在の presenter placement 世代。`PlacementSwitched` を
+    /// App 側が「信頼する」現在の presenter placement 世代。`PlacementCommitted` を
     /// 受けるたびに単調非減少で進め、これより古い世代の close を stale として棄却する。
     /// pump/render threads とは共有しない (App = UI thread 専用) が、fast-swap の
     /// `take/attach_native_output` で presenter と一緒に運ばれるため lifetime 正しい。
     #[allow(dead_code)]
     committed_generation: AtomicU64,
+    /// UI-thread projection of the transition reducer's z-order recovery permit. This travels
+    /// with the context-owned output and is updated before the command is forwarded to the pump.
+    z_order_recovery_permitted: AtomicBool,
     /// Output-lifetime monotonic revision paired with the owning source epoch.
     video_scale_request_revision: AtomicU64,
     last_vst3_available: AtomicBool,
@@ -1829,6 +1938,7 @@ impl NativeVideoOutput {
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
+            z_order_recovery_permitted: AtomicBool::new(true),
             video_scale_request_revision: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
@@ -1977,6 +2087,7 @@ impl NativeVideoOutput {
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
+            z_order_recovery_permitted: AtomicBool::new(true),
             video_scale_request_revision: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
@@ -2048,9 +2159,7 @@ impl NativeVideoOutput {
         self.committed_generation.load(Ordering::Acquire)
     }
 
-    /// `PlacementSwitched` を受けたときに App が呼ぶ。世代は単調非減少 (max) で進める。
-    /// stale (request mismatch / out-of-order) な PlacementSwitched でも、presenter の
-    /// 現世代を追い越すことは無いので max で吸収する。
+    /// reducer が `PlacementCommitted` を受けたときに App が呼ぶ。世代は単調非減少で進める。
     #[allow(dead_code)]
     pub(crate) fn bump_committed_generation(&self, generation: u64) {
         let cur = self.committed_generation.load(Ordering::Acquire);
@@ -2332,7 +2441,7 @@ impl NativeVideoOutput {
     }
 
     #[allow(dead_code)]
-    fn switch_placement(
+    pub(crate) fn prepare_placement(
         &self,
         request_id: u64,
         placement: NativeVideoPlacement,
@@ -2343,7 +2452,7 @@ impl NativeVideoOutput {
         let visible = self.visibility_gate.effective_visible();
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SwitchPlacement {
+            .send(NativeVideoOutputCommand::PreparePlacement {
                 request_id,
                 placement,
                 owner_hwnd,
@@ -2351,6 +2460,42 @@ impl NativeVideoOutput {
                 activate_on_show,
                 visible,
             });
+    }
+
+    pub(crate) fn commit_placement(&self, request_id: u64, generation: u64) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::CommitPlacement {
+                request_id,
+                generation,
+            });
+    }
+
+    pub(crate) fn retire_placement(&self, request_id: u64, generation: u64) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::RetirePlacement {
+                request_id,
+                generation,
+            });
+    }
+
+    pub(crate) fn abort_placement(&self, request_id: u64) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::AbortPlacement { request_id });
+    }
+
+    pub(crate) fn set_z_order_recovery_permit(&self, permitted: bool) {
+        self.z_order_recovery_permitted
+            .store(permitted, Ordering::Release);
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetZOrderRecoveryPermit { permitted });
+    }
+
+    pub(crate) fn z_order_recovery_permitted(&self) -> bool {
+        self.z_order_recovery_permitted.load(Ordering::Acquire)
     }
 
     fn set_playback_status(
@@ -3826,6 +3971,7 @@ struct NativeWindowAttach {
     height: u32,
     pixels_per_point: f32,
     observation: crate::video::native_window_host::NativeWindowObservation,
+    presenter_hwnd: u64,
 }
 
 /// この window event が、いま描画している presenter 世代のものか。
@@ -3867,6 +4013,7 @@ fn wait_for_native_window_attach(
                 height,
                 pixels_per_point,
                 observation,
+                presenter_hwnd,
             }) if actual_request == request && actual_epoch == epoch => {
                 return Ok(NativeWindowAttach {
                     targets: targets.into_targets(),
@@ -3874,6 +4021,7 @@ fn wait_for_native_window_attach(
                     height,
                     pixels_per_point,
                     observation,
+                    presenter_hwnd,
                 });
             }
             Ok(native_window_pump::PumpLifecycleEvent::Fault { message, .. }) => {
@@ -4070,6 +4218,7 @@ fn run_native_video_output(
     //     再構築後は新 presenter へ手動で再適用する必要がある。
     let mut cur_placement = config.placement;
     let mut cur_owner_hwnd = config.owner_hwnd;
+    let mut cur_presenter_hwnd = initial_attach.presenter_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
     let mut cur_text_contrast = config.text_contrast;
@@ -4172,7 +4321,9 @@ fn run_native_video_output(
         topology,
         startup_window_intents,
     )?;
+    window_pump.target_commit(cur_window_request, cur_generation, None)?;
     wait_for_native_window_published(&window_pump, cur_window_request, cur_generation, &cancel)?;
+    window_pump.target_retire(cur_window_request, cur_generation, None)?;
     // 音声のみ native シェル (Inc 6 ②-1): 映像 first frame が永久に来ないので、window を
     // publish できた時点で presenter を「表示準備完了」とみなす。これをしないと
     // `native_presenter_pending()` (= `!first_presented`) が永久に true のままになり、
@@ -4238,6 +4389,7 @@ fn run_native_video_output(
     // Inc 7 hidden presenter (動画→音声モード): pump が公開する可視状態を consume policy の
     // 唯一の正本にする。source swap はこの output-lifetime state を交換しない。
     let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
+    let mut deferred_transition_commands = std::collections::VecDeque::new();
     emit_native_vram_trace(
         "native_presenter_started",
         "after_presenter_init",
@@ -4473,7 +4625,11 @@ fn run_native_video_output(
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
         let mut desired_scale_apply_due = false;
-        for command in command_rx.drain() {
+        let commands: Vec<_> = deferred_transition_commands
+            .drain(..)
+            .chain(command_rx.drain())
+            .collect();
+        for command in commands {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
@@ -4988,7 +5144,13 @@ fn run_native_video_output(
                         source.last_present_source_pts = None;
                     }
                 }
-                NativeVideoOutputCommand::SwitchPlacement {
+                NativeVideoOutputCommand::SetZOrderRecoveryPermit { permitted } => {
+                    window_pump.set_z_order_recovery_permit(permitted)?;
+                }
+                NativeVideoOutputCommand::CommitPlacement { .. }
+                | NativeVideoOutputCommand::RetirePlacement { .. }
+                | NativeVideoOutputCommand::AbortPlacement { .. } => {}
+                NativeVideoOutputCommand::PreparePlacement {
                     request_id,
                     placement,
                     owner_hwnd,
@@ -4996,6 +5158,23 @@ fn run_native_video_output(
                     activate_on_show,
                     visible,
                 } => {
+                    if presentation_prepare_must_wait_for_frame(
+                        placement != cur_placement,
+                        frame_output.frame().is_some(),
+                        config.audio_only,
+                    ) {
+                        deferred_transition_commands.push_back(
+                            NativeVideoOutputCommand::PreparePlacement {
+                                request_id,
+                                placement,
+                                owner_hwnd,
+                                rect: new_rect,
+                                activate_on_show,
+                                visible,
+                            },
+                        );
+                        continue;
+                    }
                     if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
                         window_pump.resize(cur_generation, placement, new_rect)?;
                         let (new_width, new_height) =
@@ -5084,12 +5263,43 @@ fn run_native_video_output(
                         send_native_output_event(
                             &ui_event_tx,
                             source.source_epoch,
-                            NativeVideoOutputEvent::PlacementSwitched {
+                            NativeVideoOutputEvent::PlacementReady {
                                 request_id,
                                 placement,
                                 generation: cur_generation,
+                                presenter_hwnd: cur_presenter_hwnd,
+                                host_hwnd: owner_hwnd,
+                                requires_retire: false,
                             },
                         );
+                        match wait_for_placement_transition_control(
+                            &command_rx,
+                            &mut deferred_transition_commands,
+                            request_id,
+                            cur_generation,
+                            false,
+                            &cancel,
+                        )? {
+                            PlacementTransitionControl::Commit => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    source.source_epoch,
+                                    NativeVideoOutputEvent::PlacementCommitted {
+                                        request_id,
+                                        placement,
+                                        generation: cur_generation,
+                                    },
+                                );
+                            }
+                            PlacementTransitionControl::Abort => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    source.source_epoch,
+                                    NativeVideoOutputEvent::PlacementAborted { request_id },
+                                );
+                            }
+                            PlacementTransitionControl::Retire => unreachable!(),
+                        }
                         continue;
                     }
 
@@ -5149,7 +5359,11 @@ fn run_native_video_output(
                         match new_presenter_result {
                             Ok(value) => value,
                             Err(err) => {
-                                window_pump.target_failed(host_request, candidate_epoch)?;
+                                window_pump.target_failed(
+                                    host_request,
+                                    candidate_epoch,
+                                    Some(request_id),
+                                )?;
                                 crate::logger::log(format!(
                                     "[native-video] placement switch target failed: {err}"
                                 ));
@@ -5213,21 +5427,22 @@ fn run_native_video_output(
                         // The typed presentation state is the only prime source.
                         // On failure it stays owned by the old core/host so a rejected
                         // switch cannot destroy the paused-frame fallback.
-                        let primed = if let Some(frame) = frame_output.frame() {
-                            let outcome = new_presenter.present(frame, config.sync_interval)?;
-                            debug_assert!(
-                                frame_output.mark_current_visible(outcome.copy_fence_value)
-                            );
-                            true
-                        } else {
-                            false
-                        };
+                        let frame = frame_output.frame().ok_or_else(|| {
+                            "presentation candidate has no frame to prime".to_string()
+                        })?;
+                        let outcome = new_presenter.present(frame, config.sync_interval)?;
+                        debug_assert!(frame_output.mark_current_visible(outcome.copy_fence_value));
+                        let primed = true;
                         Ok((primed, overlay_outcome))
                     })();
                     let (primed, overlay_outcome) = match prepare_result {
                         Ok(value) => value,
                         Err(err) => {
-                            window_pump.target_failed(host_request, candidate_epoch)?;
+                            window_pump.target_failed(
+                                host_request,
+                                candidate_epoch,
+                                Some(request_id),
+                            )?;
                             crate::logger::log(format!(
                                 "[native-video] placement switch prime failed; old host retained: {err}"
                             ));
@@ -5259,6 +5474,49 @@ fn run_native_video_output(
                         topology,
                         startup_window_intents,
                     )?;
+                    send_native_output_event(
+                        &ui_event_tx,
+                        source.source_epoch,
+                        NativeVideoOutputEvent::PlacementReady {
+                            request_id,
+                            placement,
+                            generation: candidate_epoch,
+                            presenter_hwnd: attach.presenter_hwnd,
+                            host_hwnd: owner_hwnd,
+                            requires_retire: true,
+                        },
+                    );
+                    match wait_for_placement_transition_control(
+                        &command_rx,
+                        &mut deferred_transition_commands,
+                        request_id,
+                        candidate_epoch,
+                        false,
+                        &cancel,
+                    )? {
+                        PlacementTransitionControl::Commit => {
+                            window_pump.target_commit(
+                                host_request,
+                                candidate_epoch,
+                                Some(request_id),
+                            )?;
+                        }
+                        PlacementTransitionControl::Abort => {
+                            window_pump.target_abort(
+                                host_request,
+                                candidate_epoch,
+                                Some(request_id),
+                            )?;
+                            new_presenter.detach();
+                            send_native_output_event(
+                                &ui_event_tx,
+                                source.source_epoch,
+                                NativeVideoOutputEvent::PlacementAborted { request_id },
+                            );
+                            continue;
+                        }
+                        PlacementTransitionControl::Retire => unreachable!(),
+                    }
                     wait_for_native_window_published(
                         &window_pump,
                         host_request,
@@ -5267,10 +5525,12 @@ fn run_native_video_output(
                     )?;
                     let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
                     let publish_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
-                    let detach_t0 = std::time::Instant::now();
+                    let old_generation = cur_generation;
+                    let old_placement = cur_placement;
+                    let old_owner_hwnd = cur_owner_hwnd;
+                    let old_presenter_hwnd = cur_presenter_hwnd;
+                    let old_observation = window_observation;
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
-                    let detach_timings = old_presenter.detach();
-                    let detach_ms = detach_t0.elapsed().as_secs_f64() * 1000.0;
                     if source
                         .video_scale_state
                         .invalidate_preparation_and_keep_desired()
@@ -5278,10 +5538,10 @@ fn run_native_video_output(
                         presenter.discard_prepared_video_scale_settings();
                         desired_scale_apply_due = true;
                     }
-                    frame_output.invalidate_retire_fence_prefix(old_retire_len);
                     cur_generation = candidate_epoch;
                     cur_placement = placement;
                     cur_owner_hwnd = owner_hwnd;
+                    cur_presenter_hwnd = attach.presenter_hwnd;
                     window_observation = attach.observation;
                     presenter.set_window_observation(window_observation);
                     if !visible {
@@ -5292,11 +5552,7 @@ fn run_native_video_output(
                     last_native_mouse_at = None;
                     pointer_present_synthetic = false;
                     crate::logger::log(format!(
-                        "[native-video] placement switched placement={} {}x{} primed={} request={} generation={} \
-                         total={:.1}ms (host_attach={attach_ms:.1} render_core_new={core_new_ms:.1} \
-                         prepare={prepare_ms:.1} \
-                         publish={publish_ms:.1}[hud={hud_ms:.1} retire={retire_ms:.1} wait={wait_ms:.1}] \
-                         detach_old={detach_ms:.1}[egui_overlay={:.1} rest={:.1}])",
+                        "[native-video] placement committed placement={} {}x{} primed={} request={} generation={} total={:.1}ms (host_attach={attach_ms:.1} render_core_new={core_new_ms:.1} prepare={prepare_ms:.1} publish={publish_ms:.1}[hud={hud_ms:.1} retire={retire_ms:.1} wait={wait_ms:.1}])",
                         placement.label(),
                         attach.width,
                         attach.height,
@@ -5304,18 +5560,74 @@ fn run_native_video_output(
                         request_id,
                         cur_generation,
                         switch_t0.elapsed().as_secs_f64() * 1000.0,
-                        detach_timings.egui_overlay_ms,
-                        detach_timings.rest_ms,
                     ));
                     send_native_output_event(
                         &ui_event_tx,
                         source.source_epoch,
-                        NativeVideoOutputEvent::PlacementSwitched {
+                        NativeVideoOutputEvent::PlacementCommitted {
                             request_id,
                             placement,
                             generation: cur_generation,
                         },
                     );
+                    let retire_control = wait_for_placement_transition_control(
+                        &command_rx,
+                        &mut deferred_transition_commands,
+                        request_id,
+                        candidate_epoch,
+                        true,
+                        &cancel,
+                    )?;
+                    match retire_control {
+                        PlacementTransitionControl::Retire => {
+                            window_pump.target_retire(
+                                host_request,
+                                candidate_epoch,
+                                Some(request_id),
+                            )?;
+                            let detach = old_presenter.detach();
+                            crate::logger::log(format!(
+                                "[native-video] placement retired request={} generation={} detach_old={:.1}ms egui_overlay={:.1}ms rest={:.1}ms",
+                                request_id,
+                                cur_generation,
+                                detach.egui_overlay_ms + detach.rest_ms,
+                                detach.egui_overlay_ms,
+                                detach.rest_ms,
+                            ));
+                            frame_output.invalidate_retire_fence_prefix(old_retire_len);
+                            send_native_output_event(
+                                &ui_event_tx,
+                                source.source_epoch,
+                                NativeVideoOutputEvent::PlacementRetired {
+                                    request_id,
+                                    generation: cur_generation,
+                                },
+                            );
+                        }
+                        PlacementTransitionControl::Abort => {
+                            window_pump.target_abort(
+                                host_request,
+                                candidate_epoch,
+                                Some(request_id),
+                            )?;
+                            let candidate_presenter =
+                                std::mem::replace(&mut presenter, old_presenter);
+                            candidate_presenter.detach();
+                            cur_generation = old_generation;
+                            cur_placement = old_placement;
+                            cur_owner_hwnd = old_owner_hwnd;
+                            cur_presenter_hwnd = old_presenter_hwnd;
+                            window_observation = old_observation;
+                            presenter.set_window_observation(window_observation);
+                            frame_output.clear_current();
+                            send_native_output_event(
+                                &ui_event_tx,
+                                source.source_epoch,
+                                NativeVideoOutputEvent::PlacementAborted { request_id },
+                            );
+                        }
+                        PlacementTransitionControl::Commit => unreachable!(),
+                    }
                 }
             }
         }
@@ -8894,7 +9206,7 @@ impl VideoPlayer {
 
     #[cfg(windows)]
     #[allow(dead_code)]
-    pub(crate) fn switch_native_placement(
+    pub(crate) fn prepare_native_placement(
         &self,
         request_id: u64,
         placement: NativeVideoPlacement,
@@ -8903,8 +9215,44 @@ impl VideoPlayer {
         activate_on_show: bool,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.switch_placement(request_id, placement, owner_hwnd, rect, activate_on_show);
+            output.prepare_placement(request_id, placement, owner_hwnd, rect, activate_on_show);
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn commit_native_placement(&self, request_id: u64, generation: u64) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.commit_placement(request_id, generation);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn retire_native_placement(&self, request_id: u64, generation: u64) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.retire_placement(request_id, generation);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn abort_native_placement(&self, request_id: u64) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.abort_placement(request_id);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_z_order_recovery_permit(&self, permitted: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_z_order_recovery_permit(permitted);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn z_order_recovery_permitted(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::z_order_recovery_permitted)
+            .unwrap_or(true)
     }
 
     #[cfg(windows)]
@@ -10288,6 +10636,24 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn changed_video_placement_cannot_be_ready_before_a_frame_is_owned() {
+        assert!(super::presentation_prepare_must_wait_for_frame(
+            true, false, false
+        ));
+        assert!(!super::presentation_prepare_must_wait_for_frame(
+            true, true, false
+        ));
+        assert!(!super::presentation_prepare_must_wait_for_frame(
+            false, false, false
+        ));
+        assert!(!super::presentation_prepare_must_wait_for_frame(
+            true, false, true
+        ));
+        // Killing mutation: change !has_frame to has_frame in the prepare predicate.
+    }
+
     /// キー入力の stale 判定は、この述語 1 つが担っている。
     ///
     /// App 側は裸の `NativeVideoWindowEvent` を受け取るので、ここを通した後では

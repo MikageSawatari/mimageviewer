@@ -889,7 +889,7 @@ pub(in crate::app) struct ViewerContextBundle {
     bookmark_view_state: Option<BookmarkViewState>,
     bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     fs_open_intent_from_grid: bool,
-    pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    video_presentation_transition: PresentationTransitionOwner,
     fs_zoom: f32,
     fs_pan: egui::Vec2,
     fs_zoom_active: bool,
@@ -1425,7 +1425,7 @@ impl ViewerContextBundle {
             bookmark_view_state: None,
             bookmark_open_pending: None,
             fs_open_intent_from_grid: false,
-            pending_detached_video_host_switch: None,
+            video_presentation_transition: PresentationTransitionOwner::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_zoom_active: false,
@@ -1750,7 +1750,7 @@ impl App {
             bookmark_view_state,
             bookmark_open_pending,
             fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
+            video_presentation_transition,
             fs_zoom,
             fs_pan,
             fs_zoom_active,
@@ -1994,7 +1994,7 @@ impl App {
         swap_field!(bookmark_view_state);
         swap_field!(bookmark_open_pending);
         swap_field!(fs_open_intent_from_grid);
-        swap_field!(pending_detached_video_host_switch);
+        swap_field!(video_presentation_transition);
         swap_field!(fs_zoom);
         swap_field!(fs_pan);
         swap_field!(fs_zoom_active);
@@ -2267,7 +2267,7 @@ impl App {
             bookmark_view_state,
             bookmark_open_pending,
             fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
+            video_presentation_transition,
             fs_zoom,
             fs_pan,
             fs_zoom_active,
@@ -2448,7 +2448,7 @@ impl App {
             fs_early_dims,
             fs_upload_backlog,
             fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
+            video_presentation_transition,
             fs_zoom,
             fs_pan,
             fs_zoom_active,

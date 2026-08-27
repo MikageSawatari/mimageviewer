@@ -115,7 +115,14 @@ mod metadata_ops;
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
+mod presentation_transition;
+#[cfg(windows)]
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
+#[cfg(windows)]
+use presentation_transition::{
+    CommittingProgress, PreparingProgress, PresentationCandidate, PresentationTransitionEffect,
+    PresentationTransitionEvent, PresentationTransitionOwner, PresentationTransitionState,
+};
 pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
@@ -8186,25 +8193,6 @@ fn run_fullscreen_video_marker_thumb_decode(
     result
 }
 
-/// Plan B: 進行中の viewer presentation 切替 1 件の状態。`toggle_video_window_mode`
-/// / detached host migration が生成し、presenter から `request_id` 一致の
-/// placement switch イベントが届くまで保持する。
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub(crate) struct NativeVideoModeSwitchPending {
-    /// このトグルのリクエスト ID (presenter がイベントに echo する)。
-    pub request_id: u64,
-    /// 切替先 presentation。
-    pub target_presentation: ViewerPresentation,
-    /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
-    pub deadline: std::time::Instant,
-    /// メディア窓→メイン切替 (F12/リング) の案内トーストを、**切替の確定**
-    /// (`PlacementSwitched` 適用) 時に出すか。要求発行時に出すと presenter 無応答で
-    /// 切り替わらなかったのに「切り替えました」と表示してしまう (Sol P2)。
-    /// F12 トグル経路だけが true にする (F11 等の in-window/全画面切替では出さない)。
-    pub announce_main_hint: bool,
-}
-
 /// Inc 7 hidden presenter: exit (音声モード→動画) の非同期完了待ち 1 件。
 /// `exit_video_audio_mode` が show / SwitchPlacement を要求したときに生成し、
 /// `poll_video_audio_exit_pending` が presenter の再表示 (`!native_presenter_hidden()`) を
@@ -8263,15 +8251,6 @@ pub(crate) enum VideoAudioVstPhase {
     Opening,
     /// プラグイン GUI 表示済み (二度出し防止ラッチ)。
     Active,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub(crate) struct DetachedVideoHostSwitchPending {
-    pub target_presentation: ViewerPresentation,
-    pub activate_on_show: bool,
-    pub requested_at: std::time::Instant,
-    pub deadline: std::time::Instant,
 }
 
 /// フレーム末尾で実行する native ファイル D&D の予約。
@@ -11066,11 +11045,10 @@ pub struct App {
     /// F12 別ウィンドウの仮想フルスクリーン切替中に、直前フレームを黒で安定させる状態。
     #[cfg(windows)]
     pub(crate) detached_viewer_borderless_transition: Option<DetachedViewerBorderlessTransition>,
-    /// F12 で動画を detached へ切り替えるとき、先に egui 側の detached viewer
-    /// viewport を作り、その HWND が捕捉できてから native presenter を子 HWND へ
-    /// 移行するための待機状態。
+    /// viewer presentation migration の唯一の owner。current/target、request generation、
+    /// activation intent と host/native effect を typed reducer で所有する。
     #[cfg(windows)]
-    pub(crate) pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    pub(crate) video_presentation_transition: PresentationTransitionOwner,
     /// in-window 静止画から専用 fullscreen viewport へ切り替える間、
     /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
     #[cfg(windows)]
@@ -12657,15 +12635,6 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
-    /// Plan B: 進行中の viewer presentation 切替。`Some` の間は次のトグルを無視し
-    /// (連打防止)、presenter からの `PlacementSwitched` / `PlacementSwitchFailed`
-    /// イベントを `request_id` で照合する。これにより遅延イベントが別リクエストを
-    /// 巻き戻す事故を防ぐ (Codex P2)。`deadline` 超過は presenter 無応答時の保険。
-    native_video_mode_switch: Option<NativeVideoModeSwitchPending>,
-    #[cfg(windows)]
-    /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
-    native_video_mode_switch_seq: u64,
-    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -13882,7 +13851,7 @@ impl App {
             #[cfg(windows)]
             detached_viewer_borderless_transition: None,
             #[cfg(windows)]
-            pending_detached_video_host_switch: None,
+            video_presentation_transition: PresentationTransitionOwner::default(),
             #[cfg(windows)]
             still_fullscreen_viewport_enter_suppress_until: None,
             #[cfg(windows)]
@@ -14407,9 +14376,7 @@ impl App {
             #[cfg(windows)]
             native_video_in_window_active: false,
             #[cfg(windows)]
-            native_video_mode_switch: None,
             #[cfg(windows)]
-            native_video_mode_switch_seq: 0,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -35585,7 +35552,11 @@ impl App {
             // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-            if !self.navigation_scope.is_detached_physical() {
+            if !self.navigation_scope.is_detached_physical()
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
@@ -36818,15 +36789,8 @@ impl App {
         }
         #[cfg(windows)]
         {
-            self.detached_video_host_switch_pending()
-                || matches!(
-                    self.native_video_mode_switch,
-                    Some(pending)
-                        if matches!(
-                            pending.target_presentation,
-                            ViewerPresentation::DetachedWindow
-                        )
-                )
+            self.video_presentation_transition.is_transitioning()
+                && self.video_presentation_transition.target() == ViewerPresentation::DetachedWindow
         }
         #[cfg(not(windows))]
         {
@@ -37653,10 +37617,16 @@ impl App {
             || self.fs_viewport_shown
             || !self.detached_image_windows.is_empty()
             || !self.detached_window_manager.is_empty()
-            || self.pending_detached_video_host_switch.is_some()
+            || self.detached_video_host_switch_pending()
             || self.pending_detached_video_host_resync;
         if !had_detached {
             return false;
+        }
+
+        if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalClose);
+            self.execute_video_presentation_transition_effects(ctx);
         }
 
         self.log_detached_image_window_debug(format!(
@@ -37669,7 +37639,7 @@ impl App {
             self.fs_viewport_shown,
             self.detached_image_windows.len(),
             self.detached_window_manager.len(),
-            self.pending_detached_video_host_switch.is_some()
+            self.detached_video_host_switch_pending()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
@@ -37761,7 +37731,8 @@ impl App {
         }
 
         self.active_detached_session = None;
-        self.pending_detached_video_host_switch = None;
+        self.video_presentation_transition
+            .sync_stable(self.viewer_presentation);
         self.pending_detached_video_host_resync = false;
         self.detached_viewer_window_id = None;
         self.last_active_detached_window_id = None;
@@ -37835,8 +37806,7 @@ impl App {
             && (self.fullscreen_idx.is_some()
                 || self.fs_viewport_shown
                 || self.viewer_session_is_detached_or_switching()
-                || self.pending_detached_video_host_switch.is_some()
-                || self.native_video_mode_switch.is_some()
+                || self.video_presentation_transition.is_transitioning()
                 || self.active_detached_context_is_at_rest()
                 || !self.detached_image_windows.is_empty())
     }
@@ -38439,28 +38409,6 @@ impl App {
             .is_none_or(|state| crate::folder_tree::path_eq(&state.video_path, &bundle_video_path))
     }
 
-    /// owner stamp を持たない `native_video_mode_switch` が、まとめて閉じる ParkedLive 群の
-    /// player だけに帰属すると確定できるか。残すと最長 5 秒、font-atlas settle と native
-    /// control availability を塞ぐ。別の mounted/active/surviving parked video があれば
-    /// owner を断定できないので温存する。(review-v2.3.0 追補4: mode-switch teardown)
-    #[cfg(windows)]
-    fn closing_parked_windows_own_native_video_mode_switch(&self, window_ids: &[u64]) -> bool {
-        if self.native_video_mode_switch.is_none()
-            || self.current_viewer_context_contains_video()
-            || self.other_active_viewer_context_contains_video()
-        {
-            return false;
-        }
-        let closing_has_video = self.detached_image_windows.iter().any(|window| {
-            window_ids.contains(&window.id) && self.window_viewer_context_contains_video(window.id)
-        });
-        closing_has_video
-            && !self.detached_image_windows.iter().any(|window| {
-                !window_ids.contains(&window.id)
-                    && self.window_viewer_context_contains_video(window.id)
-            })
-    }
-
     /// ParkedLive / passive 窓が所有する bundle を drop する直前のメディア後始末。
     /// fs_idx は context ごとに別空間なので App-global normalize は path で照合する。
     /// (review-v2.3.0 追補 BA-7: parked teardown)
@@ -38473,8 +38421,7 @@ impl App {
         let clears_tile_companion = window_ids
             .iter()
             .any(|&window_id| self.parked_window_owns_video_tile_companion(window_id));
-        let clears_mode_switch =
-            self.closing_parked_windows_own_native_video_mode_switch(window_ids);
+        let clears_mode_switch = false;
         // bundle が既に外されていても、App-global pending の owner は window id で残り得る。
         // teardown seam で先に破棄して presenter/output を孤児化させない。
         // (review-v2.3.0 追補2 BA-7: parked pending teardown)
@@ -38491,9 +38438,7 @@ impl App {
             self.video_tile_reopen_deadline = None;
             self.native_video_deferred_nav_delta = None;
         }
-        if clears_mode_switch {
-            self.native_video_mode_switch = None;
-        }
+        let _ = clears_mode_switch;
         let mut plans = Vec::new();
         for &window_id in window_ids {
             let Some((id, _)) = self.locate_window_context(window_id) else {
@@ -41002,6 +40947,13 @@ impl App {
         let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
+            return true;
+        }
         if self.viewer_context_residence(active_id) != ContextResidence::AtRest {
             return false;
         }
@@ -41417,7 +41369,10 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn native_video_vst3_controls_available(&self) -> bool {
-        self.vst3_playback_controls_available() && self.native_video_mode_switch.is_none()
+        self.vst3_playback_controls_available()
+            && self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
     }
 
     #[cfg(windows)]
@@ -41452,8 +41407,13 @@ impl App {
         if !self.viewer_item_is_media(idx) {
             return None;
         }
+        let current_intent = if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition.target()
+        } else {
+            self.viewer_presentation
+        };
         Some(
-            if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow) {
+            if matches!(current_intent, ViewerPresentation::DetachedWindow) {
                 self.non_detached_viewer_presentation()
             } else {
                 ViewerPresentation::DetachedWindow
@@ -41558,7 +41518,7 @@ impl App {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     pub(crate) fn native_video_placement_to_viewer_presentation(
         placement: crate::video::NativeVideoPlacement,
     ) -> ViewerPresentation {
@@ -42125,7 +42085,12 @@ impl App {
                 viewport_id,
                 egui::ViewportCommand::InnerSize(viewport_inner_size),
             );
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            if self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
+            {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            }
         }
         ctx.request_repaint();
     }
@@ -42475,7 +42440,7 @@ impl App {
         let session_window_id = self
             .active_detached_session
             .map(|session| session.window_id);
-        let Some((window_id, presenter_target)) = self
+        let Some((window_id, presenter_target, z_order_permitted)) = self
             .with_viewer_context_ref(active_id, |context| {
                 if !viewer_context_bundle_displays_media_path(context, target_path) {
                     return None;
@@ -42488,7 +42453,15 @@ impl App {
                 let presenter_target = matches!(context.items().get(idx), Some(GridItem::Video(_)))
                     && !viewer_context_is_music_consumer(context)
                     && presenter_player.is_some();
-                if let Some(player) = presenter_player.filter(|_| presenter_target) {
+                // The reducer publishes its permit to the context-owned output. Reading that
+                // projection keeps this at-rest context route generation-safe without widening
+                // the frozen ContextRef API.
+                let z_order_permitted = presenter_player
+                    .map(|player| player.z_order_recovery_permitted())
+                    .unwrap_or(true);
+                if let Some(player) =
+                    presenter_player.filter(|_| presenter_target && z_order_permitted)
+                {
                     player.request_presenter_raise();
                 }
                 Some((
@@ -42496,12 +42469,17 @@ impl App {
                         .viewer_session_detached_window_id()
                         .or(session_window_id),
                     presenter_target,
+                    z_order_permitted,
                 ))
             })
             .flatten()
         else {
             return false;
         };
+        if !z_order_permitted {
+            ctx.request_repaint();
+            return true;
+        }
         if presenter_target {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
@@ -42521,6 +42499,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
+            return true;
+        }
         let mounted_matches = self.viewer_session_is_detached()
             && self.fullscreen_idx == Some(idx)
             && self
@@ -42673,6 +42658,13 @@ impl App {
             return;
         };
         if self.viewer_session_is_detached() {
+            return;
+        }
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
             return;
         }
 
@@ -42913,8 +42905,10 @@ impl App {
         // 記録する。これにより in-window 動画 ⇔ 静止画をホイールで往復しても
         // モードが一貫する。
         self.native_video_in_window_active = matches!(presentation, ViewerPresentation::MainWindow);
-        // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
-        self.native_video_mode_switch = None;
+        // Stable の projection だけを新しい presentation へ同期する。遷移中の owner は
+        // source-swap / terminal event が世代付きで完結させるため、ここでは破棄しない。
+        self.video_presentation_transition
+            .sync_stable(self.viewer_presentation);
         self.log_detached_image_window_debug(format!(
             "prepare_viewer_presentation_open_state idx={idx} presentation={:?} \
              fs_idx={:?} session={:?} window_id={:?} independent={} \
@@ -50911,6 +50905,16 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        #[cfg(windows)]
+        if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalClose);
+            return;
+        }
+        self.close_fullscreen_now();
+    }
+
+    fn close_fullscreen_now(&mut self) {
         // 閉じる間 UI スレッドが止まっていると、その分だけ**誰も描かない**フレームが並び、
         // 画面のちらつきとして見える (利用者報告 2026-08-27、実測 9 フレーム / 約 300ms)。
         // どの段で止まっているかを 1 行で出す。ログ行の時刻と合わせれば、presenter 停止や
@@ -50992,7 +50996,8 @@ impl App {
         // (= フルスクリーン抜けると別動画扱い、stale fs_idx 復活防止)
         #[cfg(windows)]
         {
-            self.pending_detached_video_host_switch = None;
+            self.video_presentation_transition
+                .sync_stable(self.viewer_presentation);
             let fs_idxs: Vec<usize> = self.normalize_ui_states.keys().copied().collect();
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
@@ -59517,22 +59522,10 @@ impl App {
                 );
                 return;
             }
-            let now = std::time::Instant::now();
-            let video_switch_in_flight = self
-                .native_video_mode_switch
-                .is_some_and(|pending| now < pending.deadline);
-            let detached_host_switch_in_flight = self
-                .pending_detached_video_host_switch
-                .is_some_and(|pending| now < pending.deadline);
-            if video_switch_in_flight || detached_host_switch_in_flight {
-                crate::logger::log(format!(
-                    "[detached-viewer] ignore F12 toggle while video placement switch is pending \
-                     in_flight={video_switch_in_flight} host_switch_in_flight={detached_host_switch_in_flight}"
-                ));
-                return;
-            }
             if let Some(target_presentation) = self.always_new_media_f12_target_presentation() {
-                if target_presentation != self.viewer_presentation {
+                if target_presentation != self.viewer_presentation
+                    || self.video_presentation_transition.is_transitioning()
+                {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
@@ -59554,18 +59547,12 @@ impl App {
                         // 要求発行時ではなく **切替の確定** (`PlacementSwitched` 適用) 時に
                         // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
                         // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
-                        let request_before = self
-                            .native_video_mode_switch
-                            .map(|pending| pending.request_id);
-                        self.switch_native_video_viewer_presentation(target_presentation, true);
-                        let switch_started = self
-                            .native_video_mode_switch
-                            .is_some_and(|pending| Some(pending.request_id) != request_before);
-                        if switch_started
+                        if let Some(request_id) =
+                            self.request_native_video_viewer_presentation(target_presentation, true)
                             && announce_main_hint
-                            && let Some(pending) = self.native_video_mode_switch.as_mut()
                         {
-                            pending.announce_main_hint = true;
+                            self.video_presentation_transition
+                                .set_announce_main_hint(request_id);
                         }
                     } else if let Some(idx) = self.fullscreen_idx
                         && self.viewer_item_supports_egui_detached_viewport(idx)
@@ -59602,12 +59589,13 @@ impl App {
                 self.detached_image_windows.len()
             ));
             if !self.settings.detached_viewer_enabled {
-                self.pending_detached_video_host_switch = None;
                 self.clear_detached_viewer_borderless_fullscreen_state();
             }
             if let Some(idx) = self.fullscreen_idx {
                 let target_presentation = self.effective_viewer_presentation_for_open(idx);
-                if target_presentation != self.viewer_presentation {
+                if target_presentation != self.viewer_presentation
+                    || self.video_presentation_transition.is_transitioning()
+                {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
@@ -63942,7 +63930,7 @@ impl App {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_audio_mode == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
-                    && self.native_video_mode_switch.is_none()
+                    && !self.video_presentation_transition.is_transitioning()
                     && self.native_video_source_swap_pending.is_none()
                     && self.native_video_fast_swap_pending.is_none()
                     && self.video_tile_swap_pending.is_none()
@@ -64487,7 +64475,7 @@ impl App {
         // (= ユーザーの「動画へ戻る」が消失 + show 済み presenter に旧動画 hold フレームが
         // 露出)。exit 完了後の EOF は mode=None で Video 分類に落ち、通常の連続再生として
         // 次動画が映像表示で開く (review-v2.3.0 P2-1)。
-        if self.native_video_mode_switch.is_some()
+        if self.video_presentation_transition.is_transitioning()
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
@@ -64532,7 +64520,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx)
             || self.video_audio_mode != Some(fs_idx)
             || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
-            || self.native_video_mode_switch.is_some()
+            || self.video_presentation_transition.is_transitioning()
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
@@ -65128,12 +65116,13 @@ impl App {
         // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定
         // (Codex #4: Plan B の SwitchPlacement で child HWND に切り替わった瞬間に
         //  VST owner が誤って child を指さないようガードする)。
-        // さらに、モード切替の進行中 (`native_video_mode_switch` Some) は presenter が
-        // 新 HWND を publish 済みでも `PlacementSwitched` 未処理で実モードが旧いまま
-        // のフレームがあるため、その間は owner 同期自体を止める (Codex 再 P1)。
+        // さらに presentation reducer が recovery permit を閉じている間は、candidate publish と
+        // outgoing retire の中間で owner 同期を独自に走らせない。
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-            && self.native_video_mode_switch.is_none()
+            && self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
             // Inc 7 hidden presenter: 音声モード中は presenter を非アクティブ扱いにして
             // VST owner 同期を止める (presenter は hide されていて owner にしない)。
             // ただし 7e の VST ホスト表示中は presenter を un-hide して VST owner にするので許可する。
@@ -65256,33 +65245,13 @@ impl App {
         #[cfg(windows)]
         self.poll_video_audio_exit_pending(ctx);
         #[cfg(windows)]
-        self.poll_detached_video_host_switch_pending(ctx);
+        self.poll_video_presentation_transition(ctx);
         // detached host HWND が変わったら presenter child を現 host へ再親付けする
         // (host capture race で presenter が道連れ死 → 再生終了する既存バグの対策)。
         #[cfg(windows)]
         self.poll_detached_video_host_resync();
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
-        // Plan B: presenter 無応答で placement 切替 pending が滞留すると VST owner /
-        // availability 同期が永久停止するため、deadline 超過の pending は明示的に
-        // 破棄する。
-        #[cfg(windows)]
-        if let Some(pending) = self.native_video_mode_switch {
-            let mode_switch_now = std::time::Instant::now();
-            if mode_switch_now >= pending.deadline {
-                crate::logger::log(format!(
-                    "[native-video] placement switch request {} timed out \
-                     (no presenter event); clearing pending",
-                    pending.request_id
-                ));
-                self.native_video_mode_switch = None;
-            } else {
-                merge_repaint_deadline(
-                    &mut next_repaint,
-                    Some(pending.deadline.saturating_duration_since(mode_switch_now)),
-                );
-            }
-        }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
             self.poll_native_video_fast_swap(ctx);
@@ -66374,7 +66343,12 @@ impl eframe::App for App {
             // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
             // ので raise 要求は無視する (HUD teardown 済み)。7e の VST ホスト表示中は presenter を
             // un-hide して HUD も出しているので raise を許可する。
-            if pending && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
+            if pending
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+                && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some())
+            {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();

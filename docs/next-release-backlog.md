@@ -3356,7 +3356,7 @@ placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, pl
 - 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
   **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
 
-### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — 未対応
+### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — R2b 実装済み、実機計測待ち
 
 > ⚠ detached viewer リワーク中の領域。症状パッチ (delay / guard / 追加 repaint) を入れない。
 
@@ -3451,6 +3451,28 @@ z-order / show / raise / destroy のたびにどちらが手前かが入れ替�
 > 当初私はこのボタン側を数えており、**利用者の指摘で対象を間違えていたことが分かった**。
 - 関連: §1.115 (font atlas 側。**別機構**。破棄フレームは 14 → 0 になったがちらつきは残った)。
 - 規模 \ 優先度: Medium ～ Large / P2。
+
+#### R2b 実装結果 (2026-08-28)
+
+- `pending_detached_video_host_switch` と `native_video_mode_switch` を廃止し、context-owned
+  `PresentationTransitionOwner` (`Stable → Preparing → Ready → Committing → Stable`) へ統合した。
+  current / target / request generation / activation intent と candidate/prior HWND を 1 request が
+  所有し、F12 再入力、failure、Esc、window close、player end、stale Ready/Commit を reducer で
+  解決する。
+- native contract は hidden candidate の create/attach/prime を `Ready` までに済ませ、`Commit` で
+  初めて publish し、incoming detached host の visibility 確認後に outgoing を retire する。
+  fixed-ms commit / forced recovery は無い。failure/abort は hidden candidate だけを cleanup する。
+- host `Visible/Focus/Destroy` と native `Publish/Destroy` を reducer effect に限定し、遷移中の
+  presenter/HUD/VST/focus recovery は同じ permit を読む。実 action は transition id / target / HWND
+  付き `[presentation-transition]` ログに出る。既存 `[ui-frame-gap]` / `[atlas-probe]` は変更していない。
+- 自動回帰は両方向、abort、F12 再入力、Esc、window close、player end、stale generation を含む。
+  出荷判定前に実機 1 往復で **outgoing presenter raise 0 / cover change 各方向 1 /
+  content-ready 前 host activation 0** を画面キャプチャとログで照合する。
+
+R4 に残るのは `show_viewport_deferred`、single render entry、host persistence。今回も F12 OFF は
+terminal に host HWND を破棄するため、次の ON では約 300ms の hidden host 作成を待つ。
+この待ち時間自体の短縮、F12 を跨ぐ taskbar button/host identity の永続化は本項の R2b close には
+含めず、R4 gate C の仕様決定後に扱う。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
