@@ -1921,6 +1921,7 @@ impl NativeOverlaySeekStripWaveNotice {
 
 #[derive(Clone)]
 pub struct NativeOverlaySeekStripWaveImage {
+    pub revision: u64,
     pub window_start_secs: f64,
     pub window_end_secs: f64,
     pub bin_secs: f64,
@@ -8213,7 +8214,8 @@ impl NativeEguiOverlay {
                 ^ wave.window_end_secs.to_bits().rotate_left(11)
                 ^ wave.bin_secs.to_bits().rotate_left(23)
                 ^ ((wave.width as u64) << 32)
-                ^ wave.height as u64;
+                ^ wave.height as u64
+                ^ wave.revision.rotate_left(37);
             if self
                 .seek_strip_wave_texture
                 .as_ref()
@@ -12568,6 +12570,7 @@ mod tests {
                 crate::video::seek_strip::StripAxis::KeyframeIndex {
                     keyframes: vec![0.0, 10.0, 40.0],
                     adopted: vec![0, 1, 2],
+                    duration_secs: 40.0,
                 },
             )),
             range_value_secs: 15.0,

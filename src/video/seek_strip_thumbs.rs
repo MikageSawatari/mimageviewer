@@ -410,7 +410,9 @@ impl FrameMatchTolerance {
 
 fn frame_match_tolerance(axis: &StripAxis, index: usize) -> Option<FrameMatchTolerance> {
     match axis {
-        StripAxis::KeyframeIndex { keyframes, adopted } => {
+        StripAxis::KeyframeIndex {
+            keyframes, adopted, ..
+        } => {
             let raw_index = *adopted.get(index)?;
             let target = *keyframes.get(raw_index)?;
             let previous_gap = keyframes[..raw_index]
@@ -831,6 +833,10 @@ struct SharedState {
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
+    /// 最後に処理を終えた要求の id。**終えた = 全セルが揃った、ではない。**
+    /// supersede / cancel で途中で抜けた場合も含む。app はこれを見て「まだ処理中なので
+    /// 待つ」と「もう手を離しているので、未着セルがあるなら頼み直す」を区別する。
+    last_finished_request_id: Option<u64>,
     #[cfg(any(test, feature = "dev-tools"))]
     decode_diagnostics: StripThumbnailDecodeDiagnostics,
     fill_wait_emitted_request_id: Option<u64>,
@@ -844,6 +850,7 @@ impl SharedState {
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
+            last_finished_request_id: None,
             #[cfg(any(test, feature = "dev-tools"))]
             decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             fill_wait_emitted_request_id: None,
@@ -987,6 +994,21 @@ impl SeekStripThumbnailWorker {
         Ok(request_id)
     }
 
+    /// 表示範囲のうち、まだ 1 つも結果が無いセルがあるか。
+    ///
+    /// snapshot を作らずに済ませる軽い問い合わせ。要求のたびに cells を丸ごと clone すると、
+    /// 判定のためだけに毎回のコピーが乗る。
+    pub(crate) fn any_cell_unsettled(&self, target_secs: &[f64]) -> bool {
+        let shared = lock_recover(&self.state);
+        target_secs.iter().any(|secs| {
+            StripCellId::from_secs(*secs).is_none_or(|id| !shared.cells.contains_key(&id))
+        })
+    }
+
+    /// ワーカーが最後に手を離した要求の id。**全セルが揃ったという意味ではない。**
+    pub(crate) fn last_finished_request_id(&self) -> Option<u64> {
+        lock_recover(&self.state).last_finished_request_id
+    }
     /// 現在までの画像・型付き失敗を shallow clone して返す。
     pub(crate) fn snapshot(&self) -> StripThumbnailSnapshot {
         lock_recover(&self.state).snapshot()
@@ -1139,6 +1161,7 @@ fn run_worker(
     while !cancel.load(Ordering::Acquire) {
         let request = lock_recover(&requests).take();
         if let Some(request) = request {
+            let request_id = request.id;
             process_window_request(
                 &path,
                 hw_decode,
@@ -1150,6 +1173,9 @@ fn run_worker(
                 &mut runtime,
                 request,
             );
+            // 早期 return が多い関数なので、記録は**戻ってきたこの 1 箇所**で行う。
+            // 出口ごとに書くと、いつか足し忘れた出口が無言で残る。
+            lock_recover(&state).last_finished_request_id = Some(request_id);
             continue;
         }
 
@@ -1285,7 +1311,11 @@ fn resolve_strip_axis(
                 )
             } else {
                 Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
-                    axis: StripAxis::KeyframeIndex { keyframes, adopted },
+                    axis: StripAxis::KeyframeIndex {
+                        keyframes,
+                        adopted,
+                        duration_secs,
+                    },
                     diagnostics,
                 }))
             }
@@ -1443,6 +1473,13 @@ fn process_window_request(
 
     let mut metrics = DecodeMetrics::default();
     let mut superseded = false;
+    // どの出口で run ループを抜けたかを残す。抜け方によっては**セルが未着のまま**になり、
+    // app 側は要求済みとしか分からない (2026-08-27 の「末尾数枚が黒い」調査)。
+    let mut exit_reason = "complete";
+    let planned_cells: Vec<(usize, StripCellId)> = decode_cells
+        .iter()
+        .map(|cell| (cell.index, cell.id))
+        .collect();
     let mut retry_with_software = true;
     while retry_with_software && !cancel.load(Ordering::Acquire) {
         retry_with_software = false;
@@ -1454,6 +1491,11 @@ fn process_window_request(
                     decide_strip_supersede(&lock_recover(state).settled_ids(), &run.cells);
                 metrics.discarded_on_supersede += decision.discarded.len();
                 superseded = !cancel.load(Ordering::Acquire);
+                exit_reason = if superseded {
+                    "superseded_before_run"
+                } else {
+                    "cancelled_before_run"
+                };
                 break;
             }
 
@@ -1467,6 +1509,7 @@ fn process_window_request(
                 .is_some_and(SeekStripDecoder::keyframes_only);
             let result = {
                 let Some(decoder) = runtime.decoder.as_mut() else {
+                    exit_reason = "decoder_gone";
                     break;
                 };
                 let pending_writes = &mut runtime.deferred_cache_writes;
@@ -1528,8 +1571,12 @@ fn process_window_request(
             }
             match result.stop {
                 RunStop::Complete => {}
-                RunStop::Cancelled => break,
+                RunStop::Cancelled => {
+                    exit_reason = "cancelled_in_run";
+                    break;
+                }
                 RunStop::Superseded => {
+                    exit_reason = "superseded_in_run";
                     let decision =
                         decide_strip_supersede(&lock_recover(state).settled_ids(), &run.cells);
                     metrics.discarded_on_supersede += decision.discarded.len();
@@ -1592,6 +1639,26 @@ fn process_window_request(
         }
     }
 
+    // 未着のまま終わったセルだけを名指しする。app 側の 1 行と突き合わせれば、
+    // どちらが落としたかが決まる。
+    let unresolved: Vec<usize> = {
+        let shared = lock_recover(state);
+        planned_cells
+            .iter()
+            .filter(|(_, id)| !shared.cells.contains_key(id))
+            .map(|(index, _)| *index)
+            .collect()
+    };
+    if !unresolved.is_empty() {
+        crate::logger::log(format!(
+            "[video-seek-strip] window {} left cells unresolved: exit={exit_reason} planned={:?} unresolved={unresolved:?}",
+            request.id,
+            planned_cells
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+        ));
+    }
     emit_decode(path, &request, runtime, &metrics, superseded);
 }
 
@@ -2614,6 +2681,7 @@ mod tests {
         StripAxis::KeyframeIndex {
             keyframes: (0..count).map(|index| index as f64).collect(),
             adopted: (0..count).collect(),
+            duration_secs: count.saturating_sub(1) as f64,
         }
     }
 
@@ -2860,7 +2928,12 @@ mod tests {
                 .expect("probe video must expose an index")
                 .keyframes;
             let adopted = thin_keyframes(&keyframes, minimum_gap_secs);
-            Arc::new(StripAxis::KeyframeIndex { keyframes, adopted })
+            let duration_secs = keyframes.last().copied().unwrap_or(0.0);
+            Arc::new(StripAxis::KeyframeIndex {
+                keyframes,
+                adopted,
+                duration_secs,
+            })
         } else {
             axis
         };
@@ -2975,7 +3048,9 @@ mod tests {
             snapshot.decode_diagnostics.software_retry_failure,
         );
         match axis.as_ref() {
-            StripAxis::KeyframeIndex { keyframes, adopted } => {
+            StripAxis::KeyframeIndex {
+                keyframes, adopted, ..
+            } => {
                 let adopted_gaps: Vec<_> = adopted
                     .windows(2)
                     .map(|pair| (pair[0], pair[1], keyframes[pair[1]] - keyframes[pair[0]]))
@@ -3059,6 +3134,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![10.0, 12.0, 20.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
         };
         let work = plan(
             &axis,
@@ -3115,6 +3191,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![first_dts_secs, 7.632625],
             adopted: vec![0, 1],
+            duration_secs: 7.632625,
         };
         let work = plan(
             &axis,
@@ -3143,6 +3220,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![0.0, 2.0, 4.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 4.0,
         };
         let work = plan(
             &axis,
@@ -3213,6 +3291,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![10.0, 12.0, 20.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
         };
         let work = plan(
             &axis,
@@ -3421,6 +3500,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![0.0, f64::NAN, 2.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 2.0,
         };
         let work = plan(
             &axis,

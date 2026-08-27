@@ -156,6 +156,7 @@ struct AudioDecodeCtx {
 /// flushes this decoder, then recreates only the lightweight resampler state.
 pub(crate) struct AudioRangeDecoder {
     inner: AudioDecodeCtx,
+    discarded_non_audio_streams: usize,
 }
 
 /// Opening can fail because the file simply has no audio track, which is a
@@ -231,7 +232,17 @@ fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, AudioDecodeOpenError
 
 impl AudioRangeDecoder {
     pub(crate) fn open(path: &Path) -> Result<Self, AudioDecodeOpenError> {
-        open_audio_decode(path).map(|inner| Self { inner })
+        let mut inner = open_audio_decode(path)?;
+        let discarded_non_audio_streams =
+            discard_non_audio_streams(&mut inner.ictx, inner.stream_index);
+        Ok(Self {
+            inner,
+            discarded_non_audio_streams,
+        })
+    }
+
+    pub(crate) fn discarded_non_audio_streams(&self) -> usize {
+        self.discarded_non_audio_streams
     }
 
     /// Decode exactly the requested half-open time range to 48kHz stereo PCM.
@@ -361,6 +372,40 @@ impl AudioRangeDecoder {
             },
             stereo_samples: aligned,
         })
+    }
+}
+
+/// Exclude every non-audio stream from range-decoder demux selection.
+///
+/// `ffmpeg-the-third` exposes only a discard getter. The stream array belongs to `ictx` and remains
+/// valid for its lifetime; validate the context, array, and each stream pointer before writing the
+/// one FFmpeg-owned field.
+fn discard_non_audio_streams(
+    ictx: &mut ffmpeg::format::context::Input,
+    audio_stream_index: usize,
+) -> usize {
+    unsafe {
+        let format_context = ictx.as_mut_ptr();
+        if format_context.is_null() || audio_stream_index >= (*format_context).nb_streams as usize {
+            return 0;
+        }
+        let streams = (*format_context).streams;
+        if streams.is_null() {
+            return 0;
+        }
+        let mut discarded = 0;
+        for index in 0..(*format_context).nb_streams as usize {
+            if index == audio_stream_index {
+                continue;
+            }
+            let stream = *streams.add(index);
+            if stream.is_null() {
+                continue;
+            }
+            (*stream).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
+            discarded += 1;
+        }
+        discarded
     }
 }
 

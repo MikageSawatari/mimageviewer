@@ -5213,7 +5213,7 @@ pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
 
 pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.1;
-pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 60.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 1800.0;
 pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 15.0;
 
 pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS: f64 = 5.0;
@@ -11498,7 +11498,7 @@ mod tests {
             VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
         );
 
-        settings.video_seek_strip_min_interval_secs = 99.0;
+        settings.video_seek_strip_min_interval_secs = 9_999.0;
         settings.sanitize();
         assert_eq!(
             settings.video_seek_strip_min_interval_secs,

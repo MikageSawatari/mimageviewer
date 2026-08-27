@@ -2522,8 +2522,15 @@ fn still_touch_chrome_latched(
     fs_idx: usize,
     session_started_at: Option<std::time::Instant>,
 ) -> bool {
+    // id は closure の**外**で作る。`ctx.data` は egui Context の RwLock を read で握るので、
+    // closure の中で `still_touch_chrome_latch_id(ctx)` (= `ctx.viewport_id()`) を呼ぶと
+    // 同じ lock を再帰 read することになる。parking_lot の RwLock は writer が待っていると
+    // 後続の read を writer の後ろに並ばせるため、**自分が離さない lock を自分で待つ**。
+    // 2026-08-26 に実機で、フルスクリーン動画のシーク中に UI スレッドが恒久的に固まった
+    // (hung dump の main スレッドがこの経路だった)。
+    let latch_id = still_touch_chrome_latch_id(ctx);
     ctx.data(|data| {
-        data.get_temp::<StillTouchChromeLatch>(still_touch_chrome_latch_id(ctx))
+        data.get_temp::<StillTouchChromeLatch>(latch_id)
             == Some(StillTouchChromeLatch {
                 fs_idx,
                 session_started_at,
@@ -47987,6 +47994,91 @@ mod tests {
     }
 
     /// 分割中は同じ元ページの段が 2 つ並ぶので、現在位置は左右まで見て選ぶ。
+    /// `ctx.data` / `ctx.memory` / `ctx.input` は egui Context の RwLock を握ったまま closure を
+    /// 呼ぶ。その中で `ctx` を helper へ渡すと、helper が同じ lock を再帰 read しかねない。
+    /// parking_lot の RwLock は writer が待っていると後続の read を writer の後ろへ並ばせるので、
+    /// **自分が離さない lock を自分で待つ**恒久ハングになる。
+    ///
+    /// 2026-08-26 に `still_touch_chrome_latched` が実機でこれを踏み、フルスクリーン動画の
+    /// シーク中に UI スレッドが固まった。当時この形はコードベース全体でその 1 箇所だけだった。
+    /// 見つけたら、`ctx` を要る値へ先に落としてから closure に入る。
+    #[test]
+    fn egui_context_closures_do_not_hand_ctx_to_helpers() {
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect(&src_dir, &mut files);
+        files.sort();
+
+        let openers = [
+            "ctx.data(",
+            "ctx.data_mut(",
+            "ctx.memory(",
+            "ctx.memory_mut(",
+            "ctx.input(",
+            "ctx.input_mut(",
+            "ctx.options(",
+            "ctx.style(",
+            "ctx.fonts(",
+            "ctx.output(",
+            "ctx.output_mut(",
+        ];
+        let mut violations = Vec::new();
+        for file in &files {
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for opener in openers {
+                let mut from = 0usize;
+                while let Some(found) = text[from..].find(opener) {
+                    let start = from + found;
+                    let paren = start + opener.len() - 1;
+                    let mut depth = 0usize;
+                    let mut end = paren;
+                    for (offset, ch) in text[paren..].char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = paren + offset;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let body = &text[paren..end];
+                    if body.contains("(ctx)") || body.contains("(ctx,") {
+                        let line = text[..start].lines().count();
+                        violations.push(format!(
+                            "{}:{line} {opener} closure hands ctx to a helper",
+                            file.display()
+                        ));
+                    }
+                    from = start + opener.len();
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "egui Context lock is held across these closures:\n{}",
+            violations.join("\n")
+        );
+    }
     #[test]
     fn a_split_page_needs_the_half_to_pick_its_row() {
         use crate::page_split::PageSlice;

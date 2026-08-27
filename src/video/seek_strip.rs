@@ -16,6 +16,10 @@ pub(crate) enum StripAxis {
     KeyframeIndex {
         keyframes: Vec<f64>,
         adopted: Vec<usize>,
+        /// 素材の長さ。**末尾セルの先がどこで終わるかを知るために持つ。**
+        /// 無いと、再生が末尾へ向かう間だけ中心位置がクランプされ、ストリップの
+        /// スクロールが固まって見える (利用者報告 2026-08-27)。
+        duration_secs: f64,
     },
     /// コンテナ索引を利用できない場合の等時間グリッド。
     ///
@@ -45,7 +49,9 @@ impl StripAxis {
     /// セル `index` が表す時刻を返す。
     pub(crate) fn cell(&self, index: usize) -> Option<f64> {
         match self {
-            Self::KeyframeIndex { keyframes, adopted } => adopted
+            Self::KeyframeIndex {
+                keyframes, adopted, ..
+            } => adopted
                 .get(index)
                 .and_then(|keyframe_index| keyframes.get(*keyframe_index))
                 .copied(),
@@ -58,7 +64,7 @@ impl StripAxis {
                 if index >= count {
                     return None;
                 }
-                let time_secs = index as f64 * *interval_secs;
+                let time_secs = time_grid_cell_secs(index, *interval_secs, *duration_secs);
                 (time_secs.is_finite() && time_secs < *duration_secs).then_some(time_secs)
             }
         }
@@ -75,14 +81,20 @@ impl StripAxis {
 
         let count = self.cell_count();
         let first = self.cell(0)?;
-        if count == 1 || center_index <= 0.0 {
+        if center_index <= 0.0 {
             return Some(first);
         }
 
         let last_index = count.checked_sub(1)?;
         let last = self.cell(last_index)?;
         if center_index >= last_index as f64 {
-            return Some(last);
+            // 末尾セルの右端は素材の末尾。そこまで中心を進められないと、再生が末尾へ
+            // 近づく間だけスクロールが止まって見える (利用者報告 2026-08-27)。
+            let Some(tail_end_secs) = self.tail_end_secs() else {
+                return Some(last);
+            };
+            let fraction = (center_index - last_index as f64).clamp(0.0, 1.0);
+            return Some(last + fraction * (tail_end_secs - last));
         }
 
         let lower_index = center_index.floor() as usize;
@@ -93,6 +105,21 @@ impl StripAxis {
         Some(lower_time + fraction * (upper_time - lower_time))
     }
 
+    /// 末尾セルの右端の時刻。中心位置はここまで進める。
+    ///
+    /// 両方の軸が尺を持つ。キーフレーム軸の末尾セルは実在するキーフレームなので、素材の
+    /// 末尾との間に隙間がある (D26 が最後のキーフレームを採用するため、その隙間は普通は
+    /// 短い)。そこも中心が進めるようにする。
+    fn tail_end_secs(&self) -> Option<f64> {
+        match self {
+            Self::TimeGrid { duration_secs, .. } => {
+                duration_secs.is_finite().then_some(*duration_secs)
+            }
+            Self::KeyframeIndex { duration_secs, .. } => {
+                duration_secs.is_finite().then_some(*duration_secs)
+            }
+        }
+    }
     /// 時刻を採用セル間の小数位置へ変換する。
     ///
     /// 時刻は両端へクランプする。同一時刻のセルが連続する場合は最初の一致セルを返す。
@@ -103,14 +130,18 @@ impl StripAxis {
 
         let count = self.cell_count();
         let first = self.cell(0)?;
-        if count == 1 || time_secs <= first {
+        if time_secs <= first {
             return Some(0.0);
         }
 
         let last_index = count.checked_sub(1)?;
         let last = self.cell(last_index)?;
         if time_secs >= last {
-            return Some(last_index as f64);
+            let Some(tail_end_secs) = self.tail_end_secs().filter(|end| *end > last) else {
+                return Some(last_index as f64);
+            };
+            let fraction = ((time_secs - last) / (tail_end_secs - last)).clamp(0.0, 1.0);
+            return Some(last_index as f64 + fraction);
         }
 
         // 最初の `cell(i) >= time_secs` を探す。軸は列挙・間引き時に時刻順になる。
@@ -141,9 +172,14 @@ impl StripAxis {
     /// 設定変更でサムネイルキャッシュを無効化しないための境界でもある。
     pub(crate) fn with_minimum_gap(&self, min_gap_secs: f64) -> Self {
         match self {
-            Self::KeyframeIndex { keyframes, .. } => Self::KeyframeIndex {
+            Self::KeyframeIndex {
+                keyframes,
+                duration_secs,
+                ..
+            } => Self::KeyframeIndex {
                 keyframes: keyframes.clone(),
                 adopted: thin_keyframes(keyframes, min_gap_secs),
+                duration_secs: *duration_secs,
             },
             Self::TimeGrid {
                 fallback_interval_secs,
@@ -172,6 +208,22 @@ pub(crate) fn time_grid_interval_secs(fallback_interval_secs: f64, min_gap_secs:
     }
 }
 
+/// 格子セルの時刻。**末尾セルだけは 1 間隔ぶん手前へ寄せる。**
+///
+/// 尺は間隔の整数倍とは限らないので、素直に `index * interval` を使うと最後のセルが
+/// 尺の端数の位置に来る。172.7 秒 / 5 秒間隔なら最後は 170.0 秒で、そこへスクラブすると
+/// **残り 2.7 秒しか無く、すぐ次の動画へ移ってしまう** (利用者報告 2026-08-27)。
+/// 末尾セルを `duration - interval` に置けば、どのセルへ移っても最低 1 間隔ぶんは見られ、
+/// セルの右端が動画の末尾と一致する。
+///
+/// 末尾以外は動かさない。`count = ceil(duration / interval)` なので
+/// `(count - 1) * interval < duration`、つまり `(count - 2) * interval < duration - interval`
+/// が常に成り立ち、**直前のセルと同時刻になることはない**。
+fn time_grid_cell_secs(index: usize, interval_secs: f64, duration_secs: f64) -> f64 {
+    let regular_secs = index as f64 * interval_secs;
+    let last_cell_secs = (duration_secs - interval_secs).max(0.0);
+    regular_secs.min(last_cell_secs)
+}
 fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
     if !interval_secs.is_finite()
         || interval_secs <= 0.0
@@ -265,14 +317,41 @@ impl SeekStripMaterialAvailability {
 pub(crate) const SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS: f64 = 15.0;
 
 /// Persisted minimum-interval choices for the thumbnail strip, in seconds.
-pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] =
-    &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0];
+///
+/// 分の段は 4 時間級の動画のためにある。1 分間隔だと 1 画面が 11 分ぶんにしかならず、
+/// 全体を見渡せない (利用者要望 2026-08-26)。30 分まで広げると 4 時間が 8 セルに収まる。
+pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] = &[
+    0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0,
+];
 
 /// Persisted one-screen span choices for the waveform strip, in seconds.
 pub(crate) const WAVEFORM_RANGE_STEPS_SECS: &[f64] = &[
     5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
 ];
 
+/// 表示範囲に未着セルがあるとき、ワーカーへ頼み直すか。
+///
+/// **要求台帳ではなく配達で判断する。** ワーカーは新しい要求が来ると処理中の窓を捨てるので、
+/// 「要求した」は「届く」を意味しない。速いドラッグでは 1 つの窓が 2 セルほどしか解決できず、
+/// 残りは捨てられる。ドラッグが止まった時点で「要求済みだから頼まない」と判断すると、
+/// 捨てられたセルが**セッション中ずっと空のまま**残る (2026-08-27 実機)。
+///
+/// 送りっぱなしにもしない。ワーカーが処理中の要求を毎フレーム上書きすると、そのたびに
+/// 計画を立て直して前へ進まなくなる。手を離すまでは待つ。
+pub(crate) fn should_request_strip_window(
+    trigger_cells_missing: bool,
+    last_sent_request_id: Option<u64>,
+    last_finished_request_id: Option<u64>,
+) -> bool {
+    if !trigger_cells_missing {
+        return false;
+    }
+    match (last_sent_request_id, last_finished_request_id) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(sent), Some(finished)) => finished >= sent,
+    }
+}
 /// One wheel event changes the strip range by exactly one adjacent ladder step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekStripRangeStep {
@@ -309,10 +388,10 @@ pub(crate) fn format_seek_strip_range_value(
         return "--".to_owned();
     }
     let whole_epsilon = f64::EPSILON * seconds.abs().max(1.0) * 8.0;
-    let (value, unit) = if mode == crate::settings::VideoSeekStripMode::Waveform
-        && seconds >= 60.0
-        && (seconds % 60.0).abs() <= whole_epsilon
-    {
+    // 分表示は mode を問わない。サムネイル側も 2 分以上の段を持つようになったので、
+    // 波形だけ分・サムネイルだけ秒にすると同じ値が画面によって違う書き方になる。
+    let _ = mode;
+    let (value, unit) = if seconds >= 60.0 && (seconds % 60.0).abs() <= whole_epsilon {
         (seconds / 60.0, " 分")
     } else {
         (seconds, " 秒")
@@ -609,10 +688,6 @@ impl CellRange {
 
     pub(crate) fn end(&self) -> usize {
         *self.0.end()
-    }
-
-    pub(crate) fn contains_range(&self, other: &Self) -> bool {
-        self.start() <= other.start() && self.end() >= other.end()
     }
 }
 
@@ -1135,6 +1210,7 @@ mod tests {
         StripAxis::KeyframeIndex {
             keyframes: keyframes.to_vec(),
             adopted: adopted.to_vec(),
+            duration_secs: keyframes.last().copied().unwrap_or(0.0),
         }
     }
 
@@ -1178,7 +1254,9 @@ mod tests {
         };
         assert_eq!(axis.cell_count(), 4);
         assert_eq!(axis.cell(0), Some(0.0));
-        assert_eq!(axis.cell(3), Some(9.0));
+        // 末尾セルは 9.0 ではなく 10.0 - 3.0。9.0 だと残り 1 秒しか無く、そこへ移ると
+        // すぐ次の動画へ移ってしまう (利用者報告 2026-08-27)。
+        assert_eq!(axis.cell(3), Some(7.0));
         assert_eq!(axis.cell(4), None);
 
         let exact = StripAxis::TimeGrid {
@@ -1187,10 +1265,131 @@ mod tests {
             duration_secs: 9.0,
         };
         assert_eq!(exact.cell_count(), 3);
+        // 尺が間隔の整数倍なら、末尾セルはもともと 1 間隔ぶん手前にある。動かさない。
         assert_eq!(exact.cell(2), Some(6.0));
         assert_eq!(exact.cell(3), None);
     }
 
+    /// 実機で報告された形。172.7 秒 / 5 秒間隔で、末尾セルが 170.0 秒に来ていた。
+    /// 末尾セルの右端は素材の末尾。中心はそこまで進む。止めてしまうと、再生が末尾へ
+    /// 近づく間だけストリップのスクロールが固まって見える (利用者報告 2026-08-27)。
+    #[test]
+    fn time_grid_center_keeps_moving_through_the_last_cell() {
+        let duration_secs = 172.733_243_f64;
+        let interval_secs = 5.0_f64;
+        let axis = StripAxis::TimeGrid {
+            interval_secs,
+            fallback_interval_secs: interval_secs,
+            duration_secs,
+        };
+        let last_index = axis.cell_count() - 1;
+        let last = axis.cell(last_index).unwrap();
+
+        // 末尾セルの先頭では index も末尾セル。
+        assert_close(axis.center_index_for_time(last), last_index as f64);
+        // 素材の末尾では 1 セルぶん先まで進む。
+        assert_close(
+            axis.center_index_for_time(duration_secs),
+            last_index as f64 + 1.0,
+        );
+        // 途中は線形。
+        let middle_secs = last + (duration_secs - last) * 0.5;
+        assert_close(
+            axis.center_index_for_time(middle_secs),
+            last_index as f64 + 0.5,
+        );
+
+        // 逆写像も対称。
+        assert_close(axis.time_for_center_index(last_index as f64), last);
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 1.0),
+            duration_secs,
+        );
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 0.5),
+            middle_secs,
+        );
+        // 行き過ぎはクランプする。
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 9.0),
+            duration_secs,
+        );
+    }
+
+    /// キーフレーム軸でも中心は素材の末尾まで進む。末尾セルは実在するキーフレームなので
+    /// 素材の末尾との間に隙間が残る (D26 が最後のキーフレームを採用しても、その先に
+    /// キーフレームが無い区間は残る)。実機報告の素材は 90.14 秒で最後のキーフレームが
+    /// 87.59 秒。ここでクランプすると **末尾 2.5 秒だけバーが止まって見える**。
+    #[test]
+    fn keyframe_axis_center_also_runs_to_the_material_end() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![0.0, 40.0, 87.5875],
+            adopted: vec![0, 1, 2],
+            duration_secs: 90.139_864,
+        };
+        assert_close(axis.center_index_for_time(87.5875), 2.0);
+        assert_close(axis.center_index_for_time(90.139_864), 3.0);
+        assert_close(axis.time_for_center_index(3.0), 90.139_864);
+        // 行き過ぎはクランプする。
+        assert_close(axis.center_index_for_time(999.0), 3.0);
+        assert_close(axis.time_for_center_index(9.0), 90.139_864);
+    }
+
+    /// 末尾セルが素材の末尾と同時刻なら、伸ばす余地は無い。従来どおりクランプする。
+    #[test]
+    fn axis_without_a_tail_still_clamps_at_the_last_cell() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![0.0, 10.0, 20.0],
+            adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
+        };
+        assert_close(axis.center_index_for_time(20.0), 2.0);
+        assert_close(axis.center_index_for_time(999.0), 2.0);
+        assert_close(axis.time_for_center_index(2.0), 20.0);
+        assert_close(axis.time_for_center_index(9.0), 20.0);
+    }
+    #[test]
+    fn time_grid_last_cell_ends_at_the_material_end() {
+        let duration_secs = 172.733_243_f64;
+        let interval_secs = 5.0_f64;
+        let axis = StripAxis::TimeGrid {
+            interval_secs,
+            fallback_interval_secs: interval_secs,
+            duration_secs,
+        };
+        let last_index = axis.cell_count() - 1;
+        let last = axis.cell(last_index).unwrap();
+        // 末尾セルの右端が動画の末尾と一致する。
+        assert!(
+            (last + interval_secs - duration_secs).abs() < 1.0e-9,
+            "last={last}"
+        );
+        // 直前のセルは通常どおりで、同時刻にはならない。
+        let previous = axis.cell(last_index - 1).unwrap();
+        assert!((previous - (last_index - 1) as f64 * interval_secs).abs() < 1.0e-9);
+        assert!(previous < last, "previous={previous} last={last}");
+        // どのセルからも最低 1 間隔ぶん再生できる。
+        for index in 0..=last_index {
+            let secs = axis.cell(index).unwrap();
+            assert!(
+                secs + interval_secs <= duration_secs + 1.0e-9,
+                "cell {index} at {secs} leaves less than one interval"
+            );
+        }
+    }
+
+    /// 尺が 1 間隔に満たない素材。末尾セルを手前へ寄せる余地が無いので 0 のまま。
+    #[test]
+    fn time_grid_shorter_than_one_interval_keeps_a_single_cell_at_zero() {
+        let axis = StripAxis::TimeGrid {
+            interval_secs: 15.0,
+            fallback_interval_secs: 15.0,
+            duration_secs: 4.0,
+        };
+        assert_eq!(axis.cell_count(), 1);
+        assert_eq!(axis.cell(0), Some(0.0));
+        assert_eq!(axis.cell(1), None);
+    }
     #[test]
     fn center_index_mapping_interpolates_and_clamps_without_changing_window_position() {
         let axis = keyframe_axis(&[0.0, 2.0, 7.0, 10.0], &[0, 2, 3]);
@@ -1352,11 +1551,36 @@ mod tests {
         assert_eq!(thin_keyframes(&genuinely_short, 2.0), vec![0, 2]);
     }
 
+    /// 「要求した」を「届く」として扱うと、ワーカーが supersede で捨てたセルへ戻る道が無くなる。
+    /// 2026-08-27 実機: 速いドラッグで末尾 5 セルが空のまま固定され、Shift+S で開き直すまで
+    /// 埋まらなかった。判定は配達で行い、ワーカーが手を離すまでは待つ。
+    #[test]
+    fn strip_window_request_follows_delivery_not_the_request_ledger() {
+        // 届いているなら頼まない。
+        assert!(!should_request_strip_window(false, None, None));
+        assert!(!should_request_strip_window(false, Some(7), Some(7)));
+
+        // 一度も頼んでいないなら頼む。
+        assert!(should_request_strip_window(true, None, None));
+
+        // 頼んだが、ワーカーはまだ 1 件も終えていない。毎フレーム上書きすると計画が
+        // 立て直され続けて前へ進まないので待つ。
+        assert!(!should_request_strip_window(true, Some(3), None));
+        assert!(!should_request_strip_window(true, Some(3), Some(2)));
+
+        // ワーカーが手を離したのに未着が残っている = supersede で捨てられた。頼み直す。
+        assert!(should_request_strip_window(true, Some(3), Some(3)));
+        assert!(should_request_strip_window(true, Some(3), Some(9)));
+    }
+
     #[test]
     fn range_step_ladders_match_the_persisted_choices() {
         assert_eq!(
             THUMBNAIL_RANGE_STEPS_SECS,
-            &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+            &[
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+                1800.0,
+            ]
         );
         assert_eq!(
             WAVEFORM_RANGE_STEPS_SECS,
@@ -1401,7 +1625,15 @@ mod tests {
                 60.0,
                 SeekStripRangeStep::Wider,
             ),
-            Some(60.0)
+            Some(120.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                1800.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(1800.0)
         );
         assert_eq!(
             step_seek_strip_range(
@@ -1877,6 +2109,7 @@ mod tests {
             StripAxis::KeyframeIndex {
                 keyframes: vec![0.0, 1.0, 2.1, 4.5],
                 adopted: vec![0, 2, 3],
+                duration_secs: 4.5,
             }
         );
     }
