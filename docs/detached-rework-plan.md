@@ -1459,6 +1459,30 @@ current folder / enumerate を変えず state Drop と nav lock cleanup を終�
 開く。`move_scope_preflight_below_claim`、`omit_rar_direct_completion_scope_preflight`、
 `reject_all_rar_direct_completions_in_snapshot` の各 mutation で対応 assertion が失敗する。
 
+**2026-08-27 RAR direct scope refusal で folder navigation history を request-owned snapshot へ復元
+(backlog §1.131 follow-up、3aaa4659 が追加した refusal branch の gap):**
+
+**触った範囲**: [src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs) の
+`pending_direct_nav` consume と scope-refusal cleanup、[src/app/tests.rs](../src/app/tests.rs) の
+Navigation completion 回帰テスト。detached predicate、viewport / HWND / placement / focus / epoch、
+context registry / mount、grid selection / paste / new-folder は変更していない。
+
+**不変条件と判断理由**: Back / Forward と検索・タグ・レーティング内の container open は、実 open より
+先に変更した history / drill stack の `FolderNavHistorySnapshot` を `ArchiveConvertState` に所有させる。
+direct-read 完了が現在 snapshot scope から拒否された場合は open が成立していないため、cache load refusal、
+dialog close、worker cancel と同じ `restore_folder_nav_history` で pre-click state に戻す。3aaa4659 は
+`completion` と `deferred_fullscreen` を state drop 前に退避したが、この snapshot を退避しなかったため、
+拒否だけ正しく行われて history が成功時の形に残った。新しい App-level state、時間窓、retry / repaint /
+reset は追加していない。
+
+**回帰証明と mutation**: `Navigation` + `Some(rollback)` の direct RAR completion を generation N から
+N+1 へ差し替え、scope 外では current folder / enumerate を変えず back / forward stack が pre-click へ
+戻ること、scope 内では通常どおり RAR を開き post-click stack を維持することを検査する。
+`omit_rar_direct_scope_refusal_history_restore` は前者、`restore_rar_direct_history_unconditionally` は後者で
+失敗する。ファイル内の state 終端を再監査し、復元すべき user close / worker cancel / cache load refusal は
+既に同じ helper を呼び、navigation / activation supersede と bookmark / detached / sibling 専用終了は
+rollback ownership を持たないため、ほかに同型の欠落はない。
+
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
 mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**

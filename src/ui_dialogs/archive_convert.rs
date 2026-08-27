@@ -750,6 +750,7 @@ impl App {
             let auto_fs = state.auto_fullscreen;
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
+            let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
             if crate::perf::is_enabled() {
                 let archive_key = crate::path_key::normalize_keep_drive(&src);
@@ -819,6 +820,9 @@ impl App {
                         owner.request_id,
                         "archive_direct_navigation_outside_snapshot_scope",
                     );
+                }
+                if let Some(snapshot) = nav_history_rollback {
+                    self.restore_folder_nav_history(snapshot);
                 }
                 if deferred.is_some() {
                     self.release_fs_nav_lock();

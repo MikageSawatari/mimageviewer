@@ -56476,6 +56476,30 @@ mod smart_folder_transition_tests {
         source: &Path,
         with_deferred_fullscreen: bool,
     ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        install_pending_direct_rar_completion_with_policy(
+            app,
+            source,
+            with_deferred_fullscreen,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                MainGridArchiveTransitionIntent {
+                    source_path: source.to_path_buf(),
+                    reading_history_return_from: None,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: false,
+                    smart_folder_drill: false,
+                },
+            ),
+            None,
+        )
+    }
+
+    fn install_pending_direct_rar_completion_with_policy(
+        app: &mut App,
+        source: &Path,
+        with_deferred_fullscreen: bool,
+        completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy,
+        nav_history_rollback: Option<FolderNavHistorySnapshot>,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         let (_tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let deferred_fullscreen = with_deferred_fullscreen.then(|| {
@@ -56507,18 +56531,9 @@ mod smart_folder_transition_tests {
             pending_direct_nav: Some(source.to_path_buf()),
             allow_direct_read: true,
             fallback_cached_zip: None,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
-                    MainGridArchiveTransitionIntent {
-                        source_path: source.to_path_buf(),
-                        reading_history_return_from: None,
-                        suppress_rating_filter: false,
-                        suppress_facet_filter: false,
-                        smart_folder_drill: false,
-                    },
-                ),
+            completion,
             pending_sibling_output: None,
-            nav_history_rollback: None,
+            nav_history_rollback,
             auto_fullscreen: false,
             deferred_fullscreen,
             suppress_confirm: false,
@@ -56857,6 +56872,168 @@ mod smart_folder_transition_tests {
         // Mutation `reject_all_rar_direct_completions_in_snapshot`: make the new preflight branch
         // unconditional while a snapshot is active. This test leaves the parent folder mounted
         // and never creates zip_enumerate_pending.
+    }
+
+    #[test]
+    fn rar_direct_navigation_generation_swap_restores_history_on_scope_refusal() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-navigation-generation-swap");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale_source = root.join("history-generation-n.rar");
+        let current_source = root.join("history-generation-n-plus-one.rar");
+        std::fs::write(&stale_source, b"stale rar").unwrap();
+        std::fs::write(&current_source, b"current rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: stale_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: current_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        let generation_n = app.snapshot.as_ref().unwrap().generation_id;
+
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![stale_source.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack
+            .clear();
+        let rollback = app.folder_nav_history_snapshot();
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(stale_source.clone())
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root.clone()]
+        );
+        install_pending_direct_rar_completion_with_policy(
+            &mut app,
+            &stale_source,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            Some(rollback),
+        );
+
+        app.deactivate_snapshot();
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.visible_indices = vec![1];
+        app.selected = Some(1);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::RatingFilter {
+            active_levels: vec![5],
+        });
+        assert!(app.snapshot.as_ref().unwrap().generation_id > generation_n);
+        assert_eq!(app.snapshot_owner_entry(&stale_source), None);
+        assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert!(app.zip_enumerate_pending.is_none());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![stale_source]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
+        // Mutation `omit_rar_direct_scope_refusal_history_restore`: drop the refusal branch's
+        // restore call. The post-click empty back stack and root-bearing forward stack remain.
+    }
+
+    #[test]
+    fn rar_direct_navigation_in_scope_keeps_successful_history_transition() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-navigation-current-generation");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("history-in-scope.rar");
+        std::fs::write(&source, b"direct rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_owner_entry(&source), Some(0));
+
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![source.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack
+            .clear();
+        let rollback = app.folder_nav_history_snapshot();
+        assert_eq!(app.navigate_folder_history_back(), Some(source.clone()));
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root.clone()]
+        );
+        install_pending_direct_rar_completion_with_policy(
+            &mut app,
+            &source,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            Some(rollback),
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert!(app.zip_enumerate_pending.is_some());
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root]
+        );
+        // Mutation `restore_rar_direct_history_unconditionally`: apply the rollback before the
+        // scope decision. The successful click is undone to back=[source], forward=[].
     }
 
     #[test]
