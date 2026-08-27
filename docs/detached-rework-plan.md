@@ -214,7 +214,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
 | R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
 | R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
-| R2b | **部分完了 (R2e で 1 軸閉じた)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
+| R2b | **部分完了 — 残りは §9.8 で閉じる (2026-08-28 着手)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
 | R2c | **完了** | placement は runtime 所有、settings は seed |
 | R2d | **完了** | live-park と active 復帰の直列化を実装済み |
 | R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
@@ -1282,6 +1282,69 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
   - ⚠ **これは parked-live 経路にしか無い facts に依存した暫定解であり、一般解ではない。**
     R2e 第 3 版で「この window の bundle は今どこにあるか」を一級の問い合わせにすること
     (材料は [briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §6.5)。
+
+### 9.8 遷移所有者 (R2b 完了) — backlog §1.137 の根治として実施 (2026-08-28 合意)
+
+利用者の報告「F12 でタスクバーが何度も明滅する / 白い窓が出てから最大化される」
+(backlog §1.137) の根治。**出荷前に実施する** (利用者判断 2026-08-28)。
+
+#### 測定された事実
+
+- キャプチャの下端 18px をフレームごとに分類し、**F12 1 往復でタスクバーが 16 回反転**
+  (334ms に 9 回、333ms に 7 回、ほぼ 1 フレームごと)。
+- ホスト viewport は表示後 376ms 中身が無い。動画の子窓はその後に作られる。
+- §1.115 (font atlas resync) の撤去後もこの反転は残った。**別機構**であることが実測で確定している。
+
+#### なぜ構造修正か (ClaudeCode / Codex 双方合意、憲法 §2 の要件)
+
+現状、**「遷移中に何が画面を覆うか」の所有者が存在しない**。fullscreen → detached の
+待機中は `viewer_presentation` が旧 Fullscreen のままなので、`ensure_native_video_front` が
+新ホストを「presenter 以外の前面」と見て旧 presenter の raise を要求できる。
+ホスト表示側と旧フルスクリーン復旧側が**別々に z-order を動かせる**のが反転の正体。
+
+したがって直し方は順序の微調整ではなく、**所有境界の一本化**であり、
+本書 §9.1 が **R2b の未完件として既に記録している「純粋 reducer」「散在 pending / flag の
+typed 集約」そのもの**。R4 の半端な先行実装ではない。
+
+#### スコープ (R4 は含めない)
+
+- **含む**: `pending_detached_video_host_switch` と `native_video_mode_switch` を一つの
+  typed transition owner へ畳む。`Stable → Preparing → Ready → Committing → Stable`。
+  ホストの `Visible` / `Focus`、native publish、outgoing retire、terminal session close を
+  **reducer の effect としてのみ**発行する。native contract の `TargetReady` を
+  `Prepare` / `Ready` / `Commit` へ分ける。
+- **含まない (R4)**: `show_viewport_deferred` 化、single render entry、ホストの永続化。
+  F12 OFF でホスト HWND を terminal destroy する現行仕様は維持する。
+
+#### 実施後に残るもの (利用者への説明用)
+
+タスクバーの反転と**空の白い窓は消える**。残るのは:
+
+- hidden host の生成待ち 約 300ms (旧フルスクリーン映像がそのまま見える)
+- F12 OFF で host HWND を destroy し、次の ON で新規生成 → mIV のタスクバーボタンが
+  **1 往復に 1 回ずつ**消えて現れる (現行の 16 回反転とは別物)
+
+#### 受け入れ基準
+
+- 両方向で **outgoing presenter の raise 0 回**、**cover の変化 1 回**。
+  遷移 ID 付きで `Visible` / `Focus` / `Publish` / `Raise` / `Destroy` を記録し、
+  画面キャプチャのフレーム分類と突き合わせて確認する。
+- content-ready 前の host activation 0 回。
+- 固定 ms で commit / 復帰しない (憲法 §2 規則 5)。abort / 再入力 / Esc / close /
+  player 終了を合法遷移としてテストする。
+
+#### これをやったら症状パッチになる (明示的に禁止)
+
+- `ensure_native_video_front` へ `if pending… { return; }` を足すだけ。
+- 別の bool で `Visible(true)` を遅らせる。
+- 既存 2 つの pending を残したまま 3 つ目の transition state を足す。
+
+#### 留保
+
+`ensure_native_video_front` 単独が 7〜9 回の反転を生んだとは**まだ言えない**。
+recover raise には 250ms gate があり、333ms に 7〜9 回を直接発行する経路ではない。
+egui host の `Visible+Focus`、新 presenter の `show_and_raise`、旧 presenter の destroy、
+HUD/VST の raise も同じ遷移に参加している。reducer は**それら全部**を集約する。
 
 ## 10. 将来候補 (現行仕様では未採用)
 
