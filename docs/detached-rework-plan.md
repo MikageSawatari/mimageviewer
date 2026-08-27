@@ -1299,7 +1299,7 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
 **2026-08-27 detached grid の Descriptor open から main filter suppression を分離
-(backlog §1.131 P2-2 follow-up、利用者提示の ClaudeCode re-review と Codex の callee
+(backlog §1.132 P2-2 follow-up、利用者提示の ClaudeCode re-review と Codex の callee
 inspection が一致):**
 
 **触った範囲**: [src/app.rs](../src/app.rs) の
@@ -1325,10 +1325,10 @@ Descriptor arm へ rating producer だけを戻す mutation は main anchor の 
 facet producer だけを戻す mutation は `{Pdf}` filter の保持比較で失敗した。新しい App-level
 state、時間窓、guard / retry / repaint は追加していない。同じ caller 前段の
 `note_reading_history_open(idx)` が context-owned `reading_history_return_from` を main 上で
-変更してから detached build に入る別件は、§2 規則7に従い修正せず backlog §1.131 に記録した。
+変更してから detached build に入る別件は、§2 規則7に従い修正せず backlog §1.132 に記録した。
 
 **2026-08-27 detached container open から main の閲覧履歴戻り先予約更新を分離
-(backlog §1.131 reading_history_return_from、利用者提示の ClaudeCode re-review と
+(backlog §1.132 reading_history_return_from、利用者提示の ClaudeCode re-review と
 Codex の4入口 inspection が一致):**
 
 **触った範囲**: [src/app.rs](../src/app.rs) の Enter / 明示 container mode /
@@ -1364,7 +1364,7 @@ convert dialog cancel は main を遷移させないため、App-global request 
 mutation を正当化できない。次項で request-owned intent と成功時 commit に修正した。
 
 **2026-08-27 convertible archive の main transition を実 load 成功時 commit へ変更
-(backlog §1.131 P2、利用者提示の ClaudeCode re-review と Codex の lifecycle inspection が一致):**
+(backlog §1.132 P2、利用者提示の ClaudeCode re-review と Codex の lifecycle inspection が一致):**
 
 **触った範囲**: [src/app.rs](../src/app.rs) の4 static entry site / open request owner / common load
 boundary、[src/ui_main.rs](../src/ui_main.rs) の double-click、
@@ -1396,11 +1396,11 @@ suppression、facet filter と suppression stack、smart-folder position、main 
 
 **2026-08-27 ★固定中の converted cache alias を typed source scope で判定し、拒否を
 common load の effect より前へ移動
-(backlog §1.131 final P2、利用者提示の ClaudeCode 検証と Codex の funnel inspection が一致):**
+(backlog §1.132 final P2、利用者提示の ClaudeCode 検証と Codex の funnel inspection が一致):**
 
 **触った範囲**: [src/app.rs](../src/app.rs) の `load_folder_with_scan_claimed` にある既存
 snapshot scope guard、[src/app/tests.rs](../src/app/tests.rs) の main-grid convertible cache hit /
-`ConvertDone` / out-of-scope common-load 回帰テスト、backlog §1.131 の記録。detached predicate、
+`ConvertDone` / out-of-scope common-load 回帰テスト、backlog §1.132 の記録。detached predicate、
 viewport / HWND / placement / focus / epoch、context registry / mount、grid selection / paste /
 new-folder は変更していない。
 
@@ -1422,17 +1422,17 @@ main ownership を変更しない。新しい bool / Option、時間窓、retry 
 認可は `preserve_smart_folder_session_for_load` で実際に consume して非空性検査の vacuity を除いた。
 Folder / ZIP / PDF の通常到達3入口と明示 container mode static site が common guard より前に行う
 caller-side effect、および guard を持たない内部 `load_zip_as_folder_with_input_seq` /
-`load_pdf_as_folder` continuation は §2 規則7に従い変更せず、backlog §1.131 に残した。
+`load_pdf_as_folder` continuation は §2 規則7に従い変更せず、backlog §1.132 に残した。
 
 **2026-08-27 snapshot scope preflight を open lifecycle claim 前と RAR direct 完了へ共有
-(backlog §1.131 final P2 re-review、利用者提示の ClaudeCode re-review と Codex の
+(backlog §1.132 final P2 re-review、利用者提示の ClaudeCode re-review と Codex の
 lifecycle / generation inspection が一致):**
 
 **触った範囲**: [src/app.rs](../src/app.rs) の2つの visible-load claim 入口、純粋な
 `snapshot_scope_allows_open`、common load guard、
 [src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs) の RAR direct-read 完了、
 [src/app/tests.rs](../src/app/tests.rs) の request ownership / generation swap 回帰テスト、backlog
-§1.131 の記録。detached predicate、viewport / HWND / placement / focus / epoch、context registry / mount、
+§1.132 の記録。detached predicate、viewport / HWND / placement / focus / epoch、context registry / mount、
 grid selection / paste / new-folder は変更していない。
 
 **不変条件と判断理由**: snapshot scope 拒否は visible-open lifecycle の採用より前でなければならない。
@@ -1460,7 +1460,7 @@ current folder / enumerate を変えず state Drop と nav lock cleanup を終�
 `reject_all_rar_direct_completions_in_snapshot` の各 mutation で対応 assertion が失敗する。
 
 **2026-08-27 RAR direct scope refusal で folder navigation history を request-owned snapshot へ復元
-(backlog §1.131 follow-up、3aaa4659 が追加した refusal branch の gap):**
+(backlog §1.132 follow-up、3aaa4659 が追加した refusal branch の gap):**
 
 **触った範囲**: [src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs) の
 `pending_direct_nav` consume と scope-refusal cleanup、[src/app/tests.rs](../src/app/tests.rs) の
@@ -1803,7 +1803,7 @@ foreground ownership を扱う際の観測として残す。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
-| 2026-08-27 | ParkedLive の HUD クリック分類器 `native_video_output_event_is_parked_live_hud_click_activation` から catch-all `_ => true` を撤去し、`NativeVideoOutputEvent` 77 variant すべてを網羅 match で分類した = backlog §1.131 (ClaudeCode / Codex 双方が構造的修正と合意) | [src/app/native_video.rs](../src/app/native_video.rs) の当該述語のみ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、placement / focus、window lifecycle、activation 要求の生成・消費経路は変更なし。App state の追加なし、時間窓・guard・retry・repaint の追加なし | 実機ログ (`MIV_DETACHED_WINDOW_DEBUG=1`) で、描画経路が layout 変化のたびに出す `RequestSeekStripWindow` が「利用者の HUD クリック」と分類され、利用者が活性化した別窓を 13ms で降ろしていたことを確定。原因は個別イベントの登録漏れではなく **「未分類のイベント = 利用者のクリック」という open-world の既定**であり、シークストリップが 10 個足して 3 個しか分類されなかったのはその帰結。網羅 match 化は新 variant の分類をコンパイラに強制し、誤分類の発生境界そのものを閉じるため症状パッチではない。Codex は方針に同意したうえで一次分類案に 5 件の反例を出し (`TouchChromeLearned` は利用者タップ由来 / `CloseSeekStrip` は cause 依存で `HudHidden` は描画由来 / `SetVst3PanelPos` は自動 clamp でも発火 / `SetVst3PanelVisible` は producer 不在 / `TileColumnsDelta` は入力源が 2 つ)、ClaudeCode が全件を emit 元で裏取りして反映した。`CloseSeekStrip` は既存の `SeekStripCloseCause::is_user_dismissal()` を使うだけで payload 変更を伴わない。`TileColumnsDelta` の provenance 分離と、活性化要求の**寿命・順序**問題 (消費側が「まだ望まれている要求か」を問うていない) は §2 規則 7 に従いスコープ外とし、backlog §1.131 に残した |
+| 2026-08-27 | ParkedLive の HUD クリック分類器 `native_video_output_event_is_parked_live_hud_click_activation` から catch-all `_ => true` を撤去し、`NativeVideoOutputEvent` 77 variant すべてを網羅 match で分類した = backlog §1.132 (ClaudeCode / Codex 双方が構造的修正と合意) | [src/app/native_video.rs](../src/app/native_video.rs) の当該述語のみ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、placement / focus、window lifecycle、activation 要求の生成・消費経路は変更なし。App state の追加なし、時間窓・guard・retry・repaint の追加なし | 実機ログ (`MIV_DETACHED_WINDOW_DEBUG=1`) で、描画経路が layout 変化のたびに出す `RequestSeekStripWindow` が「利用者の HUD クリック」と分類され、利用者が活性化した別窓を 13ms で降ろしていたことを確定。原因は個別イベントの登録漏れではなく **「未分類のイベント = 利用者のクリック」という open-world の既定**であり、シークストリップが 10 個足して 3 個しか分類されなかったのはその帰結。網羅 match 化は新 variant の分類をコンパイラに強制し、誤分類の発生境界そのものを閉じるため症状パッチではない。Codex は方針に同意したうえで一次分類案に 5 件の反例を出し (`TouchChromeLearned` は利用者タップ由来 / `CloseSeekStrip` は cause 依存で `HudHidden` は描画由来 / `SetVst3PanelPos` は自動 clamp でも発火 / `SetVst3PanelVisible` は producer 不在 / `TileColumnsDelta` は入力源が 2 つ)、ClaudeCode が全件を emit 元で裏取りして反映した。`CloseSeekStrip` は既存の `SeekStripCloseCause::is_user_dismissal()` を使うだけで payload 変更を伴わない。`TileColumnsDelta` の provenance 分離と、活性化要求の**寿命・順序**問題 (消費側が「まだ望まれている要求か」を問うていない) は §2 規則 7 に従いスコープ外とし、backlog §1.132 に残した |
 | 2026-08-25 | R2e-2d で active_viewer_context_contains_video が registry 化と同時に mounted context まで含む意味へ広がり、detached video open の main-update poll を自己抑止した回帰を修正。active ID が現在 projected ではない場合だけ動画を検出する other_active_viewer_context_contains_video へ改名し、旧述語から継承した十一 caller を全数監査して同じ「別 context」意味へ移行 | src/app.rs の context predicate、main video poll 入口、pending index / tile / mode-switch / park / close / media-navigation ownership、src/app/native_video.rs の source-swap / mounted clear ownership、src/app/startup_ops.rs の bookmark handoff、src/app/tests.rs の main-update poll 到達テスト。viewport ID / registry transaction / runtime / host ownership、geometry / placement / focus、window lifecycle、pending field と既存計装は変更なし | 利用者のログ・source 分析と Codex の十一 caller / mounted・at-rest lifecycle 監査が、旧 holder 述語の意味は「App に投影されていない active context」であり、全 caller が current/mounted を別の条件または現在処理中の owner として扱う点で一致。guard / retry / delay / re-entrancy flag を足さず、projected identity との比較で residence を保つ ownership 修正である。修正前に production main-update 入口から pending poll に未到達する red を確認し、修正後は poll_native_video_open_pending 固有の host_not_ready 記録まで到達する回帰テストで固定したため、症状パッチではなく §2 に適合すると双方合意 |
 | 2026-08-22 | backlog §1.106 の右ドラッグ中左ボタン取消を passive detached viewer にも通し、既存 `DetachedRightDragEventKind::Cancel` に typed reason `PrimaryButtonPressed` を追加。deferred / ParkedLive の window callback は右ドラッグ中の primary down をこの cancel として同じ sequence channel へ送り、owner reducer が既存 cancel を実行する。左 release による通常の passive window activation は維持し、選択 / open / viewer action へは再利用しない | `src/app.rs` の `DetachedRightDragCancelReason` と deferred callback capture、`src/ui_fullscreen.rs` の ParkedLive callback / 既存 passive right-drag reducer、callback・owner・activation tests。`Input` variant の field、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、window lifecycle、`ViewerContextBundle` field は変更なし | 利用者の再調査と Codex の全 producer 列挙が、backlog 作成後の §1.100 で passive start point が第 4 surface として増え、typed cancel channel だけが primary press を表現できない点で一致。利用者が §2 を確認し、既存 `Cancel { reason }` への reason 追加は新規 App-level detached bool / Option、時間窓、heuristic、rect 条件を作らず、入力を既存 owner cancel 境界へ流す構造修正であると明示的に同意。Codex も同じ理由で症状パッチではなく §2 に適合すると合意した。activation reducerへ cancel suppression を足さず、cancel と Windows 標準の activation が並立することをテストで固定 |
 | 2026-08-22 | backlog §1.99 の ConvertibleArchive grid open を、probe / 変換前は main 所有の typed candidate、実体確定後は新しい detached context を作る destination intent として完結させた。直読み RAR、変換 RAR、RAR cache fallback、非 RAR 同期 cache hit、ZIP / PDF control の page-list 完了後にも main context 不変を回帰テストで固定 | src/app.rs の DetachedGridItemOpenPlan::ConvertibleArchiveCandidate、OpenRequestOwner::DetachedGridArchive、request sequence / stale arbitration、open_converted_grid_archive_in_detached_context と同期 cache-hit arm、src/ui_dialogs/archive_convert.rs の ArchiveConvertCompletionPolicy::DetachedGridArchive および direct / converted completion consumer、src/app/tests.rs。visibility 述語、show_viewport_* builder、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、R2e は変更なし | backlog §1.99 と docs/detached-rework-stage-archive-open.md の ClaudeCode 分析、Codex の source inspection が、誤りは完了先を Navigation に固定した request ownership にあり、RAR を ZIP descriptor に分類する問題ではない点で一致。要求 identity と completion policy が元アーカイブを保持し、確定した backing archive から ViewerContextDescriptor::Zip { archive_source_override: Some(source), .. } を作るため、別 context の main grid を後段で戻す guard ではなく request 作成境界の構造修正である。新規 detached bool / Option、delay / retry / repaint / reset / fallback を追加せず、フル機能ウィンドウの Navigation と ZIP / PDF descriptor を維持するので §2 に適合すると ClaudeCode / Codex 双方が合意 |
