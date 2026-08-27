@@ -12720,6 +12720,10 @@ pub struct App {
     native_video_last_move_client: Option<(i32, i32)>,
     /// ハング調査用: UI thread が最後に `App::update` を通過した時刻を通常ログへ残す。
     last_ui_heartbeat_log: std::time::Instant,
+    /// 直前に `App::update` へ入った時刻。**フレームの間隔**を測るために持つ。
+    /// ちらつきは「描かれないフレーム」がそのまま見えている状態なので、update の中で
+    /// 何 ms 使ったかではなく、update と update の**隙間**が見たい量になる。
+    last_ui_frame_started: Option<std::time::Instant>,
     /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
     /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
     /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
@@ -14448,6 +14452,7 @@ impl App {
             #[cfg(windows)]
             native_video_last_move_client: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
+            last_ui_frame_started: None,
             placement_slot: None,
             activation_listener: None,
             #[cfg(windows)]
@@ -65621,6 +65626,19 @@ impl eframe::App for App {
         // 確実に立っている。docs/prefetch-suppression-during-scroll-plan.md 1.3 参照。
         self.detect_scroll_input_intent(ctx);
         let now = std::time::Instant::now();
+        // 閉じる経路ごとに計器を足すと、思い付かなかった経路が無言のまま残る。
+        // 間隔そのものを測れば、どの経路を通っても記録される。
+        if let Some(previous) = self.last_ui_frame_started.replace(now) {
+            let gap_ms = now.saturating_duration_since(previous).as_secs_f64() * 1000.0;
+            if gap_ms > 50.0 {
+                crate::logger::log(format!(
+                    "[ui-frame-gap] {gap_ms:.1}ms without a frame: fullscreen={:?} presentation={:?} detached={}",
+                    self.fullscreen_idx,
+                    self.viewer_presentation,
+                    self.current_viewer_session_is_detached_or_switching(),
+                ));
+            }
+        }
         if now.saturating_duration_since(self.last_ui_heartbeat_log)
             >= std::time::Duration::from_secs(1)
         {
