@@ -34190,6 +34190,52 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_projection_selection_event_reaches_shared_app_apply_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(r"C:\clips\pano-projection.mp4");
+        let idx = push_video(&mut app, path.clone());
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(
+            640,
+            320,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let source_epoch = player.native_source_epoch().unwrap();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant,
+            ),
+        );
+
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Equidistant
+        );
+    }
+
+    #[test]
     fn hidden_native_video_does_not_toggle_mode_owned_by_egui_music_view() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

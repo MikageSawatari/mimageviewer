@@ -3767,6 +3767,7 @@ impl App {
             | Ev::PanoramaDrag { .. }
             | Ev::TogglePanorama
             | Ev::CyclePanoramaProjection
+            | Ev::SetPanoramaProjection(_)
             | Ev::ResetPanorama
             | Ev::TileSeek { .. }
             | Ev::OpenSeekStrip
@@ -4202,6 +4203,14 @@ impl App {
             crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
                 if self.native_video_panorama_input_active(fs_idx)
                     && self.cycle_panorama_projection().is_some()
+                {
+                    self.sync_native_video_panorama_state(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetPanoramaProjection(projection) => {
+                if self.native_video_panorama_input_active(fs_idx)
+                    && self.set_panorama_projection(projection).is_some()
                 {
                     self.sync_native_video_panorama_state(fs_idx);
                     self.request_native_video_hud_repaint(ctx);

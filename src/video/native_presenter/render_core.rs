@@ -1312,6 +1312,7 @@ struct NativeEguiOverlay {
     seek_status_visible_since: Option<Instant>,
     seek_status_visible: bool,
     video_speed_popup_open: bool,
+    panorama_projection_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
@@ -1366,6 +1367,10 @@ struct NativeEguiOverlay {
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
     /// `None` なら popup 非表示または未描画。
     last_drawn_speed_popup_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画した投影方式一覧の actual rect。
+    /// HUD HWND の入力 region に同じ矩形を登録し、行クリックが背面の 360 見回し
+    /// ドラッグへ抜けないようにする。
+    last_drawn_panorama_projection_popup_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したブックマーク名編集ダイアログの actual rect。
     /// 中央モーダルだが、配置は `pos.y = (H - dialog_h) * 0.5` (dialog_h はレイアウト
     /// 用の過大見積もり) で、実コンテンツ高さとの差でダイアログ中心が画面中心より
@@ -2439,6 +2444,7 @@ pub enum NativeOverlayCommand {
     },
     TogglePanorama,
     CyclePanoramaProjection,
+    SetPanoramaProjection(crate::panorama::PanoProjection),
     ResetPanorama,
     TileSeek {
         target_secs: f64,
@@ -6570,6 +6576,28 @@ impl NativeBlackBackground {
     }
 }
 
+fn close_panorama_projection_popup_for_context(
+    popup_open: &mut bool,
+    panorama_active: bool,
+    audio_only: bool,
+) -> bool {
+    if *popup_open && (!panorama_active || audio_only) {
+        *popup_open = false;
+        true
+    } else {
+        false
+    }
+}
+
+fn native_panorama_projection_popup_hud_rect(
+    popup_open: bool,
+    last_drawn_rect: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    popup_open
+        .then_some(last_drawn_rect?)
+        .map(|rect| rect.expand(4.0))
+}
+
 impl NativeEguiOverlay {
     fn new(
         visual: IDCompositionVisual,
@@ -6687,6 +6715,7 @@ impl NativeEguiOverlay {
             seek_status_visible_since: None,
             seek_status_visible: false,
             video_speed_popup_open: false,
+            panorama_projection_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
@@ -6720,6 +6749,7 @@ impl NativeEguiOverlay {
             last_emitted_vst3_panel_pos: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
+            last_drawn_panorama_projection_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
             last_drawn_shortcut_help_rect: None,
@@ -7623,10 +7653,15 @@ impl NativeEguiOverlay {
     fn set_panorama_pose(&mut self, panorama_pose: Option<PanoPose>) {
         let changed = self.panorama_pose != panorama_pose;
         self.panorama_pose = panorama_pose;
+        let popup_closed = close_panorama_projection_popup_for_context(
+            &mut self.panorama_projection_popup_open,
+            self.panorama_pose.is_some(),
+            self.audio_only,
+        );
         let touch_changed = self
             .native_touch
             .configure_panorama(self.panorama_pose.is_some());
-        self.dirty |= changed || touch_changed;
+        self.dirty |= changed || popup_closed || touch_changed;
     }
 
     fn set_video_anime4k_state(
@@ -7795,7 +7830,13 @@ impl NativeEguiOverlay {
     }
 
     fn set_audio_only(&mut self, audio_only: bool) {
+        let popup_closed = close_panorama_projection_popup_for_context(
+            &mut self.panorama_projection_popup_open,
+            self.panorama_pose.is_some(),
+            audio_only,
+        );
         if self.audio_only == audio_only {
+            self.dirty |= popup_closed;
             return;
         }
         self.audio_only = audio_only;
@@ -8385,6 +8426,7 @@ impl NativeEguiOverlay {
     /// - touch panel handles (touch chrome latch 中): 左右端の 48pt rect
     /// - VST3 panel (`vst3_panel_visible()`): center modal panel
     /// - speed popup (`video_speed_popup_open`): 画面下端の popup
+    /// - panorama projection popup: 上バーの投影ボタンから開く方式一覧
     /// - bookmark title editor (`bookmark_title_edit.is_some()`): center modal
     /// - normalize progress / scan UI (`normalize_state` の各 phase)
     /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
@@ -8690,6 +8732,16 @@ impl NativeEguiOverlay {
             }
         }
 
+        if let Some(rect) = native_panorama_projection_popup_hud_rect(
+            self.panorama_projection_popup_open,
+            self.last_drawn_panorama_projection_popup_rect,
+        ) {
+            let rect_px = rect_to_px(rect);
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
         // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
         //
@@ -8929,13 +8981,14 @@ impl NativeEguiOverlay {
     }
 
     fn top_bar_visible(&self) -> bool {
-        Self::native_hud_top_visible_from_hover(
-            self.visibility_hover_pos(),
-            self.top_bar_visible,
-            self.external_drag_in_progress,
-            self.native_touch.chrome_latched(),
-            self.top_bar_locked,
-        )
+        self.panorama_projection_popup_open
+            || Self::native_hud_top_visible_from_hover(
+                self.visibility_hover_pos(),
+                self.top_bar_visible,
+                self.external_drag_in_progress,
+                self.native_touch.chrome_latched(),
+                self.top_bar_locked,
+            )
     }
 
     fn top_bar_hover_visible(&self) -> bool {
@@ -9415,6 +9468,7 @@ impl NativeEguiOverlay {
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut hover_preview_anchor_x = self.hover_preview_anchor_x;
         let mut video_speed_popup_open = self.video_speed_popup_open;
+        let mut panorama_projection_popup_open = self.panorama_projection_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
@@ -9427,6 +9481,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
+        let mut last_drawn_panorama_projection_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
@@ -9639,10 +9694,13 @@ impl NativeEguiOverlay {
                 draw_native_top_bar(
                     ctx,
                     overlay_width_points,
+                    overlay_height_points,
                     position_secs,
                     duration_secs,
                     video_metadata.as_ref(),
                     panorama_pose,
+                    &mut panorama_projection_popup_open,
+                    &mut last_drawn_panorama_projection_popup_rect,
                     &fallback_file_name,
                     perf_visible,
                     vst3_available,
@@ -11374,12 +11432,14 @@ impl NativeEguiOverlay {
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
+        self.last_drawn_panorama_projection_popup_rect = last_drawn_panorama_projection_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.last_drawn_shortcut_help_rect = last_drawn_shortcut_help_rect;
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
+        self.panorama_projection_popup_open = panorama_projection_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
         self.seek_strip_drag_origin = seek_strip_drag_origin;
@@ -12304,13 +12364,15 @@ mod tests {
         NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
         PreparedVideoScaleSettings, SEEK_STRIP_HEIGHT, VideoOrientation,
         VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
-        VideoVisualTargetRect, compare_pixel_probe, compute_video_visual_target_rect,
-        compute_video_visual_transform, compute_video_visual_transform_for_surface,
-        configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        draw_native_seek_strip, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
+        compute_video_visual_target_rect, compute_video_visual_transform,
+        compute_video_visual_transform_for_surface, configure_overlay_style,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key,
         immediate_native_wheel_command, metadata_clean_text, native_jump_panel_visible_from_inputs,
-        native_panel_callout_hud_rects, native_right_panel_visible_from_inputs,
-        native_touch_owned_panel_sides, native_touch_panel_handle_hud_rects,
+        native_panel_callout_hud_rects, native_panorama_projection_popup_hud_rect,
+        native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
+        native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
@@ -14180,6 +14242,37 @@ mod tests {
             VideoSurfaceContent::resolved(state.is_some()),
             VideoSurfaceContent::DisplayResolved
         );
+    }
+
+    #[test]
+    fn panorama_projection_popup_closes_when_panorama_or_video_context_disappears() {
+        let mut open = true;
+        assert!(close_panorama_projection_popup_for_context(
+            &mut open, false, false
+        ));
+        assert!(!open, "leaving 360 must close its owned popup");
+
+        open = true;
+        assert!(close_panorama_projection_popup_for_context(
+            &mut open, true, true
+        ));
+        assert!(!open, "audio-only mode must close video projection UI");
+
+        open = true;
+        assert!(!close_panorama_projection_popup_for_context(
+            &mut open, true, false
+        ));
+        assert!(open, "the popup stays open in an active 360 video context");
+    }
+
+    #[test]
+    fn panorama_projection_popup_rect_is_included_in_hud_input_capture() {
+        let drawn = egui::Rect::from_min_size(egui::pos2(840.0, 58.0), egui::vec2(360.0, 196.0));
+        let captured = native_panorama_projection_popup_hud_rect(true, Some(drawn))
+            .expect("an open drawn popup must publish a HUD input rect");
+        assert!(captured.contains_rect(drawn));
+        assert_eq!(captured, drawn.expand(4.0));
+        assert!(native_panorama_projection_popup_hud_rect(false, Some(drawn)).is_none());
     }
 
     #[test]

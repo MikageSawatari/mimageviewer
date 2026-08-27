@@ -656,6 +656,7 @@ pub enum NativeVideoOutputEvent {
     },
     TogglePanorama,
     CyclePanoramaProjection,
+    SetPanoramaProjection(crate::panorama::PanoProjection),
     ResetPanorama,
     TileSeek {
         target_secs: f64,
@@ -3624,6 +3625,9 @@ fn send_native_overlay_command(
         Command::PanoramaWheel { delta } => NativeVideoOutputEvent::PanoramaWheel { delta },
         Command::TogglePanorama => NativeVideoOutputEvent::TogglePanorama,
         Command::CyclePanoramaProjection => NativeVideoOutputEvent::CyclePanoramaProjection,
+        Command::SetPanoramaProjection(projection) => {
+            NativeVideoOutputEvent::SetPanoramaProjection(projection)
+        }
         Command::ResetPanorama => NativeVideoOutputEvent::ResetPanorama,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
@@ -5507,6 +5511,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::CyclePanoramaProjection,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetPanoramaProjection(projection) => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetPanoramaProjection(projection),
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ResetPanorama => {
@@ -11172,6 +11183,38 @@ mod tests {
         );
         assert!(output.drain_events().is_empty());
         assert!(!output.overlay_input_routing_snapshot().wants_keyboard_input);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn panorama_projection_selection_preserves_mode_through_overlay_event_routing() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            7,
+            crate::video::native_presenter::NativeOverlayCommand::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant,
+            ),
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            (
+                41,
+                super::NativeVideoOutputEvent::SetPanoramaProjection(
+                    crate::panorama::PanoProjection::Equidistant
+                )
+            )
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
