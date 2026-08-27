@@ -146,6 +146,14 @@ fn compile_video_presenter_shaders(fxc: Option<&std::path::Path>) {
                 ("ps_nearest", "ps_5_0"),
             ],
         ),
+        (
+            "src/video/native_presenter/shaders/video_panorama.hlsl",
+            &[
+                ("vs_main", "vs_5_0"),
+                ("ps_orient", "ps_5_0"),
+                ("ps_main", "ps_5_0"),
+            ],
+        ),
     ];
 
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));

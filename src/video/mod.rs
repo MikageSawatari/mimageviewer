@@ -1035,6 +1035,9 @@ enum NativeVideoOutputCommand {
     SetVideoGrade {
         grade: crate::creative_lut::VideoGradeSnapshot,
     },
+    SetPanoramaPose {
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    },
     StartAnime4kMeasurement,
     SetAnime4kState {
         budget: anime4k_policy::VideoAnime4kBudgetPreset,
@@ -1474,10 +1477,6 @@ impl<F> FramePresentationState<F> {
         Self::into_displaced(previous)
     }
 
-    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
-        self.should_represent_for_visual_change(render_grade_changed)
-    }
-
     fn should_represent_for_visual_change(&self, changed: bool) -> bool {
         changed && matches!(self, Self::Visible { .. })
     }
@@ -1501,7 +1500,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 31;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 32;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1537,6 +1536,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
         NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
+        NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2081,6 +2081,16 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVideoGrade { grade });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    fn set_panorama_pose(
+        &self,
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetPanoramaPose { panorama_pose });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
@@ -2955,7 +2965,12 @@ impl NativeFrameOutputContext {
 
     fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
         self.presentation
-            .should_represent_for_grade_change(render_grade_changed)
+            .should_represent_for_visual_change(render_grade_changed)
+    }
+
+    fn should_represent_for_visual_change(&self, changed: bool) -> bool {
+        self.presentation
+            .should_represent_for_visual_change(changed)
     }
 
     fn hide(&mut self) {
@@ -4046,6 +4061,10 @@ fn run_native_video_output(
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
     let mut cur_video_grade = config.video_grade.clone();
+    let mut cur_panorama_pose: Option<(
+        crate::panorama::PanoPose,
+        crate::panorama::PanoUvTransform,
+    )> = None;
     let mut cur_scale_filter = config.scale_filter;
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
@@ -4069,6 +4088,7 @@ fn run_native_video_output(
     let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_video_grade(cur_video_grade.clone())?;
+    presenter.set_panorama_pose(cur_panorama_pose)?;
     presenter.set_overlay_audio_only(config.audio_only);
     presenter.set_overlay_checked(config.checked);
     presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
@@ -4483,6 +4503,47 @@ fn run_native_video_output(
                         }
                         Err(error) => crate::logger::log(format!(
                             "[native-video] Creative LUT shader update failed: {error}"
+                        )),
+                    }
+                }
+                NativeVideoOutputCommand::SetPanoramaPose { panorama_pose } => {
+                    let changed = cur_panorama_pose != panorama_pose;
+                    cur_panorama_pose = panorama_pose;
+                    match presenter.set_panorama_pose(cur_panorama_pose) {
+                        Ok(()) => {
+                            if changed
+                                && source
+                                    .video_scale_state
+                                    .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
+                            if frame_output.should_represent_for_visual_change(changed)
+                                && !source.video_scale_state.has_desired()
+                            {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] panorama refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "[native-video] panorama pose update failed: {error}"
                         )),
                     }
                 }
@@ -5081,6 +5142,7 @@ fn run_native_video_output(
                             cur_vst3_available && placement.is_fullscreen_borderless(),
                         );
                         new_presenter.set_video_grade(cur_video_grade.clone())?;
+                        new_presenter.set_panorama_pose(cur_panorama_pose)?;
                         new_presenter.set_overlay_audio_only(config.audio_only);
                         new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
                         new_presenter.set_overlay_checked(cur_checked);
@@ -8800,6 +8862,16 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_panorama_pose(
+        &self,
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_panorama_pose(panorama_pose);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn start_native_anime4k_measurement(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.start_anime4k_measurement();
@@ -10651,23 +10723,23 @@ mod tests {
     }
 
     #[test]
-    fn frame_presentation_grade_change_requests_only_visible_represent() {
+    fn frame_presentation_visual_change_requests_only_visible_represent() {
         let mut state = super::FramePresentationState::Empty;
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
 
         assert!(state.replace_hidden("hidden").is_none());
         assert!(state.is_hidden());
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
 
         let _ = state.replace_visible("visible", 3);
-        assert!(state.should_represent_for_grade_change(true));
+        assert!(state.should_represent_for_visual_change(true));
     }
 
     #[test]
-    fn frame_presentation_unchanged_grade_does_not_request_idle_present() {
+    fn frame_presentation_unchanged_visual_state_does_not_request_idle_present() {
         let mut state = super::FramePresentationState::Empty;
         assert!(state.replace_visible("visible", 5).is_none());
-        assert!(!state.should_represent_for_grade_change(false));
+        assert!(!state.should_represent_for_visual_change(false));
     }
 
     #[test]
@@ -10678,7 +10750,7 @@ mod tests {
         state.hide();
 
         assert!(state.is_hidden());
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
         assert_eq!(state.frame(), Some(&"visible"));
     }
 
