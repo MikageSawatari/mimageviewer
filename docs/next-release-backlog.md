@@ -2928,6 +2928,35 @@ smart scope reconcile、reading-history reservation clear、bookmark return reco
 確認する。Folder / ZIP / PDF の3通常入口 + 明示 mode static site が `AddressBarNav::Direct` の common guard
 より前に caller-side effect を commit する既知の同型は、本 defect の funnel 内修正には含めていない。
 
+#### final P2 re-review — scope preflight と RAR generation swap ✅
+
+2026-08-27 修正。`claim_open_request_owner` は snapshot scope guard より前で、拒否される
+navigation でも進行中の archive conversion、未解決 startup open、競合 bookmark open を
+終了していた。navigation scope、snapshot active、`snapshot_internal_nav`、typed owner の
+source identity だけを読む純粋な `snapshot_scope_allows_open` へ判定を集約し、container
+dispatcher と pre-scan 対応 folder load の2入口では claim より前に実行する。common load の
+既存 guard も同じ述語を使う。cache path と source path は OR にせず、
+`MainGridArchiveTransitionIntent::source_path` が実 path を置き換える。ユーザー操作の拒否 effect は
+共通 helper 1箇所に置き、stale `pending_auto_fs_open` clear と既存 toast を1回だけ行う。
+
+dialog を隠して走る RAR direct-read 完了も、実 load / auto-fullscreen 予約 / smart-folder 認可より
+前に現在 snapshot で同じ preflight を再実行する。generation N の pin 中に始めた RAR が、解除と
+filter 変更を経た generation N+1 に含まれなければ旧完了を捨てる。これは現在のユーザー操作では
+ないため toast は出さず、通常ログだけを残す。`ArchiveConvertState` の Drop による cancel token、
+deferred fullscreen の `release_fs_nav_lock`、bookmark request cleanup は拒否 branch でも完了する。
+
+PDF の guard 非経由 route は password dialog の OK retry と detached descriptor だけだった。
+前者は `show_pdf_password_dialog` が common modal input blocker に入り、背面で snapshot の解除・
+filter 変更・再固定を行えない。後者は `DetachedPhysical` context である。現行 UI から同じ
+generation swap は到達不能なので、規則7に従い変更していない。
+
+回帰テストは両 claim 入口で archive request / cancel token を保持し、未解決 startup owner と
+競合 bookmark owner も保持すること、RAR generation swap が load を拒否しつつ state Drop と nav
+lock cleanup を終えること、current generation 内の RAR は通常どおり開くことを固定した。
+mutation は `move_scope_preflight_below_claim`、
+`omit_rar_direct_completion_scope_preflight`、
+`reject_all_rar_direct_completions_in_snapshot`。
+
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 
 `SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、

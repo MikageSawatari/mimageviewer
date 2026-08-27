@@ -18188,6 +18188,12 @@ impl App {
         auto_fullscreen: bool,
         owner: OpenRequestOwner,
     ) -> FolderOpenOutcome {
+        // Scope refusal must precede lifecycle adoption: claim_open_request_owner cancels an
+        // in-flight archive conversion, unresolved startup open, and conflicting bookmark open.
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return FolderOpenOutcome::Ignored;
+        }
         // Claim the visible-open lifecycle before dispatching by container type. In particular,
         // archive B must replace an in-flight archive A before request_* observes the old state.
         if !self.claim_open_request_owner(&path, &owner) {
@@ -18269,10 +18275,45 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
     ) {
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return;
+        }
         if !self.claim_open_request_owner(&path, &owner) {
             return;
         }
         self.load_folder_with_scan_claimed(path, pre_scan, owner);
+    }
+
+    /// Pure preflight for whether a visible open belongs to the current snapshot scope.
+    ///
+    /// A converted cache ZIP is an implementation alias. Main-grid archive requests therefore
+    /// use the source identity captured by their typed owner instead of the load path; the two
+    /// paths are deliberately not OR-ed because that would widen the pinned scope.
+    pub(crate) fn snapshot_scope_allows_open(&self, path: &Path, owner: &OpenRequestOwner) -> bool {
+        if self.navigation_scope.is_detached_physical()
+            || !self.is_snapshot_active()
+            || self.snapshot_internal_nav
+        {
+            return true;
+        }
+        let scope_path = match owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::Bookmark(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => path,
+        };
+        self.snapshot_owner_entry(scope_path).is_some()
+    }
+
+    /// Apply the user-visible effects of one refused open exactly once at its earliest boundary.
+    fn reject_snapshot_out_of_scope_open(&mut self) {
+        // A blocked load cannot consume an auto-fullscreen reservation. Clear any stale request
+        // so the next valid open does not unexpectedly enter fullscreen.
+        self.pending_auto_fs_open = false;
+        self.show_feedback_toast(
+            "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)".into(),
+        );
     }
 
     /// Acquire the right to perform a visible load before any format-specific dispatch.
@@ -18383,24 +18424,8 @@ impl App {
         // snapshot 範囲外なら cache の場所にかかわらず拒否される。
         // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
         // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
-        let snapshot_scope_path = match &owner {
-            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
-            _ => &path,
-        };
-        if !detached_physical
-            && self.is_snapshot_active()
-            && !self.snapshot_internal_nav
-            && self.snapshot_owner_entry(snapshot_scope_path).is_none()
-        {
-            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
-            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
-            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
-            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
-            self.pending_auto_fs_open = false;
-            self.show_feedback_toast(
-                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
-                    .into(),
-            );
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
             return;
         }
         // A converted cache ZIP is an implementation alias outside the source archive's smart

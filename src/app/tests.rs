@@ -5521,6 +5521,138 @@ mod startup_open_path_resolve_tests {
         ));
     }
 
+    fn activate_single_archive_snapshot(app: &mut App, source: &Path) {
+        app.current_folder = source.parent().map(Path::to_path_buf);
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.to_path_buf(),
+            format: ArchiveFormat::SevenZ,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.snapshot_owner_entry(source), Some(0));
+        app.fs_feedback_toast = None;
+    }
+
+    #[test]
+    fn snapshot_refusal_before_both_claim_sites_preserves_running_archive_open_owner() {
+        for through_container_dispatcher in [true, false] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(if through_container_dispatcher {
+                "dispatcher-running.7z"
+            } else {
+                "scan-running.7z"
+            });
+            std::fs::write(&source, b"archive source").unwrap();
+            activate_single_archive_snapshot(&mut app, &source);
+            let (_scan_tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
+            let owner_cancel = Arc::clone(
+                &app.archive_convert
+                    .as_ref()
+                    .expect("archive request must be installed")
+                    .cancel,
+            );
+            let current_before = app.current_folder.clone();
+            let outside = app.tmp.path().join(if through_container_dispatcher {
+                "outside-dispatcher"
+            } else {
+                "outside-scan"
+            });
+            std::fs::create_dir_all(&outside).unwrap();
+            app.pending_auto_fs_open = true;
+
+            if through_container_dispatcher {
+                assert_eq!(
+                    app.load_folder_or_convert_archive(outside),
+                    FolderOpenOutcome::Ignored
+                );
+            } else {
+                app.load_folder(outside);
+            }
+
+            assert_eq!(app.current_folder, current_before);
+            assert!(app.archive_convert.is_some(), "request owner was destroyed");
+            assert!(Arc::ptr_eq(&owner_cancel, &cancel));
+            assert!(!cancel.load(Ordering::Relaxed), "worker was cancelled");
+            assert!(!app.pending_auto_fs_open);
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+                toast.0.contains("スナップショット中は範囲外")
+            }));
+        }
+        // Mutation `move_scope_preflight_below_claim`: move either entry preflight back after
+        // claim_open_request_owner. The corresponding iteration loses archive_convert and sets
+        // its cancel token before the common guard refuses the load.
+    }
+
+    #[test]
+    fn snapshot_refusal_preserves_unresolved_startup_open_owner() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("startup-snapshot-member.7z");
+        std::fs::write(&source, b"archive source").unwrap();
+        activate_single_archive_snapshot(&mut app, &source);
+        let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: app.tmp.path().join("unresolved-startup-target"),
+            owner: StartupOpenPathOwner::Activation,
+            cancel: Arc::clone(&cancel),
+            rx: resolve_rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+        });
+        let outside = app.tmp.path().join("outside-startup-snapshot");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        app.load_folder(outside);
+
+        let pending = app
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .expect("refusal must preserve the unresolved startup owner");
+        assert!(Arc::ptr_eq(&pending.cancel, &cancel));
+        assert!(!cancel.load(Ordering::Relaxed));
+        // Mutation `move_scope_preflight_below_claim`: the claim drops the resolver and sets this
+        // token before the inner snapshot guard refuses the visible load.
+    }
+
+    #[test]
+    fn snapshot_refusal_preserves_conflicting_bookmark_open_owner() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("bookmark-snapshot-member.7z");
+        std::fs::write(&source, b"archive source").unwrap();
+        activate_single_archive_snapshot(&mut app, &source);
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(701);
+        let bookmark_path = app.tmp.path().join("still-resolving-bookmark.pdf");
+        arm_book_bookmark(
+            &mut app,
+            request_id,
+            bookmark_path.clone(),
+            std::time::Instant::now(),
+        );
+        let outside = app.tmp.path().join("outside-bookmark-snapshot");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        app.load_folder(outside);
+
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
+        assert_eq!(
+            app.bookmark_view_target(),
+            Some(&crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                bookmark_path
+            ))
+        );
+        // Mutation `move_scope_preflight_below_claim`: the claim treats this destination as a
+        // conflicting navigation and clears both bookmark request and return state.
+    }
+
     #[test]
     fn replacing_scanning_archive_bookmark_cancels_old_scan() {
         let mut app = setup_app();
@@ -56339,6 +56471,62 @@ mod smart_folder_transition_tests {
         app.selected = Some(0);
     }
 
+    fn install_pending_direct_rar_completion(
+        app: &mut App,
+        source: &Path,
+        with_deferred_fullscreen: bool,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deferred_fullscreen = with_deferred_fullscreen.then(|| {
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                restore_video_tile: false,
+                reopen: DeferredFsReopen {
+                    history_trigger: crate::app::HistoryTrigger::UserChosen,
+                    resume_slideshow: false,
+                    target: DeferredFsTarget::None,
+                    resume_to_last_page: false,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            }
+        });
+        if with_deferred_fullscreen {
+            app.fs_nav_locked_gen = Some(app.items_generation);
+        }
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: source.to_path_buf(),
+            input_seq: app.input_seq,
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::clone(&cancel),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: Some(source.to_path_buf()),
+            allow_direct_read: true,
+            fallback_cached_zip: None,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    MainGridArchiveTransitionIntent {
+                        source_path: source.to_path_buf(),
+                        reading_history_return_from: None,
+                        suppress_rating_filter: false,
+                        suppress_facet_filter: false,
+                        smart_folder_drill: false,
+                    },
+                ),
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        cancel
+    }
+
     fn wait_for_snapshot_archive_listing(app: &mut App, cached: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
@@ -56574,6 +56762,101 @@ mod smart_folder_transition_tests {
         // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
         // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
         // mounted instead of opening the completed archive.
+    }
+
+    #[test]
+    fn rar_direct_completion_generation_swap_refuses_stale_source_and_cleans_up() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-generation-swap");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale_source = root.join("generation-n.rar");
+        let current_source = root.join("generation-n-plus-one.rar");
+        std::fs::write(&stale_source, b"stale rar").unwrap();
+        std::fs::write(&current_source, b"current rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: stale_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: current_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        let generation_n = app.snapshot.as_ref().unwrap().generation_id;
+        let cancel = install_pending_direct_rar_completion(&mut app, &stale_source, true);
+
+        app.deactivate_snapshot();
+        assert!(app.archive_convert.is_some());
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.visible_indices = vec![1];
+        app.selected = Some(1);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::RatingFilter {
+            active_levels: vec![5],
+        });
+        assert!(app.snapshot.as_ref().unwrap().generation_id > generation_n);
+        assert_eq!(app.snapshot_owner_entry(&stale_source), None);
+        assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
+        app.fs_feedback_toast = None;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(!app.fs_nav_is_locked());
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+        // Mutation `omit_rar_direct_completion_scope_preflight`: remove the completion check.
+        // The stale RAR becomes current, starts enumeration, and retains the deferred nav lock.
+    }
+
+    #[test]
+    fn rar_direct_completion_in_current_snapshot_opens_normally() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-current-generation");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("in-scope.rar");
+        std::fs::write(&source, b"direct rar").unwrap();
+        app.current_folder = Some(root);
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_owner_entry(&source), Some(0));
+        let cancel = install_pending_direct_rar_completion(&mut app, &source, false);
+        app.fs_feedback_toast = None;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert!(app.zip_enumerate_pending.is_some());
+        assert!(app.is_snapshot_active());
+        assert!(app.fs_feedback_toast.is_none());
+        // Mutation `reject_all_rar_direct_completions_in_snapshot`: make the new preflight branch
+        // unconditional while a snapshot is active. This test leaves the parent folder mounted
+        // and never creates zip_enumerate_pending.
     }
 
     #[test]

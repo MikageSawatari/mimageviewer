@@ -803,10 +803,31 @@ impl App {
                     return;
                 }
             }
+            let open_owner = completion.open_owner();
+            if let Some(owner) = open_owner.as_ref()
+                && !self.snapshot_scope_allows_open(&src, owner)
+            {
+                // The user may have replaced snapshot generation N while the hidden direct-read
+                // probe was running. This is a stale asynchronous completion, not a current user
+                // action, so discard it without surfacing the normal scope-refusal toast.
+                crate::logger::log(format!(
+                    "archive direct completion refused by current snapshot scope source={}",
+                    src.display()
+                ));
+                if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                    self.cancel_bookmark_open_request(
+                        owner.request_id,
+                        "archive_direct_navigation_outside_snapshot_scope",
+                    );
+                }
+                if deferred.is_some() {
+                    self.release_fs_nav_lock();
+                }
+                return;
+            }
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
-            let open_owner = completion.open_owner();
             if let Some(owner) = open_owner.as_ref() {
                 self.prepare_main_grid_archive_transition_for_load(owner, &src);
             }

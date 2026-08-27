@@ -1424,6 +1424,41 @@ Folder / ZIP / PDF の通常到達3入口と明示 container mode static site �
 caller-side effect、および guard を持たない内部 `load_zip_as_folder_with_input_seq` /
 `load_pdf_as_folder` continuation は §2 規則7に従い変更せず、backlog §1.131 に残した。
 
+**2026-08-27 snapshot scope preflight を open lifecycle claim 前と RAR direct 完了へ共有
+(backlog §1.131 final P2 re-review、利用者提示の ClaudeCode re-review と Codex の
+lifecycle / generation inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の2つの visible-load claim 入口、純粋な
+`snapshot_scope_allows_open`、common load guard、
+[src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs) の RAR direct-read 完了、
+[src/app/tests.rs](../src/app/tests.rs) の request ownership / generation swap 回帰テスト、backlog
+§1.131 の記録。detached predicate、viewport / HWND / placement / focus / epoch、context registry / mount、
+grid selection / paste / new-folder は変更していない。
+
+**不変条件と判断理由**: snapshot scope 拒否は visible-open lifecycle の採用より前でなければならない。
+`claim_open_request_owner` は archive conversion、未解決 startup open、競合 bookmark open を終了するため、
+後段 common guard の拒否では「stale auto-fullscreen clear と toast 以外を変えない」という前項の契約を
+守れない。navigation scope、snapshot active、既存 `snapshot_internal_nav`、typed owner identity だけを読む
+純粋述語へ判定を一元化し、container dispatcher と pre-scan folder load の双方で claim より前に呼ぶ。
+common guard も同じ述語を防衛的に再利用する。`MainGridArchiveTransitionIntent::source_path` は load path を
+置き換え、OR による scope 拡張はしない。ユーザー操作の拒否 effect は共通 helper 1箇所に置き、各入口は
+拒否後に内側へ進まないため toast は1操作につき1回である。新しい App-level state、時間窓、retry、
+repaint、reset は追加していない。
+
+**非同期完了とスコープ外**: dialog を隠して走る RAR direct completion は、generation N の解除後に
+filter を変えて generation N+1 を固定できるため到達可能だった。実 load / auto-fullscreen / smart 認可より
+前に同じ述語を再実行し、現在 snapshot 外なら toast なしで旧完了を捨てる。state Drop の cancel token、
+deferred fullscreen の `release_fs_nav_lock`、bookmark owner cleanup は拒否時も完了する。PDF の guard 非経由
+retry は password dialog が common modal input blocker で背面 snapshot 操作を止め、もう一方は
+`DetachedPhysical` descriptor open なので、現行 UI から同じ generation swap は到達不能と確認し、§2 規則7に
+従って変更していない。
+
+**回帰証明と mutation**: 両 claim 入口で進行中 archive request と cancel token、別テストで未解決 startup
+owner と競合 bookmark owner が拒否後も生存する。RAR は current snapshot 外の generation swap 完了が
+current folder / enumerate を変えず state Drop と nav lock cleanup を終える一方、scope 内完了は通常どおり
+開く。`move_scope_preflight_below_claim`、`omit_rar_direct_completion_scope_preflight`、
+`reject_all_rar_direct_completions_in_snapshot` の各 mutation で対応 assertion が失敗する。
+
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
 mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**
