@@ -5415,6 +5415,7 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            held_resolve_for_activation_admission: None,
         });
         (tx, cancel)
     }
@@ -5537,6 +5538,46 @@ mod startup_open_path_resolve_tests {
         app.fs_feedback_toast = None;
     }
 
+    fn activate_archive_and_folder_snapshot(app: &mut App, source: &Path, folder: &Path) {
+        app.current_folder = source.parent().map(Path::to_path_buf);
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: source.to_path_buf(),
+                format: ArchiveFormat::SevenZ,
+            },
+            GridItem::Folder(folder.to_path_buf()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.snapshot_owner_entry(source), Some(0));
+        assert_eq!(app.snapshot_owner_entry(folder), Some(1));
+        app.fs_feedback_toast = None;
+    }
+
+    fn poll_activation_resolve_until_decided(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.activation_open_resolve_holds_prior_completion()
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_startup_open_path_resolve(ctx);
+            std::thread::yield_now();
+        }
+        assert!(
+            !app.activation_open_resolve_holds_prior_completion(),
+            "activation resolver did not complete"
+        );
+    }
+
+    fn show_archive_convert_dialog_frame(app: &mut App, ctx: &egui::Context) {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+    }
+
     #[test]
     fn snapshot_refusal_before_both_claim_sites_preserves_running_archive_open_owner() {
         for through_container_dispatcher in [true, false] {
@@ -5602,6 +5643,7 @@ mod startup_open_path_resolve_tests {
             rx: resolve_rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            held_resolve_for_activation_admission: None,
         });
         let outside = app.tmp.path().join("outside-startup-snapshot");
         std::fs::create_dir_all(&outside).unwrap();
@@ -5777,29 +5819,314 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
-    fn activation_cancels_normal_archive_scan_before_path_resolution() {
+    fn admitted_snapshot_activation_holds_stale_archive_bookmark_completion_until_supersede() {
         let mut app = setup_app();
-        let source = app.tmp.path().join("activation-normal-scan.7z");
-        let (tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
-        let activation = app.tmp.path().join("activation-after-normal-scan");
+        app.settings.detached_viewer_open_images_in_window = false;
+        let source = app.tmp.path().join("activation-admitted-book.7z");
+        let cached = app.tmp.path().join("activation-admitted-book.zip");
+        let activation = app.tmp.path().join("activation-admitted-destination");
+        std::fs::write(&source, b"7z").unwrap();
+        std::fs::write(&cached, []).unwrap();
         std::fs::create_dir_all(&activation).unwrap();
+        activate_archive_and_folder_snapshot(&mut app, &source, &activation);
+        let before = app.current_folder.clone();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(702);
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, cancel) = install_bookmark_archive_transition(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+            },
+        );
+        let ctx = egui::Context::default();
 
         app.start_startup_open_path_resolve(
-            activation,
+            activation.clone(),
             StartupOpenPathSource::Activation,
-            &egui::Context::default(),
+            &ctx,
         );
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_some());
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+                cached.clone(),
+                0,
+            ))),
+        )
+        .unwrap();
+        show_archive_convert_dialog_frame(&mut app, &ctx);
+
+        assert_eq!(app.current_folder, before);
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .is_some_and(|state| state.pending_nav.as_deref() == Some(cached.as_path())),
+            "stale completion must be held in its owner while activation is unresolved"
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.bookmark_open_pending.is_some());
+
+        poll_activation_resolve_until_decided(&mut app, &ctx);
 
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.archive_convert.is_none());
-        assert!(
-            tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
-                    crate::archive_converter::ConvertError::Cancelled,
-                ))
-            )
-            .is_err()
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &activation
+        ));
+        // Mutation: replace the archive completion gate predicate with false. The first
+        // current_folder/pending_nav assertions observe the stale completion landing.
+    }
+
+    #[test]
+    fn refused_snapshot_activation_releases_held_archive_bookmark_completion() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let source = app.tmp.path().join("activation-refused-book.7z");
+        let cached = app.tmp.path().join("activation-refused-book.zip");
+        let outside = app.tmp.path().join("activation-refused-outside");
+        std::fs::write(&source, b"7z").unwrap();
+        std::fs::write(&cached, []).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        activate_single_archive_snapshot(&mut app, &source);
+        let before = app.current_folder.clone();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(703);
+        let owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
         );
+        let (tx, cancel) = install_bookmark_archive_transition(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            owner,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+            },
+        );
+        app.pending_auto_fs_open = true;
+        let ctx = egui::Context::default();
+
+        app.start_startup_open_path_resolve(outside, StartupOpenPathSource::Activation, &ctx);
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+                cached.clone(),
+                0,
+            ))),
+        )
+        .unwrap();
+        show_archive_convert_dialog_frame(&mut app, &ctx);
+        assert!(app.archive_convert.is_some());
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        poll_activation_resolve_until_decided(&mut app, &ctx);
+
+        assert_eq!(app.current_folder, before);
+        assert!(app.pending_auto_fs_open);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
+        assert!(app.bookmark_view_state.is_some());
+        assert!(app.fs_feedback_toast.is_some());
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .is_some_and(|state| state.pending_nav.as_deref() == Some(cached.as_path()))
+        );
+
+        show_archive_convert_dialog_frame(&mut app, &ctx);
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(crate::folder_tree::path_eq(
+            app.current_folder.as_deref().unwrap(),
+            &cached
+        ));
+        assert_bookmark_is_awaiting_page(&app);
+        assert!(app.bookmark_view_state.is_some());
+        // Mutation: change the defer predicate to false. Activation immediately drops both
+        // owners, so the send or the pre-refusal alive assertions fail.
+    }
+
+    #[test]
+    fn refused_snapshot_activation_resumes_held_bookmark_resolver() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = false;
+        let source = app.tmp.path().join("activation-held-bookmark.pdf");
+        let outside = app.tmp.path().join("activation-held-bookmark-outside");
+        std::fs::write(&source, b"not a real pdf").unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        app.current_folder = source.parent().map(Path::to_path_buf);
+        app.items = vec![GridItem::PdfFile(source.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.fs_feedback_toast = None;
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(704);
+        arm_book_bookmark(
+            &mut app,
+            request_id,
+            source.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone()),
+            source.clone(),
+        );
+        app.pending_auto_fs_open = true;
+        let ctx = egui::Context::default();
+
+        app.start_startup_open_path_resolve(outside, StartupOpenPathSource::Activation, &ctx);
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        tx.send(StartupOpenPathResolveResult {
+            requested: source.clone(),
+            resolved: Some(crate::folder_tree::OpenablePathResolution {
+                path: source.clone(),
+                kind: crate::folder_tree::OpenablePathKind::File,
+                requested_is_file: true,
+            }),
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+        })
+        .expect("held resolver receiver must remain owned");
+
+        poll_activation_resolve_until_decided(&mut app, &ctx);
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.pending_auto_fs_open);
+        assert!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Bookmark(_)))
+        );
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
+
+        app.poll_startup_open_path_resolve(&ctx);
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|(path, _, _)| crate::folder_tree::path_eq(path, &source))
+        );
+        assert_bookmark_is_awaiting_page(&app);
+        // Mutation: replace Some(Box::new(pending)) with None in Activation adoption. The
+        // resolver token is cancelled and the completion send fails.
+    }
+
+    #[test]
+    fn snapshot_activation_holds_bookmark_landing_polls_until_admission() {
+        {
+            let mut app = setup_app();
+            let member = app.tmp.path().join("activation-media-gate.7z");
+            let outside = app.tmp.path().join("activation-media-gate-outside");
+            std::fs::write(&member, b"7z").unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            activate_single_archive_snapshot(&mut app, &member);
+            let request_id = crate::bookmark_browser::BookmarkOpenRequestId(705);
+            let target = app.tmp.path().join("activation-media-gate.mp4");
+            arm_media_bookmark(
+                &mut app,
+                request_id,
+                target,
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            );
+            let ctx = egui::Context::default();
+            app.start_startup_open_path_resolve(outside, StartupOpenPathSource::Activation, &ctx);
+
+            app.poll_bookmark_media_open(&ctx);
+
+            assert_eq!(
+                app.bookmark_open_pending
+                    .as_ref()
+                    .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+                Some(request_id)
+            );
+            drop(app.startup_open_path_resolve_pending.take());
+            app.poll_bookmark_media_open(&ctx);
+            assert!(app.bookmark_open_pending.is_none());
+        }
+
+        {
+            let mut app = setup_app();
+            let member = app.tmp.path().join("activation-book-gate.7z");
+            let outside = app.tmp.path().join("activation-book-gate-outside");
+            std::fs::write(&member, b"7z").unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            activate_single_archive_snapshot(&mut app, &member);
+            let request_id = crate::bookmark_browser::BookmarkOpenRequestId(706);
+            let target = app.tmp.path().join("activation-book-gate.pdf");
+            arm_book_bookmark(
+                &mut app,
+                request_id,
+                target,
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            );
+            let ctx = egui::Context::default();
+            app.start_startup_open_path_resolve(outside, StartupOpenPathSource::Activation, &ctx);
+
+            app.poll_bookmark_book_open(&ctx);
+
+            assert_eq!(
+                app.bookmark_open_pending
+                    .as_ref()
+                    .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+                Some(request_id)
+            );
+            drop(app.startup_open_path_resolve_pending.take());
+            app.poll_bookmark_book_open(&ctx);
+            assert!(app.bookmark_open_pending.is_none());
+        }
+        // Mutations: remove the early return in either bookmark poll. The corresponding expired
+        // request is cancelled by its timeout before admission.
     }
 
     #[test]
@@ -6184,6 +6511,7 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
             toast_shown: false,
+            held_resolve_for_activation_admission: None,
         });
 
         let ctx = egui::Context::default();
@@ -6213,6 +6541,7 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            held_resolve_for_activation_admission: None,
         });
 
         let ctx = egui::Context::default();

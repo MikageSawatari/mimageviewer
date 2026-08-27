@@ -2992,10 +2992,13 @@ Codex の修正の半分が消えたままになった** (→ マーカーを残
 
 - 規模 \\ 優先度: — (完了)。
 
-### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 未対応
+### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 解消済み
 
 - 出典: 2026-08-27、§1.132 (v3.3.0 出荷前レビュー) の追加確認で Codex が発見。
   **v3.3.0 出荷前に閉じる対象**。
+
+#### 解消前の原因記録
+
 
 [startup_ops.rs](../src/app/startup_ops.rs) の Activation 分岐は、**パス解決と
 snapshot scope 判定より前に無条件で** `cancel_archive_convert_for_navigation` を呼ぶ:
@@ -3007,7 +3010,7 @@ if matches!(source, StartupOpenPathSource::Activation) {
 
 したがって「**範囲外 Activation → 変換が先に死ぬ → その後 navigation は拒否**」
 が成立する。SendTo / 二重起動で踏める。`3aaa4659` で入れた preflight は
-UI producer の claim だけを覛っており、**この経路は覛えていない**。
+UI producer の claim だけを対象としており、**この経路は対象外だった**。
 
 #### ⚠ 単に削除してはいけない
 
@@ -3019,6 +3022,25 @@ UI producer の claim だけを覛っており、**この経路は覛えてい�
 scope admission の後で supersede を確定させる**こと。そうしないと、早期
 キャンセル導入前の race が戻る。
 
+#### 解消内容
+
+snapshot 非 active では拒否 gate がないため従来の到着時 cancel を維持する。snapshot
+active のときだけ supersede を scope admission 後へ defer し、既存の typed
+StartupOpenPathResolvePending::owner = Activation を未 admission owner として使う。
+先行 bookmark resolver は同 pending 内へ所有移動し、archive の pending navigation と
+bookmark の media / page landing は Activation 解決中も破棄せず各 typed state 内に保持する。
+
+範囲外なら toast だけを出して resolver / conversion / bookmark と timeout clock を復元し、
+範囲内なら既存 claim_open_request_owner が初めて旧 owner を cancel する。拒否前には
+folder history、fs navigation lock、pending_auto_fs_open、bookmark view state を動かさない。
+bookmark-owned cache ZIP は BookmarkOpenRequestOwner::target の source identity で scope
+admission し、cache path との OR で snapshot 範囲を拡張しない。
+
+変換 race を固定していた旧テストは
+admitted_snapshot_activation_holds_stale_archive_bookmark_completion_until_supersede
+へ変形し、未解決中の stale completion 非着地と admission 後の cancel の両方を維持した。
+拒否側、held resolver、media / book landing も独立テストで固定した。
+
 #### 手動再現 (Codex 提示)
 
 1. キャッシュ未作成で変換に時間のかかる大きめの 7z をフォルダ A に置く
@@ -3026,9 +3048,13 @@ scope admission の後で supersede を確定させる**こと。そうしない
 3. A の一覧を ★固定 (7z が member、B が範囲外)
 4. 「確認せず変換」で 7z を開き、進捗ウィンドウが出るまで待つ
 5. **その最中に SendTo / 二重起動で B を既存インスタンスへ転送**
-6. 現状: 進捗ウィンドウが消えて変換がキャンセルされ、その後 B が範囲外として拒否される
+6. 修正後: B は範囲外 toast で拒否されるが、進捗ウィンドウと bookmark lifecycle は
+   生存する。Activation 解決中に変換が完了しても表示へ先着せず、拒否確定後に元の
+   7z / bookmark open が通常どおり続行して cache ZIP / page wait へ進む
+7. 対照確認として B を snapshot member にして同じ操作を行うと、scope admission 後に
+   Activation が勝ち、変換 / bookmark は cancel されて B へ移動する
 
-- 規模 \\ 優先度: Small 〜 Medium / **P2 (v3.3.0 出荷前)**。
+- 規模 \\ 優先度: — (**P2 解消、v3.3.0 出荷前 gate 完了**)。
 
 ### 1.134 common modal がツールバー / メニューバーのポインターナビを止めていない — 未対応
 

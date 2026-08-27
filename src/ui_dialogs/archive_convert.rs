@@ -733,10 +733,15 @@ impl App {
             return;
         }
 
-        if self
-            .archive_convert
-            .as_ref()
-            .is_some_and(|state| state.pending_direct_nav.is_some())
+        // Keep polling and rendering progress while a snapshot-gated Activation resolves, but
+        // hold every completion payload in the typed archive state until admission decides
+        // which owner may navigate the visible surface.
+        let hold_navigation_completion = self.activation_open_resolve_holds_prior_completion();
+        if !hold_navigation_completion
+            && self
+                .archive_convert
+                .as_ref()
+                .is_some_and(|state| state.pending_direct_nav.is_some())
         {
             let mut state = self
                 .archive_convert
@@ -887,10 +892,11 @@ impl App {
             return;
         }
 
-        if let Some(output) = self
-            .archive_convert
-            .as_mut()
-            .and_then(|state| state.pending_sibling_output.take())
+        if !hold_navigation_completion
+            && let Some(output) = self
+                .archive_convert
+                .as_mut()
+                .and_then(|state| state.pending_sibling_output.take())
         {
             self.archive_convert = None;
             let output_name = output
@@ -913,10 +919,11 @@ impl App {
         }
 
         // 変換完了後のナビゲーション処理 (別フィールドに移動して state を Drop)
-        if let Some(nav) = self
-            .archive_convert
-            .as_mut()
-            .and_then(|s| s.pending_nav.take())
+        if !hold_navigation_completion
+            && let Some(nav) = self
+                .archive_convert
+                .as_mut()
+                .and_then(|s| s.pending_nav.take())
         {
             // ConvertDone 受信時に `exists()` は通過しているが、pending_nav 消費までの
             // 短い間隔で並行 maintenance (clear_all/delete_entry) が先に削除する順序レースが

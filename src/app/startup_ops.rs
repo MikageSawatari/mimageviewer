@@ -36,10 +36,14 @@ impl App {
             ));
             return;
         };
+        let defer_activation_supersede =
+            matches!(source, StartupOpenPathSource::Activation) && self.is_snapshot_active();
         // A forwarded activation is a new navigation request as soon as it is received. Do not
         // let an archive conversion owned by the currently opening bookmark win the race while
-        // the activation path is still being resolved on its worker.
-        if matches!(source, StartupOpenPathSource::Activation) {
+        // the activation path is still being resolved on its worker. Snapshot lock is the one
+        // exception: scope admission can still refuse the request, so its supersede is deferred
+        // and completion-side consumers hold the prior owner's result instead.
+        if matches!(source, StartupOpenPathSource::Activation) && !defer_activation_supersede {
             self.cancel_archive_convert_for_navigation("activation_navigation");
             if let Some(request_id) = self
                 .bookmark_open_pending
@@ -49,15 +53,34 @@ impl App {
                 self.cancel_bookmark_open_request(request_id, "activation_navigation");
             }
         }
-        if let Some(pending) = self.startup_open_path_resolve_pending.take() {
-            crate::logger::log(format!(
-                "startup open: cancel pending resolve source={} requested={}",
-                pending.owner.perf_tag(),
-                pending.requested.display()
-            ));
-            let previous_owner = pending.owner.clone();
-            drop(pending);
-            self.finish_replaced_startup_open_owner(previous_owner, "resolver_replaced");
+        let mut held_resolve_for_activation_admission = None;
+        if let Some(mut pending) = self.startup_open_path_resolve_pending.take() {
+            if defer_activation_supersede {
+                if matches!(pending.owner, StartupOpenPathOwner::Activation) {
+                    crate::logger::log(format!(
+                        "startup open: replace pending activation resolve requested={}",
+                        pending.requested.display()
+                    ));
+                    self.defer_current_bookmark_open_timeout_by(pending.elapsed());
+                    held_resolve_for_activation_admission =
+                        pending.held_resolve_for_activation_admission.take();
+                    drop(pending);
+                } else {
+                    crate::logger::log(format!(
+                        "startup open: hold pending resolve for activation admission source={} requested={}",
+                        pending.owner.perf_tag(),
+                        pending.requested.display()
+                    ));
+                    held_resolve_for_activation_admission = Some(Box::new(pending));
+                }
+            } else {
+                crate::logger::log(format!(
+                    "startup open: cancel pending resolve source={} requested={}",
+                    pending.owner.perf_tag(),
+                    pending.requested.display()
+                ));
+                self.finish_replaced_startup_open_pending(pending, "resolver_replaced");
+            }
         }
 
         let (tx, rx) = mpsc::channel();
@@ -98,14 +121,23 @@ impl App {
                     rx,
                     started_at: std::time::Instant::now(),
                     toast_shown: false,
+                    held_resolve_for_activation_admission,
                 });
             }
             Err(e) => {
                 crate::logger::log(format!(
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
+                let resolve_started_at = std::time::Instant::now();
                 let result = resolve_startup_open_path(requested, source, bookmark.as_ref());
-                self.finish_startup_open_path_resolve(owner, result, ctx);
+                let held_duration = resolve_started_at.elapsed();
+                self.finish_startup_open_path_resolve_with_held(
+                    owner,
+                    result,
+                    held_resolve_for_activation_admission,
+                    held_duration,
+                    ctx,
+                );
             }
         }
     }
@@ -118,10 +150,18 @@ impl App {
 
         match recv {
             Ok(result) => {
-                let pending = self.startup_open_path_resolve_pending.take().unwrap();
+                let mut pending = self.startup_open_path_resolve_pending.take().unwrap();
                 let owner = pending.owner.clone();
+                let held = pending.held_resolve_for_activation_admission.take();
+                let held_duration = pending.elapsed();
                 drop(pending);
-                self.finish_startup_open_path_resolve(owner, result, ctx);
+                self.finish_startup_open_path_resolve_with_held(
+                    owner,
+                    result,
+                    held,
+                    held_duration,
+                    ctx,
+                );
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -143,8 +183,10 @@ impl App {
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                let pending = self.startup_open_path_resolve_pending.take().unwrap();
+                let mut pending = self.startup_open_path_resolve_pending.take().unwrap();
                 let owner = pending.owner.clone();
+                let held = pending.held_resolve_for_activation_admission.take();
+                let held_duration = pending.elapsed();
                 crate::logger::log(format!(
                     "startup open: resolve worker disconnected source={} requested={}",
                     owner.perf_tag(),
@@ -157,6 +199,8 @@ impl App {
                 } else {
                     if let StartupOpenPathOwner::Bookmark(owner) = owner {
                         self.cancel_bookmark_open_request(owner.request_id, "resolve_disconnected");
+                    } else if matches!(source, StartupOpenPathSource::Activation) {
+                        self.resume_activation_held_open(held, held_duration);
                     }
                     self.show_feedback_toast("パスの確認を完了できませんでした".to_string());
                 }
@@ -165,10 +209,28 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn finish_startup_open_path_resolve(
         &mut self,
         owner: StartupOpenPathOwner,
         result: StartupOpenPathResolveResult,
+        ctx: &egui::Context,
+    ) {
+        self.finish_startup_open_path_resolve_with_held(
+            owner,
+            result,
+            None,
+            std::time::Duration::ZERO,
+            ctx,
+        );
+    }
+
+    fn finish_startup_open_path_resolve_with_held(
+        &mut self,
+        owner: StartupOpenPathOwner,
+        result: StartupOpenPathResolveResult,
+        held: Option<Box<StartupOpenPathResolvePending>>,
+        held_duration: std::time::Duration,
         ctx: &egui::Context,
     ) {
         if !self.startup_open_path_owner_is_current(&owner) {
@@ -180,6 +242,27 @@ impl App {
             return;
         }
         let source = owner.source();
+        if matches!(source, StartupOpenPathSource::Activation) {
+            match result.resolved.as_ref() {
+                None => self.resume_activation_held_open(held, held_duration),
+                Some(resolution)
+                    if !self.snapshot_scope_allows_open(
+                        &resolution.path,
+                        &owner.open_request_owner(),
+                    ) =>
+                {
+                    crate::logger::log(format!(
+                        "startup open: activation refused before supersede requested={} resolved={}",
+                        result.requested.display(),
+                        resolution.path.display()
+                    ));
+                    self.resume_activation_held_open(held, held_duration);
+                    self.show_snapshot_out_of_scope_open_feedback();
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
         if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner
             && result.bookmark_relative_page_openable == Some(false)
         {
@@ -209,6 +292,59 @@ impl App {
                 "startup open: activation open failed for {requested_display}"
             ));
             self.show_feedback_toast("開けるパスが見つかりませんでした".to_string());
+        }
+    }
+
+    /// An unresolved Activation is the typed completion gate for the request it may supersede.
+    /// The common no-snapshot path still cancels immediately, so this predicate adds no delay
+    /// there; it only keeps deferred snapshot owners from landing before admission is known.
+    pub(crate) fn activation_open_resolve_holds_prior_completion(&self) -> bool {
+        self.startup_open_path_resolve_pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation))
+    }
+
+    fn resume_activation_held_open(
+        &mut self,
+        held: Option<Box<StartupOpenPathResolvePending>>,
+        held_duration: std::time::Duration,
+    ) {
+        self.defer_current_bookmark_open_timeout_by(held_duration);
+        let Some(held) = held else {
+            return;
+        };
+        crate::logger::log(format!(
+            "startup open: resume held resolve after activation refusal source={} requested={}",
+            held.owner.perf_tag(),
+            held.requested.display()
+        ));
+        debug_assert!(self.startup_open_path_resolve_pending.is_none());
+        self.startup_open_path_resolve_pending = Some(*held);
+    }
+
+    fn defer_current_bookmark_open_timeout_by(&mut self, duration: std::time::Duration) {
+        let Some(pending) = self.bookmark_open_pending.as_mut() else {
+            return;
+        };
+        match pending {
+            crate::bookmark_browser::PendingBookmarkOpen::Media(pending) => {
+                if let Some(resumed_at) = pending.started_at.checked_add(duration) {
+                    pending.started_at = resumed_at;
+                }
+            }
+            crate::bookmark_browser::PendingBookmarkOpen::Book(pending) => {
+                if let Some(resumed_at) = pending.started_at.checked_add(duration) {
+                    pending.started_at = resumed_at;
+                }
+                if let crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
+                    started_at,
+                    ..
+                } = &mut pending.stage
+                    && let Some(resumed_at) = started_at.checked_add(duration)
+                {
+                    *started_at = resumed_at;
+                }
+            }
         }
     }
 
@@ -274,6 +410,20 @@ impl App {
         }
     }
 
+    fn finish_replaced_startup_open_pending(
+        &mut self,
+        mut pending: StartupOpenPathResolvePending,
+        reason: &'static str,
+    ) {
+        let held = pending.held_resolve_for_activation_admission.take();
+        let owner = pending.owner.clone();
+        drop(pending);
+        self.finish_replaced_startup_open_owner(owner, reason);
+        if let Some(held) = held {
+            self.finish_replaced_startup_open_pending(*held, reason);
+        }
+    }
+
     /// A normal navigation supersedes an unresolved startup/activation/bookmark open. The
     /// resolver is removed before its receiver can be polled; bookmark-owned state is cleared
     /// only when its request ID is still current.
@@ -286,9 +436,7 @@ impl App {
             pending.owner.perf_tag(),
             pending.requested.display()
         ));
-        let owner = pending.owner.clone();
-        drop(pending);
-        self.finish_replaced_startup_open_owner(owner, "normal_navigation");
+        self.finish_replaced_startup_open_pending(pending, "normal_navigation");
     }
 
     /// Once resolution has completed, page enumeration/player setup may still be pending. A
@@ -330,8 +478,29 @@ impl App {
                         ) if current == request_id
                     )
                 });
+        let held_resolver_matches = self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .and_then(|pending| pending.held_resolve_for_activation_admission.as_deref())
+            .is_some_and(|held| {
+                matches!(
+                    held.owner,
+                    StartupOpenPathOwner::Bookmark(
+                        crate::bookmark_browser::BookmarkOpenRequestOwner {
+                            request_id: current,
+                            ..
+                        }
+                    ) if current == request_id
+                )
+            });
         if resolver_matches {
             drop(self.startup_open_path_resolve_pending.take());
+        } else if held_resolver_matches {
+            drop(
+                self.startup_open_path_resolve_pending
+                    .as_mut()
+                    .and_then(|pending| pending.held_resolve_for_activation_admission.take()),
+            );
         }
         let archive_matches = self.cancel_archive_convert_for_bookmark_request(request_id);
         let pending_matches = self
@@ -339,7 +508,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id);
         if !pending_matches {
-            return resolver_matches || archive_matches;
+            return resolver_matches || held_resolver_matches || archive_matches;
         }
         crate::logger::log(format!(
             "[bookmark-open] finish request id={} reason={reason}",

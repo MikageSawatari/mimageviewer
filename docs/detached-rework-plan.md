@@ -1453,6 +1453,49 @@ retry は password dialog が common modal input blocker で背面 snapshot 操�
 `DetachedPhysical` descriptor open なので、現行 UI から同じ generation swap は到達不能と確認し、§2 規則7に
 従って変更していない。
 
+**2026-08-27 §1.133 解消追記**: 直下の警告は発見時点の未修正範囲を残す履歴であり、
+現在は次の構造修正で外部 Activation も覆う。
+
+**触った範囲**: [src/app/startup_ops.rs](../src/app/startup_ops.rs) の Activation resolver
+ownership / admission、[src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs)
+の completion consume gate、[src/app.rs](../src/app.rs) の bookmark landing gate と
+snapshot owner identity、[src/app/tests.rs](../src/app/tests.rs) の Activation / archive /
+bookmark lifecycle 回帰テスト。detached predicate、viewport / HWND / placement / focus /
+epoch、context registry / mount、grid selection / paste / new-folder は変更していない。
+
+**不変条件と構造**: snapshot 中の外部 Activation は、worker path resolve が返るまでは
+scope admission の成否が不明なので、到着時点では archive conversion と bookmark open
+を supersede しない。既存の StartupOpenPathResolvePending::owner = Activation を
+未 admission の typed owner とし、同時に存在できない resolver だけを同 pending の
+held_resolve_for_activation_admission へ Box で所有移動する。新しい App-level bool /
+Option sentinel、時間窓、debounce、retry は追加していない。snapshot が非 active の場合は
+拒否 gate が存在しないため、従来どおり到着時に即 cancel する。
+
+archive worker の progress / message は通常どおり poll するが、pending_nav /
+pending_direct_nav 等の completion payload は Activation owner が未解決の間は typed state
+内に保持する。bookmark の media seek / book page landing も同じ owner predicate で保持する。
+結果は破棄しない。Activation が current snapshot scope 外なら held resolver と timeout
+clock を復元し、archive / bookmark completion を通常経路へ戻す。scope 内なら既存の
+claim_open_request_owner がその時点で初めて旧 owner と cancel token を終了する。
+bookmark-owned converted cache ZIP は実装 alias なので、scope 判定は cache path ではなく
+BookmarkOpenRequestOwner::target の source identity を用い、OR で範囲を拡張しない。
+
+**拒否時 effect**: Activation は gate 前に folder history、fs navigation lock、
+pending_auto_fs_open、bookmark view state のいずれも変更しない。したがって拒否は toast
+だけを出し、通常 navigation 用 reject helper の stale auto-fullscreen clear は行わない。
+held archive state が持つ nav_history_rollback / deferred fs lock も消費せず、拒否後の通常
+completion または後続の明示 cancel に同じ owner のまま委ねる。
+
+**回帰証明と mutation**: admitted_snapshot_activation_holds_stale_archive_bookmark_completion_until_supersede
+は未解決中の stale completion が main surface へ着地せず、admission 後に旧 archive /
+bookmark が終了することを固定する。refused_snapshot_activation_releases_held_archive_bookmark_completion
+は範囲外拒否後に同じ conversion と bookmark が cache ZIP open / page wait まで完了することを固定する。
+refused_snapshot_activation_resumes_held_bookmark_resolver と
+snapshot_activation_holds_bookmark_landing_polls_until_admission は resolver、media、book の
+各 completion owner を固定する。各 gate / defer / held-owner adoption の1行 mutation で
+対応テストが独立に失敗する。
+
+**以下は解消前の監査記録であり、現在形の未対応警告ではない:**
 ⚠ **2026-08-27 追記 — 範囲の説明が不正確だった**: この修正が覆うのは UI producer の claim 入口だけで、**外部 Activation は覆えていない** ([startup_ops.rs](../src/app/startup_ops.rs) が path 解決と scope 判定より前に無条件で変換を cancel する)。backlog §1.133 として起票。単に削除すると早期 cancel が防いでいた race が戻るため、Activation に request ownership / 世代を持たせ scope admission の後で supersede を確定させること。
 
 **回帰証明と mutation**: 両 claim 入口で進行中 archive request と cancel token、別テストで未解決 startup

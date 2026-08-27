@@ -2852,6 +2852,9 @@ pub(crate) struct StartupOpenPathResolvePending {
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
     started_at: std::time::Instant,
     toast_shown: bool,
+    /// A snapshot-gated Activation temporarily owns the resolver it displaced. If the
+    /// Activation is refused, this exact request (receiver and cancel token included) resumes.
+    held_resolve_for_activation_admission: Option<Box<StartupOpenPathResolvePending>>,
 }
 
 impl StartupOpenPathResolvePending {
@@ -18287,9 +18290,9 @@ impl App {
 
     /// Pure preflight for whether a visible open belongs to the current snapshot scope.
     ///
-    /// A converted cache ZIP is an implementation alias. Main-grid archive requests therefore
-    /// use the source identity captured by their typed owner instead of the load path; the two
-    /// paths are deliberately not OR-ed because that would widen the pinned scope.
+    /// A converted cache ZIP is an implementation alias. Main-grid archive and bookmark requests
+    /// therefore use the source identity captured by their typed owner instead of the load path;
+    /// the two paths are deliberately not OR-ed because that would widen the pinned scope.
     pub(crate) fn snapshot_scope_allows_open(&self, path: &Path, owner: &OpenRequestOwner) -> bool {
         if self.navigation_scope.is_detached_physical()
             || !self.is_snapshot_active()
@@ -18299,9 +18302,11 @@ impl App {
         }
         let scope_path = match owner {
             OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
-            OpenRequestOwner::Navigation
-            | OpenRequestOwner::Bookmark(_)
-            | OpenRequestOwner::DetachedGridArchive(_) => path,
+            OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
+                crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
+                | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
+            },
+            OpenRequestOwner::Navigation | OpenRequestOwner::DetachedGridArchive(_) => path,
         };
         self.snapshot_owner_entry(scope_path).is_some()
     }
@@ -18311,6 +18316,12 @@ impl App {
         // A blocked load cannot consume an auto-fullscreen reservation. Clear any stale request
         // so the next valid open does not unexpectedly enter fullscreen.
         self.pending_auto_fs_open = false;
+        self.show_snapshot_out_of_scope_open_feedback();
+    }
+
+    /// Activation performs its scope check before creating an auto-fullscreen reservation.
+    /// Its refusal must therefore leave a reservation owned by the request it temporarily held.
+    fn show_snapshot_out_of_scope_open_feedback(&mut self) {
         self.show_feedback_toast(
             "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)".into(),
         );
@@ -30383,6 +30394,10 @@ impl App {
         else {
             return;
         };
+        if self.activation_open_resolve_holds_prior_completion() {
+            return;
+        }
+
         if pending.started_at.elapsed() > std::time::Duration::from_secs(30) {
             let current_item = self
                 .fullscreen_idx
@@ -30477,6 +30492,10 @@ impl App {
         else {
             return;
         };
+        if self.activation_open_resolve_holds_prior_completion() {
+            return;
+        }
+
         let (started_at, mut entered_archive_prefix) = match &pending.stage {
             crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
                 started_at,
