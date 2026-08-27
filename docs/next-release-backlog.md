@@ -3285,6 +3285,52 @@ admitted_snapshot_activation_holds_stale_archive_bookmark_completion_until_super
 
 - 規模 \\ 優先度: Medium / P3 (出荷ブロッカーではない)。
 
+### 1.136 detached placement のテストが、実機のモニター配置に依存して揺れる — 未対応
+
+- 出典: 2026-08-27、video-strip セッションがちらつき調査中に見つけ、
+  `docs/detached-close-flicker-handoff.md` §8 で引き継いだもの。同資料は「壊れているのでは
+  なく揺れている」と正しく区別した上で、**何が揺らしているかは未特定**としていた。
+
+```
+app::tests::still_window_mode_key_tests::detached_builder_placement_latch_does_not_follow_live_drag_updates
+```
+
+実行ごとに結果が変わる (単独実行で FAILED → 直後に 3 回連続 ok、フル実行でも両方あり)。
+失敗時の値は `{x:80, y:80, w:960, h:720}` = 設定既定。
+
+#### 原因 (2026-08-27 特定)
+
+**共有状態でも実行順でもなく、テストが実機のディスプレイ構成を見ている。**
+
+`set_detached_window_runtime_placement` は `detached_window_runtime_placement_is_usable` を通らない
+placement を **無言で return** する ([app.rs](../src/app.rs) `runtime_placement_rejected` は
+debug ログのみ)。その判定は:
+
+```rust
+placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
+```
+
+`title_bar_on_some_monitor` ([monitor.rs:61](../src/monitor.rs:61)) は **`MonitorFromPoint` を
+`MONITOR_DEFAULTTONULL` で直接呼ぶ**。テスト用の差し替えは無い。
+
+テストの `initial` は `x:1564, y:240.66667, w:1167` なので、検査点は
+**(2147, 255)** 。ここがどのモニターにも乗らない瞬間 (ディスプレイのスリープ /
+構成変更 / DPI 変更 / ロックなど) に実行されると placement が保存されず、
+`active_detached_seed_placement` の `unwrap_or_else` が設定既定へ落ちる。
+**観測された失敗値と一致する。**
+
+#### 直す方向
+
+- latch の振る舞いを見るテストが OS 問い合わせを通るのが問題。
+  `title_bar_on_some_monitor` にテスト override を与えるか、placement 検証を注入可能にする。
+- **無言の拒否を残さない**。`set_detached_window_runtime_placement` の拒否は debug ログだけなので、
+  探す側には何も見えない。型で返すか、少なくともテストから見える形にする。
+- 同形の依存が他のテストにも無いかを見る (`title_bar_on_some_monitor` /
+  `MonitorFromPoint` / モニター列挙を通る検証全般)。
+
+- 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
+  **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
