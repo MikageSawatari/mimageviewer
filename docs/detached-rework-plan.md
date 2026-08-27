@@ -1453,6 +1453,8 @@ retry は password dialog が common modal input blocker で背面 snapshot 操�
 `DetachedPhysical` descriptor open なので、現行 UI から同じ generation swap は到達不能と確認し、§2 規則7に
 従って変更していない。
 
+⚠ **2026-08-27 追記 — 範囲の説明が不正確だった**: この修正が覆うのは UI producer の claim 入口だけで、**外部 Activation は覆えていない** ([startup_ops.rs](../src/app/startup_ops.rs) が path 解決と scope 判定より前に無条件で変換を cancel する)。backlog §1.133 として起票。単に削除すると早期 cancel が防いでいた race が戻るため、Activation に request ownership / 世代を持たせ scope admission の後で supersede を確定させること。
+
 **回帰証明と mutation**: 両 claim 入口で進行中 archive request と cancel token、別テストで未解決 startup
 owner と競合 bookmark owner が拒否後も生存する。RAR は current snapshot 外の generation swap 完了が
 current folder / enumerate を変えず state Drop と nav lock cleanup を終える一方、scope 内完了は通常どおり

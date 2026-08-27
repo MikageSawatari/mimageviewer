@@ -2992,6 +2992,64 @@ Codex の修正の半分が消えたままになった** (→ マーカーを残
 
 - 規模 \\ 優先度: — (完了)。
 
+### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 未対応
+
+- 出典: 2026-08-27、§1.132 (v3.3.0 出荷前レビュー) の追加確認で Codex が発見。
+  **v3.3.0 出荷前に閉じる対象**。
+
+[startup_ops.rs](../src/app/startup_ops.rs) の Activation 分岐は、**パス解決と
+snapshot scope 判定より前に無条件で** `cancel_archive_convert_for_navigation` を呼ぶ:
+
+```rust
+if matches!(source, StartupOpenPathSource::Activation) {
+    self.cancel_archive_convert_for_navigation("activation_navigation");
+```
+
+したがって「**範囲外 Activation → 変換が先に死ぬ → その後 navigation は拒否**」
+が成立する。SendTo / 二重起動で踏める。`3aaa4659` で入れた preflight は
+UI producer の claim だけを覛っており、**この経路は覛えていない**。
+
+#### ⚠ 単に削除してはいけない
+
+この早期キャンセルは「Activation の解決中に、古い bookmark / archive completion が
+表示へ着地する race」を防ぐために入っている (コメントに明記あり、
+既存テストも「Activation は解決前にキャンセルする」を固定している)。
+
+正しい形は **Activation に request ownership / 世代を持たせ、
+scope admission の後で supersede を確定させる**こと。そうしないと、早期
+キャンセル導入前の race が戻る。
+
+#### 手動再現 (Codex 提示)
+
+1. キャッシュ未作成で変換に時間のかかる大きめの 7z をフォルダ A に置く
+2. 範囲外のフォルダ B を用意する
+3. A の一覧を ★固定 (7z が member、B が範囲外)
+4. 「確認せず変換」で 7z を開き、進捗ウィンドウが出るまで待つ
+5. **その最中に SendTo / 二重起動で B を既存インスタンスへ転送**
+6. 現状: 進捗ウィンドウが消えて変換がキャンセルされ、その後 B が範囲外として拒否される
+
+- 規模 \\ 優先度: Small 〜 Medium / **P2 (v3.3.0 出荷前)**。
+
+### 1.134 common modal がツールバー / メニューバーのポインターナビを止めていない — 未対応
+
+- 出典: 2026-08-27、§1.133 の調査中に Codex が発見。**archive convert 固有ではなく、
+  全 common-modal window に関わる入力ゲートの不統一**。
+
+`common_modal_dialog_open` に登録された window は、キーボードショートカット /
+グリッド open / 背面 wheel / フルスクリーン入力を止めるが、**ツールバーの
+お気に入りボタンなどのポインターナビは止まらない** (`any_dialog_open()` で
+無効化されていない)。
+
+変換進捗ウィンドウ表示中でもお気に入りクリックでナビできるのはこれが原因。
+これ自体は §1.133 の修正対象ではない (preflight が拒否するので安全) が、
+**モーダルの意味が入力種別で違う**のは設計として不揃い。
+
+⚠ `archive_convert` を `archive_convert.is_some()` で一括登録するのは**誤り**。
+意図的に非表示にしている `Scanning` 中まで操作不能になる。現行の
+`archive_convert_dialog_visible()` 経由の登録が正しい。
+
+- 規模 \\ 優先度: Medium / P3 (出荷ブロッカーではない)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
