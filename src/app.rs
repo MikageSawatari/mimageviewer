@@ -37118,6 +37118,18 @@ impl App {
             crate::logger::log(format!(
                 "[ui-fonts] schedule main font atlas resync: {reason}"
             ));
+        } else {
+            // A second producer arriving while a resync is pending resets the repeat count
+            // below, and said nothing. That matters for the A/B: closing a detached video
+            // window can raise both `detached_viewer_cleanup` and
+            // `native_video_backdrop_hide`, so a one-shot experiment could still show five
+            // discarded passes and be read as a failed experiment rather than a re-arm.
+            crate::logger::log(format!(
+                "[ui-fonts] re-arm main font atlas resync: {reason} \
+                 (pending reason={}, repeats_left={})",
+                self.main_font_atlas_resync_reason.unwrap_or("none"),
+                self.main_font_atlas_resync_repeats_left
+            ));
         }
         self.main_font_atlas_resync_pending = true;
         // close 直後の 1 フレームだけメインウィンドウの wgpu surface が消えて full upload が
