@@ -1457,6 +1457,33 @@ passive detached は通常どおり release で窓を activate するが、選�
      事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
      もう一度 open として解釈している」が第一候補だが、**未確定**。
   3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
+- ⚠ **2026-08-27 訂正: 上の方針 1 の前提はもう成り立たない。**
+  「no-surface early return で full upload が捨てられる」ことを前提に「捨てたことを型で
+  記録する」と書いてあるが、**捨てられなくなっている**。painter 側で 2026-08-14 に根治済み:
+  - `ce6616ef` delta の適用を surface 取得より **前** へ移した
+  - `e4a52d39` 誰も描かないフレームでも eframe が texture を渡すようにした
+  - `0b645861` その配送をトランザクション化した
+
+  `begin_delivery` ([winit.rs](../vendor/egui-wgpu/src/winit.rs)) は `render_state` があれば
+  surface の有無に関係なく適用し、`render_state` は構築時以外 `None` に戻らない。
+  detached teardown が prune するのは viewport / surface だけで、`Painter` は全 viewport 共有
+  (Codex が read-only レビューで独立に確認)。surface 不在での full replacement を固定する
+  テストも既にある (`paint_and_update_textures_delivers_set_and_free_without_surface`)。
+
+  → **「捨てたことを記録する」機構は作る必要が無い。5 回の再発行は現状ほぼ vestigial** で、
+  `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES` を入れた `e09c83d9` (2026-06-18) の理由は 2 か月後に
+  消えている。その上に積んだ `d48982e5` (detached cleanup を保守経路へ戻した判断) も
+  同じ前提の上にあるので、合わせて見直す。
+- ⚠ **ちらつきへの因果はまだ確定していない。** 破棄フレームとの相関は取れているが、
+  利用者のキャプチャでは **デスクトップ全体と他アプリまで** 塗り直されており、これは
+  top-level HWND の破棄・focus / z-order 変更・DComp presenter detach による DWM の再合成で
+  説明が付く。**破棄を減らすと停止時間は縮むが、閃光は残る可能性がある。**
+  計器 `[ui-frame-gap]` / `[atlas-probe]` (`2f514a2d`) と再アームログ (`65e90871`) を入れた
+  A/B ビルドで分離する。
+- 別セッションからの引き継ぎ資料: `docs/detached-close-flicker-handoff.md` (video-strip worktree)。
+  同じ機構を「ちらつき vs フォント崩れのトレードオフ」として記述しているが、上の訂正により
+  **トレードオフではなくなっている**。同資料の見立て「再同期が毎フレーム自分を再予約している」
+  は外れで、回数は定数 5 そのもの (同資料も未確認と明記していた)。
 - **初回推定 (最大化後の追試で訂正): 再現条件は「設定」ではなく「実行時の状態」**
   (2026-08-23 追記、利用者の settings.db を読んで確認):
   報告者の永続設定は `detached_viewer_enabled=false` / `detached_viewer_open_images_in_window=false` /
