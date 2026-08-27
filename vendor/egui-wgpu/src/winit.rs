@@ -722,8 +722,8 @@ impl Painter {
 
 /// mIV probe: report every font-atlas delta and the outcome it was delivered under, so the
 /// A/B measurement for the detached-close flicker can show whether an upload really does
-/// survive a surface-less frame. `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES` in src/app.rs exists
-/// because it once did not. Temporary -- remove with the measurement.
+/// survive a surface-less frame. The caller repeat that once stood in for this ownership
+/// guarantee has been removed; keep the probe through the follow-up measurement.
 fn probe_atlas_delivery(
     site: &str,
     textures_delta: &epaint::textures::TexturesDelta,

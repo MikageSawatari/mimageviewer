@@ -43,8 +43,8 @@ fail-closed する。
    - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive/ZipDir — 全体走査、
      ZIP セントラルディレクトリ読み、または ZIP 内 prefix の代表解決が必要。PdfFile は PDF ワーカー IPC なので通常キュー)
    - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
-     通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン cleanup や
-     font atlas resync で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
+     通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン中の
+     early return で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
 4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `LoadSourcePolicy::SourceOnly` で再要求 → 高品質デコード。ただし、`make_load_request` が親コンテナや手動ピンを最終 target へ解決した後も `SourceOnly` を保つ要求だけを upgrade queue へ入れる。編集プレビューと、動画ピンから seed された完成済み WebP キャッシュは元画像から改善できない派生画像なので対象外。特に動画ピン要求は `apply_folder_thumb_pin` が意図的に `CacheOrSource` へ変換し、アイドル高画質化へ投入しないことでフォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定した idx は現在の Loaded サムネイル / viewer context に紐づけて記憶し、repaint ごとの pin 解決も行わない。この記憶は新しい items 世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する。`--perf-log` 時は最終判定を `thumb.idle_upgrade_enqueue` / `thumb.idle_upgrade_ineligible` として記録し、同一 key / idx / items 世代の反復をリリース前 `idle-health` 検査で拒否する
    - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
      親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
@@ -58,27 +58,29 @@ fail-closed する。
      enqueue が確実に enqueue できるようにする。BS で 1 段ずつ戻ると境界をまたがず発生しにくいが、
      ESC 直帰では再現性が高かった。
 
-### 1.2.1 黒サムネ回帰 (v1.8.0) と font-atlas-resync 窓での upload 先送り
+### 1.2.1 黒サムネ回帰 (v1.8.0) と texture delta 配送境界
 
 **症状 (v1.8.0 で発生 / v1.7.0 では起きない)**: フルスクリーン (静止画 / PDF ページ) を
 Esc / BS で閉じてグリッドへ戻った直後、一部のサムネが**真っ黒**になり ~0.5 秒固着する
 (その後アイドル高画質化の再レンダで自然回復)。
 
-**原因**: v1.8.0 のフルスクリーン viewport cleanup (`show_viewport_immediate` +
-`Visible(false)` + recreate) により、**close 直後の 1 フレームだけメインウィンドウの
-wgpu surface が消える**。その frame に `ctx.load_texture` で queue したテクスチャ upload
-(delta) は eframe の `paint_and_update_textures` の no-surface early return で**捨てられる**。
-font atlas は `main_font_atlas_resync` が数フレーム再 upload して救済していたが、**同じ窓で
-作られた grid サムネのテクスチャは upload だけ捨てられて `ThumbnailState::Loaded` のまま
-残る** → GPU データ空 = `draw_thumb_texture` の黒 backdrop だけが描かれる。テクスチャの
-**中身は正常** (perf 計装 `thumb/suspect_black` で 0 件確認) で、純粋に GPU upload が落ちただけ。
+**旧原因**: v1.8.0 のフルスクリーン viewport cleanup (`show_viewport_immediate` +
+`Visible(false)` + recreate) では、`ctx.load_texture` が生成した texture delta を eframe / painter の
+早期 return が捨てる境界があった。CPU 側だけが `ThumbnailState::Loaded` へ進み、GPU に中身が無い
+ため `draw_thumb_texture` の黒 backdrop だけが描かれた。2026-06-19 には暫定的に font atlas resync
+中の upload を `texture_backlog` へ先送りしていた。
 
-**修正 (2026-06-19, `poll_thumbnails`)**: `main_font_atlas_resync_pending` が立っている間は
-サムネのテクスチャ化を `texture_backlog` へ**先送り**し、surface が戻ってから upload する。
-ColorImage は破棄せず保持するので数フレーム遅れて正しく表示される (黒化しない)。
-perf イベント `thumb/upload_deferred_for_resync` で先送り件数を記録。font atlas 側の
-resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで待つ」方針を
-ユーザーテクスチャにも広げた形。
+**根本修正 (2026-08-14) と暫定策の撤去 (2026-08-27)**: `Painter` は presentation surface を
+調べる前に delta を共有 renderer へ適用し、eframe も `egui_ctx.run()` 後に viewport / window が
+消えていた 4 つの早期 return で `Painter::apply_textures_delta` を呼ぶ。したがって、生成済み delta は
+「描画されない frame でも renderer へ一度だけ配送する」という所有境界で守られる。2026-08-27 の
+実機計測でも font-atlas delta は全件 `site=paint outcome=Submitted` で、`SurfaceAbsent`、
+`no_paint` site、`RenderStateAbsent` は 0 件だった。
+
+この配送契約に caller 側の時間窓を重ねる理由は無くなったため、`poll_thumbnails` は resync 状態を
+見ず、ready になった `ColorImage` を通常の frame upload 上限内で直ちに texture 化する。
+`texture_backlog` は frame ごとの upload 上限だけを表す。回帰は caller の 4 early-return site、
+painter の no-surface delivery、viewport cleanup 中にも thumbnail upload を遅らせないテストで固定する。
 
 ### 1.3 ワーカー側の流れ
 
@@ -509,113 +511,68 @@ viewport が現在デスクトップへ付いてくる症状を避けるため�
 HWND は main HWND と同じ仮想デスクトップへ best-effort で同期する。動画 fullscreen は
 native presenter 経路であり、この egui viewport 同期の対象外。
 
-複数 viewport を閉じる / 作り直す直後は、egui の shared texture namespace と viewport ごとの
-renderer 側 font atlas texture のサイズが一時的にずれることがある。実機では、日本語フォルダ名の
-描画タイミングで `Queue::write_texture` が高さ 32 の古い font atlas texture に `Y 29..44`
-の部分 glyph update を送り、フォント崩れ後に wgpu validation panic するログを確認した。
+複数 viewport の close / recreate では、過去に CPU 側 font atlas と renderer texture の
+サイズがずれ、日本語フォルダ名の部分 glyph upload (`Y 29..44`) が古い高さ 32 の texture を
+越えて validation panic した。この原因は viewport teardown そのものではなく、生成済みの
+full atlas delta を配送前の早期 return が捨てていたことだった。
 
-> **2026-08-14 根本修正**: このずれが起きる境界を特定して塞いだ。
-> **不変条件は「生成されたフレームは、描画されなくても texture delta を必ず渡す」**。
-> egui は delta を `Context::end_pass` で `TextureManager` から**取り出して一度だけ渡す**ので、
-> 捨てられた full atlas 置換は二度と来ない。CPU 側 egui は拡張後の atlas で描き続け、
-> GPU 側は 32px のまま残り、次の部分 glyph upload が拒否される。
-> texture は renderer の共有 namespace にあり presentation surface を必要としない。
->
-> 落ちていた箇所は **2 層あった**:
->
-> 1. `Painter::paint_and_update_textures` (`vendor/egui-wgpu/src/winit.rs`) が
->    **surface 無し viewport の早期 return を `textures_delta.set` の適用より手前に持っていた**。
->    → surface 参照より前に適用する形へ変更
-> 2. **より手前**: `vendor/eframe/src/native/wgpu_integration.rs` が `egui_ctx.run()` の
->    戻り値を受け取った後、`viewports.get_mut()` と `window` / `egui_winit` の
->    パターン束縛で **4 箇所の早期 return** を持ち、そこで `textures_delta` ごと捨てていた。
->    直前で `remove_viewports_not_in` が該当 viewport を消すため、
->    **fullscreen viewport の作り直しと native video presenter への引き渡しが正にこの経路**。
->    → `Painter::apply_textures_delta` を追加し、4 箇所すべてで渡してから return する
->
-> ⚠ **1 だけを直したビルドで再発した**。1 は painter の中の話で、この経路では
-> **painter が呼ばれないまま delta が消える**ため効かない。
-> 症状が同じでも、落ちている層が違えば直らない。
-> **同じ境界が「サムネイルが純黒で固着する」形でも出ていた** (v1.8.0 回帰、
-> `poll_thumbnails` 側で resync 窓中の upload を先送りする形で回避していた)。
-> 下記の resync は本修正後も残すが、役割は「保険」であって正しさの担保ではない。
-> 実機では resync が 5 世代連続で回った末に上記 panic に至っており、
-> **リトライ回数では防げない**ことが確認できている。
-`Visible(false)` で fullscreen/detached viewport を隠した経路では
-`request_main_font_atlas_resync` を立て、`configure_fonts_for_texture_resync` で font atlas を
-full upload から再開させる。通常の `configure_fonts` は定義が同一だと egui が再読み込みを
-省略するため、未使用の一意な font family marker を混ぜて強制リロードさせる。
-v2.7.0 の UI フォント変更も同じ経路を使う。resync は固定の既定定義ではなく
-`Settings.ui_font` に対応する準備済み定義へ marker を加えるため、切り替え直後や
-detached cleanup 後に既定フォントへ戻らない。
+**2026-08-14 の根本修正**は、所有境界を次の 2 層で閉じた。
 
-`configure_fonts_for_texture_resync` の `set_fonts` は egui 仕様で「次 pass の begin_pass で
-適用」されるため、フル atlas アップロードが効く前にメイン UI を描くと上記 panic が再発する。
-`maybe_defer_for_main_font_atlas_resync` は、`should_defer_main_paint_for_font_atlas_resync` が
-true を返す全 resync 経路 (`detached_viewer_cleanup` / `fullscreen_viewport_cleanup` /
-`native_video_backdrop_hide` / `fullscreen_viewport_recreate` / `still_window_mode`) で `ctx.request_discard()` を使って
-その pass を破棄し、egui の
-**同一 OS フレーム内 multi-pass** (`max_passes`=2) で `update()` を再走させる。次 pass の
-begin_pass で新フォントが適用され、フル atlas アップロードがメイン UI 描画より前に入る。
-破棄された pass は paint されないので黒/空白フレームは出ず、2 度目の pass は入力 events が空
-(`RawInput::take` 済み) なので close / ナビ等の入力起因処理も二重発火しない。`will_discard()`
-が false (multi-pass 予算なし) の稀なケースだけ、従来どおりこの pass の描画を飛ばして次フレーム
-で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup も、メイン UI を stale
-font atlas のまま描くとフォント崩れが残ることがあるため、同じ保守経路へ乗せる。
+1. `Painter::paint_and_update_textures` は surface の有無を調べる前に
+   `textures_delta.set` / `free` を共有 renderer へ適用する。
+2. `vendor/eframe/src/native/wgpu_integration.rs` は `egui_ctx.run()` 後に
+   viewport / window / egui-winit state が消えていた 4 つの早期 return でも
+   `Painter::apply_textures_delta` を呼ぶ。
 
-ただし `request_discard` を使う font atlas resync は、その pass で描かれた
-`show_viewport_immediate` の child viewport を egui 側で未描画扱いにし、passive detached
-window の OS 窓を破棄→再生成させることがある。したがって active / passive detached viewport
-が 1 つでも生きている間は、`detached_viewer_cleanup` だけでなく
-`fullscreen_viewport_cleanup` / `native_video_backdrop_hide` /
-`fullscreen_viewport_recreate` / `still_window_mode` も同じ pending resync に合流させ、
-`detached_cleanup_font_atlas_resync_is_safe()` が真になるまで実際の resync を遅延する。
-pending は最初の reason を保持し、detached が完全 idle になった時点でその reason のまま
-`request_main_font_atlas_resync` を発火する。
+egui は delta を `Context::end_pass` で一度だけ取り出すため、不変条件は
+**「生成された frame は、描画されなくても texture delta を renderer へ必ず一度渡す」**である。
+painter 内だけを直した build では caller が painter を呼ばない境界で再発したため、両層が必要。
+この契約は font atlas と thumbnail の双方を同じ場所で保護する。
+
+**2026-08-27 の所有境界再監査**では、main の egui viewport 群は同じ `Context` /
+`Painter` / `render_state` と renderer texture namespace を共有し、detached viewport の
+破棄は font atlas texture を所有も破棄もしないことを確認した。native video presenter は
+独自の `egui::Context` と `egui_wgpu::Renderer` を持ち、main atlas の再発行先ではない。
+presenter は生成時に現在の `Settings.ui_font` で自分の font definitions を構成する。
+
+実機計測では全 atlas delta が `site=paint outcome=Submitted` で、surface-less frame へ
+当たった発行は 0 件だった。一方、旧 `native_video_backdrop_hide` が F12 toggle ごとに
+5 frame の discard を作り、`detached_viewer_cleanup` は先行 pending を re-arm しただけの
+場合にも同じ時間窓を延長していた。したがって `d48982e5` で採用した「cleanup は stale atlas
+を避けるため保守経路へ乗せる」という判断の前提は、delta を落とす配送バグの修正と実測によって
+失効した。
+
+なお、`hide_embedded_still_viewport_if_shown` のコメントには 2026-06-18 時点の実機観測として
+「動画 backdrop 用 resync の相乗りが main atlas 破損の発火源だった」と書かれていた。
+この観測自体は今の理解と矛盾しない。resync は full atlas の realloc を強制するので、
+**落とされると致命的になる大きな delta を作っていたのは resync そのもの**だった。
+つまり当時の帰属 (「相乗りが発火源」) は機構としては正しく、欠けていたのは
+「なぜその delta が届かないのか」という配送側の問いだった。2026-08-14 の修正で配送が保証され、
+2026-08-27 に resync 自体を撤去したことで、同じ破損の登場経路が両端から閉じている。
+
+現在は `detached_viewer_cleanup`、`fullscreen_viewport_cleanup`、
+`native_video_backdrop_hide`、`fullscreen_viewport_recreate`、
+`still_window_mode` のいずれも font work を発行しない。固定 repeat、marker を加えた full
+reload、`request_discard` / repass、安全待ち、thumbnail upload 先送りも持たない。
+viewport lifecycle の font firing 数は **0** が契約であり、1 回または acknowledgement 待ちではない。
 
 **緩和策: クリア色をテーマ連動にする (`App::clear_color` / `main_window_clear_color`)**。
-上記「1 フレーム黒」フォールバック、および detached 窓 close 直後の no-surface フレームで
-メインウィンドウ surface に見えるのは eframe 既定の `clear_color` 値だが、これは
+detached 窓 close 直後の DWM / top-level HWND 再合成中にメインウィンドウ surface の地として
+見える eframe 既定の `clear_color` 値は
 near-black `(12,12,12, a=180)` 固定。ダークテーマでは panel_fill と馴染むが、ライトテーマでは
 「一瞬黒」が目立つ (再現性が高いのは `auto_fullscreen_zip_pdf` ON で PDF を直接フルスクリーンに
 開き、Esc → `pending_return_to_parent` で親フォルダを `load_folder_or_convert_archive` 再読込する
 経路。重い再読込が描画スキップフレームを安定して踏む)。`eframe::App::clear_color` を
 オーバーライドして `visuals.panel_fill` (= メニューバー / パネル背景) を不透明で返すことで、
-ライト/ダークどちらでも地と馴染ませる。これは **font atlas resync の defer 自体には触れない緩和策**
-であり、上記の「stale font atlas で描かない = フォント崩れ回避」の保守トレードオフはそのまま維持する
-(= 根本修正ではなく、黒の視認性だけを下げる)。回帰ガードは `main_window_clear_color_follows_theme_panel_fill`。
+ライト/ダークどちらでも地と馴染ませる。これは font atlas の正しさとは独立した表示緩和で、
+top-level HWND teardown の再合成自体を消すものではない。回帰ガードは
+`main_window_clear_color_follows_theme_panel_fill`。
 
-静止画の F11 / ホバーバーボタンで専用 fullscreen viewport から in-window 表示へ戻す経路は、
-最初の embedded 描画がメイン `egui::Context` で走る。古い fullscreen viewport を隠した後に
-resync を予約すると 1 フレームだけ stale font atlas でメイン UI を描いてしまうため、
-`toggle_still_window_mode` で `still_window_mode` resync を先に予約する。
-
-#### resync は数フレーム再発行する (close 直後の ROOT surface 欠落対策)
-
-2026-06-18 に、マルチモニタで「画像フルスクリーン → ウィンドウに戻る」と **メインウィンドウの
-UI 文字 (ツールバー・情報オーバーレイ等) が 100% 文字化けし、フォルダ移動で直る** 再発不具合を
-egui-wgpu への一時計装で根因特定した:
-
-- フルスクリーンを閉じる際、egui の shared font atlas は near-full から fresh atlas へ
-  recreate されて **縮む** (例: 高さ 64 → 32)。これは `pos=None` の full(realloc) delta を生む。
-- ところがその **同じ 1 フレームだけ、メインウィンドウ (ROOT viewport) の wgpu surface が
-  一時的に消えており** (close / cloak / DWM 遷移中)、`egui-wgpu` の `paint_and_update_textures`
-  が `surfaces.get(viewport_id) == None` で early return する。そのフレームの full(realloc) は
-  **GPU へ届かず捨てられる**。
-- egui の atlas は 32、GPU texture は 64 のまま固着し、glyph UV (atlas=32 で正規化) が
-  64 高のテクスチャを参照して全 glyph が縦 2 倍ずれ → 文字化け。atlas が clean なので egui は
-  delta を再発行せず、後で atlas が再び育って full delta が surface のあるフレームに当たるまで
-  (= フォルダ移動で新規 glyph 追加) 直らない。
-
-対策 = **resync を 1 フレームきりでなく数フレーム連続で再発行**する
-(`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`)。`request_main_font_atlas_resync` が
-`main_font_atlas_resync_repeats_left` をセットし、`maybe_defer_for_main_font_atlas_resync` が
-`ctx.cumulative_frame_nr()` で **1 OS フレーム 1 発行** にゲートしながら毎フレーム set_fonts を
-再発行する。surface が戻ったフレームで full upload が確実に ROOT へ届く。フレームゲートは、
-discard 再パスと `update_early` / `pre_main_ui` の 2 箇所呼び出しで同一フレーム内に repeats を
-使い切る / 黒フレームになるのを防ぐ。連続再発行で font ファイルを毎フレーム読み直さないよう
-`configure_fonts_for_texture_resync` は定義をプロセス内キャッシュ (定義は固定パス + 決定的
-メトリクスで不変)。
+実際の UI フォント設定変更だけは `request_main_font_update` が pending を 1 つ所有する。
+同じ update 前の複数変更は coalesce し、次の main `update` で現在の `Settings.ui_font` を
+`configure_fonts_with_settings` に一度渡す。`set_fonts` は次 pass の `begin_pass` で適用されるが、
+それまでの atlas は有効なままなので pass を discard しない。新しい delta の配送は上記 backend
+契約に任せ、caller 側の repeat / acknowledgement / frame count は追加しない。
 
 なお、専用ボーダーレス fullscreen viewport を閉じると、別トップレベル窓の `Visible(false)` が
 DWM で反映されるまで約 1 フレームかかるため、メインウィンドウが手前に合成されてから fullscreen

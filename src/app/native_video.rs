@@ -3371,11 +3371,6 @@ impl App {
         };
         if in_window {
             self.still_fullscreen_viewport_enter_suppress_until = None;
-            if self.fs_viewport_shown {
-                self.request_main_font_atlas_resync(
-                    crate::app::FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE,
-                );
-            }
         } else {
             if let Some(fs_idx) = self.fullscreen_idx {
                 self.fs_holdover_tex = self

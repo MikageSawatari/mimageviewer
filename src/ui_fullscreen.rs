@@ -12152,9 +12152,6 @@ impl App {
             self.remove_detached_window_runtime(*id, reason);
             self.deferred_detached_image_window_views.remove(id);
         }
-        if self.detached_image_windows.is_empty() {
-            self.request_detached_cleanup_font_atlas_resync(reason);
-        }
         self.focus_main_after_detached_window_close_if_idle(ctx, reason);
     }
 
@@ -13546,13 +13543,6 @@ impl App {
         {
             self.fs_viewport_presentation = None;
             self.clear_detached_viewer_host_hwnd();
-            if cleanup_presentation == Some(ViewerPresentation::DetachedWindow) {
-                self.request_detached_cleanup_font_atlas_resync("keep_alive_cleanup");
-            } else {
-                self.request_main_font_atlas_resync(
-                    crate::app::FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_CLEANUP,
-                );
-            }
         }
         if self.fs_viewport_recreate_after_hide {
             self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
@@ -17635,7 +17625,7 @@ impl App {
     /// クラス背景がフラッシュするため (Plan B トグルで実害、2026-05-22)。
     /// `keep_fullscreen_viewport_alive` の cleanup と同じ手順。
     #[cfg(windows)]
-    fn hide_native_video_black_backdrop_if_shown(&mut self, ctx: &egui::Context) {
+    pub(crate) fn hide_native_video_black_backdrop_if_shown(&mut self, ctx: &egui::Context) {
         if !self.fs_viewport_shown {
             return;
         }
@@ -17657,15 +17647,11 @@ impl App {
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
-        self.request_main_font_atlas_resync(
-            crate::app::FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE,
-        );
     }
 
     /// in-window 静止画/PDF へ戻るときに、残っている専用 fullscreen/detached
-    /// viewport だけを隠す。動画 backdrop の cleanup とは違い、ここではフォント
-    /// atlas の再同期を発火しない。静止画/PDF の F12 OFF はフォント定義を変えず、
-    /// 実機ログでは動画 backdrop 用 resync の相乗りが main atlas 破損の発火源だった。
+    /// viewport だけを隠す。viewport の表示 lifetime は shared renderer の font atlas を
+    /// 所有しないため、この経路を含む cleanup はフォント定義を再設定しない。
     #[cfg(windows)]
     pub(crate) fn hide_embedded_still_viewport_if_shown(&mut self, ctx: &egui::Context) {
         if !self.fs_viewport_shown {
@@ -17689,13 +17675,11 @@ impl App {
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
-        self.log_detached_image_window_debug(
-            "embedded_still_viewport_hidden_without_font_resync".to_string(),
-        );
+        self.log_detached_image_window_debug("embedded_still_viewport_hidden".to_string());
     }
 
     #[cfg(windows)]
-    fn hide_current_fullscreen_viewport_for_recreate(
+    pub(crate) fn hide_current_fullscreen_viewport_for_recreate(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -17727,9 +17711,6 @@ impl App {
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
         self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
-        self.request_main_font_atlas_resync(
-            crate::app::FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_RECREATE,
-        );
     }
 
     #[cfg(windows)]

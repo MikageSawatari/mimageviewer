@@ -1480,6 +1480,33 @@ passive detached は通常どおり release で窓を activate するが、選�
   説明が付く。**破棄を減らすと停止時間は縮むが、閃光は残る可能性がある。**
   計器 `[ui-frame-gap]` / `[atlas-probe]` (`2f514a2d`) と再アームログ (`65e90871`) を入れた
   A/B ビルドで分離する。
+- **2026-08-27 実測・実装結果 — option (d) で caller resync を撤去**:
+
+  | discard reason | build A (現行 5 回) | build B (detached cleanup のみ 1 回) |
+  | --- | ---: | ---: |
+  | `native_video_backdrop_hide` | 14 | 10 |
+  | `detached_viewer_cleanup` | 0 | 3 |
+
+  2 build とも font-atlas delta は全件 `site=paint outcome=Submitted` で、
+  `SurfaceAbsent`、`no_paint` site、`RenderStateAbsent` は 0 件だった。build A の
+  detached cleanup は先行する backdrop-hide pending を re-arm しただけで、自分の reason の
+  discard を 1 回も作っていない。支配的 producer は F12 toggle ごとの
+  `native_video_backdrop_hide` であり、旧 repeat は毎回 5 frame を消費していた。
+
+  画面録画の close 周辺は 20 luma 以上の swing が build A で 17 回 / 1.20 秒、build B で
+  11 回 / 0.40 秒となり、repeat 短縮で約 3 倍短くなった。一方で閃光は残り、top-level HWND
+  teardown による DWM 再合成という別原因の見立てと一致した。PDF / video の実機確認では
+  glyph damage は出なかった。
+
+  所有境界の結論は「surface acknowledgement 後に 1 回」ではなく、**viewport lifecycle の
+  font firing は 0**。main viewport 群は `Context` / `Painter` / `render_state` /
+  renderer texture namespace を共有し、viewport teardown は atlas texture を所有しない。
+  native presenter は別 `Context` / renderer を持つため、main atlas resync は presenter を
+  修復しない。そこで repeat / reason / safety / marker reload / discard-repass /
+  thumbnail 先送りと全 lifecycle producer を撤去した。実際の UI font 設定変更だけは
+  main context owner へ coalesce し、次 update で現在設定を 1 回 `set_fonts` する。
+  正しさは painter の no-surface delivery test と、eframe の 4 early-return site を検査する
+  caller-level test の両方で固定する。計測 probe は利用者の再測定まで残す。
 - 別セッションからの引き継ぎ資料: `docs/detached-close-flicker-handoff.md` (video-strip worktree)。
   同じ機構を「ちらつき vs フォント崩れのトレードオフ」として記述しているが、上の訂正により
   **トレードオフではなくなっている**。同資料の見立て「再同期が毎フレーム自分を再予約している」
@@ -1529,16 +1556,17 @@ passive detached は通常どおり release で窓を activate するが、選�
      ([app.rs:35015](../src/app.rs:35015)) 契約と一致する。`[fs-key]` は fullscreen context の
      生存中しか一覧側 Enter を記録しないため、「キー行が無い」ことは内部 open の証拠にならない。
      4 個並んだのは `Enter:up` のみで、close/open を発火する `down` の重複は無かった。
-- **確定した原因**: 最大化そのものは増幅条件で、根は次の 2 つの時間窓 / lifecycle 不整合。
+- **確定した原因**: 最大化そのものは増幅条件で、根は次の 2 つの lifecycle 不整合
+  (2 は 2026-08-27 の option (d) で解消済み)。
   1. 明示 close が linked detached host を terminal teardown し、次の明示 open が保存済み
      `maximized=true` の全面 HWND / surface を同期的に新規作成する。
-  2. teardown 後の main surface 復帰を観測せず、固定 5 フレームの discard で font atlas の
-     full upload を再送する。結果として、利用者が Enter で viewer と一覧を往復するたび、
-     「全面 host の作り直し」と「一覧側の 5 pass 破棄」が交互に露出する。
+  2. teardown が atlas texture を所有しないのに、固定 5 フレームの discard で font atlas の
+     full upload を再送していた。利用者が Enter で viewer と一覧を往復するたび、
+     「全面 host の作り直し」と「一覧側の 5 pass 破棄」が交互に露出していた。
 - **構造的な解消方針 (実装前に detached R4 / ゲート C で方式を確定する)**:
-  1. font atlas は固定 5 回再送を廃止し、main surface の no-surface / acquire / present と
-     full-upload 完了を既存 owner の typed state で acknowledgment する。surface が使える最初の
-     1 pass だけ resync し、delay / retry / 追加 repaint で吸収しない。
+  1. **font atlas 側は実装済み**。固定 5 回だけでなく lifecycle resync 自体を廃止し、生成済み
+     delta は renderer の既存 delivery transaction で完結させる。teardown 用の新しい
+     acknowledgment state、delay / retry / 追加 repaint は作らない。
   2. linked detached の content close と OS host lifetime を分離し、`DetachedWindowManager` が
      hidden host の再利用可否を所有する。再利用できる方式なら同じ `window_id` / HWND を
      hidden → content remount → visible と遷移させる。egui の制約で terminal teardown が必須なら、
@@ -1549,8 +1577,8 @@ passive detached は通常どおり release で窓を activate するが、選�
      修正に使わない。タイトルバー最大化と F11 borderless は別状態のまま維持する。
 - **回帰条件**: 保存 placement が `maximized=true` の linked 静止画窓で Enter close/open を反復し、
   (a) 1 操作につき visibility 遷移が 1 回、(b) 再利用方式なら `window_id` / HWND が不変、teardown
-  方式なら ready 前に visible にならない、(c) main font atlas が surface acknowledgment 後の 1 回だけ
-  full upload、(d)通常サイズ・F11・folder-nav reopen・always-new / passive / ParkedLive の所有権を
+  方式なら ready 前に visible にならない、(c) cleanup / backdrop hide / recreate が font request /
+  discard を 1 回も作らない、(d)通常サイズ・F11・folder-nav reopen・always-new / passive / ParkedLive の所有権を
   変えないことを state-transition test + debug log smoke で固定する。実装時は
   [detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外の変更ログ) に合意と変更境界を記録する。
 
@@ -1586,11 +1614,12 @@ passive detached は通常どおり release で窓を activate するが、選�
     bake / draw も同じ数字を見られるようになる。
   - **B. 変化が無ければ書かない。** 現状 82/82 が no-op。A を入れれば「実測値が変わったときだけ
     書く」が自然に成立する。**変化検出を後付けの guard として足すのではなく、A の帰結にする。**
-  - **C. font atlas resync の 5 フレーム再発行を、surface 復帰の観測に置き換える** (上記の直す方向 1)。
-    A/B と独立。close 後の破棄が 5 → 1 になる。
+  - **C. font atlas 側は option (d) で解消済み。** viewport teardown は atlas owner ではないため
+    lifecycle resync / discard を 5 → 1 ではなく 0 にした。A/B と独立。
 - **検証の観測点**: 最大化した別ウィンドウを開いている間、①`runtime_placement` が毎フレーム出ない
-  こと ②`builder_no_position` が毎フレーム出ないこと ③close 後の `discard pass` が 1 回に
-  なること ④最大化 → 復元でウィンドウが元のサイズに戻ること (A で restore 値を壊していない証明)。
+  こと ②`builder_no_position` が毎フレーム出ないこと ③close 後に font-atlas 起因の
+  `discard pass` が 0 回であること ④最大化 → 復元でウィンドウが元のサイズに戻ること
+  (A で restore 値を壊していない証明)。
 
 #### Codex クロスチェック: 2 つの欠陥を同一原因として扱わない
 
@@ -1606,21 +1635,21 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
 - settings への永続化は毎フレームではなく、runtime を remove する close 境界で 1 回だけ行う
   ([app.rs:2174](../src/app.rs:2174))。したがって「82 回の同値更新」だけから
   **ウィンドウが82回再表示された**、または**それがちらつきの直接原因**とは結論できない。
-- 一方、画面遷移と一対一に対応する事実は、各 close の `recreate=true` + 5 discard と、各 open の
-  **新 `window_id` / 新 HWND / 113〜177ms の最大化 host 生成**である。よって §1.115 の直接原因は
-  上記「確定した原因」の lifecycle + surface acknowledgment 欠如とする。
+- 一方、当時の画面遷移と一対一に対応した事実は、各 close の `recreate=true` + 5 discard と、
+  各 open の **新 `window_id` / 新 HWND / 113〜177ms の最大化 host 生成**である。font discard は
+  option (d) で解消したため、§1.115 に残る直接原因は host lifecycle と DWM 再合成である。
 - 現在 geometry と restore geometry を1値に混在させる placement model は、§2.20 の座標破綻、
   不要な runtime 書き戻し、将来の placement command 振動を招く**独立した構造欠陥**であり、
-  ClaudeCode の A/B は同じ R4 設計で直す価値がある。ただし A/B だけ適用しても close ごとの
-  host 再生成と 5 discard が残る限り、§1.115 の完了条件は満たさない。
-- 実装レビューでは (1) placement A/B のみで HWND 再生成 / discard が残るケース、
-  (2) lifecycle + surface acknowledgment 修正で最大化 placement を維持するケースを分けて測り、
+  ClaudeCode の A/B は同じ R4 設計で直す価値がある。ただし font discard を撤去しても close ごとの
+  host 再生成が残る限り、§1.115 の完了条件は満たさない。
+- 実装レビューでは (1) placement A/B のみで HWND 再生成が残るケース、
+  (2) host lifecycle 修正で最大化 placement を維持し、font work は 0 のままのケースを分けて測り、
   「ログ量が減った」ことを「ちらつきが直った」ことの代用にしない。
 
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
 - 関連: §2.20 (**同じ根**。最大化中の placement が実ジオメトリを表していない)、
   [docs/detached-rework-plan.md](detached-rework-plan.md) の BA-5 / findings-12 D1
-  (font resync の discard パスが passive 窓を破棄した実害) / findings-14
+  (旧 font resync の discard パスが passive 窓を破棄した実害、option (d) で解消) / findings-14
   (毎フレーム seed による振動を `builder_placement_latch` で止めた前例)。
 
 ### 1.116 メインウィンドウの起動状態を選べるようにする — 外部SNSでの移行検討者の指摘
@@ -3002,7 +3031,7 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
 - 規模 / 優先度: Medium / P2 (実害はデータ喪失ではないが、**再起動するまで動画機能が
   丸ごと死ぬ**。原因側を潰しても別のパニックで再発し得る)。
 
-### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
+### 1.130 font atlas resync 待ちが 16ms 固定でスピンする — §1.115 option (d) で解消
 
 - 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
   **§1.122 と owner も原因も違う**ので別項目にした (憲法 §2 規則 7)。
@@ -3024,19 +3053,15 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
 §1.122 の pump (98.7% を連続で埋める) と違って常時ではないが、
 **atlas rebuild を止めた後でも残っている**ので、§1.129 では消えない別経路。
 
-#### 直し方の見立て (未検証)
+#### 解消 (2026-08-27)
 
-`safety` は `placement_pending` / `cloak_or_backdrop_active` / `opening_count` /
-`closing_count` から作られる。これらは**全部、変化したときに知らせられる側の事実**なので、
-ポーリングではなく **settled になったときに resync を flush する**形にできるはず。
-§1.122 の Direction A と同じ機構を使えるならそれに乗せる。
+§1.115 の実測と所有境界再監査により、viewport teardown は shared renderer の font atlas を
+所有せず、`d48982e5` の保守経路が補っていた dropped-upload premise も backend 側で解消済みと
+確定した。したがって settled event へ polling を置き換えるのではなく、lifecycle resync /
+`safety` / 16ms polling 自体を撤去した。placement / cloak / opening / closing は font owner では
+なくなり、実 UI font 設定変更だけを main context の one-shot pending が所有する。
 
-- ⚠ detached 述語 (placement / cloak / opening / closing) に触れるので
-  [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要。
-- ⚠ `d48982e5`「Use conservative font atlas resync」で確定した
-  「stale font atlas で描かない = フォント崩れ回避」のトレードオフを崩さないこと。
-  待ち方を変えるのであって、待たなくするのではない。
-- 規模 \\ 優先度: Small 〜 Medium / P3。
+- 規模 / 優先度: — (解消済み)。
 
 ### 1.132 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 再レビュー承認済み (2026-08-27、実機確認待ち)
 
@@ -4343,6 +4368,12 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
   別 texture の no-surface `free` も `Renderer::texture()` の消失で検査する。
   vendor manifest に明示的な lib test target を設定し、`scripts/test-full.ps1` の専用
   `--manifest-path` 段から実行される。production 挙動と `src/` 配下の既存回避策は変更していない。
+- **2026-08-27: caller 回避策の再監査完了 (§1.115 option (d))**。
+  実機 probe で atlas delta が全件 `site=paint outcome=Submitted` と確認できたため、
+  thumbnail upload 先送りと viewport lifecycle の font resync / 5 回 repeat を撤去した。
+  painter が呼ばれない境界を再び開けないよう、
+  `vendor/eframe/src/native/wgpu_integration.rs` の 4 early-return site がいずれも
+  `apply_textures_delta` を呼ぶことを caller-level test で追加固定した。
 - **残り**: exit 3/4 (`RecreateSurface` / `SkipFrame`) の `free` 配送は §1.86 で
   typed `PaintOutcome` seam を作ってから検査・修正する。本項前半からは手を伸ばさない。
 - 規模 / 優先度: 中 / P2。

@@ -16325,30 +16325,10 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(queue[0].items_gen, app.items_generation);
     }
 
-    /// 黒サムネ回帰修正 (2026-06-19, v1.8.0) + detached-rework findings-9 B2:
-    /// font-atlas resync が予約されているだけの safe-frame 待ちではサムネ upload を
-    /// 止めない。実際に `set_fonts` が発火して repeat 中の間だけ、no-surface フレームで
-    /// upload が捨てられるのを避けるため `texture_backlog` へ先送りする。
+    /// viewport cleanup は texture namespace を所有しない。生成済みサムネイル delta は
+    /// surface の有無にかかわらず backend が配送するため、caller は upload を待避しない。
     #[test]
-    fn thumbnail_upload_deferred_only_during_active_font_atlas_resync_repeats() {
-        let send = |app: &App, color: &egui::ColorImage, cur_gen: u64| {
-            app.tx
-                .send(crate::thumb_loader::ThumbMsg {
-                    idx: 0,
-                    image: Some(color.clone()),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: Some((2, 2)),
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: 0,
-                    items_gen: cur_gen,
-                })
-                .unwrap();
-        };
-
+    fn thumbnail_upload_is_not_delayed_by_viewport_cleanup() {
         let mut app = setup_app();
         let img = app.tmp.path().join("p.jpg");
         std::fs::write(&img, b"x").unwrap();
@@ -16361,47 +16341,33 @@ mod favorite_adjustment_defaults_tests {
         let cur_gen = app.items_generation;
         let ctx = egui::Context::default();
         let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: Some(color),
+                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((2, 2)),
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen: cur_gen,
+            })
+            .unwrap();
 
-        // resync 予約だけの safe-frame 待ち: upload は止めず、サムネを固着させない。
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        assert!(!app.main_font_atlas_resync_defers_texture_uploads());
-        send(&app, &color, cur_gen);
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
-            "pending safe-frame wait alone must not block thumbnail uploads"
+            "a ready thumbnail must upload immediately; viewport teardown has no caller-side defer window"
         );
-        assert!(app.texture_backlog.is_empty());
-
-        // resync repeat 開始後: テクスチャ化せず backlog へ先送り (黒サムネ化させない)。
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        app.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES - 1;
-        assert!(app.main_font_atlas_resync_defers_texture_uploads());
-        app.thumbnails[0] = ThumbnailState::Pending;
-        app.requested.insert(0, false);
-        send(&app, &color, cur_gen);
-        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(
-            matches!(app.thumbnails[0], ThumbnailState::Pending),
-            "during active resync repeats the thumbnail must not be uploaded (would be discarded -> black)"
+            app.texture_backlog.is_empty(),
+            "viewport lifecycle must not park a ready texture delta"
         );
-        assert_eq!(
-            app.texture_backlog.len(),
-            1,
-            "the ColorImage should be parked in the backlog, not dropped"
-        );
-
-        // resync 解除後: 次の poll で backlog から Loaded 化する。
-        app.main_font_atlas_resync_pending = false;
-        app.main_font_atlas_resync_repeats_left = 0;
-        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
-        assert!(
-            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
-            "after the surface returns the thumbnail uploads normally"
-        );
-        assert!(app.texture_backlog.is_empty(), "backlog should be drained");
     }
-
     #[test]
     fn final_cache_thumbnail_is_not_enqueued_for_idle_source_upgrade() {
         use std::sync::{Arc, Condvar, Mutex, atomic::Ordering};
@@ -37501,7 +37467,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn still_window_mode_schedules_main_font_resync_when_hiding_fullscreen_viewport() {
+    fn still_window_mode_does_not_reset_fonts_when_hiding_fullscreen_viewport() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
         app.fullscreen_idx = Some(idx);
@@ -37513,10 +37479,9 @@ mod still_window_mode_key_tests {
         app.toggle_still_window_mode();
 
         assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
-        assert!(app.main_font_atlas_resync_pending);
-        assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE)
+        assert!(
+            !app.main_font_update_pending,
+            "switching viewport presentation must not masquerade as a font-setting change"
         );
     }
 
@@ -37539,51 +37504,65 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.fs_viewport_presentation, None);
         assert!(
-            !app.main_font_atlas_resync_pending,
-            "static/PDF cleanup must not reuse native-video backdrop font resync"
+            !app.main_font_update_pending,
+            "static/PDF cleanup must not schedule a main font update"
         );
-        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
     }
 
     #[test]
-    fn font_resync_is_not_blocked_by_embedded_still_viewer() {
+    fn ui_font_update_coalesces_without_discard_or_repeat() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let idx = push_image(&mut app, r"C:\pics\a.jpg");
-        app.fullscreen_idx = Some(idx);
-        app.settings.video_in_window_mode = true;
-        app.native_video_in_window_active = true;
-        app.viewer_presentation = ViewerPresentation::MainWindow;
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE);
+        let draw_probe_text = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("font update probe 日本語");
+            });
+        };
 
-        // First fire: applies a full atlas re-upload, but stays armed so the next few
-        // frames re-emit it. This survives the 1-frame gap at fullscreen close where the
-        // ROOT viewport's wgpu surface is missing and the upload would be dropped.
-        let deferred = app.maybe_defer_for_main_font_atlas_resync(&ctx, "test");
-        assert!(deferred, "embedded still viewer paints on the main ctx");
-        assert_eq!(app.main_font_atlas_resync_generation, 1);
+        let baseline = ctx.run(egui::RawInput::default(), draw_probe_text);
         assert!(
-            app.main_font_atlas_resync_pending,
-            "resync re-arms for several frames to survive the close-frame surface gap"
+            !baseline.textures_delta.set.is_empty(),
+            "the baseline pass must materialize its initial atlas"
         );
 
-        // Drains the remaining repeats; pending clears only on the final fire.
-        // Reset the per-frame gate each iteration to simulate a fresh OS frame (a default
-        // Context keeps cumulative_frame_nr at 0, which would otherwise gate re-fires).
-        let mut fires = 1u32;
-        while app.main_font_atlas_resync_pending {
-            app.main_font_atlas_resync_last_fire_frame = u64::MAX;
-            assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
-            fires += 1;
-            assert!(fires <= 16, "resync repeat must terminate");
-        }
-        assert_eq!(fires, MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES);
-        assert_eq!(
-            app.main_font_atlas_resync_generation,
-            u64::from(MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES)
+        app.request_main_font_update();
+        app.request_main_font_update();
+        assert!(
+            app.main_font_update_pending,
+            "multiple setting edits before the next root pass coalesce into one application"
+        );
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.apply_pending_main_font_update(ctx);
+            draw_probe_text(ctx);
+            assert!(
+                !app.main_font_update_pending,
+                "the single settings application must consume its pending state"
+            );
+            assert!(
+                !ctx.will_discard(),
+                "the old definitions and old atlas remain valid for this pass; no repass is needed"
+            );
+        });
+
+        let applied = ctx.run(egui::RawInput::default(), draw_probe_text);
+        assert!(
+            !applied.textures_delta.set.is_empty(),
+            "the next begin_pass must apply the requested definitions and emit their atlas delta"
+        );
+        let stable = ctx.run(egui::RawInput::default(), |ctx| {
+            app.apply_pending_main_font_update(ctx);
+            draw_probe_text(ctx);
+        });
+        assert!(
+            stable.textures_delta.set.is_empty(),
+            "a consumed setting update must not rebuild the atlas again on a later pass"
+        );
+        assert!(
+            !app.main_font_update_pending,
+            "font settings must not re-arm themselves for later frames"
         );
     }
-
     #[test]
     fn still_image_root_f11_repeat_is_ignored() {
         let mut app = setup_app();
@@ -38205,15 +38184,11 @@ mod still_window_mode_key_tests {
             "runtime removal must also remove the detached host registration"
         );
         assert_eq!(
-            app.main_font_atlas_resync_frame_safety().closing_count,
+            app.detached_window_manager
+                .state_count(DetachedWindowState::Closing),
             0,
             "a terminal placement switch must not leave Closing runtime churn"
         );
-
-        // The still-playing main/fullscreen video is an intentional safety blocker. Once that
-        // unrelated live backdrop is gone, the removed runtime must not keep resync unsettled.
-        app.fullscreen_idx = None;
-        assert!(app.main_font_atlas_resync_settled_frame());
     }
 
     #[test]
@@ -41713,12 +41688,12 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_thumbnail_backlog_survives_main_font_resync() {
+    fn detached_thumbnail_upload_is_not_coupled_to_main_font_update() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
 
         install_detached_transition_gap_for_test(&mut app, 125, |bundle| {
-            bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\books\deferred.jpg"))];
+            bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\books\ready.jpg"))];
             bundle.thumbnails = vec![ThumbnailState::Pending];
             bundle.image_metas = vec![None];
             bundle.visible_indices = vec![0];
@@ -41737,38 +41712,29 @@ mod still_window_mode_key_tests {
             keep_detached_transition_gap_open(bundle);
         });
 
-        // begin_active_detached_session intentionally defers an already-pending main resync.
-        // Schedule the active repeat after the detached owner exists to reproduce a resync that
-        // overlaps this context's thumbnail result.
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        app.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES - 1;
-        assert!(app.main_font_atlas_resync_defers_texture_uploads());
-
+        app.request_main_font_update();
         run_active_detached_frame_for_test(&mut app, &ctx);
-        app.with_active_viewer_context(|detached| {
-            assert!(matches!(detached.thumbnails[0], ThumbnailState::Pending));
-            assert_eq!(detached.texture_backlog.len(), 1);
-            assert!(detached.thumb_pixels.is_empty());
-        })
-        .unwrap();
 
-        app.main_font_atlas_resync_pending = false;
-        app.main_font_atlas_resync_repeats_left = 0;
-        run_active_detached_frame_for_test(&mut app, &ctx);
         app.with_active_viewer_context(|detached| {
             assert!(matches!(
                 detached.thumbnails[0],
                 ThumbnailState::Loaded { .. }
             ));
-            assert!(detached.texture_backlog.is_empty());
+            assert!(
+                detached.texture_backlog.is_empty(),
+                "a main font-setting update must not defer a detached owner's ready texture"
+            );
             assert_eq!(
                 detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
                 Some([5, 7])
             );
         })
         .unwrap();
+        assert!(
+            app.main_font_update_pending,
+            "detached rendering must not consume the main Context's settings request"
+        );
     }
-
     #[test]
     fn detached_thumbnail_poll_does_not_force_out_of_keep_video_texture() {
         let mut app = setup_app();
@@ -48111,30 +48077,68 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_viewer_cleanup_font_resync_uses_conservative_repass() {
-        assert!(
-            should_defer_main_paint_for_font_atlas_resync(
-                FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
-            ),
-            "detached viewer close should avoid painting with a stale font atlas"
+    fn eframe_delivers_texture_delta_at_all_unpainted_viewport_returns() {
+        // egui-wgpu の headless test は surface-less Painter を実動作で検査する。
+        // ここでは一段手前の eframe が、FullOutput 取得後の4つの early return すべてで
+        // その Painter API を呼ぶことを vendored caller の source shape として固定する。
+        const SOURCE: &str = include_str!("../../vendor/eframe/src/native/wgpu_integration.rs");
+        let main_path = SOURCE
+            .split_once("fn run_ui_and_paint")
+            .and_then(|(_, rest)| rest.split_once("fn render_immediate_viewport"))
+            .map(|(section, _)| section)
+            .expect("eframe main viewport delivery section");
+        let immediate_path = SOURCE
+            .split_once("fn render_immediate_viewport")
+            .and_then(|(_, rest)| rest.split_once("fn egui_installed_atlas_size"))
+            .map(|(section, _)| section)
+            .expect("eframe immediate viewport delivery section");
+
+        assert_eq!(
+            main_path
+                .matches("painter.apply_textures_delta(&textures_delta);")
+                .count(),
+            2,
+            "missing viewport and missing window/state must both deliver the main FullOutput"
         );
-        assert!(
-            should_defer_main_paint_for_font_atlas_resync("fullscreen_viewport_cleanup"),
-            "normal fullscreen cleanup keeps the conservative font-atlas reset path"
+        assert_eq!(
+            immediate_path
+                .matches("painter.apply_textures_delta(&textures_delta);")
+                .count(),
+            2,
+            "missing viewport and missing window/state must both deliver immediate FullOutput"
         );
+    }
+
+    #[test]
+    fn app_has_no_viewport_lifecycle_font_resync_state_machine() {
+        const APP_SOURCE: &str = include_str!("../app.rs");
+        const VIEWPORT_SOURCE: &str = include_str!("../ui_fullscreen.rs");
+        const NATIVE_VIDEO_SOURCE: &str = include_str!("native_video.rs");
+
+        for retired_identifier in [
+            "MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES",
+            "main_font_atlas_resync_repeats_left",
+            "maybe_defer_for_main_font_atlas_resync",
+            "pending_detached_cleanup_font_atlas_resync",
+        ] {
+            assert!(
+                !APP_SOURCE.contains(retired_identifier),
+                "retired caller-side race absorption returned: {retired_identifier}"
+            );
+        }
         assert!(
-            should_defer_main_paint_for_font_atlas_resync(
-                FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE
-            ),
-            "native fullscreen backdrop cleanup keeps the conservative font-atlas reset path"
+            !VIEWPORT_SOURCE.contains("request_main_font_atlas_resync")
+                && !VIEWPORT_SOURCE.contains("request_detached_cleanup_font_atlas_resync")
+                && !NATIVE_VIDEO_SOURCE.contains("request_main_font_atlas_resync"),
+            "viewport visibility producers must not publish font-atlas recovery work"
         );
     }
 
     #[test]
     fn main_window_clear_color_follows_theme_panel_fill() {
-        // 描画スキップフレーム (font atlas resync の defer / detached close 直後の
-        // no-surface) で見えるクリア色は、テーマのパネル背景 (= メニューバー背景) に
-        // 合わせる。eframe 既定の near-black 固定だとライトテーマで「一瞬黒」が目立つため。
+        // top-level viewport の hide / teardown 中に DWM が見せるクリア色は、テーマの
+        // パネル背景 (= メニューバー背景) に合わせる。eframe 既定の near-black 固定だと
+        // ライトテーマで「一瞬黒」が目立つため。
         let light = egui::Visuals::light();
         let dark = egui::Visuals::dark();
         assert_eq!(
@@ -48164,236 +48168,98 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_cleanup_font_resync_waits_until_settled_frame() {
-        // CUT fix2: cleanup resync は「detached が完全 idle」まで待つのではなく、
-        // Opening/Closing や動画 placement/backdrop churn が無い settled frame で発火する。
+    fn detached_window_state_transitions_do_not_schedule_font_update() {
         let mut app = setup_app();
-        assert!(app.detached_image_windows.is_empty());
+        assert!(!app.main_font_update_pending);
 
-        app.request_detached_cleanup_font_atlas_resync("test");
-
-        // 新規/再生成中の detached 窓があるフレームでは full-upload が backend へ届かず
-        // 消費される恐れがあるので、pending のまま保持する。
         app.transition_detached_window_state(7, DetachedWindowState::Opening, "test_opening");
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert!(
-            app.pending_detached_cleanup_font_atlas_resync.is_some(),
-            "detached cleanup resync must remain pending while any detached window is opening"
-        );
-        assert!(!app.main_font_atlas_resync_pending);
-
+        assert!(!app.main_font_update_pending);
         app.transition_detached_window_state(7, DetachedWindowState::Closing, "test_closing");
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert!(
-            app.pending_detached_cleanup_font_atlas_resync.is_some(),
-            "detached cleanup resync must remain pending while any detached window is closing"
-        );
-        assert!(!app.main_font_atlas_resync_pending);
-
-        // Stable な parked/active/passive の存在だけでは待たない。これにより OFF モードで
-        // detached 窓が残っていても main atlas を修復できる。
+        assert!(!app.main_font_update_pending);
         app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_parked");
-        app.flush_pending_detached_cleanup_font_atlas_resync();
         assert!(
-            app.pending_detached_cleanup_font_atlas_resync.is_none(),
-            "pending request should be consumed once the frame is settled"
-        );
-        assert!(
-            app.main_font_atlas_resync_pending,
-            "main font atlas resync is scheduled on the first settled frame"
-        );
-        assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
+            !app.main_font_update_pending,
+            "viewport lifecycle does not own the main renderer font atlas"
         );
     }
-
     #[test]
     #[cfg(windows)]
-    fn main_font_resync_allows_stable_passive_detached_window() {
+    fn native_video_backdrop_hide_does_not_schedule_font_update_or_discard() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let tex = ctx.load_texture(
-            "passive_resync_guard",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        );
-        app.detached_image_windows
-            .push(DetachedImageWindowSnapshot {
-                id: 22,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
-                title: "passive".to_owned(),
-                location_display: "passive".to_owned(),
-                image_dims: Some((1, 1)),
-                rotation: crate::rotation_db::Rotation::None,
-                zoom_pan: None,
-                free_rotation: 0.0,
-                image_rect_norm: egui::Rect::from_min_max(
-                    egui::pos2(0.0, 0.0),
-                    egui::pos2(1.0, 1.0),
-                ),
-                image_content_bbox: None,
-                frozen_continuous_pages: Vec::new(),
-                reopen_descriptor: None,
-                reopen_sync_stamp: None,
-                activation_ready_frame: 0,
-                activation_armed: true,
-                focused_last_frame: false,
-                initial_placement_applied: true,
-            });
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
 
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.hide_native_video_black_backdrop_if_shown(ctx);
+            assert!(
+                !ctx.will_discard(),
+                "backdrop visibility is unrelated to the main renderer's valid atlas"
+            );
+        });
 
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(app.fs_viewport_presentation, None);
         assert!(
-            app.main_font_atlas_resync_pending,
-            "a stable passive detached window is not itself an unsafe frame"
-        );
-        assert_eq!(
-            app.pending_detached_cleanup_font_atlas_resync, None,
-            "direct main resync requests are gated at flush time, not moved to detached-idle wait"
-        );
-
-        assert!(app.main_font_atlas_resync_settled_frame());
-        assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
-        assert_eq!(
-            app.main_font_atlas_resync_generation, 1,
-            "stable passive windows must not prevent the full atlas upload"
+            !app.main_font_update_pending,
+            "F12/backdrop cleanup must not be treated as a font-setting change"
         );
     }
-
     #[test]
     #[cfg(windows)]
-    fn main_font_resync_settled_frame_tracks_video_and_window_churn() {
-        let mut app = setup_app();
-        let now = std::time::Instant::now();
-        assert!(app.main_font_atlas_resync_settled_frame());
-
-        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
-            request_id: 1,
-            target_presentation: ViewerPresentation::DetachedWindow,
-            deadline: now + std::time::Duration::from_secs(1),
-            announce_main_hint: false,
-        });
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        app.native_video_mode_switch = None;
-
-        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
-            target_presentation: ViewerPresentation::DetachedWindow,
-            activate_on_show: true,
-            requested_at: now,
-            deadline: now + std::time::Duration::from_secs(1),
-        });
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        app.pending_detached_video_host_switch = None;
-
-        app.pending_detached_video_host_resync = true;
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        app.pending_detached_video_host_resync = false;
-
-        app.native_video_main_cloaked = true;
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        app.native_video_main_cloaked = false;
-
-        app.transition_detached_window_state(51, DetachedWindowState::Opening, "test_opening");
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        assert_eq!(
-            app.main_font_atlas_resync_frame_safety(),
-            MainFontAtlasResyncFrameSafety {
-                placement_pending: false,
-                cloak_or_backdrop_active: false,
-                opening_count: 1,
-                closing_count: 0,
-            }
-        );
-
-        app.transition_detached_window_state(51, DetachedWindowState::Parked, "test_parked");
-        assert!(app.main_font_atlas_resync_settled_frame());
-
-        app.transition_detached_window_state(51, DetachedWindowState::Closing, "test_closing");
-        assert!(!app.main_font_atlas_resync_settled_frame());
-        assert_eq!(
-            app.main_font_atlas_resync_frame_safety(),
-            MainFontAtlasResyncFrameSafety {
-                placement_pending: false,
-                cloak_or_backdrop_active: false,
-                opening_count: 0,
-                closing_count: 1,
-            }
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn main_font_resync_does_not_consume_repeats_until_settled() {
+    fn starting_detached_session_preserves_pending_main_font_setting_update() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        app.transition_detached_window_state(52, DetachedWindowState::Opening, "test_opening");
-
-        let repeats_before = app.main_font_atlas_resync_repeats_left;
-        assert!(
-            !app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"),
-            "unsafe frames must keep the pending request for a later frame"
-        );
-        assert_eq!(app.main_font_atlas_resync_repeats_left, repeats_before);
-        assert_eq!(app.main_font_atlas_resync_generation, 0);
-
-        app.transition_detached_window_state(52, DetachedWindowState::Parked, "test_settled");
-        assert!(app.maybe_defer_for_main_font_atlas_resync(&ctx, "test"));
-        assert_eq!(app.main_font_atlas_resync_generation, 1);
-        assert_eq!(
-            app.main_font_atlas_resync_repeats_left,
-            repeats_before.saturating_sub(1)
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn pending_main_font_resync_moves_to_deferred_when_detached_session_starts() {
-        let mut app = setup_app();
-
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        assert!(app.main_font_atlas_resync_pending);
-        assert_eq!(app.pending_detached_cleanup_font_atlas_resync, None);
+        app.request_main_font_update();
 
         app.begin_active_detached_session(33, DetachedSource::Image);
 
         assert!(
-            !app.main_font_atlas_resync_pending,
-            "main font-atlas resync must not keep firing after a detached session starts"
+            app.main_font_update_pending,
+            "a detached session does not own or relocate the main Context's settings update"
         );
-        assert_eq!(
-            app.pending_detached_cleanup_font_atlas_resync,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
-        );
-        app.flush_pending_detached_cleanup_font_atlas_resync();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.apply_pending_main_font_update(ctx);
+            assert!(
+                !ctx.will_discard(),
+                "applying real font settings does not require a same-frame repass"
+            );
+        });
+        assert!(!app.main_font_update_pending);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn fullscreen_viewport_recreate_does_not_schedule_font_update_or_discard() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\recreate.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+        app.fs_viewport_generation = 4;
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.hide_current_fullscreen_viewport_for_recreate(ctx, idx);
+            assert!(
+                !ctx.will_discard(),
+                "recreating a viewport does not invalidate the shared renderer atlas"
+            );
+        });
+
+        assert_eq!(app.fs_viewport_generation, 5);
         assert!(
-            app.main_font_atlas_resync_pending,
-            "active detached sessions no longer block resync once the frame is settled"
+            !app.main_font_update_pending,
+            "viewport recreation must not be treated as a font-setting change"
         );
-        assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
-        );
-
-        app.main_font_atlas_resync_pending = false;
-        app.main_font_atlas_resync_reason = None;
-        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
-        app.transition_detached_window_state(33, DetachedWindowState::Closing, "test_closing");
-        assert!(app.detached_font_atlas_resync_should_wait());
-        let repeats_before = app.main_font_atlas_resync_repeats_left;
-        assert!(!app.maybe_defer_for_main_font_atlas_resync(&egui::Context::default(), "test"));
-        assert_eq!(
-            app.main_font_atlas_resync_repeats_left, repeats_before,
-            "unsafe frames must not consume resync repeat budget"
-        );
-
-        app.transition_detached_window_state(33, DetachedWindowState::Parked, "test_settled");
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert!(app.main_font_atlas_resync_pending);
-        assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE)
+    }
+    #[test]
+    #[cfg(windows)]
+    fn detached_session_start_does_not_create_font_work() {
+        let mut app = setup_app();
+        app.begin_active_detached_session(33, DetachedSource::Image);
+        assert!(
+            !app.main_font_update_pending,
+            "starting a detached session changes no main font settings"
         );
     }
 
@@ -48420,16 +48286,9 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fs_viewport_presentation, None);
         assert!(!app.fs_viewport_recreate_after_hide);
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(42), 0);
-        assert!(!app.main_font_atlas_resync_pending);
         assert!(
-            app.pending_detached_cleanup_font_atlas_resync.is_some(),
-            "active close finalize should defer detached cleanup font resync to the outer context"
-        );
-        app.flush_pending_detached_cleanup_font_atlas_resync();
-        assert!(app.main_font_atlas_resync_pending);
-        assert_eq!(
-            app.main_font_atlas_resync_reason,
-            Some(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP)
+            !app.main_font_update_pending,
+            "active detached close must not publish font work to the unchanged main Context"
         );
     }
 
@@ -49467,7 +49326,10 @@ mod still_window_mode_key_tests {
         assert!(!app.detached_viewer_open_next_still_detached_once);
         assert!(app.music_analysis_path.is_none());
         assert!(app.music_pcm.is_none());
-        assert!(app.pending_detached_cleanup_font_atlas_resync.is_some());
+        assert!(
+            !app.main_font_update_pending,
+            "mode-change teardown must not schedule work for unchanged font settings"
+        );
     }
 
     #[test]
@@ -49493,7 +49355,10 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.settings.ui_scale_factor, 1.5);
         assert!(app.fullscreen_idx.is_none());
-        assert!(app.pending_detached_cleanup_font_atlas_resync.is_none());
+        assert!(
+            !app.main_font_update_pending,
+            "scale-only changes must not be represented as font-setting changes"
+        );
     }
 
     #[test]

@@ -182,30 +182,6 @@ pub fn prepare_fonts(settings: &crate::settings::UiFontSettings) {
     let _ = base_font_definitions_cached(settings);
 }
 
-pub fn configure_fonts_for_texture_resync(
-    ctx: &egui::Context,
-    generation: u64,
-    settings: &crate::settings::UiFontSettings,
-) {
-    // texture resync は full atlas re-upload を出すために surface 復帰まで数フレーム連続で
-    // 呼ばれる (app.rs `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`)。毎回 `mimageviewer_font_definitions`
-    // を作ると選択フォントや CJK fallback を毎フレーム std::fs::read してしまうため、
-    // 現在の設定キーで準備済み定義を clone して使い回す。
-    if std::env::var_os("MIV_DETACHED_WINDOW_DEBUG").is_some() {
-        crate::logger::log(format!(
-            "[ui-fonts][diag] configure_fonts_for_texture_resync generation={generation} \
-             egui_frame={} egui_pass={} pass_index={} will_discard={}",
-            ctx.cumulative_frame_nr(),
-            ctx.cumulative_pass_nr(),
-            ctx.current_pass_index(),
-            ctx.will_discard()
-        ));
-    }
-    let mut fonts = base_font_definitions_cached(settings);
-    add_font_texture_resync_marker(&mut fonts, generation);
-    ctx.set_fonts(fonts);
-}
-
 fn font_settings_cache_key(settings: &crate::settings::UiFontSettings) -> String {
     let mut normalized = settings.clone();
     normalized.sanitize();
@@ -236,17 +212,12 @@ fn base_font_definitions_cached(
     if let Ok(mut cache) = cache.lock() {
         // フォント定義は CJK fallback を含みサイズが大きい。微調整 slider の値ごとに
         // 永続保持すると短時間で数百 MiB へ膨らむため、直近 1 設定だけを保持する。
-        // 適用後の atlas resync はこの直近値を使い、現在 Context が使う旧定義は
-        // egui 側の Arc が必要な間だけ保持する。
+        // 次の設定変更はこの直近値を使い、現在 Context が使う旧定義は egui 側の Arc が
+        // 必要な間だけ保持する。
         cache.clear();
         cache.insert(key, fonts.clone());
     }
     fonts
-}
-
-#[cfg(all(test, windows))]
-fn mimageviewer_font_definitions() -> egui::FontDefinitions {
-    mimageviewer_font_definitions_for(&crate::settings::UiFontSettings::default())
 }
 
 fn mimageviewer_font_definitions_for(
@@ -255,14 +226,6 @@ fn mimageviewer_font_definitions_for(
     let mut fonts = egui::FontDefinitions::default();
     install_mimageviewer_fonts_with_settings(&mut fonts, settings);
     fonts
-}
-
-fn add_font_texture_resync_marker(fonts: &mut egui::FontDefinitions, generation: u64) {
-    let marker_family = format!("miv-font-atlas-resync-{generation}");
-    fonts.families.insert(
-        egui::FontFamily::Name(Arc::<str>::from(marker_family)),
-        Vec::new(),
-    );
 }
 
 pub fn install_mimageviewer_fonts(fonts: &mut egui::FontDefinitions) {
@@ -976,35 +939,6 @@ mod tests {
                 "{name} fallback should be registered in the user-text family"
             );
         }
-    }
-
-    #[test]
-    fn texture_resync_marker_changes_definitions_without_touching_active_families() {
-        let base = mimageviewer_font_definitions();
-        let mut resync = mimageviewer_font_definitions();
-        add_font_texture_resync_marker(&mut resync, 42);
-
-        assert!(
-            base != resync,
-            "resync marker should force egui to rebuild fonts even when visible fonts are unchanged"
-        );
-        assert_eq!(
-            base.families.get(&egui::FontFamily::Proportional),
-            resync.families.get(&egui::FontFamily::Proportional),
-            "resync marker must not alter the normal proportional fallback chain"
-        );
-        assert_eq!(
-            base.families.get(&egui::FontFamily::Monospace),
-            resync.families.get(&egui::FontFamily::Monospace),
-            "resync marker must not alter the normal monospace fallback chain"
-        );
-        assert!(
-            resync
-                .families
-                .contains_key(&egui::FontFamily::Name(Arc::<str>::from(
-                    "miv-font-atlas-resync-42"
-                )))
-        );
     }
 
     #[test]

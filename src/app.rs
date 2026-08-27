@@ -150,7 +150,6 @@ pub(crate) use detached_window_manager::{
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
     DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedWindowHwndDiff,
     DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
-    MainFontAtlasResyncFrameSafety,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -397,21 +396,6 @@ pub(crate) enum DetachedViewerBorderlessTransitionPhase {
     Settle { until: std::time::Instant },
 }
 
-pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
-pub(crate) const FONT_ATLAS_RESYNC_REASON_STILL_WINDOW_MODE: &str = "still_window_mode";
-pub(crate) const FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_CLEANUP: &str =
-    "fullscreen_viewport_cleanup";
-pub(crate) const FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE: &str =
-    "native_video_backdrop_hide";
-pub(crate) const FONT_ATLAS_RESYNC_REASON_FULLSCREEN_VIEWPORT_RECREATE: &str =
-    "fullscreen_viewport_recreate";
-/// フォント atlas full upload を何フレーム連続で再発行するか。fullscreen close 直後は
-/// メインウィンドウ (ROOT viewport) の wgpu surface が 1 フレームだけ消え、その frame の
-/// full(realloc) upload が `paint_and_update_textures` の no-surface early return で捨てられる。
-/// 1 回きりだと texture が旧サイズに固着して UI 文字が化ける (atlas=32 / texture=64 のような
-/// UV 不一致)。数フレーム再発行して surface が戻ったフレームで届かせる。
-#[cfg(windows)]
-pub(crate) const MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES: u32 = 5;
 #[cfg(windows)]
 const DETACHED_VIEWER_CONTEXT_GENERATION_BASE: u64 = 1 << 63;
 #[cfg(windows)]
@@ -2619,10 +2603,6 @@ fn should_restore_fullscreen_focus_from_main_focus(
         && !embedded_still
         && keep_fullscreen_on_app_switch
         && !fullscreen_root_key_handled
-}
-
-fn should_defer_main_paint_for_font_atlas_resync(_reason: &str) -> bool {
-    true
 }
 
 fn should_render_main_fullscreen_viewport_after_detached_context(
@@ -11095,35 +11075,10 @@ pub struct App {
     /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
     #[cfg(windows)]
     pub(crate) still_fullscreen_viewport_enter_suppress_until: Option<std::time::Instant>,
-    /// 複数 viewport を閉じた/作り直したあと、メイン viewport の egui-wgpu renderer が
-    /// 古い小さい font atlas texture を持ったまま部分 glyph update を受けることがある。
-    /// 次のメイン UI 描画前にフォント定義を 1 回だけ入れ直し、font atlas を full upload
-    /// から再開させるための one-shot。
+    /// UI フォント設定が変わり、main egui Context へ新しい定義を 1 回適用する必要がある。
+    /// viewport teardown は renderer の font atlas を所有しないため、この状態には合流しない。
     #[cfg(windows)]
-    pub(crate) main_font_atlas_resync_pending: bool,
-    /// フォント atlas 再アップロードを残り何フレーム再発行するか。close 直後の 1 フレームは
-    /// メインウィンドウの wgpu surface が一時的に消えて full(realloc) upload が捨てられる
-    /// (`paint_and_update_textures` の no-surface early return)。1 回きりだと texture が
-    /// 旧サイズのまま固着して UI 文字が化けるため、数フレーム再発行して surface が戻った
-    /// フレームで確実に届かせる。
-    #[cfg(windows)]
-    pub(crate) main_font_atlas_resync_repeats_left: u32,
-    /// 最後に resync を発行した OS フレーム番号 (`ctx.cumulative_frame_nr`)。discard 再パスや
-    /// update 内 2 箇所の呼び出しで同一 OS フレーム内に複数回発行して repeats を浪費しない
-    /// ように、1 OS フレーム 1 発行へゲートする。
-    #[cfg(windows)]
-    pub(crate) main_font_atlas_resync_last_fire_frame: u64,
-    #[cfg(windows)]
-    pub(crate) main_font_atlas_resync_generation: u64,
-    #[cfg(windows)]
-    pub(crate) main_font_atlas_resync_reason: Option<&'static str>,
-    /// detached viewer の teardown 後にメイン font atlas resync が必要なことを表す pending。
-    ///
-    /// detached context の mount 中に即時 resync 判定をすると、outer/main context
-    /// に戻った後の detached viewport 生存を見落として Y-32 wgpu validation panic を起こす。
-    /// close 経路はこの flag だけを立て、outer/main context で安全判定してから flush する。
-    #[cfg(windows)]
-    pub(crate) pending_detached_cleanup_font_atlas_resync: Option<&'static str>,
+    pub(crate) main_font_update_pending: bool,
     /// 閉じた後に次回表示用の ViewportId を更新するか。
     ///
     /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
@@ -13931,17 +13886,7 @@ impl App {
             #[cfg(windows)]
             still_fullscreen_viewport_enter_suppress_until: None,
             #[cfg(windows)]
-            main_font_atlas_resync_pending: false,
-            #[cfg(windows)]
-            main_font_atlas_resync_repeats_left: 0,
-            #[cfg(windows)]
-            main_font_atlas_resync_last_fire_frame: u64::MAX,
-            #[cfg(windows)]
-            main_font_atlas_resync_generation: 0,
-            #[cfg(windows)]
-            main_font_atlas_resync_reason: None,
-            #[cfg(windows)]
-            pending_detached_cleanup_font_atlas_resync: None,
+            main_font_update_pending: false,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
             fs_opened_at: None,
@@ -31986,26 +31931,6 @@ impl App {
         const MAX_TEXTURES_PER_FRAME: u32 = 8;
         let mut textures_created = 0u32;
         let mut received = 0u32;
-        // **黒サムネ回帰修正 (2026-06-19, v1.8.0 regression)**: フルスクリーン close 直後は
-        // メインウィンドウの wgpu surface が 1 フレーム消え、その frame に queue した
-        // テクスチャ upload (delta) が `paint_and_update_textures` の no-surface early return で
-        // 捨てられる。font atlas は `main_font_atlas_resync` が数フレーム再 upload して救済するが、
-        // **この窓で `load_texture` した grid サムネは upload だけ捨てられて handle は Loaded** の
-        // ため、GPU データ空 = 真っ黒の backdrop だけが描かれる (idle 高画質化が再レンダする
-        // ~500ms 後まで固着)。対策: resync 窓の間はサムネのテクスチャ化を `texture_backlog` へ
-        // 先送りし、surface が戻ってから upload する。ColorImage は破棄せず保持されるので
-        // 数フレーム遅れて正しく表示される。
-        let defer_texture_uploads = {
-            #[cfg(windows)]
-            {
-                self.main_font_atlas_resync_defers_texture_uploads()
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        };
-        let mut deferred_for_resync = 0u32;
         let (keep_start, keep_end) = self.keep_range;
 
         // バックログ + チャネルから受信した結果を統合して処理する。
@@ -32125,10 +32050,7 @@ impl App {
 
             match color_image_opt {
                 Some(color_image) => {
-                    if treat_as_in_range
-                        && textures_created < MAX_TEXTURES_PER_FRAME
-                        && !defer_texture_uploads
-                    {
+                    if treat_as_in_range && textures_created < MAX_TEXTURES_PER_FRAME {
                         // cache origin: 1 ショット経路 (cache save なし) → 即 remove。
                         // source origin: from-source 経路。cache save 完了後の
                         //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
@@ -32272,11 +32194,8 @@ impl App {
                             }
                         }
                     } else if treat_as_in_range {
-                        // 上限到達 or font-atlas-resync 窓 (defer_texture_uploads) で keep_range 内
-                        // (or 動画): 次フレームに持ち越す。requested は除去しない (重複リクエスト防止)。
-                        if defer_texture_uploads {
-                            deferred_for_resync += 1;
-                        }
+                        // 上限到達で keep_range 内 (or 動画): 次フレームに持ち越す。
+                        // requested は除去しない (重複リクエスト防止)。
                         self.texture_backlog.push(crate::thumb_loader::ThumbMsg {
                             idx: i,
                             image: Some(color_image),
@@ -32322,21 +32241,6 @@ impl App {
                 "  [main] poll_thumbnails: received {received} ({textures_created} textures, {} backlog)",
                 self.texture_backlog.len()
             ));
-            ctx.request_repaint();
-        }
-        if deferred_for_resync > 0 {
-            // resync 窓でサムネ upload を先送りした件数。これが出ていれば回帰修正が機能して
-            // いる (= 旧来なら黒サムネ化していた upload を surface 復帰まで待たせた)。
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "thumb",
-                    "upload_deferred_for_resync",
-                    None,
-                    self.input_seq,
-                    &[("count", serde_json::Value::from(deferred_for_resync))],
-                );
-            }
-            // resync 完了後に backlog を確実に処理させる (surface 復帰フレームで再走)。
             ctx.request_repaint();
         }
         // auto_aspect: グリッド消費者では新規 Loaded で samples が増えた可能性があるので
@@ -33228,9 +33132,9 @@ impl App {
                 "  [queue] push +{new_hi}H +{new_lo}L  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
                 self.requested.len(),
             ));
-            // Normal frames also request repaint in the tail via `requested_nonempty`.
-            // Fullscreen cleanup / font-atlas resync can return before that tail, so
-            // wake the UI from the enqueue site as well.
+            // Normal frames also request repaint in the tail via `requested_nonempty`。
+            // update には fullscreen/navigation の早期 return があるため、enqueue owner からも
+            // UI を起こして結果の回収を保証する。
             ctx.request_repaint();
         }
         let t4 = frame_t0.elapsed();
@@ -37091,403 +36995,28 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn request_main_font_atlas_resync(&mut self, reason: &'static str) {
-        self.request_main_font_atlas_resync_now(reason);
-    }
-
-    #[cfg(windows)]
-    fn request_main_font_atlas_resync_now(&mut self, reason: &'static str) {
-        if Self::detached_image_window_debug_enabled() {
-            crate::logger::log(format!(
-                "[ui-fonts][diag] request_now reason={reason} pending_before={} \
-                 repeats={} detached_wait={} detached_safe={} active_context={} \
-                 session={:?} fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
-                self.main_font_atlas_resync_pending,
-                self.main_font_atlas_resync_repeats_left,
-                self.detached_font_atlas_resync_should_wait(),
-                self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_context_debug_state(),
-                self.active_detached_session,
-                self.fullscreen_idx,
-                self.viewer_presentation,
-                self.fs_viewport_shown,
-                self.detached_image_windows.len()
-            ));
-        }
-        if !self.main_font_atlas_resync_pending {
-            crate::logger::log(format!(
-                "[ui-fonts] schedule main font atlas resync: {reason}"
-            ));
+    pub(crate) fn request_main_font_update(&mut self) {
+        if !self.main_font_update_pending {
+            crate::logger::log("[ui-fonts] schedule main font update: ui_font_change");
         } else {
-            // A second producer arriving while a resync is pending resets the repeat count
-            // below, and said nothing. That matters for the A/B: closing a detached video
-            // window can raise both `detached_viewer_cleanup` and
-            // `native_video_backdrop_hide`, so a one-shot experiment could still show five
-            // discarded passes and be read as a failed experiment rather than a re-arm.
-            crate::logger::log(format!(
-                "[ui-fonts] re-arm main font atlas resync: {reason} \
-                 (pending reason={}, repeats_left={})",
-                self.main_font_atlas_resync_reason.unwrap_or("none"),
-                self.main_font_atlas_resync_repeats_left
-            ));
+            // 一時 probe の検索キーは再測定が終わるまで維持する。現在 re-arm できるのは
+            // teardown ではなく、未適用の UI フォント設定へ次の変更が合流した場合だけ。
+            crate::logger::log(
+                "[ui-fonts] re-arm main font atlas resync: ui_font_change \
+                 (pending operation=ui_font_change; repeat window removed)",
+            );
         }
-        self.main_font_atlas_resync_pending = true;
-        // close 直後の 1 フレームだけメインウィンドウの wgpu surface が消えて full upload が
-        // 捨てられる (no-surface early return)。数フレーム再発行して、surface が戻った
-        // フレームで確実に届かせる。
-        self.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES;
-        if self.main_font_atlas_resync_reason.is_none() {
-            self.main_font_atlas_resync_reason = Some(reason);
-        }
+        self.main_font_update_pending = true;
     }
 
     #[cfg(windows)]
-    pub(crate) fn request_detached_cleanup_font_atlas_resync(&mut self, source: &'static str) {
-        self.defer_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP, source);
-    }
-
-    #[cfg(windows)]
-    fn defer_main_font_atlas_resync(&mut self, reason: &'static str, source: &'static str) {
-        if Self::detached_image_window_debug_enabled() {
-            crate::logger::log(format!(
-                "[ui-fonts][diag] defer_request reason={reason} source={source} \
-                 existing={:?} detached_wait={} detached_safe={} active_context={} \
-                 session={:?} fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={}",
-                self.pending_detached_cleanup_font_atlas_resync,
-                self.detached_font_atlas_resync_should_wait(),
-                self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_context_debug_state(),
-                self.active_detached_session,
-                self.fullscreen_idx,
-                self.viewer_presentation,
-                self.fs_viewport_shown,
-                self.detached_image_windows.len()
-            ));
-        }
-        if self.pending_detached_cleanup_font_atlas_resync.is_none() {
-            crate::logger::log(format!(
-                "[ui-fonts] defer main font atlas resync: reason={reason} source={source}"
-            ));
-        }
-        if self.pending_detached_cleanup_font_atlas_resync.is_none() {
-            self.pending_detached_cleanup_font_atlas_resync = Some(reason);
-        }
-    }
-
-    #[cfg(windows)]
-    fn defer_pending_main_font_atlas_resync_for_detached_session(&mut self, source: &'static str) {
-        if !self.main_font_atlas_resync_pending {
+    fn apply_pending_main_font_update(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.main_font_update_pending) {
             return;
         }
-        let reason = self
-            .main_font_atlas_resync_reason
-            .take()
-            .unwrap_or("unknown");
-        self.main_font_atlas_resync_pending = false;
-        self.main_font_atlas_resync_repeats_left = 0;
-        self.main_font_atlas_resync_last_fire_frame = u64::MAX;
-        crate::logger::log(format!(
-            "[ui-fonts] move pending main font atlas resync to detached-deferred: \
-             reason={reason} source={source}"
-        ));
-        self.defer_main_font_atlas_resync(reason, source);
-    }
-
-    #[cfg(windows)]
-    fn log_font_atlas_pass_probe(&self, ctx: &egui::Context, phase: &'static str) {
-        if !Self::detached_image_window_debug_enabled() {
-            return;
-        }
-        let safety = self.main_font_atlas_resync_frame_safety();
-        let detached_wait = !safety.is_settled();
-        let interesting = self.main_font_atlas_resync_pending
-            || self.pending_detached_cleanup_font_atlas_resync.is_some()
-            || detached_wait
-            || ctx.current_pass_index() > 0
-            || ctx.will_discard();
-        if !interesting {
-            return;
-        }
-        let urgent = self.main_font_atlas_resync_defers_texture_uploads()
-            || ctx.current_pass_index() > 0
-            || ctx.will_discard();
-        if !urgent && self.frame_counter % 60 != 0 {
-            return;
-        }
-        crate::logger::log(format!(
-            "[ui-fonts][diag] pass_probe phase={phase} egui_frame={} egui_pass={} \
-             pass_index={} will_discard={} main_pending={} main_reason={} repeats={} \
-             last_fire={} generation={} deferred_reason={} detached_wait={} detached_safe={} \
-             placement_pending={} cloak_or_backdrop={} opening={} closing={} \
-             active_context={} session={:?} fullscreen_idx={:?} presentation={:?} \
-             fs_presentation={:?} fs_shown={} passive_windows={} embedded_still={} main_blocked={}",
-            ctx.cumulative_frame_nr(),
-            ctx.cumulative_pass_nr(),
-            ctx.current_pass_index(),
-            ctx.will_discard(),
-            self.main_font_atlas_resync_pending,
-            self.main_font_atlas_resync_reason.unwrap_or("none"),
-            self.main_font_atlas_resync_repeats_left,
-            self.main_font_atlas_resync_last_fire_frame,
-            self.main_font_atlas_resync_generation,
-            self.pending_detached_cleanup_font_atlas_resync
-                .unwrap_or("none"),
-            detached_wait,
-            safety.is_settled(),
-            safety.placement_pending,
-            safety.cloak_or_backdrop_active,
-            safety.opening_count,
-            safety.closing_count,
-            self.active_detached_context_debug_state(),
-            self.active_detached_session,
-            self.fullscreen_idx,
-            self.viewer_presentation,
-            self.fs_viewport_presentation,
-            self.fs_viewport_shown,
-            self.detached_image_windows.len(),
-            self.fullscreen_embedded_still_active(),
-            self.viewer_session_blocks_main_window()
-        ));
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn main_font_atlas_resync_settled_frame(&self) -> bool {
-        self.main_font_atlas_resync_frame_safety().is_settled()
-    }
-
-    #[cfg(windows)]
-    fn main_font_atlas_resync_video_switch_pending(&self) -> bool {
-        self.native_video_mode_switch.is_some()
-            || self.pending_detached_video_host_switch.is_some()
-            || self.pending_detached_video_host_resync
-            || self.native_video_source_swap_pending.is_some()
-    }
-
-    #[cfg(windows)]
-    fn main_font_atlas_resync_backdrop_or_cloak_active(&self) -> bool {
-        self.native_video_main_cloaked || self.native_video_fullscreen_active_for_main_backdrop()
-    }
-
-    #[cfg(windows)]
-    fn detached_window_runtime_state_count(&self, state: DetachedWindowState) -> usize {
-        self.detached_window_manager.state_count(state)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn main_font_atlas_resync_frame_safety(&self) -> MainFontAtlasResyncFrameSafety {
-        MainFontAtlasResyncFrameSafety {
-            placement_pending: self.main_font_atlas_resync_video_switch_pending(),
-            cloak_or_backdrop_active: self.main_font_atlas_resync_backdrop_or_cloak_active(),
-            opening_count: self.detached_window_runtime_state_count(DetachedWindowState::Opening),
-            closing_count: self.detached_window_runtime_state_count(DetachedWindowState::Closing),
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn main_font_atlas_resync_defers_texture_uploads(&self) -> bool {
-        self.main_font_atlas_resync_pending
-            && self.main_font_atlas_resync_repeats_left > 0
-            && self.main_font_atlas_resync_repeats_left < MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_font_atlas_resync_should_wait(&self) -> bool {
-        !self.main_font_atlas_resync_settled_frame()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_cleanup_font_atlas_resync_is_safe(&self) -> bool {
-        self.main_font_atlas_resync_settled_frame()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn flush_pending_detached_cleanup_font_atlas_resync(&mut self) {
-        let Some(reason) = self.pending_detached_cleanup_font_atlas_resync else {
-            return;
-        };
-        let safety = self.main_font_atlas_resync_frame_safety();
-        if !safety.is_settled() {
-            if self.frame_counter % 60 == 0 {
-                self.log_detached_image_window_debug(format!(
-                    "font_resync_deferred_detached_alive active_context={} session={:?} \
-                 fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} \
-                 reason={reason} placement_pending={} cloak_or_backdrop={} opening={} closing={}",
-                    self.active_detached_context_debug_state(),
-                    self.active_detached_session,
-                    self.fullscreen_idx,
-                    self.viewer_presentation,
-                    self.fs_viewport_shown,
-                    self.detached_image_windows.len(),
-                    safety.placement_pending,
-                    safety.cloak_or_backdrop_active,
-                    safety.opening_count,
-                    safety.closing_count
-                ));
-            }
-            return;
-        }
-        self.pending_detached_cleanup_font_atlas_resync = None;
-        crate::logger::log(format!(
-            "[ui-fonts] flush deferred main font atlas resync: reason={reason}"
-        ));
-        self.request_main_font_atlas_resync_now(reason);
-    }
-
-    #[cfg(windows)]
-    fn maybe_defer_for_main_font_atlas_resync(
-        &mut self,
-        ctx: &egui::Context,
-        phase: &'static str,
-    ) -> bool {
-        self.log_font_atlas_pass_probe(ctx, phase);
-        if !self.main_font_atlas_resync_pending {
-            return false;
-        }
-        let safety = self.main_font_atlas_resync_frame_safety();
-        if !safety.is_settled() {
-            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
-                crate::logger::log(format!(
-                    "[ui-fonts][diag] resync_wait_settled phase={phase} reason={} \
-                     egui_frame={} egui_pass={} pass_index={} placement_pending={} \
-                     cloak_or_backdrop={} opening={} closing={} fullscreen_idx={:?} \
-                     presentation={:?} fs_presentation={:?} fs_shown={} passive_windows={} \
-                     active_context={} session={:?}",
-                    self.main_font_atlas_resync_reason.unwrap_or("none"),
-                    ctx.cumulative_frame_nr(),
-                    ctx.cumulative_pass_nr(),
-                    ctx.current_pass_index(),
-                    safety.placement_pending,
-                    safety.cloak_or_backdrop_active,
-                    safety.opening_count,
-                    safety.closing_count,
-                    self.fullscreen_idx,
-                    self.viewer_presentation,
-                    self.fs_viewport_presentation,
-                    self.fs_viewport_shown,
-                    self.detached_image_windows.len(),
-                    self.active_detached_context_debug_state(),
-                    self.active_detached_session
-                ));
-            }
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            return false;
-        }
-        if self.viewer_session_blocks_main_window() && !self.fullscreen_embedded_still_active() {
-            if Self::detached_image_window_debug_enabled() {
-                crate::logger::log(format!(
-                    "[ui-fonts][diag] resync_wait_main_blocked phase={phase} reason={} \
-                     egui_frame={} egui_pass={} pass_index={} fullscreen_idx={:?} presentation={:?}",
-                    self.main_font_atlas_resync_reason.unwrap_or("none"),
-                    ctx.cumulative_frame_nr(),
-                    ctx.cumulative_pass_nr(),
-                    ctx.current_pass_index(),
-                    self.fullscreen_idx,
-                    self.viewer_presentation
-                ));
-            }
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            return false;
-        }
-
-        // 1 OS フレーム 1 発行へゲートする。discard 再パスや update 内 2 箇所
-        // (update_early / pre_main_ui) で同一フレーム内に複数回呼ばれても、2 回目以降は
-        // 再発行せず paint を進めさせる (= repeats を 1 フレームで使い切らない / 黒フレーム回避)。
-        let frame_nr = ctx.cumulative_frame_nr();
-        if self.main_font_atlas_resync_last_fire_frame == frame_nr {
-            return false;
-        }
-        self.main_font_atlas_resync_last_fire_frame = frame_nr;
-
-        // 数フレーム再発行する。最後の 1 回まで pending/reason を保持し、毎フレーム
-        // set_fonts で full atlas upload を再要求して surface 復帰フレームに届かせる。
-        let repeats_left = self.main_font_atlas_resync_repeats_left.saturating_sub(1);
-        self.main_font_atlas_resync_repeats_left = repeats_left;
-        let final_fire = repeats_left == 0;
-        if final_fire {
-            self.main_font_atlas_resync_pending = false;
-        }
-        self.main_font_atlas_resync_generation =
-            self.main_font_atlas_resync_generation.wrapping_add(1);
-        let generation = self.main_font_atlas_resync_generation;
-        let reason = if final_fire {
-            self.main_font_atlas_resync_reason
-                .take()
-                .unwrap_or("unknown")
-        } else {
-            self.main_font_atlas_resync_reason.unwrap_or("unknown")
-        };
-        if Self::detached_image_window_debug_enabled() {
-            crate::logger::log(format!(
-                "[ui-fonts][diag] set_fonts_for_resync phase={phase} reason={reason} \
-                 generation={generation} final_fire={final_fire} repeats_left={repeats_left} \
-                 egui_frame={} egui_pass={} pass_index={} will_discard_before={}",
-                ctx.cumulative_frame_nr(),
-                ctx.cumulative_pass_nr(),
-                ctx.current_pass_index(),
-                ctx.will_discard()
-            ));
-        }
-        crate::ui_fonts::configure_fonts_for_texture_resync(
-            ctx,
-            generation,
-            &self.settings.ui_font,
-        );
-        if !final_fire {
-            // 次フレームでも再発行する。surface が戻るまで full upload を出し続ける。
-            ctx.request_repaint();
-        }
-        let defer_main_paint = should_defer_main_paint_for_font_atlas_resync(reason);
-        if !defer_main_paint {
-            // detached cleanup 等、保守的 defer が不要な経路。フォント再アップロードを
-            // 予約しただけで、この pass はそのままメイン UI を描く。
-            crate::logger::log(format!(
-                "[ui-fonts] resync main font atlas without paint defer: phase={phase} \
-                 reason={reason} generation={generation} egui_frame={} egui_pass={} pass_index={}",
-                ctx.cumulative_frame_nr(),
-                ctx.cumulative_pass_nr(),
-                ctx.current_pass_index()
-            ));
-            ctx.request_repaint();
-            return false;
-        }
-
-        // 通常 fullscreen / 動画 backdrop / F11 recreate の resync 経路。
-        //
-        // `set_fonts` は「次 pass の begin_pass で適用」される (egui 仕様)。ここで
-        // この pass を `request_discard` で破棄すると、egui の run() が **同じ OS
-        // フレーム内** でもう一度 begin_pass → update() を走らせる。次 pass の
-        // begin_pass で new_font_definitions が適用され、font atlas のフルアップロードが
-        // メイン UI 描画より前に入るため、stale texture への部分更新 panic を避けつつ、
-        // 破棄された pass は paint されないので黒/空白フレームも出ない。
-        // 2 度目の pass は入力 events が空になる (RawInput::take 済み) ので、close や
-        // ナビ等の入力起因処理が二重発火しないのも担保される。
-        ctx.request_discard(format!("font-atlas-resync:{reason}"));
-        if ctx.will_discard() {
-            crate::logger::log(format!(
-                "[ui-fonts] discard pass for font atlas resync (same-frame repass): \
-                 phase={phase} reason={reason} generation={generation} egui_frame={} \
-                 egui_pass={} pass_index={}",
-                ctx.cumulative_frame_nr(),
-                ctx.cumulative_pass_nr(),
-                ctx.current_pass_index()
-            ));
-            // 同一フレーム内で次 pass が走るので request_repaint は不要。
-            return true;
-        }
-
-        // multi-pass の予算が無い (max_passes 到達 / 他要因の discard と競合等)。
-        // 従来どおりこの pass の描画を飛ばし、次フレームで再描画する安全側フォール
-        // バック (= 1 フレーム黒)。通常運用ではここには来ない想定。
-        crate::logger::log(format!(
-            "[ui-fonts] defer main paint for font atlas resync (no discard budget): \
-             phase={phase} reason={reason} generation={generation} egui_frame={} \
-             egui_pass={} pass_index={}",
-            ctx.cumulative_frame_nr(),
-            ctx.cumulative_pass_nr(),
-            ctx.current_pass_index()
-        ));
+        crate::ui_fonts::configure_fonts_with_settings(ctx, &self.settings.ui_font);
+        crate::logger::log("[ui-fonts] apply main font update: ui_font_change");
         ctx.request_repaint();
-        true
     }
 
     pub(crate) fn main_grid_spread_pair_cursor_idx(&mut self) -> Option<usize> {
@@ -37659,7 +37188,6 @@ impl App {
                 "session_begin window_id={window_id} source={source:?}"
             ));
         }
-        self.defer_pending_main_font_atlas_resync_for_detached_session("session_begin");
     }
 
     /// セッション終了処理を開始する (closing=true)。teardown 中は keep-alive を止めるが、
@@ -37677,7 +37205,7 @@ impl App {
     }
 
     /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
-    /// `Closing -> Removed` もここで所有し、font-atlas resync を stale runtime で塞がない。
+    /// `Closing -> Removed` もここで所有し、focus / placement / host 判定へ stale runtime を残さない。
     #[cfg(windows)]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
         let Some(session) = self.active_detached_session.take() else {
@@ -38249,7 +37777,6 @@ impl App {
         self.detached_viewer_recreate_on_next_render = false;
         self.clear_detached_viewer_host_hwnd();
         self.clear_detached_viewer_borderless_fullscreen_state();
-        self.request_detached_cleanup_font_atlas_resync("mode_change_close_all");
         self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
         ctx.request_repaint();
         self.log_detached_image_window_debug(format!(
@@ -39829,7 +39356,6 @@ impl App {
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
         // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
         self.finish_active_detached_session_close("active_close_finalize");
-        self.request_detached_cleanup_font_atlas_resync("active_close_finalize");
         self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
             "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
@@ -65811,16 +65337,14 @@ impl eframe::App for App {
     /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
     ///
     /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。
-    /// 通常フレームはパネルが全面を覆うので不可視だが、**描画を 1 フレーム飛ばす局面**
-    /// (font atlas resync の `request_discard` 予算切れ defer / detached 窓 close 直後の
-    /// no-surface フレーム) ではこのクリア色がそのまま見える。near-black 固定だと
+    /// 通常フレームはパネルが全面を覆うので不可視だが、detached top-level HWND の close /
+    /// DWM 再合成や fullscreen navigation の描画 gap ではこのクリア色が見える。near-black 固定だと
     /// ダークテーマでは地 (panel_fill) と馴染むが、**ライトテーマでは「一瞬黒」が目立つ**
     /// (例: PDF を auto-fullscreen で開いて Esc → 親フォルダ再読込で 1 フレーム blank)。
     ///
     /// テーマのパネル背景 (= メニューバー背景) に合わせると、ライト/ダークどちらでも
-    /// 地と馴染んでちらつきが目立たなくなる。font atlas resync の defer 自体には触らないので、
-    /// `d48982e5`「Use conservative font atlas resync」で確定した「stale font atlas で描かない
-    /// = フォント崩れ回避」のトレードオフは維持される (緩和策であって根本修正ではない)。
+    /// 地と馴染んでちらつきが目立たなくなる。top-level HWND teardown の再合成自体は
+    /// 消さない表示緩和であり、font atlas の正しさとは独立している。
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // eframe 既定の alpha=180 は transparent() 有効時用なので踏襲せず、不透明の
         // パネル背景色を返す (純ロジックは free fn 化して unit test で回帰ガード)。
@@ -65914,21 +65438,7 @@ impl eframe::App for App {
         }
 
         #[cfg(windows)]
-        self.flush_pending_detached_cleanup_font_atlas_resync();
-        #[cfg(windows)]
-        if self.maybe_defer_for_main_font_atlas_resync(ctx, "update_early") {
-            self.log_main_flash_probe(
-                "early_return",
-                "reason=font_resync_update_early main_ui=false detached_render_before_return=true",
-            );
-            self.log_detached_image_window_debug(format!(
-                "font_resync_update_early_render_detached_before_return passive_windows={} frame={}",
-                self.detached_image_windows.len(),
-                self.frame_counter
-            ));
-            self.render_detached_image_windows(ctx);
-            return;
-        }
+        self.apply_pending_main_font_update(ctx);
 
         // メインウィンドウの HWND を最初のフレームで取得 (Win32 ShowWindow 用)。
         // eframe::Frame::window_handle() は raw_window_handle::WindowHandle を返す。
@@ -66790,9 +66300,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.render_active_detached_viewport_backstop(ctx);
         let t_detached_backstop = frame_t0.elapsed();
-        #[cfg(windows)]
-        self.flush_pending_detached_cleanup_font_atlas_resync();
-        let t_render_fullscreen_viewport = frame_t0.elapsed();
+        let t_render_fullscreen_viewport = t_detached_backstop;
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
         // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
@@ -67015,15 +66523,6 @@ impl eframe::App for App {
                 );
                 return;
             }
-        }
-
-        #[cfg(windows)]
-        if self.maybe_defer_for_main_font_atlas_resync(ctx, "pre_main_ui") {
-            self.log_main_flash_probe(
-                "early_return",
-                "reason=font_resync_pre_main_ui main_ui=false",
-            );
-            return;
         }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
@@ -68052,13 +67551,6 @@ impl eframe::App for App {
                         "detached_backstop_ms",
                         serde_json::Value::from(
                             (t_detached_backstop - t_detached_image_windows).as_secs_f64() * 1000.0,
-                        ),
-                    ),
-                    (
-                        "font_atlas_resync_ms",
-                        serde_json::Value::from(
-                            (t_render_fullscreen_viewport - t_detached_backstop).as_secs_f64()
-                                * 1000.0,
                         ),
                     ),
                     (

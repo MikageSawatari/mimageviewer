@@ -1850,7 +1850,7 @@ impl App {
                         if !closed_detached && self.fullscreen_idx.is_some() {
                             self.close_fullscreen();
                         }
-                        self.request_main_font_atlas_resync("ui_font_change");
+                        self.request_main_font_update();
                     }
                     #[cfg(not(windows))]
                     crate::ui_fonts::configure_fonts_with_settings(ctx, &self.settings.ui_font);

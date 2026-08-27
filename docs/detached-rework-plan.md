@@ -1298,6 +1298,42 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-27 font atlas の viewport lifecycle resync を renderer 配送境界へ集約
+(backlog §1.115 option (d)、ClaudeCode と Codex が構造修正として事前合意):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の main font request state / update 順序 /
+thumbnail upload、[src/app/native_video.rs](../src/app/native_video.rs) と
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の lifecycle producer、
+[src/ui_dialogs/preferences.rs](../src/ui_dialogs/preferences.rs) と
+[src/ui_fonts.rs](../src/ui_fonts.rs) の UI font 設定適用、
+[vendor/egui-wgpu/src/winit.rs](../vendor/egui-wgpu/src/winit.rs) の既存 probe コメント、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明。detached host の visibility / placement /
+focus / epoch / HWND identity、native presenter renderer、overlay GPU、open arbitration は変更しない。
+`[ui-frame-gap]`、`[atlas-probe]`、re-arm probe は再計測まで残す。
+
+**不変条件と所有境界**: main egui viewport 群は 1 つの `Context` / `Painter` /
+`render_state` / renderer texture namespace を共有し、viewport teardown は font atlas texture を
+所有も破棄もしない。native video presenter は別の `egui::Context` と renderer を所有し、
+生成時に現在の UI font を構成するため、main atlas の再発行は presenter を修復しない。
+生成済み texture delta の正しさは、painter の surface より前の適用と、eframe の 4 つの
+no-paint early return からの配送が所有する。実機では全 atlas delta が
+`site=paint outcome=Submitted` で、surface-less / no-paint / render-state-absent 配送は 0 件だった。
+
+このため viewport close / recreate / backdrop hide / still-window toggle の font firing は 0 とし、
+`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`、pending / reason / safety state、marker 付き full reload、
+`request_discard` / repass、thumbnail upload 先送りを撤去した。`d48982e5` の detached cleanup
+保守経路は、当時存在した dropped-upload failure を caller repeat で補う判断であり、backend
+配送境界が閉じた現在は根拠を失っている。実際の UI font 設定変更だけは main context owner の
+`main_font_update_pending` に coalesce し、次 update で現在設定を 1 回 `set_fonts` する。
+旧 atlas はその時点でも有効なので discard は行わない。
+
+**§2 規則との整合**: 規則3に従い viewport 再利用方式や F12 挙動を変えず、規則5に反する
+5-frame race window を削除した。規則7に従い残る top-level HWND teardown / DWM 再合成の
+ちらつきは別 defect のまま混同せず、規則8に従い所有者を持たない App-level resync state を
+追加せず減らした。caller の 4 early-return site、cleanup / backdrop hide / recreate の
+0 firing、UI font update の 1 回 coalesce、thumbnail 即時 upload を独立テストで固定する。
+残留する DWM flash は本変更の完了条件に含めず、§1.115 の host lifecycle 側で扱う。
+
 **2026-08-27 detached grid の Descriptor open から main filter suppression を分離
 (backlog §1.132 P2-2 follow-up、利用者提示の ClaudeCode re-review と Codex の callee
 inspection が一致):**

@@ -61,25 +61,6 @@ pub(crate) struct DetachedActivationDispatch {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MainFontAtlasResyncFrameSafety {
-    pub(crate) placement_pending: bool,
-    pub(crate) cloak_or_backdrop_active: bool,
-    pub(crate) opening_count: usize,
-    pub(crate) closing_count: usize,
-}
-
-#[cfg(windows)]
-impl MainFontAtlasResyncFrameSafety {
-    pub(crate) fn is_settled(self) -> bool {
-        !self.placement_pending
-            && !self.cloak_or_backdrop_active
-            && self.opening_count == 0
-            && self.closing_count == 0
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetachedActivationCloseHitTest {
     ImageBar,
     MusicChrome,
@@ -875,6 +856,7 @@ impl DetachedWindowManager {
         self.runtimes.keys().copied().collect()
     }
 
+    #[cfg(test)]
     pub(super) fn state_count(&self, state: DetachedWindowState) -> usize {
         self.runtimes
             .values()
