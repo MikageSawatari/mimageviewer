@@ -7784,6 +7784,24 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             );
         });
     });
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("360 度ビュー").strong());
+    anchored(ui, state, "spread/panorama-projection", |ui, state| {
+        let s = &mut state.settings;
+        egui::ComboBox::from_label("投影方式")
+            .selected_text(s.panorama_projection.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::panorama::PanoProjection::all() {
+                    ui.selectable_value(&mut s.panorama_projection, mode, mode.label())
+                        .on_hover_text(mode.description());
+                }
+            });
+        ui.small(
+            "360 度ビューを開いたときの投影方式です。表示中は上部バーの投影ボタンでも\n\
+             切り替えられます (そちらの変更はこの既定値を書き換えません)。",
+        );
+        ui.small(s.panorama_projection.description());
+    });
 }
 
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {

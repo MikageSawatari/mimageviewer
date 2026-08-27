@@ -4089,6 +4089,11 @@ pub struct Settings {
     /// Screen corner used by the fullscreen navigator.
     #[serde(default)]
     pub fullscreen_navigator_corner: FullscreenNavigatorCorner,
+    /// 360 度ビューを開いたときの投影方式。閲覧中の切り替え
+    /// (`KeyAction::FsPanoramaProjection` / 上バーのボタン) はこの既定値を書き換えず、
+    /// そのセッションの `PanoramaState` だけを動かす。
+    #[serde(default)]
+    pub panorama_projection: crate::panorama::PanoProjection,
     /// Length of one side of the navigator canvas in logical points.
     #[serde(default = "default_fullscreen_navigator_size")]
     pub fullscreen_navigator_size: f32,
@@ -5842,6 +5847,7 @@ impl Default for Settings {
             fullscreen_prefetch_status_visible: true,
             fullscreen_navigator_visible: false,
             fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
+            panorama_projection: crate::panorama::PanoProjection::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
@@ -7572,6 +7578,7 @@ impl Settings {
         self.fullscreen_cursor_hide_delay_secs =
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
         self.fullscreen_navigator_corner = self.fullscreen_navigator_corner.normalized();
+        self.panorama_projection = self.panorama_projection.normalized();
         self.fullscreen_navigator_size = if self.fullscreen_navigator_size.is_finite() {
             self.fullscreen_navigator_size
                 .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
@@ -10499,6 +10506,10 @@ mod tests {
         assert_eq!(
             s.fullscreen_navigator_corner,
             FullscreenNavigatorCorner::BottomRight
+        );
+        assert_eq!(
+            s.panorama_projection,
+            crate::panorama::PanoProjection::Perspective
         );
         assert_eq!(
             s.fullscreen_navigator_size,

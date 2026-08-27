@@ -2198,6 +2198,85 @@ pub(super) enum NativeTopButtonGlyph {
     },
     /// 音符 (♪): 動画→音声モードのトグルボタン (Inc 7)。
     AudioMode,
+    Panorama,
+    PanoramaReset,
+}
+
+const NATIVE_PANORAMA_PROJECTION_POPUP_TEXT_LEFT: f32 = 48.0;
+const NATIVE_PANORAMA_PROJECTION_POPUP_ROW_HEIGHT: f32 = 40.0;
+const NATIVE_TOP_POPUP_SCREEN_MARGIN: f32 = 8.0;
+
+fn native_panorama_projection_popup_size(ctx: &egui::Context) -> egui::Vec2 {
+    let label_font = egui::FontId::proportional(13.0);
+    let description_font = egui::FontId::proportional(10.0);
+    let (content_width, title_width) = ctx.fonts_mut(|fonts| {
+        let mut content_width = 0.0_f32;
+        for &mode in crate::panorama::PanoProjection::all() {
+            for (text, font) in [
+                (mode.label(), &label_font),
+                (mode.short_description(), &description_font),
+            ] {
+                let width = fonts
+                    .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+                    .rect
+                    .width();
+                content_width = content_width.max(width);
+            }
+        }
+        let title_width = fonts
+            .layout_no_wrap(
+                "投影方式".to_owned(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            )
+            .rect
+            .width();
+        (content_width, title_width)
+    });
+    let content_width =
+        (NATIVE_PANORAMA_PROJECTION_POPUP_TEXT_LEFT + content_width + 16.0).max(title_width + 24.0);
+    egui::vec2(
+        content_width,
+        crate::panorama::PanoProjection::all().len() as f32
+            * NATIVE_PANORAMA_PROJECTION_POPUP_ROW_HEIGHT
+            + 36.0,
+    )
+}
+
+/// 上バーの右寄りのボタンから吊るす popup を、サイズを変えず画面内へ寄せる。
+/// 極端に狭く popup 自体が収まらない場合は左上 margin を優先する。
+pub(super) fn native_panorama_projection_popup_rect(
+    full_rect: egui::Rect,
+    anchor_x: f32,
+    top: f32,
+    size: egui::Vec2,
+) -> egui::Rect {
+    let margin = NATIVE_TOP_POPUP_SCREEN_MARGIN;
+    let min_x = full_rect.min.x + margin;
+    let max_x = full_rect.max.x - margin - size.x;
+    let x = anchor_x.min(max_x).max(min_x);
+    let min_y = full_rect.min.y + margin;
+    let max_y = full_rect.max.y - margin - size.y;
+    let y = top.min(max_y).max(min_y);
+    egui::Rect::from_min_size(egui::pos2(x, y), size)
+}
+
+pub(super) fn native_panorama_projection_popup_row_rect(
+    popup_rect: egui::Rect,
+    row_index: usize,
+) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            popup_rect.min.x + 4.0,
+            popup_rect.min.y
+                + 32.0
+                + row_index as f32 * NATIVE_PANORAMA_PROJECTION_POPUP_ROW_HEIGHT,
+        ),
+        egui::vec2(
+            popup_rect.width() - 8.0,
+            NATIVE_PANORAMA_PROJECTION_POPUP_ROW_HEIGHT - 4.0,
+        ),
+    )
 }
 
 pub(super) fn draw_native_top_button(
@@ -2215,9 +2294,36 @@ pub(super) fn draw_native_top_button(
     command: NativeOverlayCommand,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    draw_native_top_button_enabled(
+        ui, painter, x, y, width, height, gap, id, glyph, active, true, tooltip, command, commands,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_native_top_button_enabled(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    x: &mut f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    gap: f32,
+    id: &'static str,
+    glyph: NativeTopButtonGlyph,
+    active: bool,
+    enabled: bool,
+    tooltip: &str,
+    command: NativeOverlayCommand,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
     let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
-    draw_overlay_button_bg(painter, rect, resp.hovered(), active);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let resp = ui.interact(rect, egui::Id::new(id), sense);
+    draw_overlay_button_bg(painter, rect, enabled && resp.hovered(), active);
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::TileColumnsLess => draw_overlay_grid_density_icon(painter, rect, 3),
@@ -2230,12 +2336,60 @@ pub(super) fn draw_native_top_button(
             draw_overlay_info_icon(painter, rect, click_to_show)
         }
         NativeTopButtonGlyph::AudioMode => draw_overlay_music_note_icon(painter, rect),
+        NativeTopButtonGlyph::Panorama if enabled => {
+            crate::ui_fullscreen::draw_icons::draw_panorama_icon(
+                painter,
+                rect.center(),
+                rect.width().min(rect.height()) * 0.28,
+            )
+        }
+        NativeTopButtonGlyph::Panorama => {
+            crate::ui_fullscreen::draw_icons::draw_panorama_icon_disabled(
+                painter,
+                rect.center(),
+                rect.width().min(rect.height()) * 0.28,
+            )
+        }
+        NativeTopButtonGlyph::PanoramaReset => {
+            draw_overlay_panorama_reset_icon(painter, rect, enabled)
+        }
     }
     let resp = resp.hover_tip_dark(tooltip);
-    if resp.clicked() {
+    if enabled && resp.clicked() {
         commands.push(command);
     }
     *x -= width + gap;
+}
+
+fn draw_overlay_panorama_reset_icon(painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
+    let color = if enabled {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgba_unmultiplied(180, 180, 180, 140)
+    };
+    let radius = rect.width().min(rect.height()) * 0.25;
+    let center = rect.center();
+    let points = (1..=13)
+        .map(|step| {
+            let angle =
+                -std::f32::consts::PI * 0.75 + std::f32::consts::TAU * 0.82 * step as f32 / 13.0;
+            center + egui::vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.8, color)));
+    let tip = center
+        + egui::vec2(
+            (-std::f32::consts::PI * 0.75).cos(),
+            (-std::f32::consts::PI * 0.75).sin(),
+        ) * radius;
+    painter.line_segment(
+        [tip, tip + egui::vec2(1.0, 5.0)],
+        egui::Stroke::new(1.8, color),
+    );
+    painter.line_segment(
+        [tip, tip + egui::vec2(5.0, 0.5)],
+        egui::Stroke::new(1.8, color),
+    );
 }
 
 pub(super) fn draw_native_bar_lock_button(
@@ -3853,12 +4007,133 @@ pub(super) fn draw_top_bar_text_lines(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_native_panorama_projection_popup(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    button_rect: egui::Rect,
+    current: crate::panorama::PanoProjection,
+    popup_open: &mut bool,
+    popup_rect_out: &mut Option<egui::Rect>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    if !*popup_open {
+        return;
+    }
+
+    let popup_size = native_panorama_projection_popup_size(ctx);
+    let popup_rect = native_panorama_projection_popup_rect(
+        full_rect,
+        button_rect.min.x,
+        crate::video::native_presenter::HUD_TOP_HEIGHT + 4.0,
+        popup_size,
+    );
+    let mut selected = None;
+    let mut drawn_popup_rect = popup_rect;
+    egui::Area::new(egui::Id::new("native_panorama_projection_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup_rect.min)
+        .show(ctx, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            let (rect, _) = ui.allocate_exact_size(popup_size, egui::Sense::hover());
+            drawn_popup_rect = rect;
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
+                ),
+                egui::StrokeKind::Outside,
+            );
+            painter.text(
+                egui::pos2(rect.min.x + 12.0, rect.min.y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "投影方式",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+
+            let label_font = egui::FontId::proportional(13.0);
+            let description_font = egui::FontId::proportional(10.0);
+            for (row_index, &mode) in crate::panorama::PanoProjection::all().iter().enumerate() {
+                let item_rect = native_panorama_projection_popup_row_rect(rect, row_index);
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(("native_panorama_projection_item", mode.shader_code())),
+                    egui::Sense::click(),
+                );
+                if item_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let is_current = current.normalized() == mode;
+                let background = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                painter.rect_filled(item_rect, 4.0, background);
+                crate::ui_fullscreen::draw_icons::draw_panorama_projection_icon(
+                    &painter,
+                    egui::pos2(item_rect.min.x + 20.0, item_rect.center().y),
+                    8.0,
+                    mode,
+                );
+                let text_x = item_rect.min.x + NATIVE_PANORAMA_PROJECTION_POPUP_TEXT_LEFT - 4.0;
+                painter.text(
+                    egui::pos2(text_x, item_rect.center().y - 7.0),
+                    egui::Align2::LEFT_CENTER,
+                    mode.label(),
+                    label_font.clone(),
+                    egui::Color32::from_gray(220),
+                );
+                painter.text(
+                    egui::pos2(text_x, item_rect.center().y + 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    mode.short_description(),
+                    description_font.clone(),
+                    egui::Color32::from_gray(150),
+                );
+                if item_resp.clicked() {
+                    selected = Some(mode);
+                }
+            }
+        });
+
+    if let Some(mode) = selected {
+        commands.push(NativeOverlayCommand::SetPanoramaProjection(mode));
+        *popup_open = false;
+    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+        && !drawn_popup_rect.contains(pos)
+        && !button_rect.contains(pos)
+        && ctx.input(|input| input.pointer.any_pressed())
+    {
+        *popup_open = false;
+    }
+    if *popup_open {
+        *popup_rect_out = Some(drawn_popup_rect);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_native_top_bar(
     ctx: &egui::Context,
     overlay_width_points: f32,
+    overlay_height_points: f32,
     position_secs: f64,
     duration_secs: f64,
     metadata: Option<&NativeOverlayMetadata>,
+    panorama_pose: Option<crate::panorama::PanoPose>,
+    panorama_projection_popup_open: &mut bool,
+    panorama_projection_popup_rect_out: &mut Option<egui::Rect>,
     fallback_file_name: &str,
     perf_visible: bool,
     vst3_available: bool,
@@ -3871,6 +4146,11 @@ pub(super) fn draw_native_top_bar(
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    *panorama_projection_popup_rect_out = None;
+    if panorama_pose.is_none() || audio_only {
+        *panorama_projection_popup_open = false;
+    }
+    let mut panorama_projection_button_rect = None;
     egui::Area::new(egui::Id::new("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -3981,6 +4261,118 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
+            let panorama_detection = metadata.and_then(|metadata| metadata.panorama_detection);
+            let panorama_enabled = matches!(panorama_detection, Some(Ok(_)));
+            let panorama_active = panorama_enabled && panorama_pose.is_some();
+            if !panorama_active {
+                *panorama_projection_popup_open = false;
+            }
+            let panorama_tooltip = match panorama_detection {
+                None => "360 度動画の情報を読み込み中".to_owned(),
+                Some(Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto)) => {
+                    native_label_with_shortcut(
+                        "360 度表示",
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
+                    )
+                }
+                Some(Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Hint)) => {
+                    native_label_with_shortcut(
+                        "360 度表示 (2:1 候補)",
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
+                    )
+                }
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::UnsupportedProjection(
+                        _,
+                    ),
+                )) => "この球面投影方式には対応していません".to_owned(),
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::Stereoscopic(_),
+                )) => "立体視 360 度動画には対応していません".to_owned(),
+                Some(Err(
+                    crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic,
+                )) => "360 度動画ではありません".to_owned(),
+            };
+            draw_native_top_button_enabled(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_panorama",
+                NativeTopButtonGlyph::Panorama,
+                panorama_active,
+                panorama_enabled,
+                &panorama_tooltip,
+                NativeOverlayCommand::TogglePanorama,
+                commands,
+            );
+            if let Some(pose) = panorama_pose.filter(|_| panorama_active) {
+                let panorama_controls_enabled = !audio_only;
+                let projection_tooltip = if panorama_controls_enabled {
+                    native_label_with_shortcut(
+                        &format!(
+                            "投影方式: {}\nクリックで一覧から選択",
+                            pose.projection.label()
+                        ),
+                        shortcuts.and_then(|shortcuts| shortcuts.panorama_projection.as_deref()),
+                    )
+                } else {
+                    "音声モード中は投影方式を変更できません".to_owned()
+                };
+                let projection_rect =
+                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
+                let projection_sense = if panorama_controls_enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                };
+                let projection_resp = ui.interact(
+                    projection_rect,
+                    egui::Id::new("native_top_panorama_projection"),
+                    projection_sense,
+                );
+                draw_overlay_button_bg(
+                    &painter,
+                    projection_rect,
+                    panorama_controls_enabled && projection_resp.hovered(),
+                    *panorama_projection_popup_open,
+                );
+                crate::ui_fullscreen::draw_icons::draw_panorama_projection_icon(
+                    &painter,
+                    projection_rect.center(),
+                    projection_rect.width().min(projection_rect.height()) * 0.28,
+                    pose.projection,
+                );
+                let projection_resp = projection_resp.hover_tip_dark(&projection_tooltip);
+                panorama_projection_button_rect = Some(projection_resp.rect);
+                if panorama_controls_enabled && projection_resp.clicked() {
+                    *panorama_projection_popup_open = !*panorama_projection_popup_open;
+                }
+                x -= btn_size + gap;
+                draw_native_top_button_enabled(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_panorama_reset",
+                    NativeTopButtonGlyph::PanoramaReset,
+                    false,
+                    panorama_controls_enabled,
+                    if panorama_controls_enabled {
+                        "初期視点に戻す"
+                    } else {
+                        "音声モード中は視点をリセットできません"
+                    },
+                    NativeOverlayCommand::ResetPanorama,
+                    commands,
+                );
+            }
             let side_panel_mode = side_panel_mode.normalized();
             let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
             let info_tip = format!(
@@ -4025,7 +4417,7 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleAudioMode,
                     commands,
                 );
-                draw_native_top_button(
+                draw_native_top_button_enabled(
                     ui,
                     &painter,
                     &mut x,
@@ -4036,10 +4428,16 @@ pub(super) fn draw_native_top_bar(
                     "native_top_tile",
                     NativeTopButtonGlyph::TileGrid,
                     false,
-                    &native_label_with_shortcut(
-                        "サムネイル一覧",
-                        shortcuts.and_then(|s| s.tile_mode.as_deref()),
-                    ),
+                    panorama_pose.is_none(),
+                    if panorama_pose.is_some() {
+                        "360 度表示中はサムネイル一覧を開けません".to_owned()
+                    } else {
+                        native_label_with_shortcut(
+                            "サムネイル一覧",
+                            shortcuts.and_then(|s| s.tile_mode.as_deref()),
+                        )
+                    }
+                    .as_str(),
                     NativeOverlayCommand::ToggleTileMode,
                     commands,
                 );
@@ -4083,6 +4481,23 @@ pub(super) fn draw_native_top_bar(
                 painter.rect_filled(rect, 0.0, native_hud_dim_color());
             }
         });
+
+    if let (Some(button_rect), Some(pose)) = (panorama_projection_button_rect, panorama_pose) {
+        draw_native_panorama_projection_popup(
+            ctx,
+            egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            ),
+            button_rect,
+            pose.projection,
+            panorama_projection_popup_open,
+            panorama_projection_popup_rect_out,
+            commands,
+        );
+    } else {
+        *panorama_projection_popup_open = false;
+    }
 }
 
 pub(super) fn draw_native_top_bar_tile(
@@ -7382,5 +7797,33 @@ mod tests {
         let landscape = fit_rect_in_rect(egui::vec2(1280.0, 720.0), slot);
         assert!((landscape.width() - slot.width()).abs() < 1e-3);
         assert!(slot.contains_rect(landscape));
+    }
+
+    #[test]
+    fn panorama_projection_popup_and_rows_stay_on_screen_from_right_edge_button() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        // `size.x` represents the measured font-dependent content width, not a UI constant.
+        let popup = native_panorama_projection_popup_rect(
+            screen,
+            1220.0,
+            crate::video::native_presenter::HUD_TOP_HEIGHT + 4.0,
+            egui::vec2(484.0, 196.0),
+        );
+        assert!(popup.min.x >= screen.min.x + NATIVE_TOP_POPUP_SCREEN_MARGIN);
+        assert!(popup.max.x <= screen.max.x - NATIVE_TOP_POPUP_SCREEN_MARGIN);
+        assert!(popup.min.y >= screen.min.y + NATIVE_TOP_POPUP_SCREEN_MARGIN);
+        assert!(popup.max.y <= screen.max.y - NATIVE_TOP_POPUP_SCREEN_MARGIN);
+
+        for row_index in 0..crate::panorama::PanoProjection::all().len() {
+            let row = native_panorama_projection_popup_row_rect(popup, row_index);
+            assert!(
+                popup.contains_rect(row),
+                "row {row_index} escaped popup: {row:?}"
+            );
+            assert!(
+                screen.contains_rect(row),
+                "row {row_index} escaped screen: {row:?}"
+            );
+        }
     }
 }

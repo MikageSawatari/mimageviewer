@@ -24,6 +24,9 @@ pub(crate) const DEFAULT_WAVEFORM_SPAN_SECS: f64 =
 /// one hour. A visible span of one hour or more is decoded at exactly its visible width, without a
 /// redundant second-stage request.
 const WAVEFORM_RETAINED_SPAN_MULTIPLIER: f64 = 3.0;
+/// 波形テクスチャ 1 枚の最大幅 (物理ピクセル)。`crate::app::MAX_TEXTURE_DIM` と同じ
+/// wgpu の既定上限。これを超えると `Device::create_texture` がパニックする。
+const MAX_WAVEFORM_TEXTURE_WIDTH: usize = 8192;
 pub(crate) const MAX_WAVEFORM_RETAINED_SPAN_SECS: f64 = 3600.0;
 /// Start a replacement while one quarter of a visible screen remains beyond the visible edge.
 const WAVEFORM_REQUEST_MARGIN_RATIO: f64 = 0.25;
@@ -160,12 +163,26 @@ impl WaveSpanRequest {
         })
     }
 
+    /// 1 枚のテクスチャに焼く波形の幅 (物理ピクセル)。
+    ///
+    /// ⚠ **GPU のテクスチャ上限で頭打ちにする。** 先読みぶんを掛けた幅をそのまま
+    /// 要求すると、4K 幅のストリップ (3840px) × `WAVEFORM_RETAINED_SPAN_MULTIPLIER`
+    /// = 11520px となり、wgpu の 8192 制限を超えて `Device::create_texture` が
+    /// パニックする。**パニックしたレンダースレッドは戻らないので、以後どの動画も
+    /// 再生できなくなる** (2026-08-27 利用者報告。同じ形は 2026-08-10 / 08-14 の
+    /// panic.log にも 8320 / 9000 で残っている)。
+    ///
+    /// 幅を丸めても時間 ↔ ピクセルの対応は比率で決まるため、位置はずれない
+    /// (bin が粗くなるだけ)。**可視幅より狭くはしない**: 可視部分の解像度を
+    /// 下げてまで先読みを優先する理由はない。
     pub(crate) fn pixel_width(self, visible_pixel_width: usize, visible_span_secs: f64) -> usize {
         if visible_pixel_width == 0 || !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
             return 0;
         }
         let ratio = (self.span.duration_secs() / visible_span_secs).max(1.0);
-        ((visible_pixel_width as f64 * ratio).round() as usize).max(visible_pixel_width)
+        ((visible_pixel_width as f64 * ratio).round() as usize)
+            .max(visible_pixel_width)
+            .min(MAX_WAVEFORM_TEXTURE_WIDTH.max(visible_pixel_width))
     }
 }
 
@@ -1105,6 +1122,61 @@ mod tests {
         assert_eq!(waveform_bin_range(&bins, 0.5, 1.5), 1..3);
         assert_eq!(waveform_bin_range(&bins, 1.0, 2.0), 2..4);
         assert_eq!(waveform_bin_range(&bins, 2.0, 3.0), 4..4);
+    }
+
+    /// 先読みぶんを掛けた幅が GPU のテクスチャ上限を超えてはいけない。超えると
+    /// `Device::create_texture` がパニックし、**レンダースレッドが死んで以後どの動画も
+    /// 再生できなくなる** (2026-08-27 利用者報告。4K 幅 3840 × 3 = 11520 で発生)。
+    #[test]
+    fn a_wide_upgrade_never_asks_for_a_texture_past_the_gpu_limit() {
+        let visible_span_secs = 30.0;
+        // 4K のストリップ全幅。報告された 11520 はこの値から出ている。
+        let visible_width = 3_840;
+        let upgrade = WaveSpanRequest {
+            span: WaveSpan::centered(
+                100.0,
+                waveform_retained_span_secs(visible_span_secs).expect("retained span"),
+            )
+            .expect("span"),
+            stage: WaveRequestStage::Wide,
+        };
+        let width = upgrade.pixel_width(visible_width, visible_span_secs);
+        assert!(
+            width <= MAX_WAVEFORM_TEXTURE_WIDTH,
+            "requested {width}px exceeds the {MAX_WAVEFORM_TEXTURE_WIDTH}px GPU limit"
+        );
+        assert!(
+            width >= visible_width,
+            "the visible part must not lose resolution to make room for the look-ahead"
+        );
+    }
+
+    /// 上限に収まる範囲では従来どおり先読みぶんを掛ける (丸めが常時効いてしまわないこと)。
+    #[test]
+    fn a_wide_upgrade_still_pre_renders_when_it_fits() {
+        let visible_span_secs = 30.0;
+        let upgrade = WaveSpanRequest {
+            span: WaveSpan::centered(
+                100.0,
+                waveform_retained_span_secs(visible_span_secs).expect("retained span"),
+            )
+            .expect("span"),
+            stage: WaveRequestStage::Wide,
+        };
+        assert_eq!(upgrade.pixel_width(1_000, visible_span_secs), 3_000);
+    }
+
+    /// 可視幅そのものが上限を超える環境 (超広幅ウィンドウ) でも、可視解像度は落とさない。
+    /// ここで丸めると波形が可視部分でぼやける。テクスチャ生成側の責務として残す。
+    #[test]
+    fn an_oversized_visible_width_is_not_reduced_below_itself() {
+        let visible_span_secs = 30.0;
+        let huge = MAX_WAVEFORM_TEXTURE_WIDTH + 2_000;
+        let first = WaveSpanRequest {
+            span: WaveSpan::centered(100.0, visible_span_secs).expect("span"),
+            stage: WaveRequestStage::FirstPaint,
+        };
+        assert_eq!(first.pixel_width(huge, visible_span_secs), huge);
     }
 
     #[test]

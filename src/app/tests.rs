@@ -27557,6 +27557,32 @@ mod pipeline_cache_refactor_tests {
         pixels
     }
 
+    #[cfg(windows)]
+    fn insert_panorama_video(
+        app: &mut App,
+        path: &str,
+        width: u32,
+        height: u32,
+        orientation: crate::video::display_metadata::VideoOrientation,
+        mapping: Option<crate::video::spherical_metadata::VideoSphericalMapping>,
+        stereo: crate::video::spherical_metadata::VideoStereoLayout,
+    ) -> usize {
+        let idx = app.items.len();
+        let path = PathBuf::from(path);
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(width, height, 1, 1, orientation, mapping, stereo);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        idx
+    }
+
     fn insert_pano_final_source(
         app: &mut App,
         ctx: &egui::Context,
@@ -30095,7 +30121,11 @@ mod pipeline_cache_refactor_tests {
                 "pano_edit_mode_raw",
                 egui::Color32::BLACK,
             );
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(0.0, 0.0));
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.0,
+                0.0,
+                crate::panorama::PanoProjection::Perspective,
+            ));
 
             let ctrl = egui::Modifiers {
                 ctrl: ctrl_pressed,
@@ -30128,6 +30158,214 @@ mod pipeline_cache_refactor_tests {
             ));
         }
         crate::key_input::clear_test_frame();
+    }
+
+    /// 投影方式の一覧は上バーの投影ボタンから吊り下がり、そのボタンは 360 表示中しか
+    /// 出ない。360 を抜けたら一覧も畳む。残すと、持ち主のいない矩形がカーソル自動
+    /// 非表示・ホイール・タッチを抑止したままになる。
+    #[test]
+    fn leaving_panorama_mode_closes_the_projection_list() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-popup.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_popup",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.panorama_projection_popup_open = true;
+
+        app.toggle_panorama_mode(idx);
+
+        assert!(app.panorama_state.is_none(), "360 を抜けたはず");
+        assert!(
+            !app.panorama_projection_popup_open,
+            "the projection list must not outlive the button that owns it"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn panorama_detection_has_one_entry_for_stills_and_display_oriented_video() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let still = push_image(&mut app, "C:/pics/pano-detect.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            still,
+            "pano_detect_still",
+            egui::Color32::BLACK,
+        );
+        let video = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-rotated.mp4",
+            1920,
+            3840,
+            crate::video::display_metadata::VideoOrientation::new(90, false),
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+
+        assert_eq!(
+            app.detect_panorama(still),
+            Some(crate::panorama::PanoramaTrigger::Hint)
+        );
+        assert_eq!(
+            app.detect_panorama(video),
+            Some(crate::panorama::PanoramaTrigger::Hint),
+            "video fallback must use dimensions after orientation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_panorama_lifecycle_wheel_audio_pause_and_tile_exclusion_share_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-a.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let flat = insert_panorama_video(
+            &mut app,
+            "C:/clips/flat.mp4",
+            1920,
+            1080,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let second = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-b.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        app.fullscreen_idx = Some(first);
+        app.video_tile_mode_active = true;
+        app.settings.video_scale_filter = crate::settings::VideoScaleFilter::Anime;
+
+        app.toggle_panorama_mode(first);
+        assert!(app.is_panorama_mode_active(first));
+        assert!(!app.video_tile_mode_active);
+        assert_eq!(
+            app.settings.video_scale_filter,
+            crate::settings::VideoScaleFilter::Anime,
+            "360 must not rewrite the selected video scale filter"
+        );
+        {
+            let state = app.panorama_state.as_mut().unwrap();
+            state.yaw = 0.75;
+            state.pitch = -0.25;
+            state.fov_y = state.projection.fov_max();
+        }
+        let retained_pose = app.panorama_state.as_ref().unwrap().pose();
+        assert!(
+            app.apply_native_video_panorama_wheel(&ctx, first, -120),
+            "wheel remains consumed when FOV is already at its upper limit"
+        );
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.fullscreen_idx = Some(flat);
+        assert!(!app.is_panorama_mode_active(flat));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.fullscreen_idx = Some(second);
+        assert!(app.is_panorama_mode_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.video_audio_mode = Some(second);
+        assert!(!app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.video_audio_mode = None;
+        assert!(app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.toggle_panorama_mode(second);
+        assert!(
+            app.panorama_state.is_none(),
+            "explicit OFF discards the state"
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.close_fullscreen();
+        assert!(
+            app.panorama_state.is_none(),
+            "fullscreen exit discards the shared panorama state"
+        );
+    }
+
+    /// 一覧から選ぶ経路と、キーの順送り経路は同じ適用処理へ合流する。
+    /// 別々に持つと、片方だけ画角の丸めや通知を落とす。
+    #[test]
+    fn choosing_and_cycling_the_projection_share_one_apply_path() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-apply.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_apply",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+        // 立体射影でしか許されない広い画角にしておく。
+        app.panorama_state.as_mut().unwrap().fov_y = crate::panorama::FOV_MAX_WIDE;
+
+        // 一覧から透視を選ぶ = 画角も透視の上限まで丸める。
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Perspective),
+            Some(crate::panorama::PanoProjection::Perspective)
+        );
+        let pano = app.panorama_state.as_ref().unwrap();
+        assert_eq!(
+            pano.projection,
+            crate::panorama::PanoProjection::Perspective
+        );
+        assert!(pano.fov_y <= crate::panorama::FOV_MAX, "fov={}", pano.fov_y);
+
+        // キーの順送りも同じ適用処理を通る。
+        assert_eq!(
+            app.cycle_panorama_projection(),
+            Some(crate::panorama::PanoProjection::Stereographic)
+        );
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Stereographic
+        );
+
+        // 360 が動いていなければどちらも何もしない。
+        app.panorama_state = None;
+        assert_eq!(app.cycle_panorama_projection(), None);
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Equidistant),
+            None
+        );
     }
 
     #[test]
@@ -34556,6 +34794,52 @@ mod native_video_rating_key_tests {
         assert_eq!(
             app.settings.fullscreen_side_panel_mode,
             crate::settings::FsSidePanelMode::Hover
+        );
+    }
+
+    #[test]
+    fn native_projection_selection_event_reaches_shared_app_apply_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(r"C:\clips\pano-projection.mp4");
+        let idx = push_video(&mut app, path.clone());
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(
+            640,
+            320,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let source_epoch = player.native_source_epoch().unwrap();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant,
+            ),
+        );
+
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Equidistant
         );
     }
 
@@ -45340,7 +45624,11 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
         app.analysis_mode = true;
         app.analysis_zoom = 2.0;
@@ -45379,7 +45667,11 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
@@ -47357,7 +47649,11 @@ mod still_window_mode_key_tests {
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
             app.detached_viewer_window_id = Some(42);
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, -0.5));
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                1.0,
+                -0.5,
+                crate::panorama::PanoProjection::Perspective,
+            ));
             app.pano_toast_shown_for_current_fs = true;
             app.analysis_mode = true;
             app.analysis_zoom = 2.5;
@@ -47500,7 +47796,11 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_detached_context_uses_its_own_panorama_mode_state() {
         let mut app = setup_app();
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, 0.0));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            1.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
 
         app.build_active_context_for_test(None, DetachedSource::Image, |bundle| {
@@ -47517,7 +47817,11 @@ mod still_window_mode_key_tests {
                 !mounted.pano_toast_shown_for_current_fs,
                 "panorama guide state is also per fullscreen viewer context"
             );
-            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(0.25, -0.1));
+            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.25,
+                -0.1,
+                crate::panorama::PanoProjection::Perspective,
+            ));
             mounted.pano_toast_shown_for_current_fs = true;
         });
 

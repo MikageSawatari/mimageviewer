@@ -66,6 +66,9 @@ impl App {
             self.close_video_tile_mode();
             return;
         }
+        if self.is_panorama_mode_active(fs_idx) {
+            return;
+        }
         debug_assert_eq!(
             crate::video::seek_strip::decide_seek_strip_surface(
                 crate::video::seek_strip::SeekStripSurface::Strip,

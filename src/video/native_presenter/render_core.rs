@@ -35,6 +35,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
+use crate::panorama::{PanoPose, PanoUvTransform};
 use crate::settings::{FsSidePanelMode, VideoBottomLock, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
@@ -56,6 +57,9 @@ use super::overlay_gpu::{DeviceEpoch, overlay_gpu_service};
 #[path = "grade_pipeline.rs"]
 mod grade_pipeline;
 use self::grade_pipeline::VideoGradePipeline;
+#[path = "panorama_pipeline.rs"]
+mod panorama_pipeline;
+use self::panorama_pipeline::VideoPanoramaPipeline;
 #[path = "resample_pipeline.rs"]
 mod resample_pipeline;
 use self::resample_pipeline::{
@@ -958,6 +962,9 @@ pub struct NativeRenderCore {
     cpu_upload_scratch: Vec<u8>,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
     grade_pipeline: VideoGradePipeline,
+    panorama_pipeline: Option<VideoPanoramaPipeline>,
+    panorama_pipeline_error: Option<String>,
+    panorama_pose: Option<(PanoPose, PanoUvTransform)>,
     resample_pipeline: Option<VideoResamplePipeline>,
     resample_pipeline_error: Option<String>,
     selected_scale_filter: VideoScaleFilter,
@@ -1048,6 +1055,7 @@ struct VideoScalePreparationSignature {
     target_width: u32,
     target_height: u32,
     target_content: VideoSurfaceContent,
+    panorama_active: bool,
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
@@ -1080,6 +1088,7 @@ fn video_scale_signature_changed_fields(
     changed!(target_width);
     changed!(target_height);
     changed!(target_content);
+    changed!(panorama_active);
     changed!(grade_active);
     changed!(filter);
     changed!(smoothing_percent);
@@ -1122,6 +1131,21 @@ pub(crate) enum VideoScalePreparedPresentError {
 enum VideoSurfaceContent {
     LegacySource,
     DisplayResolved,
+    PanoramaResolved,
+}
+
+impl VideoSurfaceContent {
+    fn resolved(panorama_active: bool) -> Self {
+        if panorama_active {
+            Self::PanoramaResolved
+        } else {
+            Self::DisplayResolved
+        }
+    }
+
+    fn is_resolved(self) -> bool {
+        !matches!(self, Self::LegacySource)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1159,6 +1183,7 @@ struct DisplaySurfaceRequestKey {
     sar_num: u32,
     sar_den: u32,
     orientation: VideoOrientation,
+    panorama_active: bool,
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
@@ -1263,6 +1288,7 @@ struct NativeEguiOverlay {
     started_at: Instant,
     pending_events: Vec<egui::Event>,
     native_touch: crate::video::native_touch::NativeTouchAdapter,
+    panorama_pose: Option<PanoPose>,
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
@@ -1286,6 +1312,7 @@ struct NativeEguiOverlay {
     seek_status_visible_since: Option<Instant>,
     seek_status_visible: bool,
     video_speed_popup_open: bool,
+    panorama_projection_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
@@ -1340,6 +1367,10 @@ struct NativeEguiOverlay {
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
     /// `None` なら popup 非表示または未描画。
     last_drawn_speed_popup_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画した投影方式一覧の actual rect。
+    /// HUD HWND の入力 region に同じ矩形を登録し、行クリックが背面の 360 見回し
+    /// ドラッグへ抜けないようにする。
+    last_drawn_panorama_projection_popup_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したブックマーク名編集ダイアログの actual rect。
     /// 中央モーダルだが、配置は `pos.y = (H - dialog_h) * 0.5` (dialog_h はレイアウト
     /// 用の過大見積もり) で、実コンテンツ高さとの差でダイアログ中心が画面中心より
@@ -1726,6 +1757,12 @@ pub struct NativeOverlayMetadata {
     /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
     pub interlace_detected: bool,
     pub touch_video_chrome_learned: bool,
+    pub panorama_detection: Option<
+        Result<
+            crate::video::spherical_metadata::VideoPanoramaTrigger,
+            crate::video::spherical_metadata::VideoPanoramaRejection,
+        >,
+    >,
     pub shortcuts: NativeOverlayShortcutLabels,
     pub shortcut_help: Arc<NativeOverlayShortcutHelp>,
 }
@@ -1749,6 +1786,8 @@ pub struct NativeOverlayShortcutLabels {
     pub bookmark: Option<String>,
     pub capture: Option<String>,
     pub toggle_audio_mode: Option<String>,
+    pub panorama: Option<String>,
+    pub panorama_projection: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2210,12 +2249,18 @@ struct NativeRightPanelVisibilityInputs {
     hover_preview_active: bool,
     tag_picker_open: bool,
     pointer_in_hover_rect: bool,
+    /// 360 度表示中は左右パネルを出さない。見回しドラッグで画面端まで指 / カーソルが
+    /// 動くたびにパネルが開き、操作の邪魔になる (2026-08-27 利用者報告)。
+    panorama_active: bool,
     side_panel_mode: FsSidePanelMode,
     info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
     if input.shortcut_help_open {
+        return false;
+    }
+    if input.panorama_active {
         return false;
     }
     if input.external_drag_in_progress || input.vst3_panel_visible {
@@ -2246,12 +2291,17 @@ struct NativeJumpPanelVisibilityInputs {
     video_speed_popup_open: bool,
     hover_preview_active: bool,
     pointer_in_hover_rect: bool,
+    /// 右パネルと同じ理由で 360 度表示中は出さない。
+    panorama_active: bool,
     side_panel_mode: FsSidePanelMode,
     left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs) -> bool {
     if input.shortcut_help_open {
+        return false;
+    }
+    if input.panorama_active {
         return false;
     }
     if input.vst3_panel_visible {
@@ -2385,6 +2435,17 @@ pub enum NativeOverlayCommand {
         delta_secs: f64,
     },
     TouchChromeLearned,
+    PanoramaDrag {
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    },
+    PanoramaWheel {
+        delta: i32,
+    },
+    TogglePanorama,
+    CyclePanoramaProjection,
+    SetPanoramaProjection(crate::panorama::PanoProjection),
+    ResetPanorama,
     TileSeek {
         target_secs: f64,
     },
@@ -2811,6 +2872,16 @@ impl NativeRenderCore {
             // created. Anime4K pixel shaders are loaded here from build-time FXC
             // bytecode. A later filter selection never invokes D3DCompile.
             let grade_pipeline = VideoGradePipeline::new(&d3d_device1)?;
+            let (panorama_pipeline, panorama_pipeline_error) =
+                match VideoPanoramaPipeline::new(&d3d_device1) {
+                    Ok(pipeline) => (Some(pipeline), None),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "native-presenter: video panorama pipeline unavailable: {error}"
+                        ));
+                        (None, Some(error))
+                    }
+                };
             let (resample_pipeline, resample_pipeline_error) = match VideoResamplePipeline::new(
                 &d3d_device1,
             ) {
@@ -3198,6 +3269,9 @@ impl NativeRenderCore {
                 cpu_upload_scratch: Vec::new(),
                 video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
                 grade_pipeline,
+                panorama_pipeline,
+                panorama_pipeline_error,
+                panorama_pose: None,
                 resample_pipeline,
                 resample_pipeline_error,
                 selected_scale_filter: config.scale_filter,
@@ -3347,7 +3421,7 @@ impl NativeRenderCore {
         // Consume the edge before performing GPU work. A failure is logged by
         // the caller and is not converted into an unbounded retry loop.
         self.resize_settle = VideoResizeSettleState::Settled;
-        self.selected_scale_filter != VideoScaleFilter::OsDefault
+        self.panorama_pose.is_some() || self.selected_scale_filter != VideoScaleFilter::OsDefault
     }
 
     pub fn set_video_compact(&mut self, compact: bool) -> Result<(), String> {
@@ -3407,6 +3481,7 @@ impl NativeRenderCore {
         let grade_active = !self.video_grade.adjustments.is_identity();
         let decision = decide_video_surface_size(VideoSurfaceSizeInput {
             filter: self.selected_scale_filter,
+            panorama_active: self.panorama_pose.is_some(),
             source_width,
             source_height,
             sar_num: new_sar_num,
@@ -3418,10 +3493,7 @@ impl NativeRenderCore {
             resizing: self.resize_settle.is_resizing(now),
             current_surface_width: self.surface_width,
             current_surface_height: self.surface_height,
-            current_surface_is_display_resolved: matches!(
-                self.surface_content,
-                VideoSurfaceContent::DisplayResolved
-            ),
+            current_surface_is_display_resolved: self.surface_content.is_resolved(),
         });
         let kept_current_during_resize = matches!(
             &decision,
@@ -3433,7 +3505,7 @@ impl NativeRenderCore {
                 let current_width = self.surface_width;
                 let current_height = self.surface_height;
                 let current_content = self.surface_content;
-                if matches!(current_content, VideoSurfaceContent::DisplayResolved) {
+                if current_content.is_resolved() {
                     let key = DisplaySurfaceRequestKey {
                         source_width,
                         source_height,
@@ -3442,6 +3514,7 @@ impl NativeRenderCore {
                         sar_num: new_sar_num,
                         sar_den: new_sar_den,
                         orientation: new_orientation,
+                        panorama_active: self.panorama_pose.is_some(),
                         grade_active,
                         filter: self.selected_scale_filter,
                         smoothing_percent: self.downscale_smoothing_percent,
@@ -3453,6 +3526,7 @@ impl NativeRenderCore {
                         current_width,
                         current_height,
                         new_orientation,
+                        self.panorama_pose.is_some(),
                         grade_active,
                         self.selected_scale_filter,
                         self.downscale_smoothing_percent,
@@ -3528,6 +3602,7 @@ impl NativeRenderCore {
                     sar_num: new_sar_num,
                     sar_den: new_sar_den,
                     orientation: new_orientation,
+                    panorama_active: self.panorama_pose.is_some(),
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
@@ -3554,6 +3629,7 @@ impl NativeRenderCore {
                     sar_num: new_sar_num,
                     sar_den: new_sar_den,
                     orientation: new_orientation,
+                    panorama_active: self.panorama_pose.is_some(),
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
@@ -3580,6 +3656,7 @@ impl NativeRenderCore {
                     width,
                     height,
                     new_orientation,
+                    self.panorama_pose.is_some(),
                     grade_active,
                     self.selected_scale_filter,
                     self.downscale_smoothing_percent,
@@ -3602,7 +3679,7 @@ impl NativeRenderCore {
                         sync_interval,
                         width,
                         height,
-                        VideoSurfaceContent::DisplayResolved,
+                        VideoSurfaceContent::resolved(self.panorama_pose.is_some()),
                         new_sar_num,
                         new_sar_den,
                         new_orientation,
@@ -3632,7 +3709,8 @@ impl NativeRenderCore {
         };
         if result.is_ok()
             && !kept_current_during_resize
-            && self.selected_scale_filter != VideoScaleFilter::OsDefault
+            && (self.panorama_pose.is_some()
+                || self.selected_scale_filter != VideoScaleFilter::OsDefault)
         {
             self.resize_settle = VideoResizeSettleState::Settled;
         }
@@ -3696,7 +3774,7 @@ impl NativeRenderCore {
                 Self::video_scale_request_key(signature, requested_width, requested_height),
                 reason,
             );
-        } else if signature.target_content == VideoSurfaceContent::DisplayResolved {
+        } else if signature.target_content.is_resolved() {
             let key = Self::video_scale_request_key(
                 signature,
                 signature.target_width,
@@ -3708,6 +3786,7 @@ impl NativeRenderCore {
                 signature.target_width,
                 signature.target_height,
                 signature.orientation,
+                signature.panorama_active,
                 signature.grade_active,
                 signature.filter,
                 smoothing_percent,
@@ -3720,7 +3799,7 @@ impl NativeRenderCore {
             }
         }
 
-        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+        if signature.target_content.is_resolved() {
             let key = Self::video_scale_request_key(
                 signature,
                 signature.target_width,
@@ -3781,6 +3860,7 @@ impl NativeRenderCore {
         let sar_den = frame.sar_den.max(1);
         let decision = decide_video_surface_size(VideoSurfaceSizeInput {
             filter,
+            panorama_active: self.panorama_pose.is_some(),
             source_width,
             source_height,
             sar_num,
@@ -3792,15 +3872,15 @@ impl NativeRenderCore {
             resizing: self.resize_settle.is_resizing(now),
             current_surface_width: self.surface_width,
             current_surface_height: self.surface_height,
-            current_surface_is_display_resolved: matches!(
-                self.surface_content,
-                VideoSurfaceContent::DisplayResolved
-            ),
+            current_surface_is_display_resolved: self.surface_content.is_resolved(),
         });
         let (target_width, target_height, target_content, fallback) = match decision {
-            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
-                (width, height, VideoSurfaceContent::DisplayResolved, None)
-            }
+            VideoSurfaceSizeDecision::DisplayResolution { width, height } => (
+                width,
+                height,
+                VideoSurfaceContent::resolved(self.panorama_pose.is_some()),
+                None,
+            ),
             VideoSurfaceSizeDecision::FallbackToLegacy {
                 width,
                 height,
@@ -3828,6 +3908,7 @@ impl NativeRenderCore {
                 target_width,
                 target_height,
                 target_content,
+                panorama_active: self.panorama_pose.is_some(),
                 grade_active: !self.video_grade.adjustments.is_identity(),
                 filter,
                 smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
@@ -3853,7 +3934,7 @@ impl NativeRenderCore {
             anime4k_variant,
             Instant::now(),
         );
-        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+        if signature.target_content.is_resolved() {
             let key = Self::video_scale_request_key(
                 signature,
                 signature.target_width,
@@ -3885,6 +3966,7 @@ impl NativeRenderCore {
             sar_num: signature.sar_num,
             sar_den: signature.sar_den,
             orientation: signature.orientation,
+            panorama_active: signature.panorama_active,
             grade_active: signature.grade_active,
             filter: signature.filter,
             smoothing_percent: signature.smoothing_percent,
@@ -4035,29 +4117,33 @@ impl NativeRenderCore {
         ))
     }
     fn sync_overlay_video_scale_state(&mut self) {
-        let outside_note = self.active_scale_fallback.as_ref().and_then(|fallback| {
-            if fallback.key.filter != self.selected_scale_filter
-                || fallback.key.smoothing_percent != self.downscale_smoothing_percent
-                || fallback.key.anime4k_variant != self.selected_anime4k_variant
-            {
-                return None;
-            }
-            let VideoScaleFallbackReason::DisplaySizeLimitExceeded {
-                max_dimension,
-                max_pixels,
-                ..
-            } = &fallback.reason
-            else {
-                return None;
-            };
-            Some(crate::ui_helpers::processing_size_outside_note_for(
-                "動画",
-                &format!(
-                    "長辺 {}px 以下・総画素数 {}px 以下",
-                    max_dimension, max_pixels
-                ),
-            ))
-        });
+        let outside_note = if self.panorama_pose.is_some() {
+            Some("360 投影中のため一時停止しています".to_owned())
+        } else {
+            self.active_scale_fallback.as_ref().and_then(|fallback| {
+                if fallback.key.filter != self.selected_scale_filter
+                    || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+                    || fallback.key.anime4k_variant != self.selected_anime4k_variant
+                {
+                    return None;
+                }
+                let VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    max_dimension,
+                    max_pixels,
+                    ..
+                } = &fallback.reason
+                else {
+                    return None;
+                };
+                Some(crate::ui_helpers::processing_size_outside_note_for(
+                    "動画",
+                    &format!(
+                        "長辺 {}px 以下・総画素数 {}px 以下",
+                        max_dimension, max_pixels
+                    ),
+                ))
+            })
+        };
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_video_scale_state(
                 self.selected_scale_filter,
@@ -4184,11 +4270,48 @@ impl NativeRenderCore {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        panorama_active: bool,
         grade_active: bool,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     ) -> Result<(), VideoScaleFallbackReason> {
+        if panorama_active {
+            let Some(pipeline) = self.panorama_pipeline.as_mut() else {
+                return Err(VideoScaleFallbackReason::PanoramaPipelineUnavailable {
+                    error: self
+                        .panorama_pipeline_error
+                        .clone()
+                        .unwrap_or_else(|| "pipeline was not created".to_string()),
+                });
+            };
+            let (oriented_width, oriented_height) = if orientation.swaps_axes() {
+                (source_height, source_width)
+            } else {
+                (source_width, source_height)
+            };
+            pipeline
+                .prepare(&self.d3d_device1, source_width, source_height, orientation)
+                .map_err(|error| {
+                    VideoScaleFallbackReason::PanoramaOrientationIntermediateCreationFailed {
+                        width: oriented_width,
+                        height: oriented_height,
+                        error,
+                    }
+                })?;
+            if grade_active {
+                self.grade_pipeline
+                    .prepare_intermediate(&self.d3d_device1, source_width, source_height)
+                    .map_err(
+                        |error| VideoScaleFallbackReason::GradeIntermediateCreationFailed {
+                            width: source_width,
+                            height: source_height,
+                            error,
+                        },
+                    )?;
+            }
+            return Ok(());
+        }
         let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
             (source_height, source_width)
         } else {
@@ -4432,7 +4555,7 @@ impl NativeRenderCore {
         let (swap_chain, waitable) =
             self.create_video_swap_chain(width, height)
                 .map_err(|error| {
-                    if content == VideoSurfaceContent::DisplayResolved {
+                    if content.is_resolved() {
                         VideoSurfaceSwapError::DisplayCreation(
                             VideoScaleFallbackReason::DisplaySwapChainCreationFailed {
                                 width,
@@ -4460,7 +4583,7 @@ impl NativeRenderCore {
                     .expect("prepared video surface swap chain"),
             )
             .map_err(|error| {
-                if content == VideoSurfaceContent::DisplayResolved {
+                if content.is_resolved() {
                     VideoSurfaceSwapError::DisplayCreation(
                         VideoScaleFallbackReason::DisplayBackbufferCreationFailed {
                             width,
@@ -4564,7 +4687,7 @@ impl NativeRenderCore {
         //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
         let (transform_sar_num, transform_sar_den, transform_orientation) =
             transform_geometry_for_surface(new_content, new_sar_num, new_sar_den, new_orientation);
-        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
+        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform_for_surface(
             new_w,
             new_h,
             self.width,
@@ -4573,6 +4696,7 @@ impl NativeRenderCore {
             transform_sar_den,
             transform_orientation,
             self.video_visual_layout(),
+            new_content == VideoSurfaceContent::PanoramaResolved,
         );
         let transform = Matrix3x2 {
             M11: m11,
@@ -4640,6 +4764,7 @@ impl NativeRenderCore {
                     Value::from(match new_content {
                         VideoSurfaceContent::LegacySource => "legacy_source",
                         VideoSurfaceContent::DisplayResolved => "display_resolved",
+                        VideoSurfaceContent::PanoramaResolved => "panorama_resolved",
                     }),
                 ),
                 (
@@ -4810,6 +4935,15 @@ impl NativeRenderCore {
             copy_fence_value: 0,
         };
         let grade_active = !self.video_grade.adjustments.is_identity();
+        let panorama_pose = if surface_content == VideoSurfaceContent::PanoramaResolved {
+            Some(
+                self.panorama_pose
+                    .ok_or_else(|| "panorama surface has no active pose".to_string())?,
+            )
+        } else {
+            None
+        };
+        let panorama_active = panorama_pose.is_some();
         let resample_active = surface_content == VideoSurfaceContent::DisplayResolved;
         let resample_mode = resample_active.then(|| {
             self.resample_mode(
@@ -4823,7 +4957,8 @@ impl NativeRenderCore {
         });
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
+                let probe_this_frame =
+                    !grade_active && !panorama_active && !resample_active && self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
                         bytes,
@@ -4842,7 +4977,42 @@ impl NativeRenderCore {
                 )?;
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if resample_active {
+                    if let Some((pose, uv)) = panorama_pose {
+                        let source = self.grade_pipeline.upload_cpu_source(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &self.cpu_upload_scratch,
+                            frame.width,
+                            frame.height,
+                        )?;
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            source
+                        };
+                        self.panorama_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video panorama pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                                pose,
+                                uv,
+                            )?;
+                    } else if resample_active {
                         let source = self.grade_pipeline.upload_cpu_source(
                             &self.d3d_device1,
                             &self.d3d_context,
@@ -4923,25 +5093,35 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = match (resample_mode, grade_active) {
-                    (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
-                        "cpu_upload_grade_resample_lanczos3"
+                metrics.path = if panorama_active {
+                    if grade_active {
+                        "cpu_upload_grade_panorama"
+                    } else {
+                        "cpu_upload_panorama"
                     }
-                    (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
-                        "cpu_upload_resample_lanczos3"
+                } else {
+                    match (resample_mode, grade_active) {
+                        (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
+                            "cpu_upload_grade_resample_lanczos3"
+                        }
+                        (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
+                            "cpu_upload_resample_lanczos3"
+                        }
+                        (Some(VideoResampleMode::Nis), true) => "cpu_upload_grade_resample_nis",
+                        (Some(VideoResampleMode::Nis), false) => "cpu_upload_resample_nis",
+                        (Some(VideoResampleMode::Nearest), true) => {
+                            "cpu_upload_grade_resample_nearest"
+                        }
+                        (Some(VideoResampleMode::Nearest), false) => "cpu_upload_resample_nearest",
+                        (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                            "cpu_upload_grade_resample_anime4k"
+                        }
+                        (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                            "cpu_upload_resample_anime4k"
+                        }
+                        (None, true) => "cpu_upload_grade",
+                        (None, false) => "cpu_upload",
                     }
-                    (Some(VideoResampleMode::Nis), true) => "cpu_upload_grade_resample_nis",
-                    (Some(VideoResampleMode::Nis), false) => "cpu_upload_resample_nis",
-                    (Some(VideoResampleMode::Nearest), true) => "cpu_upload_grade_resample_nearest",
-                    (Some(VideoResampleMode::Nearest), false) => "cpu_upload_resample_nearest",
-                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
-                        "cpu_upload_grade_resample_anime4k"
-                    }
-                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
-                        "cpu_upload_resample_anime4k"
-                    }
-                    (None, true) => "cpu_upload_grade",
-                    (None, false) => "cpu_upload",
                 };
             }
             VideoFrameData::Gpu(gpu_frame) => {
@@ -4954,7 +5134,8 @@ impl NativeRenderCore {
                 metrics.shared_handle = gpu_frame.shared_handle.0 as usize as u64;
                 metrics.shared_texture_gen = gpu_frame.shared_texture_gen;
                 metrics.fence_value = gpu_frame.fence_value;
-                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
+                let probe_this_frame =
+                    !grade_active && !panorama_active && !resample_active && self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
                 {
@@ -4990,7 +5171,35 @@ impl NativeRenderCore {
                 };
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if resample_active {
+                    if let Some((pose, uv)) = panorama_pose {
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &src,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            src.clone()
+                        };
+                        self.panorama_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video panorama pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                                pose,
+                                uv,
+                            )?;
+                    } else if resample_active {
                         let source = if grade_active {
                             self.grade_pipeline.draw_to_intermediate(
                                 &self.d3d_device1,
@@ -5073,27 +5282,37 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = match (resample_mode, grade_active) {
-                    (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
-                        "d3d11_shared_grade_resample_lanczos3"
+                metrics.path = if panorama_active {
+                    if grade_active {
+                        "d3d11_shared_grade_panorama"
+                    } else {
+                        "d3d11_shared_panorama"
                     }
-                    (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
-                        "d3d11_shared_resample_lanczos3"
+                } else {
+                    match (resample_mode, grade_active) {
+                        (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
+                            "d3d11_shared_grade_resample_lanczos3"
+                        }
+                        (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
+                            "d3d11_shared_resample_lanczos3"
+                        }
+                        (Some(VideoResampleMode::Nis), true) => "d3d11_shared_grade_resample_nis",
+                        (Some(VideoResampleMode::Nis), false) => "d3d11_shared_resample_nis",
+                        (Some(VideoResampleMode::Nearest), true) => {
+                            "d3d11_shared_grade_resample_nearest"
+                        }
+                        (Some(VideoResampleMode::Nearest), false) => {
+                            "d3d11_shared_resample_nearest"
+                        }
+                        (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                            "d3d11_shared_grade_resample_anime4k"
+                        }
+                        (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                            "d3d11_shared_resample_anime4k"
+                        }
+                        (None, true) => "d3d11_shared_grade",
+                        (None, false) => "d3d11_shared",
                     }
-                    (Some(VideoResampleMode::Nis), true) => "d3d11_shared_grade_resample_nis",
-                    (Some(VideoResampleMode::Nis), false) => "d3d11_shared_resample_nis",
-                    (Some(VideoResampleMode::Nearest), true) => {
-                        "d3d11_shared_grade_resample_nearest"
-                    }
-                    (Some(VideoResampleMode::Nearest), false) => "d3d11_shared_resample_nearest",
-                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
-                        "d3d11_shared_grade_resample_anime4k"
-                    }
-                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
-                        "d3d11_shared_resample_anime4k"
-                    }
-                    (None, true) => "d3d11_shared_grade",
-                    (None, false) => "d3d11_shared",
                 };
                 if let Some(guard) = keyed_mutex_guard {
                     guard.release_to_reader()?;
@@ -5541,6 +5760,18 @@ impl NativeRenderCore {
         Ok(())
     }
 
+    pub fn set_panorama_pose(
+        &mut self,
+        panorama_pose: Option<(PanoPose, PanoUvTransform)>,
+    ) -> Result<(), String> {
+        self.panorama_pose = panorama_pose;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_panorama_pose(panorama_pose.map(|(pose, _)| pose));
+        }
+        self.sync_overlay_video_scale_state();
+        Ok(())
+    }
+
     pub fn set_overlay_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_metadata(metadata);
@@ -5926,7 +6157,7 @@ impl NativeRenderCore {
             self.sar_den,
             self.orientation,
         );
-        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
+        let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform_for_surface(
             self.surface_width,
             self.surface_height,
             win_w,
@@ -5935,6 +6166,7 @@ impl NativeRenderCore {
             sar_den,
             orientation,
             self.video_visual_layout(),
+            self.surface_content == VideoSurfaceContent::PanoramaResolved,
         );
         let transform = Matrix3x2 {
             M11: m11,
@@ -6344,6 +6576,28 @@ impl NativeBlackBackground {
     }
 }
 
+fn close_panorama_projection_popup_for_context(
+    popup_open: &mut bool,
+    panorama_active: bool,
+    audio_only: bool,
+) -> bool {
+    if *popup_open && (!panorama_active || audio_only) {
+        *popup_open = false;
+        true
+    } else {
+        false
+    }
+}
+
+fn native_panorama_projection_popup_hud_rect(
+    popup_open: bool,
+    last_drawn_rect: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    popup_open
+        .then_some(last_drawn_rect?)
+        .map(|rect| rect.expand(4.0))
+}
+
 impl NativeEguiOverlay {
     fn new(
         visual: IDCompositionVisual,
@@ -6437,6 +6691,7 @@ impl NativeEguiOverlay {
             started_at: Instant::now(),
             pending_events: Vec::new(),
             native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
+            panorama_pose: None,
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
@@ -6460,6 +6715,7 @@ impl NativeEguiOverlay {
             seek_status_visible_since: None,
             seek_status_visible: false,
             video_speed_popup_open: false,
+            panorama_projection_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
@@ -6493,6 +6749,7 @@ impl NativeEguiOverlay {
             last_emitted_vst3_panel_pos: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
+            last_drawn_panorama_projection_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
             last_drawn_shortcut_help_rect: None,
@@ -6675,7 +6932,7 @@ impl NativeEguiOverlay {
             surface,
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
-                accepts_pinch: false,
+                accepts_pinch: self.panorama_pose.is_some(),
                 tap_zones: true,
             },
         }
@@ -6738,6 +6995,16 @@ impl NativeEguiOverlay {
                     } => {
                         self.pending_overlay_commands
                             .push(NativeOverlayCommand::SeekRelative { delta_secs });
+                    }
+                    crate::video::native_touch::NativeVideoTouchCommand::PanoramaDrag {
+                        delta_points,
+                        viewport_height_points,
+                    } => {
+                        self.pending_overlay_commands
+                            .push(NativeOverlayCommand::PanoramaDrag {
+                                delta_points,
+                                viewport_height_points,
+                            });
                     }
                     crate::video::native_touch::NativeVideoTouchCommand::LearnAndShowChrome => {
                         self.native_touch.show_chrome();
@@ -7104,7 +7371,13 @@ impl NativeEguiOverlay {
                         self.height as f32 / pixels_per_point,
                     )
                     .contains(pos);
-                if let Some(command) = immediate_native_wheel_command(
+                let panorama_wheel = self.panorama_pose.is_some() && !self.audio_only;
+                if panorama_wheel {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::PanoramaWheel {
+                            delta: i32::from(wheel.delta),
+                        });
+                } else if let Some(command) = immediate_native_wheel_command(
                     wheel.delta,
                     wheel.ctrl,
                     self.tile_overlay.is_some(),
@@ -7115,11 +7388,13 @@ impl NativeEguiOverlay {
                     self.pending_overlay_commands.push(command);
                 }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
-                self.pending_events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
-                    modifiers,
-                });
+                if !panorama_wheel {
+                    self.pending_events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
+                        modifiers,
+                    });
+                }
                 self.dirty = true;
             }
             NativeEvent::MouseLeave => {
@@ -7375,6 +7650,20 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_panorama_pose(&mut self, panorama_pose: Option<PanoPose>) {
+        let changed = self.panorama_pose != panorama_pose;
+        self.panorama_pose = panorama_pose;
+        let popup_closed = close_panorama_projection_popup_for_context(
+            &mut self.panorama_projection_popup_open,
+            self.panorama_pose.is_some(),
+            self.audio_only,
+        );
+        let touch_changed = self
+            .native_touch
+            .configure_panorama(self.panorama_pose.is_some());
+        self.dirty |= changed || popup_closed || touch_changed;
+    }
+
     fn set_video_anime4k_state(
         &mut self,
         budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
@@ -7541,7 +7830,13 @@ impl NativeEguiOverlay {
     }
 
     fn set_audio_only(&mut self, audio_only: bool) {
+        let popup_closed = close_panorama_projection_popup_for_context(
+            &mut self.panorama_projection_popup_open,
+            self.panorama_pose.is_some(),
+            audio_only,
+        );
         if self.audio_only == audio_only {
+            self.dirty |= popup_closed;
             return;
         }
         self.audio_only = audio_only;
@@ -8095,6 +8390,7 @@ impl NativeEguiOverlay {
                 NativeOverlayCommand::NavigateItem { .. }
                     | NativeOverlayCommand::TileColumnsDelta { .. }
                     | NativeOverlayCommand::StepSeekStripRange { .. }
+                    | NativeOverlayCommand::PanoramaWheel { .. }
             )
         });
         let mut routing = self.input_routing();
@@ -8130,6 +8426,7 @@ impl NativeEguiOverlay {
     /// - touch panel handles (touch chrome latch 中): 左右端の 48pt rect
     /// - VST3 panel (`vst3_panel_visible()`): center modal panel
     /// - speed popup (`video_speed_popup_open`): 画面下端の popup
+    /// - panorama projection popup: 上バーの投影ボタンから開く方式一覧
     /// - bookmark title editor (`bookmark_title_edit.is_some()`): center modal
     /// - normalize progress / scan UI (`normalize_state` の各 phase)
     /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
@@ -8435,6 +8732,16 @@ impl NativeEguiOverlay {
             }
         }
 
+        if let Some(rect) = native_panorama_projection_popup_hud_rect(
+            self.panorama_projection_popup_open,
+            self.last_drawn_panorama_projection_popup_rect,
+        ) {
+            let rect_px = rect_to_px(rect);
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
         // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
         //
@@ -8674,13 +8981,14 @@ impl NativeEguiOverlay {
     }
 
     fn top_bar_visible(&self) -> bool {
-        Self::native_hud_top_visible_from_hover(
-            self.visibility_hover_pos(),
-            self.top_bar_visible,
-            self.external_drag_in_progress,
-            self.native_touch.chrome_latched(),
-            self.top_bar_locked,
-        )
+        self.panorama_projection_popup_open
+            || Self::native_hud_top_visible_from_hover(
+                self.visibility_hover_pos(),
+                self.top_bar_visible,
+                self.external_drag_in_progress,
+                self.native_touch.chrome_latched(),
+                self.top_bar_locked,
+            )
     }
 
     fn top_bar_hover_visible(&self) -> bool {
@@ -8758,6 +9066,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             tag_picker_open: self.tag_picker_open,
+            panorama_active: self.panorama_pose.is_some(),
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
             info_panel_open: self.info_panel_open,
@@ -8772,6 +9081,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             pointer_in_hover_rect: self.jump_panel_hover_latched,
+            panorama_active: self.panorama_pose.is_some(),
             side_panel_mode: self.side_panel_mode,
             left_panel_open: self.left_panel_open,
         })
@@ -8812,7 +9122,8 @@ impl NativeEguiOverlay {
 
     /// ClickToShow の最端 hover で表示する左右 callout。panel 本体の modal gate と揃える。
     fn side_panel_callout_visibility(&self) -> (bool, bool) {
-        if self.side_panel_mode.normalized() != FsSidePanelMode::ClickToShow
+        if self.panorama_pose.is_some()
+            || self.side_panel_mode.normalized() != FsSidePanelMode::ClickToShow
             || self.external_drag_in_progress
             || self.shortcut_help_open
             || self.vst3_panel_visible()
@@ -9000,6 +9311,7 @@ impl NativeEguiOverlay {
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
+        let panorama_pose = self.panorama_pose;
         let shortcut_labels = video_metadata.as_ref().map(|metadata| &metadata.shortcuts);
         let mut shortcut_help_open = self.shortcut_help_open;
         let fallback_file_name = self.fallback_file_name.clone();
@@ -9156,6 +9468,7 @@ impl NativeEguiOverlay {
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut hover_preview_anchor_x = self.hover_preview_anchor_x;
         let mut video_speed_popup_open = self.video_speed_popup_open;
+        let mut panorama_projection_popup_open = self.panorama_projection_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
@@ -9168,6 +9481,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
+        let mut last_drawn_panorama_projection_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
@@ -9380,9 +9694,13 @@ impl NativeEguiOverlay {
                 draw_native_top_bar(
                     ctx,
                     overlay_width_points,
+                    overlay_height_points,
                     position_secs,
                     duration_secs,
                     video_metadata.as_ref(),
+                    panorama_pose,
+                    &mut panorama_projection_popup_open,
+                    &mut last_drawn_panorama_projection_popup_rect,
                     &fallback_file_name,
                     perf_visible,
                     vst3_available,
@@ -11114,12 +11432,14 @@ impl NativeEguiOverlay {
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
+        self.last_drawn_panorama_projection_popup_rect = last_drawn_panorama_projection_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.last_drawn_shortcut_help_rect = last_drawn_shortcut_help_rect;
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
+        self.panorama_projection_popup_open = panorama_projection_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
         self.seek_strip_drag_origin = seek_strip_drag_origin;
@@ -11735,7 +12055,9 @@ fn transform_geometry_for_surface(
         // The resample output already materializes SAR and orientation into the
         // physical display rectangle. Reapplying either in DComp would distort
         // or rotate the resolved pixels a second time.
-        VideoSurfaceContent::DisplayResolved => (1, 1, VideoOrientation::IDENTITY),
+        VideoSurfaceContent::DisplayResolved | VideoSurfaceContent::PanoramaResolved => {
+            (1, 1, VideoOrientation::IDENTITY)
+        }
     }
 }
 
@@ -11832,6 +12154,7 @@ pub(super) fn compute_video_visual_target_rect(
 ///
 /// 戻り値は `(M11, M12, M21, M22, M31, M32)`。orientation=0 では旧 SAR 実装と
 /// 完全に同じ値を返す。90/270 度では fit 対象の表示幅・高さを転置する。
+#[cfg(test)]
 fn compute_video_visual_transform(
     surface_w: u32,
     surface_h: u32,
@@ -11841,6 +12164,31 @@ fn compute_video_visual_transform(
     sar_den: u32,
     orientation: VideoOrientation,
     layout: impl Into<VideoVisualLayout>,
+) -> (f32, f32, f32, f32, f32, f32) {
+    compute_video_visual_transform_for_surface(
+        surface_w,
+        surface_h,
+        win_w,
+        win_h,
+        sar_num,
+        sar_den,
+        orientation,
+        layout,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_video_visual_transform_for_surface(
+    surface_w: u32,
+    surface_h: u32,
+    win_w: u32,
+    win_h: u32,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+    layout: impl Into<VideoVisualLayout>,
+    fill_target: bool,
 ) -> (f32, f32, f32, f32, f32, f32) {
     let surface_w = surface_w.max(1) as f32;
     let surface_h = surface_h.max(1) as f32;
@@ -11858,6 +12206,16 @@ fn compute_video_visual_transform(
     let target = compute_video_visual_target_rect(win_w, win_h, layout);
     let (target_x, target_y, target_w, target_h) =
         (target.x, target.y, target.width, target.height);
+    if fill_target {
+        return (
+            target_w / surface_w,
+            0.0,
+            0.0,
+            target_h / surface_h,
+            target_x,
+            target_y,
+        );
+    }
     // `display_w × display_h` を `target_w × target_h` に letterbox fit する scale。
     let scale = (target_w / display_w).min(target_h / display_h);
     // SAR は raw X 軸にだけ掛け、その後に orientation を合成する。
@@ -12006,17 +12364,20 @@ mod tests {
         NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
         PreparedVideoScaleSettings, SEEK_STRIP_HEIGHT, VideoOrientation,
         VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
-        VideoVisualTargetRect, compare_pixel_probe, compute_video_visual_target_rect,
-        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
-        cursor_move_is_activity, draw_native_seek_strip, effective_overlay_pixels_per_point,
-        egui_key_from_virtual_key, immediate_native_wheel_command, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
+        compute_video_visual_target_rect, compute_video_visual_transform,
+        compute_video_visual_transform_for_surface, configure_overlay_style,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        immediate_native_wheel_command, metadata_clean_text, native_jump_panel_visible_from_inputs,
+        native_panel_callout_hud_rects, native_panorama_projection_popup_hud_rect,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
+    use crate::panorama::{PanoPose, PanoUvTransform};
     use crate::settings::{FsSidePanelMode, VideoBottomLock};
     use crate::video::native_presenter::overlay_draw::{
         NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
@@ -12795,6 +13156,7 @@ mod tests {
             target_width: 3840,
             target_height: 2160,
             target_content: VideoSurfaceContent::DisplayResolved,
+            panorama_active: false,
             grade_active: false,
             filter: crate::settings::VideoScaleFilter::Sharp,
             smoothing_percent: 30,
@@ -13320,6 +13682,78 @@ mod tests {
         }
     }
 
+    /// 360 度表示中は左右パネルを出さない。見回しドラッグでカーソル / 指が画面端まで
+    /// 動くたびにパネルが開き、操作の邪魔になる (2026-08-27 利用者報告)。
+    /// ホバーで開く条件が揃っていても、360 が優先して閉じたままにする。
+    #[test]
+    fn panorama_keeps_both_side_panels_closed_even_while_hovering_the_edges() {
+        let right_hovering = NativeRightPanelVisibilityInputs {
+            shortcut_help_open: false,
+            external_drag_in_progress: false,
+            vst3_panel_visible: false,
+            metadata_available: true,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            tag_picker_open: false,
+            pointer_in_hover_rect: true,
+            panorama_active: false,
+            side_panel_mode: FsSidePanelMode::Hover,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+        };
+        assert!(
+            native_right_panel_visible_from_inputs(right_hovering),
+            "hovering the right edge opens the panel while the sphere is off"
+        );
+        assert!(
+            !native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
+                panorama_active: true,
+                ..right_hovering
+            }),
+            "a look-around drag must not pull the right panel out"
+        );
+        // タグピッカーが開いていても 360 が勝つ (ピッカーは通常 hover 条件を迂回する)。
+        assert!(
+            !native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
+                panorama_active: true,
+                tag_picker_open: true,
+                ..right_hovering
+            }),
+            "360 must win over the tag picker's own bypass"
+        );
+
+        let jump_hovering = NativeJumpPanelVisibilityInputs {
+            shortcut_help_open: false,
+            vst3_panel_visible: false,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            pointer_in_hover_rect: true,
+            panorama_active: false,
+            side_panel_mode: FsSidePanelMode::Hover,
+            left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+        };
+        assert!(
+            native_jump_panel_visible_from_inputs(jump_hovering),
+            "hovering the left edge opens the panel while the sphere is off"
+        );
+        assert!(
+            !native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
+                panorama_active: true,
+                ..jump_hovering
+            }),
+            "a look-around drag must not pull the left panel out"
+        );
+        // 明示的に開いた状態で 360 に入っても閉じたままにする。
+        assert!(
+            !native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
+                panorama_active: true,
+                pointer_in_hover_rect: false,
+                left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                ..jump_hovering
+            }),
+            "an explicitly opened panel must also stay closed under 360"
+        );
+    }
+
     #[test]
     fn shortcut_help_modal_suppresses_native_edge_panels() {
         let right_base = NativeRightPanelVisibilityInputs {
@@ -13331,6 +13765,7 @@ mod tests {
             hover_preview_active: false,
             tag_picker_open: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13338,6 +13773,7 @@ mod tests {
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 ..right_base
             }
@@ -13345,6 +13781,7 @@ mod tests {
         assert!(native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
                 ..right_base
             }
@@ -13359,6 +13796,7 @@ mod tests {
             NativeRightPanelVisibilityInputs {
                 tag_picker_open: true,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13367,6 +13805,7 @@ mod tests {
                 shortcut_help_open: true,
                 tag_picker_open: true,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13377,6 +13816,7 @@ mod tests {
             video_speed_popup_open: false,
             hover_preview_active: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13384,12 +13824,14 @@ mod tests {
         assert!(!native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..jump_base
             }
         ));
         assert!(native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
                 ..jump_base
             }
@@ -13413,6 +13855,7 @@ mod tests {
             hover_preview_active: false,
             tag_picker_open: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::ClickToShow,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13421,6 +13864,7 @@ mod tests {
             NativeRightPanelVisibilityInputs {
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13438,6 +13882,7 @@ mod tests {
             video_speed_popup_open: false,
             hover_preview_active: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::ClickToShow,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13446,6 +13891,7 @@ mod tests {
             NativeJumpPanelVisibilityInputs {
                 left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..jump_base
             }
         ));
@@ -13776,6 +14222,76 @@ mod tests {
         assert_eq!(m21, 0.0);
         assert_eq!(ox, 0.0);
         assert_eq!(oy, HUD_TOP_HEIGHT);
+    }
+
+    #[test]
+    fn clearing_panorama_pose_returns_resolve_ownership_to_normal_resampling() {
+        let pose = PanoPose::new(
+            0.0,
+            0.0,
+            crate::panorama::FOV_DEFAULT,
+            crate::panorama::PanoProjection::Perspective,
+        );
+        let mut state = Some((pose, PanoUvTransform::IDENTITY));
+        assert_eq!(
+            VideoSurfaceContent::resolved(state.is_some()),
+            VideoSurfaceContent::PanoramaResolved
+        );
+        state = None;
+        assert_eq!(
+            VideoSurfaceContent::resolved(state.is_some()),
+            VideoSurfaceContent::DisplayResolved
+        );
+    }
+
+    #[test]
+    fn panorama_projection_popup_closes_when_panorama_or_video_context_disappears() {
+        let mut open = true;
+        assert!(close_panorama_projection_popup_for_context(
+            &mut open, false, false
+        ));
+        assert!(!open, "leaving 360 must close its owned popup");
+
+        open = true;
+        assert!(close_panorama_projection_popup_for_context(
+            &mut open, true, true
+        ));
+        assert!(!open, "audio-only mode must close video projection UI");
+
+        open = true;
+        assert!(!close_panorama_projection_popup_for_context(
+            &mut open, true, false
+        ));
+        assert!(open, "the popup stays open in an active 360 video context");
+    }
+
+    #[test]
+    fn panorama_projection_popup_rect_is_included_in_hud_input_capture() {
+        let drawn = egui::Rect::from_min_size(egui::pos2(840.0, 58.0), egui::vec2(360.0, 196.0));
+        let captured = native_panorama_projection_popup_hud_rect(true, Some(drawn))
+            .expect("an open drawn popup must publish a HUD input rect");
+        assert!(captured.contains_rect(drawn));
+        assert_eq!(captured, drawn.expand(4.0));
+        assert!(native_panorama_projection_popup_hud_rect(false, Some(drawn)).is_none());
+    }
+
+    #[test]
+    fn panorama_surface_fills_the_visual_target_without_letterboxing() {
+        let (m11, m12, m21, m22, ox, oy) = compute_video_visual_transform_for_surface(
+            1920,
+            960,
+            1920,
+            1080,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            VideoVisualLayout::from(false),
+            true,
+        );
+        assert_eq!((m12, m21), (0.0, 0.0));
+        assert!((m11 - 1.0).abs() < f32::EPSILON);
+        assert!((m22 - 1.125).abs() < 1.0e-6);
+        assert_eq!((ox, oy), (0.0, 0.0));
     }
 
     /// orientation=0 は回転対応前の SAR transform と完全に同じ値を返す。

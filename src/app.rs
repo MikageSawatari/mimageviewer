@@ -2949,11 +2949,19 @@ impl PlayTestState {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-struct NativeVideoPointerDown {
-    fs_idx: usize,
-    x: i32,
-    y: i32,
-    at: std::time::Instant,
+enum NativeVideoPointerDown {
+    PlaybackClick {
+        fs_idx: usize,
+        x: i32,
+        y: i32,
+        at: std::time::Instant,
+    },
+    PanoramaDrag {
+        fs_idx: usize,
+        last_position_points: egui::Pos2,
+        viewport_height_points: f32,
+        pixels_per_point: f32,
+    },
 }
 
 #[cfg(windows)]
@@ -10995,6 +11003,8 @@ pub struct App {
     pub(crate) fit_popup_open: bool,
     /// スライドショー設定ポップアップ表示中
     pub(crate) slideshow_popup_open: bool,
+    /// 360 度ビューの投影方式ポップアップ表示中。360 表示中しか開けない。
+    pub(crate) panorama_projection_popup_open: bool,
     /// 上バーの「…」から開く右上パネル。root / navigator submenu を単一状態で所有する。
     pub(crate) fs_overflow_panel_state: FsOverflowPanelState,
 
@@ -13872,6 +13882,7 @@ impl App {
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
+            panorama_projection_popup_open: false,
             fit_popup_open: false,
             slideshow_popup_open: false,
             fs_overflow_panel_state: FsOverflowPanelState::Closed,
@@ -23601,6 +23612,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
@@ -37945,6 +37957,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
@@ -51369,6 +51382,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
         // including the Esc that would close it. Leaving fullscreen by any other route (the
@@ -61673,6 +61687,17 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoramaTrigger> {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return match player.panorama_detection()? {
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto) => {
+                    Some(crate::panorama::PanoramaTrigger::Auto)
+                }
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Hint) => {
+                    Some(crate::panorama::PanoramaTrigger::Hint)
+                }
+                Err(_) => None,
+            };
+        }
         let source_key = self.metadata_cache_key(fs_idx)?;
         let pano_info = self
             .xmp_panorama_info
@@ -62033,7 +62058,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -62145,7 +62170,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -62243,7 +62268,7 @@ impl App {
         &mut self,
         fs_idx: usize,
         resolution: &crate::panorama::PanoSourceResolution,
-        pose: (f32, f32, f32),
+        pose: crate::panorama::PanoPose,
     ) {
         let source_key = resolution.source_key.clone();
         let cache_key = resolution.cache_key;
@@ -62272,15 +62297,12 @@ impl App {
         let cancel_worker = Arc::clone(&cancel);
         let source_key_worker = source_key.clone();
         std::thread::spawn(move || {
-            let (yaw, pitch, fov_y) = pose;
             let out = crate::panorama::render_settle_overlay(
                 &src_rgba,
                 src_w,
                 src_h,
                 uv,
-                yaw,
-                pitch,
-                fov_y,
+                pose,
                 out_w,
                 out_h,
                 &policy,
@@ -62388,13 +62410,14 @@ impl App {
             refinement.settle_since = None;
         }
         crate::logger::log(format!(
-            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3}) viewport={:?}",
+            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3},{}) viewport={:?}",
             result.width,
             result.height,
             result.source_key,
-            result.pose.0,
-            result.pose.1,
-            result.pose.2,
+            result.pose.yaw,
+            result.pose.pitch,
+            result.pose.fov_y,
+            result.pose.projection.label(),
             result.viewport_size,
         ));
     }
@@ -62841,6 +62864,36 @@ impl App {
         }
     }
 
+    /// 360 ビューの投影方式を順送りする (`KeyAction::FsPanoramaProjection` / 上バーの
+    /// 投影ボタン)。360 モード中しか意味を持たないので、非アクティブなら `None`。
+    ///
+    /// **環境設定の既定値 (`Settings::panorama_projection`) は書き換えない**。ここは
+    /// 「今見ているこの 1 枚を別の写り方で見る」操作であって、既定の変更ではない。
+    /// 既定を変えたい利用者は環境設定から選ぶ。
+    ///
+    /// 方式が変わると settle overlay の pose 一致が崩れるので、次フレームの
+    /// `note_state` が自動で進行中 render を cancel し、静止 500ms 後に焼き直す。
+    /// ここで overlay を明示破棄しないのは、pose を単一の型
+    /// ([`crate::panorama::PanoPose`]) に閉じて stale 判定を 1 箇所に保つため。
+    pub(crate) fn cycle_panorama_projection(&mut self) -> Option<crate::panorama::PanoProjection> {
+        let next = self.panorama_state.as_ref()?.projection.next();
+        self.set_panorama_projection(next)
+    }
+
+    /// 上バーの一覧から選ばれた投影方式を適用する。順送り
+    /// ([`Self::cycle_panorama_projection`]) もここへ合流するので、適用と通知の
+    /// 経路は 1 つだけになる。
+    pub(crate) fn set_panorama_projection(
+        &mut self,
+        projection: crate::panorama::PanoProjection,
+    ) -> Option<crate::panorama::PanoProjection> {
+        let pano = self.panorama_state.as_mut()?;
+        let applied = pano.set_projection(projection);
+        pano.sanitize();
+        self.show_feedback_toast(format!("投影方式: {}", applied.label()));
+        Some(applied)
+    }
+
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
@@ -62849,10 +62902,14 @@ impl App {
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+        let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
         if self.panorama_state.is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
             // Codex P2 第 18 ラウンド)。
             self.panorama_state = None;
+            // 投影ポップアップの持ち主 (上バーの投影ボタン) は 360 OFF で消えるので、
+            // 開いたまま残さない。残すとカーソル自動非表示やホイールの抑制が効き続ける。
+            self.panorama_projection_popup_open = false;
             self.clear_pano_upload();
             // **進行中の settle render と high-res worker を cancel** (Codex P2 第 8、
             // 2026-05): 360 OFF 中も worker が走り続けると、(a) ~2.15 GB の RGBA を
@@ -62864,11 +62921,32 @@ impl App {
             for (_, req) in self.pano_high_res_pending.drain() {
                 req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(windows)]
+            if is_video {
+                self.sync_native_video_panorama_state(fs_idx);
+            }
             return;
         }
         // ON: GPano hint があれば初期視点に反映
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
-        self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
+        self.panorama_state = Some(crate::panorama::PanoramaState::new(
+            init_yaw,
+            init_pitch,
+            self.settings.panorama_projection,
+        ));
+        // Video 360 owns the same native canvas as tile mode, but it is not the
+        // still-viewer's restriction mode. Keep playback and panels intact.
+        if is_video {
+            self.close_video_tile_mode();
+            #[cfg(windows)]
+            {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_tile_overlay(None);
+                }
+                self.sync_native_video_panorama_state(fs_idx);
+            }
+            return;
+        }
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
@@ -62910,6 +62988,13 @@ impl App {
     /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して
     /// 初期視点として返す。XMP が無いか hint が無い場合は (0, 0)。
     fn panorama_initial_pose(&self, fs_idx: usize) -> (f32, f32) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            let Some(mapping) = player.panorama_mapping() else {
+                return (0.0, 0.0);
+            };
+            let to_rad = std::f32::consts::PI / 180.0;
+            return (mapping.yaw_degrees * to_rad, mapping.pitch_degrees * to_rad);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return (0.0, 0.0);
         };
@@ -62935,6 +63020,12 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> crate::panorama::PanoUvTransform {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return player
+                .panorama_mapping()
+                .map(|mapping| mapping.uv_transform)
+                .unwrap_or(crate::panorama::PanoUvTransform::IDENTITY);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return crate::panorama::PanoUvTransform::IDENTITY;
         };
