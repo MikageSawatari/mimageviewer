@@ -3356,6 +3356,58 @@ placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, pl
 - 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
   **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
 
+### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — 未対応
+
+> ⚠ detached viewer リワーク中の領域。症状パッチ (delay / guard / 追加 repaint) を入れない。
+
+- 出典: 2026-08-28、利用者の観察「F12 を押すと、動画のウィンドウサイズをいちど
+  真っ白に表示してから、最大化して、その後再生しているように見える」を
+  ログで裏付けたもの。**§1.115 の font atlas resync を撤去した後も残るちらつきの主因候補**。
+
+#### 実測 (build C = font work 撤去後のログ)
+
+```
+33.192  [native-video] defer placement switch until detached host is ready: target=DetachedWindow
+33.192  [native-video-key] F12 (seq=13)
+33.489  [detached-viewer] registered host hwnd=0x2280fde        <- ホストはもう見えている
+33.568  [native-video] resume deferred detached placement switch after 376.5ms
+33.574  [native-video] window created-hidden: hwnd=0x4982e4e rect=(0,34 3840x2054)
+33.701  [native-video] window shown: hwnd=0x4982e4e visible=true
+```
+
+**ON 側だけが非対称に遅い**。OFF (→ Fullscreen) には遅延が無く、押下から 7ms で
+presenter window を作り、`placement switched ... total=139.0ms` で完了する。
+
+内訳: ホスト viewport の生成・登録に約 297ms、登録を検知して resume するまでに約 79ms。
+
+#### 見立て (未検証)
+
+ホストの viewport は `activate=true` で**先に可視になり**、その時点では動画がまだ attach
+されていないので中身が無い。376ms 後に全画面サイズの presenter window が上に乗るので、
+「白 → 最大化 → 再生」と見える。直すなら**見せる順序の所有権** (presenter が publish するまで
+ホストを見せない) を決める形になる。**遅延を短くする・待ちを入れる等の症状パッチは不可**。
+
+
+#### 同じ根を持つもう一つの症状: タスクバーの明滅 (2026-08-28 利用者報告)
+
+同じログ (約 115 秒の 1 セッション) でのウィンドウ生成回数:
+
+| | 個数 |
+| --- | --- |
+| detached ホスト viewport | **13** (`host_generation` 1〜13、すべて別 hwnd) |
+| native-video window | **15** (`detached-viewer-child` 9 + `fullscreen-borderless` 6) |
+
+detached ホストの builder は `.with_taskbar(true)` ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。
+つまり **F12 のたびにトップレベルウィンドウを破棄して作り直しており、タスクバーボタンが
+消えては現れる**。白いウィンドウと同じ根 (= ウィンドウを再利用せず毎回新規に作る)
+なので、別起票にせずここで扱う。
+
+修正の方向も共通で、「**ウィンドウの寿命を F12 のトグルと切り離す**」か、
+少なくとも「**見せる順序の所有権を決める**」ことになる。リワークの
+`DetachedWindowRuntime` / 状態 enum が扱う領域なので、先にプラン §2 を読むこと。
+- 関連: §1.115 (font atlas 側。**別機構**。破棄フレームは 14 → 0 になったがちらつきは残った)。
+- 規模 \ 優先度: Medium ～ Large / P2。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
