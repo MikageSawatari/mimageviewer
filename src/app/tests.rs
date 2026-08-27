@@ -56211,6 +56211,259 @@ mod smart_folder_transition_tests {
         index
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ConvertibleArchiveMainState {
+        reading_history_return_from: Option<PathBuf>,
+        rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
+        facet_filter: crate::settings::FacetFilter,
+        facet_filter_suppression_stack: Vec<(PathBuf, crate::settings::FacetFilter)>,
+        smart_folder: super::top_level_grid_view::SmartFolderViewState,
+        item_keys: Vec<String>,
+    }
+
+    fn convertible_archive_main_state(app: &App) -> ConvertibleArchiveMainState {
+        ConvertibleArchiveMainState {
+            reading_history_return_from: app.reading_history_return_from.clone(),
+            rating_filter_suppressed_at: app.rating_filter_suppressed_at.clone(),
+            facet_filter: app.settings.facet_filter.clone(),
+            facet_filter_suppression_stack: app
+                .facet_filter_suppression_stack
+                .iter()
+                .map(|suppression| (suppression.anchor.clone(), suppression.saved_filter.clone()))
+                .collect(),
+            smart_folder: app
+                .top_level_grid_view
+                .smart_folder()
+                .cloned()
+                .expect("smart-folder position must exist"),
+            item_keys: app.items.iter().map(GridItem::perf_key).collect(),
+        }
+    }
+
+    fn install_convertible_archive_main_grid(
+        app: &mut super::phase_c_support::AppTestEnv,
+    ) -> (PathBuf, ConvertibleArchiveMainState) {
+        let root = app.tmp.path().join("convertible-smart-root");
+        let entry = root.join("books");
+        let source = entry.join("book.7z");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&source, b"deterministic archive request fixture").unwrap();
+        app.rating_db
+            .as_ref()
+            .expect("rating DB")
+            .set(&crate::adjustment_db::normalize_path(&source), 5)
+            .unwrap();
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let smart = definition("Convertible lifecycle", root);
+        let smart_id = smart.id;
+        app.settings.smart_folders = vec![smart];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(smart_id, false);
+        wait_for_smart_folder_idle(app, &ctx, smart_id);
+
+        select_real_path(app, &entry);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(entry.as_path())
+        );
+
+        let idx = select_real_path(app, &source);
+        assert_eq!(
+            app.get_rating(idx),
+            5,
+            "smart snapshot must carry source rating"
+        );
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Archive);
+        app.rebuild_visible_indices();
+        assert!(app.visible_indices.contains(&idx));
+        app.reading_history_return_from = Some(app.tmp.path().join("reserved-history.zip"));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(app.facet_filter_suppression_stack.is_empty());
+
+        let before = convertible_archive_main_state(app);
+        (source, before)
+    }
+
+    fn write_convert_completion_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("page-001.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn ignored_convertible_archive_keeps_main_transition_intent_uncommitted() {
+        let mut app = setup_app();
+        let (_source, before) = install_convertible_archive_main_grid(&mut app);
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+
+        assert_eq!(convertible_archive_main_state(&app), before);
+        assert!(app.archive_convert.is_none());
+        // Mutation `commit_before_ignore_guard`: commit the captured intent before the Ignore
+        // check. This assertion then observes the cleared reservation, both suppressions, and the
+        // advanced smart scope.
+    }
+
+    #[test]
+    fn cancelled_convertible_archive_dialog_drops_main_transition_intent() {
+        let mut app = setup_app();
+        let (_source, before) = install_convertible_archive_main_grid(&mut app);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(app.archive_convert.is_some());
+        assert_eq!(convertible_archive_main_state(&app), before);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.show_archive_convert_dialog(ctx),
+        );
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(convertible_archive_main_state(&app), before);
+        // Mutation `commit_on_request_adoption`: commit MainGridArchive when
+        // request_archive_convert_owned adopts the request. The pre-cancel assertion and the final
+        // assertion both fail.
+    }
+
+    fn publish_convert_done_and_open(app: &mut App, cached: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = app
+            .archive_convert
+            .as_mut()
+            .expect("real grid path must create the conversion request");
+        state.rx = rx;
+        state.phase = crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+            progress: std::sync::Arc::new(
+                crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+            ),
+        };
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 4,
+                    nested_archive_count: 0,
+                },
+                cached.to_path_buf(),
+                std::fs::metadata(cached).unwrap().len() as i64,
+            ))),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+    }
+
+    #[test]
+    fn successful_convertible_archive_completion_commits_main_transition_intent() {
+        let mut app = setup_app();
+        let (source, before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("converted-book.zip");
+        write_convert_completion_zip(&cached);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert_eq!(convertible_archive_main_state(&app), before);
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.completion),
+            Some(
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    intent
+                )
+            ) if intent.smart_folder_drill
+        ));
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        publish_convert_done_and_open(&mut app, &cached);
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.reading_history_return_from.is_none());
+        assert_eq!(
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(anchor, _)| anchor),
+            Some(&source)
+        );
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_filter_suppression_stack.len(), 1);
+        assert_eq!(app.facet_filter_suppression_stack[0].anchor, source);
+        assert_eq!(
+            app.facet_filter_suppression_stack[0].saved_filter,
+            before.facet_filter
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(source.as_path())
+        );
+        assert!(
+            app.items.is_empty(),
+            "successful load boundary replaces the source grid with the archive loading state"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_zip_enumerate();
+            std::thread::yield_now();
+        }
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == &cached && entry_name == "page-001.jpg"
+        ));
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(source.as_path())
+        );
+        // Mutation `omit_success_completion_commit`: remove commit_main_grid_archive_transition
+        // from the loaded pending_nav branch. The reservation/suppression/smart-scope assertions
+        // all fail.
+    }
+
     fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.folder_nav_pending.is_some() {

@@ -6577,19 +6577,16 @@ impl App {
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
-                self.note_reading_history_open(idx);
-                self.begin_smart_folder_drill(&path);
+                let owner = self.main_grid_archive_open_owner(idx, &path);
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                 } else if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.open_archive_via_cache(path, cached, auto_fs);
+                    self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
                 } else {
-                    self.request_archive_convert(path, format, auto_fs);
+                    self.request_archive_convert_owned(path, format, auto_fs, owner);
                 }
                 None
             }

@@ -13153,8 +13153,7 @@ impl App {
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
-                    self.note_reading_history_open(idx);
-                    self.begin_smart_folder_drill(&pf);
+                    let owner = self.main_grid_archive_open_owner(idx, &pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active
@@ -13171,10 +13170,10 @@ impl App {
                         self.record_tag_view_nav_open(&pf);
                     }
                     self.record_rating_view_nav_open(&pf);
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    let open_outcome =
-                        self.load_folder_or_convert_archive_with_auto_fullscreen(pf, auto_fs);
+                    let open_outcome = self
+                        .load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                            pf, auto_fs, owner,
+                        );
                     match (open_outcome, search_rollback) {
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);

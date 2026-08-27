@@ -2888,14 +2888,21 @@ fresh detached bundle を作る前の mounted main projection 上で rating / fa
 抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
 ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
 
-#### 同経路の別件 — reading-history return owner を detached destination と照合する (未対応)
+#### follow-up — reading-history owner と convertible 非遷移 lifecycle ✅
 
-2つの UI caller は detached helper より前に `note_reading_history_open(idx)` を呼ぶ。
-この関数が変更する `reading_history_return_from` は `ViewerContextBundle` 所有なので、
-detached build が fresh bundle へ交換する前の main に変更が残り、detached 側は `None` から
-始まる。閲覧履歴から別窓で本を開いた場合の戻り先仕様と、通常一覧から別窓を開いた際に main の
-既存予約を消すべきかを、両 caller / close / Backspace lifecycle で棚卸しして owner 境界を決める。
-今回の filter suppression 修正には含めない (§2 規則7)。優先度 P2、規模 Small〜Medium。
+2026-08-27 修正。Enter、double-click、gamepad accept、明示 container mode の4 static site は、
+detached arbitration が main fallback を採用した後だけ `reading_history_return_from` を更新する。
+このうち通常到達するのは前3入口で、明示 mode は multi-window 時に副作用なしで早期 return する。
+
+残っていた反例は `GridItem::ConvertibleArchive` だった。main fallback 採用後でも、Ignore 判定や
+非同期変換 request より前に reading-history 予約、rating / facet suppression stack、smart-folder
+position を更新していたため、Ignore と dialog cancel で画面が遷移しないのに main state だけが
+変わっていた。`MainGridArchiveTransitionIntent` を既存の open / convert request owner に保持し、
+cache / RAR direct / 変換完了の実 load 成功時だけ4状態を commit する。Ignore、request start failure、
+dialog cancel は intent を捨てるだけで main items と4状態を変えない。これは d7645901 の regression
+ではない。同 commit より前から `note_reading_history_open` は入口先頭にあり、d7645901 は呼出しを
+convertible arm 内へ移したものの Ignore 判定より前という誤った側を維持し、両 suppression も元から
+同じ側にあった。
 
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 

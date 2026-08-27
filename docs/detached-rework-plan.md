@@ -228,7 +228,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | stage-audio | **完了** | 音声も動画と共通の単一メディア窓へ接続済み |
 | stage-folder-nav | **完了** | 独立静止画窓の通常画像 / PDF / ZIP の物理フォルダ移動を context-owned pending で実装済み |
 | physical open routing | **実装済み** | strict target と detached `window_id` を維持して bundle 内で poll / apply |
-| terminal close routing | **基盤実装済み・不変条件は未完** | session/runtime の terminal 経路はあるが、close 後の全 in-flight producer 停止は未達。BA-7 / R2b の残件 |
+| terminal close routing | **完了** | 7b991af0 の `ViewerContextBundle::cancel_all_context_work` と `Drop` 集約により、terminal retire は context-owned の全 in-flight producer を停止する。有限 pending は各 pending 型の `Drop` を維持 |
 | nav lock ownership | **実装済み** | lock generation と遅延 nav intent は `ViewerContextBundle` 所有 |
 | holdover ownership | **実装済み** | holdover texture は `ViewerContextBundle` とともに mount / swap |
 | manager / session 分離 | **実装済み** | `DetachedWindowManager` と `ViewerSession` を導入済み |
@@ -1309,7 +1309,9 @@ inspection が一致):**
 focus / epoch、keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
 
 **不変条件と判断理由**: Descriptor は park が完了しない場合、または context start が
-`false` を返す場合に通常 main navigation へ戻り得るが、その2 caller は採用した main 分岐で
+`false` を返す場合に通常 main navigation へ戻り得るが、責務を持つ static site は4つ
+(通常到達する Enter / double-click / gamepad accept の3入口と、multi-window 時には副作用なしで
+早期 return する明示 container mode) であり、採用した main 分岐で
 既に rating / facet suppression を行う。成功時は fresh bundle が `DetachedPhysical` を所有し、物理 scope の全ページを
 App-global display filter より前に確定するため suppression は誰にも不要である。したがって
 detached helper は mounted main projection を変更せず、抑制責務は実際に main navigation を
@@ -1355,9 +1357,42 @@ reading_history_back_nav() == ReadingHistory が残ることを検査する。�
 gamepad の note_reading_history_open(idx) を guard 直後の detached attempt 前へ戻す
 mutation では、新 detached テストが予約 Some(history-book.zip) に対する実値 None で
 失敗した。新しい App-level state、時間窓、guard / retry / repaint は追加していない。
-4入口の arbitration 前に同形の別 mutation は見つからなかった。UI の選択 / 入力診断、
-Folder candidate の main-owned scan、convertible archive の App-global request owner は
-各 ownership 契約どおりなので、§2 規則7に従い変更していない。
+前回の「4入口の arbitration 前に同形の別 mutation は見つからなかった」という記述は不正確だった。
+反例は arbitration 後の `GridItem::ConvertibleArchive` arm で、実 navigation の成否が決まる前に
+reading-history 予約、smart-folder position、rating / facet suppression を更新していた。Ignore と
+convert dialog cancel は main を遷移させないため、App-global request owner であることだけではこの
+mutation を正当化できない。次項で request-owned intent と成功時 commit に修正した。
+
+**2026-08-27 convertible archive の main transition を実 load 成功時 commit へ変更
+(backlog §1.131 P2、利用者提示の ClaudeCode re-review と Codex の lifecycle inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の4 static entry site / open request owner / common load
+boundary、[src/ui_main.rs](../src/ui_main.rs) の double-click、
+[src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の gamepad accept、
+[src/ui_dialogs/archive_convert.rs](../src/ui_dialogs/archive_convert.rs) の cache / direct / convert
+completion、[src/app/tests.rs](../src/app/tests.rs) の実 request lifecycle 回帰テスト。detached predicate、
+viewport / HWND / placement / focus / epoch、grid selection / paste / new-folder は変更していない。
+
+**不変条件と成功境界**: source grid 上で reading-history の次値、rating / facet suppression の適用可否、
+smart-folder drill の有無を `MainGridArchiveTransitionIntent` に capture し、既存
+`OpenRequestOwner::MainGridArchive` と `ArchiveConvertState::completion` が所有する。新しい App field は
+追加しない。cache は `open_archive_via_cache_owned` が cache ZIP を `current_folder` として採用し source
+override を設定した後、RAR direct は `load_zip_as_folder_with_input_seq` 後に source が
+`current_folder` と一致した後、非同期変換は `pending_nav` が cache ZIP load と source override を
+完了した後だけ commit する。Ignore、request start failure、dialog cancel、load block は commit しない。
+smart-folder の one-shot load 認可だけは resident session を共通 load 境界で保存するため直前に行うが、
+position は進めない。cache ZIP は source scope 外の実装 alias なので typed owner の common load では
+その実パスによる reconciliation を遅延し、成功 commit で source archive path へ position を進める。
+
+**回帰証明と mutation**: Ignore、Escape による dialog cancel、`ConvertDone` から実 cache ZIP を開く
+成功完了を gamepad の実 producer / request / dialog path で駆動し、reading-history 予約、rating
+suppression、facet filter と suppression stack、smart-folder position、main items の不変または更新を
+比較した。`commit_before_ignore_guard`、`commit_on_request_adoption`、
+`omit_success_completion_commit` の各 mutation で対応テストが失敗する。d7645901 が新設した regression
+ではなく、同 commit 前から入口先頭にあった reading-history mutation を arm 内の同じ誤った側へ移し、
+両 suppression も従来から Ignore / cancel より前にあった。Folder / ZIP / PDF も caller 側 mutation
+後に `AddressBarNav::Direct` の load block が起こり得る同形を持つが、Ignore / convert cancel はなく、
+§2 規則7に従い本修正には含めない。
 
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
