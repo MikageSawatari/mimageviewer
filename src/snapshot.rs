@@ -466,8 +466,9 @@ impl Default for FilterState {
 /// `App` が snapshot active 中に保持する state。`App.snapshot: Option<SnapshotState>` で
 /// active/inactive を表現する (= `is_some()` で判定)。
 ///
-/// snapshot ON 時に既存の `App.items` / `App.thumbnails` / `App.visible_indices` /
-/// `App.scroll_offset_y` を `saved_*` field に退避し、snapshot subset で置き換える。
+/// snapshot ON 時に既存の `App.items` / `App.thumbnails` / `App.image_metas` /
+/// `App.visible_indices` / `App.scroll_offset_y` を `saved_*` field に退避し、snapshot
+/// subset で置き換える。
 /// snapshot OFF 時に `saved_*` から復元 (= 元のフォルダ表示に戻る)。
 ///
 /// 設計: docs/star-lock-snapshot-design.md §4.2 / §4.6 / §5
@@ -497,6 +498,9 @@ pub struct SnapshotState {
     pub saved_items: Vec<crate::grid_item::GridItem>,
     /// snapshot ON 時点の `App.thumbnails` (= GPU texture 状態含む)
     pub saved_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+    /// snapshot ON 時点の `App.image_metas`。
+    /// `saved_items` と位置対応するため、解除時は必ず同時に書き戻す。
+    pub saved_image_metas: Vec<Option<(i64, i64)>>,
     /// snapshot ON 時点の `App.visible_indices` (= filter 適用後の indices)
     pub saved_visible_indices: Vec<usize>,
     /// snapshot ON 時点の `App.scroll_offset_y`
@@ -520,6 +524,8 @@ pub struct SnapshotState {
     /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
     /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+    /// 同上、`list_view_items` と位置対応する画像 metadata。
+    pub list_view_image_metas: Vec<Option<(i64, i64)>>,
 
     /// 検索 view (Ctrl+G/Ctrl+S) から ★固定した場合の「戻り先フォルダ」。
     ///

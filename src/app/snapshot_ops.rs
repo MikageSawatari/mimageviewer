@@ -578,6 +578,26 @@ impl App {
         }
     }
 
+    /// `items` の index space を直接交換する snapshot 経路用の Details invalidation。
+    ///
+    /// 遅延 metadata worker は idx と visible revision を snapshot しているため、受信側を
+    /// drop して cancel を立てる。viewport 由来の prewarm indices も旧 index space なので
+    /// 次の Details 描画で作り直すまで空にする。
+    fn invalidate_snapshot_details_index_state(&mut self) {
+        self.invalidate_details_meta_requirements();
+        self.details_tag_prewarm_indices.clear();
+    }
+
+    /// swap 後の `visible_indices` を canonical source として Details order を復元する。
+    fn rebuild_snapshot_details_index_state(&mut self) {
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            self.rebuild_details_order();
+        } else {
+            self.details_order.clear();
+            self.details_order_revision = self.details_order_revision.wrapping_add(1);
+        }
+    }
+
     /// snapshot を activate する (= 現在の visible_indices を capture して固定)。
     ///
     /// 実装手順 (§4.5 mutual exclusion lifecycle):
@@ -628,6 +648,16 @@ impl App {
             .cloned()
             .collect();
         debug_assert_eq!(captured_items_grid.len(), captured_entries.len());
+        let captured_image_metas: Vec<Option<(i64, i64)>> = self
+            .visible_indices
+            .iter()
+            .filter_map(|&i| {
+                let item = self.items.get(i)?;
+                snapshot_key_from_grid_item(item)?;
+                Some(self.image_metas.get(i).copied().flatten())
+            })
+            .collect();
+        debug_assert_eq!(captured_image_metas.len(), captured_entries.len());
 
         let filter_at_capture = self.current_filter_state();
         let origin = self
@@ -691,12 +721,14 @@ impl App {
                 .and_then(snapshot_key_from_grid_item)
                 .and_then(|key| membership.get(&key).copied())
         });
-        // list_view_items / list_view_thumbnails 用に clone を確保
+        // list_view_items / list_view_thumbnails / list_view_image_metas 用に clone を確保
         // (= BS で snapshot list 復帰した時に Pending リセットせず再利用するため)。
         let list_view_items = captured_items_grid.clone();
         let list_view_thumbnails = captured_thumbnails.clone();
+        let list_view_image_metas = captured_image_metas.clone();
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
+        let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
@@ -734,12 +766,14 @@ impl App {
             generation_id,
             saved_items,
             saved_thumbnails,
+            saved_image_metas,
             saved_visible_indices,
             saved_scroll_offset_y,
             saved_selected,
             saved_zip_nav,
             list_view_items,
             list_view_thumbnails,
+            list_view_image_metas,
             pre_snapshot_search_origin,
         });
         self.top_level_grid_view.begin(
@@ -752,6 +786,7 @@ impl App {
         // は thumbnails 自体は触らないので、上で入れ替えた captured_thumbnails は維持される。
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.invalidate_snapshot_details_index_state();
         self.finish_snapshot_viewer_index_swap(viewer_index_swap);
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
@@ -785,6 +820,7 @@ impl App {
                 self.rehydrate_page_edit_state_for_current_items(&origin);
             }
         }
+        self.rebuild_snapshot_details_index_state();
 
         let msg = if search_was_active {
             format!("検索結果をスナップショットに固定しました ({n} 件)")
@@ -805,6 +841,12 @@ impl App {
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
         let snap = self.snapshot.take()?;
         let _ = self.restore_rating_filter_suppression();
+        // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
+        // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
+        if let Some(return_to) = self.top_level_grid_view.take_return_to() {
+            self.show_feedback_toast("★固定を解除しました".into());
+            return Some(return_to);
+        }
         let at_origin = self.current_folder.as_ref().is_some_and(|path| {
             crate::snapshot::snapshot_key_from_path(path)
                 == crate::snapshot::snapshot_key_from_path(&snap.origin)
@@ -834,11 +876,7 @@ impl App {
         let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let fallback =
             self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        Some(
-            self.top_level_grid_view
-                .take_return_to()
-                .unwrap_or(fallback),
-        )
+        Some(fallback)
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
@@ -977,6 +1015,7 @@ impl App {
             }
             self.items = snap.saved_items;
             self.thumbnails = merged_thumbnails;
+            self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
@@ -991,6 +1030,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
@@ -1004,6 +1044,7 @@ impl App {
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
             }
+            self.rebuild_snapshot_details_index_state();
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
@@ -1031,7 +1072,7 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, is_search_snapshot) = {
+        let (snap_origin, list_items, list_thumbs, list_image_metas, is_search_snapshot) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -1039,6 +1080,7 @@ impl App {
                 snap.origin.clone(),
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
+                snap.list_view_image_metas.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.pre_snapshot_search_origin.is_some(),
@@ -1073,6 +1115,7 @@ impl App {
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
         self.thumbnails = list_thumbs;
+        self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
@@ -1083,6 +1126,7 @@ impl App {
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.invalidate_snapshot_details_index_state();
         self.clear_tags_cache();
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
         // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
@@ -1097,6 +1141,7 @@ impl App {
             self.mark_color_filter_scope_dirty();
             self.rebuild_visible_indices();
         }
+        self.rebuild_snapshot_details_index_state();
         self.show_feedback_toast("★固定リストに戻りました".into());
         true
     }

@@ -3716,27 +3716,113 @@ impl App {
     }
 
     #[cfg(windows)]
+    /// While ParkedLive, a command the user deliberately issued asks for the media window to be
+    /// activated; anything the renderer, a worker, or a lifecycle transition produced must not.
+    ///
+    /// The match is exhaustive on purpose. It used to end in `_ => true`, which made "an event we
+    /// have not classified" mean "the user clicked a HUD button", so every event added anywhere in
+    /// the video subsystem became an activation stealer by default. The seek strip added ten and
+    /// three were classified; `RequestSeekStripWindow`, which the renderer emits whenever the strip
+    /// layout changes, then pulled the video window in front of whatever the user had just
+    /// activated (backlog §1.131). Adding a variant must now cost a decision here.
     pub(crate) fn native_video_output_event_is_parked_live_hud_click_activation(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
         use crate::video::NativeVideoOutputEvent as Ev;
 
         match event {
-            // Lifecycle/status/hover events keep parked state maintenance working and must not
-            // activate the media window.
+            // Produced by the renderer, a worker, or a lifecycle transition, so none of these
+            // carry user intent. `Window` is raw input, but the left button and the maintenance
+            // subset are answered by dedicated predicates before this one is consulted.
             Ev::Window(_)
+            | Ev::OverlayInputRouting(_)
+            | Ev::Anime4kAdapterReady(_)
+            | Ev::Anime4kMeasurementProgress { .. }
+            | Ev::Anime4kMeasurementCompleted(_)
             | Ev::PlacementSwitched { .. }
             | Ev::PlacementSwitchFailed { .. }
             | Ev::RequestSeekThumbnail { .. }
             | Ev::ClearSeekThumbnail
-            | Ev::TileColumnsDelta { .. } => false,
-            // Native presenter converts plain wheel into NavigateItem. Keep wheel-origin
-            // navigation inert while parked, but treat the HUD prev/next buttons as clicks
-            // that request activation.
+            | Ev::RequestSeekStripWindow { .. }
+            | Ev::VideoScaleSettingsCommitted { .. } => false,
+            // Emitted both when the user finishes dragging the VST panel and when a saved position
+            // is clamped back inside changed bounds. The drag already requests activation through
+            // the left-button path above, so the renderer half must not add a second request.
+            Ev::SetVst3PanelPos { .. } => false,
+            // No presenter produces this today. Default-deny until one does.
+            Ev::SetVst3PanelVisible { .. } => false,
+            // Both producers are user input (Ctrl+wheel and the HUD column buttons), but neither
+            // has requested activation while parked since R2. Telling them apart needs provenance
+            // in the payload, which is a change this fix does not need; see backlog §1.131.
+            Ev::TileColumnsDelta { .. } => false,
+            // Events that carry their own cause: ask the cause, not the variant. The presenter
+            // converts a plain wheel into `NavigateItem`, and closes the strip with `HudHidden`
+            // from the draw path whenever the HUD is not visible.
             Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
-            // Every other event is produced by a native HUD command. While ParkedLive, button
-            // functions stay inert; the click itself requests activation instead.
-            _ => true,
+            Ev::CloseSeekStrip { cause } => cause.is_user_dismissal(),
+            // Native HUD commands the user issued. While ParkedLive the button function stays
+            // inert; the click itself requests activation.
+            Ev::Seek { .. }
+            | Ev::SeekRelative { .. }
+            | Ev::TouchChromeLearned
+            | Ev::TileSeek { .. }
+            | Ev::OpenSeekStrip
+            | Ev::MoveSeekStrip { .. }
+            | Ev::CommitSeekStrip { .. }
+            | Ev::SetSeekStripState { .. }
+            | Ev::StepSeekStripRange { .. }
+            | Ev::ToggleTileMode
+            | Ev::TogglePerfOverlay
+            | Ev::ToggleSidePanelMode
+            | Ev::ToggleBarLock { .. }
+            | Ev::ToggleSeekStripLock
+            | Ev::ToggleClickInfoOpen
+            | Ev::OpenTouchInfoPanel
+            | Ev::DismissTouchSidePanels
+            | Ev::ToggleVst3Gui
+            | Ev::ToggleAudioMode
+            | Ev::CloseFullscreen { .. }
+            | Ev::ToggleWindowMode
+            | Ev::SetVst3VideoCompact { .. }
+            | Ev::Vst3ShowSlotGui { .. }
+            | Ev::Vst3HideSlotGui { .. }
+            | Ev::Vst3SetBypass { .. }
+            | Ev::Vst3LoadChainSlot { .. }
+            | Ev::Vst3SaveChainSlot { .. }
+            | Ev::VideoAdjustLoadSlot { .. }
+            | Ev::VideoAdjustSaveSlot { .. }
+            | Ev::SeekToStartAndPlay
+            | Ev::TogglePlay
+            | Ev::ToggleMute
+            | Ev::ToggleLoop
+            | Ev::ToggleContinuous
+            | Ev::SetVolume { .. }
+            | Ev::SetVideoAdjustments { .. }
+            | Ev::RequestVideoScaleSettings { .. }
+            | Ev::SetVideoAnime4kBudget { .. }
+            | Ev::RemeasureVideoAnime4k
+            | Ev::SetPlaybackSpeed { .. }
+            | Ev::CopyFrameToClipboard
+            | Ev::FrameStep { .. }
+            | Ev::AddBookmarkAt { .. }
+            | Ev::SetPinAt { .. }
+            | Ev::JumpMarker { .. }
+            | Ev::SaveFrameToFile
+            | Ev::SetBookmarkTitle { .. }
+            | Ev::DeleteBookmark { .. }
+            | Ev::DeletePin
+            | Ev::BulkAddBookmarks { .. }
+            | Ev::ExportBookmarksToClipboard { .. }
+            | Ev::ClearAllBookmarksForCurrent
+            | Ev::OpenExternalUrl { .. }
+            | Ev::SetRating { .. }
+            | Ev::ToggleTag { .. }
+            | Ev::AddTag { .. }
+            | Ev::RemoveTag { .. }
+            | Ev::OpenTagViewForTag { .. }
+            | Ev::ToggleNormalize
+            | Ev::DisableNormalize
+            | Ev::CancelNormalizeScan => true,
         }
     }
 

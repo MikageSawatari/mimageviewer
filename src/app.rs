@@ -10106,6 +10106,11 @@ pub struct App {
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
     pub(crate) checked: std::collections::HashSet<usize>,
+    /// たった今のファイル操作が作った項目へ、カーソルとチェックを移す要求。
+    /// 適用先フォルダを持つので、操作の完了前に別の一覧へ移っても汚さない。
+    /// 詳細は [`crate::post_operation_selection`]。
+    pub(crate) post_operation_selection:
+        Option<crate::post_operation_selection::PostOperationSelection>,
 
     // ── 右クリックコンテキストメニュー ─────────────────────────
     /// コンテキストメニューの対象アイテムインデックス
@@ -13529,6 +13534,7 @@ impl App {
             pref_state: None,
             operation_customize_state: None,
             checked: std::collections::HashSet::new(),
+            post_operation_selection: None,
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
             mouse_ring_flick: None,
@@ -17433,8 +17439,13 @@ impl App {
             folder.display()
         ));
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
+        // ただし操作の結果へ選択を移す要求が生きている間は、そちらに任せて手を出さない
+        // (貼り付けの完了はこの自動再読込で拾うので、ここで元の選択へ戻すと打ち消し合う)。
         let selected_path: Option<PathBuf> = self
-            .selected
+            .post_operation_selection
+            .is_none()
+            .then(|| self.selected)
+            .flatten()
             .and_then(|idx| self.items.get(idx))
             .and_then(|item| match item {
                 GridItem::Folder(p)
@@ -17470,6 +17481,21 @@ impl App {
         }
     }
 
+    /// 再読込をまたいでカーソルを今の位置に保つための名前ヒントを置く。
+    ///
+    /// **既に指定されているヒントは潰さない。**新しいフォルダーの作成や名前変更は
+    /// 「作った物を選ぶ」ために先に名前を置いてから再読込を頼むので、ここで現在の選択に
+    /// 上書きするとカーソルが動かない (専用スレ >>305 の「カーソルが移らない」)。
+    pub(crate) fn preserve_cursor_hint_for_reload(&mut self) {
+        if self.select_after_load.is_some() {
+            return;
+        }
+        self.select_after_load = self
+            .selected
+            .and_then(|index| self.items.get(index))
+            .map(|item| item.name().into_owned());
+    }
+
     pub(crate) fn reload_current_folder_preserving_override(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
             return;
@@ -17480,10 +17506,7 @@ impl App {
         if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
             return;
         }
-        self.select_after_load = self
-            .selected
-            .and_then(|index| self.items.get(index))
-            .map(|item| item.name().into_owned());
+        self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
         self.load_folder(folder);
         if let Some(src) = saved_override {
@@ -23912,8 +23935,16 @@ impl App {
         let history_state = (!detached_physical)
             .then(|| self.folder_history.get(&source_path).copied())
             .flatten();
-        let restored = !detached_physical && self.try_select_after_load();
-        if restored && let Some((scroll, _)) = history_state {
+        // たった今の操作が作った項目があれば、そこへ移すのが最優先。名前ヒント
+        // (`select_after_load`) も履歴も、そちらは「表示の都合」で決まる復元なので譲る。
+        let from_operation = !detached_physical && self.apply_post_operation_selection();
+        let restored = from_operation || (!detached_physical && self.try_select_after_load());
+        // 追加された項目を見せるのが目的なので、操作由来のときは履歴のスクロール位置へ
+        // 戻さない (戻すと、選んだばかりの項目が画面外にある状態になる)。
+        if restored
+            && !from_operation
+            && let Some((scroll, _)) = history_state
+        {
             // BS / direct-page close は select_after_load で選択対象を更新するが、
             // 視点は戻り先リストでユーザーが見ていたスクロール位置を先に復元する。
             // scroll_to_selected は残し、対象が範囲外になった場合だけ render_grid で補正する。
@@ -33797,17 +33828,25 @@ impl App {
         // Ctrl の状態判定。AutoHotKey 等の外部ツールが Ctrl+矢印を送信する場合、
         // Ctrl と矢印が別フレームで届くことがある。直前フレームの Ctrl 押下も
         // 考慮するため、egui の全イベントから Ctrl 修飾子を探す。
-        let ctrl_held = ctx.input(|i| {
+        let (ctrl_held, ctrl_from_events_only) = ctx.input(|i| {
             // 現在のフレームで Ctrl が押されている
-            if input_permits.current_level.is_some() && i.modifiers.ctrl {
-                return true;
-            }
+            let now = input_permits.current_level.is_some() && i.modifiers.ctrl;
             // イベントの中に Ctrl 修飾子付きのキーイベントがあるか
-            i.events.iter().any(|e| match e {
+            let from_events = i.events.iter().any(|e| match e {
                 egui::Event::Key { modifiers, .. } => modifiers.ctrl,
                 _ => false,
-            })
+            });
+            (now || from_events, !now && from_events)
         });
+        // `resync_egui_modifiers_from_os` は `i.modifiers` しか直せない。イベントが
+        // 自分で持っている修飾子は古いままなので、ここだけ Ctrl が立ち続けることがある。
+        // 押しっぱなし報告 (2026-08-26) の裏取り用。**まだ挙動は変えていない。**
+        if ctrl_from_events_only {
+            crate::logger::log(
+                "[modifiers] ctrl came only from event modifiers this frame (i.modifiers.ctrl is false)"
+                    .to_string(),
+            );
+        }
         let alt_held = ctx.input(|i| {
             if input_permits.current_level.is_some() && i.modifiers.alt {
                 return true;
@@ -36304,6 +36343,28 @@ impl App {
     /// modifier の hold 状態を OS API から毎フレーム同期し、Shell 復帰直後にも
     /// 明示同期する。個別の Key event に記録された modifiers はイベント時点の情報
     /// として残し、離散ショートカットの判定までは書き換えない。
+    /// 修飾キーの押しっぱなし疑いを、状態が変わったときだけ 1 行残す。
+    ///
+    /// 「Ctrl が押しっぱなしになったように見える」という報告 (2026-08-26) に対して、
+    /// **どこがずれているのかを記録する経路がまだ無かった**。毎フレーム出すと流れるので
+    /// 遷移だけ出す。
+    fn log_modifier_staleness(stale: egui::Modifiers) {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static LAST: AtomicU8 = AtomicU8::new(0);
+        let mask = u8::from(stale.ctrl) | (u8::from(stale.shift) << 1) | (u8::from(stale.alt) << 2);
+        if LAST.swap(mask, Ordering::Relaxed) == mask {
+            return;
+        }
+        if mask == 0 {
+            crate::logger::log("[modifiers] egui caught up with the OS".to_string());
+        } else {
+            crate::logger::log(format!(
+                "[modifiers] egui still holds ctrl={} shift={} alt={} after the OS released them",
+                stale.ctrl, stale.shift, stale.alt
+            ));
+        }
+    }
+
     pub(crate) fn resync_egui_modifiers_from_os(ctx: &egui::Context) {
         #[cfg(windows)]
         {
@@ -36324,10 +36385,21 @@ impl App {
                 key_down(VK_SHIFT.0),
                 key_down(VK_MENU.0),
             );
-            ctx.input_mut(|input| {
+            let stale = ctx.input_mut(|input| {
+                let before = input.modifiers;
                 input.modifiers = modifiers;
                 input.raw.modifiers = modifiers;
+                // egui 側が「押されている」と思っていたのに OS では離れていた分。
+                // Shell のモーダルが KeyUp を持っていった後に残る。
+                egui::Modifiers {
+                    ctrl: before.ctrl && !modifiers.ctrl,
+                    shift: before.shift && !modifiers.shift,
+                    alt: before.alt && !modifiers.alt,
+                    command: false,
+                    mac_cmd: false,
+                }
             });
+            Self::log_modifier_staleness(stale);
         }
         #[cfg(not(windows))]
         let _ = ctx;
@@ -36388,6 +36460,9 @@ impl App {
             if !on_search_results
                 && let (Some(hwnd), Some(folder)) = (self.main_hwnd, self.current_favorite_target())
             {
+                // Shell が何を作るか (衝突時の改名を含めて) はこちらには分からないので、
+                // 呼ぶ**前**に今の一覧を控えて差分で拾う。
+                self.request_post_operation_selection_for_added_items(folder.clone());
                 let result = crate::native_context_menu::invoke_shell_folder_background_verb(
                     hwnd,
                     &folder,
@@ -40042,8 +40117,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_descriptor",
                 );
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                // Suppression belongs to the ordinary main-navigation branches in the callers.
+                // A committed DetachedPhysical context ignores App-global display filters.
                 descriptor
             }
             DetachedGridItemOpenPlan::FolderCandidate { path } => {
@@ -46709,6 +46784,91 @@ impl App {
         self.selected = Some(idx);
         self.scroll_to_selected = true;
         self.redirect_selected_to_visible();
+    }
+
+    /// 表示中の実ファイル / 実フォルダ項目を items 順で返す。
+    ///
+    /// 絞り込みで隠れている項目は入らない。`post_operation_selection` はこれだけを見るので、
+    /// 「フィルタは変えず、表示中の実出力だけへ適用する」が構造的に守られる。
+    fn visible_real_file_paths(&self) -> Vec<(usize, std::path::PathBuf)> {
+        self.visible_indices
+            .iter()
+            .filter_map(|&idx| {
+                let path = self.items.get(idx)?.drag_source_path()?;
+                Some((idx, path.to_path_buf()))
+            })
+            .collect()
+    }
+
+    /// 直前のファイル操作が作った項目へカーソルとチェックを移す。移したら true。
+    ///
+    /// items を入れ替えた後の 1 か所からだけ呼ぶ。判断は
+    /// [`crate::post_operation_selection::decide`] が持ち、ここは適用だけを行う。
+    fn apply_post_operation_selection(&mut self) -> bool {
+        use crate::post_operation_selection as pos;
+        let Some(mut request) = self.post_operation_selection.take() else {
+            return false;
+        };
+        let visible = self.visible_real_file_paths();
+        let now = std::time::Instant::now();
+        let step = pos::decide(&request, self.current_folder.as_deref(), &visible, now);
+        let pos::Step::Apply(indices) = step else {
+            if matches!(step, pos::Step::Wait) {
+                self.post_operation_selection = Some(request);
+            }
+            return false;
+        };
+        let Some(plan) = pos::plan_selection(&indices) else {
+            return false;
+        };
+        crate::logger::log(format!(
+            "post_operation_selection: {} item(s) added, cursor -> {}",
+            indices.len(),
+            plan.cursor
+        ));
+        self.checked.clear();
+        self.checked.extend(plan.checked.iter().copied());
+        self.grid_click_selection_anchor = Some(GridClickSelectionAnchor::new(
+            plan.cursor,
+            self.items_generation,
+        ));
+        self.select_item_after_load(plan.cursor);
+        request.record_applied(&visible, &indices, now);
+        self.post_operation_selection = Some(request);
+        true
+    }
+
+    /// 操作の結果へ選択を移す要求を積む。`folder` は適用先の実フォルダ。
+    pub(crate) fn request_post_operation_selection(
+        &mut self,
+        folder: std::path::PathBuf,
+        expected: crate::post_operation_selection::ExpectedOutputs,
+    ) {
+        self.post_operation_selection = Some(
+            crate::post_operation_selection::PostOperationSelection::new(
+                folder,
+                expected,
+                std::time::Instant::now(),
+            ),
+        );
+    }
+
+    /// 貼り付けのように **mIV が出力パスを知らない**操作の直前に、今の一覧を控える。
+    /// 名前衝突で Shell が改名した結果も差分として拾えるようにするため。
+    pub(crate) fn request_post_operation_selection_for_added_items(
+        &mut self,
+        folder: std::path::PathBuf,
+    ) {
+        let before = self
+            .items
+            .iter()
+            .filter_map(crate::grid_item::GridItem::drag_source_path)
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        self.request_post_operation_selection(
+            folder,
+            crate::post_operation_selection::ExpectedOutputs::AddedSince(before),
+        );
     }
 
     /// `select_after_load` のヒントで items 内をケース無視で検索し、見つかれば
@@ -65594,7 +65754,7 @@ impl eframe::App for App {
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
 
-        // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
+        // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
         self.flush_periodic_sidecars();
 

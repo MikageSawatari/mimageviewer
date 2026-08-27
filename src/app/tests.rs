@@ -1142,7 +1142,7 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
     );
 }
 
-/// snapshot の退避先は、退避される 6 フィールドと同じ context が持つ。
+/// snapshot の退避先は、退避される 7 フィールドと同じ context が持つ。
 ///
 /// `App::snapshot` が App-global だった頃は、2 つ目の context が snapshot を張ると
 /// 1 つ目の退避を**上書きして復元不能**にしていた。
@@ -1158,9 +1158,47 @@ fn snapshot_test_items(paths: &[&str]) -> Vec<GridItem> {
 fn seed_snapshot_context(app: &mut App, folder: &str, paths: &[&str]) {
     app.items = snapshot_test_items(paths);
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = vec![None; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
     app.current_folder = Some(PathBuf::from(folder));
     app.selected = Some(0);
+}
+
+#[cfg(windows)]
+fn snapshot_subfolder_restore(
+    root: PathBuf,
+) -> crate::app::subfolder_expansion::SubfolderExpansionRestoreState {
+    crate::app::subfolder_expansion::SubfolderExpansionRestoreState {
+        root: Some(root.clone()),
+        roots: vec![root.clone()],
+        saved_folder: Some(root),
+        snapshot: None,
+        removed_paths: Default::default(),
+    }
+}
+
+#[cfg(windows)]
+fn install_snapshot_details_pending(
+    app: &mut App,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Sender<DetailsMetaEvent>,
+) {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: std::sync::Arc::clone(&cancel),
+        phase: DetailsMetaPendingPhase::Loading {
+            rx: event_rx,
+            priority_tx,
+        },
+    });
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+    (cancel, event_tx)
 }
 
 #[cfg(windows)]
@@ -1172,6 +1210,203 @@ fn snapshot_item_paths(app: &App) -> Vec<PathBuf> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+#[cfg(windows)]
+fn rating_filter_suppression_is_owned_by_the_context_that_established_it() {
+    let mut app = phase_c_support::setup_app();
+    let filtered = [false, false, false, false, false, true];
+    app.settings.rating_filter = filtered;
+    seed_snapshot_context(&mut app, "E:/rating-owner", &["E:/rating-owner/a.jpg"]);
+    app.rating_filter_suppressed_at = Some((PathBuf::from("E:/rating-owner"), filtered));
+    assert_eq!(app.effective_rating_filter(), [true; 6]);
+
+    let other = app.build_window_context_for_test(905, |ctx| {
+        seed_snapshot_context(ctx, "E:/rating-sibling", &["E:/rating-sibling/b.jpg"]);
+    });
+    let mounted = app.with_viewer_context(other, |ctx| {
+        assert_eq!(ctx.effective_rating_filter(), filtered);
+        ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        ctx.deactivate_snapshot();
+        assert!(ctx.rating_filter_suppressed_at.is_none());
+    });
+    assert!(mounted.is_ok());
+    assert!(app.rating_filter_suppressed_at.is_some());
+    assert_eq!(app.effective_rating_filter(), [true; 6]);
+}
+
+#[test]
+#[cfg(windows)]
+fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("forked-search-restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let search_path = crate::app::search_results_synthetic_path();
+    seed_snapshot_context(
+        &mut app,
+        search_path.to_string_lossy().as_ref(),
+        &["E:/search/hit.jpg"],
+    );
+    app.global_search.active = true;
+    app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root.clone()));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+        query: "hit".into(),
+    });
+
+    app.bind_mounted_context_for_test(906);
+    let first = app.fork_mounted_live_media_context(906);
+    app.bind_mounted_context_for_test(907);
+    let second = app.fork_mounted_live_media_context(907);
+    for (position, context_id) in [first, second].into_iter().enumerate() {
+        if position != 0 {
+            // Eliminate the first restore's legacy App-global runtime as an accidental fallback.
+            app.clear_subfolder_expansion_view_state();
+        }
+        let mounted = app.with_viewer_context(context_id, |ctx| {
+            assert!(ctx.global_search_subfolder_restore.is_some());
+            assert!(ctx.top_level_grid_view.take_return_to().is_some());
+            ctx.deactivate_snapshot();
+            assert_eq!(ctx.subfolder_expansion_root.as_ref(), Some(&root));
+        });
+        assert!(mounted.is_ok());
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallback() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("unused-search-restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let search_path = crate::app::search_results_synthetic_path();
+    seed_snapshot_context(
+        &mut app,
+        search_path.to_string_lossy().as_ref(),
+        &["E:/search/hit.jpg"],
+    );
+    app.global_search.active = true;
+    app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+        query: "hit".into(),
+    });
+
+    let returned = app.dismiss_snapshot_without_restore();
+    assert!(matches!(
+        returned,
+        Some(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(_))
+    ));
+    assert!(app.global_search_subfolder_restore.is_some());
+}
+
+#[test]
+#[cfg(windows)]
+fn snapshot_activate_and_deactivate_keep_image_metas_parallel_to_items() {
+    let mut app = phase_c_support::setup_app();
+    let origin = PathBuf::from("E:/meta-snapshot");
+    app.current_folder = Some(origin.clone());
+    app.items = (0..10)
+        .map(|idx| GridItem::Image(origin.join(format!("page-{idx}.jpg"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = (0..10).map(|idx| Some((100 + idx, 1_000 + idx))).collect();
+    app.visible_indices = vec![4, 9];
+
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+    assert_eq!(
+        app.image_metas,
+        vec![Some((104, 1_004)), Some((109, 1_009))]
+    );
+    assert!(matches!(&app.items[0], GridItem::Image(path) if path.ends_with("page-4.jpg")));
+    assert!(matches!(&app.items[1], GridItem::Image(path) if path.ends_with("page-9.jpg")));
+
+    app.current_folder = Some(origin.join("child"));
+    app.items = vec![GridItem::Image(origin.join("child/temporary.jpg"))];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![Some((999, 999))];
+    app.visible_indices = vec![0];
+    assert!(app.snapshot_return_to_list_view());
+    assert_eq!(
+        app.image_metas,
+        vec![Some((104, 1_004)), Some((109, 1_009))]
+    );
+
+    app.deactivate_snapshot();
+
+    assert_eq!(app.items.len(), 10);
+    assert_eq!(app.image_metas.len(), 10);
+    for idx in 0..10 {
+        assert!(matches!(
+            &app.items[idx],
+            GridItem::Image(path) if path.ends_with(format!("page-{idx}.jpg"))
+        ));
+        assert_eq!(
+            app.image_metas[idx],
+            Some((100 + idx as i64, 1_000 + idx as i64))
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn snapshot_swaps_rebuild_details_state_without_color_filter_and_cancel_old_pending() {
+    let mut app = phase_c_support::setup_app();
+    let origin = PathBuf::from("E:/details-snapshot");
+    app.current_folder = Some(origin.clone());
+    app.items = (0..10)
+        .map(|idx| GridItem::Image(origin.join(format!("page-{idx}.jpg"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = vec![None; app.items.len()];
+    app.visible_indices = vec![4, 9];
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+    app.settings.details_show_created = true;
+    app.color_filter.enabled = false;
+    app.details_order = vec![9, 4];
+    app.details_tag_prewarm_indices = vec![9];
+    let (activate_cancel, activate_tx) = install_snapshot_details_pending(&mut app);
+    let activate_generation = app.items_generation;
+
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+    assert!(activate_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert!(
+        activate_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: activate_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+    assert_eq!(app.details_order, vec![0, 1]);
+    assert!(app.details_tag_prewarm_indices.is_empty());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+
+    app.details_order = vec![1, 0];
+    app.details_tag_prewarm_indices = vec![1];
+    let (deactivate_cancel, deactivate_tx) = install_snapshot_details_pending(&mut app);
+    let deactivate_generation = app.items_generation;
+
+    app.deactivate_snapshot();
+
+    assert!(deactivate_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert!(
+        deactivate_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: deactivate_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+    assert_eq!(app.details_order, vec![4, 9]);
+    assert!(app.details_tag_prewarm_indices.is_empty());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
 }
 
 #[test]
@@ -16014,6 +16249,161 @@ mod favorite_adjustment_defaults_tests {
 
     /// 見開きから消しゴムに入ったあと `reset_erase_mode` で元の見開き状態に戻ること。
     /// (Apply [E] / Cancel [Esc] どちらの経路でも内部的に reset_erase_mode が呼ばれる。)
+    #[test]
+    fn a_created_folder_takes_the_cursor_even_though_something_was_selected() {
+        // 「作った物を選ぶ」ヒントを置いてから再読込を頼む経路。現在の選択で上書きすると
+        // カーソルが動かない (専用スレ >>305)。
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.selected = Some(0);
+
+        app.select_after_load = Some("new folder".to_string());
+        app.preserve_cursor_hint_for_reload();
+        assert_eq!(
+            app.select_after_load.as_deref(),
+            Some("new folder"),
+            "操作が置いたヒントを現在の選択で潰してはいけない"
+        );
+
+        // 誰も指定していないときは、これまでどおり今の選択を保つ。
+        app.select_after_load = None;
+        app.preserve_cursor_hint_for_reload();
+        assert_eq!(app.select_after_load.as_deref(), Some("a.jpg"));
+    }
+
+    #[test]
+    fn pasted_items_get_checked_and_the_first_one_gets_the_cursor() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.checked.insert(0);
+
+        // 貼り付け前に一覧にあったのは a と d。b / c が増えた。
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::AddedSince(
+                [folder.join("a.jpg"), folder.join("d.jpg")]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(app.apply_post_operation_selection());
+
+        assert_eq!(app.selected, Some(1), "表示順で先頭の追加項目へカーソル");
+        assert_eq!(
+            app.checked,
+            [1, 2].into_iter().collect::<std::collections::HashSet<_>>(),
+            "複数件なら追加項目だけをチェックし、元のチェックは解除する"
+        );
+        assert!(app.scroll_to_selected, "見える位置まで運ぶ");
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(1),
+            "Shift 選択の起点も追加項目へ移す"
+        );
+    }
+
+    #[test]
+    fn a_single_created_item_gets_the_cursor_but_no_checkmark() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "new", "z.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.checked.insert(2);
+
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::Known(vec![folder.join("new")]),
+        );
+        assert!(app.apply_post_operation_selection());
+
+        assert_eq!(app.selected, Some(1));
+        assert!(
+            app.checked.is_empty(),
+            "1 件のときはチェックを付けず、元のチェックだけ解除する"
+        );
+    }
+
+    #[test]
+    fn an_operation_in_another_folder_does_not_touch_this_list() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let here = std::path::PathBuf::from("c:/here");
+        app.items.push(GridItem::Image(here.join("new")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.current_folder = Some(here.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.checked.insert(0);
+
+        // 別フォルダ宛の要求。同じ名前の項目がここにあっても選択を奪わない。
+        app.request_post_operation_selection(
+            std::path::PathBuf::from("c:/elsewhere"),
+            ExpectedOutputs::Known(vec![std::path::PathBuf::from("c:/elsewhere/new")]),
+        );
+        assert!(!app.apply_post_operation_selection());
+        assert_eq!(app.checked.len(), 1, "他所の操作でチェックを消さない");
+        assert!(
+            app.post_operation_selection.is_none(),
+            "別フォルダへ来たら要求は捨てる"
+        );
+    }
+
+    #[test]
+    fn an_output_the_filter_hides_leaves_the_filter_and_the_selection_alone() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "hidden.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+
+        // 出力は items にはあるが、絞り込みで表示から外れている状態。フィルタを
+        // 自動解除して無理に見せたり、隠れたままの項目を選んだりしてはいけない。
+        let before_filter = app.visible_indices.clone();
+        app.visible_indices.retain(|&idx| idx != 1);
+        assert_ne!(app.visible_indices, before_filter);
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::Known(vec![folder.join("hidden.jpg")]),
+        );
+        assert!(!app.apply_post_operation_selection());
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "見えない項目のために選択を動かさない"
+        );
+        assert_eq!(app.visible_indices, vec![0], "フィルタは変えない");
+        assert!(
+            app.post_operation_selection.is_some(),
+            "まだ届いていないだけかもしれないので要求は残す"
+        );
+    }
+
     #[test]
     fn switching_sides_in_text_mode_keeps_the_way_back_to_the_spread() {
         use crate::grid_item::GridItem;
@@ -39766,6 +40156,204 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn install_context_fs_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        app.fs_pending.insert(
+            0,
+            FsPendingValue::new(cancel, rx, 1, FsLoadPurpose::for_page(true)),
+        );
+    }
+
+    fn install_context_details_meta_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (priority_tx, _priority_rx) = mpsc::channel();
+        app.details_meta_pending = Some(DetailsMetaPending {
+            visible_revision: app.details_lazy_visible_revision,
+            selection_target_key: None,
+            normal_target_keys: Default::default(),
+            cancel,
+            phase: DetailsMetaPendingPhase::Loading {
+                rx: event_rx,
+                priority_tx,
+            },
+        });
+    }
+
+    fn install_context_comic_bake_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        app.comic_bake_pending.insert(
+            0,
+            ComicBakePending {
+                comic_gen: 1,
+                items_gen: app.items_generation,
+                base: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)),
+                dims: [1, 1],
+                preview_scale: 1,
+                started: std::time::Instant::now(),
+                cancel,
+                rx,
+            },
+        );
+    }
+
+    fn install_context_erase_inpaint_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel();
+        app.erase_inpaint_pending.insert(
+            crate::ui_erase::EraseInpaintPendingKey {
+                idx: 0,
+                kind: crate::ui_erase::EraseInpaintKind::Commit,
+            },
+            crate::ui_erase::EraseInpaintPending {
+                idx: 0,
+                items_generation: app.items_generation,
+                path_key: None,
+                rx,
+                progress_rx,
+                progress: crate::ui_erase::EraseInpaintProgress::Preparing,
+                cancel,
+                started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
+                log_prefix: "context-retire-test",
+                is_preview: false,
+            },
+        );
+    }
+
+    fn context_work_cancel_tokens() -> [Arc<AtomicBool>; 4] {
+        std::array::from_fn(|_| Arc::new(AtomicBool::new(false)))
+    }
+
+    fn install_all_context_work(app: &mut App, cancels: &[Arc<AtomicBool>; 4]) {
+        install_context_fs_pending(app, Arc::clone(&cancels[0]));
+        install_context_details_meta_pending(app, Arc::clone(&cancels[1]));
+        install_context_comic_bake_pending(app, Arc::clone(&cancels[2]));
+        install_context_erase_inpaint_pending(app, Arc::clone(&cancels[3]));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_fs_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(701, move |context| {
+            install_context_fs_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_fs_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_details_meta_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(702, move |context| {
+            install_context_details_meta_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_details_meta_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_comic_bake_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(703, move |context| {
+            install_context_comic_bake_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_comic_bake_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_erase_inpaint_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(704, move |context| {
+            install_context_erase_inpaint_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_erase_inpaint_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bulk_parked_context_retire_cancels_work_without_close_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.push_window_context_for_test(&ctx, 705, move |context| {
+            install_context_fs_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        // This is the bulk teardown seam: it retires the at-rest bundle directly and deliberately
+        // does not mount it or call close_fullscreen first.
+        app.teardown_paused_media_bundles_for_window_ids(&[705], "test_bulk_context_retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(app.viewer_context_residence(id), ContextResidence::Retired);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_leaves_sibling_context_work_untouched() {
+        let mut app = setup_app();
+        let retiring_cancels = context_work_cancel_tokens();
+        let sibling_cancels = context_work_cancel_tokens();
+        let retiring_installed = retiring_cancels.clone();
+        let sibling_installed = sibling_cancels.clone();
+        let retiring = app.build_window_context_for_test(706, move |context| {
+            install_all_context_work(context, &retiring_installed);
+        });
+        let sibling = app.build_window_context_for_test(707, move |context| {
+            install_all_context_work(context, &sibling_installed);
+        });
+
+        app.retire_context(retiring, "test_context_work_sibling_isolation", |_| ())
+            .expect("context should retire");
+
+        assert!(
+            retiring_cancels
+                .iter()
+                .all(|cancel| cancel.load(Ordering::Relaxed))
+        );
+        assert!(
+            sibling_cancels
+                .iter()
+                .all(|cancel| !cancel.load(Ordering::Relaxed))
+        );
+        assert_eq!(
+            app.viewer_context_residence(sibling),
+            ContextResidence::AtRest
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn detached_folder_pending_requests_are_cancelled_on_pause_and_drop() {
@@ -44534,6 +45122,130 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn install_filtered_starred_book_grid(
+        app: &mut AppTestEnv,
+        use_zip: bool,
+    ) -> (PathBuf, PathBuf) {
+        use crate::settings::FacetItemKind;
+
+        let parent = app.tmp.path().join("filtered-main-grid");
+        let book = parent.join(if use_zip {
+            "starred.zip"
+        } else {
+            "starred.pdf"
+        });
+        std::fs::create_dir_all(&parent).unwrap();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.settings.facet_filter.kinds.insert(if use_zip {
+            FacetItemKind::Zip
+        } else {
+            FacetItemKind::Pdf
+        });
+        app.current_folder = Some(parent.clone());
+        app.address = parent.to_string_lossy().to_string();
+        app.items = vec![if use_zip {
+            GridItem::ZipFile(book.clone())
+        } else {
+            GridItem::PdfFile(book.clone())
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.search_filter = Some(HashSet::from([0]));
+        app.selected = Some(0);
+        app.scroll_offset_y = 184.0;
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&book), 5)
+            .unwrap();
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.get_rating(0), 5);
+        (parent, book)
+    }
+
+    #[cfg(windows)]
+    fn assert_filtered_main_book_grid_unchanged(
+        app: &App,
+        parent: &Path,
+        item_key: &str,
+        facet_filter: &crate::settings::FacetFilter,
+        generation: u64,
+    ) {
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            vec![item_key.to_string()]
+        );
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.settings.rating_filter,
+            [false, false, false, false, false, true]
+        );
+        assert_eq!(&app.settings.facet_filter, facet_filter);
+        assert_eq!(app.current_folder.as_deref(), Some(parent));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 184.0);
+        assert_eq!(app.items_generation, generation);
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(app.facet_filter_suppression_stack.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn complete_filtered_detached_book(app: &mut App, use_zip: bool, book: &Path) {
+        if use_zip {
+            let pages = ["001.jpg", "002.jpg", "003.jpg"];
+            complete_detached_archive_page_enumeration(app, book, &pages);
+            assert_detached_archive_pages(app, book, &pages);
+        } else {
+            complete_detached_pdf_page_enumeration(app, book, 3);
+            assert_detached_pdf_pages(app, book, &[0, 1, 2]);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_descriptor_open_preserves_main_filters_and_shows_every_physical_page() {
+        let ctx = egui::Context::default();
+        for use_zip in [false, true] {
+            let mut app = setup_app();
+            let (parent, book) = install_filtered_starred_book_grid(&mut app, use_zip);
+            let item_key = app.items[0].perf_key();
+            let facet_filter = app.settings.facet_filter.clone();
+            let generation = app.items_generation;
+            assert!(
+                app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, true)
+            );
+            assert_filtered_main_book_grid_unchanged(
+                &app,
+                &parent,
+                &item_key,
+                &facet_filter,
+                generation,
+            );
+            complete_filtered_detached_book(&mut app, use_zip, &book);
+            app.with_active_viewer_context(|detached| {
+                assert_eq!(
+                    detached.navigation_scope,
+                    ViewerNavigationScope::DetachedPhysical
+                );
+                detached.rebuild_visible_indices();
+                assert_eq!(detached.visible_indices, vec![0, 1, 2]);
+            })
+            .unwrap();
+            assert_filtered_main_book_grid_unchanged(
+                &app,
+                &parent,
+                &item_key,
+                &facet_filter,
+                generation,
+            );
+        }
+    }
+
     #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();
@@ -48649,6 +49361,107 @@ mod still_window_mode_key_tests {
             flick.owner == owner
                 && flick.context == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
         }));
+    }
+
+    /// Regression for backlog §1.131: while ParkedLive, the seek strip asked the presenter for its
+    /// own window from the draw path and the classifier read that as a HUD click, so the video
+    /// window took the foreground back 13ms after the user activated a different one. Renderer-,
+    /// worker- and lifecycle-produced events must never request activation, and the classifier is
+    /// exhaustive so a new event cannot join them by default.
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_renderer_emitted_events_do_not_request_activation() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::seek_strip::{SeekStripCenter, SeekStripCloseCause};
+
+        // The event the user hit: emitted whenever the strip layout key changes, with no click.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::RequestSeekStripWindow {
+                    center: SeekStripCenter::Thumbnails { center_index: 0.0 },
+                    visible_count: 10,
+                    pixel_width: 1752,
+                    pixel_height: 141,
+                }
+            )
+        );
+
+        // The strip closes itself from the draw path whenever the HUD is not visible. Only the
+        // three causes the user actually asks for count as a dismissal.
+        for cause in [
+            SeekStripCloseCause::HudHidden,
+            SeekStripCloseCause::VideoChanged,
+            SeekStripCloseCause::FullscreenExit,
+            SeekStripCloseCause::TileModeOpened,
+            SeekStripCloseCause::Unavailable,
+        ] {
+            assert!(
+                !App::native_video_output_event_is_parked_live_hud_click_activation(
+                    &Ev::CloseSeekStrip { cause }
+                ),
+                "{cause:?} is not a user dismissal"
+            );
+        }
+        for cause in [
+            SeekStripCloseCause::Toggle,
+            SeekStripCloseCause::DownwardDrag,
+            SeekStripCloseCause::Escape,
+        ] {
+            assert!(
+                App::native_video_output_event_is_parked_live_hud_click_activation(
+                    &Ev::CloseSeekStrip { cause }
+                ),
+                "{cause:?} is a user dismissal"
+            );
+        }
+
+        // Worker completions and commit notifications arrive on their own schedule.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::Anime4kMeasurementCompleted(Err("failed".to_string()))
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::VideoScaleSettingsCommitted {
+                    filter: crate::settings::VideoScaleFilter::default(),
+                    smoothing_percent: 50,
+                    anime4k_variant: None,
+                    toast: None,
+                }
+            )
+        );
+
+        // The VST panel reports its position both after a drag and after an automatic clamp. The
+        // drag already requests activation through the left-button path, so this must not.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SetVst3PanelPos { pos: [12.0, 34.0] }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SetVst3PanelVisible { visible: true }
+            )
+        );
+
+        // A touch that teaches the chrome gesture is still the user acting.
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::TouchChromeLearned
+            )
+        );
+        // So is every deliberate strip operation.
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::OpenSeekStrip)
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::CommitSeekStrip {
+                    center: SeekStripCenter::Thumbnails { center_index: 4.0 },
+                }
+            )
+        );
     }
 
     #[test]

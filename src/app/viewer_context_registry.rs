@@ -790,6 +790,12 @@ pub(in crate::app) struct ViewerContextBundle {
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     page_dims_cache: crate::page_dims::PageDimsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
+    /// 現在の viewer context だけに効く評価 filter の一時解除 anchor。
+    ///
+    /// `effective_rating_filter` と snapshot / folder navigation の restore が同じ
+    /// mounted projection を読み書きする。ここを bundle 外に置くと、別 context の
+    /// snapshot release が owner の suppression を消費し、表示 filter も sibling へ漏れる。
+    rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
@@ -865,6 +871,12 @@ pub(in crate::app) struct ViewerContextBundle {
     /// ② 両者が同じフォルダを指していると解除時に他 context の一覧を書き戻した
     /// (監査 A2b の既知の指摘、docs/detached-rework-plan.md §9.5)。
     snapshot: Option<crate::snapshot::SnapshotState>,
+    /// Ctrl+G / Ctrl+S の検索由来 snapshot が synthetic サブ展開へ戻るための fallback。
+    /// search state 自体は App の UI projection だが、この restore payload は snapshot と
+    /// 一緒に fork / mount / retire されなければ sibling の `take()` で失われる。
+    global_search_subfolder_restore:
+        Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
+    favsearch_subfolder_restore: Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
     items_are_reading_history_view: bool,
@@ -1175,19 +1187,16 @@ impl ContextMut<'_> {
     }
 }
 
-#[cfg(all(test, windows))]
 #[cfg(windows)]
-impl Drop for ViewerContextBundle {
-    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
-    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
-    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
-    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
-    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
-    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
-    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
-    fn drop(&mut self) {
-        self.cancel_token
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+impl ViewerContextBundle {
+    /// この viewer context が所有する非同期 work を、context の terminal retire と同じ
+    /// ownership 境界で停止する。
+    ///
+    /// thumbnail pool だけは condvar 待ちで残留し得るため notify まで必要。その他は有限の
+    /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
+    /// 各 worker が既に監視している cancel token を立てる。
+    fn cancel_all_context_work(&self) {
+        self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
             q.1.notify_all();
         }
@@ -1215,8 +1224,44 @@ impl Drop for ViewerContextBundle {
         for pending in self.final_effect_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+
+        for pending in self.fs_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.details_meta_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.comic_bake_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.erase_inpaint_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
+
+#[cfg(windows)]
+impl Drop for ViewerContextBundle {
+    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
+    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
+    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
+    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
+    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
+    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
+    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
+    fn drop(&mut self) {
+        self.cancel_all_context_work();
+    }
+}
+
+// Tests exercise their own cfg graph, so production must prove this teardown exists explicitly.
+#[cfg(all(windows, not(test)))]
+const _: () = {
+    #[allow(drop_bounds)]
+    fn assert_explicit_drop<T: Drop>() {}
+
+    let _ = assert_explicit_drop::<ViewerContextBundle>;
+};
 
 #[cfg(windows)]
 impl ViewerContextBundle {
@@ -1317,6 +1362,7 @@ impl ViewerContextBundle {
             rotation_cache: std::collections::HashMap::new(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
             rating_cache: std::collections::HashMap::new(),
+            rating_filter_suppressed_at: None,
             rating_session_write_seen_generation: 0,
             metadata_import_refresh_index: None,
             current_folder_rating_cache: None,
@@ -1365,6 +1411,8 @@ impl ViewerContextBundle {
             fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             snapshot: None,
+            global_search_subfolder_restore: None,
+            favsearch_subfolder_restore: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
@@ -1639,6 +1687,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             metadata_import_refresh_index,
             current_folder_rating_cache,
@@ -1687,6 +1736,8 @@ impl App {
             fs_upload_backlog,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -1928,6 +1979,9 @@ impl App {
         swap_field!(fs_upload_backlog);
         swap_field!(top_level_grid_view);
         swap_field!(snapshot);
+        swap_field!(rating_filter_suppressed_at);
+        swap_field!(global_search_subfolder_restore);
+        swap_field!(favsearch_subfolder_restore);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
         swap_field!(items_are_reading_history_view);
@@ -2151,6 +2205,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
@@ -2198,6 +2253,8 @@ impl App {
             fs_upload_backlog,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2340,6 +2397,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
             tags_cache,
@@ -2347,6 +2405,8 @@ impl App {
             current_folder_signature,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2617,6 +2677,9 @@ impl App {
         // **作成ポリシーとして明示**しておく (退避だけ相続して surface が Folder に
         // 戻っていると、解除の行き先が無い state になる)。
         detached.snapshot = None;
+        detached.rating_filter_suppressed_at = None;
+        detached.global_search_subfolder_restore = None;
+        detached.favsearch_subfolder_restore = None;
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
         detached.cached_nav_indices = None;

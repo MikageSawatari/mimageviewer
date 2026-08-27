@@ -1602,6 +1602,9 @@ impl crate::app::App {
                     && let (Some(hwnd), Some(folder)) =
                         (self.main_hwnd, target.paths.first().cloned())
                 {
+                    // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
+                    // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
+                    self.request_post_operation_selection_for_added_items(folder.clone());
                     let result = crate::native_context_menu::invoke_shell_folder_background_verb(
                         hwnd,
                         &folder,

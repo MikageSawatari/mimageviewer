@@ -1070,8 +1070,9 @@ R2e の続きの独立ステージ**としてここに記録する (Codex の手
 **守るべき不変条件**: 表示中の `items` と、それを元へ戻す `SnapshotState` は
 **同じ `ViewerContextId` が所有する**。
 
-`activate_snapshot` は `items` / `thumbnails` / `visible_indices` / `scroll_offset_y` /
-`selected` / `zip_nav` の **6 つとも bundle field** を `App::snapshot` へ退避する。ところが
+`activate_snapshot` は `items` / `thumbnails` / `image_metas` / `visible_indices` /
+`scroll_offset_y` / `selected` / `zip_nav` の **7 つとも bundle field** を `App::snapshot` へ
+退避する。ところが
 `App::snapshot` だけが App-global で `swap_viewer_context_bundle` で交換されなかった。
 **表面の `top_level_grid_view` (どの top-level surface を表示中か) は既に per-context** なので、
 「表示は context ごと・取り消しは App 共有」という所有境界の食い違いになっていた。
@@ -1097,7 +1098,8 @@ park 時は `duplicate_for_parked!` (= `items` / `top_level_grid_view` と同ク
   「global でなければならない」までは言えない。**doc コメントが実装より古い**。
 
 **監査の handshake (Codex の指摘で修正)**: `snapshot` を bundle へ移しても
-`activate_snapshot` は 6 field の `mem::replace` のままなので、**A2b は検出され続ける**。
+`activate_snapshot` は 6 field の `mem::replace` + `zip_nav.take()` のままなので、
+**A2b は検出され続ける**。
 KNOWN_FINDINGS から削除するだけだと untracked violation になるので、
 **ALLOWLIST_ENTRIES へ意味を移した** (理由 = 退避先が context 所有になったこと)。
 KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の監査テスト 1 本も直した
@@ -1119,12 +1121,11 @@ KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の�
 - `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
   — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
 
-**残した確認事項** (Codex の指摘、本ステージでは未着手):
+**残した確認事項の解決 (2026-08-26)**:
 `rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
-`global_search_subfolder_restore` は App-global のまま snapshot lifecycle と結合している。
-前者は snapshot 解除が無条件に global suppression を解く。後者は dismiss/deactivate が
-global slot を `take()` するため、検索由来 snapshot を fork した場合に先に閉じた側が
-sibling の fallback restore を消費し得る。
+`global_search_subfolder_restore` も `ViewerContextBundle` 所有へ移した。検索 fallback の
+先行 `take()`、`image_metas` と Details index state の交換漏れも同時に、互いを混ぜない
+ownership / index-space 修正として閉じた。判断と変更境界は §11 の同日記録を参照。
 
 ### R2e の現況 (2026-08-25 時点、新しいセッションはここを最初に見る)
 
@@ -1296,6 +1297,106 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-27 detached grid の Descriptor open から main filter suppression を分離
+(backlog §1.131 P2-2 follow-up、利用者提示の ClaudeCode re-review と Codex の callee
+inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` にある
+`DetachedGridItemOpenPlan::Descriptor` arm、[src/app/tests.rs](../src/app/tests.rs) の
+実 detached open producer 回帰テスト。detached predicate、viewport / HWND / placement /
+focus / epoch、keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
+
+**不変条件と判断理由**: Descriptor は park が完了しない場合、または context start が
+`false` を返す場合に通常 main navigation へ戻り得るが、その2 caller は採用した main 分岐で
+既に rating / facet suppression を行う。成功時は fresh bundle が `DetachedPhysical` を所有し、物理 scope の全ページを
+App-global display filter より前に確定するため suppression は誰にも不要である。したがって
+detached helper は mounted main projection を変更せず、抑制責務は実際に main navigation を
+採用した境界にだけ残す。FolderCandidate も分類後の main fallback だけで抑制し、
+ConvertibleArchiveCandidate の detached completion は抑制しないため、sibling route と一致する。
+
+**回帰証明と別件記録**: 新テストは★5 filter と ZIP/PDF kind facet が有効な main から、
+★5 の ZIP / PDF を実 helper で detached open し、main の suppression / filter / stack /
+items / visible set / search filter が不変で、detached は3ページすべてを表示することを検査する。
+Descriptor arm へ rating producer だけを戻す mutation は main anchor の `is_none()` で失敗し、
+facet producer だけを戻す mutation は `{Pdf}` filter の保持比較で失敗した。新しい App-level
+state、時間窓、guard / retry / repaint は追加していない。同じ caller 前段の
+`note_reading_history_open(idx)` が context-owned `reading_history_return_from` を main 上で
+変更してから detached build に入る別件は、§2 規則7に従い修正せず backlog §1.131 に記録した。
+
+**2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
+(利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
+mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle::cancel_all_context_work` と `Drop for ViewerContextBundle`、
+[src/app/tests.rs](../src/app/tests.rs) の pending 別 / bulk retire / sibling 非干渉テスト。
+detached predicate、viewport / HWND / placement / focus / epoch、keep-alive backstop、overlay GPU、
+grid selection / paste / new-folder は変更しない。
+
+**不変条件**: context の terminal retire は caller が pause や `close_fullscreen` を先に実行したかに
+依存せず、bundle が所有する thumbnail pool の cancel + 両 queue notify、tag prewarm、legacy seed、
+metadata、converted archive cache paths、folder nav、folder pane open、全 final effect に加えて、
+全 `fs_pending`、`details_meta_pending`、全 `comic_bake_pending`、全
+`erase_inpaint_pending` の cancel token を立てる。`final_ai_pending`、
+`local_adjust_pending`、`zip_enumerate_pending` は各 pending 型自身の Drop による停止を維持し、
+bundle 側へ二重化しない。bulk ParkedLive retire と sibling context の停止境界も同じ規則にする。
+
+**重大度と判断理由 (なぜ症状パッチではないか)**: P1 の thumbnail pool は condvar 待ちのまま
+窓の開閉ごとに蓄積する thread leak だった。今回追加した4種は有限 one-shot worker なので、
+receiver が無くても計算を終えて退出し、hang や蓄積は起こさない。ただし破棄済み context のために
+CPU / GPU / AI を使い続け、最悪は orphaned MI-GAN が画像全体の tile 推論を完走する。
+そこで caller 別の guard や retry を足さず、すべての retire 経路が必ず通る既存 owner の Drop に
+停止責務を集約した。新しい App-level bool / Option、時間窓、debounce / grace / retry、repaint、
+detached heuristic は追加していない。4 cancel 行をそれぞれ個別に検出するテスト、pause /
+`close_fullscreen` を経ない bulk retire テスト、sibling の4 token が未変更であるテストを持つため、
+§2 の context ownership 境界修正であり leak 対策用の過剰な lifecycle machinery ではない。
+
+**2026-08-26 ★固定に残っていた context ownership / index-space 同期の補完
+(利用者指定の構造修正、Codex 実装。ClaudeCode review / mutation check 完了):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` mount / fork policy、[src/app/snapshot_ops.rs](../src/app/snapshot_ops.rs) と
+[src/snapshot.rs](../src/snapshot.rs) の snapshot 交換境界、対応する回帰テストと
+viewer-context audit allowlist。detached predicate、viewport / HWND / placement / focus / epoch、
+keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
+
+**不変条件**: rating filter の一時解除 anchor と Ctrl+S / Ctrl+G の synthetic subfolder
+restore payload は、それを読み書き・consume する snapshot と同じ `ViewerContextBundle` が所有する。
+live-media fork は snapshot / top-level state と一緒に複製し、fresh / materialized physical context は
+`None` から始める。`dismiss_snapshot_without_restore` は canonical `return_to` がある限り unused
+fallback を `take()` しない。items の直接交換では、位置対応する `image_metas` も capture / swap /
+restore し、generation bump 後に旧 Details metadata worker を cancel、旧 prewarm indices を破棄して、
+最終 `visible_indices` から `details_order` を再構築する。activate と at-origin deactivate の両方向、
+および snapshot list 復帰を同じ規則にする。
+
+**判断理由 (なぜ症状パッチではないか)**: Group A は per-context operation が consume する state の
+owner を既存 bundle の mount / retire 境界へ揃え、Group B は `items` と平行な state を既存の
+capture → swap → generation bump → invalidate → restore lifecycle に参加させた。新しい App-level
+bool / Option、時間窓、delay / debounce / grace / retry / repaint、detached heuristic は追加していない。
+各 mutation (`rating_filter_suppressed_at` を App-global に戻す、search restore の先行 `take()` を戻す、
+`image_metas` subset を外す、Details rebuild を外す) を個別に検出するテストを持つため、§2 の
+所有境界修正であり症状 guard ではない。
+
+**2026-08-26 `ViewerContextBundle` の production Drop 復元
+(ClaudeCode / Codex 双方が既存 ownership 契約の構造的復元と合意):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の既存
+`Drop for ViewerContextBundle` から誤って追加された `#[cfg(all(test, windows))]` を除去し、
+Windows production compile 時の明示 `Drop` trait bound 証明を追加した。
+[tools/viewer_context_audit/src/lib.rs](../tools/viewer_context_audit/src/lib.rs) の A4 exact-surface
+にも `#[cfg(windows)] impl Drop` を正規形として固定し、同じ test cfg 事故の fixture test を追加した。
+
+**不変条件**: viewer context の破棄は production でも context-owned `cancel_token` を立て、通常 / heavy
+worker queue の condvar を両方起こし、tag prewarm / legacy seed / metadata / converted archive cache paths /
+folder nav / folder pane open / 全 final effect の pending work をその context だけ cancel する。
+
+**判断理由 (なぜ症状パッチではないか)**: `2918e639` は context read view の導入 commit であり、
+既存 teardown の意味変更を伴わず Drop の直前にだけ test cfg を追加していた。新しい状態、detached 述語、
+viewport 経路、待機・retry・時間窓は追加せず、出荷済みの context ownership / teardown 契約を production
+へ戻す修正である。本番 compile proof は明示 Drop が消えれば型検査で失敗し、A4 は正規形から cfg を
+変更しても失敗するため、テストだけが teardown を持つ状態を再発させない。
 
 **2026-08-26 native video の固定16ms repaint pump 撤去 = backlog §1.122
 (ClaudeCode / Codex 双方が完全な Direction A を構造的修正と合意):**
@@ -1544,6 +1645,7 @@ foreground ownership を扱う際の観測として残す。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
+| 2026-08-27 | ParkedLive の HUD クリック分類器 `native_video_output_event_is_parked_live_hud_click_activation` から catch-all `_ => true` を撤去し、`NativeVideoOutputEvent` 77 variant すべてを網羅 match で分類した = backlog §1.131 (ClaudeCode / Codex 双方が構造的修正と合意) | [src/app/native_video.rs](../src/app/native_video.rs) の当該述語のみ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、placement / focus、window lifecycle、activation 要求の生成・消費経路は変更なし。App state の追加なし、時間窓・guard・retry・repaint の追加なし | 実機ログ (`MIV_DETACHED_WINDOW_DEBUG=1`) で、描画経路が layout 変化のたびに出す `RequestSeekStripWindow` が「利用者の HUD クリック」と分類され、利用者が活性化した別窓を 13ms で降ろしていたことを確定。原因は個別イベントの登録漏れではなく **「未分類のイベント = 利用者のクリック」という open-world の既定**であり、シークストリップが 10 個足して 3 個しか分類されなかったのはその帰結。網羅 match 化は新 variant の分類をコンパイラに強制し、誤分類の発生境界そのものを閉じるため症状パッチではない。Codex は方針に同意したうえで一次分類案に 5 件の反例を出し (`TouchChromeLearned` は利用者タップ由来 / `CloseSeekStrip` は cause 依存で `HudHidden` は描画由来 / `SetVst3PanelPos` は自動 clamp でも発火 / `SetVst3PanelVisible` は producer 不在 / `TileColumnsDelta` は入力源が 2 つ)、ClaudeCode が全件を emit 元で裏取りして反映した。`CloseSeekStrip` は既存の `SeekStripCloseCause::is_user_dismissal()` を使うだけで payload 変更を伴わない。`TileColumnsDelta` の provenance 分離と、活性化要求の**寿命・順序**問題 (消費側が「まだ望まれている要求か」を問うていない) は §2 規則 7 に従いスコープ外とし、backlog §1.131 に残した |
 | 2026-08-25 | R2e-2d で active_viewer_context_contains_video が registry 化と同時に mounted context まで含む意味へ広がり、detached video open の main-update poll を自己抑止した回帰を修正。active ID が現在 projected ではない場合だけ動画を検出する other_active_viewer_context_contains_video へ改名し、旧述語から継承した十一 caller を全数監査して同じ「別 context」意味へ移行 | src/app.rs の context predicate、main video poll 入口、pending index / tile / mode-switch / park / close / media-navigation ownership、src/app/native_video.rs の source-swap / mounted clear ownership、src/app/startup_ops.rs の bookmark handoff、src/app/tests.rs の main-update poll 到達テスト。viewport ID / registry transaction / runtime / host ownership、geometry / placement / focus、window lifecycle、pending field と既存計装は変更なし | 利用者のログ・source 分析と Codex の十一 caller / mounted・at-rest lifecycle 監査が、旧 holder 述語の意味は「App に投影されていない active context」であり、全 caller が current/mounted を別の条件または現在処理中の owner として扱う点で一致。guard / retry / delay / re-entrancy flag を足さず、projected identity との比較で residence を保つ ownership 修正である。修正前に production main-update 入口から pending poll に未到達する red を確認し、修正後は poll_native_video_open_pending 固有の host_not_ready 記録まで到達する回帰テストで固定したため、症状パッチではなく §2 に適合すると双方合意 |
 | 2026-08-22 | backlog §1.106 の右ドラッグ中左ボタン取消を passive detached viewer にも通し、既存 `DetachedRightDragEventKind::Cancel` に typed reason `PrimaryButtonPressed` を追加。deferred / ParkedLive の window callback は右ドラッグ中の primary down をこの cancel として同じ sequence channel へ送り、owner reducer が既存 cancel を実行する。左 release による通常の passive window activation は維持し、選択 / open / viewer action へは再利用しない | `src/app.rs` の `DetachedRightDragCancelReason` と deferred callback capture、`src/ui_fullscreen.rs` の ParkedLive callback / 既存 passive right-drag reducer、callback・owner・activation tests。`Input` variant の field、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、window lifecycle、`ViewerContextBundle` field は変更なし | 利用者の再調査と Codex の全 producer 列挙が、backlog 作成後の §1.100 で passive start point が第 4 surface として増え、typed cancel channel だけが primary press を表現できない点で一致。利用者が §2 を確認し、既存 `Cancel { reason }` への reason 追加は新規 App-level detached bool / Option、時間窓、heuristic、rect 条件を作らず、入力を既存 owner cancel 境界へ流す構造修正であると明示的に同意。Codex も同じ理由で症状パッチではなく §2 に適合すると合意した。activation reducerへ cancel suppression を足さず、cancel と Windows 標準の activation が並立することをテストで固定 |
 | 2026-08-22 | backlog §1.99 の ConvertibleArchive grid open を、probe / 変換前は main 所有の typed candidate、実体確定後は新しい detached context を作る destination intent として完結させた。直読み RAR、変換 RAR、RAR cache fallback、非 RAR 同期 cache hit、ZIP / PDF control の page-list 完了後にも main context 不変を回帰テストで固定 | src/app.rs の DetachedGridItemOpenPlan::ConvertibleArchiveCandidate、OpenRequestOwner::DetachedGridArchive、request sequence / stale arbitration、open_converted_grid_archive_in_detached_context と同期 cache-hit arm、src/ui_dialogs/archive_convert.rs の ArchiveConvertCompletionPolicy::DetachedGridArchive および direct / converted completion consumer、src/app/tests.rs。visibility 述語、show_viewport_* builder、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、R2e は変更なし | backlog §1.99 と docs/detached-rework-stage-archive-open.md の ClaudeCode 分析、Codex の source inspection が、誤りは完了先を Navigation に固定した request ownership にあり、RAR を ZIP descriptor に分類する問題ではない点で一致。要求 identity と completion policy が元アーカイブを保持し、確定した backing archive から ViewerContextDescriptor::Zip { archive_source_override: Some(source), .. } を作るため、別 context の main grid を後段で戻す guard ではなく request 作成境界の構造修正である。新規 detached bool / Option、delay / retry / repaint / reset / fallback を追加せず、フル機能ウィンドウの Navigation と ZIP / PDF descriptor を維持するので §2 に適合すると ClaudeCode / Codex 双方が合意 |

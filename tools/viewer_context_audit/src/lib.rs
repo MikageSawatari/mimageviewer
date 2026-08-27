@@ -114,7 +114,7 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
         file: "src/app/snapshot_ops.rs",
         function: "activate_snapshot",
         rule: Rule::A2b,
-        reason: "Stashes six per-context grid fields into ViewerContextBundle::snapshot, which is itself a bundle field exchanged by swap_viewer_context_bundle. Every value stays inside the mounted context and is restored by deactivate_snapshot in that same context; nothing is transferred to another window or owner. This was a KNOWN_FINDINGS entry while App::snapshot was App-global.",
+        reason: "Stashes seven per-context grid fields into ViewerContextBundle::snapshot, which is itself a bundle field exchanged by swap_viewer_context_bundle. Every value stays inside the mounted context and is restored by deactivate_snapshot in that same context; nothing is transferred to another window or owner. This was a KNOWN_FINDINGS entry while App::snapshot was App-global.",
     },
 ];
 
@@ -136,6 +136,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { }",
+    "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn at_rest (bundle : & 'a ViewerContextBundle) -> Self",
@@ -197,7 +198,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
 ///
 /// The one entry this list carried, `activate_snapshot`, was resolved by making
 /// `snapshot` a `ViewerContextBundle` field. Note the violation itself did **not**
-/// disappear: the function still moves six fields with `mem::replace`. What changed is
+/// disappear: the function still moves six fields with `mem::replace` and takes `zip_nav`.
+/// What changed is
 /// that the destination is now context-owned, so the entry moved to `ALLOWLIST_ENTRIES`
 /// rather than being deleted (deleting it alone would have turned a tracked finding into
 /// an untracked violation).
@@ -1961,6 +1963,39 @@ mod tests {
             &audit_public_api(changed, &refs).unwrap(),
             Rule::A4
         ));
+    }
+
+    #[test]
+    fn a4_rejects_cfg_test_gating_a_required_drop_impl() {
+        let allowed = r#"
+            #[cfg(windows)]
+            pub(crate) struct ViewerContextBundle;
+            #[cfg(windows)]
+            impl Drop for ViewerContextBundle {
+                fn drop(&mut self) {}
+            }
+        "#;
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        let changed = r#"
+            #[cfg(windows)]
+            pub(crate) struct ViewerContextBundle;
+            #[cfg(all(test, windows))]
+            #[cfg(windows)]
+            impl Drop for ViewerContextBundle {
+                fn drop(&mut self) {}
+            }
+        "#;
+        let violations = audit_public_api(changed, &refs).unwrap();
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule == Rule::A4
+                    && violation
+                        .message
+                        .contains("allowlisted public API fingerprint is missing")
+            }),
+            "{violations:#?}"
+        );
     }
 
     #[test]

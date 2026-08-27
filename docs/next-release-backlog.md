@@ -744,7 +744,20 @@
   [detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §5)。
 - 規模 / 優先度: Medium / P1。次版修正候補。
 
-### 1.100 複数の画像ウィンドウを開くと、先に開いたウィンドウでマウスジェスチャが効かなくなる — 専用スレ >>270
+### 1.100 複数の画像ウィンドウを開くと、先に開いたウィンドウでマウスジェスチャが効かなくなる ✅ 解消済み
+- **状態: 2026-08-27 実機で解消を確認 (利用者)。** 非アクティブなウィンドウでも、リング
+  ショートカット・マウスジェスチャの両方が発火する。
+- **いつ直ったか**: `d69fed5b` (2026-08-22、左クリックで右ドラッグを取り消す) の本文が経緯を
+  書いている。右ドラッグを開始できる面は 3 つではなく 4 つで、4 つ目の
+  **passive detached window は「この項目が書かれた後に detached リワークで増えた」**。
+  入口は [`apply_passive_detached_right_drag_event`](../src/ui_fullscreen.rs) で、
+  `RightDragOwner::DetachedWindow(window_id)` を持つ。`MouseGestureState` も
+  表示種別だけでなく `owner` を持つようになった ([ring_shortcut.rs](../src/ring_shortcut.rs))。
+- ⚠ **下の「根本原因」は 2026-08-21 時点の記述で、現在のコードには当てはまらない。**
+  OS watcher が `VK_LBUTTON` しか見ないのは今もそのままだが、passive window が独自に
+  pointer 入力を報告するようになったため、アクティブ化を待つ必要が無くなった。
+  **項目が名指ししたコードが変わっていないことは、不具合が残っている証拠にならない**
+  (2026-08-27、ClaudeCode がこの誤りを踏んだ)。
 
 - 出典: 専用スレ >>270 (2026-08-20)。利用者環境・手元とも再現済み。
 - 症状: 複数ウィンドウモードで画像ウィンドウを複数開くと、後から開いたウィンドウでは
@@ -1128,6 +1141,21 @@ passive detached は通常どおり release で窓を activate するが、選�
     フレーム内で観測したポインタ操作、(b) HUD が出て `clean` が false になったとき、の 2 つだけ。
     presenter 側は `update_cursor_icon` で別経路の解決をしており、**カーソルの所有者が 2 つある**。
     次の項目へ移ると直るのは、そこで `open_fullscreen` がラッチを落とすため。
+- **2026-08-27 追試: 再現しなかった (利用者、v3.3.0 開発版)。** 単一ウィンドウの通常
+  フルスクリーン、動画は全画面再生、背後にエディタを置いて ↓ 押しっぱなしで高速送り。
+  **動画の再生がすぐ始まり、背後のエディタへキーは 1 つも入らなかった。**
+  Windows のキーリピートは初回遅延の後およそ 30ms 間隔なので、1 つも漏れないということは
+  前面の空白がほぼ無いことを意味する。
+  - main window の cloaking (`native_video_main_cloaked`) は `f2215fd2` (2026-05-13) で
+    **v3.1.2 に既に入っている**ので、これが後から効いたわけではない。
+  - 未確定なもの: (a) v3.1.2 以降のどこかで解消した (b) より遅く開く動画 (大きい 4K/HEVC、
+    低速ドライブ、起動後 1 本目) が必要 (c) 報告者の環境依存。
+  - **確かめる手段は既にある**。`MIV_DETACHED_WINDOW_DEBUG=1` で起動すると
+    `main_flash_probe stage=fs_visible_false` が窓の状態ごと出る
+    ([app.rs](../src/app.rs) `log_main_flash_probe`)。抑制条件は
+    `fullscreen_idx.is_some()` を含む広いものなので、この経路なら必ず出る。
+    1 回の再現で前面の空白の有無が確定する。
+  - **既知の問題ページには載せない** (見せられないものは載せない)。再現を取れたら載せる。
 - **着手条件: 複数ウィンドウ / キー入力所有権の整理 (別 worktree、`docs/briefs/modifier-ownership-design.md`) の完了待ち。**
   症状パッチ (遷移前後の追加 `SetForegroundWindow`、遅延、キーリピート抑止) を入れない。
   問われているのは「viewer の遷移中、どのウィンドウが前面と入力とカーソルを所有するか」であり、
@@ -2498,7 +2526,12 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
 
 - 規模 \\ 優先度: Small〜Medium / **P2** (通常操作で到達し、固着する)。
 
-### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ
+### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ ✅ 修正済み (2026-08-26)
+
+- ✅ `SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、visible subset の
+  capture、activate の swap、snapshot list 復帰、at-origin deactivate の restore を
+  `items` / `thumbnails` と同じ位置対応で行う。`visible_indices = [4, 9]` の非連続 subset と
+  元一覧への往復を回帰テストで固定した。
 
 - 出典: 2026-08-26、§1.125 の設計相談中に Codex が発見。
   **§1.125 とは別の症状**なので別項目にした (憲法 §2 規則 7: ついでに直さない)。
@@ -2511,7 +2544,13 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
   **「caller 責任」**と明記している ([app.rs:25872](../src/app.rs:25872))。
 - 規模 \\ 優先度: Small / P3 (表示されるメタ情報がずれる。固着はしない)。
 
-### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない
+### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない ✅ 修正済み (2026-08-26)
+
+- ✅ items swap 後の generation bump / index queue invalidation に続けて、旧
+  `details_meta_pending` を cancel + receiver drop、`details_tag_prewarm_indices` を clear し、
+  color filter の有無に依存せず最終 `visible_indices` から `details_order` を再構築する。
+  activate / at-origin deactivate の両方向を、color filter OFF と late result rejection を含む
+  回帰テストで固定した。
 
 - 出典: §1.126 と同じ、Codex の指摘 (2026-08-26)。
 - `details_order` / `details_tag_prewarm_indices` / `details_meta_pending` は、
@@ -2668,6 +2707,92 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 
 - 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
 
+### 1.131 複数ウィンドウで動画再生中、他の窓をアクティブにすると 13ms で動画へ奪い返される ✅ 修正済み
+
+- 出典: 2026-08-27、利用者報告。**複数ウィンドウモードで動画を再生中に PDF を開こうとすると
+  「ウィンドウがちらつくだけで開けない」。動画の前に開いていた PDF ウィンドウも、
+  アクティブにしようとすると動画のウィンドウが手前に来る。**動画が無ければ開ける。
+- 状態: **2026-08-27 修正・実機確認済み**。複数ウィンドウで動画再生中に PDF が開けること、
+  先に開いていた窓が前面に留まること、parked 中の HUD クリックが従来どおり 1 回目で前面に
+  来ること、シークストリップを開いた状態でも同じことを利用者が確認。
+
+#### 原因 — 実ログで確定 (推測ではない)
+
+`MIV_DETACHED_WINDOW_DEBUG=1` で再現。同じ 4 行が 5 回繰り返された:
+
+```
+31.172  passive_activate_begin id=4                                  ← 利用者が PDF 窓をクリック
+31.185  parked-live hud command converted to activation: window_id=1
+        event=RequestSeekStripWindow { center: Thumbnails { .. }, .. }   ← 動画側が活性化を要求
+31.185  session_closing window_id=4 reason=pause_active_context      ← PDF が 13ms で降ろされる
+31.185  session_begin window_id=1 source=Video                       ← 動画が奪い返す
+```
+
+**`RequestSeekStripWindow` は利用者のクリックではない。**
+[render_core.rs](../src/video/native_presenter/render_core.rs) が**描画中に**、strip の
+layout key (overlay サイズ / DPI / 可視セル数 / center) が変わるたびに push する
+layout / resource 要求。それが「HUD がクリックされた」と分類されていた。
+
+[native_video.rs](../src/app/native_video.rs) の
+`native_video_output_event_is_parked_live_hud_click_activation` (旧):
+
+```rust
+Ev::Window(_) | Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. }
+| Ev::RequestSeekThumbnail { .. } | Ev::ClearSeekThumbnail
+| Ev::TileColumnsDelta { .. } => false,          // 維持イベント (活性化しない)
+Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
+_ => true,                                        // ⚠ それ以外は全部「HUD クリック」
+```
+
+**catch-all `_ => true` が構造的な欠陥。**`NativeVideoOutputEvent` は 77 variant あり、
+後から足したイベントは、何もしなくても「利用者がクリックした → 前面へ奪う」に既定で入る。
+
+- `RequestSeekStripWindow` の追加: **2026-08-23** (`2edc070c` シークストリップ)
+- この分類器の最終更新: **2026-08-21** (`c71d8c08` detached-rework R2)
+
+シークストリップは 10 個近くイベントを足したが、維持側に登録されたのは 3 つだけ。
+利用者の見立て (「ストリップのマージで壊れた可能性」) がそのまま当たっていた。
+
+#### 修正 (2026-08-27)
+
+`_ => true` を撤去し、**77 variant を網羅 match で分類**した。新しいイベントを足すと
+コンパイラが分類を要求する。「未知のイベント = 利用者のクリック = 前面を奪う」という
+既定をやめるのが本体で、`RequestSeekStripWindow` を維持側へ足すだけの症状パッチにはしない。
+
+Codex は方針に同意したうえで、一次分類案に **5 件の反例**を出した。全件を emit 元で裏取りし、
+うち 2 件は**同じバグの別インスタンス**だった:
+
+| 指摘 | 裏取り結果 | 対応 |
+| --- | --- | --- |
+| `CloseSeekStrip` は cause 依存 | ✓ **`HudHidden` は描画の else 枝から出る** (2 例目) | 既存の `SeekStripCloseCause::is_user_dismissal()` を使う |
+| `SetVst3PanelPos` は自動 clamp でも出る | ✓ `saved_pos_was_clamped` で発火 (3 例目)。利用者のドラッグは左ボタン経路が先に活性化するので失われない | false |
+| `TouchChromeLearned` は利用者入力 | ✓ `ToggleChrome` / `PageSide` のタップにのみ応答 | true |
+| `SetVst3PanelVisible` に producer が無い | ✓ presenter に push 箇所ゼロ | default-deny で false |
+| `TileColumnsDelta` は入力源が 2 つ | ✓ ただし**両方とも利用者入力**。今回の欠陥ではない | 現状の false を維持 (下記) |
+
+自分で追加確認した 1 件: `VideoScaleSettingsCommitted` は presenter が適用完了後に送る通知
+なので false。
+
+回帰テスト: `parked_live_renderer_emitted_events_do_not_request_activation`
+([src/app/tests.rs](../src/app/tests.rs))。`RequestSeekStripWindow` を活性化側へ戻す変異と
+`CloseSeekStrip` の cause を無視する変異の両方で落ちることを確認済み。
+
+凍結ルール下の合意は [detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
+
+#### 残した 2 件 (憲法 §2 規則 7 によりスコープ外)
+
+1. **`TileColumnsDelta` の provenance 分離** — Ctrl+ホイールと HUD の列数 ± ボタンが同じ
+   variant を共有する。現状はどちらも parked 中に活性化しない (R2 以降の挙動)。
+   分けるには payload に typed origin が要り、今回の欠陥とは別。
+2. **活性化要求の寿命・順序** — [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+   `take_parked_live_activation_requests_after_passive_render` の消費側は
+   `detached_window_state_is_parked_live(id)` だけを見る。これは「この窓は parked-live か」
+   であって「**この活性化要求はまだ望まれているか**」ではない。要求は生成理由も順序も
+   持たない `Vec<u64>` で、同一 batch は時系列でなく ID 順に並ぶ。
+   今回の症状の原因ではないが、同じ「1 つの述語で 2 つの問いに答えている」形。
+   扱うなら既存の `DetachedActivationIntent` を含む reducer へ統合し、
+   **入力順序か request identity** で最新を定義する (フレーム数や数 ms の猶予で棄却しない)。
+
 ### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
 
 - 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
@@ -2703,6 +2828,109 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
   「stale font atlas で描かない = フォント崩れ回避」のトレードオフを崩さないこと。
   待ち方を変えるのであって、待たなくするのではない。
 - 規模 \\ 優先度: Small 〜 Medium / P3。
+
+### 1.131 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 完了 (2026-08-27)
+
+- 出典: 2026-08-27、Codex による `v3.2.0..HEAD` の出荷前レビュー。
+  実装は Codex Sol、検収は ClaudeCode (3 本の brief に分けて実施)。
+
+#### P1 — 製品版に `Drop for ViewerContextBundle` が存在しなかった ✅
+
+`#[cfg(all(test, windows))]` と `#[cfg(windows)]` が重なっており、複数の
+`#[cfg]` は AND されるので実効条件が `test && windows` になっていた。
+`2918e639` (read view 導入) で事故的に追加されたもの。
+
+worker pool (5〜14 スレッド) の condvar を起こす唯一の経路なので、
+**窓の開閉ごとに 1 プールずつ永久残留**していた。実機で 400 スレッドまで
+増えるのを確認し、修正後は繰り返しても増えないことを確認済み。
+
+再発防止は **製品ビルドで落ちる形** にした (テストでは検出できない穴だったため):
+
+- `#[cfg(all(windows, not(test)))]` の const item が `ViewerContextBundle: Drop` を要求 → E0277
+- `tools/viewer_context_audit` に正規形を登録
+
+両方ともバグを再導入して実際に落ちることを確認済み。
+
+⚠ **検証中に踏んだ罠**: worktree が 2 つあると `target\dev-runtime\mimageviewer-core.exe` も
+2 つできる。相対パスで起動手順を渡したため、利用者が**修正の無い別 worktree の
+ビルド**を測っていた。どのビルドが書いたログかは `ffmpeg DLLs expected at ...` 行で判別できる。
+今後は検証バイナリを**絶対パス**で渡す。
+
+#### P2-2 / P2-3 — App-global slot の context 所有化 ✅ (ただし到達性に訂正あり)
+
+`rating_filter_suppressed_at` / `favsearch_subfolder_restore` / `global_search_subfolder_restore`
+を `ViewerContextBundle` へ移し、既存の `swap_field!` 契約に乗せた。
+
+⚠ **レビューの前提は実機と違った**。「A 窓の一時解除を B 窓の snapshot 解除が消す」
+とされていたが、**今日の mIV では踏めない**:
+
+- ★固定 (snapshot) は **メインウィンドウのツールバー専用**で、メインは 1 つしかない
+- suppression を立てる経路は、直前の
+  `if self.open_grid_container_in_detached_book_context(..) { return None; }` で
+  **別ウィンドウ側が早期 return する**
+
+つまりこの修正は「今起きている不具合の修正」ではなく、
+**fork が増えたときに踏む穴を先に塞いだもの**。単体テストが検証手段で、
+**手動確認の手順は作れない** (次に同じ指摘が出たときに再調査しないこと)。
+
+ただし P2-3 のうち **「canonical な `return_to` があるときでも fallback slot を
+消費していた」半分は単一窓でも成立する**ので、こちらは実害の修正。
+
+#### P2-2 re-review follow-up — detached descriptor open が main filter suppression を変更 ✅
+
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` の Descriptor arm は、
+fresh detached bundle を作る前の mounted main projection 上で rating / facet suppression を
+立てていた。★付き ZIP / PDF を別窓へ開くと main の
+`rating_filter_suppressed_at`、facet filter、suppression stack が変わる実到達バグだった。
+
+2026-08-27 修正。Descriptor helper から抑制を外し、detached start 不成立後に main navigation を
+採用する2 caller の既存抑制だけを正本にした。FolderCandidate も分類後の main fallback だけが
+抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
+ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
+
+#### 同経路の別件 — reading-history return owner を detached destination と照合する (未対応)
+
+2つの UI caller は detached helper より前に `note_reading_history_open(idx)` を呼ぶ。
+この関数が変更する `reading_history_return_from` は `ViewerContextBundle` 所有なので、
+detached build が fresh bundle へ交換する前の main に変更が残り、detached 側は `None` から
+始まる。閲覧履歴から別窓で本を開いた場合の戻り先仕様と、通常一覧から別窓を開いた際に main の
+既存予約を消すべきかを、両 caller / close / Backspace lifecycle で棚卸しして owner 境界を決める。
+今回の filter suppression 修正には含めない (§2 規則7)。優先度 P2、規模 Small〜Medium。
+
+#### §1.126 / §1.127 — 添字空間の追従 ✅
+
+`SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、
+`items` / `thumbnails` と同じ `mem::replace` の並びへ入れた。Details は専用の
+invalidate / rebuild 境界を作り、**color filter OFF でも**最終 `visible_indices` から order を
+再構築する (ON だと後段の `rebuild_visible_indices` が偶然直していた)。実機確認済み。
+
+#### P2-4 — `cancel_all_context_work` へ集約 ✅
+
+既存 8 件 + 新規 4 件 (`fs_pending` / `details_meta_pending` / `comic_bake_pending` /
+`erase_inpaint_pending`) を 1 つの関数へ。`Drop` がそれだけを呼ぶので、
+`close_fullscreen` を経ない bulk retire 経路も**構造的に**カバーされる。
+
+**重大度は P1 と別物** — こちらは一発型 worker で自然終了し、**蓄積しない**。
+コストは孤児化したジョブ 1 件分の CPU / GPU / AI 時間 (最悪で MI-GAN 完走)。
+この区別を曖昧にすると watchdog 等の過剰な機構を呼び込むので明記する。
+
+✅ `facet_name_cache_pending` は有限 worker を持つが cancel ハンドルが無く、
+**あえて新設しない**判断 (得られるのは有限ジョブ 1 本の末尾だけで、
+代わりに worker 側へ新しい監視点が増える)。
+`pdf_enumerate_pending` は `PdfEnumerateHandle::Drop` が既に自己処理していた。
+
+#### 検収で使った手法
+
+全 12 件の mutation (各 cancel / 各 guard を 1 つずつ壊し、名指しされたテストが
+落ちるか確認) を実施。すべて期待どおり落ちた。
+
+⚠ 検収側の事故 2 件 (記録): ① フィールド名を変える mutation は参照側が
+全壊れてコンパイル不能になり不定になる (→ `swap_field!` の 1 行だけ消す形へ)。
+② 置換先を空文字列にすると逆変換が全箇所にマッチして**復元できず、
+Codex の修正の半分が消えたままになった** (→ マーカーを残す形へ、
+かつ `git diff --numstat` を Codex 申告値と突き合わせる)。
+
+- 規模 \\ 優先度: — (完了)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
@@ -3327,7 +3555,7 @@ emote-web-log.jsonl`):
   [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
 
-### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305
+### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305 ✅ 実装済み (2026-08-26、実機確認済み)
 
 - 出典: 専用スレ >>305 (2026-08-26)。グリッドへ貼り付けたファイルが現在のソート順で
   離れた位置へ入ると、どれが追加されたものか分からなくなるため、エクスプローラーと同様に
@@ -3365,6 +3593,53 @@ emote-web-log.jsonl`):
 - 関連: [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
   §7〜§8、`src/ui_dialogs/new_folder.rs`、`App::try_select_after_load`。
 - 規模 / 優先度: 新しいフォルダー側は Small、貼り付け完了結果の取得を含めると Medium / P2。
+
+#### 実装 (2026-08-26)
+
+正本は [post_operation_selection.rs](../src/post_operation_selection.rs) の module doc。
+
+- **新しいフォルダーでカーソルが移らなかった原因**: `reload_current_folder_preserving_override`
+  が `select_after_load` を**無条件で現在の選択に上書き**していた。作成側は先に名前を
+  置いてから再読込を頼むので、使われる前に潰されていた。**名前変更も同じ経路で同じように
+  壊れていた** (報告は無かった)。`preserve_cursor_hint_for_reload` が「既にヒントがあれば
+  触らない」を持つ 1 か所になった。
+- **貼り付けの出力パス**: Shell の背景 `paste` verb に委ねているので mIV は何が作られたか
+  知らない。クリップボードの元名から推測すると、**まさに拾いたい衝突時の改名を取り逃がす**。
+  操作の**直前**に一覧にあったパスを控え、差分を追加項目とみなす方式にした。
+- **型付き要求 1 つ**にまとめた (`select_after_load` へ bool や複数名を足さない):
+
+  | 持ち物 | 効く完了条件 |
+  | --- | --- |
+  | 適用先フォルダ | 3 (操作完了前に別フォルダへ移っても、その一覧を汚さない) |
+  | `ExpectedOutputs::{Known, AddedSince}` | 2 (mIV が作った物と Shell が作った物を同じ扱いにする) |
+  | 表示中の項目だけを渡す入口 | 4 (フィルタを変えず、隠れている出力は待つだけ) |
+  | 前回適用した集合 | 大きい貼り付けで届くたびに選び足し、増えなくなったら手を引く |
+
+  判断は `post_operation_selection::decide` の純関数で、状態遷移をテストで固定した。
+- **選択規則**: 1 件はチェックを付けずカーソルだけ。複数件は全部チェックして表示順の
+  先頭へカーソルと Shift 起点。表示形式・選択方式では変えない。
+- **自動再読込との調停**: `check_external_folder_changes` は要求が生きている間、自前の
+  「元の選択へ戻す」を止める (貼り付けの完了を拾うのはこの再読込なので、放っておくと
+  打ち消し合う)。
+
+#### 残っている穴
+
+**貼り付け中に外部アプリが同じフォルダへ足したファイルと区別できない。**差分方式の
+原理的な限界。消すには貼り付け自体を `IFileOperation` + `IFileOperationProgressSink` へ
+移して実出力を受け取るしかなく、それは
+[shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
+§7 の残作業 (drop-to-folder の PowerShell 置き換え) と同じ移行になる。
+
+**絞り込みで貼り付け結果が 1 件も見えない場合、何も起きない。**実機確認 (2026-08-26) で
+「分かりやすくはないが、一旦この動きで良い」と判断。案内を出すなら「貼り付けたファイルが
+絞り込みで隠れています」のようなトーストになる。
+
+#### 実機確認 (2026-08-26)
+
+新しいフォルダー / 名前変更 / 1 件貼り付け / 複数件貼り付け / 切り取り貼り付け /
+操作直後の別フォルダ移動 / 絞り込み中、すべて期待どおり。名前衝突は利用者の環境の OS
+ダイアログに「両方保持」が無く (無視 / スキップのみ) 未確認。改名経路自体は
+`AddedSince` の差分で拾うので、選択規則としては同じ扱いになる。
 
 ## 3. 補正 / AI
 
