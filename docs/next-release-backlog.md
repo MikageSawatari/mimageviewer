@@ -2884,8 +2884,9 @@ fresh detached bundle を作る前の mounted main projection 上で rating / fa
 `rating_filter_suppressed_at`、facet filter、suppression stack が変わる実到達バグだった。
 
 2026-08-27 修正。Descriptor helper から抑制を外し、detached start 不成立後に main navigation を
-採用する2 caller の既存抑制だけを正本にした。FolderCandidate も分類後の main fallback だけが
-抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
+採用する通常到達3入口 (Enter / double-click / gamepad accept) と、明示 container mode の
+static site 1箇所の計4箇所にある既存抑制だけを正本にした。FolderCandidate も分類後の main
+fallback だけが抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
 ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
 
 #### follow-up — reading-history owner と convertible 非遷移 lifecycle ✅
@@ -2903,6 +2904,29 @@ dialog cancel は intent を捨てるだけで main items と4状態を変えな
 ではない。同 commit より前から `note_reading_history_open` は入口先頭にあり、d7645901 は呼出しを
 convertible arm 内へ移したものの Ignore 判定より前という誤った側を維持し、両 suppression も元から
 同じ側にあった。
+
+#### final P2 — ★固定中の変換 cache alias と拒否前 mutation ✅
+
+2026-08-27 修正。★固定 snapshot の member は source `book.7z` だが、cache hit と非同期変換完了は
+実体の cache ZIP を `load_folder_with_scan_claimed` へ渡すため、実 path だけを見ていた snapshot guard が
+正当な open を範囲外として拒否していた。`OpenRequestOwner::MainGridArchive` の
+`MainGridArchiveTransitionIntent::source_path` を snapshot scope identity とし、既存の
+`snapshot_owner_entry` (完全一致 + separator-aware prefix 一致) へ渡す。cache path との OR にはせず、
+source 自体が snapshot member / member container 配下でない要求は従来どおり拒否する。
+
+同 guard は smart-folder session の認可 consume / surface clear、folder-pane cancel、synthetic restore、
+smart scope reconcile、reading-history reservation clear、bookmark return reconcile より後ろにあった。
+これらは guard が読む snapshot / navigation scope / typed owner identity の成立には不要なので、guard を
+`load_folder_with_scan_claimed` の先頭 precondition へ移した。拒否時に残す effect は stale な
+`pending_auto_fs_open` の破棄と feedback toast だけで、main の表示・復元 ownership は変更しない。
+
+実 gamepad producer からの同期 cache hit、同 producerが作った request の `ConvertDone` completion、
+範囲外の common load 拒否を回帰テストにした。前2本は source alias 解決を cache ZIP 判定へ戻す mutation、
+拒否テストは smart session consume / clear または reading-history reconcile を guard より上へ戻す mutation で
+失敗する。拒否テストは smart session の `Option` だけでなく、拒否後も one-shot source 認可を実
+`preserve_smart_folder_session_for_load` 境界で consume できること、main items と snapshot count が同一なことを
+確認する。Folder / ZIP / PDF の3通常入口 + 明示 mode static site が `AddressBarNav::Direct` の common guard
+より前に caller-side effect を commit する既知の同型は、本 defect の funnel 内修正には含めていない。
 
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 

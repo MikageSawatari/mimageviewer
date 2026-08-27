@@ -18376,6 +18376,33 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
+        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
+        // 変換 cache ZIP は source archive の実装 alias なので、typed owner が保持する
+        // source identity に対して同じ完全一致 / prefix owner 解決を行う。source 自体が
+        // snapshot 範囲外なら cache の場所にかかわらず拒否される。
+        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
+        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
+        let snapshot_scope_path = match &owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            _ => &path,
+        };
+        if !detached_physical
+            && self.is_snapshot_active()
+            && !self.snapshot_internal_nav
+            && self.snapshot_owner_entry(snapshot_scope_path).is_none()
+        {
+            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
+            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
+            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
+            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
+            self.pending_auto_fs_open = false;
+            self.show_feedback_toast(
+                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
+                    .into(),
+            );
+            return;
+        }
         // A converted cache ZIP is an implementation alias outside the source archive's smart
         // scope. Keep the resident session mounted here; the typed owner commits the logical
         // source path only after the cache/direct load proves successful.
@@ -18438,28 +18465,6 @@ impl App {
             )
         {
             self.reconcile_bookmark_return_target_for_folder_load(&path);
-        }
-        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
-        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
-        // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
-        // で path 完全一致または prefix 一致を見る。
-        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
-        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
-        if !detached_physical
-            && self.is_snapshot_active()
-            && !self.snapshot_internal_nav
-            && self.snapshot_owner_entry(&path).is_none()
-        {
-            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
-            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
-            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
-            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
-            self.pending_auto_fs_open = false;
-            self.show_feedback_toast(
-                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
-                    .into(),
-            );
-            return;
         }
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。

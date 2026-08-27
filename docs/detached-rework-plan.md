@@ -1394,6 +1394,36 @@ suppression、facet filter と suppression stack、smart-folder position、main 
 後に `AddressBarNav::Direct` の load block が起こり得る同形を持つが、Ignore / convert cancel はなく、
 §2 規則7に従い本修正には含めない。
 
+**2026-08-27 ★固定中の converted cache alias を typed source scope で判定し、拒否を
+common load の effect より前へ移動
+(backlog §1.131 final P2、利用者提示の ClaudeCode 検証と Codex の funnel inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の `load_folder_with_scan_claimed` にある既存
+snapshot scope guard、[src/app/tests.rs](../src/app/tests.rs) の main-grid convertible cache hit /
+`ConvertDone` / out-of-scope common-load 回帰テスト、backlog §1.131 の記録。detached predicate、
+viewport / HWND / placement / focus / epoch、context registry / mount、grid selection / paste /
+new-folder は変更していない。
+
+**不変条件と判断理由**: cache ZIP は source archive の実装 alias であり、snapshot membership は
+利用者が固定した source identity を所有する。`OpenRequestOwner::MainGridArchive` が既に持つ
+`MainGridArchiveTransitionIntent::source_path` だけを `snapshot_owner_entry` の完全一致 / prefix
+owner 解決へ渡し、cache path との OR や App-level flag は追加しない。したがって snapshot 内 source の
+cache hit / async completion は許可され、source 自体が範囲外なら cache の配置にかかわらず拒否される。
+また snapshot guard は navigation scope、snapshot state、既存 forced internal-nav flag、typed source
+identity だけを読み、smart session consume / surface clear、folder-pane cancel、synthetic restore、
+smart scope / reading-history / bookmark reconciliation の結果には依存しない。precondition をこれらの
+effect より前へ移すことで、拒否された load は stale auto-fullscreen reservation の破棄と toast 以外の
+main ownership を変更しない。新しい bool / Option、時間窓、retry / repaint / reset は追加していない。
+
+**回帰証明とスコープ外**: 実 gamepad producer の同期 cache hit、同 producer request の
+`ConvertDone` completion、smart-folder surface と one-shot source 認可を保持した out-of-scope load を
+駆動する。`scope_cache_zip_instead_of_owned_source` mutation は前2本、smart session consume / clear
+または reading-history reconcile を guard より上へ戻す mutation は拒否テストで失敗する。拒否後の
+認可は `preserve_smart_folder_session_for_load` で実際に consume して非空性検査の vacuity を除いた。
+Folder / ZIP / PDF の通常到達3入口と明示 container mode static site が common guard より前に行う
+caller-side effect、および guard を持たない内部 `load_zip_as_folder_with_input_seq` /
+`load_pdf_as_folder` continuation は §2 規則7に従い変更せず、backlog §1.131 に残した。
+
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
 mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**

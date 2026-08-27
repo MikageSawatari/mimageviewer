@@ -56305,6 +56305,54 @@ mod smart_folder_transition_tests {
         zip.finish().unwrap();
     }
 
+    fn record_convertible_archive_cache(
+        app: &mut super::phase_c_support::AppTestEnv,
+        source: &Path,
+        cached: &Path,
+    ) {
+        let source_metadata = std::fs::metadata(source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .expect("archive cache DB")
+            .record(
+                source,
+                crate::ui_helpers::mtime_secs(&source_metadata),
+                source_metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                cached,
+                std::fs::metadata(cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+
+    fn activate_convertible_archive_snapshot(app: &mut App, source: &Path) {
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.snapshot_owner_entry(source), Some(0));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ConvertibleArchive { path, .. }]
+                if crate::folder_tree::path_eq(path, source)
+        ));
+        app.selected = Some(0);
+    }
+
+    fn wait_for_snapshot_archive_listing(app: &mut App, cached: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_zip_enumerate();
+            std::thread::yield_now();
+        }
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == cached && entry_name == "page-001.jpg"
+        ));
+    }
+
     #[test]
     fn ignored_convertible_archive_keeps_main_transition_intent_uncommitted() {
         let mut app = setup_app();
@@ -56462,6 +56510,139 @@ mod smart_folder_transition_tests {
         // Mutation `omit_success_completion_commit`: remove commit_main_grid_archive_transition
         // from the loaded pending_nav branch. The reservation/suppression/smart-scope assertions
         // all fail.
+    }
+
+    #[test]
+    fn snapshot_convertible_archive_cache_hit_uses_owned_source_scope() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("snapshot-cache-hit.zip");
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        activate_convertible_archive_snapshot(&mut app, &source);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.is_snapshot_active());
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
+        // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
+        // listing assertions fail because the common snapshot guard refuses the implementation
+        // alias before load_zip_as_folder can adopt it.
+    }
+
+    #[test]
+    fn snapshot_convertible_archive_async_completion_uses_owned_source_scope() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("snapshot-convert-done.zip");
+        write_convert_completion_zip(&cached);
+        activate_convertible_archive_snapshot(&mut app, &source);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.completion),
+            Some(
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    _
+                )
+            )
+        ));
+
+        publish_convert_done_and_open(&mut app, &cached);
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.is_snapshot_active());
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
+        // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
+        // mounted instead of opening the completed archive.
+    }
+
+    #[test]
+    fn snapshot_out_of_scope_load_is_refused_before_main_state_effects() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+
+        // Preserve a real resident smart-folder session while installing the real SnapshotState,
+        // then put both owners back into the common-load precondition state. This makes the
+        // one-shot authorization observable: a refused load must neither consume it nor discard
+        // its SmartFolder surface.
+        let smart_state = app
+            .top_level_grid_view
+            .smart_folder()
+            .cloned()
+            .expect("smart-folder surface before snapshot");
+        let smart_session = app
+            .top_level_grid_view
+            .take_smart_folder_session()
+            .expect("resident smart-folder session before snapshot");
+        activate_convertible_archive_snapshot(&mut app, &source);
+        app.top_level_grid_view.replace_surface(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(smart_state),
+        );
+        app.top_level_grid_view
+            .install_smart_folder_session(smart_session);
+        assert!(app.authorize_smart_folder_session_open(&source));
+
+        let outside = app.tmp.path().join("outside-snapshot-scope");
+        std::fs::create_dir_all(&outside).unwrap();
+        let reserved_history = app.tmp.path().join("still-reserved-history.zip");
+        app.reading_history_return_from = Some(reserved_history.clone());
+        app.suppress_nav_record_for_search_restore = true;
+
+        let folder_before = app.current_folder.clone();
+        let surface_before = app.top_level_grid_view.surface().clone();
+        let smart_id_before = app.current_smart_folder_id;
+        let items_before = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
+        let snapshot_count_before = app.snapshot_count();
+        assert_eq!(app.snapshot_owner_entry(&outside), None);
+
+        app.load_folder(outside);
+
+        assert_eq!(app.current_folder, folder_before);
+        assert_eq!(app.reading_history_return_from, Some(reserved_history));
+        assert!(app.suppress_nav_record_for_search_restore);
+        assert_eq!(app.top_level_grid_view.surface(), &surface_before);
+        assert_eq!(app.current_smart_folder_id, smart_id_before);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            items_before
+        );
+        assert_eq!(app.snapshot_count(), snapshot_count_before);
+
+        // Prove the authorization assertion is not a field-presence check: after temporarily
+        // removing only the snapshot precondition, the exact previously authorized source is
+        // still consumable by the real session boundary.
+        let snapshot = app
+            .snapshot
+            .take()
+            .expect("snapshot remains active after refusal");
+        assert!(app.preserve_smart_folder_session_for_load(&source));
+        app.snapshot = Some(snapshot);
+        // Mutation `smart_session_effect_before_snapshot_guard`: move
+        // preserve_smart_folder_session_for_load/clear_smart_folder_view_state back above the
+        // guard. It consumes/drops the authorization and surface, so the surface/session and
+        // behavioral authorization assertions fail. Moving the reading-history reconciliation
+        // back above the guard independently fails the reservation assertion.
     }
 
     fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
