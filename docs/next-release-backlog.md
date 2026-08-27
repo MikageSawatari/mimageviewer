@@ -3392,10 +3392,21 @@ presenter window を作り、`placement switched ... total=139.0ms` で完了す
 
 同じログ (約 115 秒の 1 セッション) でのウィンドウ生成回数:
 
-| | 個数 |
+| 契機 | ホスト生成 |
 | --- | --- |
-| detached ホスト viewport | **13** (`host_generation` 1〜13、すべて別 hwnd) |
-| native-video window | **15** (`detached-viewer-child` 9 + `fullscreen-borderless` 6) |
+| 起動時の動画フルスクリーン | gen=1 |
+| **F12 を 12 回 = 6 往復** | gen=2〜7 (**1 往復につき 1 個**) |
+| その後の別のフルスクリーン操作 (F12 ではない) | gen=8〜13 |
+
+native-video window は 15 (`detached-viewer-child` 9 + `fullscreen-borderless` 6)。
+
+**回数が多いのではない** —— F12 1 往復につきホスト 1 個で、無意味な繰り返しは無い。
+問題は **F12 OFF でウィンドウを捨てている**こと。そのため 1 往復でタスクバーボタンが
+「消える」「現れる」の 2 回変化し、6 往復で 12 回の変化になる。隠して再利用すれば 0 回。
+
+> 調査中に `open_fullscreen` が 155ms で 4 回出ているのを一度異常と見たが、**誤り**。
+> `idx=1 → 3 → 5 → 7` で `input_seq` も 17→20 と進んでおり、PDF の見開きページ送り。
+> ウィンドウは作られていない (この間のホストは gen=9 の 1 個だけ)。
 
 detached ホストの builder は `.with_taskbar(true)` ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。
 つまり **F12 のたびにトップレベルウィンドウを破棄して作り直しており、タスクバーボタンが
