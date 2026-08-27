@@ -466,6 +466,7 @@ impl Painter {
             Ok(()) => PaintOutcome::AppliedWithoutPaint,
             Err(outcome) => outcome,
         };
+        probe_atlas_delivery("no_paint", textures_delta, outcome);
         finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
     }
 
@@ -686,6 +687,7 @@ impl Painter {
             }
         };
 
+        probe_atlas_delivery("paint", textures_delta, outcome);
         finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
         vsync_sec
     }
@@ -716,6 +718,37 @@ impl Painter {
     pub fn destroy(&mut self) {
         // TODO(emilk): something here?
     }
+}
+
+/// mIV probe: report every font-atlas delta and the outcome it was delivered under, so the
+/// A/B measurement for the detached-close flicker can show whether an upload really does
+/// survive a surface-less frame. `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES` in src/app.rs exists
+/// because it once did not. Temporary -- remove with the measurement.
+fn probe_atlas_delivery(
+    site: &str,
+    textures_delta: &epaint::textures::TexturesDelta,
+    outcome: PaintOutcome,
+) {
+    let atlas: Vec<String> = textures_delta
+        .set
+        .iter()
+        .filter(|(id, _)| *id == epaint::TextureId::default())
+        .map(|(_, delta)| {
+            format!(
+                "{}x{}{}",
+                delta.image.width(),
+                delta.image.height(),
+                if delta.pos.is_none() { "full" } else { "partial" }
+            )
+        })
+        .collect();
+    if atlas.is_empty() {
+        return;
+    }
+    crate::atlas_diag::log_line(format!(
+        "[atlas-probe] site={site} outcome={outcome:?} deltas=[{}]",
+        atlas.join(",")
+    ));
 }
 
 fn begin_delivery(
