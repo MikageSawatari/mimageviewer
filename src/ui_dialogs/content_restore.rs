@@ -156,7 +156,14 @@ pub fn render_content_restore_modal(
         .default_height(default_height)
         .min_width(420.0)
         .min_height(240.0)
+        .max_size(screen.size())
+        .constrain_to(screen)
         .show(ctx, |ui| {
+            // 本文は右端まで使う一覧なので、floating bar の予約幅を確保しないと
+            // バーが行のテキストへ重なる。アプリ共通 style は一覧の表示面積を優先して
+            // 予約幅 0 なので、`favorites_editor` などと同じくここで局所適用する。
+            ui.spacing_mut().scroll =
+                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
             // 上限は残す。中身が要求する幅で伸びるので、長いパスを持つ行があると
             // 利用者が広げていない限りウィンドウをはみ出す。
             ui.set_max_width(ui.available_width());
@@ -210,10 +217,14 @@ fn render_content_restore_contents_with_list_height(
     ui.checkbox(dont_ask_again, "次から確認しない (環境設定で元に戻せます)");
     ui.add_space(8.0);
     let mut action = None;
+    // 右下は `Window` のリサイズつまみが描かれる場所なので、その分だけ右を空けてから
+    // ボタンを置く。空けないとつまみがボタンに重なり、掴もうとしてボタンを押す。
+    let resize_corner = ui.visuals().resize_corner_size;
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
+            ui.add_space(resize_corner);
             if ui.button("閉じる").clicked() {
                 action = Some(ContentRestoreUiAction::Close);
             }
