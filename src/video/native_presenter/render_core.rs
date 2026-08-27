@@ -2244,12 +2244,18 @@ struct NativeRightPanelVisibilityInputs {
     hover_preview_active: bool,
     tag_picker_open: bool,
     pointer_in_hover_rect: bool,
+    /// 360 度表示中は左右パネルを出さない。見回しドラッグで画面端まで指 / カーソルが
+    /// 動くたびにパネルが開き、操作の邪魔になる (2026-08-27 利用者報告)。
+    panorama_active: bool,
     side_panel_mode: FsSidePanelMode,
     info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
     if input.shortcut_help_open {
+        return false;
+    }
+    if input.panorama_active {
         return false;
     }
     if input.external_drag_in_progress || input.vst3_panel_visible {
@@ -2280,12 +2286,17 @@ struct NativeJumpPanelVisibilityInputs {
     video_speed_popup_open: bool,
     hover_preview_active: bool,
     pointer_in_hover_rect: bool,
+    /// 右パネルと同じ理由で 360 度表示中は出さない。
+    panorama_active: bool,
     side_panel_mode: FsSidePanelMode,
     left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
 }
 
 fn native_jump_panel_visible_from_inputs(input: NativeJumpPanelVisibilityInputs) -> bool {
     if input.shortcut_help_open {
+        return false;
+    }
+    if input.panorama_active {
         return false;
     }
     if input.vst3_panel_visible {
@@ -9002,6 +9013,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             tag_picker_open: self.tag_picker_open,
+            panorama_active: self.panorama_pose.is_some(),
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
             info_panel_open: self.info_panel_open,
@@ -9016,6 +9028,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: self.video_speed_popup_open,
             hover_preview_active: self.hover_preview_target_secs.is_some(),
             pointer_in_hover_rect: self.jump_panel_hover_latched,
+            panorama_active: self.panorama_pose.is_some(),
             side_panel_mode: self.side_panel_mode,
             left_panel_open: self.left_panel_open,
         })
@@ -9056,7 +9069,8 @@ impl NativeEguiOverlay {
 
     /// ClickToShow の最端 hover で表示する左右 callout。panel 本体の modal gate と揃える。
     fn side_panel_callout_visibility(&self) -> (bool, bool) {
-        if self.side_panel_mode.normalized() != FsSidePanelMode::ClickToShow
+        if self.panorama_pose.is_some()
+            || self.side_panel_mode.normalized() != FsSidePanelMode::ClickToShow
             || self.external_drag_in_progress
             || self.shortcut_help_open
             || self.vst3_panel_visible()
@@ -13606,6 +13620,78 @@ mod tests {
         }
     }
 
+    /// 360 度表示中は左右パネルを出さない。見回しドラッグでカーソル / 指が画面端まで
+    /// 動くたびにパネルが開き、操作の邪魔になる (2026-08-27 利用者報告)。
+    /// ホバーで開く条件が揃っていても、360 が優先して閉じたままにする。
+    #[test]
+    fn panorama_keeps_both_side_panels_closed_even_while_hovering_the_edges() {
+        let right_hovering = NativeRightPanelVisibilityInputs {
+            shortcut_help_open: false,
+            external_drag_in_progress: false,
+            vst3_panel_visible: false,
+            metadata_available: true,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            tag_picker_open: false,
+            pointer_in_hover_rect: true,
+            panorama_active: false,
+            side_panel_mode: FsSidePanelMode::Hover,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+        };
+        assert!(
+            native_right_panel_visible_from_inputs(right_hovering),
+            "hovering the right edge opens the panel while the sphere is off"
+        );
+        assert!(
+            !native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
+                panorama_active: true,
+                ..right_hovering
+            }),
+            "a look-around drag must not pull the right panel out"
+        );
+        // タグピッカーが開いていても 360 が勝つ (ピッカーは通常 hover 条件を迂回する)。
+        assert!(
+            !native_right_panel_visible_from_inputs(NativeRightPanelVisibilityInputs {
+                panorama_active: true,
+                tag_picker_open: true,
+                ..right_hovering
+            }),
+            "360 must win over the tag picker's own bypass"
+        );
+
+        let jump_hovering = NativeJumpPanelVisibilityInputs {
+            shortcut_help_open: false,
+            vst3_panel_visible: false,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            pointer_in_hover_rect: true,
+            panorama_active: false,
+            side_panel_mode: FsSidePanelMode::Hover,
+            left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+        };
+        assert!(
+            native_jump_panel_visible_from_inputs(jump_hovering),
+            "hovering the left edge opens the panel while the sphere is off"
+        );
+        assert!(
+            !native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
+                panorama_active: true,
+                ..jump_hovering
+            }),
+            "a look-around drag must not pull the left panel out"
+        );
+        // 明示的に開いた状態で 360 に入っても閉じたままにする。
+        assert!(
+            !native_jump_panel_visible_from_inputs(NativeJumpPanelVisibilityInputs {
+                panorama_active: true,
+                pointer_in_hover_rect: false,
+                left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                ..jump_hovering
+            }),
+            "an explicitly opened panel must also stay closed under 360"
+        );
+    }
+
     #[test]
     fn shortcut_help_modal_suppresses_native_edge_panels() {
         let right_base = NativeRightPanelVisibilityInputs {
@@ -13617,6 +13703,7 @@ mod tests {
             hover_preview_active: false,
             tag_picker_open: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13624,6 +13711,7 @@ mod tests {
         assert!(!native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 ..right_base
             }
@@ -13631,6 +13719,7 @@ mod tests {
         assert!(native_right_panel_visible_from_inputs(
             NativeRightPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
                 ..right_base
             }
@@ -13645,6 +13734,7 @@ mod tests {
             NativeRightPanelVisibilityInputs {
                 tag_picker_open: true,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13653,6 +13743,7 @@ mod tests {
                 shortcut_help_open: true,
                 tag_picker_open: true,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13663,6 +13754,7 @@ mod tests {
             video_speed_popup_open: false,
             hover_preview_active: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13670,12 +13762,14 @@ mod tests {
         assert!(!native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..jump_base
             }
         ));
         assert!(native_jump_panel_visible_from_inputs(
             NativeJumpPanelVisibilityInputs {
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle,
                 ..jump_base
             }
@@ -13699,6 +13793,7 @@ mod tests {
             hover_preview_active: false,
             tag_picker_open: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::ClickToShow,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13707,6 +13802,7 @@ mod tests {
             NativeRightPanelVisibilityInputs {
                 info_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..right_base
             }
         ));
@@ -13724,6 +13820,7 @@ mod tests {
             video_speed_popup_open: false,
             hover_preview_active: false,
             pointer_in_hover_rect: true,
+            panorama_active: false,
             side_panel_mode: FsSidePanelMode::ClickToShow,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
         };
@@ -13732,6 +13829,7 @@ mod tests {
             NativeJumpPanelVisibilityInputs {
                 left_panel_open: crate::ui_helpers::MetadataPanelOpenState::ByPointer,
                 pointer_in_hover_rect: false,
+                panorama_active: false,
                 ..jump_base
             }
         ));
