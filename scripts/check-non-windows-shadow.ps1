@@ -122,8 +122,38 @@ function Rewrite-CargoCfgFile {
 }
 
 Assert-UnderDirectory -Path $shadowRoot -Parent $targetRoot
-if ([System.IO.Directory]::Exists($shadowRoot)) {
-    [System.IO.Directory]::Delete($shadowRoot, $true)
+function Remove-ShadowTree {
+    # A plain Directory::Delete throws on a read-only file, and anything copied out of a
+    # git object store is read-only. Clear the attribute first so the tree can go.
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    if (-not [System.IO.Directory]::Exists($Path)) {
+        return $true
+    }
+    Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.IsReadOnly } |
+        ForEach-Object {
+            try {
+                $_.IsReadOnly = $false
+            } catch {
+                # Report it through the delete below rather than here; one unreadable
+                # file should not hide the rest.
+            }
+        }
+    try {
+        [System.IO.Directory]::Delete($Path, $true)
+        return $true
+    } catch {
+        Write-Warning "[non-windows-shadow] could not remove $Path : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+if (-not (Remove-ShadowTree -Path $shadowRoot)) {
+    # A stale tree would be checked instead of the current source, so this one is fatal.
+    throw "could not clear the previous shadow at $shadowRoot"
 }
 [System.IO.Directory]::CreateDirectory($targetRoot) | Out-Null
 
@@ -138,6 +168,10 @@ $robocopyArgs = @(
     "/NJS",
     "/NP",
     "/XD",
+    # A bare name excludes at any depth. The full path below only covers this
+    # repository's own .git; nested checkouts such as testdata/retro-images/pymag-ref
+    # carry their own, whose pack files are read-only and later refuse deletion.
+    ".git",
     (Join-Path $repoRoot ".git"),
     (Join-Path $repoRoot "target")
 )
@@ -202,7 +236,9 @@ finally {
     $env:CARGO_TARGET_DIR = $previousCargoTargetDir
     $env:CARGO_BUILD_JOBS = $previousCargoBuildJobs
     if ($checkPassed -and -not $KeepShadow) {
-        [System.IO.Directory]::Delete($shadowRoot, $true)
+        # The verdict is about the compile. If the temp tree survives, say so and leave
+        # the exit code alone -- a leftover directory is not a failed check.
+        [void] (Remove-ShadowTree -Path $shadowRoot)
     }
 }
 
