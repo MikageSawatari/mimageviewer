@@ -1,6 +1,40 @@
 use super::ViewerPresentation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedHostDisposition {
+    None,
+    KeepLive { hwnd: u64 },
+    RetireOutgoing { hwnd: u64 },
+}
+
+impl DetachedHostDisposition {
+    fn for_transition(
+        current: ViewerPresentation,
+        target: ViewerPresentation,
+        current_host_hwnd: u64,
+    ) -> Self {
+        match (current, target) {
+            (ViewerPresentation::DetachedWindow, ViewerPresentation::DetachedWindow) => {
+                Self::KeepLive {
+                    hwnd: current_host_hwnd,
+                }
+            }
+            (ViewerPresentation::DetachedWindow, _) => Self::RetireOutgoing {
+                hwnd: current_host_hwnd,
+            },
+            _ => Self::None,
+        }
+    }
+
+    fn current_hwnd(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::KeepLive { hwnd } | Self::RetireOutgoing { hwnd } => hwnd,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PresentationRequest {
     pub(crate) id: u64,
     pub(crate) current: ViewerPresentation,
@@ -8,7 +42,7 @@ pub(crate) struct PresentationRequest {
     pub(crate) activate: bool,
     pub(crate) announce_main_hint: bool,
     pub(crate) outgoing_presenter_hwnd: u64,
-    pub(crate) outgoing_host_hwnd: u64,
+    pub(crate) detached_host: DetachedHostDisposition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,21 +275,26 @@ impl PresentationTransitionOwner {
         activate: bool,
         announce_main_hint: bool,
         outgoing_presenter_hwnd: u64,
-        outgoing_host_hwnd: u64,
+        current_detached_host_hwnd: u64,
         ready_host_hwnd: u64,
     ) -> u64 {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let id = self.next_request_id;
+        let current = self.current();
         let (state, effects) = reduce_presentation_request(
             self.state,
             PresentationRequest {
                 id,
-                current: self.current(),
+                current,
                 target,
                 activate,
                 announce_main_hint,
                 outgoing_presenter_hwnd,
-                outgoing_host_hwnd,
+                detached_host: DetachedHostDisposition::for_transition(
+                    current,
+                    target,
+                    current_detached_host_hwnd,
+                ),
             },
             ready_host_hwnd,
         );
@@ -576,14 +615,14 @@ fn reduce_completion_transition(
                 candidate_generation,
             },
         ) if request.id == request_id && candidate.native_generation == candidate_generation => {
-            if request.current == ViewerPresentation::DetachedWindow {
+            if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
                 effects.push(PresentationTransitionEffect::CloseDetachedSession {
                     request_id: request.id,
                 });
                 effects.push(PresentationTransitionEffect::DestroyHost {
                     request_id: request.id,
                     target: request.target,
-                    hwnd: request.outgoing_host_hwnd,
+                    hwnd,
                 });
             }
             effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
@@ -617,14 +656,14 @@ fn finish_or_retire(
             effects,
         )
     } else {
-        if request.current == ViewerPresentation::DetachedWindow {
+        if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
             effects.push(PresentationTransitionEffect::CloseDetachedSession {
                 request_id: request.id,
             });
             effects.push(PresentationTransitionEffect::DestroyHost {
                 request_id: request.id,
                 target: request.target,
-                hwnd: request.outgoing_host_hwnd,
+                hwnd,
             });
         }
         effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
@@ -737,7 +776,7 @@ fn terminal_close(
     );
     let target = request.map_or(current, |request| request.target);
     let detached_host_hwnd = if current == ViewerPresentation::DetachedWindow {
-        request.map_or(0, |request| request.outgoing_host_hwnd)
+        request.map_or(0, |request| request.detached_host.current_hwnd())
     } else {
         transition_host_hwnd(state)
     };
@@ -949,6 +988,54 @@ mod tests {
             }
         );
         // Killing mutation: change current == DetachedWindow to target == DetachedWindow on retire.
+    }
+
+    #[test]
+    fn same_presentation_detached_transition_does_not_retire_the_live_host() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let request_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            OUTGOING_HOST,
+        );
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, request_id, OUTGOING_HOST);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::RetireOutgoing { .. }
+            ))
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::CloseDetachedSession { .. }
+                | PresentationTransitionEffect::DestroyHost { .. }
+        )));
+
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::CloseDetachedSession { .. }
+                | PresentationTransitionEffect::DestroyHost { .. }
+        )));
+        assert_eq!(
+            owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::DetachedWindow
+            }
+        );
+        // Killing mutation: classify DetachedWindow -> DetachedWindow as RetireOutgoing (or
+        // restore the old `request.current == DetachedWindow` completion check); the live host
+        // produces CloseDetachedSession + DestroyHost after native retire.
     }
 
     #[test]

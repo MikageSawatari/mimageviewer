@@ -2325,6 +2325,9 @@ always-new 窓と同じく no-op として扱う。
 - F12 の detached mode 切替や main 側同期による host migration は、
   `switch_native_video_viewer_presentation` が `request_id` 付きの
   `NativeVideoOutputCommand::SwitchPlacement` を render orchestration へ送る。
+- transition request は detached host を `None / KeepLive / RetireOutgoing` として所有する。
+  成功時に egui host を退役できるのは DetachedWindow から MainWindow / Fullscreen へ離れる
+  遷移だけで、同じ DetachedWindow に留まる presenter 再構築 / host resync は live host を閉じない。
 - `detached_viewer_open_images_in_window` ON 中の動画 / 音声 F12 は、現在のメディアだけを
   MainWindow / Fullscreen と DetachedWindow の間で一時移動する。次に動画 / 音声を明示 open した場合は、
   永続設定に従って再び DetachedWindow へ戻る。
@@ -2345,6 +2348,8 @@ always-new 窓と同じく no-op として扱う。
   `request_id` が pending と一致 (または presenter が pending target へ収束) した
   ときだけ `apply_video_presentation_switched` で更新する (= 旧 child HWND を
   fullscreen / VST owner と誤認しない。stale/mismatch な成功通知で新状態を巻き戻さない)。
+  DetachedWindow commit は current viewer context の window binding を先に公開し、その後に
+  `active_detached_session` を開始する。session が名指す unbound window は正当な中間状態ではない。
 - 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
   VST owner 同期 / VST availability を全停止する。
 - **close の世代タグ化 (旧 HWND teardown 由来の stale close 対策)**: window を

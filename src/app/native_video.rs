@@ -1331,7 +1331,8 @@ impl App {
             }
             _ => (0, 0),
         };
-        let outgoing_host_hwnd = (self.viewer_presentation == ViewerPresentation::DetachedWindow)
+        let current_detached_host_hwnd = (self.viewer_presentation
+            == ViewerPresentation::DetachedWindow)
             .then(|| self.detached_viewer_host_hwnd_raw())
             .unwrap_or(0);
         let ready_host_hwnd = (target_presentation == ViewerPresentation::DetachedWindow
@@ -1343,11 +1344,11 @@ impl App {
             activate_on_show,
             false,
             outgoing_presenter_hwnd,
-            outgoing_host_hwnd,
+            current_detached_host_hwnd,
             ready_host_hwnd,
         );
         let probe_host = if target_presentation == ViewerPresentation::DetachedWindow {
-            ready_host_hwnd.max(outgoing_host_hwnd)
+            ready_host_hwnd.max(current_detached_host_hwnd)
         } else {
             0
         };
@@ -3601,6 +3602,7 @@ impl App {
         self.viewer_presentation = presentation;
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
+            self.ensure_mounted_detached_session_binding(id);
             self.begin_active_detached_session(id, super::DetachedSource::Video);
         }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)

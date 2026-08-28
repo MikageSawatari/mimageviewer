@@ -35283,7 +35283,7 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
-    fn detached_video_presentation_preserves_non_detached_window_preference() {
+    fn apply_video_presentation_switched_binds_before_naming_detached_session() {
         let mut app = setup_app();
         let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
         app.fullscreen_idx = Some(idx);
@@ -35294,6 +35294,14 @@ mod native_video_rating_key_tests {
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
 
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        let session = app
+            .active_detached_session
+            .expect("detached presentation commit must publish an active session");
+        assert_eq!(
+            app.locate_window_context(session.window_id),
+            Some((app.projected_viewer_context_id(), ContextResidence::Mounted)),
+            "the session must never name an unbound detached window"
+        );
         assert!(
             !app.native_video_in_window_active,
             "detached is not a main-window child presentation"
@@ -35312,6 +35320,9 @@ mod native_video_rating_key_tests {
             !app.settings.video_in_window_mode,
             "real F11 transition to Fullscreen should still persist"
         );
+        // Killing mutation: remove ensure_mounted_detached_session_binding from
+        // apply_video_presentation_switched; the session remains set but the binding assertion
+        // above observes None.
     }
 
     /// 切替中に届いた2回目の F12 は捨てず、進行中候補を中止して元の表示先へ戻す要求にする。

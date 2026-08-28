@@ -1123,33 +1123,31 @@ KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の�
 
 ### R2e active detached session / binding lifetime follow-up (backlog §1.138、2026-08-28)
 
-F12 の detached→fullscreen 後、`active_detached_session` が window ID を保持したまま
-viewer-context registry の binding だけが消え、次の keep-alive backstop で panic した。
-§9.8 の transition owner を含まない build C でも同じ frame / message で再現しており、
-transition owner の退行ではない。同 owner の terminal effect は
-`CloseDetachedSession → DestroyHost` の正しい順を維持している。
+最初の診断は「session が window ID を保持したまま registry binding が先に消えた」だったが、
+次の実機 run の追加計装が方向を反証した。通常 open (`src/app.rs`) の session set は
+`ViewerContextId(0)/Mounted` を伴う一方、`apply_video_presentation_switched`
+(`src/app/native_video.rs`) の set は同じ window でも `binding=none` だった。その間に unbind は無い。
+backstop が見つけたのは早期 release ではなく、**最初から binding の無い window を名指す session**
+である。
 
-所有者は R2e の retire / window binding transaction。修正前に到達できた順序は次の 4 クラス。
+active session は backstop が registry owner を mount して描く公開済み所有権なので、unbound session
+は正当な中間状態ではない。通常 open に既にあった `bind_window(mounted, id)` を共通 helper へ集約し、
+native placement commit と egui F12 も session begin の前に通す。Building binding は I8 により
+commit 前非公開なので、detached book build の session begin は closure 内から commit 後・repaint
+前へ移した。production の session begin 境界も Mounted / AtRest binding の存在を要求する。
+backstop の共通 `with_window_viewer_context` mount 契約と観測計装は弱めず残す。
 
-1. active context terminal retire: `retire_context` の unbind → 呼び出し側の session finish。
-2. active viewport finalize / at-rest close: session finish → 後続 `retire_context` の unbind。
-3. mounted-main terminal close: session take → 同じ helper 内の unbind。
-4. active→passive と always-new rebind: 旧 window の unbind → session handoff / 新 session begin。
-   passive-only bulk retire は active session 無しで unbind する。
+前回の修正で入れた `App::unbind_window` assertion、`retire_context` 内の matching session finish、
+active→passive / always-new の handoff-before-unbind は、観測された 1.138 の原因ではなかった。
+ただし binding 確立後の反対向きの lifetime 違反 (session を残した release) を owner 境界で拒否する
+補完的不変条件であり、撤去しない。対応テストも実再現の証明ではなく retire / release ownership
+hardening として残す。
 
-`App::unbind_window` を lifetime assertion の choke point とし、active session が同じ window を
-指したままの release を拒否する。`retire_context` は一致する session / runtime を同じ retire
-transaction 内で先に finish し、active→passive と always-new は handoff を unbind より前へ
-並べ替えた。backstop の `None` と residence 別 panic は撤去し、registry の共通
-`with_window_viewer_context` mount だけを使う。これは silent return ではなく、違反の検出場所を
-renderer から原因 owner へ移したもの。
-
-旧 backstop (`bf391e6a` より前) は active holder が `None` の場合に「owner が既に App へ mounted」
-なのか「owner が消えた」のか区別できず、後者でも main projection を描いて黙っていた。
-`bf391e6a` の registry 化で identity / residence を区別し assertion を置いたため、以前から
-到達可能だった lifetime gap が明示的な crash になった。`Some((owner, residence))` の兄弟 panic は、
-`Building` binding が commit 前に非公開、`Retired/Unknown` が binding map に残れず、`Retiring` も
-UI-thread の同期 retire 内だけで session を先に finish するため、backstop からは到達不能。
+同じ run で、§9.8 transition owner が `DetachedWindow → DetachedWindow` host resync に current
+host を outgoing として持たせ、commit 後に live host を destroy する別退行も確定した。これは R2e
+binding defect とは独立である。request の host 意味を `None / KeepLive / RetireOutgoing` に型付けし、
+成功時に host を退役できるのは detached から non-detached へ離れる遷移だけとした。candidate
+abort / failure と terminal close の host cleanup は別 effect のまま維持する。
 
 **残した確認事項の解決 (2026-08-26)**:
 `rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
@@ -1380,7 +1378,9 @@ HUD/VST の raise も同じ遷移に参加している。reducer は**それら�
 
 - `PresentationTransitionOwner` を `ViewerContextBundle` と mounted App projection の同じ
   context-owned field として導入した。状態は `Stable / Preparing / Ready / Committing`、
-  request は current / target / generation / activation intent / outgoing HWND を所有する。
+  request は current / target / generation / activation intent / outgoing presenter と、detached host の
+  typed disposition (`None / KeepLive / RetireOutgoing`) を所有する。同一 presentation の host resync
+  は live host を保持し、detached から離れる遷移だけが outgoing host を退役できる。
   F12、detached host resync、source-swap completion、Esc / window close / player end は同じ
   reducer event/effect 境界へ入る。
 - native host contract は `TargetReady` で publish せず、hidden create + attach + frame prime の
@@ -1418,6 +1418,30 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-28 同一 presentation の host disposition と active session / binding の生成契約
+(backlog §1.138、利用者提示の実機観測を ClaudeCode / Codex 双方が構造修正の根拠として合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の request / reducer、
+[src/app/native_video.rs](../src/app/native_video.rs) の placement request / commit、[src/app.rs](../src/app.rs)
+の detached session producer、[src/app/tests.rs](../src/app/tests.rs) の回帰証明。観測用の
+`[presentation-window]` / `[presentation-transition]` / `[active-detached-session]` 計装、backstop の
+mount 契約、host geometry / placement / focus の方式は変更しない。
+
+**不変条件と所有境界**: 成功時に live detached host を退役できるのは
+`DetachedWindow → MainWindow/Fullscreen` だけで、`DetachedWindow → DetachedWindow` resync は
+presenter を retire しても host を保持する。request がこの差を `None / KeepLive / RetireOutgoing`
+として所有し、reducer は presentation 値から退役を再推測しない。active detached session は
+renderable owner の公開なので、名指す window は begin 前に registry の Mounted / AtRest binding を
+持つ。通常 / native / egui の入口を同じ binding helper へ通し、Building binding は I8 に従って
+commit 後に session を開始する。
+
+**なぜ症状パッチではないか**: close を無視する guard、backstop の `None` tolerance、時間窓、retry、
+追加 repaint は入れていない。誤った host 退役意図を typed request で表現し直し、不正な session を
+producer 境界で生成不能にした。A の同一 presentation host retirement と B の unbound session birth
+は同じ 30µs に現れたが、別 owner / 別 invariant の独立 defect として実装・テストを分離した。
+前回の unbind / retire ordering 修正は今回の実原因ではないが、反対向きの release 違反を防ぐ
+補完的不変条件として維持する。
 
 **2026-08-27 font atlas の viewport lifecycle resync を renderer 配送境界へ集約
 (backlog §1.115 option (d)、ClaudeCode と Codex が構造修正として事前合意):**

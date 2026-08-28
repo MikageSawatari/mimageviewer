@@ -3171,11 +3171,13 @@ impl App {
         window_id: u64,
         source: DetachedSource,
     ) {
-        let mounted = self
-            .mounted_viewer_context_id()
-            .expect("test mounted detached session requires a mounted context");
-        self.bind_window(mounted, window_id)
-            .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
+        if self.locate_window_context(window_id).is_none() {
+            let mounted = self
+                .mounted_viewer_context_id()
+                .expect("test mounted detached session requires a mounted context");
+            self.bind_window(mounted, window_id)
+                .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
+        }
         self.detached_viewer_window_id = Some(window_id);
         self.begin_active_detached_session(window_id, source);
     }

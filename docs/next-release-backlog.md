@@ -3497,45 +3497,52 @@ PANIC at src\ui_fullscreen.rs:13611:21: active detached backstop window 1 has no
 3 回目の F12 (detached → fullscreen) の **204ms 後**。遷移そのものは成功しており
 (`Raise` 0 件、`Publish` が `Visible`/`Focus` より先)、その直後に落ちている。
 
-#### 状態
+#### 観測で訂正した状態 (2026-08-28、次の実機 run)
 
-`render_active_detached_viewport_backstop` は `active_detached_session` から `window_id` を取り
-`locate_window_context(window_id)` を引くが、**`None` が返る** (= registry の `context_of` から
-その window の対応が既に消えている)。つまり
+前節の「session が生きたまま binding が先に消えた」という方向は、追加計装で**反証された**。
+実際の session producer は 2 本あり、通常 open は binding 済み、native placement commit は
+binding 無しで session を新規作成していた。
 
-> **`active_detached_session` が生きているのに、context binding が先に消える窓がある**
+```
+seq=1  set caller=src\\app.rs:43150              window 1 binding=ViewerContextId(0)/Mounted
+seq=3  set caller=src\\app\\native_video.rs:3604 window 1 binding=none
+seq=13 set caller=src\\app\\native_video.rs:3604 window 3 binding=none
+```
 
-これを「起き得ない」として `panic!` で落としているが、実際に起きている。
+seq=3 / 13 の前に unbind は無い。`apply_video_presentation_switched` が
+`ensure_detached_viewer_window_id()` の後、context binding を確立せず
+`begin_active_detached_session(id, Video)` を呼んでいた。backstop はその不正な session を数百 ms
+観測し続け、mount へ到達した frame で初めて `None` を検出した。したがって 1.138 の実原因は
+binding の早期解放ではなく、**binding の無い window を名指す active session の生成**である。
 
-#### 原因と修正 (2026-08-28)
+同じ run は別の独立した transition owner 退行も確定した。detached host resync の
+`DetachedWindow → DetachedWindow` 遷移が current host を outgoing host として request に保存し、
+native retire 完了後にその live host へ `DestroyHost` を発行していた。F11 は detached 窓の
+borderless 切替だけだが、その後の同一 presentation host resync が窓を閉じ、close request が
+fullscreen / player を終了させた。
 
-**panic を `if let` や early return で黙らせるのは不可**。このアサーションは
-「セッションと binding の寿命が一致する」という不変条件を表しているので、
-**寿命がずれる経路を潰す**のが根治。両方を同じ retire transaction で落とすか、
-backstop が参照する前に `active_detached_session` をクリアする。
+#### 原因と修正 (2026-08-28、観測後の訂正版)
 
-原因は、window binding の除去と `active_detached_session` の解放が別 owner / 別呼び出しに
-分かれていたこと。`retire_context` は context の binding を先に除去し、active context close の
-呼び出し側が戻り後に session を finish していた。静止画の active→passive handoff と
-always-new の旧窓→新窓 rebind にも、同じ binding-first の順序があった。
+active session は backstop が描画 owner を mount できるという公開済み所有権なので、unbound
+window を指す中間状態は正当ではない。通常 open (`prepare_viewer_presentation_open`) が従来から
+行っていた `bind_window(mounted, id)` を共通 helper へ集約し、native commit と egui F12 経路も
+session begin より前に通す。context build の binding は commit 前非公開という I8 を守るため、
+book session begin は build closure 内から commit 後・repaint 前へ移した。production の
+`begin_active_detached_session` も Mounted / AtRest binding が無い開始を所有境界で拒否する。
+backstop の契約と追加計装は弱めず、そのまま残す。
 
-R2e の所有境界で次のように閉じた。
+host 側は request の raw `outgoing_host_hwnd` を、`None / KeepLive / RetireOutgoing` の typed
+disposition に置換した。成功時に live detached host を退役できるのは
+`DetachedWindow → MainWindow/Fullscreen` だけである。`DetachedWindow → DetachedWindow` は
+presenter の再構築 / 再親付けなので host を保持する。detached 候補の abort / failure と terminal
+close による host cleanup は、この成功時退役とは別の lifecycle effect として維持する。
 
-- `unbind_window` は active session がまだ同じ window を指す binding release を、その場で
-  assertion failure にする。renderer の次フレームではなく、違反を作る owner で検出する。
-- `retire_context` は retiring context の window が active session と一致する場合、同じ retire
-  transaction 内で session / runtime を finish してから binding を外す。
-- active→passive handoff と always-new rebind は session handoff を unbind より前へ移した。
-- backstop は `with_window_viewer_context` の共通 mount 契約だけを使い、`None` / 非 mountable
-  residence を個別に assertion しない。panic を silent return へ弱めたのではない。
-
-§1.137 の transition owner は detached→fullscreen で既に
-`CloseDetachedSession → DestroyHost` の順を所有しており、ここは変更していない。build C でも
-再現したとおり、今回の所有者は transition reducer ではなく viewer-context retire / unbind。
-`bf391e6a` より前の backstop は owner holder が無い場合を「既に mounted」と区別できず main の
-App projection をそのまま描いていたため、同じ欠落を落とさず誤った context で黙って描けた。
-タイミングが新しくなった証拠はなく、同コミットの identity / residence 分離で旧 silence が
-assertion として可視化されたもの。
+前回入れた `unbind_window` assertion、`retire_context` 内の session finish、handoff-before-unbind
+は、今回観測された 1.138 の原因修正ではなかった。ただし binding 確立後に反対向きの違反
+(session を残した release) を作らせない補完的不変条件であり、撤去しない。これらのテストは
+「今回の再現原因」ではなく release / retire ownership hardening の回帰証明として位置付け直す。
+A (host disposition) と B (binding-before-session) は同じ commit effect の約 30µs 内に並んだが、
+状態 owner も壊した不変条件も異なる独立 defect である。
 
 - 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
 

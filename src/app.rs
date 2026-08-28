@@ -37183,6 +37183,25 @@ impl App {
     // ── keep-alive session / marker helpers (docs/detached-viewer-keepalive-design.md §3.7) ──
     // session state と marker は必ずこの helper 経由で触る (直接書き換え禁止)。
 
+    /// Bind a detached window before publishing a renderable active session for it.
+    #[cfg(windows)]
+    pub(crate) fn ensure_mounted_detached_session_binding(&mut self, window_id: u64) {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("detached session binding requires a mounted viewer context");
+        match self.locate_window_context(window_id) {
+            Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
+            Some((owner, residence)) => {
+                panic!("detached session window {window_id} belongs to {owner:?} in {residence:?}")
+            }
+            None => self
+                .bind_window(mounted, window_id)
+                .unwrap_or_else(|error| {
+                    panic!("detached session binding failed for {mounted:?}: {error:?}")
+                }),
+        }
+    }
+
     #[cfg(windows)]
     fn record_active_detached_session_write(
         &mut self,
@@ -37273,6 +37292,19 @@ impl App {
     #[cfg(windows)]
     #[track_caller]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        #[cfg(not(test))]
+        {
+            let (owner, residence) = self.locate_window_context(window_id).unwrap_or_else(|| {
+                panic!("cannot begin active detached session for unbound window {window_id}")
+            });
+            assert!(
+                matches!(
+                    residence,
+                    ContextResidence::Mounted | ContextResidence::AtRest
+                ),
+                "cannot begin active detached session for window {window_id} owned by {owner:?} in {residence:?}"
+            );
+        }
         let previous = self.active_detached_session;
         let current_state = self.detached_window_state(window_id);
         let changed = self
@@ -39796,13 +39828,6 @@ impl App {
                     "start_active_detached_book_context",
                 );
                 app.detached_viewer_folder_nav_reuse_window_once = false;
-                // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
-                // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
-                let session_source = match &descriptor {
-                    ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
-                    _ => DetachedSource::Book,
-                };
-                app.begin_active_detached_session(window_id, session_source);
                 // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
                 // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
                 let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
@@ -39865,7 +39890,17 @@ impl App {
 
                 BuildOutcome::Commit
             });
-        if built.is_some() {
+        if let Some(built) = built {
+            // Building bindings are intentionally unpublished. Begin the renderable session only
+            // after commit publishes the reserved binding, still before the requested repaint.
+            let window_id = self
+                .viewer_context_window(built)
+                .expect("committed detached book context must publish its window identity");
+            let session_source = match &descriptor {
+                ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
+                _ => DetachedSource::Book,
+            };
+            self.begin_active_detached_session(window_id, session_source);
             ctx.request_repaint();
             true
         } else {
@@ -43126,28 +43161,25 @@ impl App {
         }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
-            // A build has no Mounted residence and publishes its reserved binding only at commit.
-            // Every ordinary/reuse open binds the current projection here; repeated reuse is
-            // intentionally idempotent.
-            if let Some(mounted) = self.mounted_viewer_context_id() {
-                match self.locate_window_context(id) {
-                    Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
-                    Some((owner, residence)) => {
-                        panic!("detached open window {id} belongs to {owner:?} in {residence:?}")
-                    }
-                    None => self.bind_window(mounted, id).unwrap_or_else(|error| {
-                        panic!("detached open binding failed for {mounted:?}: {error:?}")
-                    }),
-                }
-            }
-            // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
-            // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
-            let source = if self.active_detached_context_is_at_rest() {
-                DetachedSource::Book
+            if self.viewer_context_residence(self.projected_viewer_context_id())
+                == ContextResidence::Building
+            {
+                // I8 keeps the reserved binding private until commit. The build transaction owner
+                // begins this session immediately after publishing that binding.
+                self.log_detached_image_window_debug(format!(
+                    "defer_session_begin_until_build_commit window_id={id}"
+                ));
             } else {
-                self.detached_source_for_idx(idx)
-            };
-            self.begin_active_detached_session(id, source);
+                self.ensure_mounted_detached_session_binding(id);
+                // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
+                // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
+                let source = if self.active_detached_context_is_at_rest() {
+                    DetachedSource::Book
+                } else {
+                    self.detached_source_for_idx(idx)
+                };
+                self.begin_active_detached_session(id, source);
+            }
         } else {
             // 非 detached を開いた (動画 fullscreen / detached 非対応アイテム等) =
             // detached セッションは終了。明示遷移なので session を畳む (§3.7)。
@@ -59745,6 +59777,7 @@ impl App {
 
         if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
+            self.ensure_mounted_detached_session_binding(id);
             self.begin_active_detached_session(id, self.detached_source_for_idx(idx));
             self.update_detached_window_runtime_flags(
                 id,
