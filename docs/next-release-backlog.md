@@ -3589,6 +3589,69 @@ A (host disposition) と B (binding-before-session) は同じ commit effect の�
 
 - 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
 
+### 1.139 タスクバー明滅の原因 = 遷移中のフォアグラウンド往復 (2026-08-28 実測で特定)
+
+**§1.137 の本体。** 計装 (`[presentation-window]`) とキャプチャの突き合わせで確定した。
+
+#### 何が起きているか
+
+fullscreen → detached の遷移中、**新しい presenter を Publish する前の約 300ms**、
+フォアグラウンドが「出ていく presenter」と「入ってくるホスト」の間を **約 100ms 周期で
+3 往復**する。1 周期はこの形:
+
+```
+WM_ACTIVATE    presenter   fg=presenter
+WM_KILLFOCUS   presenter   fg=<host>
+WM_WINDOWPOSCHANGED presenter
+WM_WINDOWPOSCHANGED main
+WM_ACTIVATE    presenter   fg=presenter
+WM_SETFOCUS    presenter
+```
+
+実測 (transition=14、キャプチャ時刻に換算):
+
+```
+26.643 ACTIVATE / 26.661 KILLFOCUS(fg=host) / 26.708 POSCHANGED x2
+26.722 ACTIVATE / 26.725 SETFOCUS / 26.738 ACTIVATE
+26.758 KILLFOCUS(fg=host) / 26.807 POSCHANGED x2
+26.819 ACTIVATE / 26.823 SETFOCUS / 26.841 ACTIVATE
+26.865 KILLFOCUS(fg=host) / 26.899 POSCHANGED x2
+26.928 ACTIVATE / 26.935 SETFOCUS
+27.133 ← ここでようやく新 presenter を Publish
+```
+
+`WM_WINDOWPOSCHANGED` が presenter と main の両方へ飛ぶたびに、Windows の
+「前面が全画面ウィンドウか」の判定が変わり、**タスクバーが 1 フレームごとに出入りする**。
+キャプチャ下端 18px の分類で同区間に 1 フレーム刻みの反転が出るのと一致する。
+
+#### 誰がやっているか
+
+**mIV 自身の `SetForegroundWindow` ではない。** この区間の記録は**すべて `source=wndproc`**
+(= 受信側) で、全 46 秒の実行で mIV が出した `SetFocus` は 3 件のみ。
+**ホストウィンドウの生成・表示そのものがフォアグラウンドを奪い、presenter が取り返す**
+という OS レベルの綱引きである。
+
+#### なぜ遷移所有者では止まらなかったか
+
+reducer の effect (`Raise` 0 件、`Publish` → `Visible` → `Focus` の順序) は設計どおり
+出ている。**往復はその effect が出るより前、ホスト viewport が作られる過程で起きている**。
+所有権を一本化しても、egui/winit がホストを作る際の activation は reducer の外にある。
+
+#### 直す方向 (未着手)
+
+往復の駆動源を特定してから決める。候補:
+
+- ホスト viewport を**非アクティブで生成**し、activation は commit まで持たせない
+  (`with_active(false)` 相当。`ui_fullscreen.rs` の builder は現在 `with_active(true)`)
+- 出ていく presenter 側の activation 取り返しを、遷移中は permit で止める
+  (permit 機構は §9.8 で導入済み。ただし今回の記録では mIV 発の呼び出しが見えないので、
+  取り返しが presenter の wndproc 内部からなのか OS 由来なのかを先に確定する)
+
+**確定していないことを実装しない。** 往復 1 周期の起点がどちらの窓かを、
+`z=` と `fg_role=` の遷移でもう一段追う。
+
+- 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
