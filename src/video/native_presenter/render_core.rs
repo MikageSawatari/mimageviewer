@@ -578,34 +578,6 @@ fn draw_native_seek_strip(
                 crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
                     let wave_rect = local_rect.shrink2(egui::vec2(2.0, 5.0));
                     painter.rect_filled(wave_rect, 3.0, egui::Color32::BLACK);
-                    // 曲の外側を先に塗る。波形は [0, duration] の内側にしか焼かれないので、
-                    // このあとの image がこの陰を覆うことはない。
-                    let out_of_track = crate::video::seek_strip_wave::waveform_out_of_track(
-                        center_time_secs,
-                        strip.waveform_span_secs,
-                        strip.duration_secs,
-                    );
-                    let shade_outside = |from: f32, to: f32| {
-                        let left = wave_rect.min.x + wave_rect.width() * from;
-                        let right = wave_rect.min.x + wave_rect.width() * to;
-                        if right - left < 0.5 {
-                            return;
-                        }
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(left, wave_rect.min.y),
-                                egui::pos2(right, wave_rect.max.y),
-                            ),
-                            0.0,
-                            NATIVE_SEEK_STRIP_OUT_OF_TRACK_FILL,
-                        );
-                    };
-                    if let Some(before) = out_of_track.before {
-                        shade_outside(0.0, before);
-                    }
-                    if let Some(after) = out_of_track.after {
-                        shade_outside(after, 1.0);
-                    }
                     if let (Some(texture_id), Some(wave_image)) =
                         (wave_texture_id, strip.wave_image.as_ref())
                     {
@@ -644,6 +616,37 @@ fn draw_native_seek_strip(
                             crate::ui_fonts::hud_text_font(14.0),
                             egui::Color32::from_gray(210),
                         );
+                    }
+                    // 曲の外側は波形の**あと**に塗る。ラスタが名乗る `window_start_secs` /
+                    // `window_end_secs` は要求した範囲そのもので、`[0, duration]` へ
+                    // クランプされていない (クランプされるのは `content_*` だけ)。つまり
+                    // 画像は曲の外まで黒で描かれるので、先に塗ると必ず覆われる。
+                    // 外側には音が無いので、上から塗って隠れるものは無い。
+                    let out_of_track = crate::video::seek_strip_wave::waveform_out_of_track(
+                        center_time_secs,
+                        strip.waveform_span_secs,
+                        strip.duration_secs,
+                    );
+                    let shade_outside = |from: f32, to: f32| {
+                        let left = wave_rect.min.x + wave_rect.width() * from;
+                        let right = wave_rect.min.x + wave_rect.width() * to;
+                        if right - left < 0.5 {
+                            return;
+                        }
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(left, wave_rect.min.y),
+                                egui::pos2(right, wave_rect.max.y),
+                            ),
+                            0.0,
+                            NATIVE_SEEK_STRIP_OUT_OF_TRACK_FILL,
+                        );
+                    };
+                    if let Some(before) = out_of_track.before {
+                        shade_outside(0.0, before);
+                    }
+                    if let Some(after) = out_of_track.after {
+                        shade_outside(after, 1.0);
                     }
                     // 境界の線は最後に引く。素早いドラッグでは波形がまだ来ていないことが
                     // 多く、そのとき陰の縁だけが終端を示す唯一の手がかりになる。

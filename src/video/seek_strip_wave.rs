@@ -346,7 +346,10 @@ pub(crate) struct WaveOutOfTrack {
 
 /// The parts of the visible strip that are outside the video, from its **duration**.
 ///
-/// Deliberately not from how much waveform has been rastered. Those two regions look the
+/// Deliberately not from how much waveform has been rastered — and not from the range the
+/// raster names either, which is the window that was asked for rather than the part of it
+/// that exists: only `content_start_secs` / `content_end_secs` are clamped to the track, so
+/// the image is drawn black past the end. Those two regions look the
 /// same today — both are simply black — and during a fast drag most of the strip has no
 /// raster yet, so the end of the track is invisible exactly when the user is moving fast
 /// enough to overshoot it. Shading what is merely unrendered would make "still loading"
