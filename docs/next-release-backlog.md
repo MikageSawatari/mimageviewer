@@ -3823,18 +3823,26 @@ retire した時点で activation が所有者である main へ一度戻り (`f
 利用者報告 (2026-08-28): 別ウィンドウ化 -> F11 で仮想フルスクリーン -> F12 を 2 回で、
 通常ウィンドウに戻る。
 
-**本修正による回帰ではない。** `detached_viewer_borderless_fullscreen` は
-`active_viewport_runtime_reset_new` / `active_viewport_runtime_adopt_passive` で意図的に
-クリアされており、host viewport runtime の作り直しで捨てられる既存設計である
-(§1.139 の 4 コミットはこのフラグを 1 度も書いていない。読むのは
-`active_detached_viewport_maximized_on_visible_commit` の除外条件のみ)。
+**本修正による回帰ではない。** §1.139 の修正前から、F12 OFF の通常経路が
+`reason=toggle_detached_viewer_mode_disabled` で
+`old_borderless=true old_restore=Some(...)` を `new_borderless=false new_restore=None` にし、
+直後の `reason=f12_to_non_detached` が消えた状態を重ねてクリアしていた。always-new media 経路にも
+同じ terminal 扱いがあった。全 write を ungated な `[presentation-borderless]` に集約した unit 再現で、
+この順序を修正前に確認した。`active_viewport_runtime_reset_new` / `adopt_passive` は原因ではなかった。
 
-**最大化より重い**。最大化は永続化された placement レコードの一部で、正しい所有者が読むように
-するだけで済んだ。仮想フルスクリーンは transient な App state に加えて、F11 を解除したときに
-戻る先である `detached_viewer_restore_placement` が対になっている。維持するなら両方が host
-再生成を越えて生き残り、Visible commit が最大化ではなく borderless ジオメトリを当てる必要がある。
+**所有範囲を確定して修正 (2026-08-28)。** F11 borderless と
+`detached_viewer_restore_placement` の対は HWND / `DetachedWindowRuntime` の状態ではなく、同じ
+viewer content を main と detached の間で移送している間の **detached presentation intent** とする。
+F12 は OS host を破棄するが viewer presentation 自体の終了ではないため、この対を保持する。
+再生成 builder は既存どおり flag から decorations と monitor geometry を作り、F11 OFF は保持した
+restore placement へ戻る。真の viewer close、F11 OFF、新しい stable detached window の生成、別の
+passive window の active 採用では従来どおり対をクリアする。後二者の clear は別 window の intent を
+漏らさないため正しいので削除していない。新しい bool / guard / timeout / retry は追加していない。
 
-- 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
+回帰テストは通常画像と always-new media の F12 OFF/ON、再生成 builder の
+`decorations=false` / geometry、F11 OFF 後の元 placement 復帰を固定する。また source audit で両 field の
+runtime write が単一 probe を迂回しないことを固定した。F12 clear の再挿入、restore だけの消去、builder
+からの borderless 適用削除が killing mutation となる。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

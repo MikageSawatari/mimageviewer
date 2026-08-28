@@ -170,6 +170,137 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
     );
 }
 
+#[test]
+#[cfg(windows)]
+fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_placement() {
+    let mut app = phase_c_support::setup_app();
+    app.items.push(GridItem::Image(PathBuf::from(
+        r"C:\pics\borderless-observation.jpg",
+    )));
+    let idx = 0;
+    let restore = crate::settings::DetachedViewerWindowPlacement {
+        x: 140.0,
+        y: 160.0,
+        w: 1500.0,
+        h: 1000.0,
+        maximized: false,
+    };
+    app.fullscreen_idx = Some(idx);
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.settings.detached_viewer_enabled = true;
+    app.detached_viewer_window_id = Some(12);
+    app.begin_active_detached_session(12, DetachedSource::Image);
+    app.set_detached_window_runtime_placement(12, restore, "test_borderless_observation");
+    app.write_detached_viewer_borderless_state(
+        true,
+        Some(restore),
+        "test",
+        "seed_borderless_before_f12",
+    );
+
+    app.toggle_detached_viewer_mode();
+    assert_ne!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert!(
+        app.detached_viewer_borderless_fullscreen,
+        "F12 host migration must preserve the detached presentation intent"
+    );
+    assert_eq!(app.detached_viewer_restore_placement, Some(restore));
+    assert_eq!(
+        app.detached_window_runtime_placement(12),
+        None,
+        "F12 OFF terminally removes the old OS-window runtime"
+    );
+
+    app.toggle_detached_viewer_mode();
+    assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert!(app.detached_viewer_borderless_fullscreen);
+    assert_eq!(app.detached_viewer_restore_placement, Some(restore));
+
+    // The recreated host consumes the preserved presentation intent through the existing builder.
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.detached_window_hwnd_clear(12);
+    let builder = app.build_inactive_fullscreen_viewport_builder(idx);
+    assert_eq!(
+        builder.decorations,
+        Some(false),
+        "a recreated detached host must be built borderless"
+    );
+    assert!(
+        builder.position.is_some() && builder.inner_size.is_some(),
+        "the recreated borderless host must receive its target monitor geometry"
+    );
+
+    // F11 OFF still has the paired restore placement and publishes it to the new runtime.
+    app.apply_detached_viewer_borderless_target(&egui::Context::default(), false);
+    assert!(!app.detached_viewer_borderless_fullscreen);
+    assert_eq!(app.detached_viewer_restore_placement, None);
+    assert_eq!(app.detached_window_runtime_placement(12), Some(restore));
+}
+
+#[test]
+#[cfg(windows)]
+fn always_new_media_f12_round_trip_preserves_borderless_presentation_intent() {
+    let mut media = phase_c_support::setup_app();
+    let restore = crate::settings::DetachedViewerWindowPlacement {
+        x: 140.0,
+        y: 160.0,
+        w: 1500.0,
+        h: 1000.0,
+        maximized: false,
+    };
+    media.items.push(GridItem::Audio(PathBuf::from(
+        r"C:\music\borderless-round-trip.flac",
+    )));
+    media.fullscreen_idx = Some(0);
+    media.viewer_presentation = ViewerPresentation::DetachedWindow;
+    media.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    media.settings.detached_viewer_open_images_in_window = true;
+    media.settings.detached_viewer_enabled = false;
+    media.settings.video_in_window_mode = true;
+    media.detached_viewer_window_id = Some(21);
+    media.begin_active_detached_session(21, DetachedSource::Audio);
+    media.write_detached_viewer_borderless_state(
+        true,
+        Some(restore),
+        "test",
+        "seed_always_new_media_borderless_before_f12",
+    );
+
+    media.toggle_detached_viewer_mode();
+    assert_eq!(media.viewer_presentation, ViewerPresentation::MainWindow);
+    assert!(media.detached_viewer_borderless_fullscreen);
+    assert_eq!(media.detached_viewer_restore_placement, Some(restore));
+
+    media.toggle_detached_viewer_mode();
+    assert_eq!(
+        media.viewer_presentation,
+        ViewerPresentation::DetachedWindow
+    );
+    assert!(media.detached_viewer_borderless_fullscreen);
+    assert_eq!(media.detached_viewer_restore_placement, Some(restore));
+}
+
+#[test]
+#[cfg(windows)]
+fn borderless_runtime_state_writes_stay_on_the_observed_path() {
+    let source = include_str!("../app.rs");
+    assert_eq!(
+        source
+            .matches("self.detached_viewer_borderless_fullscreen =")
+            .count(),
+        1,
+        "runtime borderless writes must stay in write_detached_viewer_borderless_state"
+    );
+    assert_eq!(
+        source
+            .matches("self.detached_viewer_restore_placement =")
+            .count(),
+        1,
+        "runtime restore-placement writes must stay in write_detached_viewer_borderless_state"
+    );
+}
+
 #[cfg(windows)]
 fn begin_test_detached_host_wait(app: &mut App) -> u64 {
     app.video_presentation_transition
@@ -39152,7 +39283,13 @@ mod still_window_mode_key_tests {
         );
 
         app.detached_viewer_borderless_transition = None;
-        app.detached_viewer_borderless_fullscreen = true;
+        let restore_placement = app.detached_viewer_restore_placement;
+        app.write_detached_viewer_borderless_state(
+            true,
+            restore_placement,
+            "test",
+            "simulate_borderless_enter_applied",
+        );
         app.toggle_egui_viewer_window_mode_for_input(&ctx);
 
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
@@ -48983,7 +49120,13 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(idx);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_window_id = Some(7);
-        app.detached_viewer_borderless_fullscreen = true;
+        let restore_placement = app.active_detached_viewer_current_placement();
+        app.write_detached_viewer_borderless_state(
+            true,
+            Some(restore_placement),
+            "test",
+            "seed_folder_nav_borderless",
+        );
         app.begin_active_detached_session(7, crate::app::DetachedSource::Image);
 
         // close_fullscreen が先に fullscreen_idx=None にしてから prepare を呼ぶ状況を再現。
