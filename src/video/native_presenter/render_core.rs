@@ -585,7 +585,7 @@ fn draw_native_seek_strip(
                         strip.waveform_span_secs,
                         strip.duration_secs,
                     );
-                    let mut shade_outside = |from: f32, to: f32| {
+                    let shade_outside = |from: f32, to: f32| {
                         let left = wave_rect.min.x + wave_rect.width() * from;
                         let right = wave_rect.min.x + wave_rect.width() * to;
                         if right - left < 0.5 {
