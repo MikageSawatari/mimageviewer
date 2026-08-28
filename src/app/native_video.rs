@@ -815,13 +815,6 @@ pub(super) fn apply_normalize_gain_with_perf(
     }
 }
 
-#[cfg(windows)]
-fn native_hwnd_is_visible(hwnd: u64) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-    unsafe { IsWindowVisible(HWND(hwnd as usize as *mut _)).as_bool() }
-}
-
 impl App {
     #[cfg(windows)]
     pub(crate) fn sync_native_video_grade(&mut self) {
@@ -1421,18 +1414,6 @@ impl App {
                     super::PresentationTransitionEvent::HostReady {
                         request_id: request.id,
                         hwnd: self.detached_viewer_host_hwnd_raw(),
-                    },
-                );
-            }
-            super::PresentationTransitionState::Committing {
-                request,
-                progress: super::CommittingProgress::AwaitingHostVisible { host_hwnd },
-                ..
-            } if host_hwnd != 0 && native_hwnd_is_visible(host_hwnd) => {
-                self.video_presentation_transition.dispatch(
-                    super::PresentationTransitionEvent::HostVisible {
-                        request_id: request.id,
-                        hwnd: host_hwnd,
                     },
                 );
             }

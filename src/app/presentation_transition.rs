@@ -74,7 +74,6 @@ pub(crate) enum PreparingProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommittingProgress {
     AwaitingNativeCommit,
-    AwaitingHostVisible { host_hwnd: u64 },
     AwaitingRetire,
 }
 
@@ -112,10 +111,6 @@ pub(crate) enum PresentationTransitionEvent {
     NativeCommitted {
         request_id: u64,
         candidate_generation: u64,
-    },
-    HostVisible {
-        request_id: u64,
-        hwnd: u64,
     },
     NativeRetired {
         request_id: u64,
@@ -567,19 +562,13 @@ fn reduce_late_transition(
                         hwnd: candidate.host_hwnd,
                     });
                 }
-                (
-                    PresentationTransitionState::Committing {
-                        request,
-                        candidate,
-                        progress: CommittingProgress::AwaitingHostVisible {
-                            host_hwnd: candidate.host_hwnd,
-                        },
-                    },
-                    effects,
-                )
-            } else {
-                finish_or_retire(request, candidate, effects)
             }
+            // NativeCommitted is emitted only after the candidate has been attached, primed,
+            // and published by the pump. That publication transfers presenter ownership. The
+            // outgoing presenter may wait for that boundary, but not for a later App::update to
+            // observe the egui host's OS visibility. Keep the host commands ahead of retire in
+            // the effect order while making their completion independent.
+            finish_or_retire(request, candidate, effects)
         }
         pair => reduce_completion_transition(pair.0, pair.1, effects),
     }
@@ -594,16 +583,6 @@ fn reduce_completion_transition(
     Vec<PresentationTransitionEffect>,
 ) {
     match (state, event) {
-        (
-            PresentationTransitionState::Committing {
-                request,
-                candidate,
-                progress: CommittingProgress::AwaitingHostVisible { host_hwnd },
-            },
-            PresentationTransitionEvent::HostVisible { request_id, hwnd },
-        ) if request.id == request_id && host_hwnd == hwnd => {
-            finish_or_retire(request, candidate, effects)
-        }
         (
             PresentationTransitionState::Committing {
                 request,
@@ -887,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_fullscreen_to_detached_waits_for_visible_host_before_retire() {
+    fn fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility() {
         let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
         let request_id = request(
             &mut owner,
@@ -901,33 +880,27 @@ mod tests {
             candidate_generation: GENERATION,
         });
         let effects = owner.take_effects();
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            PresentationTransitionEffect::SetHostVisible {
-                hwnd: CANDIDATE_HOST,
-                ..
-            }
-        )));
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            PresentationTransitionEffect::FocusHost {
-                hwnd: CANDIDATE_HOST,
-                ..
-            }
-        )));
-        assert!(
-            !effects.iter().any(|effect| matches!(
-                effect,
-                PresentationTransitionEffect::RetireOutgoing { .. }
-            ))
-        );
-        owner.dispatch(PresentationTransitionEvent::HostVisible {
-            request_id,
-            hwnd: CANDIDATE_HOST,
-        });
         assert!(matches!(
-            owner.take_effects().as_slice(),
-            [PresentationTransitionEffect::RetireOutgoing { .. }]
+            effects.as_slice(),
+            [
+                PresentationTransitionEffect::ApplyPresentation { .. },
+                PresentationTransitionEffect::SetHostVisible {
+                    hwnd: CANDIDATE_HOST,
+                    ..
+                },
+                PresentationTransitionEffect::FocusHost {
+                    hwnd: CANDIDATE_HOST,
+                    ..
+                },
+                PresentationTransitionEffect::RetireOutgoing { .. },
+            ]
+        ));
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Committing {
+                progress: CommittingProgress::AwaitingRetire,
+                ..
+            }
         ));
         owner.dispatch(PresentationTransitionEvent::NativeRetired {
             request_id,
@@ -939,7 +912,8 @@ mod tests {
                 current: ViewerPresentation::DetachedWindow
             }
         );
-        // Killing mutation: change current != target to current == target in NativeCommitted.
+        // Killing mutation: move finish_or_retire back behind an incoming-host visibility event.
+        // RetireOutgoing disappears from the NativeCommitted effect batch and this test fails.
     }
 
     #[test]

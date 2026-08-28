@@ -3356,7 +3356,7 @@ placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, pl
 - 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
   **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
 
-### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — R2b 実装済み、実機計測待ち
+### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — R2b + retire follow-up 実装済み、実機計測待ち
 
 > ⚠ detached viewer リワーク中の領域。症状パッチ (delay / guard / 追加 repaint) を入れない。
 
@@ -3460,7 +3460,8 @@ z-order / show / raise / destroy のたびにどちらが手前かが入れ替�
   所有し、F12 再入力、failure、Esc、window close、player end、stale Ready/Commit を reducer で
   解決する。
 - native contract は hidden candidate の create/attach/prime を `Ready` までに済ませ、`Commit` で
-  初めて publish し、incoming detached host の visibility 確認後に outgoing を retire する。
+  初めて publish する。`NativeCommitted` で host `Visible/Focus` を先に発行し、同じ effect batch で
+  outgoing を retire する。incoming host の OS visibility poll は retire の前提にしない。
   fixed-ms commit / forced recovery は無い。failure/abort は hidden candidate だけを cleanup する。
 - host `Visible/Focus/Destroy` と native `Publish/Destroy` を reducer effect に限定し、遷移中の
   presenter/HUD/VST/focus recovery は同じ permit を読む。実 action は transition id / target / HWND
@@ -3468,6 +3469,48 @@ z-order / show / raise / destroy のたびにどちらが手前かが入れ替�
 - 自動回帰は両方向、abort、F12 再入力、Esc、window close、player end、stale generation を含む。
   出荷判定前に実機 1 往復で **outgoing presenter raise 0 / cover change 各方向 1 /
   content-ready 前 host activation 0** を画面キャプチャとログで照合する。
+
+#### build I: publish 済み outgoing presenter の retire が UI sleep に依存 (2026-08-28 follow-up)
+
+```
+18.726  Publish incoming presenter
+18.727  placement committed
+18.732  host Visible / Focus
+19.216  shared output pool exhausted (以後約500msごと)
+24.630  [ui-frame-gap] 5899.4ms
+24.632  Destroy outgoing presenter        <- window click 直後
+24.661  placement retired
+```
+
+`Committing::AwaitingHostVisible` が、次の `App::update` による `IsWindowVisible(host)` の level poll まで
+`RetirePlacement` を出さなかった。native `PlacementCommitted` / `PlacementRetired` は lossless event bus
+から root viewport を wake するが、その間の `HostVisible` は UI-only event である。poll 末尾の
+`request_repaint` と visibility / focus / redraw の window event が次 pass を起こす想定だった。
+build F の約 70ms 完了も第2 pass は必要で、incidental window event に起こされただけだった。
+
+`DetachedHostDisposition` はこの依存を導入していない。問題の `Fullscreen → DetachedWindow` では
+disposition は `None` で、変更差分にも `AwaitingHostVisible` の変更は無い。build I は偶発 wake の
+無いスケジュールで既存の依存を露出させた。
+
+candidate は `NativeCommitted` が届く時点で create / attach / current-frame prime / pump publish 済み。
+ここを presenter ownership の cutover とし、commit effect を
+`ApplyPresentation → Visible → Focus → RetireOutgoing` に変更した。host command は先行させるが、
+OS visibility confirmation を retire の前提にはしない。`AwaitingHostVisible` / `HostVisible` poll は
+撤去し、timeout / retry / settle window / 追加 repaint は入れていない。
+
+GPU output pool は 16 slot、source queue は最大 8、copy-fence retire queue は最大 4 で、candidate
+prime の短い二重生存は設計内。二 presenter の zero-overlap 制約ではなく、5.9秒残った旧 fence owner
+が pool exhaustion を起こした。容量 tuning ではなく lifecycle ordering の correctness defect である。
+
+回帰テスト
+`fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility` は commit batch の
+順序と `AwaitingRetire` を固定する。retire を incoming host event の後ろへ戻す killing mutation では
+commit batch から `RetireOutgoing` が消えて失敗する。
+
+次 run では `shared output pool exhausted waiting for free slot` の連続、同区間の約5.9秒
+`[ui-frame-gap]` が無いことを確認する。`Destroy outgoing` は `placement committed` の直後、
+同じ UI pass で送った retire command の pump / WM teardown 分だけ後に並ぶ。固定msを受け入れ条件には
+しないが、build F と同じ数十ms級で、秒単位や user input 待ちにならないことを timeline で照合する。
 
 R4 に残るのは `show_viewport_deferred`、single render entry、host persistence。今回も F12 OFF は
 terminal に host HWND を破棄するため、次の ON では約 300ms の hidden host 作成を待つ。

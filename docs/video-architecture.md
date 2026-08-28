@@ -2339,8 +2339,12 @@ always-new 窓と同じく no-op として扱う。
   [src/video/mod.rs](../src/video/mod.rs)) が新 core へ状態 (再生位置 / overlay / VST /
   checked / SAR) と `FramePresentationState` が所有する現 frame を prime する。
   `present_retire` / `source.queue` は prime fallback に使わない。prime 失敗時は typed state を
-  旧 core 側に保持したまま staging を破棄する。`TargetReady` 後に pump が新 HWND を
-  publish して旧 HWND を破棄し、`PlacementSwitched` を `request_id` 付きで返す。
+  旧 core 側に保持したまま staging を破棄する。`TargetReady` は candidate を publish せず、App の
+  commit 後に pump が新 HWND を publish して `PlacementCommitted` を返す。App は同じ commit effect
+  batch で detached host の `Visible` / `Focus` command を先に発行し、続けて `RetirePlacement` を
+  発行する。pump は `TargetRetire` で旧 HWND/core を破棄して `PlacementRetired` を返す。
+  outgoing retire は incoming host の OS visibility level poll を待たない。candidate の publish / prime
+  完了が presenter ownership の cutover であり、host visibility は別 owner の事実である。
   attach/state restore/prime の失敗は staging だけを破棄して旧 host/core を維持し、
   `PlacementSwitchFailed` を返す。
 - App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`

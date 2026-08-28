@@ -120,7 +120,7 @@ mod presentation_transition;
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
 #[cfg(windows)]
 use presentation_transition::{
-    CommittingProgress, PreparingProgress, PresentationCandidate, PresentationTransitionEffect,
+    PreparingProgress, PresentationCandidate, PresentationTransitionEffect,
     PresentationTransitionEvent, PresentationTransitionOwner, PresentationTransitionState,
 };
 pub(crate) mod normalize;

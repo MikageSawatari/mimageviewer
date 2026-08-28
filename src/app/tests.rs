@@ -94,14 +94,6 @@ fn commit_test_video_presentation_transition(
             app.execute_video_presentation_host_effect(&ctx, effect);
         }
     }
-    if target == ViewerPresentation::DetachedWindow {
-        app.video_presentation_transition
-            .dispatch(PresentationTransitionEvent::HostVisible {
-                request_id,
-                hwnd: 0xD371,
-            });
-        app.video_presentation_transition.take_effects();
-    }
     app.video_presentation_transition
         .dispatch(PresentationTransitionEvent::NativeRetired {
             request_id,

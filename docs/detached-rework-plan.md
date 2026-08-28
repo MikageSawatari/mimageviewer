@@ -1384,8 +1384,9 @@ HUD/VST の raise も同じ遷移に参加している。reducer は**それら�
   F12、detached host resync、source-swap completion、Esc / window close / player end は同じ
   reducer event/effect 境界へ入る。
 - native host contract は `TargetReady` で publish せず、hidden create + attach + frame prime の
-  後に `Ready`、reducer の `PublishNative` 後に `TargetCommit`、host visibility 確認後に
-  `TargetRetire` とした。失敗/abort は candidate だけを破棄し prior host/core を残す。
+  後に `Ready`、reducer の `PublishNative` 後に `TargetCommit` とする。`NativeCommitted` は
+  pump の publish 完了 ack なので、同じ effect batch で host の `Visible` / `Focus` を先に発行し、
+  続けて `TargetRetire` を発行する。失敗/abort は candidate だけを破棄し prior host/core を残す。
   Ready / Commit / Retire / Abort は request generation と native generation の双方で stale を
   棄却し、commit/recovery の deadline は置かない。
 - egui host の `Visible` / `Focus` / `Destroy`、native `Publish` / outgoing `Destroy` は reducer
@@ -1400,6 +1401,45 @@ HUD/VST の raise も同じ遷移に参加している。reducer は**それら�
   Esc、window close、player end、newer request 後の stale Ready / Commit を固定した。
   自動検証後の実機検収は、両方向で outgoing raise 0、cover change 1、content-ready 前 activation 0
   を 1 往復の画面キャプチャと上記ログで照合する。
+
+#### build I follow-up: outgoing retire を incoming host の poll から分離 (2026-08-28)
+
+build I では `Publish` / `placement committed` / host `Visible` / `Focus` の後、outgoing presenter の
+`Destroy` が 5.9 秒来なかった。その間 `shared output pool exhausted waiting for free slot` が約 500ms
+ごとに続き、次の `[ui-frame-gap]` も 5899.4ms だった。window click 直後に `App::update` が再開し、
+`Destroy` / `PlacementRetired` が完了したため、UI thread の lock / GPU wait ではなく idle sleep が
+確定した。
+
+原因は reducer の `Committing::AwaitingHostVisible`。`PlacementCommitted` を取り込んだ pass は host の
+`Visible` / `Focus` を発行するだけで、次の `App::update` が `IsWindowVisible(host)` を再観測して
+`HostVisible` を dispatch するまで `RetirePlacement` を発行しなかった。poll 末尾の
+`ctx.request_repaint()` が次 pass を起こす想定だったが、native event bus の root wake を持つ
+`PlacementCommitted` と `PlacementRetired` の間に UI-only poll を置いたため、実機では window event
+が無いまま sleep できた。build F の約 70ms は同じ reducer が第2 passを必要としており、host の
+visibility / focus / redraw 等の incidental event で進んだだけである。
+
+この依存は `DetachedHostDisposition` 変更で導入されたものではない。
+`Fullscreen → DetachedWindow` の disposition は変更前後とも host retire を所有しない `None` で、
+同変更の source diff も `AwaitingHostVisible` 経路を変えていない。スケジューリング上の偶発 wake が
+無い run で、R2b 導入時からあった依存が露出した。
+
+所有権の cutover は OS host visibility ではなく `NativeCommitted` である。この event は candidate の
+create / attach / current-frame prime と pump publish が完了した後だけ生成される。outgoing presenter が
+正当に待てるのはここまでで、別 owner である egui host の可視 level を待たせない。
+`AwaitingHostVisible` / `HostVisible` poll を撤去し、commit effect の順序を
+`ApplyPresentation → Visible → Focus → RetireOutgoing` とした。host command は retire より先に発行するが、
+その OS-level confirmation を native resource retirement の前提にはしない。timeout / retry / settle window /
+追加 repaint は無く、観測計装も維持する。
+
+共有 GPU output pool は 16 slot、visible source queue は最大 8、copy-fence retire queue は最大 4 で、
+candidate prime のための短い二重生存を許す設計である。二 presenter が一瞬でも共存不能という
+zero-overlap 制約ではない。旧 presenter の fence ownership を 5.9 秒残したことが pool を枯らしたので、
+容量調整ではなく commit ownership 境界で retire を発行する lifecycle correctness として修正した。
+
+回帰テスト
+`fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility` は commit effect の
+完全な順序と `AwaitingRetire` を固定する。killing mutation として retire を incoming host visibility
+event の後ろへ戻すと、commit batch から `RetireOutgoing` が消えて失敗する。
 
 R4 に残すものは契約どおり `show_viewport_deferred`、single render entry、host persistence。
 F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作成を待つ仕様は維持する。
@@ -1418,6 +1458,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-28 native commit と outgoing presenter retire の所有境界
+(backlog §1.137 follow-up、利用者提示の build I 実機観測を ClaudeCode / Codex 双方が構造修正の
+根拠として合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の commit reducer /
+回帰テスト、[src/app/native_video.rs](../src/app/native_video.rs) の transition poll、
+[src/app/tests.rs](../src/app/tests.rs) の test helper。本節 §9.8 と
+[next-release-backlog.md](next-release-backlog.md)、[video-architecture.md](video-architecture.md) を更新した。
+`[presentation-transition]` / `[presentation-window]` / `[ui-frame-gap]` と GPU pressure 計装は残した。
+
+**不変条件と所有境界**: outgoing presenter は hidden candidate の create / attach / prime と pump publish
+が完了した `NativeCommitted` までを所有し、そこから先は retire 対象である。egui host の
+`Visible` / `Focus` command は同じ commit effect batch で先に発行するが、host の OS visibility は
+別 owner の事実であり native retire の前提にしない。共有 pool は短い二重生存を許し、5.9秒の
+poll dependency は許さない。
+
+**なぜ症状パッチではないか**: timeout / retry / settle window / repaint を追加せず、retire を
+worker wake の無い UI-only `HostVisible` poll から、candidate ownership が確定する native commit ack
+へ移した。host confirmation を retire の後ろへ再接続する mutation は reducer test が拒否する。
 
 **2026-08-28 同一 presentation の host disposition と active session / binding の生成契約
 (backlog §1.138、利用者提示の実機観測を ClaudeCode / Codex 双方が構造修正の根拠として合意):**
