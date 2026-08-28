@@ -460,54 +460,93 @@ fn dequantize_waveform_bin(
     }
 }
 
-fn coarse_chunk_count(duration_secs: f64) -> usize {
-    if !duration_secs.is_finite() || duration_secs <= 0.0 {
-        0
-    } else {
-        (duration_secs / COARSE_CHUNK_SECS).ceil() as usize
-    }
+/// The resolution one coarse column runs at.
+///
+/// Bin width used to be [`COARSE_BIN_SECS`] for every file, which made the column's size
+/// proportional to the duration: a year asked for 2.2 GB, and a duration large enough to
+/// saturate the cast aborted on the allocation. What has to be bounded is the number of
+/// bins — a column is an overview, and no screen shows more than a few thousand of them —
+/// so the width follows from the duration rather than the other way round.
+///
+/// Below the cap nothing changes: `bin_secs` is exactly `COARSE_BIN_SECS`, so every real
+/// recording keeps the resolution it had. A four-hour video is 144,000 bins, under 1 MiB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CoarseScale {
+    bin_secs: f64,
+    bin_count: usize,
 }
 
-fn coarse_bin_count(duration_secs: f64) -> usize {
-    if !duration_secs.is_finite() || duration_secs <= 0.0 {
-        0
-    } else {
-        (duration_secs / COARSE_BIN_SECS).ceil() as usize
+impl CoarseScale {
+    /// `None` when even the coarsest bin this may use would need more of them than
+    /// [`MAX_COARSE_BINS`]. That is past [`MAX_COARSE_BIN_SECS`] * `MAX_COARSE_BINS`,
+    /// roughly a year of continuous audio, so it means the duration is not real.
+    fn for_duration(duration_secs: f64) -> Option<Self> {
+        if !duration_secs.is_finite() || duration_secs <= 0.0 {
+            return None;
+        }
+        let bin_secs = (duration_secs / MAX_COARSE_BINS as f64)
+            .max(COARSE_BIN_SECS)
+            .min(MAX_COARSE_BIN_SECS);
+        let bin_count = (duration_secs / bin_secs).ceil();
+        if !bin_count.is_finite() || bin_count > MAX_COARSE_BINS as f64 {
+            return None;
+        }
+        Some(Self {
+            bin_secs,
+            bin_count: bin_count as usize,
+        })
+    }
+
+    fn chunk_secs(self) -> f64 {
+        self.bin_secs * COARSE_BINS_PER_CHUNK as f64
+    }
+
+    fn chunk_count(self) -> usize {
+        self.bin_count.div_ceil(COARSE_BINS_PER_CHUNK)
+    }
+
+    /// Bytes the column occupies, for the log line that explains what was chosen.
+    fn bytes(self) -> usize {
+        self.bin_count
+            .saturating_mul(std::mem::size_of::<QuantizedWaveformBin>())
     }
 }
 
 /// Largest coarse column we are willing to hold, in bytes.
 ///
-/// The column is one [`QuantizedWaveformBin`] per [`COARSE_BIN_SECS`] for the whole
-/// file, so its size is set by the duration the container reports — a number mIV
-/// does not control and already knows can be wrong: backlog §1.13 is about MPEG-PS
-/// files whose duration is missing or nonsense. At 100ms and 7 bytes a bin, a year
-/// asks for 2.2 GB, and a duration large enough to saturate the `as usize` cast asks
-/// for `usize::MAX` bins, which aborts the process before anything can refuse it.
+/// Not a rationing decision: below this the column is exactly what it always was, and a
+/// four-hour video takes under 1 MiB of it. It is the point past which the column stops
+/// growing and starts coarsening instead — 64 MiB keeps 100ms bins for eleven days of
+/// continuous audio, past any real recording.
+const MAX_COARSE_WAVEFORM_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bins that budget buys.
+const MAX_COARSE_BINS: usize =
+    MAX_COARSE_WAVEFORM_BYTES / std::mem::size_of::<QuantizedWaveformBin>();
+
+/// Coarsest bin a column may use.
 ///
-/// 32 MiB is about 5.5 days of audio, past any real recording. Refusing past that
-/// costs speed and nothing else: the column is an optimization, so a wide span
-/// decodes its own window instead of reading one that was already there.
-const MAX_COARSE_WAVEFORM_BYTES: usize = 32 * 1024 * 1024;
+/// A chunk is [`COARSE_BINS_PER_CHUNK`] bins, and analysing one decodes that much audio in
+/// a single range. Letting the bin grow without limit would walk straight back into the
+/// allocation `WINDOW_DECODE_MAX_SPAN_SECS` exists to prevent, so the bin is capped where
+/// a chunk still fits it: 3s * 600 is exactly half an hour.
+const MAX_COARSE_BIN_SECS: f64 = WINDOW_DECODE_MAX_SPAN_SECS / COARSE_BINS_PER_CHUNK as f64;
 
-/// Whether a coarse column for `duration_secs` fits [`MAX_COARSE_WAVEFORM_BYTES`].
-fn coarse_column_fits_budget(duration_secs: f64) -> bool {
-    coarse_bin_count(duration_secs)
-        .checked_mul(std::mem::size_of::<QuantizedWaveformBin>())
-        .is_some_and(|bytes| bytes <= MAX_COARSE_WAVEFORM_BYTES)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct CoarseChunkCoverage {
     bits: Vec<u64>,
     chunk_count: usize,
+    /// Seconds one chunk spans, which follows the column's bin width rather than being
+    /// fixed: see [`CoarseScale`].
+    chunk_secs: f64,
 }
 
 impl CoarseChunkCoverage {
-    fn new(chunk_count: usize) -> Self {
+    fn new(chunk_count: usize, chunk_secs: f64) -> Self {
         Self {
             bits: vec![0; chunk_count.div_ceil(64)],
             chunk_count,
+            chunk_secs,
         }
     }
 
@@ -541,8 +580,8 @@ impl CoarseChunkCoverage {
         if end_secs <= start_secs {
             return true;
         }
-        let first = (start_secs / COARSE_CHUNK_SECS).floor() as usize;
-        let end = (end_secs / COARSE_CHUNK_SECS).ceil() as usize;
+        let first = (start_secs / self.chunk_secs).floor() as usize;
+        let end = (end_secs / self.chunk_secs).ceil() as usize;
         (first.min(self.chunk_count)..end.min(self.chunk_count))
             .all(|chunk_index| self.contains(chunk_index))
     }
@@ -564,10 +603,10 @@ impl CoarseChunkCoverage {
             while chunk_index < self.chunk_count && self.contains(chunk_index) {
                 chunk_index += 1;
             }
-            let start_secs = (run_start as f64 * COARSE_CHUNK_SECS)
+            let start_secs = (run_start as f64 * self.chunk_secs)
                 .max(window_start_secs)
                 .max(0.0);
-            let end_secs = (chunk_index as f64 * COARSE_CHUNK_SECS)
+            let end_secs = (chunk_index as f64 * self.chunk_secs)
                 .min(window_end_secs)
                 .min(duration_secs);
             if end_secs > start_secs {
@@ -593,8 +632,8 @@ fn next_coarse_chunk(
     (0..coverage.chunk_count)
         .filter(|&chunk_index| !coverage.contains(chunk_index) && !failed.contains(chunk_index))
         .min_by(|&left, &right| {
-            let left_center = (left as f64 + 0.5) * COARSE_CHUNK_SECS;
-            let right_center = (right as f64 + 0.5) * COARSE_CHUNK_SECS;
+            let left_center = (left as f64 + 0.5) * coverage.chunk_secs;
+            let right_center = (right as f64 + 0.5) * coverage.chunk_secs;
             (left_center - center_secs)
                 .abs()
                 .total_cmp(&(right_center - center_secs).abs())
@@ -610,25 +649,24 @@ struct CoarseChunkUpdate {
 
 /// Convert one analyzed chunk into the exact slots it owns in the full-length coarse column.
 fn compose_coarse_chunk(
-    duration_secs: f64,
+    scale: CoarseScale,
     chunk_index: usize,
     analyzed_bins: &[WaveformBin],
 ) -> Option<CoarseChunkUpdate> {
-    let total_bins = coarse_bin_count(duration_secs);
     let bin_start = chunk_index.checked_mul(COARSE_BINS_PER_CHUNK)?;
     let bin_end = bin_start
         .saturating_add(COARSE_BINS_PER_CHUNK)
-        .min(total_bins);
-    if chunk_index >= coarse_chunk_count(duration_secs) || bin_end <= bin_start {
+        .min(scale.bin_count);
+    if chunk_index >= scale.chunk_count() || bin_end <= bin_start {
         return None;
     }
     let mut bins = vec![None; bin_end - bin_start];
     for bin in analyzed_bins {
-        let global_index = (bin.start_secs / COARSE_BIN_SECS).round() as usize;
+        let global_index = (bin.start_secs / scale.bin_secs).round() as usize;
         if global_index < bin_start || global_index >= bin_end {
             continue;
         }
-        let expected_start = global_index as f64 * COARSE_BIN_SECS;
+        let expected_start = global_index as f64 * scale.bin_secs;
         if (bin.start_secs - expected_start).abs() > 1.0e-6 {
             return None;
         }
@@ -642,25 +680,27 @@ fn compose_coarse_chunk(
 
 struct CoarseWaveform {
     duration_secs: f64,
+    scale: CoarseScale,
     bins: Vec<QuantizedWaveformBin>,
     coverage: CoarseChunkCoverage,
     failed: CoarseChunkCoverage,
 }
 
 impl CoarseWaveform {
-    fn new(duration_secs: f64) -> Self {
-        let chunk_count = coarse_chunk_count(duration_secs);
+    fn new(duration_secs: f64, scale: CoarseScale) -> Self {
+        let chunk_count = scale.chunk_count();
+        let chunk_secs = scale.chunk_secs();
         Self {
             duration_secs,
-            bins: vec![QuantizedWaveformBin::default(); coarse_bin_count(duration_secs)],
-            coverage: CoarseChunkCoverage::new(chunk_count),
-            failed: CoarseChunkCoverage::new(chunk_count),
+            scale,
+            bins: vec![QuantizedWaveformBin::default(); scale.bin_count],
+            coverage: CoarseChunkCoverage::new(chunk_count, chunk_secs),
+            failed: CoarseChunkCoverage::new(chunk_count, chunk_secs),
         }
     }
 
     fn apply_chunk(&mut self, chunk_index: usize, analyzed_bins: &[WaveformBin]) -> bool {
-        let Some(update) = compose_coarse_chunk(self.duration_secs, chunk_index, analyzed_bins)
-        else {
+        let Some(update) = compose_coarse_chunk(self.scale, chunk_index, analyzed_bins) else {
             return false;
         };
         let bin_end = update.bin_start + update.bins.len();
@@ -694,16 +734,16 @@ impl CoarseWaveform {
         if end_secs <= start_secs {
             return Vec::new();
         }
-        let first = (start_secs / COARSE_BIN_SECS).floor() as usize;
-        let end = (end_secs / COARSE_BIN_SECS).ceil() as usize;
+        let first = (start_secs / self.scale.bin_secs).floor() as usize;
+        let end = (end_secs / self.scale.bin_secs).ceil() as usize;
         (first.min(self.bins.len())..end.min(self.bins.len()))
             .filter(|&bin_index| self.coverage.contains(bin_index / COARSE_BINS_PER_CHUNK))
             .map(|bin_index| {
-                let bin_start_secs = bin_index as f64 * COARSE_BIN_SECS;
+                let bin_start_secs = bin_index as f64 * self.scale.bin_secs;
                 dequantize_waveform_bin(
                     self.bins[bin_index],
                     bin_start_secs,
-                    COARSE_BIN_SECS.min(self.duration_secs - bin_start_secs),
+                    self.scale.bin_secs.min(self.duration_secs - bin_start_secs),
                 )
             })
             .collect()
@@ -734,10 +774,11 @@ enum WaveRenderRoute {
 /// `CoarseProgressive` waits for a column to fill in. If none will ever exist the wait
 /// never ends, so "not covered yet" and "never" have to be different answers -- telling
 /// them apart is what keeps a span past thirty minutes from failing outright.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum CoarseAvailability {
-    /// A column exists and already spans the visible range.
-    CoversVisible,
+    /// A column exists and already spans the visible range, at the width it chose.
+    /// The width is carried because it is no longer a constant: see [`CoarseScale`].
+    CoversVisible { bin_secs: f64 },
     /// A column exists or is still being built, but does not span it yet.
     NotYet,
     /// No column will be built for this file, so nothing arrives by waiting.
@@ -750,7 +791,7 @@ fn decide_wave_render_route(
     visible_span_secs: f64,
 ) -> WaveRenderRoute {
     match coarse {
-        CoarseAvailability::CoversVisible if requested_bin_secs >= COARSE_BIN_SECS => {
+        CoarseAvailability::CoversVisible { bin_secs } if requested_bin_secs >= bin_secs => {
             WaveRenderRoute::Coarse
         }
         // With no column to progress against, the progressive route only refuses the
@@ -1218,13 +1259,20 @@ impl WaveWorkerRuntime {
         if visible_span_secs >= COARSE_BUILD_MIN_SPAN_SECS
             && matches!(self.coarse, CoarseBuildState::Dormant)
         {
-            self.coarse = if coarse_column_fits_budget(duration_secs) {
-                CoarseBuildState::Building(CoarseWaveform::new(duration_secs))
+            self.coarse = if let Some(scale) = CoarseScale::for_duration(duration_secs) {
+                if scale.bin_secs > COARSE_BIN_SECS {
+                    crate::logger::log(format!(
+                        "[wave] coarse column coarsened: duration {duration_secs:.0}s at                          {:.3}s per bin, {} bins, {:.1} MiB",
+                        scale.bin_secs,
+                        scale.bin_count,
+                        scale.bytes() as f64 / (1024.0 * 1024.0)
+                    ));
+                }
+                CoarseBuildState::Building(CoarseWaveform::new(duration_secs, scale))
             } else {
                 crate::logger::log(format!(
-                    "[wave] no coarse column: duration {duration_secs:.0}s wants {} bins,                      over the {} MiB budget; wide spans will decode their own window",
-                    coarse_bin_count(duration_secs),
-                    MAX_COARSE_WAVEFORM_BYTES / (1024 * 1024)
+                    "[wave] no coarse column: duration {duration_secs:.0}s is past the                      {:.0}s a column can span at {MAX_COARSE_BIN_SECS}s per bin;                      wide spans will decode their own window",
+                    MAX_COARSE_BIN_SECS * MAX_COARSE_BINS as f64
                 ));
                 CoarseBuildState::OverBudget
             };
@@ -1243,7 +1291,9 @@ impl WaveWorkerRuntime {
             CoarseBuildState::Building(coarse)
                 if coarse_covers_visible(coarse, signature, visible_center_secs) =>
             {
-                CoarseAvailability::CoversVisible
+                CoarseAvailability::CoversVisible {
+                    bin_secs: coarse.scale.bin_secs,
+                }
             }
             CoarseBuildState::Building(_)
             | CoarseBuildState::Dormant
@@ -1293,18 +1343,20 @@ fn analyze_coarse_chunk(
     path: &Path,
     chunk_index: usize,
     duration_secs: f64,
+    scale: CoarseScale,
     cancel: &AtomicBool,
     runtime: &mut WaveWorkerRuntime,
 ) -> Result<CoarseChunkAnalysis, CoarseChunkError> {
-    let chunk_start_secs = chunk_index as f64 * COARSE_CHUNK_SECS;
-    let chunk_end_secs = (chunk_start_secs + COARSE_CHUNK_SECS).min(duration_secs);
+    let chunk_secs = scale.chunk_secs();
+    let chunk_start_secs = chunk_index as f64 * chunk_secs;
+    let chunk_end_secs = (chunk_start_secs + chunk_secs).min(duration_secs);
     let window = WaveWindow {
         start_secs: chunk_start_secs,
         end_secs: chunk_end_secs,
         content_start_secs: chunk_start_secs,
         content_end_secs: chunk_end_secs,
     };
-    let analysis_range = waveform_analysis_range(window, duration_secs, COARSE_BIN_SECS)
+    let analysis_range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
         .ok_or_else(|| CoarseChunkError::Failed("invalid coarse chunk range".into()))?;
     if runtime.decoder.is_none() && runtime.decoder_open_error.is_none() {
         match crate::audio_decode::AudioRangeDecoder::open(path) {
@@ -1340,8 +1392,8 @@ fn analyze_coarse_chunk(
         analysis_range.start_secs,
         chunk_start_secs,
         chunk_end_secs,
-        COARSE_BIN_SECS,
-        COARSE_CHUNK_SECS,
+        scale.bin_secs,
+        chunk_secs,
         &|| cancel.load(Ordering::Acquire),
     )
     .ok_or(CoarseChunkError::Cancelled)?;
@@ -1399,32 +1451,38 @@ fn process_next_coarse_chunk(
     else {
         return false;
     };
-    let analysis = match analyze_coarse_chunk(
-        path,
-        chunk_index,
-        runtime.coarse().map_or(0.0, |coarse| coarse.duration_secs),
-        cancel,
-        runtime,
-    ) {
-        Ok(analysis) => analysis,
-        Err(CoarseChunkError::Cancelled) => return true,
-        Err(CoarseChunkError::Unavailable(error)) => {
-            runtime.coarse = CoarseBuildState::Unavailable(error.clone());
-            publish_active_decoder_error(runtime.active_request, state, latest_request_id, &error);
-            return false;
-        }
-        Err(CoarseChunkError::Failed(error)) => {
-            record_coarse_chunk_failure(
-                chunk_index,
-                &error,
-                state,
-                latest_request_id,
-                coarse_center_bits,
-                runtime,
-            );
-            return true;
-        }
+    let Some((duration_secs, scale)) = runtime
+        .coarse()
+        .map(|coarse| (coarse.duration_secs, coarse.scale))
+    else {
+        return false;
     };
+    let analysis =
+        match analyze_coarse_chunk(path, chunk_index, duration_secs, scale, cancel, runtime) {
+            Ok(analysis) => analysis,
+            Err(CoarseChunkError::Cancelled) => return true,
+            Err(CoarseChunkError::Unavailable(error)) => {
+                runtime.coarse = CoarseBuildState::Unavailable(error.clone());
+                publish_active_decoder_error(
+                    runtime.active_request,
+                    state,
+                    latest_request_id,
+                    &error,
+                );
+                return false;
+            }
+            Err(CoarseChunkError::Failed(error)) => {
+                record_coarse_chunk_failure(
+                    chunk_index,
+                    &error,
+                    state,
+                    latest_request_id,
+                    coarse_center_bits,
+                    runtime,
+                );
+                return true;
+            }
+        };
     let decode_elapsed = analysis.decode_elapsed;
     let analyze_elapsed = analysis.analyze_elapsed;
     let discarded_non_audio_streams = analysis.discarded_non_audio_streams;
@@ -1488,7 +1546,9 @@ fn publish_active_coarse_raster(
     let visible_covered = coarse_covers_visible(coarse, active.signature, visible_center_secs);
     let route = decide_wave_render_route(
         if visible_covered {
-            CoarseAvailability::CoversVisible
+            CoarseAvailability::CoversVisible {
+                bin_secs: coarse.scale.bin_secs,
+            }
         } else {
             CoarseAvailability::NotYet
         },
@@ -1640,7 +1700,7 @@ fn process_wave_request(
         signature,
         f64::from_bits(coarse_center_bits.load(Ordering::Acquire)),
     );
-    let coarse_covers_visible = availability == CoarseAvailability::CoversVisible;
+    let coarse_covers_visible = matches!(availability, CoarseAvailability::CoversVisible { .. });
     let route = decide_wave_render_route(availability, bin_secs, signature.visible_span_secs());
     if route == WaveRenderRoute::CoarseProgressive && runtime.decoder.is_none() {
         if runtime.decoder_open_error.is_none() {
@@ -2196,8 +2256,8 @@ mod tests {
 
     #[test]
     fn coarse_chunk_selection_tracks_center_and_coverage_islands() {
-        let mut coverage = CoarseChunkCoverage::new(7);
-        let mut failed = CoarseChunkCoverage::new(7);
+        let mut coverage = CoarseChunkCoverage::new(7, COARSE_CHUNK_SECS);
+        let mut failed = CoarseChunkCoverage::new(7, COARSE_CHUNK_SECS);
         assert_eq!(next_coarse_chunk(&coverage, &failed, 0.0), Some(0));
         assert_eq!(next_coarse_chunk(&coverage, &failed, 10_000.0), Some(6));
         assert_eq!(next_coarse_chunk(&coverage, &failed, 210.0), Some(3));
@@ -2217,14 +2277,15 @@ mod tests {
 
     #[test]
     fn d27_route_order_preserves_window_decode_through_thirty_minutes() {
-        use CoarseAvailability::{CoversVisible, Never, NotYet};
+        use CoarseAvailability::{Never, NotYet};
+        let covers = |bin_secs| CoarseAvailability::CoversVisible { bin_secs };
 
         assert_eq!(
-            decide_wave_render_route(CoversVisible, COARSE_BIN_SECS, 600.0),
+            decide_wave_render_route(covers(COARSE_BIN_SECS), COARSE_BIN_SECS, 600.0),
             WaveRenderRoute::Coarse
         );
         assert_eq!(
-            decide_wave_render_route(CoversVisible, COARSE_BIN_SECS - 0.001, 600.0),
+            decide_wave_render_route(covers(COARSE_BIN_SECS), COARSE_BIN_SECS - 0.001, 600.0),
             WaveRenderRoute::WindowDecode
         );
         assert_eq!(
@@ -2294,14 +2355,17 @@ mod tests {
         }
     }
 
-    /// 予算超過で列を作らないと決めた動画でも、1 時間以上の段が失敗しない。
+    /// 列を持てない動画では、待つ経路へ入れず、一括復号の上限も超えない。
     ///
-    /// 状態だけのテストでは足りない: `decide_wave_render_route` が `CoarseProgressive` を
-    /// 返すと `process_coarse_request` が `Building` 以外を `"coarse waveform unavailable"`
-    /// として `Failed` にするため、**列を作らない判断がそのまま波形の全滅になる**
-    /// (2026-08-27 Codex 再レビュー P1-2)。
+    /// **これは「1 時間以上の段が動く」テストではない。** 以前は名前がそう名乗って
+    /// いながら中身は逆を assert していた (2026-08-29 第 5 回レビュー指摘)。実在する
+    /// 長さの動画で 1〜3 時間の段が動くことは
+    /// `a_long_video_keeps_its_column_by_coarsening_instead_of_growing` が保証する。
+    /// ここが縛るのは、**列を持てないと分かっている動画で何が起きてはいけないか**:
+    /// `CoarseProgressive` (来ない列を待って `Failed`) にも、上限超えの一括復号にも
+    /// 入らないこと。
     #[test]
-    fn an_over_budget_file_still_routes_its_widest_spans_to_a_window_decode() {
+    fn a_file_without_a_column_neither_waits_for_one_nor_decodes_past_the_ceiling() {
         let mut runtime = WaveWorkerRuntime::new();
         runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
         assert!(matches!(&runtime.coarse, CoarseBuildState::OverBudget));
@@ -2411,7 +2475,9 @@ mod tests {
         let ceiling = peak_pcm_bytes(WINDOW_DECODE_MAX_SPAN_SECS);
 
         for availability in [
-            CoarseAvailability::CoversVisible,
+            CoarseAvailability::CoversVisible {
+                bin_secs: COARSE_BIN_SECS,
+            },
             CoarseAvailability::NotYet,
             CoarseAvailability::Never,
         ] {
@@ -2449,36 +2515,59 @@ mod tests {
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
     }
 
-    /// The coarse column is sized from the duration the container reports, which
-    /// backlog §1.13 already records as sometimes missing or nonsense. A dense
-    /// `Vec` proportional to that number reaches 2.2 GB for a year, and a value
-    /// large enough to saturate the cast aborts on the allocation itself.
+    /// 列は duration ではなく **bin 数**で縛る。長い動画では幅が粗くなるだけで、
+    /// メモリは上限で頭打ちになる。
+    ///
+    /// もとは 100ms 固定だったため列の大きさが duration に比例し、1 年で 2.2 GB、
+    /// cast が飽和する値では確保そのものが abort していた。上限を「拒否の閾値」から
+    /// 「解像度の天井」に変えたので、**実在するどの長さでも列が作れる**
+    /// (2026-08-29 第 5 回レビュー P1: 長時間波形の機能が失われていた)。
     #[test]
-    fn a_coarse_column_is_refused_when_the_duration_asks_for_more_than_the_budget() {
-        // Real recordings stay well inside it: a day is 864,000 bins, about 6 MiB.
-        assert!(coarse_column_fits_budget(60.0 * 60.0 * 24.0));
-        // The edge of the budget itself.
-        let max_bins = MAX_COARSE_WAVEFORM_BYTES / std::mem::size_of::<QuantizedWaveformBin>();
-        assert!(coarse_column_fits_budget(max_bins as f64 * COARSE_BIN_SECS));
-        // A year, which is what a broken duration reads like.
-        assert!(!coarse_column_fits_budget(60.0 * 60.0 * 24.0 * 365.0));
-        // Large enough that `as usize` saturates, so the multiply must be the guard.
-        assert!(!coarse_column_fits_budget(1e300));
+    fn a_long_video_keeps_its_column_by_coarsening_instead_of_growing() {
+        // 上限以下は今までと 1 ビットも変わらない。4 時間で 1 MiB 弱。
+        for secs in [600.0, 3_600.0, 4.0 * 3_600.0, 86_400.0] {
+            let scale = CoarseScale::for_duration(secs).expect("実在する長さ");
+            assert_eq!(
+                scale.bin_secs, COARSE_BIN_SECS,
+                "{secs}s で bin 幅が変わってしまう"
+            );
+            assert!(scale.bytes() <= MAX_COARSE_WAVEFORM_BYTES);
+        }
+        let four_hours = CoarseScale::for_duration(4.0 * 3_600.0).expect("4 時間");
+        assert_eq!(four_hours.bin_count, 144_000);
+        assert!(four_hours.bytes() < 1024 * 1024, "{}", four_hours.bytes());
 
-        let mut runtime = WaveWorkerRuntime::new();
-        runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
+        // 上限を超えると、メモリが増えるのではなく幅が粗くなる。
+        for secs in [30.0 * 86_400.0, 200.0 * 86_400.0] {
+            let scale = CoarseScale::for_duration(secs).expect("長いが実在し得る");
+            assert!(scale.bin_secs > COARSE_BIN_SECS, "{secs}s で粗くならない");
+            assert!(
+                scale.bytes() <= MAX_COARSE_WAVEFORM_BYTES,
+                "{secs}s で {} bytes",
+                scale.bytes()
+            );
+            // chunk 1 つの復号量は、一括復号の上限を超えない (P1-1 の再発防止)。
+            assert!(scale.chunk_secs() <= WINDOW_DECODE_MAX_SPAN_SECS);
+        }
+
+        // duration が実在し得ない値のときだけ、列を持たない。
+        assert!(CoarseScale::for_duration(1e300).is_none());
+        assert!(CoarseScale::for_duration(f64::NAN).is_none());
+        assert!(CoarseScale::for_duration(0.0).is_none());
+
+        // その境界は 1 年より先。実在する録画は届かない。
+        let longest = MAX_COARSE_BIN_SECS * MAX_COARSE_BINS as f64;
         assert!(
-            matches!(&runtime.coarse, CoarseBuildState::OverBudget),
-            "an impossible duration must not allocate a column"
+            longest / 86_400.0 > 300.0,
+            "列を持てる上限が {} 日しかない",
+            longest / 86_400.0
         );
-        // It is not an audio failure: the waveform still works, window by window.
-        assert!(runtime.coarse().is_none());
-        assert!(!matches!(&runtime.coarse, CoarseBuildState::Unavailable(_)));
+        assert!(CoarseScale::for_duration(longest).is_some());
     }
 
     #[test]
     fn coarse_coverage_composes_adjacent_chunks_and_keeps_islands_separate() {
-        let mut coverage = CoarseChunkCoverage::new(6);
+        let mut coverage = CoarseChunkCoverage::new(6, COARSE_CHUNK_SECS);
         coverage.insert(1);
         coverage.insert(2);
         coverage.insert(4);
@@ -2492,7 +2581,8 @@ mod tests {
 
     #[test]
     fn failed_coarse_chunks_finish_selection_without_covering_their_span() {
-        let mut coarse = CoarseWaveform::new(180.0);
+        let mut coarse =
+            CoarseWaveform::new(180.0, CoarseScale::for_duration(180.0).expect("scale"));
         coarse.coverage.insert(0);
         assert!(coarse.mark_failed(1));
         coarse.coverage.insert(2);
@@ -2559,7 +2649,8 @@ mod tests {
                 ..WaveformBin::default()
             });
         }
-        let mut coarse = CoarseWaveform::new(180.0);
+        let mut coarse =
+            CoarseWaveform::new(180.0, CoarseScale::for_duration(180.0).expect("scale"));
         assert!(coarse.apply_chunk(1, &analyzed));
         assert_eq!(coarse.coverage.marked_count(), 1);
         assert_eq!(coarse.analyzed_spans(0.0, 180.0), vec![(60.0, 120.0)]);
@@ -2575,7 +2666,8 @@ mod tests {
     #[test]
     fn coarse_chunk_composition_survives_a_short_final_chunk() {
         for duration_secs in [301.0_f64, 300.05, 299.999, 180.0, 61.0] {
-            let chunk_index = coarse_chunk_count(duration_secs) - 1;
+            let scale = CoarseScale::for_duration(duration_secs).expect("scale");
+            let chunk_index = scale.chunk_count() - 1;
             let chunk_start_secs = chunk_index as f64 * COARSE_CHUNK_SECS;
             let chunk_end_secs = (chunk_start_secs + COARSE_CHUNK_SECS).min(duration_secs);
             let window = WaveWindow {
@@ -2599,7 +2691,10 @@ mod tests {
                 &|| false,
             )
             .unwrap_or_else(|| panic!("no analysis for duration {duration_secs}"));
-            let mut coarse = CoarseWaveform::new(duration_secs);
+            let mut coarse = CoarseWaveform::new(
+                duration_secs,
+                CoarseScale::for_duration(duration_secs).expect("scale"),
+            );
             assert!(
                 coarse.apply_chunk(chunk_index, &analysis.bins),
                 "final chunk {chunk_index} of duration {duration_secs} failed to compose \
