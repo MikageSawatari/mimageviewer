@@ -3808,6 +3808,32 @@ retire した時点で activation が所有者である main へ一度戻り (`f
 ホストが受け取る、という順序になっている。ループではなく 1 回だけで、往復もしない。
 今回直した churn とは別の事象。
 
+#### 回帰修正の実機確認 (2026-08-28 18:35 前後)
+
+- タイトルバーからの最大化は往復しても維持される (利用者確認)。
+- ログ: `SIZE_MAXIMIZED` 36 件 / `SW_MAXIMIZE` 24 件 (直前の実行では両方 0 件)。
+- Visible effect が実際に読んだ値を出すようになり、`maximized=true` 12 件 / `false` 7 件。
+  「フラグを読み損ねたか、コマンドが失われたか」を区別できない状態は解消した。
+- 非表示の足場からの観測は 365 件すべて `authority=hidden_scaffold ... outcome=ignored` で拒否。
+- ちらつきの再発なし: host の `WM_SHOWWINDOW shown=false` は実行全体で 4 件、
+  **`window_create` の内側は 0 件**。
+
+#### 派生: F11 の仮想フルスクリーンは F12 往復で解除される (既存挙動、本修正の回帰ではない)
+
+利用者報告 (2026-08-28): 別ウィンドウ化 -> F11 で仮想フルスクリーン -> F12 を 2 回で、
+通常ウィンドウに戻る。
+
+**本修正による回帰ではない。** `detached_viewer_borderless_fullscreen` は
+`active_viewport_runtime_reset_new` / `active_viewport_runtime_adopt_passive` で意図的に
+クリアされており、host viewport runtime の作り直しで捨てられる既存設計である
+(§1.139 の 4 コミットはこのフラグを 1 度も書いていない。読むのは
+`active_detached_viewport_maximized_on_visible_commit` の除外条件のみ)。
+
+**最大化より重い**。最大化は永続化された placement レコードの一部で、正しい所有者が読むように
+するだけで済んだ。仮想フルスクリーンは transient な App state に加えて、F11 を解除したときに
+戻る先である `detached_viewer_restore_placement` が対になっている。維持するなら両方が host
+再生成を越えて生き残り、Visible commit が最大化ではなく borderless ジオメトリを当てる必要がある。
+
 - 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
