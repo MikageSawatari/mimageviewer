@@ -3656,29 +3656,75 @@ reducer の effect (`Raise` 0 件、`Publish` -> `Visible` -> `Focus` の順序)
 出ている。**往復はその effect が出るより前、ホスト viewport が作られる過程で起きている**。
 所有権を一本化しても、egui/winit がホストを作る際の activation は reducer の外にある。
 
-#### まだ観測できていないこと (ここが次の一手)
+#### 原因確定 (2026-08-28 第 2 回計測): `with_maximized(true)` と `with_visible(false)` が矛盾している
 
-**ホスト窓自身のメッセージが、この 300ms の間だけ記録されていない。** ホストの wndproc は
-key-input subclass 経由で観測しているが、subclass が入るのは mIV がホスト HWND を捕捉した
-時点 (= 上表の「登録」= 往復が終わった後)。したがって次がすべて空白になっている。
+`WH_CBT` + `WH_CALLWNDPROC` + `SetWinEventHook` の計装で、機構がそのまま記録された。
+遷移 2 の 1 周期 (t_us 基準、`window_create` stage の内側):
 
-- ホストが `WM_ACTIVATE` を受けたのか。受けたなら lParam の相手窓は誰か
-- ホストが生成直後に可視だったのか (登録時点では毎回 `visible=false`)
-- `SW_MAXIMIZE` / `SW_HIDE` がホストへ何回飛んだか
+```
+  0.4ms  stage window_create begin
+  1.0ms  HCBT_CREATEWND  ws_visible=false ws_maximized=false   <- 要求どおり非表示・非最大化で生成
+ 13.0ms  HCBT_MINMAX     command=SW_MAXIMIZE(3)                <- winit が最大化を適用
+ 15.7ms  HCBT_ACTIVATE   other=host                            <- SW_MAXIMIZE は表示 + activate を伴う
+ 18.3ms  host  WM_ACTIVATE WA_ACTIVE  other=main
+ 36.5ms  host  WM_SHOWWINDOW shown=false                       <- visible=false により再び隠される
+ 40.8ms  HCBT_ACTIVATE   other=main                            <- activate が main へ戻る
+ 60.0ms  main  WM_ACTIVATE WA_ACTIVE  other=host
+ 74.6ms  HCBT_ACTIVATE   other=host                            (2 周目)
+ 84.2ms  host  WM_SHOWWINDOW shown=false
+ 90.2ms  HCBT_ACTIVATE   other=main
+118.9ms  HCBT_MINMAX     command=SW_MAXIMIZE(3)                (3 周目)
+123.3ms  HCBT_ACTIVATE   other=host
+135.8ms  host  WM_SHOWWINDOW shown=false
+137.9ms  HCBT_ACTIVATE   other=main
+168.8ms  stage window_create end
+```
 
-`fg=` から「ホストが前面にいた」ことは分かるが、**誰がそうしたのかはこの空白の中にある**。
+**`ShowWindow(SW_MAXIMIZE)` は「表示する」と「activate する」を必ず伴う。** 一方
+builder は `with_visible(false)` を要求しているので、winit は最大化直後にその窓を隠す。
+隠された窓は前面でいられないので activate が main へ戻る。これが 1 周期で、
+**`create_window` の内側で 3 回繰り返される**。
 
-#### 直す方向 (未着手)
+全 `-> detached` 遷移で完全に同じ数が出る。
 
-**候補として書いていた `with_active(true)` は誤りだった。** 実コードは動画遷移中の detached
-ホストに `Some(false)` (= `with_active(false)`) を渡しており
-([ui_fullscreen.rs](../src/ui_fullscreen.rs) の `detached_activate_on_show`)、
-`with_visible(false)` も `need_show || !window_visible` の条件で入る。production 経路に
-生の `SetForegroundWindow` / `SetActiveWindow` / `SetFocus` は無い (唯一の直呼びは
-`#[cfg(test)]` の中)。**「mIV が前面を要求している」線は消えた。**
+| 計数 | 値 |
+| --- | --- |
+| ホスト窓の生成 | 1 |
+| `SW_MAXIMIZE` | **3** |
+| ホストの `WA_ACTIVE` | 4-5 |
+| ホストの `WM_SHOWWINDOW shown=false` | 3-4 |
+| main の `WA_ACTIVE` | **2-6** |
+| `HCBT_ACTIVATE` | 7 |
 
-残る筋は winit がホスト窓を作る過程そのもの (最大化の適用 = `ShowWindow(SW_MAXIMIZE)` は
-可視化と activation を伴う) だが、これはまだ推測である。上の空白を埋めるまで実装しない。
+#### これで前回の因果の読みは逆だったと分かる
+
+前回私は「ホスト生成に 300ms かかり、その隙に OS が前面を再決定している」と書いた。
+逆である。**show/hide/activate の空転そのものが 300ms を作っている。** stage 内訳が
+それを示す: `surface_create` は 0.1ms、`surface_configure` は 3.5ms、GPU 側は誤差。
+`window_create` の 168-360ms がまるごとこの空転である。
+
+「生成が長引いた 100ms ごとに 1 回」という前回の言い方も相関の言い換えでしかなかった。
+実際の駆動源は最大化であり、通常サイズの detached 窓で 1 回も起きなかったのは
+`SW_MAXIMIZE` が呼ばれないからである。
+
+#### 観測されたユーザー症状との対応
+
+- **タスクバーが出たり消えたりする**: 最大化された窓が z 順の最上位に現れては隠れるのを
+  3 回繰り返すため。全画面窓の有無で shell がタスクバーの表示を切り替える
+- **メインウィンドウが手前に来ることがある**: ホストが隠されるたびに activate が main へ
+  戻る。1 回の F12 で main が `WA_ACTIVE` を最大 6 回受け取っている (利用者報告 2026-08-28)
+
+#### 直す方向
+
+**非表示で作る窓に最大化を要求しない。** 生成時は非表示・非最大化のままとし、最大化は
+遷移所有者が `Visible` を出すのと同じ commit で当てる。所有者は既に
+`Publish -> Visible -> Focus` の順序を所有しているので、そこへ「最大化」を寄せるのは
+新しい仕組みではなく、既にある所有境界へ戻すことになる。
+
+対象は [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`build_detached_viewer_viewport_builder` の `with_maximized(placement.maximized)`。
+`with_visible(false)` が当たる経路で `with_maximized(true)` を同時に要求しないことが
+不変条件になる。
 
 - 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
 
