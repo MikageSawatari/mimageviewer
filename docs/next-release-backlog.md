@@ -3913,18 +3913,89 @@ retire した時点で activation が所有者である main へ一度戻り (`f
 利用者報告 (2026-08-28): 別ウィンドウ化 -> F11 で仮想フルスクリーン -> F12 を 2 回で、
 通常ウィンドウに戻る。
 
-**本修正による回帰ではない。** `detached_viewer_borderless_fullscreen` は
-`active_viewport_runtime_reset_new` / `active_viewport_runtime_adopt_passive` で意図的に
-クリアされており、host viewport runtime の作り直しで捨てられる既存設計である
-(§1.139 の 4 コミットはこのフラグを 1 度も書いていない。読むのは
-`active_detached_viewport_maximized_on_visible_commit` の除外条件のみ)。
+**本修正による回帰ではない。** §1.139 の修正前から、F12 OFF の通常経路が
+`reason=toggle_detached_viewer_mode_disabled` で
+`old_borderless=true old_restore=Some(...)` を `new_borderless=false new_restore=None` にし、
+直後の `reason=f12_to_non_detached` が消えた状態を重ねてクリアしていた。always-new media 経路にも
+同じ terminal 扱いがあった。全 write を ungated な `[presentation-borderless]` に集約した unit 再現で、
+この順序を修正前に確認した。`active_viewport_runtime_reset_new` / `adopt_passive` は原因ではなかった。
 
-**最大化より重い**。最大化は永続化された placement レコードの一部で、正しい所有者が読むように
-するだけで済んだ。仮想フルスクリーンは transient な App state に加えて、F11 を解除したときに
-戻る先である `detached_viewer_restore_placement` が対になっている。維持するなら両方が host
-再生成を越えて生き残り、Visible commit が最大化ではなく borderless ジオメトリを当てる必要がある。
+**所有範囲を確定して修正 (2026-08-28)。** F11 borderless と
+`detached_viewer_restore_placement` の対は HWND / `DetachedWindowRuntime` の状態ではなく、同じ
+viewer content を main と detached の間で移送している間の **detached presentation intent** とする。
+F12 は OS host を破棄するが viewer presentation 自体の終了ではないため、この対を保持する。
+再生成 builder は既存どおり flag から decorations と monitor geometry を作り、F11 OFF は保持した
+restore placement へ戻る。真の viewer close、F11 OFF、新しい stable detached window の生成、別の
+passive window の active 採用では従来どおり対をクリアする。後二者の clear は別 window の intent を
+漏らさないため正しいので削除していない。新しい bool / guard / timeout / retry は追加していない。
 
-- 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
+回帰テストは通常画像と always-new media の F12 OFF/ON、再生成 builder の
+`decorations=false` / geometry、F11 OFF 後の元 placement 復帰を固定する。また source audit で両 field の
+runtime write が単一 probe を迂回しないことを固定した。F12 clear の再挿入、restore だけの消去、builder
+からの borderless 適用削除が killing mutation となる。
+
+#### F11 修正の実機確認 (2026-08-28 21:30 前後)
+
+利用者確認: 別ウィンドウ -> F11 -> F12 往復 -> borderless 維持 -> F11 解除で元配置へ復帰。
+
+ログ (`[presentation-borderless]`):
+
+```
+f11_enter_requested   false -> false   4
+f11_enter_applied     false -> true    4
+f11_exit_applied      true  -> false   3
+close_terminal        true  -> false   1   (borderless のまま閉じた分)
+```
+
+- **F12 起因の clear は 0 件** (`toggle_detached_viewer_mode_disabled` /
+  `f12_to_non_detached` はどちらも出ない)。
+- 戻り先も対で動作: enter で `new_restore=Some(x:1116, y:92, 1254x795)`、exit で `None`。
+  うち 1 組は `maximized: true` を保持しており、**最大化した窓から F11 に入って解除すると
+  最大化状態へ戻る**。§1.139 の 2 つの修正が正しく合成されている。
+
+退行なし:
+
+- 最大化: `SIZE_MAXIMIZED` 9 / `SW_MAXIMIZE` 6 / hidden scaffold の観測拒否 259。
+- ちらつき: host の `WM_SHOWWINDOW shown=false` は実行全体で 2 件、
+  **`window_create` の内側は 0 件**。
+
+#### 調査計装の段階撤去 (2026-08-28、実機確認完了後)
+
+5 分間・F12 多用時の 2.26 MB ログでは、1.139 調査計装が 65% を占めた。原因と三つの修正が
+実機確認されたため、同期 `WH_CALLWNDPROC` / `WH_CBT`、UI thread message loop に callback される
+`SetWinEventHook`、bounded instrumentation queue / drop accounting、vendored eframe / egui-wgpu の
+stage marker と `[presentation-viewport]` sink を全廃した。vendored 4 file は marker 導入直前
+`baff797b^` の blob と hash 一致・zero diff を確認した。`[presentation-window]` からは、各 event ごとに
+top-level window を最大 256 件走査していた `z_rank` / `z=` だけを外した。
+
+一方、次は計装ではなく修正または低頻度の恒久観測なので残す。
+
+- `DetachedPlacementObservationAuthority` と `HiddenScaffold` refusal は hidden scaffold を利用者の
+  placement intent として publish させない **1.139 の修正本体**。refusal log も invariant の実測用に残す。
+- `[presentation-placement] event=write` は runtime placement の値が実際に変わった場合だけ出す。
+  per-frame の同値 write は保存動作を変えず、ログだけ省略する。
+- `write_detached_viewer_borderless_state` と `[presentation-borderless]`、単一 write-path audit、
+  1.139 の全 regression test は維持する。
+- `[presentation-window]` は transition の phase begin/end と、mIV が発行した
+  Visible / Focus / Publish / Destroy / ShowWindow / SetWindowPos 等の effect だけを残す。
+  実機での受信側 770 lines / 276 KB (`source=wndproc`) は原因確定後の恒久価値が低いため、
+  `observe_window_message`、三つの wndproc call site、`wparam/lparam` payload decode と
+  pending-command 相関を全廃した。`[presentation-transition]` は従来どおり残す。
+
+**最終ログ量 (同じ 5 分 session の実測から削除分を差し引いた値):**
+
+| prefix | lines | KB |
+| --- | ---: | ---: |
+| presentation-window (mIV effects 207 + phase 74) | **281** | **79** |
+| presentation-placement (HiddenScaffold refusal) | **259** | **61** |
+| presentation-transition | **100** | **10** |
+| presentation-borderless | **16** | **5.6** |
+| **合計** | **656** | **155.6** |
+
+2.26 MB 全体に対して **約 6.7%**。前回の約 20% は
+`[presentation-window] source=wndproc` 770 lines / 276 KB を残す前提の値であり、
+その後の利用者承認による追加削減でこの値になった。修正本体、全 regression test、
+HiddenScaffold refusal、borderless single write path は削除していない。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

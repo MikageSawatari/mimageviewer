@@ -5696,6 +5696,7 @@ impl App {
                 self.handle_fullscreen_close_request();
                 if !detached {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    #[cfg(windows)]
                     self.observe_viewport_presentation_command(
                         ctx.viewport_id(),
                         crate::presentation_observer::WindowAction::Focus,

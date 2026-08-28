@@ -13595,6 +13595,7 @@ impl App {
             format!("reason=keep_alive_cleanup viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        #[cfg(windows)]
         self.observe_viewport_presentation_command(
             fs_id,
             crate::presentation_observer::WindowAction::Visible,
@@ -22738,9 +22739,12 @@ impl App {
                 .fs_last_native_focus_claim_at
                 .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
                 .unwrap_or(false);
+            #[cfg(windows)]
             let z_order_permitted = self
                 .video_presentation_transition
                 .z_order_recovery_permitted();
+            #[cfg(not(windows))]
+            let z_order_permitted = true;
             let focus = if should_claim_native_focus && !claim_debounced && z_order_permitted {
                 self.fs_last_native_focus_claim_at = Some(std::time::Instant::now());
                 claim_native_window_focus(target.target_hwnd)
@@ -22780,13 +22784,9 @@ impl App {
                 ));
             }
             if focus_restore_click {
-                if should_claim_native_focus
-                    && !claim_debounced
-                    && self
-                        .video_presentation_transition
-                        .z_order_recovery_permitted()
-                {
+                if should_claim_native_focus && !claim_debounced && z_order_permitted {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    #[cfg(windows)]
                     self.observe_viewport_presentation_command(
                         ctx.viewport_id(),
                         crate::presentation_observer::WindowAction::Focus,
@@ -25133,6 +25133,7 @@ impl App {
             self.handle_fullscreen_close_request();
             if !detached && !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(windows)]
                 self.observe_viewport_presentation_command(
                     ctx.viewport_id(),
                     crate::presentation_observer::WindowAction::Focus,
@@ -25161,6 +25162,7 @@ impl App {
             self.close_fullscreen();
             if !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(windows)]
                 self.observe_viewport_presentation_command(
                     ctx.viewport_id(),
                     crate::presentation_observer::WindowAction::Focus,

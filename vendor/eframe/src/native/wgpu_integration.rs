@@ -1072,57 +1072,18 @@ impl Viewport {
 
         let viewport_id = self.ids.this;
 
-        // mIV presentation observer (backlog 1.139): split native HWND creation from the
-        // surface/render-state work which follows it. The sink only queues fixed data.
-        egui_wgpu::presentation_diag::emit(
-            "window_create",
-            "begin",
-            viewport_id.0.value(),
-            0,
-            0,
-        );
-        let create_result = egui_winit::create_window(egui_ctx, event_loop, &self.builder);
-        egui_wgpu::presentation_diag::emit(
-            "window_create",
-            "end",
-            viewport_id.0.value(),
-            u64::from(create_result.is_ok()),
-            0,
-        );
-        match create_result {
+        match egui_winit::create_window(egui_ctx, event_loop, &self.builder) {
             Ok(window) => {
                 windows_id.insert(window.id(), viewport_id);
 
                 let window = Arc::new(window);
-                let size = window.inner_size();
 
-                egui_wgpu::presentation_diag::emit(
-                    "initial_set_window",
-                    "begin",
-                    viewport_id.0.value(),
-                    u64::from(size.width),
-                    u64::from(size.height),
-                );
-                let set_window_result =
-                    pollster::block_on(painter.set_window(viewport_id, Some(window.clone())));
-                egui_wgpu::presentation_diag::emit(
-                    "initial_set_window",
-                    "end",
-                    viewport_id.0.value(),
-                    u64::from(size.width),
-                    u64::from(size.height),
-                );
-                if let Err(err) = set_window_result {
+                if let Err(err) =
+                    pollster::block_on(painter.set_window(viewport_id, Some(window.clone())))
+                {
                     log::error!("on set_window: viewport_id {viewport_id:?} {err}");
                 }
 
-                egui_wgpu::presentation_diag::emit(
-                    "egui_winit_state",
-                    "begin",
-                    viewport_id.0.value(),
-                    0,
-                    0,
-                );
                 self.egui_winit = Some(egui_winit::State::new(
                     egui_ctx.clone(),
                     viewport_id,
@@ -1131,13 +1092,6 @@ impl Viewport {
                     event_loop.system_theme(),
                     painter.max_texture_side(),
                 ));
-                egui_wgpu::presentation_diag::emit(
-                    "egui_winit_state",
-                    "end",
-                    viewport_id.0.value(),
-                    0,
-                    0,
-                );
 
                 egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
                 self.surface_generation = self.surface_generation.wrapping_add(1).max(1);
@@ -1184,14 +1138,6 @@ fn render_immediate_viewport(
         builder,
         mut viewport_ui_cb,
     } = immediate_viewport;
-    // mIV presentation observer (backlog 1.139): bracket the synchronous immediate viewport
-    // recursion. Drop emits the end marker on every early return below.
-    let _presentation_scope = egui_wgpu::presentation_diag::Scope::begin(
-        "immediate_viewport",
-        ids.this.0.value(),
-        0,
-        0,
-    );
 
     // mIV probe (backlog 1.129): painting one immediate viewport costs a constant ~38ms of
     // CPU regardless of its size or contents. Split this function so the stage that owns it

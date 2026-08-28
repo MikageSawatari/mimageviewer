@@ -960,8 +960,6 @@ pub fn run() -> eframe::Result {
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
-    presentation_observer::install_backend_stage_observer();
-    #[cfg(windows)]
     install_native_exception_log_hook();
 
     // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で

@@ -753,15 +753,17 @@ impl App {
         let previous =
             self.detached_window_manager
                 .set_placement(window_id, placement, default_linked);
-        crate::logger::log(format!(
-            "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
-             new_maximized={} old={previous:?} new={placement:?}",
-            crate::logger::elapsed_micros(),
-            window_id,
-            reason,
-            previous.map(|value| value.maximized),
-            placement.maximized,
-        ));
+        if previous != Some(placement) {
+            crate::logger::log(format!(
+                "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
+                 new_maximized={} old={previous:?} new={placement:?}",
+                crate::logger::elapsed_micros(),
+                window_id,
+                reason,
+                previous.map(|value| value.maximized),
+                placement.maximized,
+            ));
+        }
         self.log_detached_image_window_debug(format!(
             "runtime_placement window_id={window_id} reason={reason} \
              from={previous:?} to={placement:?}"
@@ -9815,7 +9817,6 @@ pub struct App {
     /// ParkedLive native presenter から届いた復帰要求。poll 後、snapshot を戻してから処理する。
     #[cfg(windows)]
     native_video_parked_live_activation_requests: Vec<u64>,
-    #[cfg(windows)]
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）。
     /// entry はこの bundle の items_generation を刻み、全参照で照合する。
     pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
@@ -13444,7 +13445,6 @@ impl App {
             native_video_parked_live_left_down_window_id: None,
             #[cfg(windows)]
             native_video_parked_live_activation_requests: Vec::new(),
-            #[cfg(windows)]
             fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
@@ -35637,12 +35637,15 @@ impl App {
             // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-            if !self.navigation_scope.is_detached_physical()
-                && self
-                    .video_presentation_transition
-                    .z_order_recovery_permitted()
-            {
+            #[cfg(windows)]
+            let z_order_recovery_permitted = self
+                .video_presentation_transition
+                .z_order_recovery_permitted();
+            #[cfg(not(windows))]
+            let z_order_recovery_permitted = true;
+            if !self.navigation_scope.is_detached_physical() && z_order_recovery_permitted {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(windows)]
                 self.observe_viewport_presentation_command(
                     ctx.viewport_id(),
                     crate::presentation_observer::WindowAction::Focus,
@@ -38013,7 +38016,7 @@ impl App {
         self.fs_viewport_recreate_after_hide = false;
         self.detached_viewer_recreate_on_next_render = false;
         self.clear_detached_viewer_host_hwnd();
-        self.clear_detached_viewer_borderless_fullscreen_state();
+        self.clear_detached_viewer_borderless_fullscreen_state("mode_change_close_all");
         self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
         ctx.request_repaint();
         self.log_detached_image_window_debug(format!(
@@ -39505,8 +39508,12 @@ impl App {
         self.fs_viewport_presentation = None;
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
         self.clear_detached_viewer_host_hwnd();
-        self.detached_viewer_borderless_fullscreen = false;
-        self.detached_viewer_restore_placement = None;
+        self.write_detached_viewer_borderless_state(
+            false,
+            None,
+            "App::reset_active_detached_viewport_runtime_for_new_window",
+            reason,
+        );
         self.detached_viewer_borderless_transition = None;
         self.still_fullscreen_viewport_enter_suppress_until = None;
         self.fs_viewport_recreate_after_hide = false;
@@ -39541,8 +39548,12 @@ impl App {
         self.fs_viewport_shown = true;
         self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-        self.detached_viewer_borderless_fullscreen = false;
-        self.detached_viewer_restore_placement = None;
+        self.write_detached_viewer_borderless_state(
+            false,
+            None,
+            "App::adopt_active_detached_viewport_runtime_from_passive",
+            reason,
+        );
         self.detached_viewer_borderless_transition = None;
         self.still_fullscreen_viewport_enter_suppress_until = None;
         self.fs_viewport_recreate_after_hide = false;
@@ -42265,9 +42276,46 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn clear_detached_viewer_borderless_fullscreen_state(&mut self) {
-        self.detached_viewer_borderless_fullscreen = false;
-        self.detached_viewer_restore_placement = None;
+    #[track_caller]
+    fn write_detached_viewer_borderless_state(
+        &mut self,
+        borderless: bool,
+        restore_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
+        caller: &'static str,
+        reason: &'static str,
+    ) {
+        let old_borderless = self.detached_viewer_borderless_fullscreen;
+        let old_restore = self.detached_viewer_restore_placement;
+        let callsite = std::panic::Location::caller();
+        let message = format!(
+            "[presentation-borderless] t_us={} event=write caller={} reason={} callsite={}:{} \
+             old_borderless={} new_borderless={} old_restore={old_restore:?} \
+             new_restore={restore_placement:?}",
+            crate::logger::elapsed_micros(),
+            caller,
+            reason,
+            callsite.file(),
+            callsite.line(),
+            old_borderless,
+            borderless,
+        );
+        crate::logger::log(&message);
+        self.detached_viewer_borderless_fullscreen = borderless;
+        self.detached_viewer_restore_placement = restore_placement;
+    }
+
+    #[cfg(windows)]
+    #[track_caller]
+    pub(crate) fn clear_detached_viewer_borderless_fullscreen_state(
+        &mut self,
+        reason: &'static str,
+    ) {
+        self.write_detached_viewer_borderless_state(
+            false,
+            None,
+            "App::clear_detached_viewer_borderless_fullscreen_state",
+            reason,
+        );
         self.detached_viewer_borderless_transition = None;
     }
 
@@ -42281,8 +42329,12 @@ impl App {
         }
         let target_borderless = !self.detached_viewer_borderless_fullscreen;
         if target_borderless {
-            self.detached_viewer_restore_placement =
-                Some(self.active_detached_viewer_current_placement());
+            self.write_detached_viewer_borderless_state(
+                false,
+                Some(self.active_detached_viewer_current_placement()),
+                "App::toggle_detached_viewer_borderless_fullscreen",
+                "f11_enter_requested",
+            );
         }
         self.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
             target_borderless,
@@ -42317,9 +42369,13 @@ impl App {
         if !target_borderless {
             let placement = self
                 .detached_viewer_restore_placement
-                .take()
                 .unwrap_or_else(|| self.active_detached_viewer_current_placement());
-            self.detached_viewer_borderless_fullscreen = false;
+            self.write_detached_viewer_borderless_state(
+                false,
+                None,
+                "App::apply_detached_viewer_borderless_target",
+                "f11_exit_applied",
+            );
             if let Some(window_id) = self.active_detached_hwnd_window_id() {
                 self.set_detached_window_runtime_placement(
                     window_id,
@@ -42389,7 +42445,12 @@ impl App {
                     self.settings.ui_scale_factor,
                 ),
             );
-            self.detached_viewer_borderless_fullscreen = true;
+            self.write_detached_viewer_borderless_state(
+                true,
+                self.detached_viewer_restore_placement,
+                "App::apply_detached_viewer_borderless_target",
+                "f11_enter_applied",
+            );
             self.log_detached_viewport_placement_event(
                 "borderless_enter",
                 "viewport_cmd",
@@ -43056,10 +43117,13 @@ impl App {
         if self.viewer_session_is_detached() {
             return;
         }
-        if !self
+        #[cfg(windows)]
+        let z_order_recovery_permitted = self
             .video_presentation_transition
-            .z_order_recovery_permitted()
-        {
+            .z_order_recovery_permitted();
+        #[cfg(not(windows))]
+        let z_order_recovery_permitted = true;
+        if !z_order_recovery_permitted {
             ctx.request_repaint();
             return;
         }
@@ -43081,6 +43145,7 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            #[cfg(windows)]
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Visible,
@@ -43088,6 +43153,7 @@ impl App {
                 "value=true",
             );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            #[cfg(windows)]
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Focus,
@@ -51193,7 +51259,9 @@ impl App {
             self.detached_viewer_folder_nav_reuse_window_once = false;
             self.detached_viewer_window_id = None;
             self.fs_viewport_virtual_desktop_synced_hwnd = 0;
-            self.clear_detached_viewer_borderless_fullscreen_state();
+            self.clear_detached_viewer_borderless_fullscreen_state(
+                "prepare_viewer_presentation_close_terminal",
+            );
         }
         self.vst3_deferred_media_open = None;
         self.native_video_front_synced_hwnd = 0;
@@ -51276,8 +51344,12 @@ impl App {
                 self.viewer_presentation = viewer_presentation;
                 self.fs_viewport_presentation = fs_viewport_presentation;
                 self.detached_viewer_window_id = detached_viewer_window_id;
-                self.detached_viewer_borderless_fullscreen = detached_viewer_borderless_fullscreen;
-                self.detached_viewer_restore_placement = detached_viewer_restore_placement;
+                self.write_detached_viewer_borderless_state(
+                    detached_viewer_borderless_fullscreen,
+                    detached_viewer_restore_placement,
+                    "App::close_fullscreen_for_folder_nav_reopen",
+                    "folder_nav_restore_after_intermediate_close",
+                );
                 self.detached_viewer_independent_active = detached_viewer_independent_active;
                 self.detached_viewer_open_next_still_detached_once =
                     detached_viewer_open_next_still_detached_once;
@@ -59932,9 +60004,6 @@ impl App {
                 if target_presentation != self.viewer_presentation
                     || self.video_presentation_transition.is_transitioning()
                 {
-                    if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                        self.clear_detached_viewer_borderless_fullscreen_state();
-                    }
                     // メイン側へ切り替えた場合だけ案内を出す: 「この表示先はビューア内の
                     // 前後ナビでも維持され、グリッドから開き直すと別ウィンドウへ戻る」
                     // ことが見えず、設定が壊れたと誤認されるため (実機 FB 2026-07-10)。
@@ -59994,17 +60063,11 @@ impl App {
                 self.detached_viewer_independent_active,
                 self.detached_image_windows.len()
             ));
-            if !self.settings.detached_viewer_enabled {
-                self.clear_detached_viewer_borderless_fullscreen_state();
-            }
             if let Some(idx) = self.fullscreen_idx {
                 let target_presentation = self.effective_viewer_presentation_for_open(idx);
                 if target_presentation != self.viewer_presentation
                     || self.video_presentation_transition.is_transitioning()
                 {
-                    if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                        self.clear_detached_viewer_borderless_fullscreen_state();
-                    }
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         self.switch_native_video_viewer_presentation(target_presentation, true);
                     } else if self.viewer_item_supports_egui_detached_viewport(idx) {
@@ -62901,6 +62964,7 @@ impl App {
         // Video 360 owns the same native canvas as tile mode, but it is not the
         // still-viewer's restriction mode. Keep playback and panels intact.
         if is_video {
+            #[cfg(windows)]
             self.close_video_tile_mode();
             #[cfg(windows)]
             {

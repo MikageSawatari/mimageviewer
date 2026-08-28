@@ -70,9 +70,12 @@ impl App {
                 }
             }
         }
+        #[cfg(windows)]
         let transition_owned_viewport = (visible
             && self.video_presentation_transition.is_transitioning())
         .then(|| self.fullscreen_viewport_id());
+        #[cfg(not(windows))]
+        let transition_owned_viewport = None;
         let mut commanded = 0;
         for (viewport_id, presentation) in &viewports {
             if transition_owned_viewport == Some(*viewport_id) {
@@ -94,6 +97,7 @@ impl App {
             } else {
                 ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(false));
             }
+            #[cfg(windows)]
             self.observe_viewport_presentation_command(
                 *viewport_id,
                 crate::presentation_observer::WindowAction::Visible,
