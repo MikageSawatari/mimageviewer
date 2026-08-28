@@ -36331,7 +36331,6 @@ impl App {
                     vp.maximized,
                 )
             });
-        let maximized = reported_maximized.unwrap_or(false);
 
         if outer_rect.is_none() && self.last_outer_rect.is_none() {
             crate::logger::log(format!(
@@ -36349,10 +36348,16 @@ impl App {
         let best_rect = outer_rect.or(inner_rect);
         self.last_pixels_per_point = pixels_per_point;
 
-        self.last_window_maximized =
-            tracked_window_maximized(self.last_window_maximized, minimized, reported_maximized);
+        // One resolved answer for both consumers. `maximized: None` means the platform
+        // has not reported yet, which is not the same as "not maximized" — reading it
+        // as false here saved the maximized geometry as the size to restore to, on
+        // every unreported frame of a maximized start. `deferred_initial_size_ready`
+        // already documents the same trap for the sibling consumer above.
+        let window_state =
+            read_window_state(self.last_window_maximized, minimized, reported_maximized);
+        self.last_window_maximized = window_state.maximized;
 
-        if !minimized && !maximized {
+        if window_state.rect_is_restorable {
             if let Some(rect) = best_rect {
                 let changed = self
                     .last_outer_rect
@@ -69540,6 +69545,31 @@ fn apply_folder_thumb_pin(
 /// 報告が無い (`None`) のは「最大化ではない」という証拠ではないので、これも直前の
 /// 状態を保つ。ここを `unwrap_or(false)` にすると、報告が来ない環境では最大化して
 /// 終了しても毎回 flag が落ち、「前回終了時の状態」が永久に効かなくなる。
+/// The two questions `track_window_rect` asks of one viewport report, answered once.
+///
+/// They used to be answered separately from the same `Option<bool>`, and disagreed on
+/// what `None` meant: the flag kept the previous answer, the rect gate read it as
+/// "not maximized". A maximized window whose state had not been reported yet would
+/// therefore have its full-screen geometry recorded as the rect to restore to.
+pub(crate) struct WindowStateReading {
+    /// What the window's maximized state resolves to this frame.
+    pub(crate) maximized: bool,
+    /// Whether this frame's rect is the one to come back to, so worth recording.
+    pub(crate) rect_is_restorable: bool,
+}
+
+pub(crate) fn read_window_state(
+    previous_maximized: bool,
+    minimized: bool,
+    reported_maximized: Option<bool>,
+) -> WindowStateReading {
+    let maximized = tracked_window_maximized(previous_maximized, minimized, reported_maximized);
+    WindowStateReading {
+        maximized,
+        rect_is_restorable: !minimized && !maximized,
+    }
+}
+
 pub(crate) fn tracked_window_maximized(
     previous: bool,
     minimized: bool,

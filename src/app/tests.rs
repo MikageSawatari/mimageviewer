@@ -63053,6 +63053,53 @@ fn minimizing_does_not_erase_the_remembered_maximized_state() {
     assert!(!tracked_window_maximized(false, false, None));
 }
 
+/// 報告がまだ無いフレームで、最大化した窓の矩形を「戻る先」として記録しない。
+///
+/// flag と矩形は同じ `Option<bool>` から別々に読まれていて、`None` の意味が食い違っていた:
+/// flag は直前の状態を保ち、矩形ゲートは「最大化ではない」と読む。最大化起動の未報告
+/// フレームでは、全画面いっぱいの矩形が通常復元用として保存され得た。
+#[test]
+fn an_unreported_maximized_frame_does_not_become_the_rect_to_restore_to() {
+    use crate::app::read_window_state;
+
+    // 最大化起動: 起動時に last_window_maximized = true が種付けされ、報告はまだ来ない。
+    let starting_maximized = read_window_state(true, false, None);
+    assert!(starting_maximized.maximized);
+    assert!(
+        !starting_maximized.rect_is_restorable,
+        "未報告フレームの最大化矩形を復元用に記録してはいけない"
+    );
+
+    // 明示的に「最大化ではない」と報告されて、はじめて矩形を記録する。
+    let restored = read_window_state(true, false, Some(false));
+    assert!(!restored.maximized);
+    assert!(restored.rect_is_restorable);
+
+    // 通常起動は従来どおり最初のフレームから記録する。
+    let normal = read_window_state(false, false, None);
+    assert!(!normal.maximized);
+    assert!(normal.rect_is_restorable);
+
+    // 最小化中はどちらの答えも直前の状態を保ち、矩形は記録しない。
+    for previous in [true, false] {
+        for reported in [None, Some(true), Some(false)] {
+            let minimized = read_window_state(previous, true, reported);
+            assert_eq!(minimized.maximized, previous);
+            assert!(!minimized.rect_is_restorable);
+        }
+    }
+
+    // 2 つの答えは同じ解決済み状態から来る。
+    for previous in [true, false] {
+        for minimized in [true, false] {
+            for reported in [None, Some(true), Some(false)] {
+                let state = read_window_state(previous, minimized, reported);
+                assert_eq!(state.rect_is_restorable, !minimized && !state.maximized);
+            }
+        }
+    }
+}
+
 /// 最大化 flag と復元矩形は別々に保存される。1 つに畳み込むと、最大化して終了した
 /// 次の起動で「解いたときに戻る先」を失う (detached 側の §1.115 と同じ根)。
 #[test]
