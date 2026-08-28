@@ -37,7 +37,6 @@ pub(crate) const WAVEFORM_PRE_ROLL_SECS: f64 = 0.75;
 const MIN_WAVEFORM_BIN_SECS: f64 = 0.010;
 const WAVE_RASTER_LRU_MAX_ENTRIES: usize = 8;
 pub(crate) const COARSE_BIN_SECS: f64 = 0.100;
-pub(crate) const COARSE_CHUNK_SECS: f64 = 60.0;
 const COARSE_BINS_PER_CHUNK: usize = 600;
 const WINDOW_DECODE_MAX_SPAN_SECS: f64 = 1800.0;
 const COARSE_BUILD_MIN_SPAN_SECS: f64 = 600.0;
@@ -2150,6 +2149,11 @@ fn emit_wave_coarse_serve(coarse: &CoarseWaveform, signature: WaveRequestSignatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk at the default scale. Not a constant of the system any more: the width
+    /// follows the column's bin width, and only a column that has not been coarsened
+    /// lands on sixty seconds.
+    const COARSE_CHUNK_SECS: f64 = COARSE_BIN_SECS * COARSE_BINS_PER_CHUNK as f64;
 
     #[test]
     #[ignore = "manual real-media first-paint measurement"]
