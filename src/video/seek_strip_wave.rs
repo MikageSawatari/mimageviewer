@@ -180,8 +180,13 @@ impl WaveSpanRequest {
     /// panic.log にも 8320 / 9000 で残っている)。
     ///
     /// 幅を丸めても時間 ↔ ピクセルの対応は比率で決まるため、位置はずれない
-    /// (bin が粗くなるだけ)。**可視幅より狭くはしない**: 可視部分の解像度を
-    /// 下げてまで先読みを優先する理由はない。
+    /// (bin が粗くなるだけ)。描画は `waveform_texture_slice` が時刻から UV を出し、
+    /// `painter.image` が宛先矩形へ伸縮するので、**テクスチャの画素幅は位置に関与しない**。
+    ///
+    /// 先読みぶんを削る順序では可視幅を優先するが、**可視幅そのものが上限を超えるときは
+    /// 上限が勝つ**。3 面のマルチモニターにまたがる窓など、可視幅が 8192px を超える構成は
+    /// 実在する。そこで「可視部分の解像度は下げない」を通すと、選ぶのは「少しぼやける」対
+    /// 「動画機能が再起動まで死ぬ」であって、比べるまでもない。
     pub(crate) fn pixel_width(self, visible_pixel_width: usize, visible_span_secs: f64) -> usize {
         if visible_pixel_width == 0 || !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
             return 0;
@@ -189,7 +194,7 @@ impl WaveSpanRequest {
         let ratio = (self.span.duration_secs() / visible_span_secs).max(1.0);
         ((visible_pixel_width as f64 * ratio).round() as usize)
             .max(visible_pixel_width)
-            .min(MAX_WAVEFORM_TEXTURE_WIDTH.max(visible_pixel_width))
+            .min(MAX_WAVEFORM_TEXTURE_WIDTH)
     }
 }
 
@@ -2359,17 +2364,38 @@ mod tests {
         assert_eq!(upgrade.pixel_width(1_000, visible_span_secs), 3_000);
     }
 
-    /// 可視幅そのものが上限を超える環境 (超広幅ウィンドウ) でも、可視解像度は落とさない。
-    /// ここで丸めると波形が可視部分でぼやける。テクスチャ生成側の責務として残す。
+    /// 可視幅そのものが上限を超える環境 (3 面にまたがる超広幅ウィンドウ) では、上限が勝つ。
+    ///
+    /// **以前はここで丸めず「テクスチャ生成側の責務として残す」としていたが、生成側は
+    /// 分割も縮小もしないまま残り、到達すれば必ずレンダースレッドがパニックしていた**
+    /// (2026-08-27 Codex レビュー)。要求した幅がそのまま焼かれる以上、上限を知っている
+    /// のは要求側しかない。可視部分は伸縮でわずかにぼやけるが、位置は時刻由来の UV で
+    /// 決まるためずれない。分割して鮮鋭さを取り戻す案は backlog §1.140。
     #[test]
-    fn an_oversized_visible_width_is_not_reduced_below_itself() {
+    fn an_oversized_visible_width_is_capped_at_the_texture_ceiling() {
         let visible_span_secs = 30.0;
-        let huge = MAX_WAVEFORM_TEXTURE_WIDTH + 2_000;
         let first = WaveSpanRequest {
             span: WaveSpan::centered(100.0, visible_span_secs).expect("span"),
             stage: WaveRequestStage::FirstPaint,
         };
-        assert_eq!(first.pixel_width(huge, visible_span_secs), huge);
+        for huge in [
+            MAX_WAVEFORM_TEXTURE_WIDTH + 1,
+            MAX_WAVEFORM_TEXTURE_WIDTH + 2_000,
+            11_520,
+            30_000,
+        ] {
+            assert_eq!(
+                first.pixel_width(huge, visible_span_secs),
+                MAX_WAVEFORM_TEXTURE_WIDTH,
+                "a {huge}px window must not ask for a texture the GPU refuses"
+            );
+        }
+        // 上限内の可視幅はこれまでどおり下げない。
+        assert_eq!(
+            first.pixel_width(MAX_WAVEFORM_TEXTURE_WIDTH, visible_span_secs),
+            MAX_WAVEFORM_TEXTURE_WIDTH
+        );
+        assert_eq!(first.pixel_width(1_920, visible_span_secs), 1_920);
     }
 
     #[test]
