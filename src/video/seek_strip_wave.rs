@@ -334,6 +334,50 @@ pub(crate) fn waveform_texture_slice(
     })
 }
 
+/// Where the strip stops being the video, as fractions of its visible width.
+///
+/// `before` covers `0.0..before` and `after` covers `after..1.0`; `None` means the media
+/// reaches that edge and nothing should be shaded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WaveOutOfTrack {
+    pub(crate) before: Option<f32>,
+    pub(crate) after: Option<f32>,
+}
+
+/// The parts of the visible strip that are outside the video, from its **duration**.
+///
+/// Deliberately not from how much waveform has been rastered. Those two regions look the
+/// same today — both are simply black — and during a fast drag most of the strip has no
+/// raster yet, so the end of the track is invisible exactly when the user is moving fast
+/// enough to overshoot it. Shading what is merely unrendered would make "still loading"
+/// and "past the end" indistinguishable, which is the thing this shading exists to tell
+/// apart (2026-08-28 利用者報告: 終端が見えず次の曲へ行ってしまう)。
+pub(crate) fn waveform_out_of_track(
+    center_time_secs: f64,
+    visible_span_secs: f64,
+    duration_secs: f64,
+) -> WaveOutOfTrack {
+    let empty = WaveOutOfTrack {
+        before: None,
+        after: None,
+    };
+    if !center_time_secs.is_finite()
+        || !visible_span_secs.is_finite()
+        || visible_span_secs <= 0.0
+        || !duration_secs.is_finite()
+        || duration_secs <= 0.0
+    {
+        return empty;
+    }
+    let visible_start = center_time_secs - visible_span_secs * 0.5;
+    let fraction = |secs: f64| ((secs - visible_start) / visible_span_secs) as f32;
+    WaveOutOfTrack {
+        before: (visible_start < 0.0).then(|| fraction(0.0).clamp(0.0, 1.0)),
+        after: (visible_start + visible_span_secs > duration_secs)
+            .then(|| fraction(duration_secs).clamp(0.0, 1.0)),
+    }
+}
+
 pub(crate) fn waveform_window(
     center_time_secs: f64,
     duration_secs: f64,
@@ -2293,6 +2337,56 @@ mod tests {
                     "{visible_span_secs}s を一括復号へ送ると PCM が数 GiB になる"
                 );
             }
+        }
+    }
+
+    /// 曲の外側は duration から決まり、**波形が焼けているかには左右されない**。
+    ///
+    /// 素早くドラッグしている間は大半がまだ未描画なので、未描画を根拠に陰をつけると
+    /// 「読込中」と「曲の外」が同じ見え方になる。区別が要るのはまさにその瞬間で、
+    /// 終端が見えないまま行き過ぎて次の曲へ移ってしまう (2026-08-28 利用者報告)。
+    #[test]
+    fn the_outside_of_a_track_is_decided_by_its_duration_not_by_what_is_rendered() {
+        // 中央付近: 端はどちらも見えない。
+        let middle = waveform_out_of_track(300.0, 180.0, 600.0);
+        assert_eq!(middle.before, None);
+        assert_eq!(middle.after, None);
+
+        // 終端が画面の中央に来る位置。右半分が曲の外。
+        let at_end = waveform_out_of_track(600.0, 180.0, 600.0);
+        assert_eq!(at_end.before, None);
+        assert_eq!(at_end.after, Some(0.5));
+
+        // 先頭が画面の中央。左半分が曲の外。
+        let at_start = waveform_out_of_track(0.0, 180.0, 600.0);
+        assert_eq!(at_start.before, Some(0.5));
+        assert_eq!(at_start.after, None);
+
+        // 表示範囲が曲より広ければ、両側が出る。
+        let wider_than_track = waveform_out_of_track(30.0, 600.0, 60.0);
+        assert_eq!(wider_than_track.before, Some(0.45));
+        assert_eq!(wider_than_track.after, Some(0.55));
+
+        // 終端の直前: わずかに見えるだけでも位置は正しい。
+        let nearly_at_end = waveform_out_of_track(599.0, 180.0, 600.0);
+        let after = nearly_at_end.after.expect("終端は画面内にある");
+        assert!((after - (91.0 / 180.0)).abs() < 1e-5, "{after}");
+
+        // 値が壊れていれば何も塗らない。塗る根拠が無いときに塗る方が悪い。
+        for (center, span, duration) in [
+            (f64::NAN, 180.0, 600.0),
+            (300.0, 0.0, 600.0),
+            (300.0, 180.0, 0.0),
+            (300.0, 180.0, f64::INFINITY),
+        ] {
+            let broken = waveform_out_of_track(center, span, duration);
+            assert_eq!(
+                broken,
+                WaveOutOfTrack {
+                    before: None,
+                    after: None
+                }
+            );
         }
     }
 

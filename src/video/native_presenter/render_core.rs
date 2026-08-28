@@ -578,6 +578,34 @@ fn draw_native_seek_strip(
                 crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
                     let wave_rect = local_rect.shrink2(egui::vec2(2.0, 5.0));
                     painter.rect_filled(wave_rect, 3.0, egui::Color32::BLACK);
+                    // 曲の外側を先に塗る。波形は [0, duration] の内側にしか焼かれないので、
+                    // このあとの image がこの陰を覆うことはない。
+                    let out_of_track = crate::video::seek_strip_wave::waveform_out_of_track(
+                        center_time_secs,
+                        strip.waveform_span_secs,
+                        strip.duration_secs,
+                    );
+                    let mut shade_outside = |from: f32, to: f32| {
+                        let left = wave_rect.min.x + wave_rect.width() * from;
+                        let right = wave_rect.min.x + wave_rect.width() * to;
+                        if right - left < 0.5 {
+                            return;
+                        }
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(left, wave_rect.min.y),
+                                egui::pos2(right, wave_rect.max.y),
+                            ),
+                            0.0,
+                            NATIVE_SEEK_STRIP_OUT_OF_TRACK_FILL,
+                        );
+                    };
+                    if let Some(before) = out_of_track.before {
+                        shade_outside(0.0, before);
+                    }
+                    if let Some(after) = out_of_track.after {
+                        shade_outside(after, 1.0);
+                    }
                     if let (Some(texture_id), Some(wave_image)) =
                         (wave_texture_id, strip.wave_image.as_ref())
                     {
@@ -615,6 +643,21 @@ fn draw_native_seek_strip(
                             notice.label(),
                             crate::ui_fonts::hud_text_font(14.0),
                             egui::Color32::from_gray(210),
+                        );
+                    }
+                    // 境界の線は最後に引く。素早いドラッグでは波形がまだ来ていないことが
+                    // 多く、そのとき陰の縁だけが終端を示す唯一の手がかりになる。
+                    for boundary in [out_of_track.before, out_of_track.after]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let x = wave_rect.min.x + wave_rect.width() * boundary;
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, wave_rect.min.y),
+                                egui::pos2(x, wave_rect.max.y),
+                            ],
+                            egui::Stroke::new(1.0, NATIVE_SEEK_STRIP_OUT_OF_TRACK_EDGE),
                         );
                     }
                     painter.rect_stroke(
@@ -1876,6 +1919,14 @@ pub(crate) enum NativeOverlaySeekStripAxis {
     Ready(Arc<crate::video::seek_strip::StripAxis>),
 }
 
+/// 曲の外側の塗り。黒の背景よりは明らかに明るく、白い波形とは競合しない濃さ。
+///
+/// 中を明るくする案もあったが、波形のコントラストを削るので採らなかった。外側には
+/// 失うものが無い。
+const NATIVE_SEEK_STRIP_OUT_OF_TRACK_FILL: egui::Color32 = egui::Color32::from_gray(54);
+/// 曲の内と外の境界線。陰より一段明るくして、外側が細いときでも輪郭が残るようにする。
+const NATIVE_SEEK_STRIP_OUT_OF_TRACK_EDGE: egui::Color32 = egui::Color32::from_gray(132);
+
 #[derive(Clone)]
 pub struct NativeOverlaySeekStrip {
     pub center: crate::video::seek_strip::SeekStripCenter,
@@ -1889,6 +1940,9 @@ pub struct NativeOverlaySeekStrip {
     pub wave_image: Option<NativeOverlaySeekStripWaveImage>,
     pub wave_notice: Option<NativeOverlaySeekStripWaveNotice>,
     pub waveform_span_secs: f64,
+    /// 動画の長さ。**波形の外側を描くのはこの値が根拠**で、どこまで焼けているかではない。
+    /// 詳細は `seek_strip_wave::waveform_out_of_track`。
+    pub duration_secs: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12413,6 +12467,7 @@ mod tests {
             wave_image: None,
             wave_notice: None,
             waveform_span_secs: crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+            duration_secs: 600.0,
         };
         let mut drag_origin = None;
         let mut last_window_request = None;
@@ -12580,6 +12635,7 @@ mod tests {
             wave_image: None,
             wave_notice: None,
             waveform_span_secs: 120.0,
+            duration_secs: 600.0,
         };
         let pointer = egui::pos2(
             rect.center().x + super::SEEK_STRIP_CELL_WIDTH * 0.5,
@@ -12611,6 +12667,7 @@ mod tests {
             wave_image: None,
             wave_notice: None,
             waveform_span_secs: 120.0,
+            duration_secs: 600.0,
         };
         let pointer = egui::pos2(rect.center().x + rect.width() * 0.25, rect.center().y);
         assert_eq!(
@@ -12656,6 +12713,7 @@ mod tests {
                 wave_image: None,
                 wave_notice: None,
                 waveform_span_secs: crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                duration_secs: 600.0,
             };
             let mut drag_origin = None;
             let mut last_window_request = None;
@@ -12824,6 +12882,7 @@ mod tests {
                         wave_notice: None,
                         waveform_span_secs:
                             crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        duration_secs: 600.0,
                     };
                     let mut commands = Vec::new();
                     draw_native_seek_strip(
@@ -12931,6 +12990,7 @@ mod tests {
                             wave_notice: None,
                             waveform_span_secs:
                                 crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                            duration_secs: 600.0,
                         };
                         draw_native_seek_strip(
                             ctx,

@@ -8314,6 +8314,7 @@ impl App {
                     wave_image,
                     wave_notice,
                     waveform_span_secs,
+                    duration_secs: session.duration_secs,
                 })
             }
         };
