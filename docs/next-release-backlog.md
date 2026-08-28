@@ -3474,6 +3474,48 @@ terminal に host HWND を破棄するため、次の ON では約 300ms の hid
 この待ち時間自体の短縮、F12 を跨ぐ taskbar button/host identity の永続化は本項の R2b close には
 含めず、R4 gate C の仕様決定後に扱う。
 
+### 1.138 F12 往復で `active detached backstop window N has no context binding` で落ちる — 実機クラッシュ
+
+- 出典: 2026-08-28、利用者が F12 を何度か押してクラッシュ。**2 日で 2 回踏んでいる**。
+- **今日の §1.137 (遷移所有者) の退行ではない。** 遷移所有者を含まないビルド C でも
+  同一メッセージで落ちている (`panic.log` 2026-08-28 00:23:56、frame 10 = `App::update`)。
+- アサーション自体は **2026-08-25 `bf391e6a`** (R2e の所有権整理) で入った。
+
+```
+PANIC at src\ui_fullscreen.rs:13611:21: active detached backstop window 1 has no context binding
+```
+
+#### ログ (ビルド F、遷移所有者あり)
+
+```
+16.131  [presentation-transition] id=3 target=Fullscreen effect=Publish  hwnd=0x7e0b0a
+16.193  [native-video] placement committed placement=fullscreen-borderless request=3 generation=4
+16.198  [presentation-transition] id=3 target=Fullscreen effect=Destroy  hwnd=0x382c58
+16.402  PANIC ... active detached backstop window 1 has no context binding
+```
+
+3 回目の F12 (detached → fullscreen) の **204ms 後**。遷移そのものは成功しており
+(`Raise` 0 件、`Publish` が `Visible`/`Focus` より先)、その直後に落ちている。
+
+#### 状態
+
+`render_active_detached_viewport_backstop` は `active_detached_session` から `window_id` を取り
+`locate_window_context(window_id)` を引くが、**`None` が返る** (= registry の `context_of` から
+その window の対応が既に消えている)。つまり
+
+> **`active_detached_session` が生きているのに、context binding が先に消える窓がある**
+
+これを「起き得ない」として `panic!` で落としているが、実際に起きている。
+
+#### 直す方向 (未着手)
+
+**panic を `if let` や early return で黙らせるのは不可**。このアサーションは
+「セッションと binding の寿命が一致する」という不変条件を表しているので、
+**寿命がずれる経路を潰す**のが根治。両方を同じ retire transaction で落とすか、
+backstop が参照する前に `active_detached_session` をクリアする。
+
+- 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
