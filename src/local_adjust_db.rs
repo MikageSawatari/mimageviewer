@@ -15,6 +15,19 @@ pub struct LocalAdjustDb {
     conn: rusqlite::Connection,
 }
 
+/// 保存済み JSON から補正レイヤーを復元する。**この関数を通さずに復元しないこと。**
+///
+/// [`local_adjust_core::mask_codec::DocumentBudget`] を必ず開く。生の `serde_json::from_str`
+/// で同じ文字列を読むと、壊れた / 細工された `local_adjust.db` の行を縛る累積予算を
+/// そのまま迂回できる。実際 `run_local_materialize` (描画 worker の通常経路) と
+/// content restore の 2 か所が迂回していた (2026-08-28 第 4 回レビュー)。
+///
+/// 入口が増えても漏れないよう、`layer_parse_audit` テストが src 全体を検査している。
+pub(crate) fn parse_layers_json(json: &str) -> serde_json::Result<Vec<LocalAdjustmentLayer>> {
+    let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
+    serde_json::from_str(json)
+}
+
 impl LocalAdjustDb {
     /// DB を開く (なければ作成)。
     pub fn open() -> Result<Self, rusqlite::Error> {
@@ -56,8 +69,7 @@ impl LocalAdjustDb {
     /// ページの補正レイヤー配列を取得する。未登録または JSON 破損なら None。
     pub fn get_layers(&self, page_key: &str) -> Option<Vec<LocalAdjustmentLayer>> {
         let json = self.get_layers_json(page_key)?;
-        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-        serde_json::from_str(&json).ok()
+        parse_layers_json(&json).ok()
     }
 
     pub(crate) fn get_layers_checked(
@@ -73,11 +85,8 @@ impl LocalAdjustDb {
             .query_row([page_key], |row| row.get(0))
             .optional()
             .map_err(|error| error.to_string())?;
-        json.map(|json| {
-            let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-            serde_json::from_str(&json).map_err(|error| error.to_string())
-        })
-        .transpose()
+        json.map(|json| parse_layers_json(&json).map_err(|error| error.to_string()))
+            .transpose()
     }
 
     /// worker 側で SQLite 読み込みと JSON 復元を別々に計測するため、
@@ -257,10 +266,7 @@ impl LocalAdjustDb {
             return map;
         };
         for (key, json) in rows.flatten() {
-            // Per row: one page's layers, so each page gets the whole budget rather than
-            // the scan as a whole running out partway through.
-            let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-            if let Ok(layers) = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json) {
+            if let Ok(layers) = parse_layers_json(&json) {
                 if !layers.is_empty() {
                     map.insert(key, layers);
                 }
@@ -333,8 +339,7 @@ pub fn repack_legacy_masks(path: &Path) -> RepackReport {
         report.scanned += 1;
 
         let before = local_adjust_core::mask_codec::legacy_decode_count();
-        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-        let Ok(layers) = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json) else {
+        let Ok(layers) = parse_layers_json(&json) else {
             continue;
         };
         if local_adjust_core::mask_codec::legacy_decode_count() == before {
@@ -616,5 +621,66 @@ mod real_data_dry_run {
         assert_eq!(report.skipped_changed, 0);
         // 走査したのに 1 行も書けなかったら、パースで落ちている疑い。
         assert!(report.scanned > 0 && report.rewritten > 0);
+    }
+}
+
+#[cfg(test)]
+mod layer_parse_audit {
+    /// 補正レイヤーの復元は [`super::parse_layers_json`] だけが行う。
+    ///
+    /// 予算は「開き忘れたら効かない」形なので、入口が増えるたびに漏れる。第 4 回レビューで
+    /// 見つかった `run_local_materialize` は描画 worker の通常経路で、テスト専用でも
+    /// 保守用でもなかった。検査対象を `LocalAdjustmentLayer` の deserialize に絞り、
+    /// 唯一の入口以外に現れたら落とす。
+    #[test]
+    fn only_one_function_turns_stored_json_into_layers() {
+        const ALLOWED: &[&str] = &[
+            // 唯一の入口。ここが予算を開く。
+            "src/local_adjust_db.rs",
+        ];
+
+        let mut offenders = Vec::new();
+        let mut walk = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = walk.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    walk.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let relative = path
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if ALLOWED.contains(&relative.as_str()) {
+                    continue;
+                }
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (number, line) in source.lines().enumerate() {
+                    let turns_json_into_layers = line.contains("LocalAdjustmentLayer>>(")
+                        && (line.contains("from_str") || line.contains("from_slice"));
+                    if turns_json_into_layers {
+                        offenders.push(format!("{relative}:{}", number + 1));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "補正レイヤーを直接復元している箇所がある。\
+             crate::local_adjust_db::parse_layers_json を使うこと (累積予算を開くのはそこだけ):\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

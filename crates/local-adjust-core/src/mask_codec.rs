@@ -118,19 +118,28 @@ impl Drop for DocumentBudget {
 
 /// Charge one mask against the open document scope, if there is one.
 ///
-/// Every element ends up four bytes wide in memory — `f32` coverage or a `u32` label —
-/// so that is what a mask costs whichever codec reads it.
-fn charge_document_budget<E: DeError>(count: usize) -> Result<(), E> {
+/// Two numbers, because they behave differently. `retained` is what the mask still costs
+/// once it is a plane of `f32` coverage or `u32` labels — four bytes an element either
+/// way — and it is deducted, because it stays for as long as the document does.
+/// `transient` is the decompressed byte buffer that exists only while the plane is being
+/// built from it, so it is *checked* against what is left but never deducted: charging it
+/// would refuse documents whose masks never coexist at that size.
+///
+/// Together they bound the peak, not just the total. Labels are the worst case, holding
+/// `count * 4` bytes and `count * 4` labels at once, so a budget that counted only what
+/// is retained would let a document that fits still peak at half again as much.
+fn charge_document_budget<E: DeError>(count: usize, transient: usize) -> Result<(), E> {
     const BYTES_PER_ELEMENT_IN_MEMORY: u64 = 4;
-    let cost = (count as u64).saturating_mul(BYTES_PER_ELEMENT_IN_MEMORY);
+    let retained = (count as u64).saturating_mul(BYTES_PER_ELEMENT_IN_MEMORY);
+    let peak = retained.saturating_add(transient as u64);
     DOCUMENT_BUDGET.with(|budget| match budget.get() {
         None => Ok(()),
-        Some(remaining) if cost <= remaining => {
-            budget.set(Some(remaining - cost));
+        Some(remaining) if peak <= remaining => {
+            budget.set(Some(remaining - retained));
             Ok(())
         }
         Some(remaining) => Err(E::custom(format!(
-            "this document's masks decode to more than it may hold: another {cost} bytes              with {remaining} left"
+            "this document's masks decode to more than it may hold: another {retained} bytes              kept and {transient} while decoding, with {remaining} left"
         ))),
     })
 }
@@ -187,10 +196,11 @@ fn decode<E: DeError>(tag: &str, bytes_per_element: usize, text: &str) -> Result
             "mask declares {count} entries, past the {MAX_MASK_ELEMENTS} a mask may hold"
         )));
     }
-    charge_document_budget::<E>(count)?;
     let expected = count
         .checked_mul(bytes_per_element)
         .ok_or_else(|| E::custom("mask buffer is implausibly large"))?;
+    // `expected` is the decompressed buffer, which lives beside the plane built from it.
+    charge_document_budget::<E>(count, expected)?;
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
         .map_err(|error| E::custom(format!("mask base64: {error}")))?;
@@ -266,7 +276,8 @@ where
                 "mask holds more than the {MAX_MASK_ELEMENTS} entries a mask may hold"
             )));
         }
-        charge_document_budget::<A::Error>(1)?;
+        // The array is parsed a value at a time, so nothing is held twice.
+        charge_document_budget::<A::Error>(1, 0)?;
         out.push(value);
     }
     Ok(out)
@@ -518,21 +529,27 @@ mod tests {
         layer.manual_override.subtract = Some(add);
         let json = serde_json::to_string(&vec![&layer, &layer, &layer]).unwrap();
 
-        // 3 layers x 4 buffers x 4096 entries x 4 bytes.
-        let total_bytes = 3 * 4 * 4_096 * 4;
+        // 3 layers x 4 buffers x 4096 entries x 4 bytes kept.
+        let kept_bytes = 3 * 4 * 4_096 * 4;
+        // The budget bounds the peak, and the last mask decoded still holds its
+        // decompressed bytes -- one per entry for coverage -- beside the plane it is
+        // building. A document therefore needs room for everything it keeps plus the
+        // largest buffer in flight, not just for what it keeps.
+        let peak_bytes = kept_bytes + 4_096;
 
         {
-            let _budget = DocumentBudget::with_bytes(total_bytes);
+            let _budget = DocumentBudget::with_bytes(peak_bytes);
             let parsed: Vec<LocalAdjustmentLayer> =
                 serde_json::from_str(&json).expect("a document that fits its budget must load");
             assert_eq!(parsed.len(), 3);
-            assert_eq!(DocumentBudget::remaining(), Some(0));
+            // Only what is kept is deducted; the buffer in flight is checked and released.
+            assert_eq!(DocumentBudget::remaining(), Some(peak_bytes - kept_bytes));
         }
 
         {
-            // One element short: the file is refused, and no single mask is over the
+            // One element short of the peak: refused, and no single mask is over the
             // per-mask ceiling, so only the cumulative rule can catch it.
-            let _budget = DocumentBudget::with_bytes(total_bytes - 4);
+            let _budget = DocumentBudget::with_bytes(peak_bytes - 4);
             let error = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json)
                 .expect_err("a document past its budget must be refused");
             assert!(

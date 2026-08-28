@@ -3668,8 +3668,7 @@ fn run_local_materialize(
                 return EditMaterializeResult::Cancelled { request };
             }
             let decode_t0 = std::time::Instant::now();
-            let parsed =
-                serde_json::from_str::<Vec<local_adjust_core::LocalAdjustmentLayer>>(&json);
+            let parsed = crate::local_adjust_db::parse_layers_json(&json);
             emit_edit_materialize_ms(
                 "decode",
                 "local_json",

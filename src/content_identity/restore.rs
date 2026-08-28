@@ -537,8 +537,10 @@ fn load_restore_runtime_updates(
         |row| {
             let key: String = row.get(0).map_err(|error| error.to_string())?;
             let json: String = row.get(1).map_err(|error| error.to_string())?;
-            states.entry(key).or_default().local_adjust_layers =
-                Some(serde_json::from_str(&json).map_err(|error| error.to_string())?);
+            states.entry(key).or_default().local_adjust_layers = Some(
+                crate::local_adjust_db::parse_layers_json(&json)
+                    .map_err(|error| error.to_string())?,
+            );
             Ok(())
         },
     )?;
