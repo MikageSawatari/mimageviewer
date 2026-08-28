@@ -209,6 +209,9 @@ impl SidecarFile {
             }
         };
         let legacy_before = local_adjust_core::mask_codec::legacy_decode_count();
+        // One sidecar covers every item in a folder, and each layer can hold four mask
+        // buffers. Bound what the whole file may decode, not just its largest field.
+        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
         let parsed: SidecarJson = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
