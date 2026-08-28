@@ -84,6 +84,26 @@ const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetachedViewportBuilderVisibility {
+    Preserve,
+    Hidden,
+}
+
+#[cfg(windows)]
+impl DetachedViewportBuilderVisibility {
+    fn apply(self, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+        match self {
+            Self::Preserve => builder,
+            // A hidden builder must not also carry `maximized=true`: on Windows winit applies
+            // that with ShowWindow(SW_MAXIMIZE), which shows and activates the HWND before the
+            // hidden request hides it again. Maximization belongs to the later Visible commit.
+            Self::Hidden => builder.with_visible(false),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VideoAudioExitKeyOutcome {
     MusicViewInactive,
     ContextMenuOpen,
@@ -10416,23 +10436,30 @@ impl App {
         window: &crate::app::DetachedImageWindowSnapshot,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
+        visible: bool,
         ui_scale: f32,
     ) -> egui::ViewportBuilder {
         let builder = egui::ViewportBuilder::default()
             .with_title(window.title.clone())
             .with_decorations(true)
             .with_transparent(false)
-            .with_taskbar(true);
+            .with_taskbar(true)
+            .with_visible(visible);
 
         if apply_initial_placement {
             let position =
                 window_geometry_pos_to_viewport(egui::pos2(placement.x, placement.y), ui_scale);
             let inner_size =
                 window_geometry_size_to_viewport(egui::vec2(placement.w, placement.h), ui_scale);
-            builder
-                .with_inner_size(inner_size)
-                .with_position(position)
-                .with_maximized(placement.maximized)
+            let builder = builder.with_inner_size(inner_size).with_position(position);
+            if visible {
+                builder.with_maximized(placement.maximized)
+            } else {
+                // Tray-resident passive windows are also created hidden. Leave maximization out
+                // until the tray restore owner commits Visible, for the same reason as the active
+                // detached host.
+                builder
+            }
         } else {
             builder
         }
@@ -12346,9 +12373,9 @@ impl App {
                 window,
                 window_placement,
                 apply_initial_placement,
+                self.window_visible,
                 self.settings.ui_scale_factor,
-            )
-            .with_visible(self.window_visible);
+            );
             let view = self.deferred_detached_image_window_view(
                 window,
                 window_placement,
@@ -12475,9 +12502,9 @@ impl App {
                 &window,
                 window_placement,
                 apply_initial_placement,
+                self.window_visible,
                 self.settings.ui_scale_factor,
-            )
-            .with_visible(self.window_visible);
+            );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut placement_update = None;
@@ -13417,6 +13444,11 @@ impl App {
             && (self.fs_nav_deferred_reopen_wait_active() || detached_transition_hold)
         {
             #[cfg(windows)]
+            let detached_host_needs_create = matches!(
+                self.fs_viewport_presentation,
+                Some(ViewerPresentation::DetachedWindow)
+            ) && self.detached_viewer_should_seed_placement();
+            #[cfg(windows)]
             let fs_builder = self
                 .build_inactive_fullscreen_viewport_builder_with_source(0, "keep_alive_holdover");
             #[cfg(not(windows))]
@@ -13470,6 +13502,24 @@ impl App {
                     "keep_alive_holdover",
                     fs_id,
                     hwnd_before.as_deref(),
+                );
+            }
+            #[cfg(windows)]
+            if detached_host_needs_create
+                && self.window_visible
+                && !self.video_presentation_transition.is_transitioning()
+            {
+                let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+                Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                self.observe_viewport_presentation_command(
+                    fs_id,
+                    crate::presentation_observer::WindowAction::Visible,
+                    "ui_fullscreen::keep_alive_holdover_visible_commit",
+                    if maximized {
+                        "maximized=true value=true"
+                    } else {
+                        "maximized=false value=true"
+                    },
                 );
             }
             // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
@@ -13621,21 +13671,26 @@ impl App {
         // のときは placement を seed して、egui 再生成時の既定サイズ 822x656 フラッシュを防ぐ
         // (`== 0` だと死んだ HWND を !=0 で指したまま再生成される取りこぼしを拾えない = Codex P2)。
         let title_idx = self.fullscreen_idx.unwrap_or(0);
-        let apply_placement = self.detached_viewer_should_seed_placement();
+        let detached_host_needs_create = self.detached_viewer_should_seed_placement();
+        let apply_placement = detached_host_needs_create;
         let builder_placement = if apply_placement {
             Some(self.active_detached_builder_placement_latch(true, "keepalive_backstop"))
         } else {
             None
         };
-        let builder = self
-            .build_detached_viewer_viewport_builder(
-                title_idx,
-                None,
-                apply_placement,
-                builder_placement,
-                "keepalive_backstop",
-            )
-            .with_visible(self.window_visible);
+        let builder_visibility = if detached_host_needs_create || !self.window_visible {
+            DetachedViewportBuilderVisibility::Hidden
+        } else {
+            DetachedViewportBuilderVisibility::Preserve
+        };
+        let builder = self.build_detached_viewer_viewport_builder(
+            title_idx,
+            None,
+            builder_visibility,
+            apply_placement,
+            builder_placement,
+            "keepalive_backstop",
+        );
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let live_tex = self
             .fullscreen_idx
@@ -13768,6 +13823,23 @@ impl App {
                 "keepalive_backstop",
                 viewport_id,
                 hwnd_before.as_deref(),
+            );
+        }
+        if detached_host_needs_create
+            && self.window_visible
+            && !self.video_presentation_transition.is_transitioning()
+        {
+            let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+            Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "ui_fullscreen::keepalive_backstop_visible_commit",
+                if maximized {
+                    "maximized=true value=true"
+                } else {
+                    "maximized=false value=true"
+                },
             );
         }
         self.mark_active_detached_viewport_rendered();
@@ -14126,8 +14198,10 @@ impl App {
         // 静止画の enumerate holdover は live placement を更新しないので従来どおり host 未生存時
         // のみ seed する (Codex P2)。
         #[cfg(windows)]
-        let detached_refresh_builder_placement =
-            need_show || self.detached_viewer_should_seed_placement();
+        let detached_host_needs_create =
+            detached && !embedded && self.detached_viewer_should_seed_placement();
+        #[cfg(windows)]
+        let detached_refresh_builder_placement = need_show || detached_host_needs_create;
         #[cfg(windows)]
         let detached_seed_placement = detached_refresh_builder_placement
             || self.detached_video_presentation_active_or_targeted();
@@ -14187,6 +14261,11 @@ impl App {
                 self.build_detached_viewer_viewport_builder(
                     fs_idx,
                     detached_activate_on_show,
+                    if need_show || !self.window_visible || detached_host_needs_create {
+                        DetachedViewportBuilderVisibility::Hidden
+                    } else {
+                        DetachedViewportBuilderVisibility::Preserve
+                    },
                     detached_seed_placement,
                     detached_builder_placement,
                     "active_render",
@@ -14206,7 +14285,7 @@ impl App {
             // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
-        if !embedded && (need_show || !self.window_visible) {
+        if !detached && !embedded && (need_show || !self.window_visible) {
             // 新規 viewport と tray residency 中の内部 recreate は hidden で作り、
             // DWM transition 抑止属性を当ててから
             // Visible(true) にする。初期 white client、最大化アニメーション、detached
@@ -15892,7 +15971,7 @@ impl App {
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
                 #[cfg(windows)]
-                if need_show && !embedded && self.window_visible {
+                if (need_show || detached_host_needs_create) && !embedded && self.window_visible {
                     // The viewport was created hidden above. Release visibility only after
                     // this frame has painted either real content (full/thumb/holdover) or the
                     // dark loading surface. This keeps DWM from ever presenting the unpainted
@@ -15923,7 +16002,17 @@ impl App {
                                 self.frame_counter
                             ));
                         }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        if detached {
+                            let maximized =
+                                self.active_detached_viewport_maximized_on_visible_commit();
+                            Self::send_detached_viewport_visible_commit(
+                                ctx,
+                                ctx.viewport_id(),
+                                maximized,
+                            );
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        }
                         self.observe_viewport_presentation_command(
                             ctx.viewport_id(),
                             crate::presentation_observer::WindowAction::Visible,
@@ -17748,6 +17837,7 @@ impl App {
                 .build_detached_viewer_viewport_builder(
                     fs_idx,
                     None,
+                    DetachedViewportBuilderVisibility::Hidden,
                     false,
                     None,
                     "fullscreen_viewport_recreate",
@@ -17911,6 +18001,11 @@ impl App {
                 self.build_detached_viewer_viewport_builder(
                     fs_idx,
                     None,
+                    if apply_placement {
+                        DetachedViewportBuilderVisibility::Hidden
+                    } else {
+                        DetachedViewportBuilderVisibility::Preserve
+                    },
                     apply_placement,
                     None,
                     source,
@@ -17937,6 +18032,7 @@ impl App {
         &self,
         fs_idx: usize,
         active: Option<bool>,
+        visibility: DetachedViewportBuilderVisibility,
         apply_placement: bool,
         builder_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
         source: &'static str,
@@ -17984,8 +18080,7 @@ impl App {
                 );
                 builder = builder
                     .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position)
-                    .with_maximized(false);
+                    .with_position(viewport_position);
             } else {
                 let placement = builder_placement
                     .unwrap_or_else(|| self.active_detached_viewer_current_placement());
@@ -18009,8 +18104,7 @@ impl App {
                 );
                 builder = builder
                     .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position)
-                    .with_maximized(placement.maximized);
+                    .with_position(viewport_position);
             }
         } else {
             self.log_detached_viewport_placement_event(
@@ -18026,7 +18120,30 @@ impl App {
         if let Some(active) = active {
             builder = builder.with_active(active);
         }
-        builder
+        visibility.apply(builder)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_viewport_maximized_on_visible_commit(&self) -> bool {
+        !self.detached_viewer_borderless_fullscreen
+            && self.active_detached_viewer_current_placement().maximized
+    }
+
+    /// Queue the presentation-state portion of a detached host's visible commit.
+    ///
+    /// `Maximized(true)` deliberately precedes `Visible(true)`: on Windows the maximize command
+    /// itself shows the HWND, so issuing it after Visible would briefly expose the restored-size
+    /// window. Both commands are queued only after the caller has painted/published content.
+    #[cfg(windows)]
+    pub(crate) fn send_detached_viewport_visible_commit(
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+        maximized: bool,
+    ) {
+        if maximized {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
+        }
+        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
     }
 
     #[cfg(windows)]

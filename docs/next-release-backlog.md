@@ -3714,17 +3714,37 @@ builder は `with_visible(false)` を要求しているので、winit は最大�
 - **メインウィンドウが手前に来ることがある**: ホストが隠されるたびに activate が main へ
   戻る。1 回の F12 で main が `WA_ACTIVE` を最大 6 回受け取っている (利用者報告 2026-08-28)
 
-#### 直す方向
+#### 修正 (2026-08-28)
 
 **非表示で作る窓に最大化を要求しない。** 生成時は非表示・非最大化のままとし、最大化は
 遷移所有者が `Visible` を出すのと同じ commit で当てる。所有者は既に
 `Publish -> Visible -> Focus` の順序を所有しているので、そこへ「最大化」を寄せるのは
 新しい仕組みではなく、既にある所有境界へ戻すことになる。
 
-対象は [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
-`build_detached_viewer_viewport_builder` の `with_maximized(placement.maximized)`。
-`with_visible(false)` が当たる経路で `with_maximized(true)` を同時に要求しないことが
-不変条件になる。
+実装では [ui_fullscreen.rs](../src/ui_fullscreen.rs) の active detached builder から
+`with_maximized(placement.maximized)` を除き、hidden builder mode は visibility と geometry だけを
+指定する。最大化済み host を hidden 中に restore しないため `with_maximized(false)` も送らず、
+winit の新規 HWND は観測どおり非最大化で生成される。`with_visible(false)` は維持する。
+
+最大化の owner は次のとおり。
+
+- 動画 transition: 既存 `SetHostVisible` effect (`Publish -> Visible -> Focus` の Visible commit)
+- 静止画 / 音声 detached open: content / dark-loading 描画後の既存 initial visibility release
+- host-loss 後の keep-alive holdover / backstop 再生成: holdover/content 描画・HWND 登録後の release
+- tray 中に hidden で生成された active / passive host: 既存 tray restore の visibility owner
+- `fullscreen_viewport_recreate`: cleanup-only なので最大化せず、次の active render / transition owner
+  が表示時に適用する
+
+`Maximized(true)` は `Visible(true)` より前に同じ commit へ queue する。Windows では maximize
+自身が HWND を表示するため、この順序なら content-ready 前に表示せず、通常サイズを一瞬見せてから
+最大化することもない。main/fullscreen builder にはもともと maximize 指示がなく、`target=main`
+で観測された 2 回の `SW_MAXIMIZE` も outgoing detached builder が最大化を再提示していたものなので
+同時に消える。
+
+回帰テストは、保存 placement が `maximized=true` でも hidden detached builder が
+`visible=false / maximized=None` であることと、動画 transition の `SetHostVisible` effect が
+`Maximized(true) -> Visible(true)` をこの順で発行することを固定する。新しい App state、時間窓、
+guard / retry / reorder は追加していない。
 
 - 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
 

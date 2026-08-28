@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::presentation_transition::{DetachedHostDisposition, PresentationRequest};
 use super::*;
 use crate::archive_converter::ArchiveFormat;
 use std::cell::Cell;
@@ -36,6 +38,110 @@ fn begin_test_video_presentation_transition(
 fn clear_test_video_presentation_transition(app: &mut App) {
     app.video_presentation_transition
         .reset_stable(app.viewer_presentation);
+}
+
+#[test]
+#[cfg(windows)]
+fn hidden_detached_host_builder_does_not_request_maximize() {
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\maximized.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.detached_viewer_window_id = Some(12);
+    app.begin_active_detached_session(12, DetachedSource::Image);
+    app.set_detached_window_runtime_placement(
+        12,
+        crate::settings::DetachedViewerWindowPlacement {
+            x: 100.0,
+            y: 120.0,
+            w: 1600.0,
+            h: 1200.0,
+            maximized: true,
+        },
+        "test_hidden_builder",
+    );
+    app.detached_window_hwnd_clear(12);
+
+    let builder = app.build_inactive_fullscreen_viewport_builder(0);
+
+    assert_eq!(builder.visible, Some(false));
+    assert_eq!(
+        builder.maximized, None,
+        "a hidden detached host must be created without a maximize request"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_video_visible_effect_commits_maximize_before_visible() {
+    let mut app = phase_c_support::setup_app();
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.detached_viewer_window_id = Some(12);
+    app.begin_active_detached_session(12, DetachedSource::Video);
+    app.set_detached_window_runtime_placement(
+        12,
+        crate::settings::DetachedViewerWindowPlacement {
+            x: 100.0,
+            y: 120.0,
+            w: 1600.0,
+            h: 1200.0,
+            maximized: true,
+        },
+        "test_visible_commit",
+    );
+    let viewport_id = app.fullscreen_viewport_id();
+    let ctx = egui::Context::default();
+    ctx.set_embed_viewports(false);
+    ctx.begin_pass(egui::RawInput::default());
+    ctx.show_viewport_deferred(
+        viewport_id,
+        egui::ViewportBuilder::default(),
+        |_ctx, _class| {},
+    );
+
+    app.execute_video_presentation_host_effect(
+        &ctx,
+        PresentationTransitionEffect::SetHostVisible {
+            request: PresentationRequest {
+                id: 41,
+                current: ViewerPresentation::Fullscreen,
+                target: ViewerPresentation::DetachedWindow,
+                activate: true,
+                announce_main_hint: false,
+                outgoing_presenter_hwnd: 0xA117,
+                detached_host: DetachedHostDisposition::None,
+            },
+            hwnd: 0xD371,
+        },
+    );
+    let output = ctx.end_pass();
+    let commands = &output
+        .viewport_output
+        .get(&viewport_id)
+        .expect("visible effect must target the detached viewport")
+        .commands;
+    let presentation_commands: Vec<_> = commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                egui::ViewportCommand::Maximized(_) | egui::ViewportCommand::Visible(_)
+            )
+        })
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        presentation_commands,
+        vec![
+            egui::ViewportCommand::Maximized(true),
+            egui::ViewportCommand::Visible(true),
+        ],
+        "the transition owner's Visible effect must apply maximize in the same commit, before the HWND becomes visible"
+    );
 }
 
 #[cfg(windows)]

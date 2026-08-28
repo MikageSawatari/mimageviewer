@@ -1565,10 +1565,13 @@ impl App {
                     "Visible",
                     hwnd,
                 );
-                ctx.send_viewport_cmd_to(
-                    self.fullscreen_viewport_id(),
-                    egui::ViewportCommand::Visible(true),
-                );
+                let viewport_id = self.fullscreen_viewport_id();
+                if request.target == super::ViewerPresentation::DetachedWindow {
+                    let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+                    Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+                } else {
+                    ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+                }
                 crate::presentation_observer::observe_viewport_command_for_transition(
                     request.id,
                     Self::presentation_probe_target(request.target),

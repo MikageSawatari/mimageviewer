@@ -9,6 +9,15 @@ use eframe::egui;
 use crate::app::App;
 use crate::tray::TrayEvent;
 
+#[derive(Clone, Copy)]
+enum RetainedViewportPresentation {
+    Plain,
+    #[cfg(windows)]
+    Detached {
+        maximized: bool,
+    },
+}
+
 fn should_close_fullscreen_for_tray(
     fullscreen_open: bool,
     fs_cache_has_video: bool,
@@ -27,16 +36,37 @@ impl App {
         ctx: &egui::Context,
         visible: bool,
     ) -> usize {
-        let mut viewport_ids = Vec::new();
+        let mut viewports = Vec::new();
         if self.fs_viewport_shown {
-            viewport_ids.push(self.fullscreen_viewport_id());
+            #[cfg(windows)]
+            let presentation = if matches!(
+                self.fs_viewport_presentation,
+                Some(crate::app::ViewerPresentation::DetachedWindow)
+            ) {
+                RetainedViewportPresentation::Detached {
+                    maximized: self.active_detached_viewport_maximized_on_visible_commit(),
+                }
+            } else {
+                RetainedViewportPresentation::Plain
+            };
+            #[cfg(not(windows))]
+            let presentation = RetainedViewportPresentation::Plain;
+            viewports.push((self.fullscreen_viewport_id(), presentation));
         }
         #[cfg(windows)]
         {
             for window in &self.detached_image_windows {
                 let viewport_id = Self::detached_image_window_viewport_id(window.id);
-                if !viewport_ids.contains(&viewport_id) {
-                    viewport_ids.push(viewport_id);
+                if !viewports
+                    .iter()
+                    .any(|(existing, _)| *existing == viewport_id)
+                {
+                    viewports.push((
+                        viewport_id,
+                        RetainedViewportPresentation::Detached {
+                            maximized: self.detached_window_seed_placement(window.id).maximized,
+                        },
+                    ));
                 }
             }
         }
@@ -44,11 +74,26 @@ impl App {
             && self.video_presentation_transition.is_transitioning())
         .then(|| self.fullscreen_viewport_id());
         let mut commanded = 0;
-        for viewport_id in &viewport_ids {
+        for (viewport_id, presentation) in &viewports {
             if transition_owned_viewport == Some(*viewport_id) {
                 continue;
             }
-            ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
+            if visible {
+                match presentation {
+                    RetainedViewportPresentation::Plain => {
+                        ctx.send_viewport_cmd_to(
+                            *viewport_id,
+                            egui::ViewportCommand::Visible(true),
+                        );
+                    }
+                    #[cfg(windows)]
+                    RetainedViewportPresentation::Detached { maximized } => {
+                        Self::send_detached_viewport_visible_commit(ctx, *viewport_id, *maximized);
+                    }
+                }
+            } else {
+                ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(false));
+            }
             self.observe_viewport_presentation_command(
                 *viewport_id,
                 crate::presentation_observer::WindowAction::Visible,

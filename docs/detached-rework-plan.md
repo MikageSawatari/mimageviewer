@@ -1459,6 +1459,34 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-28 hidden detached host の maximize を既存 Visible commit owner へ移管
+(backlog §1.139、利用者の WH_CBT / WH_CALLWNDPROC 実測と winit source の導出が一致し、
+ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の active / passive detached builder、
+initial visibility release、keep-alive holdover / backstop、fullscreen viewport recreate、
+[src/app/native_video.rs](../src/app/native_video.rs) の既存 `SetHostVisible` effect consumer、
+[src/tray_integration.rs](../src/tray_integration.rs) の既存 retained viewport restore owner、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明、[next-release-backlog.md](next-release-backlog.md)
+§1.139。`[presentation-hook]` / `[presentation-winevent]` / `[presentation-viewport]` を含む既存計装は
+実機再検証まで維持する。
+
+**不変条件と所有境界**: hidden で生成・再生成する detached builder は visibility と geometry だけを
+指定し、maximize を同時に要求しない。保存 placement の `maximized` は、動画なら既存 reducer の
+`Publish -> Visible -> Focus` にある Visible effect、静止画 / 音声なら content-ready 後の initial
+visibility release、host-loss recovery なら描画・登録後の keep-alive/backstop release、tray resident
+host なら restore owner が読む。最大化が必要な場合は `Maximized(true) -> Visible(true)` を同一 commit
+として queue する。cleanup-only の `fullscreen_viewport_recreate` は表示せず、次の表示 owner まで
+maximize を保持する。main/fullscreen builder 自体は maximize を要求しない。
+
+**なぜ症状パッチではないか**: 実測で `ShowWindow(SW_MAXIMIZE)` が hidden host を表示・activate し、
+`visible=false` が直後に隠すという矛盾が 3 周の foreground churn と 300ms を直接作っていた。
+結果側の focus / taskbar を抑止せず、矛盾した二つの presentation instruction を生成境界から分離して
+最大化を既存 commit owner へ戻した。`with_visible(false)` の content-ready 契約は維持し、新しい
+App-level bool / Option、timeout / settle window、guard / retry / repaint、機能制限は追加していない。
+hidden builder へ maximize を戻す mutation と、Visible effect から maximize を落とす・順序を逆にする
+mutation はそれぞれ独立テストが拒否する。
+
 **2026-08-28 native commit と outgoing presenter retire の所有境界
 (backlog §1.137 follow-up、利用者提示の build I 実機観測を ClaudeCode / Codex 双方が構造修正の
 根拠として合意):**
