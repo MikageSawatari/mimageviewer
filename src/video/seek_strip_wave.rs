@@ -413,6 +413,27 @@ fn coarse_bin_count(duration_secs: f64) -> usize {
     }
 }
 
+/// Largest coarse column we are willing to hold, in bytes.
+///
+/// The column is one [`QuantizedWaveformBin`] per [`COARSE_BIN_SECS`] for the whole
+/// file, so its size is set by the duration the container reports — a number mIV
+/// does not control and already knows can be wrong: backlog §1.13 is about MPEG-PS
+/// files whose duration is missing or nonsense. At 100ms and 7 bytes a bin, a year
+/// asks for 2.2 GB, and a duration large enough to saturate the `as usize` cast asks
+/// for `usize::MAX` bins, which aborts the process before anything can refuse it.
+///
+/// 32 MiB is about 5.5 days of audio, past any real recording. Refusing past that
+/// costs speed and nothing else: the column is an optimization, so a wide span
+/// decodes its own window instead of reading one that was already there.
+const MAX_COARSE_WAVEFORM_BYTES: usize = 32 * 1024 * 1024;
+
+/// Whether a coarse column for `duration_secs` fits [`MAX_COARSE_WAVEFORM_BYTES`].
+fn coarse_column_fits_budget(duration_secs: f64) -> bool {
+    coarse_bin_count(duration_secs)
+        .checked_mul(std::mem::size_of::<QuantizedWaveformBin>())
+        .is_some_and(|bytes| bytes <= MAX_COARSE_WAVEFORM_BYTES)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CoarseChunkCoverage {
     bits: Vec<u64>,
@@ -1066,6 +1087,10 @@ enum CoarseBuildState {
     Dormant,
     Building(CoarseWaveform),
     Unavailable(crate::audio_decode::AudioDecodeOpenError),
+    /// The reported duration asks for a column past [`MAX_COARSE_WAVEFORM_BYTES`], so
+    /// none was built. Distinct from `Unavailable`, which means the audio itself cannot
+    /// be read: here the waveform still works, it just decodes each window it shows.
+    OverBudget,
 }
 
 #[derive(Clone, Copy)]
@@ -1099,21 +1124,34 @@ impl WaveWorkerRuntime {
         if visible_span_secs >= COARSE_BUILD_MIN_SPAN_SECS
             && matches!(self.coarse, CoarseBuildState::Dormant)
         {
-            self.coarse = CoarseBuildState::Building(CoarseWaveform::new(duration_secs));
+            self.coarse = if coarse_column_fits_budget(duration_secs) {
+                CoarseBuildState::Building(CoarseWaveform::new(duration_secs))
+            } else {
+                crate::logger::log(format!(
+                    "[wave] no coarse column: duration {duration_secs:.0}s wants {} bins,                      over the {} MiB budget; wide spans will decode their own window",
+                    coarse_bin_count(duration_secs),
+                    MAX_COARSE_WAVEFORM_BYTES / (1024 * 1024)
+                ));
+                CoarseBuildState::OverBudget
+            };
         }
     }
 
     fn coarse(&self) -> Option<&CoarseWaveform> {
         match &self.coarse {
             CoarseBuildState::Building(coarse) => Some(coarse),
-            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+            CoarseBuildState::Dormant
+            | CoarseBuildState::Unavailable(_)
+            | CoarseBuildState::OverBudget => None,
         }
     }
 
     fn coarse_mut(&mut self) -> Option<&mut CoarseWaveform> {
         match &mut self.coarse {
             CoarseBuildState::Building(coarse) => Some(coarse),
-            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+            CoarseBuildState::Dormant
+            | CoarseBuildState::Unavailable(_)
+            | CoarseBuildState::OverBudget => None,
         }
     }
 
@@ -2080,6 +2118,33 @@ mod tests {
         assert!(matches!(&runtime.coarse, CoarseBuildState::Dormant));
         runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS);
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
+    }
+
+    /// The coarse column is sized from the duration the container reports, which
+    /// backlog §1.13 already records as sometimes missing or nonsense. A dense
+    /// `Vec` proportional to that number reaches 2.2 GB for a year, and a value
+    /// large enough to saturate the cast aborts on the allocation itself.
+    #[test]
+    fn a_coarse_column_is_refused_when_the_duration_asks_for_more_than_the_budget() {
+        // Real recordings stay well inside it: a day is 864,000 bins, about 6 MiB.
+        assert!(coarse_column_fits_budget(60.0 * 60.0 * 24.0));
+        // The edge of the budget itself.
+        let max_bins = MAX_COARSE_WAVEFORM_BYTES / std::mem::size_of::<QuantizedWaveformBin>();
+        assert!(coarse_column_fits_budget(max_bins as f64 * COARSE_BIN_SECS));
+        // A year, which is what a broken duration reads like.
+        assert!(!coarse_column_fits_budget(60.0 * 60.0 * 24.0 * 365.0));
+        // Large enough that `as usize` saturates, so the multiply must be the guard.
+        assert!(!coarse_column_fits_budget(1e300));
+
+        let mut runtime = WaveWorkerRuntime::new();
+        runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
+        assert!(
+            matches!(&runtime.coarse, CoarseBuildState::OverBudget),
+            "an impossible duration must not allocate a column"
+        );
+        // It is not an audio failure: the waveform still works, window by window.
+        assert!(runtime.coarse().is_none());
+        assert!(!matches!(&runtime.coarse, CoarseBuildState::Unavailable(_)));
     }
 
     #[test]

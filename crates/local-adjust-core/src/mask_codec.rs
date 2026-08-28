@@ -49,10 +49,18 @@ const TAG_ALPHA_U8: &str = "q8z:";
 /// Tag for little-endian `u32` labels.
 const TAG_LABEL_U32: &str = "u32z:";
 
-/// A decompressed buffer larger than this is refused rather than allocated. A
-/// mask has one entry per pixel, so this allows a 4 gigapixel page — far past
-/// anything decodable — while keeping a corrupt length from exhausting memory.
-const MAX_DECODED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Most entries a single mask may declare, one per source pixel.
+///
+/// The header is the first thing read from a file that may be corrupt, or that a
+/// stranger wrote: edit bundles are made to be exchanged. So the count decides an
+/// allocation before any of the data behind it has been seen, and every entry is
+/// widened to four bytes once decoded.
+///
+/// 128 Mi entries is 134 megapixels, past any camera whose output can be edited
+/// here — the largest images mIV opens are panoramas, and 360 view refuses to
+/// enter edit mode at all, so no mask exists at that size. A page like the one in
+/// the table above is 13.8M, so this leaves an order of magnitude in hand.
+const MAX_MASK_ELEMENTS: usize = 128 * 1024 * 1024;
 
 static LEGACY_DECODES: AtomicU64 = AtomicU64::new(0);
 
@@ -101,14 +109,22 @@ fn decode<E: DeError>(tag: &str, bytes_per_element: usize, text: &str) -> Result
     let count: usize = count
         .parse()
         .map_err(|_| E::custom(format!("mask element count {count:?} is not a number")))?;
+    if count > MAX_MASK_ELEMENTS {
+        return Err(E::custom(format!(
+            "mask declares {count} entries, past the {MAX_MASK_ELEMENTS} a mask may hold"
+        )));
+    }
     let expected = count
         .checked_mul(bytes_per_element)
-        .filter(|bytes| *bytes <= MAX_DECODED_BYTES)
         .ok_or_else(|| E::custom("mask buffer is implausibly large"))?;
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
         .map_err(|error| E::custom(format!("mask base64: {error}")))?;
-    let mut out = Vec::with_capacity(expected);
+    // Grow into the bytes that actually arrive rather than reserving what the header
+    // asked for. `with_capacity(expected)` handed a corrupt count the whole allocation
+    // before reading a byte, so a payload of a few kilobytes could take gigabytes and
+    // end the process. `take` still stops a bomb one byte past the declared length.
+    let mut out = Vec::new();
     DeflateDecoder::new(compressed.as_slice())
         .take(expected as u64 + 1)
         .read_to_end(&mut out)
@@ -383,6 +399,37 @@ mod tests {
         assert!(
             error.to_string().contains("bytes"),
             "the error should say the length disagreed: {error}"
+        );
+    }
+
+    /// The count in the header decides an allocation before any of the data behind
+    /// it is read, and edit bundles are made to be handed to other people. A payload
+    /// of a few bytes must not be able to ask for gigabytes.
+    #[test]
+    fn a_small_payload_cannot_claim_a_count_past_the_ceiling() {
+        let mut mask = RasterVectorMask::empty(8, 8);
+        mask.alpha[3] = 1.0;
+        let json = serde_json::to_string(&mask).unwrap();
+        // The payload stays as it is; only the declared count moves.
+        let swapped = json.replace("\"q8z:64:", &format!("\"q8z:{}:", u64::MAX));
+        assert_ne!(swapped, json, "the count should have been replaced");
+        let error = serde_json::from_str::<RasterVectorMask>(&swapped)
+            .expect_err("a count past the ceiling must be refused, not allocated");
+        assert!(
+            error.to_string().contains("past the"),
+            "the error should name the ceiling: {error}"
+        );
+
+        // One entry over is refused; the ceiling itself is only rejected later, by the
+        // payload not carrying that many bytes -- never by allocating them up front.
+        let over = json.replace("\"q8z:64:", &format!("\"q8z:{}:", MAX_MASK_ELEMENTS + 1));
+        assert!(serde_json::from_str::<RasterVectorMask>(&over).is_err());
+        let at = json.replace("\"q8z:64:", &format!("\"q8z:{MAX_MASK_ELEMENTS}:"));
+        let error = serde_json::from_str::<RasterVectorMask>(&at)
+            .expect_err("the payload holds 64 entries, not the maximum");
+        assert!(
+            error.to_string().contains("bytes"),
+            "at the ceiling the length check should be what refuses it: {error}"
         );
     }
 
