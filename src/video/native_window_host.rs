@@ -17,13 +17,11 @@ use windows::Win32::UI::Input::Ime::{
     CANDIDATEFORM, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
     ImmSetCompositionWindow,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetCapture, SetFocus, VK_LBUTTON,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowRect, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_NO,
     IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDC_WAIT, LoadCursorW, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetCursor, SetWindowPos,
+    SetCursor,
 };
 
 use super::NativeVideoPlacement;
@@ -532,7 +530,11 @@ impl NativeWindowHost {
         let focus_t0 = std::time::Instant::now();
         if super::native_child_should_set_focus(placement, activate_on_show) {
             unsafe {
-                let _ = SetFocus(Some(self.presenter().hwnd()));
+                let _ = crate::presentation_observer::set_focus(
+                    Some(self.presenter().hwnd()),
+                    crate::presentation_observer::WindowRole::Presenter,
+                    "NativeWindowHost::show_for_placement",
+                );
             }
         }
         let focus_ms = focus_t0.elapsed().as_secs_f64() * 1000.0;
@@ -828,7 +830,7 @@ impl NativeWindowHost {
             ),
         );
         unsafe {
-            let _ = SetWindowPos(
+            let _ = crate::presentation_observer::set_window_pos(
                 self.hwnd(),
                 None,
                 x,
@@ -836,6 +838,8 @@ impl NativeWindowHost {
                 width as i32,
                 height as i32,
                 SWP_NOACTIVATE | SWP_NOZORDER,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeWindowHost::resize_existing_native_window_to_rect",
             );
         }
         (width, height)
@@ -873,7 +877,7 @@ impl NativeWindowHost {
             ),
         );
         unsafe {
-            let _ = SetWindowPos(
+            let _ = crate::presentation_observer::set_window_pos(
                 self.hwnd(),
                 None,
                 0,
@@ -881,6 +885,8 @@ impl NativeWindowHost {
                 width as i32,
                 height as i32,
                 SWP_NOACTIVATE | SWP_NOZORDER,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeWindowHost::reflow_child_to_parent_client",
             );
         }
         (width, height)

@@ -173,6 +173,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window_binding_probe (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",

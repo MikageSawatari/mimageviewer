@@ -22,6 +22,8 @@ pub use wgpu;
 
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
+/// mIV presentation observer bridge (backlog 1.139); temporary instrumentation.
+pub mod presentation_diag;
 mod mipmap;
 mod renderer;
 

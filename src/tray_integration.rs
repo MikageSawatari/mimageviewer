@@ -9,6 +9,15 @@ use eframe::egui;
 use crate::app::App;
 use crate::tray::TrayEvent;
 
+#[derive(Clone, Copy)]
+enum RetainedViewportPresentation {
+    Plain,
+    #[cfg(windows)]
+    Detached {
+        maximized: bool,
+    },
+}
+
 fn should_close_fullscreen_for_tray(
     fullscreen_open: bool,
     fs_cache_has_video: bool,
@@ -27,23 +36,73 @@ impl App {
         ctx: &egui::Context,
         visible: bool,
     ) -> usize {
-        let mut viewport_ids = Vec::new();
+        let mut viewports = Vec::new();
         if self.fs_viewport_shown {
-            viewport_ids.push(self.fullscreen_viewport_id());
+            #[cfg(windows)]
+            let presentation = if matches!(
+                self.fs_viewport_presentation,
+                Some(crate::app::ViewerPresentation::DetachedWindow)
+            ) {
+                RetainedViewportPresentation::Detached {
+                    maximized: self.active_detached_viewport_maximized_on_visible_commit(),
+                }
+            } else {
+                RetainedViewportPresentation::Plain
+            };
+            #[cfg(not(windows))]
+            let presentation = RetainedViewportPresentation::Plain;
+            viewports.push((self.fullscreen_viewport_id(), presentation));
         }
         #[cfg(windows)]
         {
             for window in &self.detached_image_windows {
                 let viewport_id = Self::detached_image_window_viewport_id(window.id);
-                if !viewport_ids.contains(&viewport_id) {
-                    viewport_ids.push(viewport_id);
+                if !viewports
+                    .iter()
+                    .any(|(existing, _)| *existing == viewport_id)
+                {
+                    viewports.push((
+                        viewport_id,
+                        RetainedViewportPresentation::Detached {
+                            maximized: self.detached_window_seed_placement(window.id).maximized,
+                        },
+                    ));
                 }
             }
         }
-        for viewport_id in &viewport_ids {
-            ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
+        let transition_owned_viewport = (visible
+            && self.video_presentation_transition.is_transitioning())
+        .then(|| self.fullscreen_viewport_id());
+        let mut commanded = 0;
+        for (viewport_id, presentation) in &viewports {
+            if transition_owned_viewport == Some(*viewport_id) {
+                continue;
+            }
+            if visible {
+                match presentation {
+                    RetainedViewportPresentation::Plain => {
+                        ctx.send_viewport_cmd_to(
+                            *viewport_id,
+                            egui::ViewportCommand::Visible(true),
+                        );
+                    }
+                    #[cfg(windows)]
+                    RetainedViewportPresentation::Detached { maximized } => {
+                        Self::send_detached_viewport_visible_commit(ctx, *viewport_id, *maximized);
+                    }
+                }
+            } else {
+                ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(false));
+            }
+            self.observe_viewport_presentation_command(
+                *viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "tray::set_all_viewports_visible",
+                if visible { "value=true" } else { "value=false" },
+            );
+            commanded += 1;
         }
-        viewport_ids.len()
+        commanded
     }
 
     /// Request the same root viewport close as the main window's [x] button.
@@ -224,9 +283,14 @@ impl App {
                 *slot.lock().unwrap() = captured;
             }
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+            use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
             unsafe {
-                let _ = ShowWindow(HWND(hwnd_raw as *mut _), SW_HIDE);
+                let _ = crate::presentation_observer::show_window(
+                    HWND(hwnd_raw as *mut _),
+                    SW_HIDE,
+                    crate::presentation_observer::WindowRole::Main,
+                    "tray_integration::hide_to_tray",
+                );
             }
         }
 

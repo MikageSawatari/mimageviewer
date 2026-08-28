@@ -15,8 +15,8 @@ use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE,
-    TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerType, POINTER_FLAG_CANCELED, POINTER_INFO,
@@ -25,23 +25,22 @@ use windows::Win32::UI::Input::{GetCurrentInputMessageSource, IMDT_TOUCH, INPUT_
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed,
-    LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, POINTER_INPUT_TYPE, PT_TOUCH,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect,
+    GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW, MA_ACTIVATE,
+    MA_ACTIVATEANDEAT, MSG, PM_REMOVE, POINTER_INPUT_TYPE, PT_TOUCH, PeekMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE, WM_POINTERUP,
+    WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -572,7 +571,7 @@ unsafe extern "system" fn in_window_resize_subclass_proc(
                                 child_hwnd.0 as usize, hwnd.0 as usize, w, h
                             ));
                         }
-                        let _ = SetWindowPos(
+                        let _ = crate::presentation_observer::set_window_pos(
                             child_hwnd,
                             None,
                             0,
@@ -580,6 +579,8 @@ unsafe extern "system" fn in_window_resize_subclass_proc(
                             w,
                             h,
                             SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
+                            crate::presentation_observer::WindowRole::Presenter,
+                            "in_window_resize_subclass",
                         );
                     }
                 }
@@ -732,12 +733,26 @@ impl NativeVideoWindow {
                     return Err(format!("CreateWindowExW: {err:?}"));
                 }
             };
+            crate::presentation_observer::register(
+                crate::presentation_observer::WindowRole::Presenter,
+                hwnd.0 as usize as u64,
+            );
             crate::dwm_transitions::disable_transitions_for_window(hwnd);
             if config.initially_visible {
                 let _ = if config.activate_on_show {
-                    ShowWindow(hwnd, SW_SHOW)
+                    crate::presentation_observer::show_window(
+                        hwnd,
+                        SW_SHOW,
+                        crate::presentation_observer::WindowRole::Presenter,
+                        "NativeVideoWindow::create",
+                    )
                 } else {
-                    ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                    crate::presentation_observer::show_window(
+                        hwnd,
+                        SW_SHOWNOACTIVATE,
+                        crate::presentation_observer::WindowRole::Presenter,
+                        "NativeVideoWindow::create",
+                    )
                 };
             }
             if config.initially_visible && raise_on_show && config.activate_on_show {
@@ -780,7 +795,12 @@ impl NativeVideoWindow {
         let dwm_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let show_t0 = std::time::Instant::now();
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = crate::presentation_observer::show_window(
+                self.hwnd,
+                SW_SHOW,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeVideoWindow::show_and_raise",
+            );
         }
         let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
         let raise_t0 = std::time::Instant::now();
@@ -809,12 +829,17 @@ impl NativeVideoWindow {
         let dwm_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let show_t0 = std::time::Instant::now();
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            let _ = crate::presentation_observer::show_window(
+                self.hwnd,
+                SW_SHOWNOACTIVATE,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeVideoWindow::show_no_activate",
+            );
         }
         let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
         let swp_t0 = std::time::Instant::now();
         unsafe {
-            let _ = SetWindowPos(
+            let _ = crate::presentation_observer::set_window_pos(
                 self.hwnd,
                 Some(HWND_TOP),
                 0,
@@ -822,6 +847,8 @@ impl NativeVideoWindow {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeVideoWindow::show_no_activate",
             );
         }
         crate::logger::log(format!(
@@ -846,7 +873,12 @@ impl NativeVideoWindow {
                 return false;
             }
             crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let _ = crate::presentation_observer::show_window(
+                self.hwnd,
+                SW_HIDE,
+                crate::presentation_observer::WindowRole::Presenter,
+                "NativeVideoWindow::hide",
+            );
         }
         log_window_state("hidden", self.hwnd);
         true
@@ -870,9 +902,17 @@ impl NativeVideoWindow {
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                 );
-                let _ = DestroyWindow(self.hwnd);
+                let _ = crate::presentation_observer::destroy_window(
+                    self.hwnd,
+                    crate::presentation_observer::WindowRole::Presenter,
+                    "NativeVideoWindow::destroy",
+                );
             }
         }
+        crate::presentation_observer::unregister(
+            crate::presentation_observer::WindowRole::Presenter,
+            self.hwnd.0 as usize as u64,
+        );
         self.hwnd = HWND::default();
     }
 }
@@ -1158,9 +1198,23 @@ pub fn claim_foreground(target_hwnd_raw: u64) -> ForegroundClaimReport {
         if attached {
             attach_probe.record(AttachSpanSamplePoint::AfterAttach);
         }
-        let set_foreground_ok = SetForegroundWindow(target).as_bool();
-        let set_active_ok = SetActiveWindow(target).is_ok();
-        let set_focus_ok = SetFocus(Some(target)).is_ok();
+        let set_foreground_ok = crate::presentation_observer::set_foreground_window(
+            target,
+            crate::presentation_observer::WindowRole::Presenter,
+            "claim_foreground",
+        );
+        let set_active_ok = crate::presentation_observer::set_active_window(
+            target,
+            crate::presentation_observer::WindowRole::Presenter,
+            "claim_foreground",
+        )
+        .is_ok();
+        let set_focus_ok = crate::presentation_observer::set_focus(
+            Some(target),
+            crate::presentation_observer::WindowRole::Presenter,
+            "claim_foreground",
+        )
+        .is_ok();
         attach_probe.record(AttachSpanSamplePoint::AfterFocus);
         let post_foreground = GetForegroundWindow();
         let detach_ok = attached && AttachThreadInput(this_tid, foreground_tid, false).as_bool();
@@ -1181,7 +1235,18 @@ pub fn claim_foreground(target_hwnd_raw: u64) -> ForegroundClaimReport {
 fn bring_hwnd_to_front(hwnd: HWND) -> bool {
     unsafe {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
-        SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok()
+        crate::presentation_observer::set_window_pos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            flags,
+            crate::presentation_observer::WindowRole::Presenter,
+            "bring_hwnd_to_front",
+        )
+        .is_ok()
     }
 }
 
@@ -1656,6 +1721,13 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     log_win32_message(TouchDebugWindow::Presenter, hwnd, msg, wparam, lparam);
+    crate::presentation_observer::observe_window_message(
+        hwnd,
+        crate::presentation_observer::WindowRole::Presenter,
+        msg,
+        wparam,
+        lparam,
+    );
     if let Some(result) = handle_presenter_pointer_message(hwnd, msg, wparam) {
         return result;
     }
@@ -1729,7 +1801,11 @@ unsafe extern "system" fn wnd_proc(
             }
             if wparam.0 as u32 == 0x1B && window_state(hwnd).is_some_and(|s| s.close_on_escape) {
                 unsafe {
-                    let _ = DestroyWindow(hwnd);
+                    let _ = crate::presentation_observer::destroy_window(
+                        hwnd,
+                        crate::presentation_observer::WindowRole::Presenter,
+                        "presenter_wndproc_escape",
+                    );
                 }
                 return LRESULT(0);
             }
@@ -2035,7 +2111,11 @@ unsafe extern "system" fn wnd_proc(
                 });
             }
             unsafe {
-                let _ = DestroyWindow(hwnd);
+                let _ = crate::presentation_observer::destroy_window(
+                    hwnd,
+                    crate::presentation_observer::WindowRole::Presenter,
+                    "presenter_wndproc_close",
+                );
             }
             LRESULT(0)
         }
@@ -2240,7 +2320,8 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW,
+        DestroyWindow, GetCursorPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetForegroundWindow, SetWindowPos, ShowWindow, WS_EX_TOOLWINDOW,
     };
 
     static CURSOR_WINDOW_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

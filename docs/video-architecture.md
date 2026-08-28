@@ -2325,6 +2325,9 @@ always-new 窓と同じく no-op として扱う。
 - F12 の detached mode 切替や main 側同期による host migration は、
   `switch_native_video_viewer_presentation` が `request_id` 付きの
   `NativeVideoOutputCommand::SwitchPlacement` を render orchestration へ送る。
+- transition request は detached host を `None / KeepLive / RetireOutgoing` として所有する。
+  成功時に egui host を退役できるのは DetachedWindow から MainWindow / Fullscreen へ離れる
+  遷移だけで、同じ DetachedWindow に留まる presenter 再構築 / host resync は live host を閉じない。
 - `detached_viewer_open_images_in_window` ON 中の動画 / 音声 F12 は、現在のメディアだけを
   MainWindow / Fullscreen と DetachedWindow の間で一時移動する。次に動画 / 音声を明示 open した場合は、
   永続設定に従って再び DetachedWindow へ戻る。
@@ -2336,8 +2339,12 @@ always-new 窓と同じく no-op として扱う。
   [src/video/mod.rs](../src/video/mod.rs)) が新 core へ状態 (再生位置 / overlay / VST /
   checked / SAR) と `FramePresentationState` が所有する現 frame を prime する。
   `present_retire` / `source.queue` は prime fallback に使わない。prime 失敗時は typed state を
-  旧 core 側に保持したまま staging を破棄する。`TargetReady` 後に pump が新 HWND を
-  publish して旧 HWND を破棄し、`PlacementSwitched` を `request_id` 付きで返す。
+  旧 core 側に保持したまま staging を破棄する。`TargetReady` は candidate を publish せず、App の
+  commit 後に pump が新 HWND を publish して `PlacementCommitted` を返す。App は同じ commit effect
+  batch で detached host の `Visible` / `Focus` command を先に発行し、続けて `RetirePlacement` を
+  発行する。pump は `TargetRetire` で旧 HWND/core を破棄して `PlacementRetired` を返す。
+  outgoing retire は incoming host の OS visibility level poll を待たない。candidate の publish / prime
+  完了が presenter ownership の cutover であり、host visibility は別 owner の事実である。
   attach/state restore/prime の失敗は staging だけを破棄して旧 host/core を維持し、
   `PlacementSwitchFailed` を返す。
 - App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`
@@ -2345,6 +2352,8 @@ always-new 窓と同じく no-op として扱う。
   `request_id` が pending と一致 (または presenter が pending target へ収束) した
   ときだけ `apply_video_presentation_switched` で更新する (= 旧 child HWND を
   fullscreen / VST owner と誤認しない。stale/mismatch な成功通知で新状態を巻き戻さない)。
+  DetachedWindow commit は current viewer context の window binding を先に公開し、その後に
+  `active_detached_session` を開始する。session が名指す unbound window は正当な中間状態ではない。
 - 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
   VST owner 同期 / VST availability を全停止する。
 - **close の世代タグ化 (旧 HWND teardown 由来の stale close 対策)**: window を

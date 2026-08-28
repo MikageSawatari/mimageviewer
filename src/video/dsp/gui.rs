@@ -34,14 +34,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetWindowRect, IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SC_CLOSE, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
-    WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT,
-    WM_PARENTNOTIFY, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
-    WS_THICKFRAME,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetWindowRect,
+    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SC_CLOSE, SW_SHOW,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOWPOS, WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_PARENTNOTIFY, WM_SIZE, WM_SYSCOMMAND,
+    WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -246,7 +245,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // SSL Meter Pro のグラフィカルな右クリックメニューが閉じる可能性がある。
                 let event_msg = (wparam.0 & 0xFFFF) as u32;
                 if event_msg == WM_LBUTTONDOWN {
-                    let _ = SetForegroundWindow(hwnd);
+                    let _ = crate::presentation_observer::set_foreground_window(
+                        hwnd,
+                        crate::presentation_observer::WindowRole::Other,
+                        "vst_gui::mouse_activate",
+                    );
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -405,7 +408,7 @@ fn sync_bridge_container_to_host(host_hwnd: HWND) {
         if !ClientToScreen(host_hwnd, &mut origin).as_bool() {
             return;
         }
-        let _ = SetWindowPos(
+        let _ = crate::presentation_observer::set_window_pos(
             container_hwnd,
             None,
             origin.x,
@@ -413,6 +416,8 @@ fn sync_bridge_container_to_host(host_hwnd: HWND) {
             width,
             height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::sync_bridge_container_to_host",
         );
     }
 }
@@ -459,7 +464,17 @@ fn sync_bridge_container_to_pending_window_pos(host_hwnd: HWND, pending: *const 
         } else {
             SWP_NOZORDER | SWP_NOACTIVATE
         };
-        let _ = SetWindowPos(container_hwnd, None, x, y, width, height, flags);
+        let _ = crate::presentation_observer::set_window_pos(
+            container_hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
+            flags,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::resize_bridge_container",
+        );
     }
 }
 
@@ -702,7 +717,7 @@ fn clamp_rect_origin_to_nearest_work_area(x: i32, y: i32, width: i32, height: i3
 
 fn ensure_window_visible_on_monitor(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+        GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
     unsafe {
@@ -720,7 +735,7 @@ fn ensure_window_visible_on_monitor(hwnd: HWND) {
             "[VST3 GUI] moved off-screen host window back on-screen: ({}, {}) -> ({}, {}) size={}x{}",
             rect.left, rect.top, x, y, width, height
         ));
-        let _ = SetWindowPos(
+        let _ = crate::presentation_observer::set_window_pos(
             hwnd,
             None,
             x,
@@ -728,6 +743,8 @@ fn ensure_window_visible_on_monitor(hwnd: HWND) {
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::ensure_window_visible_on_monitor",
         );
     }
 }
@@ -882,7 +899,12 @@ fn create_window(
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
         }
         if visible {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = crate::presentation_observer::show_window(
+                hwnd,
+                SW_SHOW,
+                crate::presentation_observer::WindowRole::Other,
+                "vst_gui::create",
+            );
         }
 
         // 実 client rect を確認 (デバッグ用)
@@ -924,7 +946,11 @@ fn close_window() {
         if let Some(st) = state.as_mut() {
             if let Some(hwnd) = st.hwnd.take() {
                 unsafe {
-                    let _ = DestroyWindow(hwnd);
+                    let _ = crate::presentation_observer::destroy_window(
+                        hwnd,
+                        crate::presentation_observer::WindowRole::Other,
+                        "vst_gui::destroy",
+                    );
                 }
             }
             st.close_tx = None;
@@ -974,17 +1000,20 @@ pub fn get_window_rect(hwnd_u64: u64) -> Option<(i32, i32, u32, u32)> {
 /// 一部の環境 (= Always On Top を解除する別アプリの介入等) で外れることがあるため、
 /// 念のため SetWindowPos(HWND_TOPMOST) も毎回呼ぶ。
 pub fn bring_to_front(hwnd_u64: u64) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_TOPMOST, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE};
     if hwnd_u64 == 0 {
         return;
     }
     unsafe {
         let hwnd = HWND(hwnd_u64 as *mut _);
         crate::dwm_transitions::disable_transitions_for_window(hwnd);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetWindowPos(
+        let _ = crate::presentation_observer::show_window(
+            hwnd,
+            SW_SHOW,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::raise_window",
+        );
+        let _ = crate::presentation_observer::set_window_pos(
             hwnd,
             Some(HWND_TOPMOST),
             0,
@@ -992,6 +1021,8 @@ pub fn bring_to_front(hwnd_u64: u64) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::raise_window",
         );
     }
 }
@@ -1052,7 +1083,7 @@ pub fn snapshot_z_order(targets: &[u64]) -> Vec<u64> {
 /// フォーカスを取れず即閉じる挙動を回避)。
 pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     };
     if hwnd_u64 == 0 {
         return;
@@ -1064,7 +1095,7 @@ pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
         } else {
             HWND_NOTOPMOST
         };
-        let _ = SetWindowPos(
+        let _ = crate::presentation_observer::set_window_pos(
             hwnd,
             Some(z),
             0,
@@ -1072,6 +1103,8 @@ pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::set_window_topmost",
         );
     }
 }
@@ -1083,7 +1116,7 @@ pub fn set_window_topmost(hwnd_u64: u64, topmost: bool) {
 /// 呼ぶと plugin の重い初期化が走り「重くなって固まる」「DAW より遅い」
 /// 報告 (2026-04) の根本原因になっていた。窓は破棄せず可視状態のみ切替える。
 pub fn set_window_visible(hwnd_u64: u64, visible: bool) {
-    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA, ShowWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
     if hwnd_u64 == 0 {
         return;
     }
@@ -1093,7 +1126,12 @@ pub fn set_window_visible(hwnd_u64: u64, visible: bool) {
         if visible {
             ensure_window_visible_on_monitor(hwnd);
         }
-        let _ = ShowWindow(hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
+        let _ = crate::presentation_observer::show_window(
+            hwnd,
+            if visible { SW_SHOWNA } else { SW_HIDE },
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::set_window_visible",
+        );
     }
 }
 
@@ -1120,7 +1158,7 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
         let hwnd = HWND(hwnd_u64 as *mut _);
-        let _ = SetWindowPos(
+        let _ = crate::presentation_observer::set_window_pos(
             hwnd,
             None,
             0,
@@ -1128,6 +1166,8 @@ pub fn resize_window_client(hwnd_u64: u64, width: u32, height: u32) {
             outer_w,
             outer_h,
             SWP_NOMOVE | SWP_NOZORDER,
+            crate::presentation_observer::WindowRole::Other,
+            "vst_gui::resize_window_client",
         );
     }
 }

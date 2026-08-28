@@ -65,15 +65,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IsWindow,
+    MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, WINDOWPOS, WM_APPCOMMAND,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
@@ -233,6 +233,11 @@ impl HudOverlayWindow {
                 }
             };
 
+            crate::presentation_observer::register(
+                crate::presentation_observer::WindowRole::Hud,
+                hwnd.0 as usize as u64,
+            );
+
             crate::dwm_transitions::disable_transitions_for_window(hwnd);
 
             // 初期 region は「空」(= 全画面 click-through、bar 非表示時)。
@@ -257,7 +262,12 @@ impl HudOverlayWindow {
             // 初期 region は空 (= 全画面穴) なので、ShowWindow を呼んでも物理的に
             // 表示される pixel はなく flicker は起きない。CP5 で region に実 UI rect が
             // 入って初めて HUD のピクセルが見えるようになる。
-            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            let _ = crate::presentation_observer::show_window(
+                hwnd,
+                SW_SHOWNA,
+                crate::presentation_observer::WindowRole::Hud,
+                "HudOverlayWindow::create",
+            );
 
             Ok(Self {
                 hwnd,
@@ -282,7 +292,7 @@ impl HudOverlayWindow {
             return;
         }
         unsafe {
-            let _ = SetWindowPos(
+            let _ = crate::presentation_observer::set_window_pos(
                 self.hwnd,
                 None,
                 x,
@@ -290,6 +300,8 @@ impl HudOverlayWindow {
                 w.max(1) as i32,
                 h.max(1) as i32,
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                crate::presentation_observer::WindowRole::Hud,
+                "HudOverlayWindow::set_geometry",
             );
         }
     }
@@ -306,7 +318,12 @@ impl HudOverlayWindow {
             return;
         }
         unsafe {
-            let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
+            let _ = crate::presentation_observer::show_window(
+                self.hwnd,
+                if visible { SW_SHOWNA } else { SW_HIDE },
+                crate::presentation_observer::WindowRole::Hud,
+                "HudOverlayWindow::set_visible",
+            );
         }
     }
 
@@ -317,7 +334,7 @@ impl HudOverlayWindow {
             return;
         }
         unsafe {
-            let _ = SetWindowPos(
+            let _ = crate::presentation_observer::set_window_pos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
                 0,
@@ -325,6 +342,8 @@ impl HudOverlayWindow {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                crate::presentation_observer::WindowRole::Hud,
+                "HudOverlayWindow::raise_to_top",
             );
         }
     }
@@ -364,10 +383,18 @@ impl Drop for HudOverlayWindow {
         if !self.hwnd.0.is_null() {
             unsafe {
                 if IsWindow(Some(self.hwnd)).as_bool() {
-                    let _ = DestroyWindow(self.hwnd);
+                    let _ = crate::presentation_observer::destroy_window(
+                        self.hwnd,
+                        crate::presentation_observer::WindowRole::Hud,
+                        "HudOverlayWindow::drop",
+                    );
                 }
             }
         }
+        crate::presentation_observer::unregister(
+            crate::presentation_observer::WindowRole::Hud,
+            self.hwnd.0 as usize as u64,
+        );
         // state_ptr は WM_NCDESTROY で Box::from_raw して drop される。
     }
 }
@@ -687,6 +714,13 @@ unsafe extern "system" fn hud_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
+    crate::presentation_observer::observe_window_message(
+        hwnd,
+        crate::presentation_observer::WindowRole::Hud,
+        msg,
+        wparam,
+        lparam,
+    );
     if let Some(state) = window_state(hwnd) {
         let WindowState {
             event_sink,

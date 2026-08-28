@@ -126,19 +126,32 @@ pub(crate) enum StagingWindow {
         host: HostedWindow,
         visibility: WindowVisibility,
     },
+    Ready {
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    },
+    Committed {
+        host: HostedWindow,
+        visibility: WindowVisibility,
+    },
 }
 
 impl StagingWindow {
     fn epoch(self) -> WindowEpoch {
         match self {
             Self::Requested { epoch, .. } => epoch,
-            Self::Created { host, .. } => host.epoch,
+            Self::Created { host, .. }
+            | Self::Ready { host, .. }
+            | Self::Committed { host, .. } => host.epoch,
         }
     }
 
     fn visibility(self) -> WindowVisibility {
         match self {
-            Self::Requested { visibility, .. } | Self::Created { visibility, .. } => visibility,
+            Self::Requested { visibility, .. }
+            | Self::Created { visibility, .. }
+            | Self::Ready { visibility, .. }
+            | Self::Committed { visibility, .. } => visibility,
         }
     }
 
@@ -150,6 +163,8 @@ impl StagingWindow {
                 visibility,
             },
             Self::Created { host, .. } => Self::Created { host, visibility },
+            Self::Ready { host, .. } => Self::Ready { host, visibility },
+            Self::Committed { host, .. } => Self::Committed { host, visibility },
         }
     }
 }
@@ -419,6 +434,18 @@ pub(crate) enum WindowHostEvent {
         failure: WindowHostFailure,
     },
     TargetReady {
+        request: WindowRequestId,
+        epoch: WindowEpoch,
+    },
+    TargetCommit {
+        request: WindowRequestId,
+        epoch: WindowEpoch,
+    },
+    TargetRetire {
+        request: WindowRequestId,
+        epoch: WindowEpoch,
+    },
+    TargetAbort {
         request: WindowRequestId,
         epoch: WindowEpoch,
     },
@@ -733,7 +760,10 @@ fn set_visibility(
             visibility: old_visibility,
         } if staging.epoch() == epoch => {
             if old_visibility == visibility {
-                return WindowHostTransition::confirmed_visibility(state, old, visibility);
+                return WindowHostTransition::ignored(
+                    state,
+                    WindowHostTransitionStatus::IgnoredIdempotent,
+                );
             }
             WindowHostTransition::applied(
                 WindowHostState::Switching {
@@ -742,10 +772,7 @@ fn set_visibility(
                     staging: staging.with_visibility(visibility),
                     visibility,
                 },
-                vec![WindowHostEffect::ApplyVisibility {
-                    host: old,
-                    visibility,
-                }],
+                Vec::new(),
             )
         }
         WindowHostState::Visible { request, host } if host.epoch == epoch => {
@@ -853,7 +880,9 @@ fn collect_staging_for_close(
                 epoch,
             });
         }
-        StagingWindow::Created { host, .. } => created.push(host),
+        StagingWindow::Created { host, .. }
+        | StagingWindow::Ready { host, .. }
+        | StagingWindow::Committed { host, .. } => created.push(host),
     }
 }
 
@@ -871,6 +900,9 @@ fn reduce_event(state: WindowHostState, event: WindowHostEvent) -> WindowHostTra
             failure,
         } => window_create_failed(state, request, epoch, failure),
         WindowHostEvent::TargetReady { request, epoch } => target_ready(state, request, epoch),
+        WindowHostEvent::TargetCommit { request, epoch } => target_commit(state, request, epoch),
+        WindowHostEvent::TargetRetire { request, epoch } => target_retire(state, request, epoch),
+        WindowHostEvent::TargetAbort { request, epoch } => target_abort(state, request, epoch),
         WindowHostEvent::TargetFailed {
             request,
             epoch,
@@ -970,7 +1002,11 @@ fn window_created(
                 vec![WindowHostEffect::AttachTarget { host: event_host }],
             )
         }
-        StagingWindow::Created { host, .. } if host == event_host => {
+        StagingWindow::Created { host, .. }
+        | StagingWindow::Ready { host, .. }
+        | StagingWindow::Committed { host, .. }
+            if host == event_host =>
+        {
             WindowHostTransition::ignored(state, WindowHostTransitionStatus::IgnoredIdempotent)
         }
         _ => WindowHostTransition::new(
@@ -991,31 +1027,27 @@ fn target_ready(
             request: expected_request,
             staging: StagingWindow::Created { host, visibility },
             prior,
-        } if expected_request == request && host.epoch == epoch => {
-            let mut effects = vec![WindowHostEffect::Publish { host, visibility }];
-            if let PriorHost::Prior {
-                host: prior_host, ..
-            } = prior
-            {
-                effects.push(WindowHostEffect::Destroy { host: prior_host });
-                effects.push(WindowHostEffect::DetachTarget {
-                    lease: prior_host.lease(),
-                });
-            }
-            WindowHostTransition::applied(active_state(request, host, visibility), effects)
-        }
+        } if expected_request == request && host.epoch == epoch => WindowHostTransition::applied(
+            WindowHostState::Preparing {
+                request,
+                staging: StagingWindow::Ready { host, visibility },
+                prior,
+            },
+            Vec::new(),
+        ),
         WindowHostState::Switching {
             request: expected_request,
             old,
             staging: StagingWindow::Created { host, visibility },
             ..
         } if expected_request == request && host.epoch == epoch => WindowHostTransition::applied(
-            active_state(request, host, visibility),
-            vec![
-                WindowHostEffect::Publish { host, visibility },
-                WindowHostEffect::Destroy { host: old },
-                WindowHostEffect::DetachTarget { lease: old.lease() },
-            ],
+            WindowHostState::Switching {
+                request,
+                old,
+                staging: StagingWindow::Ready { host, visibility },
+                visibility,
+            },
+            Vec::new(),
         ),
         WindowHostState::Preparing {
             request: expected_request,
@@ -1036,6 +1068,148 @@ fn target_ready(
         ),
         _ => WindowHostTransition::ignored(state, WindowHostTransitionStatus::IgnoredStale),
     }
+}
+
+fn target_commit(
+    state: WindowHostState,
+    request: WindowRequestId,
+    epoch: WindowEpoch,
+) -> WindowHostTransition {
+    match state {
+        WindowHostState::Preparing {
+            request: expected,
+            staging: StagingWindow::Ready { host, visibility },
+            prior,
+        } if expected == request && host.epoch == epoch => WindowHostTransition::applied(
+            WindowHostState::Preparing {
+                request,
+                staging: StagingWindow::Committed { host, visibility },
+                prior,
+            },
+            vec![WindowHostEffect::Publish { host, visibility }],
+        ),
+        WindowHostState::Switching {
+            request: expected,
+            old,
+            staging: StagingWindow::Ready { host, visibility },
+            ..
+        } if expected == request && host.epoch == epoch => WindowHostTransition::applied(
+            WindowHostState::Switching {
+                request,
+                old,
+                staging: StagingWindow::Committed { host, visibility },
+                visibility,
+            },
+            vec![WindowHostEffect::Publish { host, visibility }],
+        ),
+        _ => WindowHostTransition::ignored(state, WindowHostTransitionStatus::IgnoredStale),
+    }
+}
+
+fn target_retire(
+    state: WindowHostState,
+    request: WindowRequestId,
+    epoch: WindowEpoch,
+) -> WindowHostTransition {
+    match state {
+        WindowHostState::Preparing {
+            request: expected,
+            staging: StagingWindow::Committed { host, visibility },
+            prior,
+        } if expected == request && host.epoch == epoch => {
+            retire_prior(request, host, visibility, prior)
+        }
+        WindowHostState::Switching {
+            request: expected,
+            old,
+            staging: StagingWindow::Committed { host, visibility },
+            ..
+        } if expected == request && host.epoch == epoch => retire_prior(
+            request,
+            host,
+            visibility,
+            PriorHost::Prior {
+                host: old,
+                visibility,
+            },
+        ),
+        _ => WindowHostTransition::ignored(state, WindowHostTransitionStatus::IgnoredStale),
+    }
+}
+
+fn retire_prior(
+    request: WindowRequestId,
+    host: HostedWindow,
+    visibility: WindowVisibility,
+    prior: PriorHost,
+) -> WindowHostTransition {
+    let mut effects = Vec::new();
+    if let PriorHost::Prior {
+        host: prior_host, ..
+    } = prior
+    {
+        effects.push(WindowHostEffect::Destroy { host: prior_host });
+        effects.push(WindowHostEffect::DetachTarget {
+            lease: prior_host.lease(),
+        });
+    }
+    WindowHostTransition::applied(active_state(request, host, visibility), effects)
+}
+
+fn target_abort(
+    state: WindowHostState,
+    request: WindowRequestId,
+    epoch: WindowEpoch,
+) -> WindowHostTransition {
+    match state {
+        WindowHostState::Preparing {
+            request: expected,
+            staging,
+            prior,
+        } if expected == request && staging.epoch() == epoch => {
+            abort_candidate(request, staging, prior)
+        }
+        WindowHostState::Switching {
+            request: expected,
+            old,
+            staging,
+            visibility,
+        } if expected == request && staging.epoch() == epoch => abort_candidate(
+            request,
+            staging,
+            PriorHost::Prior {
+                host: old,
+                visibility,
+            },
+        ),
+        _ => WindowHostTransition::ignored(state, WindowHostTransitionStatus::IgnoredStale),
+    }
+}
+
+fn abort_candidate(
+    request: WindowRequestId,
+    staging: StagingWindow,
+    prior: PriorHost,
+) -> WindowHostTransition {
+    let mut effects = Vec::new();
+    match staging {
+        StagingWindow::Requested { epoch, .. } => {
+            effects.push(WindowHostEffect::CancelCreate { request, epoch });
+        }
+        StagingWindow::Created { host, .. }
+        | StagingWindow::Ready { host, .. }
+        | StagingWindow::Committed { host, .. } => {
+            effects.push(WindowHostEffect::Destroy { host });
+            effects.push(WindowHostEffect::DetachTarget {
+                lease: host.lease(),
+            });
+        }
+    }
+    let next = match prior {
+        PriorHost::NoPrior => WindowHostState::Empty,
+        PriorHost::Prior { host, visibility } => active_state(host.request, host, visibility),
+    };
+    WindowHostTransition::applied(next, effects)
 }
 
 fn window_create_failed(
@@ -1082,7 +1256,10 @@ fn target_failed(
             prior,
         } if expected == request && staging.epoch() == epoch => {
             let mut cleanup = Vec::new();
-            if let StagingWindow::Created { host, .. } = staging {
+            if let StagingWindow::Created { host, .. }
+            | StagingWindow::Ready { host, .. }
+            | StagingWindow::Committed { host, .. } = staging
+            {
                 cleanup.push(WindowHostEffect::Destroy { host });
                 cleanup.push(WindowHostEffect::DetachTarget {
                     lease: host.lease(),
@@ -1097,7 +1274,10 @@ fn target_failed(
             visibility,
         } if expected == request && staging.epoch() == epoch => {
             let mut effects = Vec::new();
-            if let StagingWindow::Created { host, .. } = staging {
+            if let StagingWindow::Created { host, .. }
+            | StagingWindow::Ready { host, .. }
+            | StagingWindow::Committed { host, .. } = staging
+            {
                 effects.push(WindowHostEffect::Destroy { host });
                 effects.push(WindowHostEffect::DetachTarget {
                     lease: host.lease(),
@@ -1170,7 +1350,10 @@ fn window_destroyed(state: WindowHostState, lease: WindowLease) -> WindowHostTra
             )
         }
         WindowHostState::Preparing {
-            staging: StagingWindow::Created { host, .. },
+            staging:
+                StagingWindow::Created { host, .. }
+                | StagingWindow::Ready { host, .. }
+                | StagingWindow::Committed { host, .. },
             prior,
             ..
         } if host.lease() == lease => {
@@ -1196,7 +1379,10 @@ fn window_destroyed(state: WindowHostState, lease: WindowLease) -> WindowHostTra
         ),
         WindowHostState::Switching {
             old,
-            staging: StagingWindow::Created { host, .. },
+            staging:
+                StagingWindow::Created { host, .. }
+                | StagingWindow::Ready { host, .. }
+                | StagingWindow::Committed { host, .. },
             visibility,
             ..
         } if host.lease() == lease => WindowHostTransition::applied(
@@ -1460,6 +1646,14 @@ mod tests {
                             request: host.request,
                             epoch: host.epoch,
                         });
+                        self.events.push_back(WindowHostEvent::TargetCommit {
+                            request: host.request,
+                            epoch: host.epoch,
+                        });
+                        self.events.push_back(WindowHostEvent::TargetRetire {
+                            request: host.request,
+                            epoch: host.epoch,
+                        });
                     }
                     WindowHostEffect::Destroy { host }
                     | WindowHostEffect::DestroyOrphan { host } => {
@@ -1551,7 +1745,36 @@ mod tests {
                 epoch: WindowEpoch(10),
             }),
         );
-        assert!(matches!(state, WindowHostState::Visible { .. }));
+        assert!(matches!(
+            state,
+            WindowHostState::Preparing {
+                staging: StagingWindow::Ready { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            backend
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, WindowHostEffect::Publish { .. }))
+                .count(),
+            0
+        );
+
+        let state = backend.dispatch_and_drain(
+            state,
+            WindowHostInput::Event(WindowHostEvent::TargetCommit {
+                request: WindowRequestId(1),
+                epoch: WindowEpoch(10),
+            }),
+        );
+        assert!(matches!(
+            state,
+            WindowHostState::Preparing {
+                staging: StagingWindow::Committed { .. },
+                ..
+            }
+        ));
         assert_eq!(
             backend
                 .effects
@@ -1560,6 +1783,15 @@ mod tests {
                 .count(),
             1
         );
+
+        let state = backend.dispatch_and_drain(
+            state,
+            WindowHostInput::Event(WindowHostEvent::TargetRetire {
+                request: WindowRequestId(1),
+                epoch: WindowEpoch(10),
+            }),
+        );
+        assert!(matches!(state, WindowHostState::Visible { .. }));
     }
 
     #[test]
@@ -1722,7 +1954,21 @@ mod tests {
                 epoch: WindowEpoch(11),
             }),
         );
-        let current = match ready.state {
+        let committed = reduce_window_host(
+            ready.state,
+            WindowHostInput::Event(WindowHostEvent::TargetCommit {
+                request: WindowRequestId(2),
+                epoch: WindowEpoch(11),
+            }),
+        );
+        let retired = reduce_window_host(
+            committed.state,
+            WindowHostInput::Event(WindowHostEvent::TargetRetire {
+                request: WindowRequestId(2),
+                epoch: WindowEpoch(11),
+            }),
+        );
+        let current = match retired.state {
             WindowHostState::Visible { host, .. } => host,
             other => panic!("expected visible replacement, got {other:?}"),
         };

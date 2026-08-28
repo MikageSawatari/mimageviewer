@@ -3356,7 +3356,7 @@ placement.is_sane() && crate::monitor::title_bar_on_some_monitor(placement.x, pl
 - 規模 \\ 優先度: Small ～ Medium / P2 (出荷ブロッカーではないが、
   **リリース前の全体テストが理由なく赤くなる**ので早めに閉じる)。
 
-### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — 未対応
+### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — R2b + retire follow-up 実装済み、実機計測待ち
 
 > ⚠ detached viewer リワーク中の領域。症状パッチ (delay / guard / 追加 repaint) を入れない。
 
@@ -3451,6 +3451,390 @@ z-order / show / raise / destroy のたびにどちらが手前かが入れ替�
 > 当初私はこのボタン側を数えており、**利用者の指摘で対象を間違えていたことが分かった**。
 - 関連: §1.115 (font atlas 側。**別機構**。破棄フレームは 14 → 0 になったがちらつきは残った)。
 - 規模 \ 優先度: Medium ～ Large / P2。
+
+#### R2b 実装結果 (2026-08-28)
+
+- `pending_detached_video_host_switch` と `native_video_mode_switch` を廃止し、context-owned
+  `PresentationTransitionOwner` (`Stable → Preparing → Ready → Committing → Stable`) へ統合した。
+  current / target / request generation / activation intent と candidate/prior HWND を 1 request が
+  所有し、F12 再入力、failure、Esc、window close、player end、stale Ready/Commit を reducer で
+  解決する。
+- native contract は hidden candidate の create/attach/prime を `Ready` までに済ませ、`Commit` で
+  初めて publish する。`NativeCommitted` で host `Visible/Focus` を先に発行し、同じ effect batch で
+  outgoing を retire する。incoming host の OS visibility poll は retire の前提にしない。
+  fixed-ms commit / forced recovery は無い。failure/abort は hidden candidate だけを cleanup する。
+- host `Visible/Focus/Destroy` と native `Publish/Destroy` を reducer effect に限定し、遷移中の
+  presenter/HUD/VST/focus recovery は同じ permit を読む。実 action は transition id / target / HWND
+  付き `[presentation-transition]` ログに出る。既存 `[ui-frame-gap]` / `[atlas-probe]` は変更していない。
+- 自動回帰は両方向、abort、F12 再入力、Esc、window close、player end、stale generation を含む。
+  出荷判定前に実機 1 往復で **outgoing presenter raise 0 / cover change 各方向 1 /
+  content-ready 前 host activation 0** を画面キャプチャとログで照合する。
+
+#### build I: publish 済み outgoing presenter の retire が UI sleep に依存 (2026-08-28 follow-up)
+
+```
+18.726  Publish incoming presenter
+18.727  placement committed
+18.732  host Visible / Focus
+19.216  shared output pool exhausted (以後約500msごと)
+24.630  [ui-frame-gap] 5899.4ms
+24.632  Destroy outgoing presenter        <- window click 直後
+24.661  placement retired
+```
+
+`Committing::AwaitingHostVisible` が、次の `App::update` による `IsWindowVisible(host)` の level poll まで
+`RetirePlacement` を出さなかった。native `PlacementCommitted` / `PlacementRetired` は lossless event bus
+から root viewport を wake するが、その間の `HostVisible` は UI-only event である。poll 末尾の
+`request_repaint` と visibility / focus / redraw の window event が次 pass を起こす想定だった。
+build F の約 70ms 完了も第2 pass は必要で、incidental window event に起こされただけだった。
+
+`DetachedHostDisposition` はこの依存を導入していない。問題の `Fullscreen → DetachedWindow` では
+disposition は `None` で、変更差分にも `AwaitingHostVisible` の変更は無い。build I は偶発 wake の
+無いスケジュールで既存の依存を露出させた。
+
+candidate は `NativeCommitted` が届く時点で create / attach / current-frame prime / pump publish 済み。
+ここを presenter ownership の cutover とし、commit effect を
+`ApplyPresentation → Visible → Focus → RetireOutgoing` に変更した。host command は先行させるが、
+OS visibility confirmation を retire の前提にはしない。`AwaitingHostVisible` / `HostVisible` poll は
+撤去し、timeout / retry / settle window / 追加 repaint は入れていない。
+
+GPU output pool は 16 slot、source queue は最大 8、copy-fence retire queue は最大 4 で、candidate
+prime の短い二重生存は設計内。二 presenter の zero-overlap 制約ではなく、5.9秒残った旧 fence owner
+が pool exhaustion を起こした。容量 tuning ではなく lifecycle ordering の correctness defect である。
+
+回帰テスト
+`fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility` は commit batch の
+順序と `AwaitingRetire` を固定する。retire を incoming host event の後ろへ戻す killing mutation では
+commit batch から `RetireOutgoing` が消えて失敗する。
+
+次 run では `shared output pool exhausted waiting for free slot` の連続、同区間の約5.9秒
+`[ui-frame-gap]` が無いことを確認する。`Destroy outgoing` は `placement committed` の直後、
+同じ UI pass で送った retire command の pump / WM teardown 分だけ後に並ぶ。固定msを受け入れ条件には
+しないが、build F と同じ数十ms級で、秒単位や user input 待ちにならないことを timeline で照合する。
+
+R4 に残るのは `show_viewport_deferred`、single render entry、host persistence。今回も F12 OFF は
+terminal に host HWND を破棄するため、次の ON では約 300ms の hidden host 作成を待つ。
+この待ち時間自体の短縮、F12 を跨ぐ taskbar button/host identity の永続化は本項の R2b close には
+含めず、R4 gate C の仕様決定後に扱う。
+
+### 1.138 F12 往復で `active detached backstop window N has no context binding` で落ちる — 実機クラッシュ
+
+- 出典: 2026-08-28、利用者が F12 を何度か押してクラッシュ。**2 日で 2 回踏んでいる**。
+- **今日の §1.137 (遷移所有者) の退行ではない。** 遷移所有者を含まないビルド C でも
+  同一メッセージで落ちている (`panic.log` 2026-08-28 00:23:56、frame 10 = `App::update`)。
+- アサーション自体は **2026-08-25 `bf391e6a`** (R2e の所有権整理) で入った。
+
+```
+PANIC at src\ui_fullscreen.rs:13611:21: active detached backstop window 1 has no context binding
+```
+
+#### ログ (ビルド F、遷移所有者あり)
+
+```
+16.131  [presentation-transition] id=3 target=Fullscreen effect=Publish  hwnd=0x7e0b0a
+16.193  [native-video] placement committed placement=fullscreen-borderless request=3 generation=4
+16.198  [presentation-transition] id=3 target=Fullscreen effect=Destroy  hwnd=0x382c58
+16.402  PANIC ... active detached backstop window 1 has no context binding
+```
+
+3 回目の F12 (detached → fullscreen) の **204ms 後**。遷移そのものは成功しており
+(`Raise` 0 件、`Publish` が `Visible`/`Focus` より先)、その直後に落ちている。
+
+#### 観測で訂正した状態 (2026-08-28、次の実機 run)
+
+前節の「session が生きたまま binding が先に消えた」という方向は、追加計装で**反証された**。
+実際の session producer は 2 本あり、通常 open は binding 済み、native placement commit は
+binding 無しで session を新規作成していた。
+
+```
+seq=1  set caller=src\\app.rs:43150              window 1 binding=ViewerContextId(0)/Mounted
+seq=3  set caller=src\\app\\native_video.rs:3604 window 1 binding=none
+seq=13 set caller=src\\app\\native_video.rs:3604 window 3 binding=none
+```
+
+seq=3 / 13 の前に unbind は無い。`apply_video_presentation_switched` が
+`ensure_detached_viewer_window_id()` の後、context binding を確立せず
+`begin_active_detached_session(id, Video)` を呼んでいた。backstop はその不正な session を数百 ms
+観測し続け、mount へ到達した frame で初めて `None` を検出した。したがって 1.138 の実原因は
+binding の早期解放ではなく、**binding の無い window を名指す active session の生成**である。
+
+同じ run は別の独立した transition owner 退行も確定した。detached host resync の
+`DetachedWindow → DetachedWindow` 遷移が current host を outgoing host として request に保存し、
+native retire 完了後にその live host へ `DestroyHost` を発行していた。F11 は detached 窓の
+borderless 切替だけだが、その後の同一 presentation host resync が窓を閉じ、close request が
+fullscreen / player を終了させた。
+
+#### 原因と修正 (2026-08-28、観測後の訂正版)
+
+active session は backstop が描画 owner を mount できるという公開済み所有権なので、unbound
+window を指す中間状態は正当ではない。通常 open (`prepare_viewer_presentation_open`) が従来から
+行っていた `bind_window(mounted, id)` を共通 helper へ集約し、native commit と egui F12 経路も
+session begin より前に通す。context build の binding は commit 前非公開という I8 を守るため、
+book session begin は build closure 内から commit 後・repaint 前へ移した。production の
+`begin_active_detached_session` も Mounted / AtRest binding が無い開始を所有境界で拒否する。
+backstop の契約と追加計装は弱めず、そのまま残す。
+
+host 側は request の raw `outgoing_host_hwnd` を、`None / KeepLive / RetireOutgoing` の typed
+disposition に置換した。成功時に live detached host を退役できるのは
+`DetachedWindow → MainWindow/Fullscreen` だけである。`DetachedWindow → DetachedWindow` は
+presenter の再構築 / 再親付けなので host を保持する。detached 候補の abort / failure と terminal
+close による host cleanup は、この成功時退役とは別の lifecycle effect として維持する。
+
+前回入れた `unbind_window` assertion、`retire_context` 内の session finish、handoff-before-unbind
+は、今回観測された 1.138 の原因修正ではなかった。ただし binding 確立後に反対向きの違反
+(session を残した release) を作らせない補完的不変条件であり、撤去しない。これらのテストは
+「今回の再現原因」ではなく release / retire ownership hardening の回帰証明として位置付け直す。
+A (host disposition) と B (binding-before-session) は同じ commit effect の約 30µs 内に並んだが、
+状態 owner も壊した不変条件も異なる独立 defect である。
+
+- 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
+
+### 1.139 タスクバー明滅の原因 = 遷移中のフォアグラウンド往復 (2026-08-28 実測で特定)
+
+**§1.137 の本体。** 計装 (`[presentation-window]`) とキャプチャの突き合わせで確定した。
+
+#### 何が起きているか
+
+fullscreen → detached の遷移中、**新しい presenter を Publish する前の約 300ms**、
+フォアグラウンドが「出ていく presenter」と「入ってくるホスト」の間を **約 100ms 周期で
+3 往復**する。1 周期はこの形:
+
+```
+WM_ACTIVATE    presenter   fg=presenter
+WM_KILLFOCUS   presenter   fg=<host>
+WM_WINDOWPOSCHANGED presenter
+WM_WINDOWPOSCHANGED main
+WM_ACTIVATE    presenter   fg=presenter
+WM_SETFOCUS    presenter
+```
+
+実測 (transition=14、キャプチャ時刻に換算):
+
+```
+26.643 ACTIVATE / 26.661 KILLFOCUS(fg=host) / 26.708 POSCHANGED x2
+26.722 ACTIVATE / 26.725 SETFOCUS / 26.738 ACTIVATE
+26.758 KILLFOCUS(fg=host) / 26.807 POSCHANGED x2
+26.819 ACTIVATE / 26.823 SETFOCUS / 26.841 ACTIVATE
+26.865 KILLFOCUS(fg=host) / 26.899 POSCHANGED x2
+26.928 ACTIVATE / 26.935 SETFOCUS
+27.133 ← ここでようやく新 presenter を Publish
+```
+
+`WM_WINDOWPOSCHANGED` が presenter と main の両方へ飛ぶたびに、Windows の
+「前面が全画面ウィンドウか」の判定が変わり、**タスクバーが 1 フレームごとに出入りする**。
+キャプチャ下端 18px の分類で同区間に 1 フレーム刻みの反転が出るのと一致する。
+
+#### 誰がやっているか
+
+**mIV 自身の `SetForegroundWindow` ではない。** この区間の記録は**すべて `source=wndproc`**
+(= 受信側) で、全 46 秒の実行で mIV が出した `SetFocus` は 3 件のみ。
+**ホストウィンドウの生成・表示そのものがフォアグラウンドを奪い、presenter が取り返す**
+という OS レベルの綱引きである。
+
+#### 発生条件: ホスト窓が「最大化」のときだけ起きる
+
+同じ実行の全 30 遷移を、`phase=begin` から `[detached-viewer] registered host` までの
+所要時間と、区間内の `WM_KILLFOCUS` 件数で並べると、2 群にきれいに割れる。
+
+| ホスト窓 | 生成〜登録 | Publish まで | 余分な前面奪取 |
+| --- | --- | --- | --- |
+| 通常サイズ (約 1600x1200) | 15-17ms | 151-158ms | **0 回** |
+| 最大化 (3862x2110 @ 4K) | 162-367ms | 387-554ms | **3 回** |
+
+奪取のオフセットは約 40 / 130 / 210ms で、最後に Publish 時の正規の受け渡しが 1 回入る。
+**「必ず 3 回」ではなく「生成が長引いた 100ms ごとに 1 回」**である。通常サイズでは
+生成が 15ms で終わるので往復する暇が無く、奪取は Publish 時の 1 回だけになる。
+
+利用者が今この明滅を強く感じるのは、detached 窓を最大化して使っているため。同じ実行の
+ログでも、F11 で detached をフルスクリーン化した 36.5s 以降、ホスト窓の外形が最大化サイズ
+(3862x2110 @ (-11,-11)) に変わったところから 3 回の奪取が始まっている。それ以前の通常
+サイズの遷移 (id=3/5/8/12) では 1 回も起きていない。
+
+#### なぜ遷移所有者では止まらなかったか
+
+reducer の effect (`Raise` 0 件、`Publish` -> `Visible` -> `Focus` の順序) は設計どおり
+出ている。**往復はその effect が出るより前、ホスト viewport が作られる過程で起きている**。
+所有権を一本化しても、egui/winit がホストを作る際の activation は reducer の外にある。
+
+#### 原因確定 (2026-08-28 第 2 回計測): `with_maximized(true)` と `with_visible(false)` が矛盾している
+
+`WH_CBT` + `WH_CALLWNDPROC` + `SetWinEventHook` の計装で、機構がそのまま記録された。
+遷移 2 の 1 周期 (t_us 基準、`window_create` stage の内側):
+
+```
+  0.4ms  stage window_create begin
+  1.0ms  HCBT_CREATEWND  ws_visible=false ws_maximized=false   <- 要求どおり非表示・非最大化で生成
+ 13.0ms  HCBT_MINMAX     command=SW_MAXIMIZE(3)                <- winit が最大化を適用
+ 15.7ms  HCBT_ACTIVATE   other=host                            <- SW_MAXIMIZE は表示 + activate を伴う
+ 18.3ms  host  WM_ACTIVATE WA_ACTIVE  other=main
+ 36.5ms  host  WM_SHOWWINDOW shown=false                       <- visible=false により再び隠される
+ 40.8ms  HCBT_ACTIVATE   other=main                            <- activate が main へ戻る
+ 60.0ms  main  WM_ACTIVATE WA_ACTIVE  other=host
+ 74.6ms  HCBT_ACTIVATE   other=host                            (2 周目)
+ 84.2ms  host  WM_SHOWWINDOW shown=false
+ 90.2ms  HCBT_ACTIVATE   other=main
+118.9ms  HCBT_MINMAX     command=SW_MAXIMIZE(3)                (3 周目)
+123.3ms  HCBT_ACTIVATE   other=host
+135.8ms  host  WM_SHOWWINDOW shown=false
+137.9ms  HCBT_ACTIVATE   other=main
+168.8ms  stage window_create end
+```
+
+**`ShowWindow(SW_MAXIMIZE)` は「表示する」と「activate する」を必ず伴う。** 一方
+builder は `with_visible(false)` を要求しているので、winit は最大化直後にその窓を隠す。
+隠された窓は前面でいられないので activate が main へ戻る。これが 1 周期で、
+**`create_window` の内側で 3 回繰り返される**。
+
+全 `-> detached` 遷移で完全に同じ数が出る。
+
+| 計数 | 値 |
+| --- | --- |
+| ホスト窓の生成 | 1 |
+| `SW_MAXIMIZE` | **3** |
+| ホストの `WA_ACTIVE` | 4-5 |
+| ホストの `WM_SHOWWINDOW shown=false` | 3-4 |
+| main の `WA_ACTIVE` | **2-6** |
+| `HCBT_ACTIVATE` | 7 |
+
+#### これで前回の因果の読みは逆だったと分かる
+
+前回私は「ホスト生成に 300ms かかり、その隙に OS が前面を再決定している」と書いた。
+逆である。**show/hide/activate の空転そのものが 300ms を作っている。** stage 内訳が
+それを示す: `surface_create` は 0.1ms、`surface_configure` は 3.5ms、GPU 側は誤差。
+`window_create` の 168-360ms がまるごとこの空転である。
+
+「生成が長引いた 100ms ごとに 1 回」という前回の言い方も相関の言い換えでしかなかった。
+実際の駆動源は最大化であり、通常サイズの detached 窓で 1 回も起きなかったのは
+`SW_MAXIMIZE` が呼ばれないからである。
+
+#### 観測されたユーザー症状との対応
+
+- **タスクバーが出たり消えたりする**: 最大化された窓が z 順の最上位に現れては隠れるのを
+  3 回繰り返すため。全画面窓の有無で shell がタスクバーの表示を切り替える
+- **メインウィンドウが手前に来ることがある**: ホストが隠されるたびに activate が main へ
+  戻る。1 回の F12 で main が `WA_ACTIVE` を最大 6 回受け取っている (利用者報告 2026-08-28)
+
+#### 修正 (2026-08-28)
+
+**非表示で作る窓に最大化を要求しない。** 生成時は非表示・非最大化のままとし、最大化は
+遷移所有者が `Visible` を出すのと同じ commit で当てる。所有者は既に
+`Publish -> Visible -> Focus` の順序を所有しているので、そこへ「最大化」を寄せるのは
+新しい仕組みではなく、既にある所有境界へ戻すことになる。
+
+実装では [ui_fullscreen.rs](../src/ui_fullscreen.rs) の active detached builder から
+`with_maximized(placement.maximized)` を除き、hidden builder mode は visibility と geometry だけを
+指定する。最大化済み host を hidden 中に restore しないため `with_maximized(false)` も送らず、
+winit の新規 HWND は観測どおり非最大化で生成される。`with_visible(false)` は維持する。
+
+最大化の owner は次のとおり。
+
+- 動画 transition: 既存 `SetHostVisible` effect (`Publish -> Visible -> Focus` の Visible commit)
+- 静止画 / 音声 detached open: content / dark-loading 描画後の既存 initial visibility release
+- host-loss 後の keep-alive holdover / backstop 再生成: holdover/content 描画・HWND 登録後の release
+- tray 中に hidden で生成された active / passive host: 既存 tray restore の visibility owner
+- `fullscreen_viewport_recreate`: cleanup-only なので最大化せず、次の active render / transition owner
+  が表示時に適用する
+
+`Maximized(true)` は `Visible(true)` より前に同じ commit へ queue する。Windows では maximize
+自身が HWND を表示するため、この順序なら content-ready 前に表示せず、通常サイズを一瞬見せてから
+最大化することもない。main/fullscreen builder にはもともと maximize 指示がなく、`target=main`
+で観測された 2 回の `SW_MAXIMIZE` も outgoing detached builder が最大化を再提示していたものなので
+同時に消える。
+
+回帰テストは、保存 placement が `maximized=true` でも hidden detached builder が
+`visible=false / maximized=None` であることと、動画 transition の `SetHostVisible` effect が
+`Maximized(true) -> Visible(true)` をこの順で発行することを固定する。新しい App state、時間窓、
+guard / retry / reorder は追加していない。
+
+#### 実機検証 (2026-08-28 17:28 capture + log)
+
+**ログ計数** (`-> detached` で新規ホストを作る 19 遷移すべて):
+
+| 計数 | 修正前 | 期待 | 実測 |
+| --- | ---: | ---: | ---: |
+| `SW_MAXIMIZE` (window_create 内) | 3 | 1 | **0** (※下記) |
+| host `WA_ACTIVE` | 4-5 | 1 | **1-2** |
+| host `WM_SHOWWINDOW shown=false` | 3-4 | 0 | **0** |
+| main `WA_ACTIVE` | 2-6 | 0 | **0-2** |
+| `HCBT_ACTIVATE` | 7 | 1 | **1** |
+
+**`window_create` は 168-360ms から 9ms になった。** 空転が 300ms を作っていたという
+診断がそのまま裏付けられた。`surface_configure` は 3.1ms で、GPU 側は元から誤差だった。
+
+**キャプチャ計測** (下端 18px の輝度を frame ごとに分類し、状態が続いた frame 数で数える):
+
+| capture | 長さ | 状態変化 | **短い変化 (3 frame 以下)** | 1 frame |
+| --- | ---: | ---: | ---: | ---: |
+| 修正前 14:10 | 46.2s | 91 | **52** | 27 |
+| 修正前 15:51 | 36.2s | 52 | **30** | 15 |
+| **修正後 17:28** | 42.9s | 57 | **2** | 2 |
+
+状態変化の総数が減っていないのは、F11/F12 による意図した表示切り替えがそのまま
+数えられているため。**明滅として見えるのは 3 frame 以下の変化**で、これが秒あたり
+1.13 / 0.83 -> **0.047** へ約 20 分の 1 になった。
+
+#### 最大化復元の hardware regression と追補修正 (2026-08-28)
+
+上の実行では最大化された detached 窓を使っておらず、移設した
+`Maximized(true) -> Visible(true)` commit は未検証だった。その後、利用者が detached 窓を
+ダブルクリックで最大化して F12 を 2 往復すると、通常サイズで復帰する回帰を実機で確認した。
+38 遷移を含むログ全体で `SIZE_MAXIMIZED` / `ws_maximized=true` / `SW_MAXIMIZE` /
+`maximized=true value=true` はすべて 0 件だった。これは hidden builder から maximize を外した
+ちらつき修正で導入され、未検証だった最大化経路を実機確認して発見した回帰である。
+
+`Visible` effect に `maximized` 引数、runtime placement の一元 write 境界に old/new と caller の
+計装を加え、production と同じ active-render capture -> Visible effect の seam を再現した。
+保存済み `{x:100,y:120,w:1600,h:1200,maximized:true}` は、非表示で非最大化の再生成 host が
+報告した `{x:200,y:220,w:1800,h:900,maximized:false}` に Visible commit より前に置換され、effect は
+`Visible(true)` だけを発行した。したがって downstream command loss ではなく、render-time capture が
+自分たちの hidden scaffold を利用者の placement intent として公開したことが原因。`maximized` だけでなく
+`x/y/w/h` も同じ ownership violation を受ける。
+
+placement observation authority を `UserVisibleHost / HiddenScaffold` として型にし、各 capture 時点の
+実 HWND の `IsWindowVisible` から決める。hidden scaffold は placement を一切 publish せず、OS 上で
+可視な host だけが利用者の geometry / maximized intent を更新できる。これにより保存済み
+`maximized:true` は既存 Visible owner が読むまで保持され、同じ commit で
+`Maximized(true) -> Visible(true)` が出る。新しい App state、時間窓、frame-count guard、retry は無い。
+回帰テスト
+`recreated_detached_host_preserves_maximized_placement_until_visible_commit` は hidden observation 後も
+placement 全体が不変で、実際の video Visible effect が上記 2 command を順に出すことを固定する。
+hidden observation を writable に戻す mutation は placement equality と command 列の双方で失敗し、
+Visible commit から maximize を落とす mutation は command 列で失敗する。
+
+#### 残った軽微な事象 (利用者が許容と判断)
+
+切り替えの瞬間にメインウィンドウが一瞬見えることがある。ログ上は、出ていく presenter を
+retire した時点で activation が所有者である main へ一度戻り (`fg=main`)、その直後に
+ホストが受け取る、という順序になっている。ループではなく 1 回だけで、往復もしない。
+今回直した churn とは別の事象。
+
+#### 回帰修正の実機確認 (2026-08-28 18:35 前後)
+
+- タイトルバーからの最大化は往復しても維持される (利用者確認)。
+- ログ: `SIZE_MAXIMIZED` 36 件 / `SW_MAXIMIZE` 24 件 (直前の実行では両方 0 件)。
+- Visible effect が実際に読んだ値を出すようになり、`maximized=true` 12 件 / `false` 7 件。
+  「フラグを読み損ねたか、コマンドが失われたか」を区別できない状態は解消した。
+- 非表示の足場からの観測は 365 件すべて `authority=hidden_scaffold ... outcome=ignored` で拒否。
+- ちらつきの再発なし: host の `WM_SHOWWINDOW shown=false` は実行全体で 4 件、
+  **`window_create` の内側は 0 件**。
+
+#### 派生: F11 の仮想フルスクリーンは F12 往復で解除される (既存挙動、本修正の回帰ではない)
+
+利用者報告 (2026-08-28): 別ウィンドウ化 -> F11 で仮想フルスクリーン -> F12 を 2 回で、
+通常ウィンドウに戻る。
+
+**本修正による回帰ではない。** `detached_viewer_borderless_fullscreen` は
+`active_viewport_runtime_reset_new` / `active_viewport_runtime_adopt_passive` で意図的に
+クリアされており、host viewport runtime の作り直しで捨てられる既存設計である
+(§1.139 の 4 コミットはこのフラグを 1 度も書いていない。読むのは
+`active_detached_viewport_maximized_on_visible_commit` の除外条件のみ)。
+
+**最大化より重い**。最大化は永続化された placement レコードの一部で、正しい所有者が読むように
+するだけで済んだ。仮想フルスクリーンは transient な App state に加えて、F11 を解除したときに
+戻る先である `detached_viewer_restore_placement` が対になっている。維持するなら両方が host
+再生成を越えて生き残り、Visible commit が最大化ではなく borderless ジオメトリを当てる必要がある。
+
+- 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

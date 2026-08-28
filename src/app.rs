@@ -115,7 +115,14 @@ mod metadata_ops;
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
+mod presentation_transition;
+#[cfg(windows)]
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
+#[cfg(windows)]
+use presentation_transition::{
+    PreparingProgress, PresentationCandidate, PresentationTransitionEffect,
+    PresentationTransitionEvent, PresentationTransitionOwner, PresentationTransitionState,
+};
 pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
@@ -746,6 +753,15 @@ impl App {
         let previous =
             self.detached_window_manager
                 .set_placement(window_id, placement, default_linked);
+        crate::logger::log(format!(
+            "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
+             new_maximized={} old={previous:?} new={placement:?}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            reason,
+            previous.map(|value| value.maximized),
+            placement.maximized,
+        ));
         self.log_detached_image_window_debug(format!(
             "runtime_placement window_id={window_id} reason={reason} \
              from={previous:?} to={placement:?}"
@@ -905,11 +921,24 @@ impl App {
     }
 
     fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
-        self.detached_window_manager.clear_hwnd(window_id)
+        let cleared = self.detached_window_manager.clear_hwnd(window_id);
+        if let Some(hwnd) = cleared {
+            crate::presentation_observer::unregister(
+                crate::presentation_observer::WindowRole::Host,
+                hwnd,
+            );
+        }
+        cleared
     }
 
     fn detached_window_hwnd_clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
         let cleared = self.detached_window_manager.clear_hwnd_if_dead(window_id);
+        if let Some(hwnd) = cleared {
+            crate::presentation_observer::unregister(
+                crate::presentation_observer::WindowRole::Host,
+                hwnd,
+            );
+        }
         if cleared.is_some()
             && let Some(window) = self
                 .detached_image_windows
@@ -926,8 +955,14 @@ impl App {
 
     fn detached_window_hwnd_set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
         let default_linked = self.detached_window_runtime_default_linked();
-        self.detached_window_manager
-            .set_hwnd(window_id, hwnd, default_linked)
+        let previous = self
+            .detached_window_manager
+            .set_hwnd(window_id, hwnd, default_linked);
+        crate::presentation_observer::register(
+            crate::presentation_observer::WindowRole::Host,
+            hwnd,
+        );
+        previous
     }
 
     fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
@@ -2314,6 +2349,31 @@ enum DetachedGridItemOpenPlan {
 /// アクティブ detached viewer セッションの再オープン経路の種別 (将来拡張用)。
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedPlacementObservationAuthority {
+    UserVisibleHost,
+    HiddenScaffold,
+}
+
+#[cfg(windows)]
+impl DetachedPlacementObservationAuthority {
+    fn from_host_visibility(visible: bool) -> Self {
+        if visible {
+            Self::UserVisibleHost
+        } else {
+            Self::HiddenScaffold
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserVisibleHost => "user_visible_host",
+            Self::HiddenScaffold => "hidden_scaffold",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedSource {
     Image,
     Video,
@@ -2333,6 +2393,35 @@ pub(crate) enum DetachedSource {
 pub(crate) struct ActiveDetachedSession {
     pub(crate) window_id: u64,
     pub(crate) source: DetachedSource,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActiveDetachedSessionProbe {
+    sequence: u64,
+    action: &'static str,
+    reason: &'static str,
+    owner: &'static str,
+    caller_file: &'static str,
+    caller_line: u32,
+    window_id: Option<u64>,
+    source: Option<DetachedSource>,
+}
+
+#[cfg(windows)]
+impl Default for ActiveDetachedSessionProbe {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            action: "init",
+            reason: "app_init",
+            owner: "App::new",
+            caller_file: "-",
+            caller_line: 0,
+            window_id: None,
+            source: None,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -8186,25 +8275,6 @@ fn run_fullscreen_video_marker_thumb_decode(
     result
 }
 
-/// Plan B: 進行中の viewer presentation 切替 1 件の状態。`toggle_video_window_mode`
-/// / detached host migration が生成し、presenter から `request_id` 一致の
-/// placement switch イベントが届くまで保持する。
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub(crate) struct NativeVideoModeSwitchPending {
-    /// このトグルのリクエスト ID (presenter がイベントに echo する)。
-    pub request_id: u64,
-    /// 切替先 presentation。
-    pub target_presentation: ViewerPresentation,
-    /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
-    pub deadline: std::time::Instant,
-    /// メディア窓→メイン切替 (F12/リング) の案内トーストを、**切替の確定**
-    /// (`PlacementSwitched` 適用) 時に出すか。要求発行時に出すと presenter 無応答で
-    /// 切り替わらなかったのに「切り替えました」と表示してしまう (Sol P2)。
-    /// F12 トグル経路だけが true にする (F11 等の in-window/全画面切替では出さない)。
-    pub announce_main_hint: bool,
-}
-
 /// Inc 7 hidden presenter: exit (音声モード→動画) の非同期完了待ち 1 件。
 /// `exit_video_audio_mode` が show / SwitchPlacement を要求したときに生成し、
 /// `poll_video_audio_exit_pending` が presenter の再表示 (`!native_presenter_hidden()`) を
@@ -8263,15 +8333,6 @@ pub(crate) enum VideoAudioVstPhase {
     Opening,
     /// プラグイン GUI 表示済み (二度出し防止ラッチ)。
     Active,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub(crate) struct DetachedVideoHostSwitchPending {
-    pub target_presentation: ViewerPresentation,
-    pub activate_on_show: bool,
-    pub requested_at: std::time::Instant,
-    pub deadline: std::time::Instant,
 }
 
 /// フレーム末尾で実行する native ファイル D&D の予約。
@@ -9737,6 +9798,8 @@ pub struct App {
     /// helper 5 つ (begin/closing/finish/mark/rendered) 経由でのみ触る。
     #[cfg(windows)]
     pub(crate) active_detached_session: Option<ActiveDetachedSession>,
+    #[cfg(windows)]
+    pub(crate) active_detached_session_probe: ActiveDetachedSessionProbe,
     /// アクティブ detached の `show_viewport_immediate` を最後に呼んだ frame_counter。
     /// backstop の二重描画/描き漏れ防止 (§3.6)。
     #[cfg(windows)]
@@ -11066,11 +11129,10 @@ pub struct App {
     /// F12 別ウィンドウの仮想フルスクリーン切替中に、直前フレームを黒で安定させる状態。
     #[cfg(windows)]
     pub(crate) detached_viewer_borderless_transition: Option<DetachedViewerBorderlessTransition>,
-    /// F12 で動画を detached へ切り替えるとき、先に egui 側の detached viewer
-    /// viewport を作り、その HWND が捕捉できてから native presenter を子 HWND へ
-    /// 移行するための待機状態。
+    /// viewer presentation migration の唯一の owner。current/target、request generation、
+    /// activation intent と host/native effect を typed reducer で所有する。
     #[cfg(windows)]
-    pub(crate) pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    pub(crate) video_presentation_transition: PresentationTransitionOwner,
     /// in-window 静止画から専用 fullscreen viewport へ切り替える間、
     /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
     #[cfg(windows)]
@@ -12657,15 +12719,6 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
-    /// Plan B: 進行中の viewer presentation 切替。`Some` の間は次のトグルを無視し
-    /// (連打防止)、presenter からの `PlacementSwitched` / `PlacementSwitchFailed`
-    /// イベントを `request_id` で照合する。これにより遅延イベントが別リクエストを
-    /// 巻き戻す事故を防ぐ (Codex P2)。`deadline` 超過は presenter 無応答時の保険。
-    native_video_mode_switch: Option<NativeVideoModeSwitchPending>,
-    #[cfg(windows)]
-    /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
-    native_video_mode_switch_seq: u64,
-    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -13383,6 +13436,8 @@ impl App {
             #[cfg(windows)]
             active_detached_session: None,
             #[cfg(windows)]
+            active_detached_session_probe: ActiveDetachedSessionProbe::default(),
+            #[cfg(windows)]
             detached_active_viewport_rendered_frame: u64::MAX,
             #[cfg(windows)]
             native_video_parked_live_input_window_id: None,
@@ -13882,7 +13937,7 @@ impl App {
             #[cfg(windows)]
             detached_viewer_borderless_transition: None,
             #[cfg(windows)]
-            pending_detached_video_host_switch: None,
+            video_presentation_transition: PresentationTransitionOwner::default(),
             #[cfg(windows)]
             still_fullscreen_viewport_enter_suppress_until: None,
             #[cfg(windows)]
@@ -14407,9 +14462,7 @@ impl App {
             #[cfg(windows)]
             native_video_in_window_active: false,
             #[cfg(windows)]
-            native_video_mode_switch: None,
             #[cfg(windows)]
-            native_video_mode_switch_seq: 0,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -35585,8 +35638,18 @@ impl App {
             // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-            if !self.navigation_scope.is_detached_physical() {
+            if !self.navigation_scope.is_detached_physical()
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "app::close_reopen_focus",
+                    "viewport_command=Focus",
+                );
             }
             // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
             // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
@@ -36818,15 +36881,8 @@ impl App {
         }
         #[cfg(windows)]
         {
-            self.detached_video_host_switch_pending()
-                || matches!(
-                    self.native_video_mode_switch,
-                    Some(pending)
-                        if matches!(
-                            pending.target_presentation,
-                            ViewerPresentation::DetachedWindow
-                        )
-                )
+            self.video_presentation_transition.is_transitioning()
+                && self.video_presentation_transition.target() == ViewerPresentation::DetachedWindow
         }
         #[cfg(not(windows))]
         {
@@ -37161,10 +37217,129 @@ impl App {
     // ── keep-alive session / marker helpers (docs/detached-viewer-keepalive-design.md §3.7) ──
     // session state と marker は必ずこの helper 経由で触る (直接書き換え禁止)。
 
+    /// Bind a detached window before publishing a renderable active session for it.
+    #[cfg(windows)]
+    pub(crate) fn ensure_mounted_detached_session_binding(&mut self, window_id: u64) {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("detached session binding requires a mounted viewer context");
+        match self.locate_window_context(window_id) {
+            Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
+            Some((owner, residence)) => {
+                panic!("detached session window {window_id} belongs to {owner:?} in {residence:?}")
+            }
+            None => self
+                .bind_window(mounted, window_id)
+                .unwrap_or_else(|error| {
+                    panic!("detached session binding failed for {mounted:?}: {error:?}")
+                }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn record_active_detached_session_write(
+        &mut self,
+        action: &'static str,
+        reason: &'static str,
+        owner: &'static str,
+        previous: Option<ActiveDetachedSession>,
+        next: Option<ActiveDetachedSession>,
+        caller: &'static std::panic::Location<'static>,
+    ) {
+        let sequence = self
+            .active_detached_session_probe
+            .sequence
+            .wrapping_add(1)
+            .max(1);
+        let named = next.or(previous);
+        let binding = named.and_then(|session| {
+            self.viewer_context_window_binding_probe(session.window_id)
+                .map(|(id, residence)| format!("{id:?}/{residence:?}"))
+        });
+        self.active_detached_session_probe = ActiveDetachedSessionProbe {
+            sequence,
+            action,
+            reason,
+            owner,
+            caller_file: caller.file(),
+            caller_line: caller.line(),
+            window_id: named.map(|session| session.window_id),
+            source: named.map(|session| session.source),
+        };
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=session seq={} action={} reason={} owner={} caller={}:{} previous={:?} next={:?} window_id={:?} source={:?} binding={} transition={}",
+            crate::logger::elapsed_micros(),
+            sequence,
+            action,
+            reason,
+            owner,
+            caller.file(),
+            caller.line(),
+            previous.map(|session| session.window_id),
+            next.map(|session| session.window_id),
+            named.map(|session| session.window_id),
+            named.map(|session| session.source),
+            binding.as_deref().unwrap_or("none"),
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_active_detached_session_backstop_read(
+        &self,
+        stage: &'static str,
+        force: bool,
+    ) {
+        let session = self.active_detached_session;
+        let binding = session.and_then(|session| {
+            self.viewer_context_window_binding_probe(session.window_id)
+                .map(|(id, residence)| format!("{id:?}/{residence:?}"))
+        });
+        if !force
+            && crate::presentation_observer::active_transition_id().is_none()
+            && (session.is_none() || binding.is_some())
+        {
+            return;
+        }
+        let last = self.active_detached_session_probe;
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=backstop stage={} value={:?} source={:?} binding={} last_seq={} last_action={} last_reason={} last_owner={} last_caller={}:{} last_window_id={:?} last_source={:?} transition={}",
+            crate::logger::elapsed_micros(),
+            stage,
+            session.map(|value| value.window_id),
+            session.map(|value| value.source),
+            binding.as_deref().unwrap_or("none"),
+            last.sequence,
+            last.action,
+            last.reason,
+            last.owner,
+            last.caller_file,
+            last.caller_line,
+            last.window_id,
+            last.source,
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+    }
+
     /// アクティブ detached セッションを開始 / 更新する (set)。既に同じ window_id の
     /// セッションがあれば runtime state を Active に戻して据え置く (passive→active 再開や F12 再 ON)。
     #[cfg(windows)]
+    #[track_caller]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        #[cfg(not(test))]
+        {
+            let (owner, residence) = self.locate_window_context(window_id).unwrap_or_else(|| {
+                panic!("cannot begin active detached session for unbound window {window_id}")
+            });
+            assert!(
+                matches!(
+                    residence,
+                    ContextResidence::Mounted | ContextResidence::AtRest
+                ),
+                "cannot begin active detached session for window {window_id} owned by {owner:?} in {residence:?}"
+            );
+        }
+        let previous = self.active_detached_session;
         let current_state = self.detached_window_state(window_id);
         let changed = self
             .active_detached_session
@@ -37175,6 +37350,14 @@ impl App {
             })
             .unwrap_or(true);
         self.active_detached_session = Some(ActiveDetachedSession { window_id, source });
+        self.record_active_detached_session_write(
+            "set",
+            "session_begin",
+            "App::begin_active_detached_session",
+            previous,
+            self.active_detached_session,
+            std::panic::Location::caller(),
+        );
         if changed || current_state != Some(DetachedWindowState::Active) {
             self.transition_detached_window_state(
                 window_id,
@@ -37207,8 +37390,23 @@ impl App {
     /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
     /// `Closing -> Removed` もここで所有し、focus / placement / host 判定へ stale runtime を残さない。
     #[cfg(windows)]
+    #[track_caller]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
-        let Some(session) = self.active_detached_session.take() else {
+        let previous = self.active_detached_session;
+        let taken = self.active_detached_session.take();
+        self.record_active_detached_session_write(
+            if taken.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            reason,
+            "App::finish_active_detached_session_close",
+            previous,
+            None,
+            std::panic::Location::caller(),
+        );
+        let Some(session) = taken else {
             return;
         };
         if let Some((owner, ContextResidence::Mounted)) =
@@ -37226,8 +37424,23 @@ impl App {
 
     /// Active-to-passive is not terminal: the passive renderer keeps the runtime and OS viewport.
     #[cfg(windows)]
+    #[track_caller]
     fn finish_active_detached_session_handoff(&mut self, reason: &'static str) {
-        if let Some(session) = self.active_detached_session.take() {
+        let previous = self.active_detached_session;
+        let taken = self.active_detached_session.take();
+        self.record_active_detached_session_write(
+            if taken.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            reason,
+            "App::finish_active_detached_session_handoff",
+            previous,
+            None,
+            std::panic::Location::caller(),
+        );
+        if let Some(session) = taken {
             self.log_detached_image_window_debug(format!(
                 "session_handoff window_id={} reason={reason}",
                 session.window_id
@@ -37653,10 +37866,16 @@ impl App {
             || self.fs_viewport_shown
             || !self.detached_image_windows.is_empty()
             || !self.detached_window_manager.is_empty()
-            || self.pending_detached_video_host_switch.is_some()
+            || self.detached_video_host_switch_pending()
             || self.pending_detached_video_host_resync;
         if !had_detached {
             return false;
+        }
+
+        if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalClose);
+            self.execute_video_presentation_transition_effects(ctx);
         }
 
         self.log_detached_image_window_debug(format!(
@@ -37669,7 +37888,7 @@ impl App {
             self.fs_viewport_shown,
             self.detached_image_windows.len(),
             self.detached_window_manager.len(),
-            self.pending_detached_video_host_switch.is_some()
+            self.detached_video_host_switch_pending()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
@@ -37760,8 +37979,22 @@ impl App {
             self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
         }
 
+        let previous_session = self.active_detached_session;
         self.active_detached_session = None;
-        self.pending_detached_video_host_switch = None;
+        self.record_active_detached_session_write(
+            if previous_session.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            "mode_change_close_all_final_reset",
+            "App::mode_change_close_all_detached",
+            previous_session,
+            None,
+            std::panic::Location::caller(),
+        );
+        self.video_presentation_transition
+            .sync_stable(self.viewer_presentation);
         self.pending_detached_video_host_resync = false;
         self.detached_viewer_window_id = None;
         self.last_active_detached_window_id = None;
@@ -37835,8 +38068,7 @@ impl App {
             && (self.fullscreen_idx.is_some()
                 || self.fs_viewport_shown
                 || self.viewer_session_is_detached_or_switching()
-                || self.pending_detached_video_host_switch.is_some()
-                || self.native_video_mode_switch.is_some()
+                || self.video_presentation_transition.is_transitioning()
                 || self.active_detached_context_is_at_rest()
                 || !self.detached_image_windows.is_empty())
     }
@@ -37914,6 +38146,53 @@ impl App {
         self.active_detached_hwnd_window_id()
             .map(|window_id| self.detached_window_hwnd_raw_for_window_id(window_id))
             .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn observe_viewport_presentation_command(
+        &self,
+        viewport_id: egui::ViewportId,
+        action: crate::presentation_observer::WindowAction,
+        source: &'static str,
+        detail: &'static str,
+    ) {
+        let (role, hwnd) = if viewport_id == egui::ViewportId::ROOT {
+            (
+                crate::presentation_observer::WindowRole::Main,
+                self.main_hwnd.unwrap_or(0) as u64,
+            )
+        } else if let Some(window_id) = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)
+            .filter(|window_id| Self::detached_image_window_viewport_id(*window_id) == viewport_id)
+        {
+            (
+                crate::presentation_observer::WindowRole::Host,
+                self.detached_window_hwnd_raw_for_window_id(window_id),
+            )
+        } else if let Some(window) = self
+            .detached_image_windows
+            .iter()
+            .find(|window| Self::detached_image_window_viewport_id(window.id) == viewport_id)
+        {
+            (
+                crate::presentation_observer::WindowRole::Host,
+                self.detached_window_hwnd_raw_for_window_id(window.id),
+            )
+        } else {
+            (
+                crate::presentation_observer::WindowRole::Backdrop,
+                self.fs_viewport_virtual_desktop_synced_hwnd,
+            )
+        };
+        crate::presentation_observer::observe_viewport_command(
+            action,
+            role,
+            hwnd,
+            source,
+            format!("viewport={viewport_id:?} {detail}"),
+        );
     }
 
     #[cfg(windows)]
@@ -38439,28 +38718,6 @@ impl App {
             .is_none_or(|state| crate::folder_tree::path_eq(&state.video_path, &bundle_video_path))
     }
 
-    /// owner stamp を持たない `native_video_mode_switch` が、まとめて閉じる ParkedLive 群の
-    /// player だけに帰属すると確定できるか。残すと最長 5 秒、font-atlas settle と native
-    /// control availability を塞ぐ。別の mounted/active/surviving parked video があれば
-    /// owner を断定できないので温存する。(review-v2.3.0 追補4: mode-switch teardown)
-    #[cfg(windows)]
-    fn closing_parked_windows_own_native_video_mode_switch(&self, window_ids: &[u64]) -> bool {
-        if self.native_video_mode_switch.is_none()
-            || self.current_viewer_context_contains_video()
-            || self.other_active_viewer_context_contains_video()
-        {
-            return false;
-        }
-        let closing_has_video = self.detached_image_windows.iter().any(|window| {
-            window_ids.contains(&window.id) && self.window_viewer_context_contains_video(window.id)
-        });
-        closing_has_video
-            && !self.detached_image_windows.iter().any(|window| {
-                !window_ids.contains(&window.id)
-                    && self.window_viewer_context_contains_video(window.id)
-            })
-    }
-
     /// ParkedLive / passive 窓が所有する bundle を drop する直前のメディア後始末。
     /// fs_idx は context ごとに別空間なので App-global normalize は path で照合する。
     /// (review-v2.3.0 追補 BA-7: parked teardown)
@@ -38473,8 +38730,7 @@ impl App {
         let clears_tile_companion = window_ids
             .iter()
             .any(|&window_id| self.parked_window_owns_video_tile_companion(window_id));
-        let clears_mode_switch =
-            self.closing_parked_windows_own_native_video_mode_switch(window_ids);
+        let clears_mode_switch = false;
         // bundle が既に外されていても、App-global pending の owner は window id で残り得る。
         // teardown seam で先に破棄して presenter/output を孤児化させない。
         // (review-v2.3.0 追補2 BA-7: parked pending teardown)
@@ -38491,9 +38747,7 @@ impl App {
             self.video_tile_reopen_deadline = None;
             self.native_video_deferred_nav_delta = None;
         }
-        if clears_mode_switch {
-            self.native_video_mode_switch = None;
-        }
+        let _ = clears_mode_switch;
         let mut plans = Vec::new();
         for &window_id in window_ids {
             let Some((id, _)) = self.locate_window_context(window_id) else {
@@ -39327,6 +39581,12 @@ impl App {
             self.detached_image_windows.len()
         ));
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        self.observe_viewport_presentation_command(
+            egui::ViewportId::ROOT,
+            crate::presentation_observer::WindowAction::Focus,
+            "app::focus_main_after_detached_window_close_if_idle",
+            "viewport_command=Focus",
+        );
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
@@ -39602,13 +39862,6 @@ impl App {
                     "start_active_detached_book_context",
                 );
                 app.detached_viewer_folder_nav_reuse_window_once = false;
-                // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
-                // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
-                let session_source = match &descriptor {
-                    ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
-                    _ => DetachedSource::Book,
-                };
-                app.begin_active_detached_session(window_id, session_source);
                 // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
                 // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
                 let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
@@ -39671,7 +39924,17 @@ impl App {
 
                 BuildOutcome::Commit
             });
-        if built.is_some() {
+        if let Some(built) = built {
+            // Building bindings are intentionally unpublished. Begin the renderable session only
+            // after commit publishes the reserved binding, still before the requested repaint.
+            let window_id = self
+                .viewer_context_window(built)
+                .expect("committed detached book context must publish its window identity");
+            let session_source = match &descriptor {
+                ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
+                _ => DetachedSource::Book,
+            };
+            self.begin_active_detached_session(window_id, session_source);
             ctx.request_repaint();
             true
         } else {
@@ -41002,6 +41265,13 @@ impl App {
         let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
+            return true;
+        }
         if self.viewer_context_residence(active_id) != ContextResidence::AtRest {
             return false;
         }
@@ -41157,6 +41427,7 @@ impl App {
             let mounted = self
                 .mounted_viewer_context_id()
                 .expect("preserving a detached still requires a mounted context");
+            self.handoff_active_detached_viewport_to_passive("main_context_change");
             let owner = self
                 .unbind_window(window_id)
                 .expect("preserved detached still window must be bound before handoff");
@@ -41175,7 +41446,6 @@ impl App {
                     "fullfeature_linked_still_media_handoff",
                 );
             }
-            self.handoff_active_detached_viewport_to_passive("main_context_change");
             if let Some(window_id) = parked_window_id {
                 self.transition_detached_window_state(
                     window_id,
@@ -41299,6 +41569,7 @@ impl App {
             let mounted = self
                 .mounted_viewer_context_id()
                 .expect("always-new detached still open requires a mounted context");
+            self.finish_active_detached_session_handoff("always_new_window_rebind");
             let owner = self
                 .unbind_window(parked_window_id)
                 .expect("parked detached still window must be bound");
@@ -41417,7 +41688,10 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn native_video_vst3_controls_available(&self) -> bool {
-        self.vst3_playback_controls_available() && self.native_video_mode_switch.is_none()
+        self.vst3_playback_controls_available()
+            && self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
     }
 
     #[cfg(windows)]
@@ -41452,8 +41726,13 @@ impl App {
         if !self.viewer_item_is_media(idx) {
             return None;
         }
+        let current_intent = if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition.target()
+        } else {
+            self.viewer_presentation
+        };
         Some(
-            if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow) {
+            if matches!(current_intent, ViewerPresentation::DetachedWindow) {
                 self.non_detached_viewer_presentation()
             } else {
                 ViewerPresentation::DetachedWindow
@@ -41558,7 +41837,7 @@ impl App {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
     pub(crate) fn native_video_placement_to_viewer_presentation(
         placement: crate::video::NativeVideoPlacement,
     ) -> ViewerPresentation {
@@ -41885,6 +42164,10 @@ impl App {
             ));
         }
         self.fs_viewport_virtual_desktop_synced_hwnd = hwnd_raw;
+        crate::presentation_observer::register(
+            crate::presentation_observer::WindowRole::Backdrop,
+            hwnd_raw,
+        );
     }
 
     #[cfg(windows)]
@@ -42125,7 +42408,18 @@ impl App {
                 viewport_id,
                 egui::ViewportCommand::InnerSize(viewport_inner_size),
             );
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            if self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
+            {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    viewport_id,
+                    crate::presentation_observer::WindowAction::Focus,
+                    "app::apply_detached_viewer_borderless_target",
+                    "viewport_command=Focus",
+                );
+            }
         }
         ctx.request_repaint();
     }
@@ -42240,6 +42534,7 @@ impl App {
     ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
         self.save_detached_viewer_placement_from_logical_rect_with_source(
             "unspecified",
+            DetachedPlacementObservationAuthority::UserVisibleHost,
             outer_rect,
             inner_rect,
             pixels_per_point,
@@ -42251,11 +42546,36 @@ impl App {
     pub(crate) fn save_detached_viewer_placement_from_logical_rect_with_source(
         &mut self,
         source: &'static str,
+        authority: DetachedPlacementObservationAuthority,
         outer_rect: egui::Rect,
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
         maximized: bool,
     ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        if authority == DetachedPlacementObservationAuthority::HiddenScaffold {
+            crate::logger::log(format!(
+                "[presentation-placement] t_us={} event=observation source={} authority={} \
+                 input_maximized={} outer=({:.3},{:.3} {:.3}x{:.3}) inner={} outcome=ignored",
+                crate::logger::elapsed_micros(),
+                source,
+                authority.label(),
+                maximized,
+                outer_rect.min.x,
+                outer_rect.min.y,
+                outer_rect.width(),
+                outer_rect.height(),
+                inner_rect
+                    .map(|rect| format!(
+                        "({:.3},{:.3} {:.3}x{:.3})",
+                        rect.min.x,
+                        rect.min.y,
+                        rect.width(),
+                        rect.height()
+                    ))
+                    .unwrap_or_else(|| "none".to_string()),
+            ));
+            return None;
+        }
         if self.detached_viewer_borderless_fullscreen
             || self.detached_viewer_borderless_transition.is_some()
         {
@@ -42399,6 +42719,19 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn active_detached_placement_observation_authority(
+        &self,
+    ) -> DetachedPlacementObservationAuthority {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let visible = self
+            .detached_viewer_host_hwnd_alive()
+            .is_some_and(|hwnd| unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() });
+        DetachedPlacementObservationAuthority::from_host_visibility(visible)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn sync_detached_viewer_to_selected(&mut self, ctx: &egui::Context) {
         if !self.settings.detached_viewer_enabled || !self.viewer_session_is_detached() {
             return;
@@ -42475,7 +42808,7 @@ impl App {
         let session_window_id = self
             .active_detached_session
             .map(|session| session.window_id);
-        let Some((window_id, presenter_target)) = self
+        let Some((window_id, presenter_target, z_order_permitted)) = self
             .with_viewer_context_ref(active_id, |context| {
                 if !viewer_context_bundle_displays_media_path(context, target_path) {
                     return None;
@@ -42488,7 +42821,15 @@ impl App {
                 let presenter_target = matches!(context.items().get(idx), Some(GridItem::Video(_)))
                     && !viewer_context_is_music_consumer(context)
                     && presenter_player.is_some();
-                if let Some(player) = presenter_player.filter(|_| presenter_target) {
+                // The reducer publishes its permit to the context-owned output. Reading that
+                // projection keeps this at-rest context route generation-safe without widening
+                // the frozen ContextRef API.
+                let z_order_permitted = presenter_player
+                    .map(|player| player.z_order_recovery_permitted())
+                    .unwrap_or(true);
+                if let Some(player) =
+                    presenter_player.filter(|_| presenter_target && z_order_permitted)
+                {
                     player.request_presenter_raise();
                 }
                 Some((
@@ -42496,12 +42837,17 @@ impl App {
                         .viewer_session_detached_window_id()
                         .or(session_window_id),
                     presenter_target,
+                    z_order_permitted,
                 ))
             })
             .flatten()
         else {
             return false;
         };
+        if !z_order_permitted {
+            ctx.request_repaint();
+            return true;
+        }
         if presenter_target {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
@@ -42509,7 +42855,19 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(window_id);
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::restore_active_context_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::restore_active_context_window",
+                "viewport_command=Focus",
+            );
         }
         ctx.request_repaint();
         true
@@ -42521,6 +42879,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
+            return true;
+        }
         let mounted_matches = self.viewer_session_is_detached()
             && self.fullscreen_idx == Some(idx)
             && self
@@ -42538,7 +42903,19 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::activate_media_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::activate_media_window",
+                "viewport_command=Focus",
+            );
         } else if mounted_matches && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
@@ -42675,6 +43052,13 @@ impl App {
         if self.viewer_session_is_detached() {
             return;
         }
+        if !self
+            .video_presentation_transition
+            .z_order_recovery_permitted()
+        {
+            ctx.request_repaint();
+            return;
+        }
 
         const RESTORE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
@@ -42693,7 +43077,19 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::restore_viewer_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::restore_viewer_window",
+                "viewport_command=Focus",
+            );
             restored = true;
         }
 
@@ -42838,28 +43234,25 @@ impl App {
         }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
-            // A build has no Mounted residence and publishes its reserved binding only at commit.
-            // Every ordinary/reuse open binds the current projection here; repeated reuse is
-            // intentionally idempotent.
-            if let Some(mounted) = self.mounted_viewer_context_id() {
-                match self.locate_window_context(id) {
-                    Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
-                    Some((owner, residence)) => {
-                        panic!("detached open window {id} belongs to {owner:?} in {residence:?}")
-                    }
-                    None => self.bind_window(mounted, id).unwrap_or_else(|error| {
-                        panic!("detached open binding failed for {mounted:?}: {error:?}")
-                    }),
-                }
-            }
-            // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
-            // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
-            let source = if self.active_detached_context_is_at_rest() {
-                DetachedSource::Book
+            if self.viewer_context_residence(self.projected_viewer_context_id())
+                == ContextResidence::Building
+            {
+                // I8 keeps the reserved binding private until commit. The build transaction owner
+                // begins this session immediately after publishing that binding.
+                self.log_detached_image_window_debug(format!(
+                    "defer_session_begin_until_build_commit window_id={id}"
+                ));
             } else {
-                self.detached_source_for_idx(idx)
-            };
-            self.begin_active_detached_session(id, source);
+                self.ensure_mounted_detached_session_binding(id);
+                // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
+                // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
+                let source = if self.active_detached_context_is_at_rest() {
+                    DetachedSource::Book
+                } else {
+                    self.detached_source_for_idx(idx)
+                };
+                self.begin_active_detached_session(id, source);
+            }
         } else {
             // 非 detached を開いた (動画 fullscreen / detached 非対応アイテム等) =
             // detached セッションは終了。明示遷移なので session を畳む (§3.7)。
@@ -42913,8 +43306,10 @@ impl App {
         // 記録する。これにより in-window 動画 ⇔ 静止画をホイールで往復しても
         // モードが一貫する。
         self.native_video_in_window_active = matches!(presentation, ViewerPresentation::MainWindow);
-        // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
-        self.native_video_mode_switch = None;
+        // Stable の projection だけを新しい presentation へ同期する。遷移中の owner は
+        // source-swap / terminal event が世代付きで完結させるため、ここでは破棄しない。
+        self.video_presentation_transition
+            .sync_stable(self.viewer_presentation);
         self.log_detached_image_window_debug(format!(
             "prepare_viewer_presentation_open_state idx={idx} presentation={:?} \
              fs_idx={:?} session={:?} window_id={:?} independent={} \
@@ -50911,6 +51306,16 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        #[cfg(windows)]
+        if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalClose);
+            return;
+        }
+        self.close_fullscreen_now();
+    }
+
+    fn close_fullscreen_now(&mut self) {
         // 閉じる間 UI スレッドが止まっていると、その分だけ**誰も描かない**フレームが並び、
         // 画面のちらつきとして見える (利用者報告 2026-08-27、実測 9 フレーム / 約 300ms)。
         // どの段で止まっているかを 1 行で出す。ログ行の時刻と合わせれば、presenter 停止や
@@ -50992,7 +51397,8 @@ impl App {
         // (= フルスクリーン抜けると別動画扱い、stale fs_idx 復活防止)
         #[cfg(windows)]
         {
-            self.pending_detached_video_host_switch = None;
+            self.video_presentation_transition
+                .sync_stable(self.viewer_presentation);
             let fs_idxs: Vec<usize> = self.normalize_ui_states.keys().copied().collect();
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
@@ -59444,6 +59850,7 @@ impl App {
 
         if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
+            self.ensure_mounted_detached_session_binding(id);
             self.begin_active_detached_session(id, self.detached_source_for_idx(idx));
             self.update_detached_window_runtime_flags(
                 id,
@@ -59517,22 +59924,10 @@ impl App {
                 );
                 return;
             }
-            let now = std::time::Instant::now();
-            let video_switch_in_flight = self
-                .native_video_mode_switch
-                .is_some_and(|pending| now < pending.deadline);
-            let detached_host_switch_in_flight = self
-                .pending_detached_video_host_switch
-                .is_some_and(|pending| now < pending.deadline);
-            if video_switch_in_flight || detached_host_switch_in_flight {
-                crate::logger::log(format!(
-                    "[detached-viewer] ignore F12 toggle while video placement switch is pending \
-                     in_flight={video_switch_in_flight} host_switch_in_flight={detached_host_switch_in_flight}"
-                ));
-                return;
-            }
             if let Some(target_presentation) = self.always_new_media_f12_target_presentation() {
-                if target_presentation != self.viewer_presentation {
+                if target_presentation != self.viewer_presentation
+                    || self.video_presentation_transition.is_transitioning()
+                {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
@@ -59554,18 +59949,12 @@ impl App {
                         // 要求発行時ではなく **切替の確定** (`PlacementSwitched` 適用) 時に
                         // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
                         // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
-                        let request_before = self
-                            .native_video_mode_switch
-                            .map(|pending| pending.request_id);
-                        self.switch_native_video_viewer_presentation(target_presentation, true);
-                        let switch_started = self
-                            .native_video_mode_switch
-                            .is_some_and(|pending| Some(pending.request_id) != request_before);
-                        if switch_started
+                        if let Some(request_id) =
+                            self.request_native_video_viewer_presentation(target_presentation, true)
                             && announce_main_hint
-                            && let Some(pending) = self.native_video_mode_switch.as_mut()
                         {
-                            pending.announce_main_hint = true;
+                            self.video_presentation_transition
+                                .set_announce_main_hint(request_id);
                         }
                     } else if let Some(idx) = self.fullscreen_idx
                         && self.viewer_item_supports_egui_detached_viewport(idx)
@@ -59602,12 +59991,13 @@ impl App {
                 self.detached_image_windows.len()
             ));
             if !self.settings.detached_viewer_enabled {
-                self.pending_detached_video_host_switch = None;
                 self.clear_detached_viewer_borderless_fullscreen_state();
             }
             if let Some(idx) = self.fullscreen_idx {
                 let target_presentation = self.effective_viewer_presentation_for_open(idx);
-                if target_presentation != self.viewer_presentation {
+                if target_presentation != self.viewer_presentation
+                    || self.video_presentation_transition.is_transitioning()
+                {
                     if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                         self.clear_detached_viewer_borderless_fullscreen_state();
                     }
@@ -63942,7 +64332,7 @@ impl App {
                 self.fullscreen_idx == Some(*fs_idx)
                     && self.video_audio_mode == Some(*fs_idx)
                     && self.video_continuous_last_eof == Some((*fs_idx, *seek_serial))
-                    && self.native_video_mode_switch.is_none()
+                    && !self.video_presentation_transition.is_transitioning()
                     && self.native_video_source_swap_pending.is_none()
                     && self.native_video_fast_swap_pending.is_none()
                     && self.video_tile_swap_pending.is_none()
@@ -64487,7 +64877,7 @@ impl App {
         // (= ユーザーの「動画へ戻る」が消失 + show 済み presenter に旧動画 hold フレームが
         // 露出)。exit 完了後の EOF は mode=None で Video 分類に落ち、通常の連続再生として
         // 次動画が映像表示で開く (review-v2.3.0 P2-1)。
-        if self.native_video_mode_switch.is_some()
+        if self.video_presentation_transition.is_transitioning()
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
@@ -64532,7 +64922,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx)
             || self.video_audio_mode != Some(fs_idx)
             || self.video_continuous_last_eof != Some((fs_idx, seek_serial))
-            || self.native_video_mode_switch.is_some()
+            || self.video_presentation_transition.is_transitioning()
             || self.native_video_source_swap_pending.is_some()
             || self.native_video_fast_swap_pending.is_some()
             || self.video_tile_swap_pending.is_some()
@@ -65128,12 +65518,13 @@ impl App {
         // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定
         // (Codex #4: Plan B の SwitchPlacement で child HWND に切り替わった瞬間に
         //  VST owner が誤って child を指さないようガードする)。
-        // さらに、モード切替の進行中 (`native_video_mode_switch` Some) は presenter が
-        // 新 HWND を publish 済みでも `PlacementSwitched` 未処理で実モードが旧いまま
-        // のフレームがあるため、その間は owner 同期自体を止める (Codex 再 P1)。
+        // さらに presentation reducer が recovery permit を閉じている間は、candidate publish と
+        // outgoing retire の中間で owner 同期を独自に走らせない。
         #[cfg(windows)]
         if matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
-            && self.native_video_mode_switch.is_none()
+            && self
+                .video_presentation_transition
+                .z_order_recovery_permitted()
             // Inc 7 hidden presenter: 音声モード中は presenter を非アクティブ扱いにして
             // VST owner 同期を止める (presenter は hide されていて owner にしない)。
             // ただし 7e の VST ホスト表示中は presenter を un-hide して VST owner にするので許可する。
@@ -65256,33 +65647,13 @@ impl App {
         #[cfg(windows)]
         self.poll_video_audio_exit_pending(ctx);
         #[cfg(windows)]
-        self.poll_detached_video_host_switch_pending(ctx);
+        self.poll_video_presentation_transition(ctx);
         // detached host HWND が変わったら presenter child を現 host へ再親付けする
         // (host capture race で presenter が道連れ死 → 再生終了する既存バグの対策)。
         #[cfg(windows)]
         self.poll_detached_video_host_resync();
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
-        // Plan B: presenter 無応答で placement 切替 pending が滞留すると VST owner /
-        // availability 同期が永久停止するため、deadline 超過の pending は明示的に
-        // 破棄する。
-        #[cfg(windows)]
-        if let Some(pending) = self.native_video_mode_switch {
-            let mode_switch_now = std::time::Instant::now();
-            if mode_switch_now >= pending.deadline {
-                crate::logger::log(format!(
-                    "[native-video] placement switch request {} timed out \
-                     (no presenter event); clearing pending",
-                    pending.request_id
-                ));
-                self.native_video_mode_switch = None;
-            } else {
-                merge_repaint_deadline(
-                    &mut next_repaint,
-                    Some(pending.deadline.saturating_duration_since(mode_switch_now)),
-                );
-            }
-        }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
             self.poll_native_video_fast_swap(ctx);
@@ -65477,6 +65848,10 @@ impl eframe::App for App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    crate::presentation_observer::register(
+                        crate::presentation_observer::WindowRole::Main,
+                        hwnd_raw as u64,
+                    );
                     // マウスドライバが WM_APPCOMMAND_BROWSER_BACKWARD/FORWARD で送るか、
                     // AHK 等が VK_BROWSER_BACK/FORWARD keystroke で送るルートを WH_GETMESSAGE
                     // フックで拾い、進む/戻るボタンを Ctrl+↑/↓ と等価に扱う。詳細は
@@ -66374,7 +66749,12 @@ impl eframe::App for App {
             // Inc 7 hidden presenter: 音声モード中は presenter (+ HUD) が hide されている
             // ので raise 要求は無視する (HUD teardown 済み)。7e の VST ホスト表示中は presenter を
             // un-hide して HUD も出しているので raise を許可する。
-            if pending && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some()) {
+            if pending
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+                && (self.video_audio_mode.is_none() || self.video_audio_vst.is_some())
+            {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         player.request_hud_raise();

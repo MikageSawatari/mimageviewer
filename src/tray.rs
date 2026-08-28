@@ -378,7 +378,7 @@ fn run_tray_thread(
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_SHOW,
-        SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, TranslateMessage, WM_CLOSE, WM_PAINT,
+        SW_SHOWNOACTIVATE, TranslateMessage, WM_CLOSE, WM_PAINT,
     };
 
     // HWND (`*mut c_void`) は Send/Sync ではないので、クロージャでキャプチャするときは
@@ -462,11 +462,20 @@ fn run_tray_thread(
             };
             if !used_placement {
                 unsafe {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = crate::presentation_observer::show_window(
+                        hwnd,
+                        SW_SHOW,
+                        crate::presentation_observer::WindowRole::Main,
+                        "tray::open",
+                    );
                 }
             }
             unsafe {
-                let _ = SetForegroundWindow(hwnd);
+                let _ = crate::presentation_observer::set_foreground_window(
+                    hwnd,
+                    crate::presentation_observer::WindowRole::Main,
+                    "tray::open",
+                );
             }
             if let Some(sem) = &io_sem {
                 sem.set_throttled(false);
@@ -528,13 +537,26 @@ fn run_tray_thread(
                         // BOOL は 4 バイト整数 (TRUE=1)。DWM 側は *const c_void で受ける
                         // のでサイズを厳密に指定するだけでよい (型は BOOL 相当)。
                         let cloak_true: i32 = 1;
-                        let _ = DwmSetWindowAttribute(
+                        let cloak_ok = DwmSetWindowAttribute(
                             hwnd,
                             DWMWA_CLOAK,
                             &cloak_true as *const _ as *const _,
                             std::mem::size_of::<i32>() as u32,
+                        )
+                        .is_ok();
+                        crate::presentation_observer::observe_dwm_cloak(
+                            hwnd,
+                            crate::presentation_observer::WindowRole::Main,
+                            true,
+                            "tray::quit",
+                            cloak_ok,
                         );
-                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        let _ = crate::presentation_observer::show_window(
+                            hwnd,
+                            SW_SHOWNOACTIVATE,
+                            crate::presentation_observer::WindowRole::Main,
+                            "tray::quit",
+                        );
                     }
                     let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }

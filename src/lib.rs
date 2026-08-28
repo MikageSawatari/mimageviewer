@@ -56,6 +56,8 @@ mod empty_items_reason;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
+#[cfg(windows)]
+pub(crate) mod presentation_observer;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
 /// (HWND 引数の関数群の呼び出し元はすべて cfg(windows) 済み)。
@@ -957,6 +959,8 @@ pub fn run() -> eframe::Result {
 
     install_panic_log_hook();
     install_texture_delta_ledger();
+    #[cfg(windows)]
+    presentation_observer::install_backend_stage_observer();
     #[cfg(windows)]
     install_native_exception_log_hook();
 

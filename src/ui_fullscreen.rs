@@ -25,11 +25,11 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, ContextResidence, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
-    FsNavigationDisplayTarget, FsNavigationPresentation, FsNavigationSequence,
-    FsNavigationSequenceTarget, FsNavigationTargetPhase, FsOpenMaterialization,
-    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
-    FsPrefetchSideDisplay, ViewerPresentation, build_fs_prefetch_indicator,
+    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
+    FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
+    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
+    build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -81,6 +81,26 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 /// recovery area. On an image or viewport smaller than this, the whole shorter axis is required.
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetachedViewportBuilderVisibility {
+    Preserve,
+    Hidden,
+}
+
+#[cfg(windows)]
+impl DetachedViewportBuilderVisibility {
+    fn apply(self, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+        match self {
+            Self::Preserve => builder,
+            // A hidden builder must not also carry `maximized=true`: on Windows winit applies
+            // that with ShowWindow(SW_MAXIMIZE), which shows and activates the HWND before the
+            // hidden request hides it again. Maximization belongs to the later Visible commit.
+            Self::Hidden => builder.with_visible(false),
+        }
+    }
+}
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10416,23 +10436,30 @@ impl App {
         window: &crate::app::DetachedImageWindowSnapshot,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
+        visible: bool,
         ui_scale: f32,
     ) -> egui::ViewportBuilder {
         let builder = egui::ViewportBuilder::default()
             .with_title(window.title.clone())
             .with_decorations(true)
             .with_transparent(false)
-            .with_taskbar(true);
+            .with_taskbar(true)
+            .with_visible(visible);
 
         if apply_initial_placement {
             let position =
                 window_geometry_pos_to_viewport(egui::pos2(placement.x, placement.y), ui_scale);
             let inner_size =
                 window_geometry_size_to_viewport(egui::vec2(placement.w, placement.h), ui_scale);
-            builder
-                .with_inner_size(inner_size)
-                .with_position(position)
-                .with_maximized(placement.maximized)
+            let builder = builder.with_inner_size(inner_size).with_position(position);
+            if visible {
+                builder.with_maximized(placement.maximized)
+            } else {
+                // Tray-resident passive windows are also created hidden. Leave maximization out
+                // until the tray restore owner commits Visible, for the same reason as the active
+                // detached host.
+                builder
+            }
         } else {
             builder
         }
@@ -12346,9 +12373,9 @@ impl App {
                 window,
                 window_placement,
                 apply_initial_placement,
+                self.window_visible,
                 self.settings.ui_scale_factor,
-            )
-            .with_visible(self.window_visible);
+            );
             let view = self.deferred_detached_image_window_view(
                 window,
                 window_placement,
@@ -12475,9 +12502,9 @@ impl App {
                 &window,
                 window_placement,
                 apply_initial_placement,
+                self.window_visible,
                 self.settings.ui_scale_factor,
-            )
-            .with_visible(self.window_visible);
+            );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
             let mut placement_update = None;
@@ -13417,6 +13444,11 @@ impl App {
             && (self.fs_nav_deferred_reopen_wait_active() || detached_transition_hold)
         {
             #[cfg(windows)]
+            let detached_host_needs_create = matches!(
+                self.fs_viewport_presentation,
+                Some(ViewerPresentation::DetachedWindow)
+            ) && self.detached_viewer_should_seed_placement();
+            #[cfg(windows)]
             let fs_builder = self
                 .build_inactive_fullscreen_viewport_builder_with_source(0, "keep_alive_holdover");
             #[cfg(not(windows))]
@@ -13470,6 +13502,24 @@ impl App {
                     "keep_alive_holdover",
                     fs_id,
                     hwnd_before.as_deref(),
+                );
+            }
+            #[cfg(windows)]
+            if detached_host_needs_create
+                && self.window_visible
+                && !self.video_presentation_transition.is_transitioning()
+            {
+                let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+                Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                self.observe_viewport_presentation_command(
+                    fs_id,
+                    crate::presentation_observer::WindowAction::Visible,
+                    "ui_fullscreen::keep_alive_holdover_visible_commit",
+                    if maximized {
+                        "maximized=true value=true"
+                    } else {
+                        "maximized=false value=true"
+                    },
                 );
             }
             // keep-alive marker: deferred holdover で描いた fs_id が現セッションの detached id と
@@ -13545,6 +13595,12 @@ impl App {
             format!("reason=keep_alive_cleanup viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::keep_alive_cleanup",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         #[cfg(windows)]
         {
@@ -13567,6 +13623,7 @@ impl App {
     /// `App::update` のフルスクリーン区間の**末尾**で毎フレーム呼ぶこと。
     #[cfg(windows)]
     pub(crate) fn render_active_detached_viewport_backstop(&mut self, ctx: &egui::Context) {
+        self.log_active_detached_session_backstop_read("entry", false);
         if !self.detached_active_window_alive_wanted() {
             return;
         }
@@ -13589,27 +13646,15 @@ impl App {
         // The binding table answers both ownership and residence for this viewport. Mounting an
         // at-rest owner keeps all indexed state together; an already-mounted owner renders
         // directly without a second pass.
+        self.log_active_detached_session_backstop_read("mount", true);
         let window_id = self
             .active_detached_session
             .expect("live detached viewport must have an active session")
             .window_id;
-        match self.locate_window_context(window_id) {
-            Some((_, ContextResidence::AtRest)) => {
-                self.with_window_viewer_context(window_id, |app| {
-                    app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-                })
-                .expect("at-rest backstop owner must be mountable");
-            }
-            Some((_, ContextResidence::Mounted)) => {
-                self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-            }
-            Some((owner, residence)) => {
-                panic!(
-                    "active detached backstop window {window_id} belongs to {owner:?} in {residence:?}"
-                );
-            }
-            None => panic!("active detached backstop window {window_id} has no context binding"),
-        }
+        self.with_window_viewer_context(window_id, |app| {
+            app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+        })
+        .expect("active detached backstop owner must be mountable");
     }
 
     /// Draw the keep-alive backstop while the active detached viewer context owns `App`'s
@@ -13626,21 +13671,26 @@ impl App {
         // のときは placement を seed して、egui 再生成時の既定サイズ 822x656 フラッシュを防ぐ
         // (`== 0` だと死んだ HWND を !=0 で指したまま再生成される取りこぼしを拾えない = Codex P2)。
         let title_idx = self.fullscreen_idx.unwrap_or(0);
-        let apply_placement = self.detached_viewer_should_seed_placement();
+        let detached_host_needs_create = self.detached_viewer_should_seed_placement();
+        let apply_placement = detached_host_needs_create;
         let builder_placement = if apply_placement {
             Some(self.active_detached_builder_placement_latch(true, "keepalive_backstop"))
         } else {
             None
         };
-        let builder = self
-            .build_detached_viewer_viewport_builder(
-                title_idx,
-                None,
-                apply_placement,
-                builder_placement,
-                "keepalive_backstop",
-            )
-            .with_visible(self.window_visible);
+        let builder_visibility = if detached_host_needs_create || !self.window_visible {
+            DetachedViewportBuilderVisibility::Hidden
+        } else {
+            DetachedViewportBuilderVisibility::Preserve
+        };
+        let builder = self.build_detached_viewer_viewport_builder(
+            title_idx,
+            None,
+            builder_visibility,
+            apply_placement,
+            builder_placement,
+            "keepalive_backstop",
+        );
         // 表示物: live があれば live、無ければ holdover (前フレーム)。ギャップ中は holdover。
         let live_tex = self
             .fullscreen_idx
@@ -13773,6 +13823,23 @@ impl App {
                 "keepalive_backstop",
                 viewport_id,
                 hwnd_before.as_deref(),
+            );
+        }
+        if detached_host_needs_create
+            && self.window_visible
+            && !self.video_presentation_transition.is_transitioning()
+        {
+            let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+            Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "ui_fullscreen::keepalive_backstop_visible_commit",
+                if maximized {
+                    "maximized=true value=true"
+                } else {
+                    "maximized=false value=true"
+                },
             );
         }
         self.mark_active_detached_viewport_rendered();
@@ -14093,7 +14160,15 @@ impl App {
         let detached_activate_on_show = if detached {
             if need_show {
                 self.detached_viewer_focus_requested = false;
-                Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
+                if self.video_presentation_transition.is_transitioning()
+                    && self.video_presentation_transition.target()
+                        == ViewerPresentation::DetachedWindow
+                {
+                    let _ = self.take_detached_viewer_activate_on_show();
+                    Some(false)
+                } else {
+                    Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
+                }
             } else {
                 self.detached_viewer_no_activate_once = false;
                 None
@@ -14123,8 +14198,10 @@ impl App {
         // 静止画の enumerate holdover は live placement を更新しないので従来どおり host 未生存時
         // のみ seed する (Codex P2)。
         #[cfg(windows)]
-        let detached_refresh_builder_placement =
-            need_show || self.detached_viewer_should_seed_placement();
+        let detached_host_needs_create =
+            detached && !embedded && self.detached_viewer_should_seed_placement();
+        #[cfg(windows)]
+        let detached_refresh_builder_placement = need_show || detached_host_needs_create;
         #[cfg(windows)]
         let detached_seed_placement = detached_refresh_builder_placement
             || self.detached_video_presentation_active_or_targeted();
@@ -14184,6 +14261,11 @@ impl App {
                 self.build_detached_viewer_viewport_builder(
                     fs_idx,
                     detached_activate_on_show,
+                    if need_show || !self.window_visible || detached_host_needs_create {
+                        DetachedViewportBuilderVisibility::Hidden
+                    } else {
+                        DetachedViewportBuilderVisibility::Preserve
+                    },
                     detached_seed_placement,
                     detached_builder_placement,
                     "active_render",
@@ -14203,7 +14285,7 @@ impl App {
             // builder に寄せる (taskbar 属性を音声ファイルと揃える、Codex 7d 検証)。
             self.build_still_fullscreen_viewport_builder()
         };
-        if !embedded && (need_show || !self.window_visible) {
+        if !detached && !embedded && (need_show || !self.window_visible) {
             // 新規 viewport と tray residency 中の内部 recreate は hidden で作り、
             // DWM transition 抑止属性を当ててから
             // Visible(true) にする。初期 white client、最大化アニメーション、detached
@@ -14326,6 +14408,7 @@ impl App {
                             let restore_placement = self
                                 .save_detached_viewer_placement_from_logical_rect_with_source(
                                     "active_render",
+                                    self.active_detached_placement_observation_authority(),
                                     rect,
                                     inner_rect,
                                     pixels_per_point,
@@ -14427,10 +14510,27 @@ impl App {
                     }
                 }
                 #[cfg(windows)]
-                if detached_focus_existing && self.window_visible {
+                if detached_focus_existing
+                    && self.window_visible
+                    && self
+                        .video_presentation_transition
+                        .z_order_recovery_permitted()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Visible,
+                        "ui_fullscreen::restore_current_viewport",
+                        "value=true",
+                    );
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Focus,
+                        "ui_fullscreen::restore_current_viewport",
+                        "viewport_command=Focus",
+                    );
                     ctx.request_repaint();
                 }
 
@@ -15872,12 +15972,16 @@ impl App {
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
                 #[cfg(windows)]
-                if need_show && !embedded && self.window_visible {
+                if (need_show || detached_host_needs_create) && !embedded && self.window_visible {
                     // The viewport was created hidden above. Release visibility only after
                     // this frame has painted either real content (full/thumb/holdover) or the
                     // dark loading surface. This keeps DWM from ever presenting the unpainted
                     // white client area that `open_visibility_probe` caught on first open.
-                    let release = if detached {
+                    let transition_owns_detached_visibility =
+                        detached && self.video_presentation_transition.is_transitioning();
+                    let release = if transition_owns_detached_visibility {
+                        None
+                    } else if detached {
                         detached_initial_visibility_release(detached_open_content_ready, true)
                     } else {
                         Some(DetachedInitialVisibilityRelease::Content)
@@ -15899,9 +16003,31 @@ impl App {
                                 self.frame_counter
                             ));
                         }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        if detached {
+                            let maximized =
+                                self.active_detached_viewport_maximized_on_visible_commit();
+                            Self::send_detached_viewport_visible_commit(
+                                ctx,
+                                ctx.viewport_id(),
+                                maximized,
+                            );
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        }
+                        self.observe_viewport_presentation_command(
+                            ctx.viewport_id(),
+                            crate::presentation_observer::WindowAction::Visible,
+                            "ui_fullscreen::initial_visibility_release",
+                            "value=true",
+                        );
                         if !detached || detached_activate_on_show.unwrap_or(false) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            self.observe_viewport_presentation_command(
+                                ctx.viewport_id(),
+                                crate::presentation_observer::WindowAction::Focus,
+                                "ui_fullscreen::initial_visibility_release",
+                                "viewport_command=Focus",
+                            );
                         }
                     } else {
                         ctx.request_repaint();
@@ -17651,6 +17777,12 @@ impl App {
             format!("reason=native_video_backdrop_hide viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::native_video_backdrop_hide",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17679,6 +17811,12 @@ impl App {
             format!("reason=embedded_still_viewport_hide viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::embedded_still_viewport_hide",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17700,6 +17838,7 @@ impl App {
                 .build_detached_viewer_viewport_builder(
                     fs_idx,
                     None,
+                    DetachedViewportBuilderVisibility::Hidden,
                     false,
                     None,
                     "fullscreen_viewport_recreate",
@@ -17714,6 +17853,12 @@ impl App {
             format!("reason=fullscreen_viewport_recreate viewport={fs_id:?} fs_idx={fs_idx}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::fullscreen_viewport_recreate",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17739,10 +17884,27 @@ impl App {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
-            if need_show && self.window_visible {
+            if need_show
+                && self.window_visible
+                && self
+                    .video_presentation_transition
+                    .z_order_recovery_permitted()
+            {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Visible,
+                    "ui_fullscreen::video_viewport_present",
+                    "value=true",
+                );
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::video_viewport_present",
+                    "viewport_command=Focus",
+                );
             }
             if let Some(keys) =
                 fullscreen_shortcut_event_summary(ctx, &self.keymap, FS_VIDEO_ACTIVE_SCOPES)
@@ -17840,6 +18002,11 @@ impl App {
                 self.build_detached_viewer_viewport_builder(
                     fs_idx,
                     None,
+                    if apply_placement {
+                        DetachedViewportBuilderVisibility::Hidden
+                    } else {
+                        DetachedViewportBuilderVisibility::Preserve
+                    },
                     apply_placement,
                     None,
                     source,
@@ -17866,6 +18033,7 @@ impl App {
         &self,
         fs_idx: usize,
         active: Option<bool>,
+        visibility: DetachedViewportBuilderVisibility,
         apply_placement: bool,
         builder_placement: Option<crate::settings::DetachedViewerWindowPlacement>,
         source: &'static str,
@@ -17913,8 +18081,7 @@ impl App {
                 );
                 builder = builder
                     .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position)
-                    .with_maximized(false);
+                    .with_position(viewport_position);
             } else {
                 let placement = builder_placement
                     .unwrap_or_else(|| self.active_detached_viewer_current_placement());
@@ -17938,8 +18105,7 @@ impl App {
                 );
                 builder = builder
                     .with_inner_size(viewport_inner_size)
-                    .with_position(viewport_position)
-                    .with_maximized(placement.maximized);
+                    .with_position(viewport_position);
             }
         } else {
             self.log_detached_viewport_placement_event(
@@ -17955,7 +18121,30 @@ impl App {
         if let Some(active) = active {
             builder = builder.with_active(active);
         }
-        builder
+        visibility.apply(builder)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_viewport_maximized_on_visible_commit(&self) -> bool {
+        !self.detached_viewer_borderless_fullscreen
+            && self.active_detached_viewer_current_placement().maximized
+    }
+
+    /// Queue the presentation-state portion of a detached host's visible commit.
+    ///
+    /// `Maximized(true)` deliberately precedes `Visible(true)`: on Windows the maximize command
+    /// itself shows the HWND, so issuing it after Visible would briefly expose the restored-size
+    /// window. Both commands are queued only after the caller has painted/published content.
+    #[cfg(windows)]
+    pub(crate) fn send_detached_viewport_visible_commit(
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+        maximized: bool,
+    ) {
+        if maximized {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
+        }
+        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
     }
 
     #[cfg(windows)]
@@ -22549,7 +22738,10 @@ impl App {
                 .fs_last_native_focus_claim_at
                 .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
                 .unwrap_or(false);
-            let focus = if should_claim_native_focus && !claim_debounced {
+            let z_order_permitted = self
+                .video_presentation_transition
+                .z_order_recovery_permitted();
+            let focus = if should_claim_native_focus && !claim_debounced && z_order_permitted {
                 self.fs_last_native_focus_claim_at = Some(std::time::Instant::now());
                 claim_native_window_focus(target.target_hwnd)
             } else {
@@ -22579,7 +22771,7 @@ impl App {
                     vst_gui_visible,
                     viewport_focused,
                     focus_restore_click,
-                    should_claim_native_focus && !claim_debounced,
+                    should_claim_native_focus && !claim_debounced && z_order_permitted,
                     claim_debounced,
                     focus.set_foreground_ok,
                     focus.attach_thread_input_ok,
@@ -22588,8 +22780,19 @@ impl App {
                 ));
             }
             if focus_restore_click {
-                if should_claim_native_focus && !claim_debounced {
+                if should_claim_native_focus
+                    && !claim_debounced
+                    && self
+                        .video_presentation_transition
+                        .z_order_recovery_permitted()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Focus,
+                        "ui_fullscreen::pointer_focus_regain",
+                        "viewport_command=Focus",
+                    );
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_primary_suppression.arm_pointer_stream();
@@ -24915,6 +25118,11 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
+            #[cfg(windows)]
+            let presentation_was_transitioning =
+                self.video_presentation_transition.is_transitioning();
+            #[cfg(not(windows))]
+            let presentation_was_transitioning = false;
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
@@ -24923,8 +25131,14 @@ impl App {
             }
             let detached = self.viewer_session_is_detached();
             self.handle_fullscreen_close_request();
-            if !detached {
+            if !detached && !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::close_request_focus",
+                    "viewport_command=Focus",
+                );
             }
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
@@ -24939,8 +25153,21 @@ impl App {
                     "ui_fullscreen::handle_fs_navigation:close_to_page_list",
                 );
             }
+            #[cfg(windows)]
+            let presentation_was_transitioning =
+                self.video_presentation_transition.is_transitioning();
+            #[cfg(not(windows))]
+            let presentation_was_transitioning = false;
             self.close_fullscreen();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if !presentation_was_transitioning {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::video_close_focus",
+                    "viewport_command=Focus",
+                );
+            }
             ctx.request_repaint();
         }
         // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が

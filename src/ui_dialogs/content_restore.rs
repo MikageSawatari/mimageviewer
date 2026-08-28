@@ -117,18 +117,59 @@ pub fn render_content_restore_modal(
     rows: &mut [ContentRestoreUiRow],
     dont_ask_again: &mut bool,
 ) -> Option<ContentRestoreUiAction> {
-    let modal_width = (ctx.content_rect().width() - 80.0).clamp(420.0, 780.0);
-    egui::Modal::new(egui::Id::new("content_restore_modal"))
+    let screen = ctx.content_rect();
+    let modal_width = (screen.width() - 80.0).clamp(420.0, 780.0);
+    // `egui::Modal` は `Area` を使うので縦にサイズを持てず、**中身の高さがそのまま窓の
+    // 高さになる**。一覧の上限を `ui.available_height()` から決めていたため、
+    // 「窓が中身に縮む → 次フレームの空きが減る → 一覧がさらに縮む」が毎フレーム回り、
+    // 開いたまま眺めているだけで一覧が数行まで潰れていた (2026-08-28 の実機報告)。
+    // 幅は最初から `content_rect` 由来で安定していたのに、高さだけ自分の中身を見ていた。
+    //
+    // 窓に確定した高さを持たせるとこのループは成立しない。`Window` なら利用者が
+    // 掴んで広げられるという要望もそのまま満たせる。キーボードと一覧の入力は
+    // `content_restore` が `modal_dialog_block_reason` に登録済みなので止まったままである。
+    let default_height = (screen.height() - 160.0).clamp(320.0, 720.0);
+
+    // `Modal` が描いていた暗幕とクリック吸収は自前で持つ。`Window` へ替えたのは
+    // リサイズのためで、「背面は触れない」という合図と、背面ボタンへクリックが
+    // 抜けない性質まで手放す意図はない (`modal_dialog_block_reason` はポインタ
+    // ナビまでは止めない — backlog §1.134)。窓より 1 段下の order に置く。
+    egui::Area::new(egui::Id::new("content_restore_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .sense(egui::Sense::CLICK | egui::Sense::DRAG)
+        .interactable(true)
         .show(ctx, |ui| {
-            ui.set_min_width(modal_width);
-            // 上限も要る。中身が要求する幅で伸びるので、長いパスを持つ行があると
-            // ウィンドウをはみ出す。
-            ui.set_max_width(modal_width);
-            ui.heading("編集内容の復元");
-            ui.add_space(8.0);
-            render_content_restore_contents(ui, rows, dont_ask_again)
-        })
-        .inner
+            ui.set_min_size(screen.size());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(100));
+        });
+
+    let mut result = None;
+    egui::Window::new("編集内容の復元")
+        .id(egui::Id::new("content_restore_modal"))
+        .order(egui::Order::Foreground)
+        .resizable(true)
+        .collapsible(false)
+        .default_pos(screen.center() - egui::vec2(modal_width / 2.0, default_height / 2.0))
+        .default_width(modal_width)
+        .default_height(default_height)
+        .min_width(420.0)
+        .min_height(240.0)
+        .max_size(screen.size())
+        .constrain_to(screen)
+        .show(ctx, |ui| {
+            // 本文は右端まで使う一覧なので、floating bar の予約幅を確保しないと
+            // バーが行のテキストへ重なる。アプリ共通 style は一覧の表示面積を優先して
+            // 予約幅 0 なので、`favorites_editor` などと同じくここで局所適用する。
+            ui.spacing_mut().scroll =
+                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+            // 上限は残す。中身が要求する幅で伸びるので、長いパスを持つ行があると
+            // 利用者が広げていない限りウィンドウをはみ出す。
+            ui.set_max_width(ui.available_width());
+            result = render_content_restore_contents(ui, rows, dont_ask_again);
+        });
+    result
 }
 
 fn render_content_restore_contents_with_list_height(
@@ -176,10 +217,14 @@ fn render_content_restore_contents_with_list_height(
     ui.checkbox(dont_ask_again, "次から確認しない (環境設定で元に戻せます)");
     ui.add_space(8.0);
     let mut action = None;
+    // 右下は `Window` のリサイズつまみが描かれる場所なので、その分だけ右を空けてから
+    // ボタンを置く。空けないとつまみがボタンに重なり、掴もうとしてボタンを押す。
+    let resize_corner = ui.visuals().resize_corner_size;
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
+            ui.add_space(resize_corner);
             if ui.button("閉じる").clicked() {
                 action = Some(ContentRestoreUiAction::Close);
             }
@@ -449,6 +494,67 @@ mod tests {
         assert!(
             three_hundred_tall > three_hundred + 150.0,
             "enlarging the window should enlarge the viewport: {three_hundred} -> {three_hundred_tall}"
+        );
+    }
+
+    /// `measured_list_height` above runs the body inside a `CentralPanel`, where the available
+    /// height is fixed by the panel. That is why it never saw the real defect: in the window the
+    /// dialog actually uses, the container sized itself to its own content, so deriving the list
+    /// height from `ui.available_height()` fed the result back into the next frame's input and the
+    /// list collapsed a little on every frame until only a couple of rows were left.
+    ///
+    /// This runs the real entry point for several frames and watches the window instead.
+    #[test]
+    fn the_restore_window_does_not_shrink_while_it_is_just_sitting_there() {
+        let ctx = egui::Context::default();
+        let mut rows = (0..48)
+            .map(|index| ContentRestoreUiRow {
+                file_name: format!("target-{index}.png"),
+                selected: true,
+                source_index: 0,
+                sources: vec![ContentRestoreUiSource {
+                    path: format!("C:/source/file-{index}.png"),
+                    source_exists: true,
+                }],
+            })
+            .collect::<Vec<_>>();
+        let mut dont_ask_again = false;
+        let mut heights = Vec::new();
+        for _ in 0..8 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
+                },
+            );
+            if let Some(rect) =
+                ctx.memory(|memory| memory.area_rect(egui::Id::new("content_restore_modal")))
+            {
+                heights.push(rect.height());
+            }
+        }
+
+        assert!(
+            heights.len() >= 6,
+            "the window must be laid out on every frame: {heights:?}"
+        );
+        // The first frame is still deciding; from the second onwards the height is the contract.
+        let settled = heights[1];
+        for (frame, height) in heights.iter().enumerate().skip(2) {
+            assert!(
+                *height >= settled - 1.0,
+                "frame {frame} lost height with no input: {heights:?}"
+            );
+        }
+        assert!(
+            settled > 240.0,
+            "a 48 row list should open at a usable height: {heights:?}"
         );
     }
 }

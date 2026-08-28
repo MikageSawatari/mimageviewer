@@ -203,7 +203,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 ## 9. 進捗記録
 
-### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認、R2e 分を 2026-08-25 に反映)
+### 9.1 現況 (唯一の進捗表、R2b close を 2026-08-28 に反映)
 
 この表だけを現行ステージ判定に使う。後続のコミット・検収記録は、各時点の実装履歴であり、
 現在の完了判定ではない。コードから実装を確認できた範囲を記載し、7 月 24〜26 日分を含む
@@ -214,7 +214,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
 | R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
 | R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
-| R2b | **部分完了 (R2e で 1 軸閉じた)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
+| R2b | **完了 (2026-08-28、§9.8)** | Runtime routing / `ParkedLive` / context registry の所有型化に加え、presentation migration を `PresentationTransitionOwner` の純粋 reducer へ集約した。旧 `pending_detached_video_host_switch` / `native_video_mode_switch` は廃止し、host/native の publish・activation・retire・terminal close と z-order recovery permit を同じ request generation で所有する。R4 の deferred viewport / single render entry / host persistence は含まない |
 | R2c | **完了** | placement は runtime 所有、settings は seed |
 | R2d | **完了** | live-park と active 復帰の直列化を実装済み |
 | R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
@@ -1121,6 +1121,34 @@ KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の�
 - `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
   — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
 
+### R2e active detached session / binding lifetime follow-up (backlog §1.138、2026-08-28)
+
+最初の診断は「session が window ID を保持したまま registry binding が先に消えた」だったが、
+次の実機 run の追加計装が方向を反証した。通常 open (`src/app.rs`) の session set は
+`ViewerContextId(0)/Mounted` を伴う一方、`apply_video_presentation_switched`
+(`src/app/native_video.rs`) の set は同じ window でも `binding=none` だった。その間に unbind は無い。
+backstop が見つけたのは早期 release ではなく、**最初から binding の無い window を名指す session**
+である。
+
+active session は backstop が registry owner を mount して描く公開済み所有権なので、unbound session
+は正当な中間状態ではない。通常 open に既にあった `bind_window(mounted, id)` を共通 helper へ集約し、
+native placement commit と egui F12 も session begin の前に通す。Building binding は I8 により
+commit 前非公開なので、detached book build の session begin は closure 内から commit 後・repaint
+前へ移した。production の session begin 境界も Mounted / AtRest binding の存在を要求する。
+backstop の共通 `with_window_viewer_context` mount 契約と観測計装は弱めず残す。
+
+前回の修正で入れた `App::unbind_window` assertion、`retire_context` 内の matching session finish、
+active→passive / always-new の handoff-before-unbind は、観測された 1.138 の原因ではなかった。
+ただし binding 確立後の反対向きの lifetime 違反 (session を残した release) を owner 境界で拒否する
+補完的不変条件であり、撤去しない。対応テストも実再現の証明ではなく retire / release ownership
+hardening として残す。
+
+同じ run で、§9.8 transition owner が `DetachedWindow → DetachedWindow` host resync に current
+host を outgoing として持たせ、commit 後に live host を destroy する別退行も確定した。これは R2e
+binding defect とは独立である。request の host 意味を `None / KeepLive / RetireOutgoing` に型付けし、
+成功時に host を退役できるのは detached から non-detached へ離れる遷移だけとした。candidate
+abort / failure と terminal close の host cleanup は別 effect のまま維持する。
+
 **残した確認事項の解決 (2026-08-26)**:
 `rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
 `global_search_subfolder_restore` も `ViewerContextBundle` 所有へ移した。検索 fallback の
@@ -1283,6 +1311,139 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
     R2e 第 3 版で「この window の bundle は今どこにあるか」を一級の問い合わせにすること
     (材料は [briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §6.5)。
 
+### 9.8 遷移所有者 (R2b 完了) — backlog §1.137 の根治として実施 (2026-08-28 合意)
+
+利用者の報告「F12 でタスクバーが何度も明滅する / 白い窓が出てから最大化される」
+(backlog §1.137) の根治。**出荷前に実施する** (利用者判断 2026-08-28)。
+
+#### 測定された事実
+
+- キャプチャの下端 18px をフレームごとに分類し、**F12 1 往復でタスクバーが 16 回反転**
+  (334ms に 9 回、333ms に 7 回、ほぼ 1 フレームごと)。
+- ホスト viewport は表示後 376ms 中身が無い。動画の子窓はその後に作られる。
+- §1.115 (font atlas resync) の撤去後もこの反転は残った。**別機構**であることが実測で確定している。
+
+#### なぜ構造修正か (ClaudeCode / Codex 双方合意、憲法 §2 の要件)
+
+現状、**「遷移中に何が画面を覆うか」の所有者が存在しない**。fullscreen → detached の
+待機中は `viewer_presentation` が旧 Fullscreen のままなので、`ensure_native_video_front` が
+新ホストを「presenter 以外の前面」と見て旧 presenter の raise を要求できる。
+ホスト表示側と旧フルスクリーン復旧側が**別々に z-order を動かせる**のが反転の正体。
+
+したがって直し方は順序の微調整ではなく、**所有境界の一本化**であり、
+本書 §9.1 が **R2b の未完件として既に記録している「純粋 reducer」「散在 pending / flag の
+typed 集約」そのもの**。R4 の半端な先行実装ではない。
+
+#### スコープ (R4 は含めない)
+
+- **含む**: `pending_detached_video_host_switch` と `native_video_mode_switch` を一つの
+  typed transition owner へ畳む。`Stable → Preparing → Ready → Committing → Stable`。
+  ホストの `Visible` / `Focus`、native publish、outgoing retire、terminal session close を
+  **reducer の effect としてのみ**発行する。native contract の `TargetReady` を
+  `Prepare` / `Ready` / `Commit` へ分ける。
+- **含まない (R4)**: `show_viewport_deferred` 化、single render entry、ホストの永続化。
+  F12 OFF でホスト HWND を terminal destroy する現行仕様は維持する。
+
+#### 実施後に残るもの (利用者への説明用)
+
+タスクバーの反転と**空の白い窓は消える**。残るのは:
+
+- hidden host の生成待ち 約 300ms (旧フルスクリーン映像がそのまま見える)
+- F12 OFF で host HWND を destroy し、次の ON で新規生成 → mIV のタスクバーボタンが
+  **1 往復に 1 回ずつ**消えて現れる (現行の 16 回反転とは別物)
+
+#### 受け入れ基準
+
+- 両方向で **outgoing presenter の raise 0 回**、**cover の変化 1 回**。
+  遷移 ID 付きで `Visible` / `Focus` / `Publish` / `Raise` / `Destroy` を記録し、
+  画面キャプチャのフレーム分類と突き合わせて確認する。
+- content-ready 前の host activation 0 回。
+- 固定 ms で commit / 復帰しない (憲法 §2 規則 5)。abort / 再入力 / Esc / close /
+  player 終了を合法遷移としてテストする。
+
+#### これをやったら症状パッチになる (明示的に禁止)
+
+- `ensure_native_video_front` へ `if pending… { return; }` を足すだけ。
+- 別の bool で `Visible(true)` を遅らせる。
+- 既存 2 つの pending を残したまま 3 つ目の transition state を足す。
+
+#### 留保
+
+`ensure_native_video_front` 単独が 7〜9 回の反転を生んだとは**まだ言えない**。
+recover raise には 250ms gate があり、333ms に 7〜9 回を直接発行する経路ではない。
+egui host の `Visible+Focus`、新 presenter の `show_and_raise`、旧 presenter の destroy、
+HUD/VST の raise も同じ遷移に参加している。reducer は**それら全部**を集約する。
+
+#### 実装結果 (2026-08-28、R2b close)
+
+- `PresentationTransitionOwner` を `ViewerContextBundle` と mounted App projection の同じ
+  context-owned field として導入した。状態は `Stable / Preparing / Ready / Committing`、
+  request は current / target / generation / activation intent / outgoing presenter と、detached host の
+  typed disposition (`None / KeepLive / RetireOutgoing`) を所有する。同一 presentation の host resync
+  は live host を保持し、detached から離れる遷移だけが outgoing host を退役できる。
+  F12、detached host resync、source-swap completion、Esc / window close / player end は同じ
+  reducer event/effect 境界へ入る。
+- native host contract は `TargetReady` で publish せず、hidden create + attach + frame prime の
+  後に `Ready`、reducer の `PublishNative` 後に `TargetCommit` とする。`NativeCommitted` は
+  pump の publish 完了 ack なので、同じ effect batch で host の `Visible` / `Focus` を先に発行し、
+  続けて `TargetRetire` を発行する。失敗/abort は candidate だけを破棄し prior host/core を残す。
+  Ready / Commit / Retire / Abort は request generation と native generation の双方で stale を
+  棄却し、commit/recovery の deadline は置かない。
+- egui host の `Visible` / `Focus` / `Destroy`、native `Publish` / outgoing `Destroy` は reducer
+  effect だけから発行する。transition 中は App と native pump の recovery permit を閉じ、
+  `ensure_native_video_front`、HUD、VST、grid same-media raise、main-focus restore、tray restore が
+  独自の raise / activation を行わない。tray visibility intent は permit 再開時の active epoch へ
+  再束縛する。
+- `[presentation-transition] id=... target=... effect=... hwnd=0x...` で、実際に適用された
+  `Visible / Focus / Publish / Destroy` を記録する。stale contract event は effect が無いため
+  記録されず、transition-owned `Raise` は存在しない。`[ui-frame-gap]` / `[atlas-probe]` は維持した。
+- pure reducer と native contract の回帰テストで、両方向、candidate failure、F12 再入力、
+  Esc、window close、player end、newer request 後の stale Ready / Commit を固定した。
+  自動検証後の実機検収は、両方向で outgoing raise 0、cover change 1、content-ready 前 activation 0
+  を 1 往復の画面キャプチャと上記ログで照合する。
+
+#### build I follow-up: outgoing retire を incoming host の poll から分離 (2026-08-28)
+
+build I では `Publish` / `placement committed` / host `Visible` / `Focus` の後、outgoing presenter の
+`Destroy` が 5.9 秒来なかった。その間 `shared output pool exhausted waiting for free slot` が約 500ms
+ごとに続き、次の `[ui-frame-gap]` も 5899.4ms だった。window click 直後に `App::update` が再開し、
+`Destroy` / `PlacementRetired` が完了したため、UI thread の lock / GPU wait ではなく idle sleep が
+確定した。
+
+原因は reducer の `Committing::AwaitingHostVisible`。`PlacementCommitted` を取り込んだ pass は host の
+`Visible` / `Focus` を発行するだけで、次の `App::update` が `IsWindowVisible(host)` を再観測して
+`HostVisible` を dispatch するまで `RetirePlacement` を発行しなかった。poll 末尾の
+`ctx.request_repaint()` が次 pass を起こす想定だったが、native event bus の root wake を持つ
+`PlacementCommitted` と `PlacementRetired` の間に UI-only poll を置いたため、実機では window event
+が無いまま sleep できた。build F の約 70ms は同じ reducer が第2 passを必要としており、host の
+visibility / focus / redraw 等の incidental event で進んだだけである。
+
+この依存は `DetachedHostDisposition` 変更で導入されたものではない。
+`Fullscreen → DetachedWindow` の disposition は変更前後とも host retire を所有しない `None` で、
+同変更の source diff も `AwaitingHostVisible` 経路を変えていない。スケジューリング上の偶発 wake が
+無い run で、R2b 導入時からあった依存が露出した。
+
+所有権の cutover は OS host visibility ではなく `NativeCommitted` である。この event は candidate の
+create / attach / current-frame prime と pump publish が完了した後だけ生成される。outgoing presenter が
+正当に待てるのはここまでで、別 owner である egui host の可視 level を待たせない。
+`AwaitingHostVisible` / `HostVisible` poll を撤去し、commit effect の順序を
+`ApplyPresentation → Visible → Focus → RetireOutgoing` とした。host command は retire より先に発行するが、
+その OS-level confirmation を native resource retirement の前提にはしない。timeout / retry / settle window /
+追加 repaint は無く、観測計装も維持する。
+
+共有 GPU output pool は 16 slot、visible source queue は最大 8、copy-fence retire queue は最大 4 で、
+candidate prime のための短い二重生存を許す設計である。二 presenter が一瞬でも共存不能という
+zero-overlap 制約ではない。旧 presenter の fence ownership を 5.9 秒残したことが pool を枯らしたので、
+容量調整ではなく commit ownership 境界で retire を発行する lifecycle correctness として修正した。
+
+回帰テスト
+`fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility` は commit effect の
+完全な順序と `AwaitingRetire` を固定する。killing mutation として retire を incoming host visibility
+event の後ろへ戻すと、commit batch から `RetireOutgoing` が消えて失敗する。
+
+R4 に残すものは契約どおり `show_viewport_deferred`、single render entry、host persistence。
+F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作成を待つ仕様は維持する。
+
 ## 10. 将来候補 (現行仕様では未採用)
 
 - **pin の再導入**: CUT 前の linked/pin 意味論は戻さない。必要なら、既存窓を
@@ -1297,6 +1458,97 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-28 hidden detached host の maximize を既存 Visible commit owner へ移管
+(backlog §1.139、利用者の WH_CBT / WH_CALLWNDPROC 実測と winit source の導出が一致し、
+ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の active / passive detached builder、
+initial visibility release、keep-alive holdover / backstop、fullscreen viewport recreate、
+[src/app/native_video.rs](../src/app/native_video.rs) の既存 `SetHostVisible` effect consumer、
+[src/tray_integration.rs](../src/tray_integration.rs) の既存 retained viewport restore owner、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明、[next-release-backlog.md](next-release-backlog.md)
+§1.139。`[presentation-hook]` / `[presentation-winevent]` / `[presentation-viewport]` を含む既存計装は
+実機再検証まで維持する。
+
+**不変条件と所有境界**: hidden で生成・再生成する detached builder は visibility と geometry だけを
+指定し、maximize を同時に要求しない。保存 placement の `maximized` は、動画なら既存 reducer の
+`Publish -> Visible -> Focus` にある Visible effect、静止画 / 音声なら content-ready 後の initial
+visibility release、host-loss recovery なら描画・登録後の keep-alive/backstop release、tray resident
+host なら restore owner が読む。最大化が必要な場合は `Maximized(true) -> Visible(true)` を同一 commit
+として queue する。cleanup-only の `fullscreen_viewport_recreate` は表示せず、次の表示 owner まで
+maximize を保持する。main/fullscreen builder 自体は maximize を要求しない。
+
+**なぜ症状パッチではないか**: 実測で `ShowWindow(SW_MAXIMIZE)` が hidden host を表示・activate し、
+`visible=false` が直後に隠すという矛盾が 3 周の foreground churn と 300ms を直接作っていた。
+結果側の focus / taskbar を抑止せず、矛盾した二つの presentation instruction を生成境界から分離して
+最大化を既存 commit owner へ戻した。`with_visible(false)` の content-ready 契約は維持し、新しい
+App-level bool / Option、timeout / settle window、guard / retry / repaint、機能制限は追加していない。
+hidden builder へ maximize を戻す mutation と、Visible effect から maximize を落とす・順序を逆にする
+mutation はそれぞれ独立テストが拒否する。
+
+**同日追補 — hidden recreate 中の placement observation ownership**: 上記修正の実機確認で
+ちらつきは解消したが、最大化した detached 窓を F12 で再生成すると通常サイズへ戻る回帰を確認した。
+hidden host は意図的に非最大化で作られるため、Visible commit より前の active render が live state の
+`maximized:false` を保存し、移管先 owner が読む intent を消していた。観測では同じ capture が
+`x/y/w/h` も scaffold の矩形へ置換した。
+
+**追補の触った範囲**: [src/app.rs](../src/app.rs) の runtime placement write / observation authority、
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の active render capture、
+[src/app/native_video.rs](../src/app/native_video.rs) の Visible 計装、[src/app/tests.rs](../src/app/tests.rs) の
+回帰証明、[next-release-backlog.md](next-release-backlog.md) §1.139。観測計装は実機再検証まで維持する。
+
+**追補後の不変条件**: OS 上で可視な detached host だけが利用者の runtime placement intent を
+publish できる。hidden recreate scaffold は一時的な restored geometry / maximized=false を報告しても
+保存 placement を変更しない。authority は capture 時点の HWND の `IsWindowVisible` から導出し、
+新しい App state、timeout / settle window、frame-count guard、retry は追加しない。これは最大化だけを
+特別扱いする症状 guard ではなく、geometry 全体の producer ownership を live user window に戻す
+構造修正である。hidden observation を writable に戻す mutation と、Visible owner から maximize を
+落とす mutation は一つの seam test が拒否する。
+
+**2026-08-28 native commit と outgoing presenter retire の所有境界
+(backlog §1.137 follow-up、利用者提示の build I 実機観測を ClaudeCode / Codex 双方が構造修正の
+根拠として合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の commit reducer /
+回帰テスト、[src/app/native_video.rs](../src/app/native_video.rs) の transition poll、
+[src/app/tests.rs](../src/app/tests.rs) の test helper。本節 §9.8 と
+[next-release-backlog.md](next-release-backlog.md)、[video-architecture.md](video-architecture.md) を更新した。
+`[presentation-transition]` / `[presentation-window]` / `[ui-frame-gap]` と GPU pressure 計装は残した。
+
+**不変条件と所有境界**: outgoing presenter は hidden candidate の create / attach / prime と pump publish
+が完了した `NativeCommitted` までを所有し、そこから先は retire 対象である。egui host の
+`Visible` / `Focus` command は同じ commit effect batch で先に発行するが、host の OS visibility は
+別 owner の事実であり native retire の前提にしない。共有 pool は短い二重生存を許し、5.9秒の
+poll dependency は許さない。
+
+**なぜ症状パッチではないか**: timeout / retry / settle window / repaint を追加せず、retire を
+worker wake の無い UI-only `HostVisible` poll から、candidate ownership が確定する native commit ack
+へ移した。host confirmation を retire の後ろへ再接続する mutation は reducer test が拒否する。
+
+**2026-08-28 同一 presentation の host disposition と active session / binding の生成契約
+(backlog §1.138、利用者提示の実機観測を ClaudeCode / Codex 双方が構造修正の根拠として合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の request / reducer、
+[src/app/native_video.rs](../src/app/native_video.rs) の placement request / commit、[src/app.rs](../src/app.rs)
+の detached session producer、[src/app/tests.rs](../src/app/tests.rs) の回帰証明。観測用の
+`[presentation-window]` / `[presentation-transition]` / `[active-detached-session]` 計装、backstop の
+mount 契約、host geometry / placement / focus の方式は変更しない。
+
+**不変条件と所有境界**: 成功時に live detached host を退役できるのは
+`DetachedWindow → MainWindow/Fullscreen` だけで、`DetachedWindow → DetachedWindow` resync は
+presenter を retire しても host を保持する。request がこの差を `None / KeepLive / RetireOutgoing`
+として所有し、reducer は presentation 値から退役を再推測しない。active detached session は
+renderable owner の公開なので、名指す window は begin 前に registry の Mounted / AtRest binding を
+持つ。通常 / native / egui の入口を同じ binding helper へ通し、Building binding は I8 に従って
+commit 後に session を開始する。
+
+**なぜ症状パッチではないか**: close を無視する guard、backstop の `None` tolerance、時間窓、retry、
+追加 repaint は入れていない。誤った host 退役意図を typed request で表現し直し、不正な session を
+producer 境界で生成不能にした。A の同一 presentation host retirement と B の unbound session birth
+は同じ 30µs に現れたが、別 owner / 別 invariant の独立 defect として実装・テストを分離した。
+前回の unbind / retire ordering 修正は今回の実原因ではないが、反対向きの release 違反を防ぐ
+補完的不変条件として維持する。
 
 **2026-08-27 font atlas の viewport lifecycle resync を renderer 配送境界へ集約
 (backlog §1.115 option (d)、ClaudeCode と Codex が構造修正として事前合意):**
