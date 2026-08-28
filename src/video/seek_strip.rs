@@ -326,7 +326,7 @@ pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] = &[
 
 /// Persisted one-screen span choices for the waveform strip, in seconds.
 pub(crate) const WAVEFORM_RANGE_STEPS_SECS: &[f64] = &[
-    5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
+    5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
 ];
 
 /// 表示範囲に未着セルがあるとき、ワーカーへ頼み直すか。
@@ -1573,6 +1573,43 @@ mod tests {
         assert!(should_request_strip_window(true, Some(3), Some(9)));
     }
 
+    /// 既定値は、その ladder の段でなければならない。
+    ///
+    /// 波形の既定は 3 分だが ladder は 2 分の次が 5 分で、**一度ホイールを回すと二度と
+    /// 3 分へ戻せなかった** (2026-08-27 Codex レビュー)。既定として選ぶ価値がある値なら、
+    /// 選び直せなければならない。
+    #[test]
+    fn every_persisted_default_is_a_step_on_its_own_ladder() {
+        assert!(
+            WAVEFORM_RANGE_STEPS_SECS
+                .contains(&crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS),
+            "波形の既定 {} 秒が ladder {WAVEFORM_RANGE_STEPS_SECS:?} に無い",
+            crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
+        );
+        assert!(
+            THUMBNAIL_RANGE_STEPS_SECS
+                .contains(&crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS),
+            "サムネイルの既定 {} 秒が ladder に無い",
+            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+        );
+
+        // 既定から左右へ 1 段動かして、また戻ってこられる。
+        let mode = crate::settings::VideoSeekStripMode::Waveform;
+        let default = crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS;
+        let narrower = step_seek_strip_range(mode, default, SeekStripRangeStep::Narrower)
+            .expect("a step below the default");
+        assert_eq!(
+            step_seek_strip_range(mode, narrower, SeekStripRangeStep::Wider),
+            Some(default)
+        );
+        let wider = step_seek_strip_range(mode, default, SeekStripRangeStep::Wider)
+            .expect("a step above the default");
+        assert_eq!(
+            step_seek_strip_range(mode, wider, SeekStripRangeStep::Narrower),
+            Some(default)
+        );
+    }
+
     #[test]
     fn range_step_ladders_match_the_persisted_choices() {
         assert_eq!(
@@ -1585,8 +1622,8 @@ mod tests {
         assert_eq!(
             WAVEFORM_RANGE_STEPS_SECS,
             &[
-                5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0,
-                10800.0,
+                5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
+                7200.0, 10800.0,
             ]
         );
         assert_eq!(
