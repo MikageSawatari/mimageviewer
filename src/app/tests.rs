@@ -50497,7 +50497,11 @@ mod still_window_mode_key_tests {
         app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
             owner,
             RightDragContext::VideoFullscreen,
-            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            // ジェスチャが「メニュー遅延を十分に過ぎている」ことだけを表す。**実時間の
+            // 長さに意味は無い。** Windows の `Instant` は起動からの計数なので、
+            // `Instant::now() - 1時間` は**稼働 1 時間未満のマシンで必ずパニックする**
+            // (2026-08-28、稼働 44 分の実機で発覚。閾値 400ms に対して 9000 倍だった)。
+            std::time::Instant::now() - crate::ring_shortcut::mouse_flick_menu_delay() * 4,
             egui::pos2(40.0, 50.0),
         ));
         assert!(

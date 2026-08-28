@@ -673,6 +673,9 @@ impl CoarseWaveform {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaveRenderRoute {
+    /// No column will be built and the span is past what one decode may hold in memory.
+    /// See [`decide_wave_render_route`].
+    TooWideWithoutColumn,
     Coarse,
     WindowDecode,
     CoarseProgressive,
@@ -703,11 +706,19 @@ fn decide_wave_render_route(
         CoarseAvailability::CoversVisible if requested_bin_secs >= COARSE_BIN_SECS => {
             WaveRenderRoute::Coarse
         }
-        // Decoding the window costs more than reading a column, which is why the
-        // progressive route exists past thirty minutes. But with no column to progress
-        // against, that route only refuses the request, so every span past the threshold
-        // would show nothing at all. Pay the decode instead.
-        CoarseAvailability::Never => WaveRenderRoute::WindowDecode,
+        // With no column to progress against, the progressive route only refuses the
+        // request, so a span past thirty minutes would show nothing at all. Decode the
+        // window instead -- but only while the window is one a decode may hold.
+        //
+        // `WINDOW_DECODE_MAX_SPAN_SECS` is not a preference. A range decode allocates the
+        // whole requested span as 48kHz stereo f32, sized from the span rather than from
+        // the audio actually found, and holds the aligned copy beside it: three hours is
+        // 3.86 GiB twice over. Sending the widest spans here to avoid one OOM would only
+        // have bought a larger one.
+        CoarseAvailability::Never if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS => {
+            WaveRenderRoute::WindowDecode
+        }
+        CoarseAvailability::Never => WaveRenderRoute::TooWideWithoutColumn,
         _ if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS => WaveRenderRoute::WindowDecode,
         _ => WaveRenderRoute::CoarseProgressive,
     }
@@ -1597,6 +1608,18 @@ fn process_wave_request(
             return;
         }
     }
+    if route == WaveRenderRoute::TooWideWithoutColumn {
+        // Say so rather than falling into the coarse path, which would report the same
+        // "coarse waveform unavailable" it reports for a column that is merely still
+        // filling in. Narrower spans on this file still work.
+        publish_wave_failure(
+            state,
+            request.id,
+            latest_request_id,
+            "this file has no coarse column, and the span is wider than one decode may hold",
+        );
+        return;
+    }
     if route != WaveRenderRoute::WindowDecode {
         process_coarse_request(
             request.id,
@@ -2166,11 +2189,17 @@ mod tests {
             WaveRenderRoute::CoarseProgressive
         );
 
-        // 列が来ないと分かっているなら、待つ経路へ入れてはいけない。入れると
+        // 列が来ないと分かっているなら、**待つ経路へは入れない**。入れると
         // `process_coarse_request` が毎回 Failed を返し、30 分より広い段が全滅する。
+        // ただし一括復号にも上限があるので、そこを超えたら型で断る (P1-1)。
+        for visible_span_secs in [600.0, WINDOW_DECODE_MAX_SPAN_SECS] {
+            assert_eq!(
+                decide_wave_render_route(Never, 0.5, visible_span_secs),
+                WaveRenderRoute::WindowDecode,
+                "{visible_span_secs}s の段が待ちに入ってしまう"
+            );
+        }
         for visible_span_secs in [
-            600.0,
-            WINDOW_DECODE_MAX_SPAN_SECS,
             WINDOW_DECODE_MAX_SPAN_SECS + 0.001,
             3600.0,
             7200.0,
@@ -2178,8 +2207,8 @@ mod tests {
         ] {
             assert_eq!(
                 decide_wave_render_route(Never, 0.5, visible_span_secs),
-                WaveRenderRoute::WindowDecode,
-                "{visible_span_secs}s の段が待ちに入ってしまう"
+                WaveRenderRoute::TooWideWithoutColumn,
+                "{visible_span_secs}s を一括復号へ送ってはいけない"
             );
         }
     }
@@ -2246,16 +2275,72 @@ mod tests {
                 CoarseAvailability::Never,
                 "予算超過は「まだ」ではなく「来ない」"
             );
-            assert_eq!(
-                decide_wave_render_route(
-                    availability,
-                    waveform_bin_secs(signature.span_secs(), signature.pixel_width),
-                    visible_span_secs
-                ),
-                WaveRenderRoute::WindowDecode,
-                "{visible_span_secs}s の段が復号へ回らない"
+            let route = decide_wave_render_route(
+                availability,
+                waveform_bin_secs(signature.span_secs(), signature.pixel_width),
+                visible_span_secs,
             );
+            if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS {
+                assert_eq!(
+                    route,
+                    WaveRenderRoute::WindowDecode,
+                    "{visible_span_secs}s の段が復号へ回らない"
+                );
+            } else {
+                assert_eq!(
+                    route,
+                    WaveRenderRoute::TooWideWithoutColumn,
+                    "{visible_span_secs}s を一括復号へ送ると PCM が数 GiB になる"
+                );
+            }
         }
+    }
+
+    /// 一括 PCM 復号へ回る範囲は、必ず固定上限の内側に収まる。
+    ///
+    /// `decode_range_to_stereo_f32` は要求範囲ぶんの 48kHz stereo f32 を確保する。長さは
+    /// **実際に見つかった音声ではなく要求範囲**で決まり、時刻合わせ後のコピーが並存するので、
+    /// 3 時間なら 3.86 GiB が 2 つになる。列を作れない動画を無条件に一括復号へ送ると、
+    /// 32 MiB の OOM を避けた代わりにその 200 倍を確保することになる
+    /// (2026-08-28 Codex 第 4 回レビュー P1-1)。
+    ///
+    /// route の列挙ではなく、**そこから決まる確保量**を縛る。
+    #[test]
+    fn nothing_reaches_a_range_decode_with_more_span_than_it_may_hold() {
+        /// 48kHz stereo f32、時刻合わせ後のコピーと並存する分を含む。
+        fn peak_pcm_bytes(span_secs: f64) -> f64 {
+            span_secs * 48_000.0 * 2.0 * 4.0 * 2.0
+        }
+        let ceiling = peak_pcm_bytes(WINDOW_DECODE_MAX_SPAN_SECS);
+
+        for availability in [
+            CoarseAvailability::CoversVisible,
+            CoarseAvailability::NotYet,
+            CoarseAvailability::Never,
+        ] {
+            for visible_span_secs in crate::video::seek_strip::WAVEFORM_RANGE_STEPS_SECS
+                .iter()
+                .copied()
+            {
+                for requested_bin_secs in [MIN_WAVEFORM_BIN_SECS, 0.5, COARSE_BIN_SECS, 5.0] {
+                    let route = decide_wave_render_route(
+                        availability,
+                        requested_bin_secs,
+                        visible_span_secs,
+                    );
+                    if route == WaveRenderRoute::WindowDecode {
+                        assert!(
+                            peak_pcm_bytes(visible_span_secs) <= ceiling,
+                            "{availability:?} / {visible_span_secs}s / bin {requested_bin_secs} が                              一括復号へ回り、PCM は {:.1} GiB になる",
+                            peak_pcm_bytes(visible_span_secs) / (1024.0 * 1024.0 * 1024.0)
+                        );
+                    }
+                }
+            }
+        }
+
+        // 上限そのものは 3 時間の 1/6。実測でこの値が動いたら気づけるように書いておく。
+        assert!((ceiling / (1024.0 * 1024.0 * 1024.0) - 1.288).abs() < 0.01);
     }
 
     #[test]
