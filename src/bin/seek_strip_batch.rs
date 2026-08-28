@@ -189,10 +189,10 @@ where
 fn print_usage() {
     println!(
         "Usage: seek_strip_batch [OPTIONS] <FILE-OR-FOLDER>...
-         
+
          Recursively verifies mImageViewer video files with the app's own
          SeekStripThumbnailWorker and axis resolver.
-         
+
          Options:
            --limit N           Verify at most N files
            --json              Emit one JSON report to stdout

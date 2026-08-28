@@ -48100,6 +48100,7 @@ mod tests {
         assert!(!whole.is_step(5, PageSlice::Left));
     }
 
+    #[test]
     fn continuous_single_page_rect_aligns_trimmed_content_inside_virtual_unit() {
         let unit_rect =
             egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(80.0, 100.0));

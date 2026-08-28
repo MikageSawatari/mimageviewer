@@ -5644,6 +5644,7 @@ C:\isolated\miv-data"#
         assert!(!std::ptr::eq(first, interned_pdf_password("another")));
     }
 
+    #[test]
     fn dll_failure_skips_all_worker_attempts() {
         let mut calls = 0;
         let result: Result<((), WorkerSlotStartup<()>), String> =
