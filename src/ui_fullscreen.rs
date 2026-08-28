@@ -25,11 +25,11 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, ContextResidence, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
-    FsNavigationDisplayTarget, FsNavigationPresentation, FsNavigationSequence,
-    FsNavigationSequenceTarget, FsNavigationTargetPhase, FsOpenMaterialization,
-    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
-    FsPrefetchSideDisplay, ViewerPresentation, build_fs_prefetch_indicator,
+    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
+    FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
+    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
+    build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -13593,23 +13593,10 @@ impl App {
             .active_detached_session
             .expect("live detached viewport must have an active session")
             .window_id;
-        match self.locate_window_context(window_id) {
-            Some((_, ContextResidence::AtRest)) => {
-                self.with_window_viewer_context(window_id, |app| {
-                    app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-                })
-                .expect("at-rest backstop owner must be mountable");
-            }
-            Some((_, ContextResidence::Mounted)) => {
-                self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-            }
-            Some((owner, residence)) => {
-                panic!(
-                    "active detached backstop window {window_id} belongs to {owner:?} in {residence:?}"
-                );
-            }
-            None => panic!("active detached backstop window {window_id} has no context binding"),
-        }
+        self.with_window_viewer_context(window_id, |app| {
+            app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+        })
+        .expect("active detached backstop owner must be mountable");
     }
 
     /// Draw the keep-alive backstop while the active detached viewer context owns `App`'s

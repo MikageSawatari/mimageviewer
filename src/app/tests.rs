@@ -38275,6 +38275,7 @@ mod still_window_mode_key_tests {
             app.detached_window_state(session.window_id),
             Some(DetachedWindowState::Active)
         );
+        app.bind_mounted_context_for_test(session.window_id);
 
         let request_id = begin_test_video_presentation_transition(
             &mut app,
@@ -38297,6 +38298,77 @@ mod still_window_mode_key_tests {
             None,
             "the terminal video presentation transition must remove its detached runtime"
         );
+        assert_eq!(
+            app.locate_window_context(session.window_id),
+            None,
+            "F12 detached -> fullscreen must release the binding in the same terminal close"
+        );
+        // Killing mutation: remove CloseDetachedSession from the detached -> fullscreen retire
+        // effects; the session and its mounted-main binding both remain.
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn active_window_context_retire_finishes_session_before_binding_release() {
+        let mut app = setup_app();
+        let window_id = 124;
+        let context_id =
+            app.build_active_context_for_test(Some(window_id), DetachedSource::Video, |context| {
+                context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            });
+
+        app.retire_context(context_id, "test_active_window_context_retire", |_| ())
+            .expect("the active at-rest context should retire");
+
+        assert!(
+            app.active_detached_session.is_none(),
+            "retire must stop the session naming the window before releasing its binding"
+        );
+        assert_eq!(app.locate_window_context(window_id), None);
+        assert_eq!(app.detached_window_state(window_id), None);
+        // Killing mutation: remove the matching-session finish from retire_context; the
+        // unbind boundary assertion fires while the session still names this window.
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn at_rest_session_finish_precedes_later_context_retire() {
+        let mut app = setup_app();
+        let window_id = 125;
+        let context_id =
+            app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
+                context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            });
+
+        app.begin_active_detached_session_close("test_session_first");
+        app.finish_active_detached_session_close("test_session_first");
+
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(
+            app.locate_window_context(window_id),
+            Some((context_id, ContextResidence::AtRest)),
+            "an at-rest context keeps the binding until its owner transaction retires"
+        );
+
+        app.retire_context(context_id, "test_session_first_retire", |_| ())
+            .expect("the closed at-rest context should retire");
+        assert_eq!(app.locate_window_context(window_id), None);
+        // Killing mutation: remove active_detached_session.take() from session finish; the
+        // intermediate assertion observes that the session outlived its terminal close.
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[should_panic(
+        expected = "cannot release window 126 while the active detached session still names it"
+    )]
+    fn raw_unbind_rejects_a_window_named_by_the_active_session() {
+        let mut app = setup_app();
+        app.begin_mounted_detached_session_for_test(126, DetachedSource::Image);
+
+        let _ = app.unbind_window(126);
+        // Killing mutation: remove the active-session assertion from unbind_window; this call
+        // succeeds and the expected panic disappears.
     }
 
     #[cfg(windows)]
@@ -41327,6 +41399,10 @@ mod still_window_mode_key_tests {
 
         assert!(cancel.load(Ordering::Relaxed));
         assert_eq!(app.viewer_context_residence(id), ContextResidence::Retired);
+        assert_eq!(app.locate_window_context(705), None);
+        assert!(app.active_detached_session.is_none());
+        // Killing mutation: skip the bound-window unbind in retire_context; the retired context
+        // remains discoverable through window 705.
     }
 
     #[test]
@@ -45636,6 +45712,15 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_viewer_window_id, Some(2));
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(!app.fs_viewport_shown);
+        assert_eq!(app.locate_window_context(first_window_id), None);
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(2),
+            "always-new rebind must stop naming the parked window before releasing it"
+        );
+        assert!(app.locate_window_context(2).is_some());
+        // Killing mutation: remove finish_active_detached_session_handoff before the old-window
+        // unbind; the ownership-boundary assertion panics before window 2 can be bound.
     }
 
     #[test]
@@ -45859,11 +45944,22 @@ mod still_window_mode_key_tests {
 
         assert!(app.should_preserve_active_detached_image_window_for_main_context_change());
         assert!(app.preserve_active_detached_image_window_for_main_context_change());
+        assert!(
+            app.active_detached_session.is_none(),
+            "active-to-passive handoff must clear the active session"
+        );
+        assert_eq!(
+            app.locate_window_context(window_id),
+            None,
+            "the materialized passive snapshot no longer owns a viewer-context binding"
+        );
         app.close_fullscreen();
 
         assert_eq!(app.fullscreen_idx, None);
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].location_display, "a.jpg");
+        // Killing mutation: move handoff_active_detached_viewport_to_passive back below
+        // unbind_window; the ownership-boundary assertion rejects the old ordering.
     }
 
     #[test]

@@ -3507,12 +3507,35 @@ PANIC at src\ui_fullscreen.rs:13611:21: active detached backstop window 1 has no
 
 これを「起き得ない」として `panic!` で落としているが、実際に起きている。
 
-#### 直す方向 (未着手)
+#### 原因と修正 (2026-08-28)
 
 **panic を `if let` や early return で黙らせるのは不可**。このアサーションは
 「セッションと binding の寿命が一致する」という不変条件を表しているので、
 **寿命がずれる経路を潰す**のが根治。両方を同じ retire transaction で落とすか、
 backstop が参照する前に `active_detached_session` をクリアする。
+
+原因は、window binding の除去と `active_detached_session` の解放が別 owner / 別呼び出しに
+分かれていたこと。`retire_context` は context の binding を先に除去し、active context close の
+呼び出し側が戻り後に session を finish していた。静止画の active→passive handoff と
+always-new の旧窓→新窓 rebind にも、同じ binding-first の順序があった。
+
+R2e の所有境界で次のように閉じた。
+
+- `unbind_window` は active session がまだ同じ window を指す binding release を、その場で
+  assertion failure にする。renderer の次フレームではなく、違反を作る owner で検出する。
+- `retire_context` は retiring context の window が active session と一致する場合、同じ retire
+  transaction 内で session / runtime を finish してから binding を外す。
+- active→passive handoff と always-new rebind は session handoff を unbind より前へ移した。
+- backstop は `with_window_viewer_context` の共通 mount 契約だけを使い、`None` / 非 mountable
+  residence を個別に assertion しない。panic を silent return へ弱めたのではない。
+
+§1.137 の transition owner は detached→fullscreen で既に
+`CloseDetachedSession → DestroyHost` の順を所有しており、ここは変更していない。build C でも
+再現したとおり、今回の所有者は transition reducer ではなく viewer-context retire / unbind。
+`bf391e6a` より前の backstop は owner holder が無い場合を「既に mounted」と区別できず main の
+App projection をそのまま描いていたため、同じ欠落を落とさず誤った context で黙って描けた。
+タイミングが新しくなった証拠はなく、同コミットの identity / residence 分離で旧 silence が
+assertion として可視化されたもの。
 
 - 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
 

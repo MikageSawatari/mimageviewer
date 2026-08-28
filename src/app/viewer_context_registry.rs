@@ -278,6 +278,7 @@ impl<P> ContextTable<P> {
         Some(id)
     }
 
+    #[cfg(test)]
     fn unbind_context_core(&mut self, id: ViewerContextId) -> Option<u64> {
         let window_id = self.window_of.remove(&id)?;
         assert_eq!(self.context_of.remove(&window_id), Some(id));
@@ -2882,6 +2883,11 @@ impl App {
     }
 
     pub(in crate::app) fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId> {
+        assert_ne!(
+            self.active_detached_window_id(),
+            Some(window_id),
+            "cannot release window {window_id} while the active detached session still names it"
+        );
         self.viewer_contexts.table.unbind_window(window_id)
     }
 
@@ -3025,12 +3031,20 @@ impl App {
         _reason: &'static str,
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireError> {
+        let reason = _reason;
+        let retiring_window = self.viewer_contexts.table.window_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        if retiring_window == self.active_detached_window_id() {
+            self.begin_active_detached_session_close(reason);
+            self.finish_active_detached_session_close(reason);
+        }
         let value = {
             let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
             digest(ContextMut { bundle: payload })
         };
-        self.viewer_contexts.table.unbind_context_core(id);
+        if let Some(window_id) = retiring_window {
+            assert_eq!(self.unbind_window(window_id), Some(id));
+        }
         let ops = self.viewer_contexts.table.plan_finish_retire(id);
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_retire();

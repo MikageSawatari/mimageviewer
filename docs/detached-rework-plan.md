@@ -1121,6 +1121,36 @@ KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の�
 - `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
   — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
 
+### R2e active detached session / binding lifetime follow-up (backlog §1.138、2026-08-28)
+
+F12 の detached→fullscreen 後、`active_detached_session` が window ID を保持したまま
+viewer-context registry の binding だけが消え、次の keep-alive backstop で panic した。
+§9.8 の transition owner を含まない build C でも同じ frame / message で再現しており、
+transition owner の退行ではない。同 owner の terminal effect は
+`CloseDetachedSession → DestroyHost` の正しい順を維持している。
+
+所有者は R2e の retire / window binding transaction。修正前に到達できた順序は次の 4 クラス。
+
+1. active context terminal retire: `retire_context` の unbind → 呼び出し側の session finish。
+2. active viewport finalize / at-rest close: session finish → 後続 `retire_context` の unbind。
+3. mounted-main terminal close: session take → 同じ helper 内の unbind。
+4. active→passive と always-new rebind: 旧 window の unbind → session handoff / 新 session begin。
+   passive-only bulk retire は active session 無しで unbind する。
+
+`App::unbind_window` を lifetime assertion の choke point とし、active session が同じ window を
+指したままの release を拒否する。`retire_context` は一致する session / runtime を同じ retire
+transaction 内で先に finish し、active→passive と always-new は handoff を unbind より前へ
+並べ替えた。backstop の `None` と residence 別 panic は撤去し、registry の共通
+`with_window_viewer_context` mount だけを使う。これは silent return ではなく、違反の検出場所を
+renderer から原因 owner へ移したもの。
+
+旧 backstop (`bf391e6a` より前) は active holder が `None` の場合に「owner が既に App へ mounted」
+なのか「owner が消えた」のか区別できず、後者でも main projection を描いて黙っていた。
+`bf391e6a` の registry 化で identity / residence を区別し assertion を置いたため、以前から
+到達可能だった lifetime gap が明示的な crash になった。`Some((owner, residence))` の兄弟 panic は、
+`Building` binding が commit 前に非公開、`Retired/Unknown` が binding map に残れず、`Retiring` も
+UI-thread の同期 retire 内だけで session を先に finish するため、backstop からは到達不能。
+
 **残した確認事項の解決 (2026-08-26)**:
 `rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
 `global_search_subfolder_restore` も `ViewerContextBundle` 所有へ移した。検索 fallback の

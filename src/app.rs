@@ -41109,6 +41109,7 @@ impl App {
             let mounted = self
                 .mounted_viewer_context_id()
                 .expect("preserving a detached still requires a mounted context");
+            self.handoff_active_detached_viewport_to_passive("main_context_change");
             let owner = self
                 .unbind_window(window_id)
                 .expect("preserved detached still window must be bound before handoff");
@@ -41127,7 +41128,6 @@ impl App {
                     "fullfeature_linked_still_media_handoff",
                 );
             }
-            self.handoff_active_detached_viewport_to_passive("main_context_change");
             if let Some(window_id) = parked_window_id {
                 self.transition_detached_window_state(
                     window_id,
@@ -41251,6 +41251,7 @@ impl App {
             let mounted = self
                 .mounted_viewer_context_id()
                 .expect("always-new detached still open requires a mounted context");
+            self.finish_active_detached_session_handoff("always_new_window_rebind");
             let owner = self
                 .unbind_window(parked_window_id)
                 .expect("parked detached still window must be bound");
