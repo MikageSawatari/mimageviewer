@@ -48176,7 +48176,6 @@ mod tests {
         assert!((rects[0].1.width() - 96.0).abs() < 0.001);
     }
 
-    #[test]
     /// 連結読みの段は、**寸法計算では表示空間**の部分矩形を使う。
     ///
     /// `width` / `height` は回転後の寸法なのに `content_bbox` は元画像空間なので、

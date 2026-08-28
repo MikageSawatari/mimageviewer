@@ -7802,7 +7802,11 @@ impl App {
                     .as_ref()
                     .filter(|raster| {
                         let width = raster.width as usize;
-                        raster.height as usize == pixel_height && width >= visible_pixel_width
+                        raster.height as usize == pixel_height
+                            && width
+                                >= crate::video::seek_strip_wave::effective_visible_pixel_width(
+                                    visible_pixel_width,
+                                )
                     })
                     .map(|raster| crate::video::seek_strip_wave::WaveSpan {
                         start_secs: raster.window_start_secs,
