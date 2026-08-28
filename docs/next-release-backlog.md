@@ -3844,6 +3844,31 @@ passive window の active 採用では従来どおり対をクリアする。後
 runtime write が単一 probe を迂回しないことを固定した。F12 clear の再挿入、restore だけの消去、builder
 からの borderless 適用削除が killing mutation となる。
 
+#### F11 修正の実機確認 (2026-08-28 21:30 前後)
+
+利用者確認: 別ウィンドウ -> F11 -> F12 往復 -> borderless 維持 -> F11 解除で元配置へ復帰。
+
+ログ (`[presentation-borderless]`):
+
+```
+f11_enter_requested   false -> false   4
+f11_enter_applied     false -> true    4
+f11_exit_applied      true  -> false   3
+close_terminal        true  -> false   1   (borderless のまま閉じた分)
+```
+
+- **F12 起因の clear は 0 件** (`toggle_detached_viewer_mode_disabled` /
+  `f12_to_non_detached` はどちらも出ない)。
+- 戻り先も対で動作: enter で `new_restore=Some(x:1116, y:92, 1254x795)`、exit で `None`。
+  うち 1 組は `maximized: true` を保持しており、**最大化した窓から F11 に入って解除すると
+  最大化状態へ戻る**。§1.139 の 2 つの修正が正しく合成されている。
+
+退行なし:
+
+- 最大化: `SIZE_MAXIMIZED` 9 / `SW_MAXIMIZE` 6 / hidden scaffold の観測拒否 259。
+- ちらつき: host の `WM_SHOWWINDOW shown=false` は実行全体で 2 件、
+  **`window_create` の内側は 0 件**。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
