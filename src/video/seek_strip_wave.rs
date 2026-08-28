@@ -476,16 +476,38 @@ pub(crate) struct CoarseScale {
 }
 
 impl CoarseScale {
-    /// `None` when even the coarsest bin this may use would need more of them than
-    /// [`MAX_COARSE_BINS`]. That is past [`MAX_COARSE_BIN_SECS`] * `MAX_COARSE_BINS`,
-    /// roughly a year of continuous audio, so it means the duration is not real.
+    /// The width is always a whole multiple of [`COARSE_BIN_SECS`], never `duration /
+    /// MAX_COARSE_BINS` directly.
+    ///
+    /// Two places downstream re-derive a position from the width, and both of them assume
+    /// a grid this arbitrary quotient does not sit on:
+    ///
+    /// - [`waveform_analysis_range`] aligns the decode start in whole microseconds of the
+    ///   bin, which is only exact while the bin is a whole number of them.
+    /// - the analyser rounds the bin to whole audio frames and reports each bin's start
+    ///   as `frame / sample_rate`, so its grid steps by `round(bin_secs * rate) / rate`.
+    ///
+    /// A width off either grid drifts, and [`compose_coarse_chunk`] refuses a chunk whose
+    /// bins land more than a microsecond from where it expects — which marks the chunk
+    /// failed and never retries it. At 48kHz a twelve-day file drifted past that on its
+    /// second bin, so the column silently never built for exactly the files the variable
+    /// width was added to serve (2026-08-29 第 6 回レビュー P1).
+    ///
+    /// Multiplying instead keeps every property the fixed 100ms already has: whole
+    /// microseconds, and whole frames at every sample rate where 100ms is whole.
+    ///
+    /// `None` when even [`MAX_COARSE_BIN_SECS`] would need more bins than
+    /// [`MAX_COARSE_BINS`] — past a year of audio, so the duration is not real.
     fn for_duration(duration_secs: f64) -> Option<Self> {
         if !duration_secs.is_finite() || duration_secs <= 0.0 {
             return None;
         }
-        let bin_secs = (duration_secs / MAX_COARSE_BINS as f64)
-            .max(COARSE_BIN_SECS)
-            .min(MAX_COARSE_BIN_SECS);
+        let span_per_multiple = COARSE_BIN_SECS * MAX_COARSE_BINS as f64;
+        let multiple = (duration_secs / span_per_multiple).ceil().max(1.0);
+        if !multiple.is_finite() || multiple > MAX_COARSE_BIN_MULTIPLE as f64 {
+            return None;
+        }
+        let bin_secs = COARSE_BIN_SECS * multiple;
         let bin_count = (duration_secs / bin_secs).ceil();
         if !bin_count.is_finite() || bin_count > MAX_COARSE_BINS as f64 {
             return None;
@@ -530,6 +552,10 @@ const MAX_COARSE_BINS: usize =
 /// allocation `WINDOW_DECODE_MAX_SPAN_SECS` exists to prevent, so the bin is capped where
 /// a chunk still fits it: 3s * 600 is exactly half an hour.
 const MAX_COARSE_BIN_SECS: f64 = WINDOW_DECODE_MAX_SPAN_SECS / COARSE_BINS_PER_CHUNK as f64;
+
+/// How many [`COARSE_BIN_SECS`] the widest bin is, since the width is always a whole
+/// number of them. See [`CoarseScale::for_duration`].
+const MAX_COARSE_BIN_MULTIPLE: usize = (MAX_COARSE_BIN_SECS / COARSE_BIN_SECS) as usize;
 
 #[derive(Clone, Debug, PartialEq)]
 struct CoarseChunkCoverage {
@@ -1657,7 +1683,9 @@ fn render_coarse_raster(
         window_start_secs: window.start_secs,
         window_end_secs: window.end_secs,
         visible_span_secs: signature.visible_span_secs(),
-        bin_secs: COARSE_BIN_SECS,
+        // The column's own width, not the default: a coarsened column reports what it
+        // really used, or the cache key and the overlay disagree with the pixels.
+        bin_secs: coarse.scale.bin_secs,
         width: signature.pixel_width as u32,
         height: signature.pixel_height as u32,
         rgba: Arc::new(rgba),
@@ -2517,6 +2545,84 @@ mod tests {
         assert!(matches!(&runtime.coarse, CoarseBuildState::Dormant));
         runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS);
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
+    }
+
+    /// 可変 bin 幅の列でも、実際に解析した bin がそのまま格納できる。
+    ///
+    /// **これは理論値のテストではない。**`analyze_window_samples` を実 sample rate で
+    /// 通し、その結果を `apply_chunk` へ渡して coverage に入る (= failed にならない) ことを
+    /// 見る。解析は bin を整数フレームへ丸めて `frame / sample_rate` を報告するので、
+    /// 幅が任意の f64 だと `compose_coarse_chunk` の 1µs 許容差を超えて**チャンクごと
+    /// 捨てられ、二度と再解析されない**。12 日のファイルは 2 個目の bin で超えていた
+    /// (2026-08-29 第 6 回レビュー P1)。
+    #[test]
+    fn a_coarsened_column_still_stores_the_bins_that_were_actually_analyzed() {
+        for sample_rate in [44_100_u32, 48_000] {
+            for duration_secs in [
+                12.0 * 86_400.0,
+                30.0 * 86_400.0,
+                200.0 * 86_400.0,
+                300.0 * 86_400.0,
+            ] {
+                let scale = CoarseScale::for_duration(duration_secs).expect("scale");
+                assert!(
+                    scale.bin_secs > COARSE_BIN_SECS,
+                    "{duration_secs}s で粗くならない"
+                );
+
+                // 幅は 100ms の整数倍。ここが崩れると下の 2 つの格子と合わなくなる。
+                let multiple = scale.bin_secs / COARSE_BIN_SECS;
+                assert!(
+                    (multiple - multiple.round()).abs() < 1e-9,
+                    "{sample_rate}Hz / {duration_secs}s: bin {} は 100ms の整数倍でない",
+                    scale.bin_secs
+                );
+                // 解析が丸める整数フレーム数と、幅が指す秒数が一致する。
+                let frames_per_bin = (scale.bin_secs * sample_rate as f64).round();
+                assert!(
+                    (frames_per_bin / sample_rate as f64 - scale.bin_secs).abs() < 1e-12,
+                    "{sample_rate}Hz: bin {} がフレーム格子に乗らない",
+                    scale.bin_secs
+                );
+
+                // 先頭チャンクと、その次のチャンクの両方を実際に通す。
+                for chunk_index in [0_usize, 1] {
+                    let chunk_secs = scale.chunk_secs();
+                    let chunk_start_secs = chunk_index as f64 * chunk_secs;
+                    let chunk_end_secs = (chunk_start_secs + chunk_secs).min(duration_secs);
+                    let window = WaveWindow {
+                        start_secs: chunk_start_secs,
+                        end_secs: chunk_end_secs,
+                        content_start_secs: chunk_start_secs,
+                        content_end_secs: chunk_end_secs,
+                    };
+                    let range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
+                        .expect("analysis range");
+                    let frames =
+                        ((range.end_secs - range.start_secs) * sample_rate as f64).ceil() as usize;
+                    let samples = vec![0.05_f32; frames * 2];
+                    let analysis = analyze_window_samples(
+                        &samples,
+                        sample_rate,
+                        range.start_secs,
+                        chunk_start_secs,
+                        chunk_end_secs,
+                        scale.bin_secs,
+                        chunk_secs,
+                        &|| false,
+                    )
+                    .expect("analysis");
+
+                    let mut coarse = CoarseWaveform::new(duration_secs, scale);
+                    assert!(
+                        coarse.apply_chunk(chunk_index, &analysis.bins),
+                        "{sample_rate}Hz / {duration_secs}s / chunk {chunk_index}:                          解析した bin を格納できない"
+                    );
+                    assert!(coarse.coverage.contains(chunk_index));
+                    assert!(!coarse.failed.contains(chunk_index));
+                }
+            }
+        }
     }
 
     /// 列は duration ではなく **bin 数**で縛る。長い動画では幅が粗くなるだけで、
