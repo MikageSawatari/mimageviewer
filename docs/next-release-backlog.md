@@ -3997,35 +3997,6 @@ top-level window を最大 256 件走査していた `z_rank` / `z=` だけを�
 その後の利用者承認による追加削減でこの値になった。修正本体、全 regression test、
 HiddenScaffold refusal、borderless single write path は削除していない。
 
-### 1.140 再起動から 1 時間以内はテストが 1 件必ず落ちる (2026-08-28 特定)
-
-`app::tests::still_window_mode_key_tests::parked_live_native_right_drag_allow_list_is_narrow_and_state_based`
-が `std/src/time.rs:445` (Instant から Duration を引いたときのオーバーフロー) で panic する。
-
-原因はテスト自身の 1 行:
-
-```rust
-// src/app/tests.rs
-std::time::Instant::now() - std::time::Duration::from_secs(3600)
-```
-
-Windows の `Instant` は起動時刻が原点なので、**稼働時間が 1 時間未満だと必ず panic する**。
-コードの欠陥ではなく、実行環境 (稼働時間) にテストが依存している。
-
-**紛らわしさが本体の害。** 2026-08-28 の PC クラッシュ後、再起動 30 分後に走らせた
-lib テストがこの 1 件だけ赤になり、直前に入れた変更 (計装撤去) の退行かと一度疑った。
-master でも同じように落ちることを確認して環境依存と分かったが、**再起動直後に
-テストを回した人は必ずこの回り道をする**。
-
-- 対応案: `Instant::now()` からの減算をやめ、`checked_sub` で作れないときの扱いを
-  明示するか、対象の閾値より十分小さい値にする。ただし「1 時間前」という意図が
-  production 側の閾値と結びついているなら、単に値を縮めると検査が弱くなる。
-  **このテストの所有者が閾値の意図を確認してから決めるのが筋。**
-- 同型が他にないかは `Instant::now() - Duration::from_secs(` で機械的に探せる
-  (2026-08-28 時点では `ui_fullscreen.rs` に 120 秒が 3 件。こちらは 2 分なので実害は薄い)。
-
-- 規模 \ 優先度: Small / P3 (テスト環境依存。製品挙動には影響しない)。
-
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
