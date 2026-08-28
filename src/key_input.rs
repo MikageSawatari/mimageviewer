@@ -2043,6 +2043,8 @@ unsafe extern "system" fn main_key_input_subclass_proc(
         hwnd,
         crate::presentation_observer::WindowRole::Host,
         msg,
+        wparam,
+        lparam,
     );
     let hwnd_raw = hwnd.0 as u64;
     if let Some(edge) = key_edge_from_message(msg, wparam, lparam) {

@@ -718,6 +718,8 @@ unsafe extern "system" fn hud_wnd_proc(
         hwnd,
         crate::presentation_observer::WindowRole::Hud,
         msg,
+        wparam,
+        lparam,
     );
     if let Some(state) = window_state(hwnd) {
         let WindowState {

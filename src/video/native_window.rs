@@ -1725,6 +1725,8 @@ unsafe extern "system" fn wnd_proc(
         hwnd,
         crate::presentation_observer::WindowRole::Presenter,
         msg,
+        wparam,
+        lparam,
     );
     if let Some(result) = handle_presenter_pointer_message(hwnd, msg, wparam) {
         return result;
