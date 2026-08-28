@@ -187,23 +187,7 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                // mIV presentation observer (backlog 1.139): separate native surface creation
-                // from adapter/render-state lookup and the first 4K surface configure.
-                let surface = {
-                    let _scope = crate::presentation_diag::Scope::begin(
-                        "surface_create",
-                        viewport_id.0.value(),
-                        u64::from(size.width),
-                        u64::from(size.height),
-                    );
-                    self.instance.create_surface(window)?
-                };
-                let _scope = crate::presentation_diag::Scope::begin(
-                    "surface_add",
-                    viewport_id.0.value(),
-                    u64::from(size.width),
-                    u64::from(size.height),
-                );
+                let surface = self.instance.create_surface(window)?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
@@ -251,12 +235,6 @@ impl Painter {
         let render_state = if let Some(render_state) = &self.render_state {
             render_state
         } else {
-            let _scope = crate::presentation_diag::Scope::begin(
-                "render_state_create",
-                viewport_id.0.value(),
-                u64::from(size.width),
-                u64::from(size.height),
-            );
             let render_state = RenderState::create(
                 &self.configuration,
                 &self.instance,
@@ -301,12 +279,6 @@ impl Painter {
             log::debug!("The window height was zero; skipping generate textures");
             return Ok(());
         };
-        let _scope = crate::presentation_diag::Scope::begin(
-            "surface_configure",
-            viewport_id.0.value(),
-            u64::from(size.width),
-            u64::from(size.height),
-        );
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
         Ok(())
     }

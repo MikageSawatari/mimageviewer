@@ -753,15 +753,17 @@ impl App {
         let previous =
             self.detached_window_manager
                 .set_placement(window_id, placement, default_linked);
-        crate::logger::log(format!(
-            "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
-             new_maximized={} old={previous:?} new={placement:?}",
-            crate::logger::elapsed_micros(),
-            window_id,
-            reason,
-            previous.map(|value| value.maximized),
-            placement.maximized,
-        ));
+        if previous != Some(placement) {
+            crate::logger::log(format!(
+                "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
+                 new_maximized={} old={previous:?} new={placement:?}",
+                crate::logger::elapsed_micros(),
+                window_id,
+                reason,
+                previous.map(|value| value.maximized),
+                placement.maximized,
+            ));
+        }
         self.log_detached_image_window_debug(format!(
             "runtime_placement window_id={window_id} reason={reason} \
              from={previous:?} to={placement:?}"
@@ -9816,7 +9818,6 @@ pub struct App {
     /// ParkedLive native presenter から届いた復帰要求。poll 後、snapshot を戻してから処理する。
     #[cfg(windows)]
     native_video_parked_live_activation_requests: Vec<u64>,
-    #[cfg(windows)]
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）。
     /// entry はこの bundle の items_generation を刻み、全参照で照合する。
     pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
@@ -13445,7 +13446,6 @@ impl App {
             native_video_parked_live_left_down_window_id: None,
             #[cfg(windows)]
             native_video_parked_live_activation_requests: Vec::new(),
-            #[cfg(windows)]
             fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
@@ -35638,12 +35638,15 @@ impl App {
             // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-            if !self.navigation_scope.is_detached_physical()
-                && self
-                    .video_presentation_transition
-                    .z_order_recovery_permitted()
-            {
+            #[cfg(windows)]
+            let z_order_recovery_permitted = self
+                .video_presentation_transition
+                .z_order_recovery_permitted();
+            #[cfg(not(windows))]
+            let z_order_recovery_permitted = true;
+            if !self.navigation_scope.is_detached_physical() && z_order_recovery_permitted {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                #[cfg(windows)]
                 self.observe_viewport_presentation_command(
                     ctx.viewport_id(),
                     crate::presentation_observer::WindowAction::Focus,
@@ -36331,7 +36334,6 @@ impl App {
                     vp.maximized,
                 )
             });
-        let maximized = reported_maximized.unwrap_or(false);
 
         if outer_rect.is_none() && self.last_outer_rect.is_none() {
             crate::logger::log(format!(
@@ -36349,10 +36351,16 @@ impl App {
         let best_rect = outer_rect.or(inner_rect);
         self.last_pixels_per_point = pixels_per_point;
 
-        self.last_window_maximized =
-            tracked_window_maximized(self.last_window_maximized, minimized, reported_maximized);
+        // One resolved answer for both consumers. `maximized: None` means the platform
+        // has not reported yet, which is not the same as "not maximized" — reading it
+        // as false here saved the maximized geometry as the size to restore to, on
+        // every unreported frame of a maximized start. `deferred_initial_size_ready`
+        // already documents the same trap for the sibling consumer above.
+        let window_state =
+            read_window_state(self.last_window_maximized, minimized, reported_maximized);
+        self.last_window_maximized = window_state.maximized;
 
-        if !minimized && !maximized {
+        if window_state.rect_is_restorable {
             if let Some(rect) = best_rect {
                 let changed = self
                     .last_outer_rect
@@ -43110,10 +43118,13 @@ impl App {
         if self.viewer_session_is_detached() {
             return;
         }
-        if !self
+        #[cfg(windows)]
+        let z_order_recovery_permitted = self
             .video_presentation_transition
-            .z_order_recovery_permitted()
-        {
+            .z_order_recovery_permitted();
+        #[cfg(not(windows))]
+        let z_order_recovery_permitted = true;
+        if !z_order_recovery_permitted {
             ctx.request_repaint();
             return;
         }
@@ -43135,6 +43146,7 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            #[cfg(windows)]
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Visible,
@@ -43142,6 +43154,7 @@ impl App {
                 "value=true",
             );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            #[cfg(windows)]
             self.observe_viewport_presentation_command(
                 fs_id,
                 crate::presentation_observer::WindowAction::Focus,
@@ -62952,6 +62965,7 @@ impl App {
         // Video 360 owns the same native canvas as tile mode, but it is not the
         // still-viewer's restriction mode. Keep playback and panels intact.
         if is_video {
+            #[cfg(windows)]
             self.close_video_tile_mode();
             #[cfg(windows)]
             {
@@ -69595,6 +69609,31 @@ fn apply_folder_thumb_pin(
 /// 報告が無い (`None`) のは「最大化ではない」という証拠ではないので、これも直前の
 /// 状態を保つ。ここを `unwrap_or(false)` にすると、報告が来ない環境では最大化して
 /// 終了しても毎回 flag が落ち、「前回終了時の状態」が永久に効かなくなる。
+/// The two questions `track_window_rect` asks of one viewport report, answered once.
+///
+/// They used to be answered separately from the same `Option<bool>`, and disagreed on
+/// what `None` meant: the flag kept the previous answer, the rect gate read it as
+/// "not maximized". A maximized window whose state had not been reported yet would
+/// therefore have its full-screen geometry recorded as the rect to restore to.
+pub(crate) struct WindowStateReading {
+    /// What the window's maximized state resolves to this frame.
+    pub(crate) maximized: bool,
+    /// Whether this frame's rect is the one to come back to, so worth recording.
+    pub(crate) rect_is_restorable: bool,
+}
+
+pub(crate) fn read_window_state(
+    previous_maximized: bool,
+    minimized: bool,
+    reported_maximized: Option<bool>,
+) -> WindowStateReading {
+    let maximized = tracked_window_maximized(previous_maximized, minimized, reported_maximized);
+    WindowStateReading {
+        maximized,
+        rect_is_restorable: !minimized && !maximized,
+    }
+}
+
 pub(crate) fn tracked_window_maximized(
     previous: bool,
     minimized: bool,

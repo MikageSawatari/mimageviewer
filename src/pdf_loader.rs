@@ -5628,7 +5628,6 @@ C:\isolated\miv-data"#
         assert_eq!(requested_workers, 10);
     }
 
-    #[test]
     /// 同じパスワードは 1 度しか確保せず、確保済みの文字列をそのまま返す。
     /// (pdfium-render の過剰な lifetime 制約を lifetime transmute なしで満たすための仕組み)
     #[test]

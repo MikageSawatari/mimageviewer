@@ -1468,8 +1468,10 @@ initial visibility release、keep-alive holdover / backstop、fullscreen viewpor
 [src/app/native_video.rs](../src/app/native_video.rs) の既存 `SetHostVisible` effect consumer、
 [src/tray_integration.rs](../src/tray_integration.rs) の既存 retained viewport restore owner、
 [src/app/tests.rs](../src/app/tests.rs) の回帰証明、[next-release-backlog.md](next-release-backlog.md)
-§1.139。`[presentation-hook]` / `[presentation-winevent]` / `[presentation-viewport]` を含む既存計装は
-実機再検証まで維持する。
+§1.139。この時点では `[presentation-hook]` / `[presentation-winevent]` /
+`[presentation-viewport]` を実機再検証まで維持し、確認完了後に backlog §1.139 の段階撤去記録どおり
+削除した。修正 invariant と `[presentation-transition]`、`[presentation-window]` の
+mIV-issued effect / phase 記録は維持し、受信側 `source=wndproc` は原因確定後に撤去した。
 
 **不変条件と所有境界**: hidden で生成・再生成する detached builder は visibility と geometry だけを
 指定し、maximize を同時に要求しない。保存 placement の `maximized` は、動画なら既存 reducer の
@@ -1496,7 +1498,8 @@ hidden host は意図的に非最大化で作られるため、Visible commit �
 **追補の触った範囲**: [src/app.rs](../src/app.rs) の runtime placement write / observation authority、
 [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の active render capture、
 [src/app/native_video.rs](../src/app/native_video.rs) の Visible 計装、[src/app/tests.rs](../src/app/tests.rs) の
-回帰証明、[next-release-backlog.md](next-release-backlog.md) §1.139。観測計装は実機再検証まで維持する。
+回帰証明、[next-release-backlog.md](next-release-backlog.md) §1.139。この時点では観測計装を実機再検証まで
+維持し、確認完了後は `HiddenScaffold` refusal と placement change write だけを残して高頻度計装を撤去した。
 
 **追補後の不変条件**: OS 上で可視な detached host だけが利用者の runtime placement intent を
 publish できる。hidden recreate scaffold は一時的な restored geometry / maximized=false を報告しても

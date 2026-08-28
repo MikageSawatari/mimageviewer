@@ -152,6 +152,16 @@ pub(crate) struct WaveSpanRequest {
     pub(crate) stage: WaveRequestStage,
 }
 
+/// 実際に焼ける可視幅。GPU 上限を超える窓では、届く raster は可視ストリップより狭い。
+///
+/// 「可視範囲はもう描けているか」を問う側が生の可視幅と比べると、上限で頭打ちになった
+/// raster は**永久に「まだ足りない」と判定される**。再生中は中心時刻が動き続けるので、
+/// 同じ要求を毎フレーム出し直し、復号を連続キャンセルして波形が追従しなくなる。
+/// 要求側と判定側は必ずこの 1 つの答えを使う。
+pub(crate) fn effective_visible_pixel_width(visible_pixel_width: usize) -> usize {
+    visible_pixel_width.min(MAX_WAVEFORM_TEXTURE_WIDTH)
+}
+
 impl WaveSpanRequest {
     fn first_paint(center_time_secs: f64, visible_span_secs: f64) -> Option<Self> {
         Some(Self {
@@ -180,16 +190,22 @@ impl WaveSpanRequest {
     /// panic.log にも 8320 / 9000 で残っている)。
     ///
     /// 幅を丸めても時間 ↔ ピクセルの対応は比率で決まるため、位置はずれない
-    /// (bin が粗くなるだけ)。**可視幅より狭くはしない**: 可視部分の解像度を
-    /// 下げてまで先読みを優先する理由はない。
+    /// (bin が粗くなるだけ)。描画は `waveform_texture_slice` が時刻から UV を出し、
+    /// `painter.image` が宛先矩形へ伸縮するので、**テクスチャの画素幅は位置に関与しない**。
+    ///
+    /// 先読みぶんを削る順序では可視幅を優先するが、**可視幅そのものが上限を超えるときは
+    /// 上限が勝つ**。3 面のマルチモニターにまたがる窓など、可視幅が 8192px を超える構成は
+    /// 実在する。そこで「可視部分の解像度は下げない」を通すと、選ぶのは「少しぼやける」対
+    /// 「動画機能が再起動まで死ぬ」であって、比べるまでもない。
     pub(crate) fn pixel_width(self, visible_pixel_width: usize, visible_span_secs: f64) -> usize {
         if visible_pixel_width == 0 || !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
             return 0;
         }
+        let effective = effective_visible_pixel_width(visible_pixel_width);
         let ratio = (self.span.duration_secs() / visible_span_secs).max(1.0);
-        ((visible_pixel_width as f64 * ratio).round() as usize)
-            .max(visible_pixel_width)
-            .min(MAX_WAVEFORM_TEXTURE_WIDTH.max(visible_pixel_width))
+        ((effective as f64 * ratio).round() as usize)
+            .max(effective)
+            .min(MAX_WAVEFORM_TEXTURE_WIDTH)
     }
 }
 
@@ -411,6 +427,27 @@ fn coarse_bin_count(duration_secs: f64) -> usize {
     } else {
         (duration_secs / COARSE_BIN_SECS).ceil() as usize
     }
+}
+
+/// Largest coarse column we are willing to hold, in bytes.
+///
+/// The column is one [`QuantizedWaveformBin`] per [`COARSE_BIN_SECS`] for the whole
+/// file, so its size is set by the duration the container reports — a number mIV
+/// does not control and already knows can be wrong: backlog §1.13 is about MPEG-PS
+/// files whose duration is missing or nonsense. At 100ms and 7 bytes a bin, a year
+/// asks for 2.2 GB, and a duration large enough to saturate the `as usize` cast asks
+/// for `usize::MAX` bins, which aborts the process before anything can refuse it.
+///
+/// 32 MiB is about 5.5 days of audio, past any real recording. Refusing past that
+/// costs speed and nothing else: the column is an optimization, so a wide span
+/// decodes its own window instead of reading one that was already there.
+const MAX_COARSE_WAVEFORM_BYTES: usize = 32 * 1024 * 1024;
+
+/// Whether a coarse column for `duration_secs` fits [`MAX_COARSE_WAVEFORM_BYTES`].
+fn coarse_column_fits_budget(duration_secs: f64) -> bool {
+    coarse_bin_count(duration_secs)
+        .checked_mul(std::mem::size_of::<QuantizedWaveformBin>())
+        .is_some_and(|bytes| bytes <= MAX_COARSE_WAVEFORM_BYTES)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -642,17 +679,37 @@ enum WaveRenderRoute {
 }
 
 /// D27's ordered three-way routing decision.
+/// What the coarse column can offer this request.
+///
+/// `CoarseProgressive` waits for a column to fill in. If none will ever exist the wait
+/// never ends, so "not covered yet" and "never" have to be different answers -- telling
+/// them apart is what keeps a span past thirty minutes from failing outright.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoarseAvailability {
+    /// A column exists and already spans the visible range.
+    CoversVisible,
+    /// A column exists or is still being built, but does not span it yet.
+    NotYet,
+    /// No column will be built for this file, so nothing arrives by waiting.
+    Never,
+}
+
 fn decide_wave_render_route(
-    coarse_covers_visible: bool,
+    coarse: CoarseAvailability,
     requested_bin_secs: f64,
     visible_span_secs: f64,
 ) -> WaveRenderRoute {
-    if coarse_covers_visible && requested_bin_secs >= COARSE_BIN_SECS {
-        WaveRenderRoute::Coarse
-    } else if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS {
-        WaveRenderRoute::WindowDecode
-    } else {
-        WaveRenderRoute::CoarseProgressive
+    match coarse {
+        CoarseAvailability::CoversVisible if requested_bin_secs >= COARSE_BIN_SECS => {
+            WaveRenderRoute::Coarse
+        }
+        // Decoding the window costs more than reading a column, which is why the
+        // progressive route exists past thirty minutes. But with no column to progress
+        // against, that route only refuses the request, so every span past the threshold
+        // would show nothing at all. Pay the decode instead.
+        CoarseAvailability::Never => WaveRenderRoute::WindowDecode,
+        _ if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS => WaveRenderRoute::WindowDecode,
+        _ => WaveRenderRoute::CoarseProgressive,
     }
 }
 
@@ -1066,6 +1123,10 @@ enum CoarseBuildState {
     Dormant,
     Building(CoarseWaveform),
     Unavailable(crate::audio_decode::AudioDecodeOpenError),
+    /// The reported duration asks for a column past [`MAX_COARSE_WAVEFORM_BYTES`], so
+    /// none was built. Distinct from `Unavailable`, which means the audio itself cannot
+    /// be read: here the waveform still works, it just decodes each window it shows.
+    OverBudget,
 }
 
 #[derive(Clone, Copy)]
@@ -1099,21 +1160,54 @@ impl WaveWorkerRuntime {
         if visible_span_secs >= COARSE_BUILD_MIN_SPAN_SECS
             && matches!(self.coarse, CoarseBuildState::Dormant)
         {
-            self.coarse = CoarseBuildState::Building(CoarseWaveform::new(duration_secs));
+            self.coarse = if coarse_column_fits_budget(duration_secs) {
+                CoarseBuildState::Building(CoarseWaveform::new(duration_secs))
+            } else {
+                crate::logger::log(format!(
+                    "[wave] no coarse column: duration {duration_secs:.0}s wants {} bins,                      over the {} MiB budget; wide spans will decode their own window",
+                    coarse_bin_count(duration_secs),
+                    MAX_COARSE_WAVEFORM_BYTES / (1024 * 1024)
+                ));
+                CoarseBuildState::OverBudget
+            };
+        }
+    }
+
+    /// What the column can offer, asked of the state rather than rebuilt by the caller.
+    /// `OverBudget` is not "not yet": waiting on it never resolves.
+    fn coarse_availability(
+        &self,
+        signature: WaveRequestSignature,
+        visible_center_secs: f64,
+    ) -> CoarseAvailability {
+        match &self.coarse {
+            CoarseBuildState::OverBudget => CoarseAvailability::Never,
+            CoarseBuildState::Building(coarse)
+                if coarse_covers_visible(coarse, signature, visible_center_secs) =>
+            {
+                CoarseAvailability::CoversVisible
+            }
+            CoarseBuildState::Building(_)
+            | CoarseBuildState::Dormant
+            | CoarseBuildState::Unavailable(_) => CoarseAvailability::NotYet,
         }
     }
 
     fn coarse(&self) -> Option<&CoarseWaveform> {
         match &self.coarse {
             CoarseBuildState::Building(coarse) => Some(coarse),
-            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+            CoarseBuildState::Dormant
+            | CoarseBuildState::Unavailable(_)
+            | CoarseBuildState::OverBudget => None,
         }
     }
 
     fn coarse_mut(&mut self) -> Option<&mut CoarseWaveform> {
         match &mut self.coarse {
             CoarseBuildState::Building(coarse) => Some(coarse),
-            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+            CoarseBuildState::Dormant
+            | CoarseBuildState::Unavailable(_)
+            | CoarseBuildState::OverBudget => None,
         }
     }
 
@@ -1335,7 +1429,11 @@ fn publish_active_coarse_raster(
     };
     let visible_covered = coarse_covers_visible(coarse, active.signature, visible_center_secs);
     let route = decide_wave_render_route(
-        visible_covered,
+        if visible_covered {
+            CoarseAvailability::CoversVisible
+        } else {
+            CoarseAvailability::NotYet
+        },
         waveform_bin_secs(active.signature.span_secs(), active.signature.pixel_width),
         active.signature.visible_span_secs(),
     );
@@ -1480,18 +1578,12 @@ fn process_wave_request(
         return;
     };
     let bin_secs = waveform_bin_secs(signature.span_secs(), signature.pixel_width);
-    let coarse_covers_visible = runtime.coarse().is_some_and(|coarse| {
-        coarse_covers_visible(
-            coarse,
-            signature,
-            f64::from_bits(coarse_center_bits.load(Ordering::Acquire)),
-        )
-    });
-    let route = decide_wave_render_route(
-        coarse_covers_visible,
-        bin_secs,
-        signature.visible_span_secs(),
+    let availability = runtime.coarse_availability(
+        signature,
+        f64::from_bits(coarse_center_bits.load(Ordering::Acquire)),
     );
+    let coarse_covers_visible = availability == CoarseAvailability::CoversVisible;
+    let route = decide_wave_render_route(availability, bin_secs, signature.visible_span_secs());
     if route == WaveRenderRoute::CoarseProgressive && runtime.decoder.is_none() {
         if runtime.decoder_open_error.is_none() {
             match crate::audio_decode::AudioRangeDecoder::open(path) {
@@ -2055,22 +2147,115 @@ mod tests {
 
     #[test]
     fn d27_route_order_preserves_window_decode_through_thirty_minutes() {
+        use CoarseAvailability::{CoversVisible, Never, NotYet};
+
         assert_eq!(
-            decide_wave_render_route(true, COARSE_BIN_SECS, 600.0),
+            decide_wave_render_route(CoversVisible, COARSE_BIN_SECS, 600.0),
             WaveRenderRoute::Coarse
         );
         assert_eq!(
-            decide_wave_render_route(true, COARSE_BIN_SECS - 0.001, 600.0),
+            decide_wave_render_route(CoversVisible, COARSE_BIN_SECS - 0.001, 600.0),
             WaveRenderRoute::WindowDecode
         );
         assert_eq!(
-            decide_wave_render_route(false, 0.5, WINDOW_DECODE_MAX_SPAN_SECS),
+            decide_wave_render_route(NotYet, 0.5, WINDOW_DECODE_MAX_SPAN_SECS),
             WaveRenderRoute::WindowDecode
         );
         assert_eq!(
-            decide_wave_render_route(false, 0.5, WINDOW_DECODE_MAX_SPAN_SECS + 0.001),
+            decide_wave_render_route(NotYet, 0.5, WINDOW_DECODE_MAX_SPAN_SECS + 0.001),
             WaveRenderRoute::CoarseProgressive
         );
+
+        // 列が来ないと分かっているなら、待つ経路へ入れてはいけない。入れると
+        // `process_coarse_request` が毎回 Failed を返し、30 分より広い段が全滅する。
+        for visible_span_secs in [
+            600.0,
+            WINDOW_DECODE_MAX_SPAN_SECS,
+            WINDOW_DECODE_MAX_SPAN_SECS + 0.001,
+            3600.0,
+            7200.0,
+            10_800.0,
+        ] {
+            assert_eq!(
+                decide_wave_render_route(Never, 0.5, visible_span_secs),
+                WaveRenderRoute::WindowDecode,
+                "{visible_span_secs}s の段が待ちに入ってしまう"
+            );
+        }
+    }
+
+    /// 要求が作る raster は、必ず「表示済み」判定を満たす幅になる。
+    ///
+    /// 判定側 ([native_video.rs] の `displayed`) が生の可視幅と比べていたため、8192 で
+    /// 頭打ちになった raster は可視幅 8193px 以上で**永久に「まだ足りない」**と読まれた。
+    /// 再生中は中心時刻が 100ms ごとに動くので毎フレーム要求し直し、復号を連続キャンセル
+    /// して波形が追従しなくなる (2026-08-27 Codex 再レビュー P2-1)。
+    #[test]
+    fn a_finished_raster_always_satisfies_the_displayed_width_check() {
+        for visible in [
+            400_usize,
+            1_920,
+            3_840,
+            MAX_WAVEFORM_TEXTURE_WIDTH - 1,
+            MAX_WAVEFORM_TEXTURE_WIDTH,
+            MAX_WAVEFORM_TEXTURE_WIDTH + 1,
+            11_520,
+            30_000,
+        ] {
+            for visible_span_secs in [30.0, 600.0, 3_600.0] {
+                let request = WaveSpanRequest {
+                    span: WaveSpan::centered(1_000.0, visible_span_secs).expect("span"),
+                    stage: WaveRequestStage::FirstPaint,
+                };
+                let produced = request.pixel_width(visible, visible_span_secs);
+                assert!(
+                    produced >= effective_visible_pixel_width(visible),
+                    "visible={visible} span={visible_span_secs}: 作った {produced}px が                      表示済み判定の下限 {}px に届かない",
+                    effective_visible_pixel_width(visible)
+                );
+                assert!(produced <= MAX_WAVEFORM_TEXTURE_WIDTH);
+            }
+        }
+    }
+
+    /// 予算超過で列を作らないと決めた動画でも、1 時間以上の段が失敗しない。
+    ///
+    /// 状態だけのテストでは足りない: `decide_wave_render_route` が `CoarseProgressive` を
+    /// 返すと `process_coarse_request` が `Building` 以外を `"coarse waveform unavailable"`
+    /// として `Failed` にするため、**列を作らない判断がそのまま波形の全滅になる**
+    /// (2026-08-27 Codex 再レビュー P1-2)。
+    #[test]
+    fn an_over_budget_file_still_routes_its_widest_spans_to_a_window_decode() {
+        let mut runtime = WaveWorkerRuntime::new();
+        runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
+        assert!(matches!(&runtime.coarse, CoarseBuildState::OverBudget));
+
+        for visible_span_secs in [1800.0, 3600.0, 7200.0, 10_800.0] {
+            let signature = WaveRequestSignature::new(
+                5_000.0,
+                1e300,
+                visible_span_secs,
+                visible_span_secs,
+                1_920,
+                131,
+            )
+            .expect("a valid signature");
+            let availability = runtime.coarse_availability(signature, 5_000.0);
+            assert_eq!(
+                availability,
+                CoarseAvailability::Never,
+                "予算超過は「まだ」ではなく「来ない」"
+            );
+            assert_eq!(
+                decide_wave_render_route(
+                    availability,
+                    waveform_bin_secs(signature.span_secs(), signature.pixel_width),
+                    visible_span_secs
+                ),
+                WaveRenderRoute::WindowDecode,
+                "{visible_span_secs}s の段が復号へ回らない"
+            );
+        }
     }
 
     #[test]
@@ -2080,6 +2265,33 @@ mod tests {
         assert!(matches!(&runtime.coarse, CoarseBuildState::Dormant));
         runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS);
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
+    }
+
+    /// The coarse column is sized from the duration the container reports, which
+    /// backlog §1.13 already records as sometimes missing or nonsense. A dense
+    /// `Vec` proportional to that number reaches 2.2 GB for a year, and a value
+    /// large enough to saturate the cast aborts on the allocation itself.
+    #[test]
+    fn a_coarse_column_is_refused_when_the_duration_asks_for_more_than_the_budget() {
+        // Real recordings stay well inside it: a day is 864,000 bins, about 6 MiB.
+        assert!(coarse_column_fits_budget(60.0 * 60.0 * 24.0));
+        // The edge of the budget itself.
+        let max_bins = MAX_COARSE_WAVEFORM_BYTES / std::mem::size_of::<QuantizedWaveformBin>();
+        assert!(coarse_column_fits_budget(max_bins as f64 * COARSE_BIN_SECS));
+        // A year, which is what a broken duration reads like.
+        assert!(!coarse_column_fits_budget(60.0 * 60.0 * 24.0 * 365.0));
+        // Large enough that `as usize` saturates, so the multiply must be the guard.
+        assert!(!coarse_column_fits_budget(1e300));
+
+        let mut runtime = WaveWorkerRuntime::new();
+        runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
+        assert!(
+            matches!(&runtime.coarse, CoarseBuildState::OverBudget),
+            "an impossible duration must not allocate a column"
+        );
+        // It is not an audio failure: the waveform still works, window by window.
+        assert!(runtime.coarse().is_none());
+        assert!(!matches!(&runtime.coarse, CoarseBuildState::Unavailable(_)));
     }
 
     #[test]
@@ -2294,17 +2506,38 @@ mod tests {
         assert_eq!(upgrade.pixel_width(1_000, visible_span_secs), 3_000);
     }
 
-    /// 可視幅そのものが上限を超える環境 (超広幅ウィンドウ) でも、可視解像度は落とさない。
-    /// ここで丸めると波形が可視部分でぼやける。テクスチャ生成側の責務として残す。
+    /// 可視幅そのものが上限を超える環境 (3 面にまたがる超広幅ウィンドウ) では、上限が勝つ。
+    ///
+    /// **以前はここで丸めず「テクスチャ生成側の責務として残す」としていたが、生成側は
+    /// 分割も縮小もしないまま残り、到達すれば必ずレンダースレッドがパニックしていた**
+    /// (2026-08-27 Codex レビュー)。要求した幅がそのまま焼かれる以上、上限を知っている
+    /// のは要求側しかない。可視部分は伸縮でわずかにぼやけるが、位置は時刻由来の UV で
+    /// 決まるためずれない。分割して鮮鋭さを取り戻す案は backlog §1.140。
     #[test]
-    fn an_oversized_visible_width_is_not_reduced_below_itself() {
+    fn an_oversized_visible_width_is_capped_at_the_texture_ceiling() {
         let visible_span_secs = 30.0;
-        let huge = MAX_WAVEFORM_TEXTURE_WIDTH + 2_000;
         let first = WaveSpanRequest {
             span: WaveSpan::centered(100.0, visible_span_secs).expect("span"),
             stage: WaveRequestStage::FirstPaint,
         };
-        assert_eq!(first.pixel_width(huge, visible_span_secs), huge);
+        for huge in [
+            MAX_WAVEFORM_TEXTURE_WIDTH + 1,
+            MAX_WAVEFORM_TEXTURE_WIDTH + 2_000,
+            11_520,
+            30_000,
+        ] {
+            assert_eq!(
+                first.pixel_width(huge, visible_span_secs),
+                MAX_WAVEFORM_TEXTURE_WIDTH,
+                "a {huge}px window must not ask for a texture the GPU refuses"
+            );
+        }
+        // 上限内の可視幅はこれまでどおり下げない。
+        assert_eq!(
+            first.pixel_width(MAX_WAVEFORM_TEXTURE_WIDTH, visible_span_secs),
+            MAX_WAVEFORM_TEXTURE_WIDTH
+        );
+        assert_eq!(first.pixel_width(1_920, visible_span_secs), 1_920);
     }
 
     #[test]

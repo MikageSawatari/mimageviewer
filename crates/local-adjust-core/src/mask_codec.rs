@@ -49,10 +49,91 @@ const TAG_ALPHA_U8: &str = "q8z:";
 /// Tag for little-endian `u32` labels.
 const TAG_LABEL_U32: &str = "u32z:";
 
-/// A decompressed buffer larger than this is refused rather than allocated. A
-/// mask has one entry per pixel, so this allows a 4 gigapixel page — far past
-/// anything decodable — while keeping a corrupt length from exhausting memory.
-const MAX_DECODED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Most entries a single mask may declare, one per source pixel.
+///
+/// The header is the first thing read from a file that may be corrupt, or that a
+/// stranger wrote: edit bundles are made to be exchanged. So the count decides an
+/// allocation before any of the data behind it has been seen, and every entry is
+/// widened to four bytes once decoded.
+///
+/// 128 Mi entries is 134 megapixels, past any camera whose output can be edited
+/// here — the largest images mIV opens are panoramas, and 360 view refuses to
+/// enter edit mode at all, so no mask exists at that size. A page like the one in
+/// the table above is 13.8M, so this leaves an order of magnitude in hand.
+const MAX_MASK_ELEMENTS: usize = 128 * 1024 * 1024;
+
+/// How much mask memory one document may decode, in bytes, unless a caller says less.
+///
+/// The largest real sidecar measured held 152,002,937 alpha values across every layer of
+/// every item, which is 608 MB once widened to `f32`. A gigabyte clears that and still
+/// bounds a file built to exhaust memory.
+pub const DEFAULT_DOCUMENT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+thread_local! {
+    /// Bytes left in the document being parsed on this thread. `None` means no document
+    /// scope is open, in which case only the per-mask ceiling applies.
+    static DOCUMENT_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A budget covering every mask decoded until this value is dropped.
+///
+/// [`MAX_MASK_ELEMENTS`] bounds one field, which does not bound a file. A single
+/// [`crate::LocalAdjustmentLayer`] can carry a subject mask, its source alpha, and both
+/// manual-override rasters; a sidecar carries any number of layers over any number of
+/// items. Every one of those can sit under the per-mask ceiling while the file as a whole
+/// asks for tens of gigabytes — a flat alpha plane compresses to almost nothing, so the
+/// file that does it is small.
+///
+/// Open one around each file parsed from disk. Charges are made from the count in the
+/// header, before anything is decompressed, so an over-budget document is refused rather
+/// than allocated.
+#[must_use = "the budget applies only while this value is alive"]
+pub struct DocumentBudget {
+    previous: Option<u64>,
+}
+
+impl DocumentBudget {
+    /// Open a scope with [`DEFAULT_DOCUMENT_BUDGET_BYTES`].
+    pub fn open() -> Self {
+        Self::with_bytes(DEFAULT_DOCUMENT_BUDGET_BYTES)
+    }
+
+    pub fn with_bytes(bytes: u64) -> Self {
+        let previous = DOCUMENT_BUDGET.with(|budget| budget.replace(Some(bytes)));
+        Self { previous }
+    }
+
+    /// Bytes still available in the open scope, for tests and diagnostics.
+    #[must_use]
+    pub fn remaining() -> Option<u64> {
+        DOCUMENT_BUDGET.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for DocumentBudget {
+    fn drop(&mut self) {
+        DOCUMENT_BUDGET.with(|budget| budget.set(self.previous));
+    }
+}
+
+/// Charge one mask against the open document scope, if there is one.
+///
+/// Every element ends up four bytes wide in memory — `f32` coverage or a `u32` label —
+/// so that is what a mask costs whichever codec reads it.
+fn charge_document_budget<E: DeError>(count: usize) -> Result<(), E> {
+    const BYTES_PER_ELEMENT_IN_MEMORY: u64 = 4;
+    let cost = (count as u64).saturating_mul(BYTES_PER_ELEMENT_IN_MEMORY);
+    DOCUMENT_BUDGET.with(|budget| match budget.get() {
+        None => Ok(()),
+        Some(remaining) if cost <= remaining => {
+            budget.set(Some(remaining - cost));
+            Ok(())
+        }
+        Some(remaining) => Err(E::custom(format!(
+            "this document's masks decode to more than it may hold: another {cost} bytes              with {remaining} left"
+        ))),
+    })
+}
 
 static LEGACY_DECODES: AtomicU64 = AtomicU64::new(0);
 
@@ -101,14 +182,23 @@ fn decode<E: DeError>(tag: &str, bytes_per_element: usize, text: &str) -> Result
     let count: usize = count
         .parse()
         .map_err(|_| E::custom(format!("mask element count {count:?} is not a number")))?;
+    if count > MAX_MASK_ELEMENTS {
+        return Err(E::custom(format!(
+            "mask declares {count} entries, past the {MAX_MASK_ELEMENTS} a mask may hold"
+        )));
+    }
+    charge_document_budget::<E>(count)?;
     let expected = count
         .checked_mul(bytes_per_element)
-        .filter(|bytes| *bytes <= MAX_DECODED_BYTES)
         .ok_or_else(|| E::custom("mask buffer is implausibly large"))?;
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
         .map_err(|error| E::custom(format!("mask base64: {error}")))?;
-    let mut out = Vec::with_capacity(expected);
+    // Grow into the bytes that actually arrive rather than reserving what the header
+    // asked for. `with_capacity(expected)` handed a corrupt count the whole allocation
+    // before reading a byte, so a payload of a few kilobytes could take gigabytes and
+    // end the process. `take` still stops a bomb one byte past the declared length.
+    let mut out = Vec::new();
     DeflateDecoder::new(compressed.as_slice())
         .take(expected as u64 + 1)
         .read_to_end(&mut out)
@@ -153,14 +243,33 @@ impl<'de> Visitor<'de> for AlphaVisitor {
             .collect())
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        note_legacy_decode();
-        let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-        while let Some(value) = seq.next_element::<f32>()? {
-            out.push(value);
-        }
-        Ok(out)
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        read_legacy_seq(seq)
     }
+}
+
+/// Read the released number-array form under the same limits as the packed one.
+///
+/// The old form is verbose, so a file large enough to exhaust memory would itself be
+/// enormous — but it decodes into the same buffers, and a document budget that only
+/// counted one of the two encodings would be a hole a re-encode could walk through.
+fn read_legacy_seq<'de, T, A>(mut seq: A) -> Result<Vec<T>, A::Error>
+where
+    T: serde::Deserialize<'de>,
+    A: SeqAccess<'de>,
+{
+    note_legacy_decode();
+    let mut out: Vec<T> = Vec::new();
+    while let Some(value) = seq.next_element::<T>()? {
+        if out.len() == MAX_MASK_ELEMENTS {
+            return Err(A::Error::custom(format!(
+                "mask holds more than the {MAX_MASK_ELEMENTS} entries a mask may hold"
+            )));
+        }
+        charge_document_budget::<A::Error>(1)?;
+        out.push(value);
+    }
+    Ok(out)
 }
 
 /// `#[serde(with = "...")]` for a required alpha buffer.
@@ -248,13 +357,8 @@ pub mod labels {
                     .collect())
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                note_legacy_decode();
-                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(value) = seq.next_element::<u32>()? {
-                    out.push(value);
-                }
-                Ok(out)
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                read_legacy_seq(seq)
             }
         }
 
@@ -265,7 +369,10 @@ pub mod labels {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RasterVectorMask, RegionMask, SubjectMask};
+    use crate::{
+        LocalAdjustmentLayer, LocalEffect, LocalMask, RasterVectorMask, RegionMask, SubjectMask,
+        SubjectMaskRefinement,
+    };
 
     #[test]
     fn a_soft_edge_survives_the_round_trip_within_one_step_of_255() {
@@ -383,6 +490,106 @@ mod tests {
         assert!(
             error.to_string().contains("bytes"),
             "the error should say the length disagreed: {error}"
+        );
+    }
+
+    /// A per-mask ceiling does not bound a file.
+    ///
+    /// One layer carries a subject mask, its source alpha, and both manual-override
+    /// rasters; a sidecar carries any number of layers over any number of items. Each can
+    /// sit under `MAX_MASK_ELEMENTS` while the document asks for tens of gigabytes, and
+    /// the file that does it is small because a flat alpha plane compresses to nothing.
+    #[test]
+    fn one_document_cannot_spend_more_than_its_budget_across_many_masks() {
+        // A layer whose four mask buffers are individually unremarkable.
+        let mut subject = SubjectMask {
+            width: 64,
+            height: 64,
+            alpha: vec![0.0; 4_096],
+            source_alpha: Some(vec![0.0; 4_096]),
+            refinement: SubjectMaskRefinement::default(),
+        };
+        subject.alpha[7] = 1.0;
+        let mut add = RasterVectorMask::empty(64, 64);
+        add.alpha[9] = 1.0;
+        let mut layer =
+            LocalAdjustmentLayer::new("budgeted", LocalMask::Subject(subject), LocalEffect::None);
+        layer.manual_override.add = Some(add.clone());
+        layer.manual_override.subtract = Some(add);
+        let json = serde_json::to_string(&vec![&layer, &layer, &layer]).unwrap();
+
+        // 3 layers x 4 buffers x 4096 entries x 4 bytes.
+        let total_bytes = 3 * 4 * 4_096 * 4;
+
+        {
+            let _budget = DocumentBudget::with_bytes(total_bytes);
+            let parsed: Vec<LocalAdjustmentLayer> =
+                serde_json::from_str(&json).expect("a document that fits its budget must load");
+            assert_eq!(parsed.len(), 3);
+            assert_eq!(DocumentBudget::remaining(), Some(0));
+        }
+
+        {
+            // One element short: the file is refused, and no single mask is over the
+            // per-mask ceiling, so only the cumulative rule can catch it.
+            let _budget = DocumentBudget::with_bytes(total_bytes - 4);
+            let error = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json)
+                .expect_err("a document past its budget must be refused");
+            assert!(
+                error.to_string().contains("more than it may hold"),
+                "the error should name the document budget: {error}"
+            );
+        }
+
+        // The scope closes with the value it was opened over.
+        assert_eq!(DocumentBudget::remaining(), None);
+    }
+
+    /// The released number-array form decodes into the same buffers, so it is charged
+    /// the same way; a budget that counted only one encoding would be a hole.
+    #[test]
+    fn the_legacy_number_array_is_charged_against_the_same_budget() {
+        let legacy = r#"{"width":2,"height":2,"alpha":[0.0,1.0,0.5,0.0],"shapes":[]}"#;
+        {
+            let _budget = DocumentBudget::with_bytes(16);
+            let mask: RasterVectorMask = serde_json::from_str(legacy).unwrap();
+            assert_eq!(mask.alpha.len(), 4);
+            assert_eq!(DocumentBudget::remaining(), Some(0));
+        }
+        {
+            let _budget = DocumentBudget::with_bytes(12);
+            assert!(serde_json::from_str::<RasterVectorMask>(legacy).is_err());
+        }
+    }
+
+    /// The count in the header decides an allocation before any of the data behind
+    /// it is read, and edit bundles are made to be handed to other people. A payload
+    /// of a few bytes must not be able to ask for gigabytes.
+    #[test]
+    fn a_small_payload_cannot_claim_a_count_past_the_ceiling() {
+        let mut mask = RasterVectorMask::empty(8, 8);
+        mask.alpha[3] = 1.0;
+        let json = serde_json::to_string(&mask).unwrap();
+        // The payload stays as it is; only the declared count moves.
+        let swapped = json.replace("\"q8z:64:", &format!("\"q8z:{}:", u64::MAX));
+        assert_ne!(swapped, json, "the count should have been replaced");
+        let error = serde_json::from_str::<RasterVectorMask>(&swapped)
+            .expect_err("a count past the ceiling must be refused, not allocated");
+        assert!(
+            error.to_string().contains("past the"),
+            "the error should name the ceiling: {error}"
+        );
+
+        // One entry over is refused; the ceiling itself is only rejected later, by the
+        // payload not carrying that many bytes -- never by allocating them up front.
+        let over = json.replace("\"q8z:64:", &format!("\"q8z:{}:", MAX_MASK_ELEMENTS + 1));
+        assert!(serde_json::from_str::<RasterVectorMask>(&over).is_err());
+        let at = json.replace("\"q8z:64:", &format!("\"q8z:{MAX_MASK_ELEMENTS}:"));
+        let error = serde_json::from_str::<RasterVectorMask>(&at)
+            .expect_err("the payload holds 64 entries, not the maximum");
+        assert!(
+            error.to_string().contains("bytes"),
+            "at the ceiling the length check should be what refuses it: {error}"
         );
     }
 

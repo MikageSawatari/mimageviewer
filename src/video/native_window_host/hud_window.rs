@@ -714,13 +714,6 @@ unsafe extern "system" fn hud_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
-    crate::presentation_observer::observe_window_message(
-        hwnd,
-        crate::presentation_observer::WindowRole::Hud,
-        msg,
-        wparam,
-        lparam,
-    );
     if let Some(state) = window_state(hwnd) {
         let WindowState {
             event_sink,

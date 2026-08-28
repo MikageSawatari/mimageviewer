@@ -2531,7 +2531,10 @@ where
     Ok(())
 }
 
+/// Bundles are made to be handed to other people, so a row read out of one is exactly
+/// the input a mask budget is for.
 fn parse_db_json<T: serde::de::DeserializeOwned>(json: &str, column: usize) -> rusqlite::Result<T> {
+    let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
     serde_json::from_str(json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             column,

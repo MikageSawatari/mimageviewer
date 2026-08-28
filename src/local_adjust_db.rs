@@ -56,6 +56,7 @@ impl LocalAdjustDb {
     /// ページの補正レイヤー配列を取得する。未登録または JSON 破損なら None。
     pub fn get_layers(&self, page_key: &str) -> Option<Vec<LocalAdjustmentLayer>> {
         let json = self.get_layers_json(page_key)?;
+        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
         serde_json::from_str(&json).ok()
     }
 
@@ -72,8 +73,11 @@ impl LocalAdjustDb {
             .query_row([page_key], |row| row.get(0))
             .optional()
             .map_err(|error| error.to_string())?;
-        json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
-            .transpose()
+        json.map(|json| {
+            let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
+            serde_json::from_str(&json).map_err(|error| error.to_string())
+        })
+        .transpose()
     }
 
     /// worker 側で SQLite 読み込みと JSON 復元を別々に計測するため、
@@ -253,6 +257,9 @@ impl LocalAdjustDb {
             return map;
         };
         for (key, json) in rows.flatten() {
+            // Per row: one page's layers, so each page gets the whole budget rather than
+            // the scan as a whole running out partway through.
+            let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
             if let Ok(layers) = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json) {
                 if !layers.is_empty() {
                     map.insert(key, layers);
@@ -326,6 +333,7 @@ pub fn repack_legacy_masks(path: &Path) -> RepackReport {
         report.scanned += 1;
 
         let before = local_adjust_core::mask_codec::legacy_decode_count();
+        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
         let Ok(layers) = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json) else {
             continue;
         };

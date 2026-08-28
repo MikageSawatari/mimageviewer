@@ -3063,7 +3063,7 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
 
 - 規模 / 優先度: — (解消済み)。
 
-### 1.132 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 再レビュー承認済み (2026-08-27、実機確認待ち)
+### 1.132 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 2 ラウンドとも実機確認済み (2026-08-27)
 
 - 出典: 2026-08-27、Codex による `v3.2.0..HEAD` の出荷前レビュー。
   実装は Codex Sol、検収は ClaudeCode (3 本の brief に分けて実施)。
@@ -3225,6 +3225,56 @@ Codex の修正の半分が消えたままになった** (→ マーカーを残
 かつ `git diff --numstat` を Codex 申告値と突き合わせる)。
 
 - 規模 \\ 優先度: — (完了)。
+
+#### 第 2 ラウンド (2026-08-27、HEAD `52620c96`) — P1 ×2 / P2 ×2 + 小 4 件 ✅ 実機確認済み
+
+レーン A / B / C を master へ統合した後の全体レビュー。**4 件とも自分で emit 元まで
+裏取りし、全件に変異テスト**(ガードを外すと落ちること)を通した。
+
+| | 指摘 | 直し方 | commit |
+| --- | --- | --- | --- |
+| P1 | 圧縮マスクが最大 20 GB のピークを作れる | 上限を 4 GiB → **128 Mi エントリ** (134 MP、編集できる最大の画像より上)。`Vec::with_capacity(宣言値)` をやめ、**実際に届いたバイトへ伸ばす** | `4ff168d2` |
+| P1 | duration 由来で波形が無制限確保 | **32 MiB (約 5.5 日) を超えたら coarse 列を作らない**。⚠ 初回の修正は routing を直しておらず、30 分より広い段が全滅した (第 3 ラウンド P1-2 で修正) | `4ff168d2` → `10e9bf82` |
+| P2 | 8192px 超のテクスチャでパニック | 上限を**無条件**に適用 (下記の設計反転あり) | `2295f2c9` |
+| P2 | 最大化状態の解釈が二系統 | `read_window_state` が **1 つの解決済み状態から両方を答える** | `94671438` |
+| 小 | 既定 180 秒が ladder に無く戻せない | ladder に追加 + 「既定は必ず段である」を規則としてテスト化 | `4ab98d3f` |
+| 小 | 360 設計書の冒頭が「360 動画は未実装」 | 訂正 (同じ文書の §13.8 は実装済みと書いていた) | `4ab98d3f` |
+| 小 | テスト 2 件が `#[test]` を失って未登録 | 復帰。**2 件とも通る** = テストは正しく、番人がいなかっただけ | `38e5e230` |
+| 小 | `git diff --check` が空白 2 件で失敗 | 修正 | `38e5e230` |
+
+**設計判断の反転が 1 件**: `WaveSpanRequest::pixel_width` は「可視幅が上限を超えても丸めない、
+**テクスチャ生成側の責務として残す**」と明示し、テストもそれを守っていた。しかし生成側は
+分割も縮小もせず `load_texture` を呼ぶだけで、**責務は実装されないまま**だった。要求した幅が
+そのまま焼かれる以上、上限を知っているのは要求側しかない。テストは削除せず理由付きで
+書き換えた。鮮鋭さを取り戻す分割案は §1.140。
+
+**出荷前に入れなかった 1 件**: Susie のクラッシュ対象 ID (§1.141)。失敗は限定的で
+自己修復可能、修正は decode のホットパスに触れ、**実際のクラッシュを再現する手段が無い**。
+
+**実機確認済み (2026-08-27)**: 最大化終了→再起動→最大化解除で通常サイズが戻る / 通常サイズの
+位置とサイズが戻る / 波形ストリップと 3 分の段 / 補正レイヤーのマスク読み書き。
+
+**残る既知項目**: F12 の白いホストとタスクバー明滅 (§1.137〜§1.139、マージ・実機確認済み) /
+動画レンダースレッドの復旧不在 (§1.135) / スレッド終了時の native heap 例外 (§1.123) /
+detached placement テストの実モニター依存 (§1.136)。
+
+#### 第 3 ラウンド (2026-08-27、HEAD `dd39d1f6`) — 第 2 ラウンドの修正が作った退行 2 件 ✅
+
+**2 件とも、私が入れた修正の退行だった。**新しい状態と新しい上限を入れて、
+**それを読む側を数えなかった**のが共通の原因 (memory: enumerate-same-shaped-paths)。
+
+| | 指摘 | 直し方 | commit |
+| --- | --- | --- | --- |
+| P1-1 | 上限が 1 マスク単位で、文書全体の累積を縛らない | `DocumentBudget` (既定 1 GiB) を導入。**ヘッダの count で、展開前に課金**。sidecar / local_adjust 行 / bundle 行ごとに scope を開く。旧 number-array 形式も同じ予算で課金 | `056d456f` |
+| P1-2 | `OverBudget` が window 経路へ落ちず、30 分より広い段が全滅 | `CoarseAvailability` に **`Never`** を足した。`CoarseProgressive` は「列が埋まるのを待つ」経路なので、来ない列を待つと `process_coarse_request` が毎回 `Failed` を返す | `10e9bf82` |
+| P2-1 | 8192px に丸めた raster が「表示済み」と認識されない | 要求側と判定側が `effective_visible_pixel_width` を共有。再生中は中心が 100ms ごとに動くので、認識されないと**毎フレーム要求し直して自分の復号をキャンセル**していた | `10e9bf82` |
+| P3 | 重複 `#[test]` 2 件 | doc の上にあった余分な属性を除去 (前回は不足分を足しただけだった) | `10e9bf82` |
+| P3 | 360 設計書 Phase 3 のチェックが未了 | 実装済みへ更新 | — |
+
+**教訓**: P1-2 は「列を作らない」と決めたときに、その状態を読む `decide_wave_render_route` /
+`process_coarse_request` を辿らなかった。P2-1 は「幅に上限を付けた」ときに、その幅と比較する
+`displayed` 判定を辿らなかった。**どちらも 1 つの述語を 2 か所が別々に答えていた形**で、
+今回はどちらも「1 つの答えを共有する」形に直した。
 
 ### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 解消済み
 
@@ -3589,6 +3639,46 @@ A (host disposition) と B (binding-before-session) は同じ commit effect の�
 
 - 規模 \\ 優先度: Small 〜 Medium / **P1 (即死する。§1.137 の実機確認もこれで止まる)**。
 
+### 1.141 Susie のクラッシュ対象 ID が「エントリ名 + 長さ」止まり
+
+- 出典: 2026-08-27 の出荷前レビュー (Codex、機能別評価の Susie 行)。
+- 機構: [susie_loader.rs](../src/susie_loader.rs) の `decode_bytes` は、クラッシュした
+  入力を二度と同じプラグインへ渡さないための識別子を
+  `format!("{filename_hint}#{}", bytes.len())` で作る。ZIP 内画像はパスを持たないため、
+  名前だけでは別書庫の同名エントリを巻き添えにする — その対策として長さを足した経緯が
+  コメントに残っている。
+- 残る穴: **同名かつ同サイズで中身が違う**エントリは、まだ同一視される。
+  片方でプラグインが落ちると、もう片方も開かれなくなる。
+- 実害の大きさ: 落ちるのは既にクラッシュした後の話で、結果は「開けたはずの 1 枚が
+  開かれない」。クラッシュや破損ではない。**同名同サイズは再配布された同一ファイルである
+  ことが多く、その場合は巻き添えではなく正しい判断**になる。
+- 直し方の候補: バイト列のハッシュを識別子に含める。全体ハッシュは decode 経路 (数 MB) に
+  数ミリ秒を足す。先頭 + 末尾の固定長だけを混ぜる案なら実質ゼロだが、**どちらも実際の
+  クラッシュを再現できないと検証できない**。
+- 2026-08-27 の判断: **出荷前には入れない。** 失敗は限定的で自己修復可能 (再起動で解除)、
+  一方で修正は decode のホットパスに触れ、実機で確かめる手段が無い。
+- 規模 / 優先度: 小 / **P3**。
+
+### 1.140 超広幅ウィンドウで波形ストリップの鮮鋭さが落ちる (分割描画の検討)
+
+- 出典: 2026-08-27 の出荷前レビュー (Codex P2) をきっかけに判明。
+- 経緯: `WaveSpanRequest::pixel_width` は「可視幅そのものが GPU 上限 (8192px) を超えても
+  丸めない」を明示的な設計としており、コメントは**「テクスチャ生成側の責務として残す」**と
+  書いていた。しかし [render_core.rs](../src/video/native_presenter/render_core.rs) の
+  `sync_seek_strip_textures` は分割も縮小もせず `load_texture` を呼ぶだけで、
+  **その責務は実装されないまま残っていた**。到達すれば必ずレンダースレッドが
+  パニックし、以後どの動画も再生できなくなる (§1.135 と同じ終わり方)。
+- 2026-08-27 の対応: 上限を要求側で無条件に効かせた
+  (`an_oversized_visible_width_is_capped_at_the_texture_ceiling`)。
+  **パニックは消えるが、可視幅が 8192px を超える構成では波形がわずかにぼやける** (伸縮のため)。
+  位置は時刻由来の UV で決まるのでずれない。
+- 残っていること: 鮮鋭さを取り戻すなら**分割描画**しかない。RGBA を N 枚のテクスチャへ分け、
+  `waveform_texture_slice` の UV をタイル境界で割り、N 回 `painter.image` する。
+  継ぎ目と、raster revision ごとの N 枚アップロードのコストを見る必要がある。
+- 到達条件: 可視ストリップ幅 (物理ピクセル) が 8192 を超える構成。4K 2 面 (7680) では届かず、
+  3 面またぎや 8K で届く。**開発機の仮想デスクトップ幅は 6001px なので、ここでは再現しない。**
+- 規模 / 優先度: 中 / **P3** (パニックは解消済み。残るのは限られた構成での画質)。
+
 ### 1.139 タスクバー明滅の原因 = 遷移中のフォアグラウンド往復 (2026-08-28 実測で特定)
 
 **§1.137 の本体。** 計装 (`[presentation-window]`) とキャプチャの突き合わせで確定した。
@@ -3868,6 +3958,73 @@ close_terminal        true  -> false   1   (borderless のまま閉じた分)
 - 最大化: `SIZE_MAXIMIZED` 9 / `SW_MAXIMIZE` 6 / hidden scaffold の観測拒否 259。
 - ちらつき: host の `WM_SHOWWINDOW shown=false` は実行全体で 2 件、
   **`window_create` の内側は 0 件**。
+
+#### 調査計装の段階撤去 (2026-08-28、実機確認完了後)
+
+5 分間・F12 多用時の 2.26 MB ログでは、1.139 調査計装が 65% を占めた。原因と三つの修正が
+実機確認されたため、同期 `WH_CALLWNDPROC` / `WH_CBT`、UI thread message loop に callback される
+`SetWinEventHook`、bounded instrumentation queue / drop accounting、vendored eframe / egui-wgpu の
+stage marker と `[presentation-viewport]` sink を全廃した。vendored 4 file は marker 導入直前
+`baff797b^` の blob と hash 一致・zero diff を確認した。`[presentation-window]` からは、各 event ごとに
+top-level window を最大 256 件走査していた `z_rank` / `z=` だけを外した。
+
+一方、次は計装ではなく修正または低頻度の恒久観測なので残す。
+
+- `DetachedPlacementObservationAuthority` と `HiddenScaffold` refusal は hidden scaffold を利用者の
+  placement intent として publish させない **1.139 の修正本体**。refusal log も invariant の実測用に残す。
+- `[presentation-placement] event=write` は runtime placement の値が実際に変わった場合だけ出す。
+  per-frame の同値 write は保存動作を変えず、ログだけ省略する。
+- `write_detached_viewer_borderless_state` と `[presentation-borderless]`、単一 write-path audit、
+  1.139 の全 regression test は維持する。
+- `[presentation-window]` は transition の phase begin/end と、mIV が発行した
+  Visible / Focus / Publish / Destroy / ShowWindow / SetWindowPos 等の effect だけを残す。
+  実機での受信側 770 lines / 276 KB (`source=wndproc`) は原因確定後の恒久価値が低いため、
+  `observe_window_message`、三つの wndproc call site、`wparam/lparam` payload decode と
+  pending-command 相関を全廃した。`[presentation-transition]` は従来どおり残す。
+
+**最終ログ量 (同じ 5 分 session の実測から削除分を差し引いた値):**
+
+| prefix | lines | KB |
+| --- | ---: | ---: |
+| presentation-window (mIV effects 207 + phase 74) | **281** | **79** |
+| presentation-placement (HiddenScaffold refusal) | **259** | **61** |
+| presentation-transition | **100** | **10** |
+| presentation-borderless | **16** | **5.6** |
+| **合計** | **656** | **155.6** |
+
+2.26 MB 全体に対して **約 6.7%**。前回の約 20% は
+`[presentation-window] source=wndproc` 770 lines / 276 KB を残す前提の値であり、
+その後の利用者承認による追加削減でこの値になった。修正本体、全 regression test、
+HiddenScaffold refusal、borderless single write path は削除していない。
+
+### 1.140 再起動から 1 時間以内はテストが 1 件必ず落ちる (2026-08-28 特定)
+
+`app::tests::still_window_mode_key_tests::parked_live_native_right_drag_allow_list_is_narrow_and_state_based`
+が `std/src/time.rs:445` (Instant から Duration を引いたときのオーバーフロー) で panic する。
+
+原因はテスト自身の 1 行:
+
+```rust
+// src/app/tests.rs
+std::time::Instant::now() - std::time::Duration::from_secs(3600)
+```
+
+Windows の `Instant` は起動時刻が原点なので、**稼働時間が 1 時間未満だと必ず panic する**。
+コードの欠陥ではなく、実行環境 (稼働時間) にテストが依存している。
+
+**紛らわしさが本体の害。** 2026-08-28 の PC クラッシュ後、再起動 30 分後に走らせた
+lib テストがこの 1 件だけ赤になり、直前に入れた変更 (計装撤去) の退行かと一度疑った。
+master でも同じように落ちることを確認して環境依存と分かったが、**再起動直後に
+テストを回した人は必ずこの回り道をする**。
+
+- 対応案: `Instant::now()` からの減算をやめ、`checked_sub` で作れないときの扱いを
+  明示するか、対象の閾値より十分小さい値にする。ただし「1 時間前」という意図が
+  production 側の閾値と結びついているなら、単に値を縮めると検査が弱くなる。
+  **このテストの所有者が閾値の意図を確認してから決めるのが筋。**
+- 同型が他にないかは `Instant::now() - Duration::from_secs(` で機械的に探せる
+  (2026-08-28 時点では `ui_fullscreen.rs` に 120 秒が 3 件。こちらは 2 分なので実害は薄い)。
+
+- 規模 \ 優先度: Small / P3 (テスト環境依存。製品挙動には影響しない)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
