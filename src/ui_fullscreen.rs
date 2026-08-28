@@ -14408,6 +14408,7 @@ impl App {
                             let restore_placement = self
                                 .save_detached_viewer_placement_from_logical_rect_with_source(
                                     "active_render",
+                                    self.active_detached_placement_observation_authority(),
                                     rect,
                                     inner_rect,
                                     pixels_per_point,

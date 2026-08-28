@@ -3773,16 +3773,33 @@ guard / retry / reorder は追加していない。
 数えられているため。**明滅として見えるのは 3 frame 以下の変化**で、これが秒あたり
 1.13 / 0.83 -> **0.047** へ約 20 分の 1 になった。
 
-#### まだ検証できていない経路
+#### 最大化復元の hardware regression と追補修正 (2026-08-28)
 
-**最大化された detached 窓は、この実行では 1 回も使われていない。** `settings.db` の
-`detached_viewer_window_placement` は `maximized:false` で、ログ中の `SIZE_MAXIMIZED` は
-修正前 48 件に対し修正後 0 件、`ws_maximized=true` も 0 件。実際に使われたのは
-「ほぼ全画面の復元サイズ窓」と F11 のボーダーレス全画面だった。
+上の実行では最大化された detached 窓を使っておらず、移設した
+`Maximized(true) -> Visible(true)` commit は未検証だった。その後、利用者が detached 窓を
+ダブルクリックで最大化して F12 を 2 往復すると、通常サイズで復帰する回帰を実機で確認した。
+38 遷移を含むログ全体で `SIZE_MAXIMIZED` / `ws_maximized=true` / `SW_MAXIMIZE` /
+`maximized=true value=true` はすべて 0 件だった。これは hidden builder から maximize を外した
+ちらつき修正で導入され、未検証だった最大化経路を実機確認して発見した回帰である。
 
-したがって `SW_MAXIMIZE=0` は「この構成では正しい」だけであり、**今回移設した
-`Maximized(true) -> Visible(true)` の commit 自体はまだ 1 度も走っていない**。
-最大化した detached 窓が最大化状態で戻るかは未確認。
+`Visible` effect に `maximized` 引数、runtime placement の一元 write 境界に old/new と caller の
+計装を加え、production と同じ active-render capture -> Visible effect の seam を再現した。
+保存済み `{x:100,y:120,w:1600,h:1200,maximized:true}` は、非表示で非最大化の再生成 host が
+報告した `{x:200,y:220,w:1800,h:900,maximized:false}` に Visible commit より前に置換され、effect は
+`Visible(true)` だけを発行した。したがって downstream command loss ではなく、render-time capture が
+自分たちの hidden scaffold を利用者の placement intent として公開したことが原因。`maximized` だけでなく
+`x/y/w/h` も同じ ownership violation を受ける。
+
+placement observation authority を `UserVisibleHost / HiddenScaffold` として型にし、各 capture 時点の
+実 HWND の `IsWindowVisible` から決める。hidden scaffold は placement を一切 publish せず、OS 上で
+可視な host だけが利用者の geometry / maximized intent を更新できる。これにより保存済み
+`maximized:true` は既存 Visible owner が読むまで保持され、同じ commit で
+`Maximized(true) -> Visible(true)` が出る。新しい App state、時間窓、frame-count guard、retry は無い。
+回帰テスト
+`recreated_detached_host_preserves_maximized_placement_until_visible_commit` は hidden observation 後も
+placement 全体が不変で、実際の video Visible effect が上記 2 command を順に出すことを固定する。
+hidden observation を writable に戻す mutation は placement equality と command 列の双方で失敗し、
+Visible commit から maximize を落とす mutation は command 列で失敗する。
 
 #### 残った軽微な事象 (利用者が許容と判断)
 

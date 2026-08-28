@@ -1566,8 +1566,9 @@ impl App {
                     hwnd,
                 );
                 let viewport_id = self.fullscreen_viewport_id();
+                let maximized = request.target == super::ViewerPresentation::DetachedWindow
+                    && self.active_detached_viewport_maximized_on_visible_commit();
                 if request.target == super::ViewerPresentation::DetachedWindow {
-                    let maximized = self.active_detached_viewport_maximized_on_visible_commit();
                     Self::send_detached_viewport_visible_commit(ctx, viewport_id, maximized);
                 } else {
                     ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
@@ -1579,7 +1580,7 @@ impl App {
                     crate::presentation_observer::WindowRole::Host,
                     hwnd,
                     "transition_owner",
-                    "value=true",
+                    format!("value=true maximized={maximized}"),
                 );
             }
             super::PresentationTransitionEffect::FocusHost { request, hwnd } => {

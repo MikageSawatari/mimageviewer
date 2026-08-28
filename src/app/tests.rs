@@ -75,7 +75,7 @@ fn hidden_detached_host_builder_does_not_request_maximize() {
 
 #[test]
 #[cfg(windows)]
-fn detached_video_visible_effect_commits_maximize_before_visible() {
+fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() {
     let mut app = phase_c_support::setup_app();
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -91,6 +91,32 @@ fn detached_video_visible_effect_commits_maximize_before_visible() {
             maximized: true,
         },
         "test_visible_commit",
+    );
+    let before_capture = app
+        .detached_window_runtime_placement(12)
+        .expect("test placement must exist before the recreated host reports state");
+    let observation_authority = DetachedPlacementObservationAuthority::from_host_visibility(false);
+    assert_eq!(
+        observation_authority,
+        DetachedPlacementObservationAuthority::HiddenScaffold
+    );
+    app.save_detached_viewer_placement_from_logical_rect_with_source(
+        "active_render",
+        observation_authority,
+        egui::Rect::from_min_size(egui::pos2(200.0, 220.0), egui::vec2(1800.0, 900.0)),
+        Some(egui::Rect::from_min_size(
+            egui::pos2(200.0, 220.0),
+            egui::vec2(1800.0, 900.0),
+        )),
+        1.0,
+        false,
+    );
+    let after_capture = app
+        .detached_window_runtime_placement(12)
+        .expect("render capture must leave a placement record");
+    assert_eq!(
+        after_capture, before_capture,
+        "a hidden recreate scaffold must not publish its temporary restored state or geometry as user placement"
     );
     let viewport_id = app.fullscreen_viewport_id();
     let ctx = egui::Context::default();
@@ -140,7 +166,7 @@ fn detached_video_visible_effect_commits_maximize_before_visible() {
             egui::ViewportCommand::Maximized(true),
             egui::ViewportCommand::Visible(true),
         ],
-        "the transition owner's Visible effect must apply maximize in the same commit, before the HWND becomes visible"
+        "the preserved maximized intent must be applied by the transition owner's Visible commit"
     );
 }
 

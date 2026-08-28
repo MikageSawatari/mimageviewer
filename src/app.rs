@@ -753,6 +753,15 @@ impl App {
         let previous =
             self.detached_window_manager
                 .set_placement(window_id, placement, default_linked);
+        crate::logger::log(format!(
+            "[presentation-placement] t_us={} event=write window_id={} caller={} old_maximized={:?} \
+             new_maximized={} old={previous:?} new={placement:?}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            reason,
+            previous.map(|value| value.maximized),
+            placement.maximized,
+        ));
         self.log_detached_image_window_debug(format!(
             "runtime_placement window_id={window_id} reason={reason} \
              from={previous:?} to={placement:?}"
@@ -2338,6 +2347,31 @@ enum DetachedGridItemOpenPlan {
 }
 
 /// アクティブ detached viewer セッションの再オープン経路の種別 (将来拡張用)。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedPlacementObservationAuthority {
+    UserVisibleHost,
+    HiddenScaffold,
+}
+
+#[cfg(windows)]
+impl DetachedPlacementObservationAuthority {
+    fn from_host_visibility(visible: bool) -> Self {
+        if visible {
+            Self::UserVisibleHost
+        } else {
+            Self::HiddenScaffold
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserVisibleHost => "user_visible_host",
+            Self::HiddenScaffold => "hidden_scaffold",
+        }
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedSource {
@@ -42500,6 +42534,7 @@ impl App {
     ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
         self.save_detached_viewer_placement_from_logical_rect_with_source(
             "unspecified",
+            DetachedPlacementObservationAuthority::UserVisibleHost,
             outer_rect,
             inner_rect,
             pixels_per_point,
@@ -42511,11 +42546,36 @@ impl App {
     pub(crate) fn save_detached_viewer_placement_from_logical_rect_with_source(
         &mut self,
         source: &'static str,
+        authority: DetachedPlacementObservationAuthority,
         outer_rect: egui::Rect,
         inner_rect: Option<egui::Rect>,
         pixels_per_point: f32,
         maximized: bool,
     ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+        if authority == DetachedPlacementObservationAuthority::HiddenScaffold {
+            crate::logger::log(format!(
+                "[presentation-placement] t_us={} event=observation source={} authority={} \
+                 input_maximized={} outer=({:.3},{:.3} {:.3}x{:.3}) inner={} outcome=ignored",
+                crate::logger::elapsed_micros(),
+                source,
+                authority.label(),
+                maximized,
+                outer_rect.min.x,
+                outer_rect.min.y,
+                outer_rect.width(),
+                outer_rect.height(),
+                inner_rect
+                    .map(|rect| format!(
+                        "({:.3},{:.3} {:.3}x{:.3})",
+                        rect.min.x,
+                        rect.min.y,
+                        rect.width(),
+                        rect.height()
+                    ))
+                    .unwrap_or_else(|| "none".to_string()),
+            ));
+            return None;
+        }
         if self.detached_viewer_borderless_fullscreen
             || self.detached_viewer_borderless_transition.is_some()
         {
@@ -42656,6 +42716,19 @@ impl App {
         );
         self.set_detached_window_runtime_placement(window_id, placement, "active_placement_update");
         None
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_placement_observation_authority(
+        &self,
+    ) -> DetachedPlacementObservationAuthority {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let visible = self
+            .detached_viewer_host_hwnd_alive()
+            .is_some_and(|hwnd| unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() });
+        DetachedPlacementObservationAuthority::from_host_visibility(visible)
     }
 
     #[cfg(windows)]

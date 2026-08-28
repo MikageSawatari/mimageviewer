@@ -1487,6 +1487,25 @@ App-level bool / Option、timeout / settle window、guard / retry / repaint、�
 hidden builder へ maximize を戻す mutation と、Visible effect から maximize を落とす・順序を逆にする
 mutation はそれぞれ独立テストが拒否する。
 
+**同日追補 — hidden recreate 中の placement observation ownership**: 上記修正の実機確認で
+ちらつきは解消したが、最大化した detached 窓を F12 で再生成すると通常サイズへ戻る回帰を確認した。
+hidden host は意図的に非最大化で作られるため、Visible commit より前の active render が live state の
+`maximized:false` を保存し、移管先 owner が読む intent を消していた。観測では同じ capture が
+`x/y/w/h` も scaffold の矩形へ置換した。
+
+**追補の触った範囲**: [src/app.rs](../src/app.rs) の runtime placement write / observation authority、
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の active render capture、
+[src/app/native_video.rs](../src/app/native_video.rs) の Visible 計装、[src/app/tests.rs](../src/app/tests.rs) の
+回帰証明、[next-release-backlog.md](next-release-backlog.md) §1.139。観測計装は実機再検証まで維持する。
+
+**追補後の不変条件**: OS 上で可視な detached host だけが利用者の runtime placement intent を
+publish できる。hidden recreate scaffold は一時的な restored geometry / maximized=false を報告しても
+保存 placement を変更しない。authority は capture 時点の HWND の `IsWindowVisible` から導出し、
+新しい App state、timeout / settle window、frame-count guard、retry は追加しない。これは最大化だけを
+特別扱いする症状 guard ではなく、geometry 全体の producer ownership を live user window に戻す
+構造修正である。hidden observation を writable に戻す mutation と、Visible owner から maximize を
+落とす mutation は一つの seam test が拒否する。
+
 **2026-08-28 native commit と outgoing presenter retire の所有境界
 (backlog §1.137 follow-up、利用者提示の build I 実機観測を ClaudeCode / Codex 双方が構造修正の
 根拠として合意):**
