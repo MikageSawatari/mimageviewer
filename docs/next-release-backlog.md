@@ -3631,24 +3631,54 @@ WM_SETFOCUS    presenter
 **ホストウィンドウの生成・表示そのものがフォアグラウンドを奪い、presenter が取り返す**
 という OS レベルの綱引きである。
 
+#### 発生条件: ホスト窓が「最大化」のときだけ起きる
+
+同じ実行の全 30 遷移を、`phase=begin` から `[detached-viewer] registered host` までの
+所要時間と、区間内の `WM_KILLFOCUS` 件数で並べると、2 群にきれいに割れる。
+
+| ホスト窓 | 生成〜登録 | Publish まで | 余分な前面奪取 |
+| --- | --- | --- | --- |
+| 通常サイズ (約 1600x1200) | 15-17ms | 151-158ms | **0 回** |
+| 最大化 (3862x2110 @ 4K) | 162-367ms | 387-554ms | **3 回** |
+
+奪取のオフセットは約 40 / 130 / 210ms で、最後に Publish 時の正規の受け渡しが 1 回入る。
+**「必ず 3 回」ではなく「生成が長引いた 100ms ごとに 1 回」**である。通常サイズでは
+生成が 15ms で終わるので往復する暇が無く、奪取は Publish 時の 1 回だけになる。
+
+利用者が今この明滅を強く感じるのは、detached 窓を最大化して使っているため。同じ実行の
+ログでも、F11 で detached をフルスクリーン化した 36.5s 以降、ホスト窓の外形が最大化サイズ
+(3862x2110 @ (-11,-11)) に変わったところから 3 回の奪取が始まっている。それ以前の通常
+サイズの遷移 (id=3/5/8/12) では 1 回も起きていない。
+
 #### なぜ遷移所有者では止まらなかったか
 
-reducer の effect (`Raise` 0 件、`Publish` → `Visible` → `Focus` の順序) は設計どおり
+reducer の effect (`Raise` 0 件、`Publish` -> `Visible` -> `Focus` の順序) は設計どおり
 出ている。**往復はその effect が出るより前、ホスト viewport が作られる過程で起きている**。
 所有権を一本化しても、egui/winit がホストを作る際の activation は reducer の外にある。
 
+#### まだ観測できていないこと (ここが次の一手)
+
+**ホスト窓自身のメッセージが、この 300ms の間だけ記録されていない。** ホストの wndproc は
+key-input subclass 経由で観測しているが、subclass が入るのは mIV がホスト HWND を捕捉した
+時点 (= 上表の「登録」= 往復が終わった後)。したがって次がすべて空白になっている。
+
+- ホストが `WM_ACTIVATE` を受けたのか。受けたなら lParam の相手窓は誰か
+- ホストが生成直後に可視だったのか (登録時点では毎回 `visible=false`)
+- `SW_MAXIMIZE` / `SW_HIDE` がホストへ何回飛んだか
+
+`fg=` から「ホストが前面にいた」ことは分かるが、**誰がそうしたのかはこの空白の中にある**。
+
 #### 直す方向 (未着手)
 
-往復の駆動源を特定してから決める。候補:
+**候補として書いていた `with_active(true)` は誤りだった。** 実コードは動画遷移中の detached
+ホストに `Some(false)` (= `with_active(false)`) を渡しており
+([ui_fullscreen.rs](../src/ui_fullscreen.rs) の `detached_activate_on_show`)、
+`with_visible(false)` も `need_show || !window_visible` の条件で入る。production 経路に
+生の `SetForegroundWindow` / `SetActiveWindow` / `SetFocus` は無い (唯一の直呼びは
+`#[cfg(test)]` の中)。**「mIV が前面を要求している」線は消えた。**
 
-- ホスト viewport を**非アクティブで生成**し、activation は commit まで持たせない
-  (`with_active(false)` 相当。`ui_fullscreen.rs` の builder は現在 `with_active(true)`)
-- 出ていく presenter 側の activation 取り返しを、遷移中は permit で止める
-  (permit 機構は §9.8 で導入済み。ただし今回の記録では mIV 発の呼び出しが見えないので、
-  取り返しが presenter の wndproc 内部からなのか OS 由来なのかを先に確定する)
-
-**確定していないことを実装しない。** 往復 1 周期の起点がどちらの窓かを、
-`z=` と `fg_role=` の遷移でもう一段追う。
+残る筋は winit がホスト窓を作る過程そのもの (最大化の適用 = `ShowWindow(SW_MAXIMIZE)` は
+可視化と activation を伴う) だが、これはまだ推測である。上の空白を埋めるまで実装しない。
 
 - 規模 \\ 優先度: Medium / P2 (§1.137 の本体)。
 
