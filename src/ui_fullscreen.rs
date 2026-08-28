@@ -13545,6 +13545,12 @@ impl App {
             format!("reason=keep_alive_cleanup viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::keep_alive_cleanup",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         #[cfg(windows)]
         {
@@ -13567,6 +13573,7 @@ impl App {
     /// `App::update` のフルスクリーン区間の**末尾**で毎フレーム呼ぶこと。
     #[cfg(windows)]
     pub(crate) fn render_active_detached_viewport_backstop(&mut self, ctx: &egui::Context) {
+        self.log_active_detached_session_backstop_read("entry", false);
         if !self.detached_active_window_alive_wanted() {
             return;
         }
@@ -13589,6 +13596,7 @@ impl App {
         // The binding table answers both ownership and residence for this viewport. Mounting an
         // at-rest owner keeps all indexed state together; an already-mounted owner renders
         // directly without a second pass.
+        self.log_active_detached_session_backstop_read("mount", true);
         let window_id = self
             .active_detached_session
             .expect("live detached viewport must have an active session")
@@ -14430,7 +14438,19 @@ impl App {
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Visible,
+                        "ui_fullscreen::restore_current_viewport",
+                        "value=true",
+                    );
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Focus,
+                        "ui_fullscreen::restore_current_viewport",
+                        "viewport_command=Focus",
+                    );
                     ctx.request_repaint();
                 }
 
@@ -15904,8 +15924,20 @@ impl App {
                             ));
                         }
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        self.observe_viewport_presentation_command(
+                            ctx.viewport_id(),
+                            crate::presentation_observer::WindowAction::Visible,
+                            "ui_fullscreen::initial_visibility_release",
+                            "value=true",
+                        );
                         if !detached || detached_activate_on_show.unwrap_or(false) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            self.observe_viewport_presentation_command(
+                                ctx.viewport_id(),
+                                crate::presentation_observer::WindowAction::Focus,
+                                "ui_fullscreen::initial_visibility_release",
+                                "viewport_command=Focus",
+                            );
                         }
                     } else {
                         ctx.request_repaint();
@@ -17655,6 +17687,12 @@ impl App {
             format!("reason=native_video_backdrop_hide viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::native_video_backdrop_hide",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17683,6 +17721,12 @@ impl App {
             format!("reason=embedded_still_viewport_hide viewport={fs_id:?}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::embedded_still_viewport_hide",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17718,6 +17762,12 @@ impl App {
             format!("reason=fullscreen_viewport_recreate viewport={fs_id:?} fs_idx={fs_idx}"),
         );
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.observe_viewport_presentation_command(
+            fs_id,
+            crate::presentation_observer::WindowAction::Visible,
+            "ui_fullscreen::fullscreen_viewport_recreate",
+            "value=false",
+        );
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.clear_detached_viewer_host_hwnd();
@@ -17751,7 +17801,19 @@ impl App {
             {
                 crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Visible,
+                    "ui_fullscreen::video_viewport_present",
+                    "value=true",
+                );
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::video_viewport_present",
+                    "viewport_command=Focus",
+                );
             }
             if let Some(keys) =
                 fullscreen_shortcut_event_summary(ctx, &self.keymap, FS_VIDEO_ACTIVE_SCOPES)
@@ -22607,6 +22669,12 @@ impl App {
                         .z_order_recovery_permitted()
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Focus,
+                        "ui_fullscreen::pointer_focus_regain",
+                        "viewport_command=Focus",
+                    );
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_primary_suppression.arm_pointer_stream();
@@ -24947,6 +25015,12 @@ impl App {
             self.handle_fullscreen_close_request();
             if !detached && !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::close_request_focus",
+                    "viewport_command=Focus",
+                );
             }
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
@@ -24969,6 +25043,12 @@ impl App {
             self.close_fullscreen();
             if !presentation_was_transitioning {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "ui_fullscreen::video_close_focus",
+                    "viewport_command=Focus",
+                );
             }
             ctx.request_repaint();
         }

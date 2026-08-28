@@ -49,6 +49,12 @@ impl App {
                 continue;
             }
             ctx.send_viewport_cmd_to(*viewport_id, egui::ViewportCommand::Visible(visible));
+            self.observe_viewport_presentation_command(
+                *viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "tray::set_all_viewports_visible",
+                if visible { "value=true" } else { "value=false" },
+            );
             commanded += 1;
         }
         commanded
@@ -232,9 +238,14 @@ impl App {
                 *slot.lock().unwrap() = captured;
             }
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+            use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
             unsafe {
-                let _ = ShowWindow(HWND(hwnd_raw as *mut _), SW_HIDE);
+                let _ = crate::presentation_observer::show_window(
+                    HWND(hwnd_raw as *mut _),
+                    SW_HIDE,
+                    crate::presentation_observer::WindowRole::Main,
+                    "tray_integration::hide_to_tray",
+                );
             }
         }
 

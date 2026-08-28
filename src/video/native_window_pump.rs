@@ -778,16 +778,15 @@ impl PumpRuntime {
         }
         self.state = transition.state;
         for effect in transition.effects {
+            let action_host = transition_action.and_then(|(_, _, action)| match (action, effect) {
+                ("Publish", WindowHostEffect::Publish { host, .. }) => Some(host),
+                (
+                    "Destroy",
+                    WindowHostEffect::Destroy { host } | WindowHostEffect::DestroyOrphan { host },
+                ) => Some(host),
+                _ => None,
+            });
             if let Some((transition_id, target_epoch, action)) = transition_action {
-                let action_host = match (action, effect) {
-                    ("Publish", WindowHostEffect::Publish { host, .. }) => Some(host),
-                    (
-                        "Destroy",
-                        WindowHostEffect::Destroy { host }
-                        | WindowHostEffect::DestroyOrphan { host },
-                    ) => Some(host),
-                    _ => None,
-                };
                 if let Some(host) = action_host {
                     self.log_transition_native_action(
                         transition_id,
@@ -797,9 +796,60 @@ impl PumpRuntime {
                     );
                 }
             }
+            let target = transition_action
+                .map(|(_, target_epoch, _)| self.presentation_probe_target(target_epoch));
+            let action_hwnd = action_host
+                .and_then(|host| self.hosts.get(&host.epoch))
+                .map(|host| host.hwnd().0 as usize as u64)
+                .unwrap_or(0);
+            let _probe_scope =
+                transition_action
+                    .zip(target)
+                    .map(|((transition_id, _, _), target)| {
+                        crate::presentation_observer::TransitionScope::enter(transition_id, target)
+                    });
             self.apply_effect(effect)?;
+            if let (Some((transition_id, _, action)), Some(target), Some(_)) =
+                (transition_action, target, action_host)
+            {
+                let probe_action = if action == "Publish" {
+                    crate::presentation_observer::WindowAction::Publish
+                } else {
+                    crate::presentation_observer::WindowAction::Destroy
+                };
+                crate::presentation_observer::observe_for_transition(
+                    transition_id,
+                    target,
+                    probe_action,
+                    crate::presentation_observer::WindowRole::Presenter,
+                    action_hwnd,
+                    "native_window_pump",
+                    format!("epoch={}", action_host.unwrap().epoch.0),
+                );
+            }
         }
         Ok(())
+    }
+
+    fn presentation_probe_target(
+        &self,
+        target_epoch: u64,
+    ) -> crate::presentation_observer::TransitionTarget {
+        self.requests
+            .get(&WindowEpoch(target_epoch))
+            .map(|request| match request.placement {
+                NativeVideoPlacement::MainWindowChild => {
+                    crate::presentation_observer::TransitionTarget::Main
+                }
+                NativeVideoPlacement::FullscreenBorderless => {
+                    crate::presentation_observer::TransitionTarget::Fullscreen
+                }
+                NativeVideoPlacement::DetachedViewerChild
+                | NativeVideoPlacement::DetachedWindow => {
+                    crate::presentation_observer::TransitionTarget::Detached
+                }
+            })
+            .unwrap_or(crate::presentation_observer::TransitionTarget::Unknown)
     }
 
     fn apply_effect(&mut self, effect: WindowHostEffect) -> Result<(), String> {
@@ -832,6 +882,13 @@ impl PumpRuntime {
             WindowHostEffect::Raise { host } => {
                 if let Some(window) = self.hosts.get(&host.epoch) {
                     let _ = window.raise_presenter_to_front();
+                    crate::presentation_observer::observe(
+                        crate::presentation_observer::WindowAction::Raise,
+                        crate::presentation_observer::WindowRole::Presenter,
+                        window.hwnd().0 as usize as u64,
+                        "native_window_pump::Raise",
+                        format!("epoch={}", host.epoch.0),
+                    );
                 }
                 Ok(())
             }

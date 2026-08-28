@@ -912,11 +912,24 @@ impl App {
     }
 
     fn detached_window_hwnd_clear(&mut self, window_id: u64) -> Option<u64> {
-        self.detached_window_manager.clear_hwnd(window_id)
+        let cleared = self.detached_window_manager.clear_hwnd(window_id);
+        if let Some(hwnd) = cleared {
+            crate::presentation_observer::unregister(
+                crate::presentation_observer::WindowRole::Host,
+                hwnd,
+            );
+        }
+        cleared
     }
 
     fn detached_window_hwnd_clear_if_dead(&mut self, window_id: u64) -> Option<u64> {
         let cleared = self.detached_window_manager.clear_hwnd_if_dead(window_id);
+        if let Some(hwnd) = cleared {
+            crate::presentation_observer::unregister(
+                crate::presentation_observer::WindowRole::Host,
+                hwnd,
+            );
+        }
         if cleared.is_some()
             && let Some(window) = self
                 .detached_image_windows
@@ -933,8 +946,14 @@ impl App {
 
     fn detached_window_hwnd_set(&mut self, window_id: u64, hwnd: u64) -> Option<u64> {
         let default_linked = self.detached_window_runtime_default_linked();
-        self.detached_window_manager
-            .set_hwnd(window_id, hwnd, default_linked)
+        let previous = self
+            .detached_window_manager
+            .set_hwnd(window_id, hwnd, default_linked);
+        crate::presentation_observer::register(
+            crate::presentation_observer::WindowRole::Host,
+            hwnd,
+        );
+        previous
     }
 
     fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
@@ -2340,6 +2359,35 @@ pub(crate) enum DetachedSource {
 pub(crate) struct ActiveDetachedSession {
     pub(crate) window_id: u64,
     pub(crate) source: DetachedSource,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActiveDetachedSessionProbe {
+    sequence: u64,
+    action: &'static str,
+    reason: &'static str,
+    owner: &'static str,
+    caller_file: &'static str,
+    caller_line: u32,
+    window_id: Option<u64>,
+    source: Option<DetachedSource>,
+}
+
+#[cfg(windows)]
+impl Default for ActiveDetachedSessionProbe {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            action: "init",
+            reason: "app_init",
+            owner: "App::new",
+            caller_file: "-",
+            caller_line: 0,
+            window_id: None,
+            source: None,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -9716,6 +9764,8 @@ pub struct App {
     /// helper 5 つ (begin/closing/finish/mark/rendered) 経由でのみ触る。
     #[cfg(windows)]
     pub(crate) active_detached_session: Option<ActiveDetachedSession>,
+    #[cfg(windows)]
+    pub(crate) active_detached_session_probe: ActiveDetachedSessionProbe,
     /// アクティブ detached の `show_viewport_immediate` を最後に呼んだ frame_counter。
     /// backstop の二重描画/描き漏れ防止 (§3.6)。
     #[cfg(windows)]
@@ -13351,6 +13401,8 @@ impl App {
             last_active_detached_window_id: None,
             #[cfg(windows)]
             active_detached_session: None,
+            #[cfg(windows)]
+            active_detached_session_probe: ActiveDetachedSessionProbe::default(),
             #[cfg(windows)]
             detached_active_viewport_rendered_frame: u64::MAX,
             #[cfg(windows)]
@@ -35558,6 +35610,12 @@ impl App {
                     .z_order_recovery_permitted()
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    ctx.viewport_id(),
+                    crate::presentation_observer::WindowAction::Focus,
+                    "app::close_reopen_focus",
+                    "viewport_command=Focus",
+                );
             }
             // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
             // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
@@ -37125,10 +37183,97 @@ impl App {
     // ── keep-alive session / marker helpers (docs/detached-viewer-keepalive-design.md §3.7) ──
     // session state と marker は必ずこの helper 経由で触る (直接書き換え禁止)。
 
+    #[cfg(windows)]
+    fn record_active_detached_session_write(
+        &mut self,
+        action: &'static str,
+        reason: &'static str,
+        owner: &'static str,
+        previous: Option<ActiveDetachedSession>,
+        next: Option<ActiveDetachedSession>,
+        caller: &'static std::panic::Location<'static>,
+    ) {
+        let sequence = self
+            .active_detached_session_probe
+            .sequence
+            .wrapping_add(1)
+            .max(1);
+        let named = next.or(previous);
+        let binding = named.and_then(|session| {
+            self.viewer_context_window_binding_probe(session.window_id)
+                .map(|(id, residence)| format!("{id:?}/{residence:?}"))
+        });
+        self.active_detached_session_probe = ActiveDetachedSessionProbe {
+            sequence,
+            action,
+            reason,
+            owner,
+            caller_file: caller.file(),
+            caller_line: caller.line(),
+            window_id: named.map(|session| session.window_id),
+            source: named.map(|session| session.source),
+        };
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=session seq={} action={} reason={} owner={} caller={}:{} previous={:?} next={:?} window_id={:?} source={:?} binding={} transition={}",
+            crate::logger::elapsed_micros(),
+            sequence,
+            action,
+            reason,
+            owner,
+            caller.file(),
+            caller.line(),
+            previous.map(|session| session.window_id),
+            next.map(|session| session.window_id),
+            named.map(|session| session.window_id),
+            named.map(|session| session.source),
+            binding.as_deref().unwrap_or("none"),
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn log_active_detached_session_backstop_read(
+        &self,
+        stage: &'static str,
+        force: bool,
+    ) {
+        let session = self.active_detached_session;
+        let binding = session.and_then(|session| {
+            self.viewer_context_window_binding_probe(session.window_id)
+                .map(|(id, residence)| format!("{id:?}/{residence:?}"))
+        });
+        if !force
+            && crate::presentation_observer::active_transition_id().is_none()
+            && (session.is_none() || binding.is_some())
+        {
+            return;
+        }
+        let last = self.active_detached_session_probe;
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=backstop stage={} value={:?} source={:?} binding={} last_seq={} last_action={} last_reason={} last_owner={} last_caller={}:{} last_window_id={:?} last_source={:?} transition={}",
+            crate::logger::elapsed_micros(),
+            stage,
+            session.map(|value| value.window_id),
+            session.map(|value| value.source),
+            binding.as_deref().unwrap_or("none"),
+            last.sequence,
+            last.action,
+            last.reason,
+            last.owner,
+            last.caller_file,
+            last.caller_line,
+            last.window_id,
+            last.source,
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+    }
+
     /// アクティブ detached セッションを開始 / 更新する (set)。既に同じ window_id の
     /// セッションがあれば runtime state を Active に戻して据え置く (passive→active 再開や F12 再 ON)。
     #[cfg(windows)]
+    #[track_caller]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        let previous = self.active_detached_session;
         let current_state = self.detached_window_state(window_id);
         let changed = self
             .active_detached_session
@@ -37139,6 +37284,14 @@ impl App {
             })
             .unwrap_or(true);
         self.active_detached_session = Some(ActiveDetachedSession { window_id, source });
+        self.record_active_detached_session_write(
+            "set",
+            "session_begin",
+            "App::begin_active_detached_session",
+            previous,
+            self.active_detached_session,
+            std::panic::Location::caller(),
+        );
         if changed || current_state != Some(DetachedWindowState::Active) {
             self.transition_detached_window_state(
                 window_id,
@@ -37171,8 +37324,23 @@ impl App {
     /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
     /// `Closing -> Removed` もここで所有し、focus / placement / host 判定へ stale runtime を残さない。
     #[cfg(windows)]
+    #[track_caller]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
-        let Some(session) = self.active_detached_session.take() else {
+        let previous = self.active_detached_session;
+        let taken = self.active_detached_session.take();
+        self.record_active_detached_session_write(
+            if taken.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            reason,
+            "App::finish_active_detached_session_close",
+            previous,
+            None,
+            std::panic::Location::caller(),
+        );
+        let Some(session) = taken else {
             return;
         };
         if let Some((owner, ContextResidence::Mounted)) =
@@ -37190,8 +37358,23 @@ impl App {
 
     /// Active-to-passive is not terminal: the passive renderer keeps the runtime and OS viewport.
     #[cfg(windows)]
+    #[track_caller]
     fn finish_active_detached_session_handoff(&mut self, reason: &'static str) {
-        if let Some(session) = self.active_detached_session.take() {
+        let previous = self.active_detached_session;
+        let taken = self.active_detached_session.take();
+        self.record_active_detached_session_write(
+            if taken.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            reason,
+            "App::finish_active_detached_session_handoff",
+            previous,
+            None,
+            std::panic::Location::caller(),
+        );
+        if let Some(session) = taken {
             self.log_detached_image_window_debug(format!(
                 "session_handoff window_id={} reason={reason}",
                 session.window_id
@@ -37730,7 +37913,20 @@ impl App {
             self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
         }
 
+        let previous_session = self.active_detached_session;
         self.active_detached_session = None;
+        self.record_active_detached_session_write(
+            if previous_session.is_some() {
+                "clear"
+            } else {
+                "clear_none"
+            },
+            "mode_change_close_all_final_reset",
+            "App::mode_change_close_all_detached",
+            previous_session,
+            None,
+            std::panic::Location::caller(),
+        );
         self.video_presentation_transition
             .sync_stable(self.viewer_presentation);
         self.pending_detached_video_host_resync = false;
@@ -37884,6 +38080,53 @@ impl App {
         self.active_detached_hwnd_window_id()
             .map(|window_id| self.detached_window_hwnd_raw_for_window_id(window_id))
             .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn observe_viewport_presentation_command(
+        &self,
+        viewport_id: egui::ViewportId,
+        action: crate::presentation_observer::WindowAction,
+        source: &'static str,
+        detail: &'static str,
+    ) {
+        let (role, hwnd) = if viewport_id == egui::ViewportId::ROOT {
+            (
+                crate::presentation_observer::WindowRole::Main,
+                self.main_hwnd.unwrap_or(0) as u64,
+            )
+        } else if let Some(window_id) = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)
+            .filter(|window_id| Self::detached_image_window_viewport_id(*window_id) == viewport_id)
+        {
+            (
+                crate::presentation_observer::WindowRole::Host,
+                self.detached_window_hwnd_raw_for_window_id(window_id),
+            )
+        } else if let Some(window) = self
+            .detached_image_windows
+            .iter()
+            .find(|window| Self::detached_image_window_viewport_id(window.id) == viewport_id)
+        {
+            (
+                crate::presentation_observer::WindowRole::Host,
+                self.detached_window_hwnd_raw_for_window_id(window.id),
+            )
+        } else {
+            (
+                crate::presentation_observer::WindowRole::Backdrop,
+                self.fs_viewport_virtual_desktop_synced_hwnd,
+            )
+        };
+        crate::presentation_observer::observe_viewport_command(
+            action,
+            role,
+            hwnd,
+            source,
+            format!("viewport={viewport_id:?} {detail}"),
+        );
     }
 
     #[cfg(windows)]
@@ -39272,6 +39515,12 @@ impl App {
             self.detached_image_windows.len()
         ));
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        self.observe_viewport_presentation_command(
+            egui::ViewportId::ROOT,
+            crate::presentation_observer::WindowAction::Focus,
+            "app::focus_main_after_detached_window_close_if_idle",
+            "viewport_command=Focus",
+        );
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
@@ -41846,6 +42095,10 @@ impl App {
             ));
         }
         self.fs_viewport_virtual_desktop_synced_hwnd = hwnd_raw;
+        crate::presentation_observer::register(
+            crate::presentation_observer::WindowRole::Backdrop,
+            hwnd_raw,
+        );
     }
 
     #[cfg(windows)]
@@ -42091,6 +42344,12 @@ impl App {
                 .z_order_recovery_permitted()
             {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                self.observe_viewport_presentation_command(
+                    viewport_id,
+                    crate::presentation_observer::WindowAction::Focus,
+                    "app::apply_detached_viewer_borderless_target",
+                    "viewport_command=Focus",
+                );
             }
         }
         ctx.request_repaint();
@@ -42488,7 +42747,19 @@ impl App {
             let viewport_id = Self::detached_image_window_viewport_id(window_id);
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::restore_active_context_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::restore_active_context_window",
+                "viewport_command=Focus",
+            );
         }
         ctx.request_repaint();
         true
@@ -42524,7 +42795,19 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::activate_media_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::activate_media_window",
+                "viewport_command=Focus",
+            );
         } else if mounted_matches && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
@@ -42686,7 +42969,19 @@ impl App {
             let fs_id = self.fullscreen_viewport_id();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::restore_viewer_window",
+                "value=true",
+            );
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            self.observe_viewport_presentation_command(
+                fs_id,
+                crate::presentation_observer::WindowAction::Focus,
+                "app::restore_viewer_window",
+                "viewport_command=Focus",
+            );
             restored = true;
         }
 
@@ -65447,6 +65742,10 @@ impl eframe::App for App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    crate::presentation_observer::register(
+                        crate::presentation_observer::WindowRole::Main,
+                        hwnd_raw as u64,
+                    );
                     // マウスドライバが WM_APPCOMMAND_BROWSER_BACKWARD/FORWARD で送るか、
                     // AHK 等が VK_BROWSER_BACK/FORWARD keystroke で送るルートを WH_GETMESSAGE
                     // フックで拾い、進む/戻るボタンを Ctrl+↑/↓ と等価に扱う。詳細は

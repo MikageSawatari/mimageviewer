@@ -1325,9 +1325,11 @@ impl App {
         }
         self.video_presentation_transition
             .sync_stable(self.viewer_presentation);
-        let outgoing_presenter_hwnd = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
-            _ => 0,
+        let (outgoing_presenter_hwnd, outgoing_hud_hwnd) = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                (player.native_presenter_hwnd(), player.native_hud_hwnd())
+            }
+            _ => (0, 0),
         };
         let outgoing_host_hwnd = (self.viewer_presentation == ViewerPresentation::DetachedWindow)
             .then(|| self.detached_viewer_host_hwnd_raw())
@@ -1336,14 +1338,49 @@ impl App {
             && self.detached_viewer_video_host_ready())
         .then(|| self.detached_viewer_host_hwnd_raw())
         .unwrap_or(0);
-        Some(self.video_presentation_transition.request_transition(
+        let request_id = self.video_presentation_transition.request_transition(
             target_presentation,
             activate_on_show,
             false,
             outgoing_presenter_hwnd,
             outgoing_host_hwnd,
             ready_host_hwnd,
-        ))
+        );
+        let probe_host = if target_presentation == ViewerPresentation::DetachedWindow {
+            ready_host_hwnd.max(outgoing_host_hwnd)
+        } else {
+            0
+        };
+        let probe_backdrop = (target_presentation == ViewerPresentation::Fullscreen)
+            .then_some(self.fs_viewport_virtual_desktop_synced_hwnd)
+            .unwrap_or(0);
+        crate::presentation_observer::begin_transition(
+            request_id,
+            Self::presentation_probe_target(target_presentation),
+            crate::presentation_observer::KnownWindows {
+                main: self.main_hwnd.unwrap_or(0) as u64,
+                host: probe_host,
+                presenter: outgoing_presenter_hwnd,
+                backdrop: probe_backdrop,
+                hud: outgoing_hud_hwnd,
+            },
+        );
+        Some(request_id)
+    }
+
+    #[cfg(windows)]
+    fn presentation_probe_target(
+        presentation: ViewerPresentation,
+    ) -> crate::presentation_observer::TransitionTarget {
+        match presentation {
+            ViewerPresentation::MainWindow => crate::presentation_observer::TransitionTarget::Main,
+            ViewerPresentation::Fullscreen => {
+                crate::presentation_observer::TransitionTarget::Fullscreen
+            }
+            ViewerPresentation::DetachedWindow => {
+                crate::presentation_observer::TransitionTarget::Detached
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -1404,6 +1441,8 @@ impl App {
         self.execute_video_presentation_transition_effects(ctx);
         if self.video_presentation_transition.is_transitioning() {
             ctx.request_repaint();
+        } else {
+            crate::presentation_observer::finish_transition();
         }
     }
 
@@ -1548,12 +1587,30 @@ impl App {
                     self.fullscreen_viewport_id(),
                     egui::ViewportCommand::Visible(true),
                 );
+                crate::presentation_observer::observe_viewport_command_for_transition(
+                    request.id,
+                    Self::presentation_probe_target(request.target),
+                    crate::presentation_observer::WindowAction::Visible,
+                    crate::presentation_observer::WindowRole::Host,
+                    hwnd,
+                    "transition_owner",
+                    "value=true",
+                );
             }
             super::PresentationTransitionEffect::FocusHost { request, hwnd } => {
                 Self::log_presentation_transition_effect(request.id, request.target, "Focus", hwnd);
                 ctx.send_viewport_cmd_to(
                     self.fullscreen_viewport_id(),
                     egui::ViewportCommand::Focus,
+                );
+                crate::presentation_observer::observe_viewport_command_for_transition(
+                    request.id,
+                    Self::presentation_probe_target(request.target),
+                    crate::presentation_observer::WindowAction::Focus,
+                    crate::presentation_observer::WindowRole::Host,
+                    hwnd,
+                    "transition_owner",
+                    "viewport_command=Focus",
                 );
             }
             super::PresentationTransitionEffect::DestroyHost {
@@ -1566,6 +1623,15 @@ impl App {
                     ctx.send_viewport_cmd_to(
                         Self::detached_image_window_viewport_id(window_id),
                         egui::ViewportCommand::Close,
+                    );
+                    crate::presentation_observer::observe_viewport_command_for_transition(
+                        request_id,
+                        Self::presentation_probe_target(target),
+                        crate::presentation_observer::WindowAction::Destroy,
+                        crate::presentation_observer::WindowRole::Host,
+                        hwnd,
+                        "transition_owner",
+                        "viewport_command=Close",
                     );
                 }
             }
@@ -2870,7 +2936,7 @@ impl App {
         use windows::Win32::UI::WindowsAndMessaging::{
             GA_ROOT, GWL_STYLE, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindow,
             IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-            SetWindowPos, WS_CHILD,
+            WS_CHILD,
         };
         let editor_arc = self.dsp_bridge.editor_hwnds_snapshot();
         let raw_list: Vec<u64> = match editor_arc.read() {
@@ -3036,7 +3102,7 @@ impl App {
                         );
                     }
                     let ok = unsafe {
-                        SetWindowPos(
+                        crate::presentation_observer::set_window_pos(
                             hwnd,
                             None,
                             rect.left,
@@ -3044,6 +3110,8 @@ impl App {
                             0,
                             0,
                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                            crate::presentation_observer::WindowRole::Other,
+                            "app::clamp_vst_windows_away_from_video_ui",
                         )
                     }
                     .is_ok();

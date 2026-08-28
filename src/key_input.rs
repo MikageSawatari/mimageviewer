@@ -2039,6 +2039,11 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     _id: usize,
     _ref_data: usize,
 ) -> LRESULT {
+    crate::presentation_observer::observe_window_message(
+        hwnd,
+        crate::presentation_observer::WindowRole::Host,
+        msg,
+    );
     let hwnd_raw = hwnd.0 as u64;
     if let Some(edge) = key_edge_from_message(msg, wparam, lparam) {
         push_edge(hwnd_raw, edge);

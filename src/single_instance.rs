@@ -658,8 +658,7 @@ pub fn spawn_activation_listener(
         use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindowVisible, PostMessageW, SW_SHOW, SW_SHOWNOACTIVATE, SetForegroundWindow,
-            ShowWindow, WM_CLOSE,
+            IsWindowVisible, PostMessageW, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
         };
         use windows::core::PCWSTR;
 
@@ -732,9 +731,18 @@ pub fn spawn_activation_listener(
                         };
                         unsafe {
                             if !used_placement {
-                                let _ = ShowWindow(hwnd, SW_SHOW);
+                                let _ = crate::presentation_observer::show_window(
+                                    hwnd,
+                                    SW_SHOW,
+                                    crate::presentation_observer::WindowRole::Main,
+                                    "single_instance::activate",
+                                );
                             }
-                            let _ = SetForegroundWindow(hwnd);
+                            let _ = crate::presentation_observer::set_foreground_window(
+                                hwnd,
+                                crate::presentation_observer::WindowRole::Main,
+                                "single_instance::activate",
+                            );
                         }
                         egui_ctx.request_repaint();
                     } else if r.0 == WAIT_OBJECT_0.0 + 1 && handles.shutdown != 0 {
@@ -747,13 +755,26 @@ pub fn spawn_activation_listener(
                         unsafe {
                             if !IsWindowVisible(hwnd).as_bool() {
                                 let cloak_true: i32 = 1;
-                                let _ = DwmSetWindowAttribute(
+                                let cloak_ok = DwmSetWindowAttribute(
                                     hwnd,
                                     DWMWA_CLOAK,
                                     &cloak_true as *const _ as *const _,
                                     std::mem::size_of::<i32>() as u32,
+                                )
+                                .is_ok();
+                                crate::presentation_observer::observe_dwm_cloak(
+                                    hwnd,
+                                    crate::presentation_observer::WindowRole::Main,
+                                    true,
+                                    "single_instance::shutdown",
+                                    cloak_ok,
                                 );
-                                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                                let _ = crate::presentation_observer::show_window(
+                                    hwnd,
+                                    SW_SHOWNOACTIVATE,
+                                    crate::presentation_observer::WindowRole::Main,
+                                    "single_instance::shutdown",
+                                );
                             }
                             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                         }

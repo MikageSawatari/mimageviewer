@@ -205,6 +205,13 @@ impl<P> ContextTable<P> {
             .map(|id| (id, self.residence_core(id)))
     }
 
+    fn window_binding_probe(&self, window_id: u64) -> Option<(ViewerContextId, ContextResidence)> {
+        self.context_of
+            .get(&window_id)
+            .copied()
+            .map(|id| (id, self.residence_core(id)))
+    }
+
     fn window_for_context(&self, id: ViewerContextId) -> Option<u64> {
         assert!(self.pending.is_none());
         self.window_of.get(&id).copied()
@@ -2845,6 +2852,13 @@ impl App {
         self.viewer_contexts.table.locate_window_context(window_id)
     }
 
+    pub(in crate::app) fn viewer_context_window_binding_probe(
+        &self,
+        window_id: u64,
+    ) -> Option<(ViewerContextId, ContextResidence)> {
+        self.viewer_contexts.table.window_binding_probe(window_id)
+    }
+
     pub(in crate::app) fn viewer_context_window(&self, id: ViewerContextId) -> Option<u64> {
         self.viewer_contexts.table.window_for_context(id)
     }
@@ -2874,27 +2888,69 @@ impl App {
         }
     }
 
+    #[track_caller]
     pub(in crate::app) fn bind_window(
         &mut self,
         id: ViewerContextId,
         window_id: u64,
     ) -> Result<(), BindError> {
-        self.viewer_contexts.table.bind_window(id, window_id)
+        let result = self.viewer_contexts.table.bind_window(id, window_id);
+        let caller = std::panic::Location::caller();
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=binding action=bind window_id={} context={id:?} result={:?} caller={}:{} session={:?} transition={}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            result.as_ref().err(),
+            caller.file(),
+            caller.line(),
+            self.active_detached_session
+                .map(|session| session.window_id),
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+        result
     }
 
+    #[track_caller]
     pub(in crate::app) fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId> {
         assert_ne!(
             self.active_detached_window_id(),
             Some(window_id),
             "cannot release window {window_id} while the active detached session still names it"
         );
-        self.viewer_contexts.table.unbind_window(window_id)
+        let result = self.viewer_contexts.table.unbind_window(window_id);
+        let caller = std::panic::Location::caller();
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=binding action=unbind window_id={} context={:?} caller={}:{} session={:?} last_setter={}/{} transition={}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            result,
+            caller.file(),
+            caller.line(),
+            self.active_detached_session
+                .map(|session| session.window_id),
+            self.active_detached_session_probe.owner,
+            self.active_detached_session_probe.reason,
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
+        result
     }
 
+    #[track_caller]
     pub(in crate::app) fn reserve_window_binding_for_build(&mut self, window_id: u64) {
         self.viewer_contexts
             .table
             .reserve_window_binding_for_build(window_id);
+        let caller = std::panic::Location::caller();
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=binding action=reserve window_id={} caller={}:{} session={:?} transition={}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            caller.file(),
+            caller.line(),
+            self.active_detached_session
+                .map(|session| session.window_id),
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
     }
 
     pub(in crate::app) fn with_viewer_context<R>(
@@ -2959,6 +3015,20 @@ impl App {
         let ops = self.viewer_contexts.table.plan_abort_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_abort_build();
+        let session = self.active_detached_session;
+        let binding = session.and_then(|value| {
+            self.viewer_context_window_binding_probe(value.window_id)
+                .map(|(id, residence)| format!("{id:?}/{residence:?}"))
+        });
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=binding action=abort_build session={:?} binding={} last_setter={}/{} transition={}",
+            crate::logger::elapsed_micros(),
+            session.map(|value| value.window_id),
+            binding.as_deref().unwrap_or("none"),
+            self.active_detached_session_probe.owner,
+            self.active_detached_session_probe.reason,
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
     }
 
     fn finish_viewer_context_build(
@@ -2971,7 +3041,19 @@ impl App {
             BuildOutcome::Commit => {
                 let ops = self.viewer_contexts.table.plan_commit_build();
                 self.execute_viewer_context_ops(ops, None);
-                Some(self.viewer_contexts.table.finish_commit_build())
+                let finished = self.viewer_contexts.table.finish_commit_build();
+                if let Some(window_id) = self.viewer_contexts.table.window_for_context(finished) {
+                    crate::logger::log(format!(
+                        "[active-detached-session] t_us={} kind=binding action=publish_build window_id={} context={finished:?} reason={} session={:?} transition={}",
+                        crate::logger::elapsed_micros(),
+                        window_id,
+                        reason,
+                        self.active_detached_session
+                            .map(|session| session.window_id),
+                        crate::presentation_observer::active_transition_id().unwrap_or(0),
+                    ));
+                }
+                Some(finished)
             }
             BuildOutcome::Abort(abort_reason) => {
                 crate::logger::log(format!(
@@ -3004,6 +3086,14 @@ impl App {
             ForkPolicy::LiveMediaPark { window_id },
             ProductionForkSpec::LiveMedia,
         );
+        crate::logger::log(format!(
+            "[active-detached-session] t_us={} kind=binding action=transfer_live window_id={} from={source:?} to={parked:?} session={:?} transition={}",
+            crate::logger::elapsed_micros(),
+            window_id,
+            self.active_detached_session
+                .map(|session| session.window_id),
+            crate::presentation_observer::active_transition_id().unwrap_or(0),
+        ));
         self.transfer_native_video_open_pending_context(source, parked);
         parked
     }
@@ -3180,10 +3270,19 @@ impl App {
         let id = self.stash_mounted_and_start_fresh("test_stash_mounted_as_active");
         self.bind_window(id, window_id)
             .unwrap_or_else(|error| panic!("test stashed context binding failed: {error:?}"));
+        let previous = self.active_detached_session;
         self.active_detached_session = Some(ActiveDetachedSession {
             window_id,
             source: DetachedSource::Image,
         });
+        self.record_active_detached_session_write(
+            "set",
+            "test_stash_mounted_as_active",
+            "App::stash_mounted_as_active_for_test",
+            previous,
+            self.active_detached_session,
+            std::panic::Location::caller(),
+        );
         id
     }
 }

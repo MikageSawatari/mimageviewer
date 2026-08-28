@@ -254,6 +254,15 @@ pub fn log(msg: impl AsRef<str>) {
     }
 }
 
+/// Returns the same process-relative clock used by [`log`], at microsecond resolution.
+/// Transition probes include this value because the ordinary log prefix is rounded to millis.
+pub(crate) fn elapsed_micros() -> u64 {
+    START
+        .get()
+        .map(|s| s.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 /// Buffered log data is normally flushed by [`log`] after every line. Keep an
 /// explicit flush operation for shutdown paths that may terminate the process
 /// without running Rust destructors.

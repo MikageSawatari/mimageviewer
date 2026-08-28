@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, GetClassNameW, GetWindowRect, GetWindowTextW, HWND_TOP, IsIconic,
-    IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 use windows::core::{BOOL, Result};
 
@@ -85,21 +85,41 @@ pub fn disable_transitions_for_window(hwnd: HWND) {
 
 pub fn set_window_cloaked(hwnd: HWND, cloaked: bool) -> windows::core::Result<()> {
     let cloak: i32 = if cloaked { 1 } else { 0 };
-    unsafe {
+    let result = unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_CLOAK,
             &cloak as *const i32 as *const _,
             std::mem::size_of::<i32>() as u32,
         )
-    }
+    };
+    crate::presentation_observer::observe_dwm_cloak(
+        hwnd,
+        crate::presentation_observer::WindowRole::Other,
+        cloaked,
+        "dwm_transitions::set_window_cloaked",
+        result.is_ok(),
+    );
+    result
 }
 
 pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
     let hwnd = find_visible_thread_window_matching_rect(main_hwnd, expected)?;
     unsafe {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-        if SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok() {
+        if crate::presentation_observer::set_window_pos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            flags,
+            crate::presentation_observer::WindowRole::Other,
+            "dwm_transitions::raise_visible_thread_window_matching_rect",
+        )
+        .is_ok()
+        {
             Some(hwnd)
         } else {
             None

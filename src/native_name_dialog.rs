@@ -93,15 +93,14 @@ mod windows_impl {
     };
     use windows::Win32::System::SystemServices::SS_PATHELLIPSIS;
     use windows::Win32::UI::Controls::{EM_LIMITTEXT, EM_SETSEL};
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
         BS_DEFPUSHBUTTON, BS_PUSHBUTTON, DLGPROC, DLGTEMPLATE, DS_MODALFRAME, DS_SETFONT,
         DialogBoxIndirectParamW, ES_AUTOHSCROLL, EndDialog, GetDlgItem, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HWND_TOP, IDCANCEL, IDOK,
         MB_ICONWARNING, MB_OK, MB_OKCANCEL, MessageBoxW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-        WINDOW_LONG_PTR_INDEX, WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_CAPTION,
-        WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, WINDOW_LONG_PTR_INDEX, WM_CLOSE,
+        WM_COMMAND, WM_INITDIALOG, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU,
+        WS_TABSTOP, WS_VISIBLE,
     };
     use windows::core::PCWSTR;
 
@@ -241,7 +240,11 @@ mod windows_impl {
                         };
                         let _ =
                             SendMessageW(edit, EM_SETSEL, Some(WPARAM(start)), Some(LPARAM(end)));
-                        let _ = SetFocus(Some(edit));
+                        let _ = crate::presentation_observer::set_focus(
+                            Some(edit),
+                            crate::presentation_observer::WindowRole::Other,
+                            "native_name_dialog::init",
+                        );
                     }
                 }
                 // Focus was assigned explicitly to the EDIT control.
@@ -320,7 +323,7 @@ mod windows_impl {
                     y = y.clamp(work.top, (work.bottom - height).max(work.top));
                 }
                 let _ = unsafe {
-                    SetWindowPos(
+                    crate::presentation_observer::set_window_pos(
                         dialog,
                         Some(HWND_TOP),
                         x,
@@ -328,6 +331,8 @@ mod windows_impl {
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
+                        crate::presentation_observer::WindowRole::Other,
+                        "native_name_dialog::place_over_owner",
                     )
                 };
             }
@@ -336,7 +341,7 @@ mod windows_impl {
         // Raise and focus explicitly. A sibling window of ours that re-asserts foreground
         // would otherwise leave the modal unreachable except through Alt+Tab.
         let _ = unsafe {
-            SetWindowPos(
+            crate::presentation_observer::set_window_pos(
                 dialog,
                 Some(HWND_TOP),
                 0,
@@ -344,9 +349,17 @@ mod windows_impl {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                crate::presentation_observer::WindowRole::Other,
+                "native_name_dialog::raise",
             )
         };
-        let _ = unsafe { SetForegroundWindow(dialog) };
+        let _ = unsafe {
+            crate::presentation_observer::set_foreground_window(
+                dialog,
+                crate::presentation_observer::WindowRole::Other,
+                "native_name_dialog::raise",
+            )
+        };
     }
 
     unsafe fn owner_work_area(owner: HWND) -> Option<RECT> {

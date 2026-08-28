@@ -5696,6 +5696,12 @@ impl App {
                 self.handle_fullscreen_close_request();
                 if !detached {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.observe_viewport_presentation_command(
+                        ctx.viewport_id(),
+                        crate::presentation_observer::WindowAction::Focus,
+                        "gamepad::apply_ring_close_fullscreen",
+                        "viewport_command=Focus",
+                    );
                 }
                 ctx.request_repaint();
             }
