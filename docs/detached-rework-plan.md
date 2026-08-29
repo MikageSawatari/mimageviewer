@@ -1459,6 +1459,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-30 gamepad の配り先と面を 1 つの判定に揃える (レビュー R-02 の残件。修正の形は
+Codex が [review-v3.3.0 §9.2](review-v3.3.0/README.md) で示した根本修正そのもの):**
+
+**触った範囲**: [src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の
+`current_input_surface` / `gamepad_batch_goes_to_active_context`、
+[src/app.rs](../src/app.rs) の root pass routing 1 行、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明 2 本。
+
+**不変条件と所有境界**: batch の配り先と、その batch の中で解決される `ActionSurface` は
+**同じ 1 つの関数から導く**。2026-08-29 の R-02 修正は「別ウィンドウが前面ならそちらへ配る」
+側だけを直し、配り先は `active_detached_context_is_at_rest()` (= 前面を見ない) のままだった。
+そのため前面がメインでも batch が別ウィンドウの context へ入り、`MainWindow` と解決された
+グリッド操作が mount 中の bundle の `selected` を書き換えていた。`handle_gamepad_y_tap` の
+コメントは当時から「前面 / last-touched がメインならメインを操作する」と書いてある。
+
+直したのは `current_input_surface` の 4 番目の引数だけ。root projection の `fullscreen_idx`
+には別ウィンドウのビューアが現れないので、`|| active_detached_context_is_at_rest()` を足す。
+第 1 引数は `viewer_session_is_detached_or_switching` が既に同じ事実を含んでいるため触らない
+(**最初は足していたが、変異テストが生き残って冗長だと分かった**)。
+
+**なぜ症状パッチではないか**: 述語に例外を足したのではなく、2 つに割れていた判定を 1 つに
+した。新しい App-level bool / Option は無い (規則 3)。時間窓も retry も無い (規則 5)。既存の
+`a_foreground_detached_viewer_receives_the_gamepad_batch_itself` は無変更で緑のまま (規則 8)。
+配り先を旧規則へ戻す変異と、4 番目の引数を戻す変異の両方を、追加した 2 本が拒否する。
+
 **2026-08-29 R-27 host/session lease 移譲 (v3.3.0 出荷前レビュー R-27。ClaudeCode /
 Codex 双方が構造的修正と合意):**
 

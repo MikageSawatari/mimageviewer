@@ -63676,6 +63676,80 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
     );
 }
 
+/// 前面がメインなら、別ウィンドウが開いていても batch は root で配る。
+///
+/// v3.3.0 では配り先が `active_detached_context_is_at_rest()` だけを見ており、**前面を
+/// 見ていなかった**。別ウィンドウを開いたままメイン一覧を操作すると、batch が
+/// 別ウィンドウの context へ入り、`handle_gamepad_direction_for_grid` が mount 中の
+/// bundle の `selected` を動かしていた (メイン一覧は動かない)。`handle_gamepad_y_tap` の
+/// コメントは当時から「前面 / last-touched がメインならメインを操作する」と書いてある。
+///
+/// 前面 HWND はテストから触れないが、`resolve_input_surface` は前面が取れないとき
+/// 直近に配った面へ落ちるので、そこを使って両方の向きを確かめる。
+#[test]
+#[cfg(windows)]
+fn the_gamepad_goes_to_the_main_window_when_that_is_the_surface() {
+    let mut app = phase_c_support::setup_app();
+    let window_id = 79;
+    let context_id = app.build_window_context_for_test(window_id, |bundle| {
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    app.detached_viewer_window_id = Some(window_id);
+    assert_eq!(app.active_viewer_context_id(), Some(context_id));
+    assert!(
+        app.active_detached_context_is_at_rest(),
+        "AtRest の active context を作れていない"
+    );
+
+    // 直近に操作したのがメイン = メインが前面という状況。
+    app.detached_window_manager
+        .note_input_surface(crate::app::ActionSurface::MainWindow);
+    assert!(
+        !app.gamepad_batch_goes_to_active_context(),
+        "前面がメインなのに別ウィンドウへ配ろうとしている"
+    );
+
+    // 直近に操作したのが別ウィンドウなら、そちらへ配る (v3.3.0 の修正を維持)。
+    app.detached_window_manager
+        .note_input_surface(crate::app::ActionSurface::Viewer);
+    assert!(
+        app.gamepad_batch_goes_to_active_context(),
+        "前面が別ウィンドウなのに root で配ろうとしている"
+    );
+}
+
+/// 配り先と、その batch の中で解決される面が同じ答えになること。
+///
+/// 割れていると、メイン宛と解決した操作が別ウィンドウの bundle を書き換える。
+/// **同じ 1 つの関数から導く**のが不変条件なので、両方を並べて確かめる。
+#[test]
+#[cfg(windows)]
+fn the_gamepad_destination_and_the_action_surface_agree() {
+    let mut app = phase_c_support::setup_app();
+    let window_id = 80;
+    app.build_window_context_for_test(window_id, |bundle| {
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    app.detached_viewer_window_id = Some(window_id);
+
+    for (surface, goes_to_context) in [
+        (crate::app::ActionSurface::MainWindow, false),
+        (crate::app::ActionSurface::Viewer, true),
+    ] {
+        app.detached_window_manager.note_input_surface(surface);
+        assert_eq!(
+            app.gamepad_batch_goes_to_active_context(),
+            goes_to_context,
+            "配り先が面と食い違っている: {surface:?}"
+        );
+        assert_eq!(
+            app.current_input_surface_for_test(),
+            surface,
+            "面の解決が直近の面と食い違っている: {surface:?}"
+        );
+    }
+}
+
 /// 遷移中に context を畳む経路でも、通常の teardown まで到達する。
 ///
 /// `close_fullscreen` は遷移中なら `TerminalClose` を出して戻り、teardown を「後で

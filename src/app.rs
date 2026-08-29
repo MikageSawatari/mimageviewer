@@ -66966,10 +66966,12 @@ impl eframe::App for App {
         // 物理デバイスはここで読む。**配り先は前面の viewer なので、まだ決めない。**
         // AtRest の active context が前面なら、その context を mount した中で配る
         // (root projection で配ると、別ウィンドウを見ているのにメイングリッドが動く。
-        // 2026-08-29 レビュー R-02)。
+        // 2026-08-29 レビュー R-02)。逆に**前面がメインなら root で配る** — そこを
+        // 見ていなかったため、メイン宛と解決した操作が別ウィンドウの bundle を
+        // 書き換えていた (同 R-02 の残件)。
         let gamepad_batch = self.sample_gamepad_input(ctx);
         #[cfg(windows)]
-        let gamepad_goes_to_active_context = self.active_detached_context_is_at_rest();
+        let gamepad_goes_to_active_context = self.gamepad_batch_goes_to_active_context();
         #[cfg(not(windows))]
         let gamepad_goes_to_active_context = false;
         let mut gamepad_nav = None;

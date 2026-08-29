@@ -572,14 +572,28 @@ impl App {
         });
     }
 
+    /// いま入力を受け取るべき面。**配り先の判定もこれを使う** (`App::update` の
+    /// gamepad routing)。
+    ///
+    /// AtRest の active context は root projection の `fullscreen_idx` にも
+    /// `viewer_session_*` にも現れない。「ビューアが別ウィンドウで開いている」という
+    /// 事実をここに含めないと、root pass では**常に** `MainWindow` と答える。
+    /// 配り先だけが別の情報源 (`active_detached_context_is_at_rest`) を見ていたため、
+    /// **前面がメインでも batch が別ウィンドウの context へ入り**、
+    /// `handle_gamepad_direction_for_grid` が mount 中の bundle の `selected` を動かして
+    /// いた (2026-08-29 レビュー R-02。`handle_gamepad_y_tap` のコメントは当時から
+    /// 「前面 / last-touched がメインならメインを操作する」と書いてあった)。
     fn current_input_surface(&self) -> crate::app::ActionSurface {
         #[cfg(windows)]
         {
+            // 第 1 引数は `viewer_session_is_detached_or_switching` が既に AtRest の
+            // active context を含んでいる。足りないのは第 4 引数のほうで、root projection の
+            // `fullscreen_idx` には別ウィンドウのビューアが現れない。
             return self.detached_window_manager.resolve_input_surface(
                 self.viewer_session_is_detached_or_switching(),
                 self.main_hwnd.and_then(|hwnd| u64::try_from(hwnd).ok()),
                 foreground_app_hwnd(),
-                self.fullscreen_idx.is_some(),
+                self.fullscreen_idx.is_some() || self.active_detached_context_is_at_rest(),
             );
         }
         #[cfg(not(windows))]
@@ -590,6 +604,22 @@ impl App {
                 crate::app::ActionSurface::MainWindow
             }
         }
+    }
+
+    /// gamepad の batch をどこへ配るか。**mount する前に一度だけ決める。**
+    ///
+    /// 決め手は [`Self::current_input_surface`] 1 つ。ここが別の事実を見ると、
+    /// 「メイン宛と解決した操作が別ウィンドウの bundle を書き換える」という R-02 の
+    /// 所有権割れが戻る。
+    #[cfg(all(test, windows))]
+    pub(crate) fn current_input_surface_for_test(&self) -> crate::app::ActionSurface {
+        self.current_input_surface()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn gamepad_batch_goes_to_active_context(&self) -> bool {
+        self.active_detached_context_is_at_rest()
+            && self.current_input_surface() == crate::app::ActionSurface::Viewer
     }
 
     /// 直近に配った面。overlay の表示先はこれで決める。
