@@ -1459,6 +1459,58 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-29 presentation transition の所有境界 7 件 (v3.3.0 出荷前レビュー R-01 / R-17 /
+R-24 と、その調査で出た同型。ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の
+reducer と state、[src/video/mod.rs](../src/video/mod.rs) の command 受信と placement 待機、
+[src/app/native_video.rs](../src/app/native_video.rs) の effect 実行、
+[src/app.rs](../src/app.rs) の close-and-retire seam、[src/app/tests.rs](../src/app/tests.rs) の回帰証明。
+commit は `eb275c2a` / `21b05da2` / `64847e3c` / `ce663f82` / `0a1e2aeb` / `7a198b07`。
+
+**不変条件と所有境界**:
+
+- **in-flight な abort の identity は、後から来た要求では動かない。**`Aborting` が持つ
+  `request` は「abort が終わったら始める後継」であって native は知らない。これを
+  「発行済み」と数えると、後継 id で `aborted_request_id` を上書きして元 request の
+  terminal event が一致しなくなる。terminal event は成功 (`NativeAborted`) と失敗
+  (`NativeFailed`) の両方が同じ identity で照合される。
+- **drain した batch は、一致した control より後ろも所有者を持つ。**`drain` は queue と
+  latest slot から全件外すので、途中 return で捨てた分は消える。待機は手元の保留分を
+  先に見てから receiver を見る。
+- **frame の command は 1 つの queue が持ち、入れ子の待機もそれを見る。**局所 Vec に
+  取り残すと、待機が待っている control が手の届かない場所に居る。次 frame へ延期する
+  ときは、後ろに並んでいる分も一緒に送る (追い越させない)。
+- **`NativeCommitted` は所有権の受け渡し点なので、そこから先の置換は巻き戻しではない。**
+  post-commit の置換は abort を出さず、走っている retire の完了を待ってから後継を始める。
+  `current()` は publish 済みの target を返す。
+- **bundle を捨てる seam は、その bundle が積んだ terminal effect を実行し切る。**
+  実行は `TerminalSessionClose` 経由で `close_fullscreen` まで到達するので、seam は
+  「到達したか」を受け取り、していないときだけ自分で閉じる (二重 teardown を作らない)。
+
+**なぜ症状パッチではないか**: 追加したのは guard / delay / retry / repaint / 一括 reset で
+はなく、**壊れていた所有境界の型付け**である。新しい App-level bool / Option は足していない
+(規則 3 — 状態は既存の `PresentationTransitionState` / `PreparingProgress` に持たせ、実行結果は
+戻り値で返す)。時間窓も物理状態 proxy も使っていない (規則 5 — identity は event が運ぶ
+request id と generation だけで決まる)。既存の detached テストは 1 本も削除・弱体化していない
+(規則 8)。各修正について、元の欠陥を復元する mutation を作り、テストが落ちることを確認した。
+
+**Codex が反証した仮説を 1 件記録する**: レビュー台帳の R-15「commit 後 retire 前の置換で
+App と native の presentation が分裂する」は**成立しない**。effect は FIFO で実行され
+`RetireOutgoing` が `AbortNative` より先に積まれるため、native は retire して新しい表示に
+留まる。観測されるのは R-17 のハングであって rollback ではない。モデリングの穴 (`Aborting` が
+publication phase を持たない) は実在したので、そちらは `ce663f82` で型に持たせた。
+
+**未了として引き継ぐもの** (Codex Q4 / Q5、2026-08-29 時点):
+
+- `teardown_paused_media_bundles_for_window_ids` が `retire_context` を直接呼び、bundle の
+  transition owner を drain していない。passive close / mode change / removed-path close /
+  parked-poll close / new-media replacement が該当する。
+- `Committing::AwaitingRetire` に直接 `TerminalClose` が来る経路は、retire が積まれた後に
+  `AbortNative` を出し、publish 前の `request.current` で安定する。`RetiringCommitted` は
+  正しく扱えているので、同じ扱いを明示分岐として足す必要がある。
+
+
 **2026-08-28 hidden detached host の maximize を既存 Visible commit owner へ移管
 (backlog §1.139、利用者の WH_CBT / WH_CALLWNDPROC 実測と winit source の導出が一致し、
 ClaudeCode / Codex 双方が構造的修正と合意):**
