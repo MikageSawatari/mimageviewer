@@ -713,7 +713,12 @@ fn reduce_abort_transition(
                         ..
                     },
             },
-            PresentationTransitionEvent::NativeAborted { request_id },
+            // native が abort を「失敗」で終えた場合も、その request が終わったこと
+            // に変わりはない。ここで拾わないと、下の汎用 `NativeFailed` 分岐が後継の
+            // id と照合して外し、catch-all に落ちて永久に待つ (R-01 と同じ取り違え。
+            // Codex の Q5 指摘で発覚)。
+            PresentationTransitionEvent::NativeAborted { request_id }
+            | PresentationTransitionEvent::NativeFailed { request_id },
         ) if aborted_request_id == request_id => {
             if aborted_candidate_host_hwnd != 0
                 && request.target != ViewerPresentation::DetachedWindow
@@ -1311,6 +1316,42 @@ mod tests {
                 } if request.id == fourth_id
             ),
             "元 request の abort 完了で最後の後継へ進めていない: {:?}",
+            owner.state()
+        );
+    }
+
+    /// abort が失敗で終わっても、後継はそこで止まらない。
+    ///
+    /// `NativeFailed` の汎用分岐は state が持つ request と照合する。`Aborting` でそれは
+    /// **後継**なので、native が中止した側について失敗を返すと照合が外れ、catch-all に
+    /// 落ちて `NativeAborted` を永久に待つ。abort の終わり方が成功か失敗かは、後継を
+    /// 始めてよいかどうかを変えない。
+    #[test]
+    fn an_abort_that_ends_in_failure_still_releases_the_successor() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let issued_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        drive_to_native_wait(&mut owner);
+        let successor_id = request(&mut owner, ViewerPresentation::MainWindow, MAIN_HOST);
+        owner.take_effects();
+
+        owner.dispatch(PresentationTransitionEvent::NativeFailed {
+            request_id: issued_id,
+        });
+
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::AwaitingHost
+                        | PreparingProgress::ReadyToPrepare { .. },
+                } if request.id == successor_id
+            ),
+            "abort が失敗で終わったら後継が始まらない: {:?}",
             owner.state()
         );
     }
