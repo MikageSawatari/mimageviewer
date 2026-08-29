@@ -47676,6 +47676,36 @@ impl App {
         Ok(())
     }
 
+    /// 編集の正本 DB への書き込み結果を、**durable な mirror を公開してよいか**へ変える。
+    ///
+    /// 失敗を成功として公開しない。sidecar と content ledger が「保存済み」を主張すると、
+    /// 次回起動時に古い正本の行が新しい sidecar を拒否し (import は「中央が authoritative」
+    /// なので行があれば skip する)、利用者からは編集が消えたように見える。さらに sidecar の
+    /// mtime だけが進むので、フォルダ切替のたびに sidecar import の fast-path が外れる
+    /// (2026-08-29 レビュー R-26)。
+    ///
+    /// **画面上の編集は消さない。**in-memory の状態は呼び出し側が先に更新してよく、ここで
+    /// false を返すのは「durable な mirror を書くな」という意味に限る。利用者はその場で
+    /// 失敗を知り、やり直せる。
+    ///
+    /// レーティング DB は既にこの形 ([`Self::report_rating_write_error`])。編集ストアだけが
+    /// 結果を捨てていた。
+    #[must_use]
+    fn edit_store_write_succeeded<E: std::fmt::Display>(
+        &mut self,
+        what: &'static str,
+        result: Result<(), E>,
+    ) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                crate::logger::log(format!("[edit-store] {what}: write failed: {error}"));
+                self.show_feedback_toast(format!("{what}を保存できませんでした: {error}"));
+                false
+            }
+        }
+    }
+
     pub(crate) fn report_rating_write_error(&mut self, error: &str) {
         crate::logger::log(format!("[RATING] user write failed: {error}"));
         self.show_feedback_toast(format!("レーティングを保存できませんでした: {error}"));
@@ -53927,12 +53957,17 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        if let Some(db) = &self.mask_db {
-            let _ = db.set_raw(&key, compressed, shapes_json, w, h);
-        }
+        let written = match &self.mask_db {
+            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
+            None => Ok(()),
+        };
+        // 画面上の編集は残す。durable な mirror だけ、正本が受け取れたときに書く。
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, true);
         self.mask_pages.insert(idx);
         self.bump_erase_mask_generation(idx);
+        if !self.edit_store_write_succeeded("消しゴムのマスク", written) {
+            return;
+        }
         let sidecar_mask =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
@@ -53952,12 +53987,16 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        if let Some(db) = &self.mask_db {
-            let _ = db.delete(&key);
-        }
+        let written = match &self.mask_db {
+            Some(db) => db.delete(&key),
+            None => Ok(()),
+        };
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
         self.mask_pages.remove(&idx);
         self.bump_erase_mask_generation(idx);
+        if !self.edit_store_write_succeeded("消しゴムのマスクの削除", written) {
+            return;
+        }
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
@@ -54016,12 +54055,16 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        if let Some(db) = &self.conceal_db {
-            let _ = db.set_raw(&key, compressed, shapes_json, w, h);
-        }
+        let written = match &self.conceal_db {
+            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
+            None => Ok(()),
+        };
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, true);
         self.conceal_pages.insert(idx);
         self.bump_conceal_mask_generation(idx);
+        if !self.edit_store_write_succeeded("隠蔽加工", written) {
+            return;
+        }
         let sidecar_conceal =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_conceal(rel, sidecar_conceal));
@@ -54042,12 +54085,16 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        if let Some(db) = &self.conceal_db {
-            let _ = db.delete(&key);
-        }
+        let written = match &self.conceal_db {
+            Some(db) => db.delete(&key),
+            None => Ok(()),
+        };
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
         self.conceal_pages.remove(&idx);
         self.bump_conceal_mask_generation(idx);
+        if !self.edit_store_write_succeeded("隠蔽加工の削除", written) {
+            return;
+        }
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
@@ -54072,14 +54119,16 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        if let Some(db) = &self.local_adjust_db {
-            if let Err(err) = db.set_layers(&key, &layers) {
-                crate::logger::log(format!(
-                    "local_adjust: failed to save layers idx={idx} error={err}"
-                ));
-            }
-        }
+        let written = match &self.local_adjust_db {
+            Some(db) => db.set_layers(&key, &layers),
+            None => Ok(()),
+        };
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
+        if !self.edit_store_write_succeeded("補正レイヤー", written) {
+            // 画面には残す。durable な mirror だけ書かない。
+            self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
+            return;
+        }
         if layers.is_empty() {
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
         } else {
@@ -54186,27 +54235,27 @@ impl App {
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
         if let Some(settings) = normalized {
-            if let Some(db) = &self.export_crop_db {
-                if let Err(err) = db.set(&key, settings) {
-                    crate::logger::log(format!(
-                        "export_crop: failed to save crop idx={idx} error={err}"
-                    ));
-                }
-            }
-            self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, settings));
+            let written = match &self.export_crop_db {
+                Some(db) => db.set(&key, settings),
+                None => Ok(()),
+            };
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
-        } else {
-            if let Some(db) = &self.export_crop_db {
-                if let Err(err) = db.remove(&key) {
-                    crate::logger::log(format!(
-                        "export_crop: failed to remove crop idx={idx} error={err}"
-                    ));
-                }
+            if !self.edit_store_write_succeeded("切り出し範囲", written) {
+                return;
             }
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_export_crop(rel));
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, settings));
+        } else {
+            let written = match &self.export_crop_db {
+                Some(db) => db.remove(&key),
+                None => Ok(()),
+            };
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
+            if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
+                return;
+            }
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_export_crop(rel));
         }
         // crop は edit-result / final AI を作り直さないが、永続編集プレビューの最終段には
         // 含まれる。確定した矩形が変わった時点で旧 WebP だけを失効させる。
@@ -58578,10 +58627,12 @@ impl App {
         // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
         // 非現在ページ保存もカバー)。
         self.invalidate_compare_prepared_for_idx(idx);
-        if let Some(db) = &self.comic_db {
-            if let Err(e) = db.set(key, objects) {
-                crate::logger::log(format!("[comic] comic.db set failed key={key}: {e}"));
-            }
+        let written = match &self.comic_db {
+            Some(db) => db.set(key, objects),
+            None => Ok(()),
+        };
+        if !self.edit_store_write_succeeded("テキスト注釈", written) {
+            return;
         }
         // サイドカーミラー (mimageviewer.dat)。「設定のバックアップ」ON 時のみ書く
         // (with_sidecar_mut が OFF なら no-op)。フォルダ移動で注釈を保持する (§6.2)。
@@ -60608,15 +60659,20 @@ impl App {
             &target.page_key,
             !matches_default,
         );
-        if matches_default {
-            self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
-                sidecar.remove_adjust(rel)
-            });
-        } else {
-            let sidecar_params = params.clone();
-            self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), move |sidecar, rel| {
-                sidecar.set_adjust(rel, sidecar_params)
-            });
+        // 正本が受け取れなかった書き込みを sidecar へ写さない。写すと次回起動時に
+        // 古い正本の行が勝ち、利用者からは補正が消えたように見える (R-26)。
+        if db_result.is_ok() {
+            if matches_default {
+                self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
+                    sidecar.remove_adjust(rel)
+                });
+            } else {
+                let sidecar_params = params.clone();
+                self.with_sidecar_coords_mut(
+                    target.sidecar_coords.as_ref(),
+                    move |sidecar, rel| sidecar.set_adjust(rel, sidecar_params),
+                );
+            }
         }
 
         let thumb_color_changed = !old_effective_for_key.color_settings_eq(&params);
@@ -60657,7 +60713,8 @@ impl App {
     /// 標準との等価比較に変更した。お気に入り標準もこれで同じ扱いになる。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
         if let Some(target) = self.page_adjustment_target_for_idx(idx) {
-            let _ = self.set_page_params_for_target(&target, params);
+            let result = self.set_page_params_for_target(&target, params);
+            let _ = self.edit_store_write_succeeded("補正", result);
         }
     }
 
@@ -60685,9 +60742,12 @@ impl App {
             self.adjustment_page_params.remove(idx);
         }
         Self::set_page_key_presence(&mut self.adjusted_page_keys, &target.page_key, false);
-        self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
-            sidecar.remove_adjust(rel)
-        });
+        // set 側と同じ理由で、正本が受け取れたときだけ sidecar を写す (R-26)。
+        if db_result.is_ok() {
+            self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
+                sidecar.remove_adjust(rel)
+            });
+        }
 
         for idx in indices {
             let old = old_by_idx
@@ -60734,13 +60794,15 @@ impl App {
                     .into_iter()
                     .map(|idx| (idx, self.effective_params(idx).clone()))
                     .collect::<Vec<_>>();
-                let _ = self.set_page_params_for_target(target, params.clone());
+                let result = self.set_page_params_for_target(target, params.clone());
+                let _ = self.edit_store_write_succeeded("補正", result);
                 for (idx, old) in old_by_idx {
                     self.clear_caches_for_param_change(idx, &old, &params);
                 }
             }
             None => {
-                let _ = self.clear_page_params_for_target(target);
+                let result = self.clear_page_params_for_target(target);
+                let _ = self.edit_store_write_succeeded("補正の解除", result);
             }
         }
     }
@@ -60753,7 +60815,8 @@ impl App {
     /// 色調 (adjustment) キャッシュは常にクリアする。
     pub(crate) fn clear_page_params(&mut self, idx: usize) {
         if let Some(target) = self.page_adjustment_target_for_idx(idx) {
-            let _ = self.clear_page_params_for_target(&target);
+            let result = self.clear_page_params_for_target(&target);
+            let _ = self.edit_store_write_succeeded("補正の解除", result);
         }
     }
 
@@ -60826,26 +60889,32 @@ impl App {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
             }
-            if let Some(db) = self.adjustment_db.as_mut() {
-                let _ = db.remove_page_params_bulk(&keys);
-            }
+            let written = match self.adjustment_db.as_mut() {
+                Some(db) => db.remove_page_params_bulk(&keys),
+                None => Ok(()),
+            };
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
-            for (folder, rels) in sidecar_coords {
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.remove_adjust_bulk(rels);
+            if self.edit_store_write_succeeded("補正の一括解除", written) {
+                for (folder, rels) in sidecar_coords {
+                    if let Some(sc) = self.sidecar_mut(&folder) {
+                        sc.remove_adjust_bulk(rels);
+                    }
                 }
             }
         } else {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
-            if let Some(db) = self.adjustment_db.as_mut() {
-                let _ = db.set_page_params_bulk(&keys, &params);
-            }
+            let written = match self.adjustment_db.as_mut() {
+                Some(db) => db.set_page_params_bulk(&keys, &params),
+                None => Ok(()),
+            };
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
-            for (folder, rels) in sidecar_coords {
-                if let Some(sc) = self.sidecar_mut(&folder) {
-                    sc.set_adjust_bulk(rels, &params);
+            if self.edit_store_write_succeeded("補正の一括適用", written) {
+                for (folder, rels) in sidecar_coords {
+                    if let Some(sc) = self.sidecar_mut(&folder) {
+                        sc.set_adjust_bulk(rels, &params);
+                    }
                 }
             }
         }
@@ -60875,13 +60944,17 @@ impl App {
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
-        if let Some(db) = self.adjustment_db.as_mut() {
-            let _ = db.remove_page_params_bulk(&keys);
-        }
+        let written = if let Some(db) = self.adjustment_db.as_mut() {
+            db.remove_page_params_bulk(&keys)
+        } else {
+            Ok(())
+        };
         Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
-        for (folder, rels) in sidecar_coords {
-            if let Some(sc) = self.sidecar_mut(&folder) {
-                sc.remove_adjust_bulk(rels);
+        if self.edit_store_write_succeeded("補正の全解除", written) {
+            for (folder, rels) in sidecar_coords {
+                if let Some(sc) = self.sidecar_mut(&folder) {
+                    sc.remove_adjust_bulk(rels);
+                }
             }
         }
         self.clear_all_color_caches();
@@ -61014,15 +61087,21 @@ impl App {
             Some(p) => {
                 self.adjustment_favorite_params
                     .insert(favorite_id, p.clone());
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.set_favorite_params(favorite_id, p);
-                }
+                // ここには sidecar mirror が無いので発散はしないが、失敗を黙って
+                // 飲むと「この標準にする」が無言で効かない。
+                let written = match &self.adjustment_db {
+                    Some(db) => db.set_favorite_params(favorite_id, p),
+                    None => Ok(()),
+                };
+                let _ = self.edit_store_write_succeeded("お気に入りの標準", written);
             }
             None => {
                 self.adjustment_favorite_params.remove(&favorite_id);
-                if let Some(db) = &self.adjustment_db {
-                    let _ = db.remove_favorite_params(favorite_id);
-                }
+                let written = match &self.adjustment_db {
+                    Some(db) => db.remove_favorite_params(favorite_id),
+                    None => Ok(()),
+                };
+                let _ = self.edit_store_write_succeeded("お気に入りの標準の解除", written);
             }
         }
         let ai_changed_indices = self.inherited_default_ai_changed_indices(&default_params_before);

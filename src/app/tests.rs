@@ -15040,6 +15040,55 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(toast_text(&app), "[隠蔽スロット2適用]");
     }
 
+    /// 正本 DB が受け取れなかった編集を、サイドカーへ「保存済み」として写さない。
+    ///
+    /// 写すと、次回起動時のサイドカー import が「中央 DB に行がある」を理由に skip し
+    /// (中央が authoritative)、古い正本が勝って利用者からは編集が消えたように見える。
+    /// さらにサイドカーの mtime だけが進むので、フォルダ切替のたびに import の fast-path
+    /// が外れる (2026-08-29 レビュー R-26)。
+    ///
+    /// 画面上の編集は消さない。失敗はトーストで伝え、利用者がやり直せるようにする。
+    #[test]
+    fn an_edit_the_store_refused_is_not_mirrored_into_the_sidecar() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("pics");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image = folder.join("page.png");
+        std::fs::write(&image, b"x").unwrap();
+        app.settings.sidecar_backup_enabled = true;
+        app.items = vec![GridItem::Image(image.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        // 正本を書けない状態にする。read-only で開いた DB は書き込みだけが失敗する。
+        let db_path = app.tmp.path().join("mask.db");
+        drop(app.mask_db.take());
+        app.mask_db =
+            Some(crate::mask_db::MaskDb::open_readonly_at(&db_path).expect("read-only で開ける"));
+
+        let mask = vec![true; 4];
+        app.save_mask_with_sidecar(0, &mask, &[], 2, 2);
+
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存できなかったことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        let mirrored = app
+            .sidecars
+            .get(&folder)
+            .is_some_and(|sidecar| sidecar.items().values().any(|entry| entry.mask.is_some()));
+        assert!(
+            !mirrored,
+            "正本が受け取らなかった編集をサイドカーへ写している (次回起動時に古い正本が勝つ)"
+        );
+        // 画面上は残る。利用者はやり直せる。
+        assert!(
+            app.mask_pages.contains(&0),
+            "保存に失敗しただけで、編集が画面から消えている"
+        );
+    }
+
     #[test]
     fn delete_mask_shortcuts_remove_existing_masks_and_clear_caches() {
         let ctx = egui::Context::default();
