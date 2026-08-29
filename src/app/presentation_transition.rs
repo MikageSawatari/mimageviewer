@@ -183,6 +183,20 @@ pub(crate) enum PresentationTransitionEffect {
     SetZOrderRecoveryPermit(bool),
 }
 
+/// terminal 効果の実行が、通常の teardown まで到達したか。
+///
+/// `TerminalSessionClose` の実行は `close_fullscreen` を呼び、遷移が既に `Stable` なので
+/// そのまま `close_fullscreen_now` まで走る。**呼び出し側が「まだ閉じていない」と見なして
+/// 二度目を呼ぶと、初回 close が整えた状態を巻き戻す。**閉じたかどうかを bool ではなく
+/// 名前で返すのは、呼び出し側が「何を確かめて分岐したのか」を読めるようにするため。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentationEffectsOutcome {
+    /// 効果の実行中に `close_fullscreen` まで到達した。呼び出し側は再度閉じない。
+    ClosedFullscreen,
+    /// 到達していない。閉じる責任は呼び出し側にある。
+    DidNotClose,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PresentationTransitionOwner {
     next_request_id: u64,

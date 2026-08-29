@@ -1441,7 +1441,11 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn execute_video_presentation_transition_effects(&mut self, ctx: &egui::Context) {
+    pub(super) fn execute_video_presentation_transition_effects(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> PresentationEffectsOutcome {
+        let mut outcome = PresentationEffectsOutcome::DidNotClose;
         loop {
             let effects = self.video_presentation_transition.take_effects();
             if effects.is_empty() {
@@ -1545,10 +1549,17 @@ impl App {
                                 .dispatch(super::PresentationTransitionEvent::TerminalClose);
                         }
                     }
-                    effect => self.execute_video_presentation_host_effect(ctx, effect),
+                    effect => {
+                        if self.execute_video_presentation_host_effect(ctx, effect)
+                            == PresentationEffectsOutcome::ClosedFullscreen
+                        {
+                            outcome = PresentationEffectsOutcome::ClosedFullscreen;
+                        }
+                    }
                 }
             }
         }
+        outcome
     }
 
     #[cfg(windows)]
@@ -1556,7 +1567,8 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         effect: super::PresentationTransitionEffect,
-    ) {
+    ) -> PresentationEffectsOutcome {
+        let mut outcome = PresentationEffectsOutcome::DidNotClose;
         match effect {
             super::PresentationTransitionEffect::SetHostVisible { request, hwnd } => {
                 Self::log_presentation_transition_effect(
@@ -1646,7 +1658,10 @@ impl App {
                 }
             }
             super::PresentationTransitionEffect::TerminalSessionClose { .. } => {
+                // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と
+                // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
                 self.close_fullscreen();
+                outcome = PresentationEffectsOutcome::ClosedFullscreen;
             }
             super::PresentationTransitionEffect::SetZOrderRecoveryPermit(permitted) => {
                 if let Some(idx) = self.native_video_presentation_switch_source()
@@ -1662,6 +1677,7 @@ impl App {
             | super::PresentationTransitionEffect::AbortNative { .. }
             | super::PresentationTransitionEffect::RetireOutgoing { .. } => unreachable!(),
         }
+        outcome
     }
 
     /// detached 動画再生中に host HWND が変わったとき、presenter child を現 host へ

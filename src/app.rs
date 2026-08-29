@@ -120,8 +120,9 @@ mod presentation_transition;
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
 #[cfg(windows)]
 use presentation_transition::{
-    PreparingProgress, PresentationCandidate, PresentationTransitionEffect,
-    PresentationTransitionEvent, PresentationTransitionOwner, PresentationTransitionState,
+    PreparingProgress, PresentationCandidate, PresentationEffectsOutcome,
+    PresentationTransitionEffect, PresentationTransitionEvent, PresentationTransitionOwner,
+    PresentationTransitionState,
 };
 pub(crate) mod normalize;
 mod prefetch_policy;
@@ -37830,6 +37831,12 @@ impl App {
                     let fs_id = app.fullscreen_viewport_id();
                     ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
                 }
+                // この closure を抜けた直後に context は retire される。遷移中に
+                // `close_fullscreen` を呼ぶと `TerminalClose` を出して戻るだけなので、
+                // ここで完遂させないと teardown へ到達しない (R-24)。
+                #[cfg(windows)]
+                app.close_fullscreen_to_completion(ctx);
+                #[cfg(not(windows))]
                 app.close_fullscreen();
             },
             |context| ClosedBookmarkSummary::read(context.as_ref()),
@@ -51389,6 +51396,35 @@ impl App {
             return;
         }
         self.close_fullscreen_now();
+    }
+
+    /// 「後で」が無い経路から、フルスクリーンを終端まで閉じる。
+    ///
+    /// [`Self::close_fullscreen`] は遷移中なら `TerminalClose` を出して戻り、実際の
+    /// teardown は後で effects を実行する誰かに任せる。通常フレームではそれで足りるが、
+    /// **直後に context を retire する経路にはその「後で」が無い**。effects を実行する
+    /// 前に bundle が捨てられ、動画の再生位置保存・pending の cancel・native の teardown
+    /// へ到達しないまま終わる (2026-08-29 レビュー R-24)。
+    ///
+    /// ここで terminal effects を実行し切ってから通常の teardown へ入る。
+    #[cfg(windows)]
+    pub(crate) fn close_fullscreen_to_completion(&mut self, ctx: &egui::Context) {
+        // 守る不変条件は「この呼び出しを抜けたとき、未実行の effect が残っていない」。
+        // 「遷移中なら」で条件を付けない — `close_fullscreen` が既に `TerminalClose` を
+        // 出していると state は `Stable` なのに effect だけが積まれた状態になり、
+        // 条件付きだとそれを掃き出さずに通り抜ける。
+        if self.video_presentation_transition.is_transitioning() {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalClose);
+        }
+        // `TerminalSessionClose` の実行は、その中で `close_fullscreen` まで走る。
+        // **走ったなら二度目を呼ばない** — 初回 close が整えた状態を巻き戻す
+        // (Codex Q1)。走っていない場合だけ、ここで閉じる。
+        if self.execute_video_presentation_transition_effects(ctx)
+            == PresentationEffectsOutcome::DidNotClose
+        {
+            self.close_fullscreen();
+        }
     }
 
     fn close_fullscreen_now(&mut self) {

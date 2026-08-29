@@ -5347,7 +5347,7 @@ fn run_native_video_output(
                     generation,
                 } => {
                     crate::logger::log(format!(
-                        "[native-video] placement control with no active transition:                          request={request_id} generation={generation}"
+                        "[native-video] placement control with no active transition: request={request_id} generation={generation}"
                     ));
                 }
                 NativeVideoOutputCommand::AbortPlacement { request_id } => {

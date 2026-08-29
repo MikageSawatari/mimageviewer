@@ -63383,6 +63383,182 @@ fn repaint_request_probe() -> (
     (ctx, requests)
 }
 
+/// context を畳む seam は、素の `close_fullscreen` を呼ばない。
+///
+/// 欠陥は seam 側にあり、`close_fullscreen_to_completion` を直接呼ぶテストでは守れない
+/// (seam を戻しても緑のままだった)。retire 後は context ごと消えるので観測点も残らない。
+/// そこで、この 1 つしかない seam の本文を読んで判定する。
+///
+/// `close_and_retire_context` の本番呼び出し元はここだけ。増えたらこの検査も更新し、
+/// 増えた側が terminal effects をどう完遂するかを書くこと。
+#[test]
+#[cfg(windows)]
+fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
+    let src = std::fs::read_to_string("src/app.rs").expect("src/app.rs を読めない");
+
+    // rustfmt 済みなので、メソッドの終わりはインデント 4 の閉じ括弧の行。
+    // 改行コードに依存しないよう行単位で切り出す。
+    const NEWLINE: &str = "
+";
+    let mut body = String::new();
+    let mut inside = false;
+    for line in src.lines() {
+        if line.contains("fn take_and_close_current_active_viewer_context(") {
+            inside = true;
+        }
+        if inside {
+            body.push_str(line);
+            body.push_str(NEWLINE);
+            if line == "    }" {
+                break;
+            }
+        }
+    }
+    assert!(
+        !body.is_empty(),
+        "seam が見つからない (改名したならこの検査も更新する)"
+    );
+    let body = body.as_str();
+
+    assert!(
+        body.contains("close_fullscreen_to_completion"),
+        "遷移中に TerminalClose を出しただけで context を捨てている。 この closure を抜けた直後に bundle は retire されるので、 effects を実行する「後で」が無い"
+    );
+    // 非 Windows には遷移そのものが無いので、そちらの素の呼び出しは正しい。
+    // Windows 側に素の呼び出しが残っていないことだけを見る。
+    let mut previous = "";
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == "app.close_fullscreen();" {
+            assert_eq!(
+                previous, "#[cfg(not(windows))]",
+                "Windows 側に素の close_fullscreen が残っている。遷移中は TerminalClose を 出して戻るだけで、再生位置の保存も pending の cancel も native の teardown も走らない"
+            );
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            previous = trimmed;
+        }
+    }
+
+    // 本番の retire 経路がここだけであることも一緒に見る。
+    let production_seams = src.matches("close_and_retire_context(").count();
+    assert_eq!(
+        production_seams, 1,
+        "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
+    );
+}
+
+/// 遷移中に context を畳む経路でも、通常の teardown まで到達する。
+///
+/// `close_fullscreen` は遷移中なら `TerminalClose` を出して戻り、teardown を「後で
+/// effects を実行する誰か」に任せる。**直後に context を retire する経路にはその
+/// 「後で」が無い**ので、そのまま捨てると再生位置の保存も pending の cancel も
+/// native の teardown も走らないまま終わる (2026-08-29 レビュー R-24)。
+#[test]
+#[cfg(windows)]
+fn closing_a_context_mid_transition_still_reaches_the_normal_teardown() {
+    let mut app = phase_c_support::setup_app();
+    install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:/clips/retire.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    begin_test_video_presentation_transition(&mut app, ViewerPresentation::DetachedWindow, false);
+    let ctx = egui::Context::default();
+    assert!(app.video_presentation_transition.is_transitioning());
+
+    // teardown が触る印。close_fullscreen_now に到達していれば落ちる。
+    app.spread_popup_open = true;
+    app.fit_popup_open = true;
+
+    // 素の close_fullscreen は TerminalClose を出して戻るだけ。
+    app.close_fullscreen();
+    assert!(
+        app.spread_popup_open,
+        "遷移中の close_fullscreen が teardown まで走っている (この前提が変わったなら close_fullscreen_to_completion の存在理由も見直すこと)"
+    );
+
+    app.close_fullscreen_to_completion(&ctx);
+
+    assert!(
+        !app.video_presentation_transition.is_transitioning(),
+        "terminal effects を実行し切っていない: {:?}",
+        app.video_presentation_transition.state()
+    );
+    assert!(
+        !app.spread_popup_open && !app.fit_popup_open,
+        "context を畳む前に teardown へ到達していない"
+    );
+    // `TerminalClose` は host の破棄や session の終了を effect として積む。dispatch した
+    // だけで戻ると state は `Stable` になるので teardown 自体には到達するが、**積んだ
+    // effect は bundle ごと捨てられる**。実行し切ったこと (= 残っていないこと) を見る。
+    assert!(
+        app.video_presentation_transition.take_effects().is_empty(),
+        "terminal effect が未実行のまま残っている。この直後に context は retire されるので、 host の破棄も session の終了も誰も実行しない"
+    );
+}
+
+/// terminal effect の実行は、閉じたかどうかを呼び出し側へ返す。
+///
+/// `TerminalSessionClose` の実行は、その中で `close_fullscreen` を呼ぶ。遷移は既に
+/// `Stable` なのでそのまま teardown まで走る。呼び出し側がこれを知らずにもう一度閉じると、
+/// 初回 close が整えた状態を巻き戻す (Codex Q1)。
+///
+/// 「二度閉じていない」ことを直接観測できる印は teardown 側に無い (二度目も同じ値を
+/// 書くだけ) ので、**報告値そのもの**と、それで分岐する両側を見る。
+#[test]
+#[cfg(windows)]
+fn executing_a_terminal_close_reports_that_it_closed() {
+    let mut app = phase_c_support::setup_app();
+    install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:/clips/outcome.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    begin_test_video_presentation_transition(&mut app, ViewerPresentation::DetachedWindow, false);
+    let ctx = egui::Context::default();
+
+    // 遷移中の close は TerminalClose を積んで戻る。
+    app.close_fullscreen();
+    assert_eq!(
+        app.execute_video_presentation_transition_effects(&ctx),
+        crate::app::PresentationEffectsOutcome::ClosedFullscreen,
+        "TerminalSessionClose を実行したのに「閉じていない」と報告している"
+    );
+
+    // 積む物が無ければ、閉じる責任は呼び出し側に残る。
+    assert_eq!(
+        app.execute_video_presentation_transition_effects(&ctx),
+        crate::app::PresentationEffectsOutcome::DidNotClose,
+        "実行すべき effect が無いのに「閉じた」と報告している"
+    );
+}
+
+/// 遷移が動いていない状態で畳むときも、teardown は走る。
+///
+/// 報告が `DidNotClose` の側。ここを落とすと、遷移が無い通常の retire で
+/// フルスクリーンが閉じないまま context が捨てられる。
+#[test]
+#[cfg(windows)]
+fn closing_a_context_without_a_transition_still_tears_down() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    assert!(!app.video_presentation_transition.is_transitioning());
+    app.spread_popup_open = true;
+    app.fit_popup_open = true;
+
+    app.close_fullscreen_to_completion(&ctx);
+
+    assert!(
+        !app.spread_popup_open && !app.fit_popup_open,
+        "遷移が無いときに teardown へ到達していない"
+    );
+}
+
 #[test]
 #[cfg(windows)]
 fn presentation_transition_poll_drives_prepare_without_a_forced_deadline() {

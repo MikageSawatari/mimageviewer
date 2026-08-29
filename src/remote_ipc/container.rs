@@ -2051,7 +2051,7 @@ fn collect_zip_entry_dims(
     }
     if unresolved > 0 || undecodable > 0 {
         crate::logger::log(format!(
-            "remote_ipc: zip entry dims incomplete path={} attempted={attempted}              unresolved={unresolved} undecodable={undecodable}",
+            "remote_ipc: zip entry dims incomplete path={} attempted={attempted} unresolved={unresolved} undecodable={undecodable}",
             container_path.display()
         ));
     }
@@ -5195,7 +5195,7 @@ impl ContainerEngine {
         // 件数を残す。全ページ不明ならカタログもヘッダ読みも当たっていない。
         if unknown > 0 {
             crate::logger::log(format!(
-                "remote_ipc: page dims unknown pages={unknown}/{pages} path={}                  (landscape detection is off for those pages)",
+                "remote_ipc: page dims unknown pages={unknown}/{pages} path={} (landscape detection is off for those pages)",
                 container_path.display()
             ));
         }
