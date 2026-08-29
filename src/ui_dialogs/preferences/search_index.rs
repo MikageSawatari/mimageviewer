@@ -108,6 +108,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "external-tools/list",
+        ExternalTools,
+        "登録した外部ツール",
+        [
+            "外部ツール",
+            "アプリケーションで開く",
+            "open with",
+            "関連付け",
+            "実行ファイル",
+            "引数"
+        ]
+    ),
+    entry!(
         "startup/specific-folder",
         Startup,
         "指定フォルダ:",

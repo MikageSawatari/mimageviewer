@@ -11492,6 +11492,14 @@ pub struct App {
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
     pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
+    /// 外部ツールの process spawn を UI スレッド外で待つ短命 worker。
+    /// 実行中の外部ツール起動。**Vec で持つ**: 単一 slot にすると 2 つ続けて起動した
+    /// ときに先の結果 (失敗 toast を含む) が捨てられる。UNC 上の EXE では spawn 自体が
+    /// 秒単位で待たされ得るので、この窓は実際に踏める。
+    pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
+    /// ネットワークパス上の登録 EXE を起動する前の確認要求。
+    pub(crate) external_tool_launch_confirmation:
+        Option<crate::external_tool::ExternalLaunchRequest>,
 
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
@@ -14049,6 +14057,8 @@ impl App {
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
             cached_handlers: None,
+            external_tool_launch_pending: Vec::new(),
+            external_tool_launch_confirmation: None,
             cached_nav_indices: None,
             cached_fs_seek_info: None,
 
@@ -15683,6 +15693,7 @@ impl App {
             self.book_reorder.is_some() => "book_reorder",
             self.show_preferences => "preferences",
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
+            self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
             self.show_settings_restore => "settings_restore",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
@@ -66584,6 +66595,7 @@ impl eframe::App for App {
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_file_drop_pending();
+        self.poll_external_tool_launch(ctx);
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_rename_migration_pending(ctx);
@@ -67242,6 +67254,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_external_tool_launch_confirmation(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。

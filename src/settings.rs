@@ -7998,7 +7998,7 @@ impl Settings {
         // ── 「アプリケーションで開く」履歴 ──
         self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
         self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);
-        self.external_tools = std::mem::take(&mut src.external_tools);
+        // `external_tools` は環境設定ページが正本なので、編集中の値を維持する。
         // ── AI アップスケール runtime 選択 ──
         self.ai_upscale_enabled = src.ai_upscale_enabled;
         self.ai_upscale_model_override = src.ai_upscale_model_override.take();
@@ -10476,12 +10476,17 @@ mod tests {
     }
 
     #[test]
-    fn preferences_ok_keeps_live_external_tools_before_their_ui_exists() {
+    fn preferences_ok_keeps_edited_external_tools() {
         let mut edited = Settings::default();
+        edited.external_tools = vec![crate::external_tool::ExternalTool {
+            id: crate::external_tool::ExternalToolId(23),
+            name: "Edited Tool".to_string(),
+            ..crate::external_tool::ExternalTool::defaults_for_viewing()
+        }];
         let mut live = Settings::default();
         live.external_tools = vec![crate::external_tool::ExternalTool {
             id: crate::external_tool::ExternalToolId(17),
-            name: "Editor".to_string(),
+            name: "Live Tool".to_string(),
             ..crate::external_tool::ExternalTool::defaults_for_editing()
         }];
 
@@ -10490,9 +10495,9 @@ mod tests {
         assert_eq!(edited.external_tools.len(), 1);
         assert_eq!(
             edited.external_tools[0].id,
-            crate::external_tool::ExternalToolId(17)
+            crate::external_tool::ExternalToolId(23)
         );
-        assert_eq!(edited.external_tools[0].name, "Editor");
+        assert_eq!(edited.external_tools[0].name, "Edited Tool");
     }
 
     #[test]

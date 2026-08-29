@@ -138,19 +138,17 @@ pub fn pick_exe_dialog() -> Option<AppHandler> {
     None
 }
 
-/// 指定したアプリケーションでファイルを開く。
-pub fn launch_with_app(exe_path: &str, file_path: &std::path::Path) {
-    let mut cmd = std::process::Command::new(exe_path);
-    #[cfg(windows)]
-    let file_arg = file_path.to_string_lossy().replace('/', "\\");
-    #[cfg(windows)]
-    cmd.arg(&file_arg);
-    #[cfg(not(windows))]
-    cmd.arg(file_path.as_os_str());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    let _ = cmd.spawn();
+/// 旧「アプリケーションで開く」からの起動要求を worker へ渡す。
+///
+/// ファイルパスは `OsStr` のまま引数へ入れ、process spawn の成否は receiver で UI 側へ返す。
+pub(crate) fn launch_with_app(
+    display_name: String,
+    exe_path: &std::ffi::OsStr,
+    file_path: &std::path::Path,
+) -> Result<crate::external_tool::ExternalLaunchPending, String> {
+    crate::external_tool::start_launch_worker(crate::external_tool::build_legacy_launch_request(
+        display_name,
+        std::path::PathBuf::from(exe_path),
+        file_path.to_path_buf(),
+    ))
 }

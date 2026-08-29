@@ -202,12 +202,13 @@ Codex Sol による read-only 調査。file:line は調査時点の master (6464
 外部 SNS で「外部ツール設定が無い」と言われた背景はこれで説明が付く。
 **差し込み口そのものは既にあるので、そこへ外部ツールを載せればよい** (§4.9)。
 
-**現行実装の既知の弱点** ([open_with.rs:141](../src/open_with.rs:141)):
+**P1 着手前に確認した既知の弱点** ([open_with.rs](../src/open_with.rs)):
 
-- Windows でもパスを `to_string_lossy()` で `String` 化している (非 Unicode パスが壊れる)
-- `spawn()` の `Result` を捨てており、**起動失敗が利用者に何も伝わらない**
+- Windows でもパスを `to_string_lossy()` で `String` 化していた (P1 で `OsStr` のまま渡すよう修正済み)
+- `spawn()` の `Result` を捨てていた (P1 で worker の結果を toast 通知するよう修正済み)
 - 関連付けアプリの列挙 (`SHAssocEnumHandlers`) をメニュー描画の UI 経路から同期実行している
-  ([context_menu.rs:2087](../src/ui_dialogs/context_menu.rs:2087))
+  ([context_menu.rs:2087](../src/ui_dialogs/context_menu.rs:2087))。P1 の環境設定ページは worker 化済みで、
+  旧コンテキストメニュー側の載せ替えは P1b で行う
 
 ### 3.2 一時実体化に使える既存部品
 
@@ -620,7 +621,7 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 | Phase | 内容 | 規模 |
 | --- | --- | --- |
 | **P0 (実装済み 2026-08-29)** | `ExternalTool` 型 + 設定 DB (complex field) + 既存 `custom_open_with_apps` からの移行 + 移行テスト | S |
-| **P1** | 環境設定「外部ツール」ページ、引数テンプレート、作業フォルダー、起動失敗通知、`OsStr` 化 | M |
+| **P1 (実装済み 2026-08-30)** | 環境設定「外部ツール」ページ、引数テンプレート、作業フォルダー、起動失敗通知、`OsStr` 化 | M |
 | **P2** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、メニュー / ツールバー / キースロット | M |
 | **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
 | **P4** | `VideoPolicy::CurrentFrame`、`SpreadPolicy::Merged` の合成、`{container}`/`{entry}`/`{page}`/`{time}` | M |

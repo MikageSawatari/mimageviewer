@@ -2055,7 +2055,11 @@ impl crate::app::App {
         for recent in self.settings.recent_open_with_apps.clone() {
             let label = format!("{}で開く", recent.display_name);
             if ui.button(&label).clicked() {
-                crate::open_with::launch_with_app(&recent.exe_path, &file_path_owned);
+                self.start_legacy_open_with(
+                    recent.display_name.clone(),
+                    std::path::PathBuf::from(&recent.exe_path),
+                    file_path_owned.clone(),
+                );
                 self.settings
                     .record_recent_open_with(recent.display_name, recent.exe_path);
                 self.settings.save();
@@ -2071,7 +2075,11 @@ impl crate::app::App {
             if !custom_apps.is_empty() {
                 for app in &custom_apps {
                     if ui.button(&app.display_name).clicked() {
-                        crate::open_with::launch_with_app(&app.exe_path, &file_path_owned);
+                        self.start_legacy_open_with(
+                            app.display_name.clone(),
+                            std::path::PathBuf::from(&app.exe_path),
+                            file_path_owned.clone(),
+                        );
                         self.settings.record_recent_open_with(
                             app.display_name.clone(),
                             app.exe_path.clone(),
@@ -2095,7 +2103,11 @@ impl crate::app::App {
             };
             for handler in &handlers {
                 if ui.button(&handler.display_name).clicked() {
-                    crate::open_with::launch_with_app(&handler.exe_path, &file_path_owned);
+                    self.start_legacy_open_with(
+                        handler.display_name.clone(),
+                        std::path::PathBuf::from(&handler.exe_path),
+                        file_path_owned.clone(),
+                    );
                     self.settings.record_recent_open_with(
                         handler.display_name.clone(),
                         handler.exe_path.clone(),
