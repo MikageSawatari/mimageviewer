@@ -9575,7 +9575,10 @@ impl App {
             .get(&fs_idx)
             .cloned()
             .unwrap_or_default();
-        let before_layers = layers.clone();
+        // Undo 用の複製は保存する回だけ作る。ドラッグ中は毎フレームここを通り、
+        // レイヤー文書には**画像原寸**のラスターマスク (`Vec<f32>`) が入っているので、
+        // 使わない複製が 1 枚 24MP で 27.7ms / 96 MB になる (2026-08-29 実測)。
+        let before_layers = persist.then(|| layers.clone());
         let Some(layer) = layers.get_mut(layer_idx) else {
             return false;
         };
@@ -9583,7 +9586,7 @@ impl App {
             return false;
         }
         self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
-        if persist {
+        if let Some(before_layers) = before_layers {
             self.set_local_adjust_layers_for_idx_with_undo(
                 fs_idx,
                 before_layers,
