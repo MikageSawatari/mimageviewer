@@ -7457,6 +7457,26 @@ pub(crate) struct FavoriteDefaultClearConfirm {
     pub favorite_name: String,
 }
 
+/// 編集内容を正本 (中央 DB) へ書いた結果。
+///
+/// **`Unavailable` を `Committed` と同じに扱わないこと。** 起動時に DB を開けなかった
+/// 状態を `Ok(())` へ潰すと、`edit_store_write_succeeded` が真を返し、正本が受理して
+/// いない編集の sidecar ミラーが書かれる。次回起動の `sidecar::import_to_dbs` は
+/// 「中央が authoritative」なので、中央に古い行があるとその sidecar を捨てる。
+/// 利用者にはエラーもトーストも出ないまま編集が消える (2026-08-29 レビュー R-26)。
+///
+/// 3 値にしているのは、`Result` では「開けていない」と「書けた」が同じ値になり、
+/// 呼び出し側がどちらか区別できないため。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EditStoreOutcome {
+    /// 正本が受理した。sidecar ミラーを書いてよい。
+    Committed,
+    /// 起動時に DB を開けていないので、書き込みを試してすらいない。
+    Unavailable,
+    /// 正本が拒否した。
+    Failed(String),
+}
+
 /// メタ操作 (タグ付与など) を発火させた UI 面。
 ///
 /// detached viewer 時代はメイングリッドとビューア窓が同時に見える + 同時に操作できる
@@ -47716,19 +47736,32 @@ impl App {
     /// レーティング DB は既にこの形 ([`Self::report_rating_write_error`])。編集ストアだけが
     /// 結果を捨てていた。
     #[must_use]
-    fn edit_store_write_succeeded<E: std::fmt::Display>(
+    /// `Option<Result<..>>` を [`EditStoreOutcome`] に畳む。
+    ///
+    /// 呼び出し側は `self.<db>.as_ref().map(|db| db.op(..))` の形で渡す。`None` が
+    /// 「DB を開けていない」、`Some(Err)` が「拒否された」に対応する。
+    fn edit_store_write<E: std::fmt::Display>(attempt: Option<Result<(), E>>) -> EditStoreOutcome {
+        match attempt {
+            None => EditStoreOutcome::Unavailable,
+            Some(Ok(())) => EditStoreOutcome::Committed,
+            Some(Err(error)) => EditStoreOutcome::Failed(error.to_string()),
+        }
+    }
+
+    /// 正本が受理したときだけ真。偽なら sidecar ミラーを書かずに戻ること。
+    fn edit_store_write_succeeded(
         &mut self,
         what: &'static str,
-        result: Result<(), E>,
+        outcome: EditStoreOutcome,
     ) -> bool {
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                crate::logger::log(format!("[edit-store] {what}: write failed: {error}"));
-                self.show_feedback_toast(format!("{what}を保存できませんでした: {error}"));
-                false
-            }
-        }
+        let reason = match outcome {
+            EditStoreOutcome::Committed => return true,
+            EditStoreOutcome::Unavailable => "保存先を開けませんでした".to_string(),
+            EditStoreOutcome::Failed(error) => error,
+        };
+        crate::logger::log(format!("[edit-store] {what}: write failed: {reason}"));
+        self.show_feedback_toast(format!("{what}を保存できませんでした: {reason}"));
+        false
     }
 
     pub(crate) fn report_rating_write_error(&mut self, error: &str) {
@@ -53982,10 +54015,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.mask_db {
-            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.mask_db
+                .as_ref()
+                .map(|db| db.set_raw(&key, compressed, shapes_json, w, h)),
+        );
         // 画面上の編集は残す。durable な mirror だけ、正本が受け取れたときに書く。
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, true);
         self.mask_pages.insert(idx);
@@ -54012,10 +54046,7 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.mask_db {
-            Some(db) => db.delete(&key),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.mask_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
         self.mask_pages.remove(&idx);
         self.bump_erase_mask_generation(idx);
@@ -54080,10 +54111,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.conceal_db {
-            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.conceal_db
+                .as_ref()
+                .map(|db| db.set_raw(&key, compressed, shapes_json, w, h)),
+        );
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, true);
         self.conceal_pages.insert(idx);
         self.bump_conceal_mask_generation(idx);
@@ -54110,10 +54142,7 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.conceal_db {
-            Some(db) => db.delete(&key),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.conceal_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
         self.conceal_pages.remove(&idx);
         self.bump_conceal_mask_generation(idx);
@@ -54144,10 +54173,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.local_adjust_db {
-            Some(db) => db.set_layers(&key, &layers),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.local_adjust_db
+                .as_ref()
+                .map(|db| db.set_layers(&key, &layers)),
+        );
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
         if !self.edit_store_write_succeeded("補正レイヤー", written) {
             // 画面には残す。durable な mirror だけ書かない。
@@ -54260,10 +54290,11 @@ impl App {
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
         if let Some(settings) = normalized {
-            let written = match &self.export_crop_db {
-                Some(db) => db.set(&key, settings),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.export_crop_db
+                    .as_ref()
+                    .map(|db| db.set(&key, settings)),
+            );
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
             if !self.edit_store_write_succeeded("切り出し範囲", written) {
@@ -54271,10 +54302,8 @@ impl App {
             }
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, settings));
         } else {
-            let written = match &self.export_crop_db {
-                Some(db) => db.remove(&key),
-                None => Ok(()),
-            };
+            let written =
+                Self::edit_store_write(self.export_crop_db.as_ref().map(|db| db.remove(&key)));
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
             if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
@@ -58652,10 +58681,7 @@ impl App {
         // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
         // 非現在ページ保存もカバー)。
         self.invalidate_compare_prepared_for_idx(idx);
-        let written = match &self.comic_db {
-            Some(db) => db.set(key, objects),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.comic_db.as_ref().map(|db| db.set(key, objects)));
         if !self.edit_store_write_succeeded("テキスト注釈", written) {
             return;
         }
@@ -60655,7 +60681,7 @@ impl App {
         &mut self,
         target: &PageAdjustmentTarget,
         params: crate::adjustment::AdjustParams,
-    ) -> Result<(), String> {
+    ) -> EditStoreOutcome {
         // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
@@ -60665,12 +60691,13 @@ impl App {
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
             .collect::<Vec<_>>();
         let matches_default = params == self.adjustment_standard_params_for_target(target);
-        let db_result = match &self.adjustment_db {
-            Some(db) if matches_default => db.remove_page_params(&target.page_key),
-            Some(db) => db.set_page_params(&target.page_key, &params),
-            None => Ok(()),
-        }
-        .map_err(|error| error.to_string());
+        let db_result = Self::edit_store_write(self.adjustment_db.as_ref().map(|db| {
+            if matches_default {
+                db.remove_page_params(&target.page_key)
+            } else {
+                db.set_page_params(&target.page_key, &params)
+            }
+        }));
 
         for idx in &indices {
             if matches_default {
@@ -60686,7 +60713,8 @@ impl App {
         );
         // 正本が受け取れなかった書き込みを sidecar へ写さない。写すと次回起動時に
         // 古い正本の行が勝ち、利用者からは補正が消えたように見える (R-26)。
-        if db_result.is_ok() {
+        // DB を開けていない場合も「受け取れなかった」に含める。
+        if db_result == EditStoreOutcome::Committed {
             if matches_default {
                 self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
                     sidecar.remove_adjust(rel)
@@ -60746,7 +60774,7 @@ impl App {
     pub(crate) fn clear_page_params_for_target(
         &mut self,
         target: &PageAdjustmentTarget,
-    ) -> Result<(), String> {
+    ) -> EditStoreOutcome {
         // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
         let old_effective_for_key = self.effective_params_for_target(target);
         let fallback = self.adjustment_standard_params_for_target(target);
@@ -60756,19 +60784,18 @@ impl App {
             .iter()
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
             .collect::<Vec<_>>();
-        let db_result = self
-            .adjustment_db
-            .as_ref()
-            .map(|db| db.remove_page_params(&target.page_key))
-            .unwrap_or(Ok(()))
-            .map_err(|error| error.to_string());
+        let db_result = Self::edit_store_write(
+            self.adjustment_db
+                .as_ref()
+                .map(|db| db.remove_page_params(&target.page_key)),
+        );
 
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
         Self::set_page_key_presence(&mut self.adjusted_page_keys, &target.page_key, false);
         // set 側と同じ理由で、正本が受け取れたときだけ sidecar を写す (R-26)。
-        if db_result.is_ok() {
+        if db_result == EditStoreOutcome::Committed {
             self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
                 sidecar.remove_adjust(rel)
             });
@@ -60914,10 +60941,11 @@ impl App {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
             }
-            let written = match self.adjustment_db.as_mut() {
-                Some(db) => db.remove_page_params_bulk(&keys),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.adjustment_db
+                    .as_mut()
+                    .map(|db| db.remove_page_params_bulk(&keys)),
+            );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
             if self.edit_store_write_succeeded("補正の一括解除", written) {
                 for (folder, rels) in sidecar_coords {
@@ -60930,10 +60958,11 @@ impl App {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
-            let written = match self.adjustment_db.as_mut() {
-                Some(db) => db.set_page_params_bulk(&keys, &params),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.adjustment_db
+                    .as_mut()
+                    .map(|db| db.set_page_params_bulk(&keys, &params)),
+            );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
             if self.edit_store_write_succeeded("補正の一括適用", written) {
                 for (folder, rels) in sidecar_coords {
@@ -60969,11 +60998,11 @@ impl App {
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
-        let written = if let Some(db) = self.adjustment_db.as_mut() {
-            db.remove_page_params_bulk(&keys)
-        } else {
-            Ok(())
-        };
+        let written = Self::edit_store_write(
+            self.adjustment_db
+                .as_mut()
+                .map(|db| db.remove_page_params_bulk(&keys)),
+        );
         Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
         if self.edit_store_write_succeeded("補正の全解除", written) {
             for (folder, rels) in sidecar_coords {
@@ -61114,18 +61143,20 @@ impl App {
                     .insert(favorite_id, p.clone());
                 // ここには sidecar mirror が無いので発散はしないが、失敗を黙って
                 // 飲むと「この標準にする」が無言で効かない。
-                let written = match &self.adjustment_db {
-                    Some(db) => db.set_favorite_params(favorite_id, p),
-                    None => Ok(()),
-                };
+                let written = Self::edit_store_write(
+                    self.adjustment_db
+                        .as_ref()
+                        .map(|db| db.set_favorite_params(favorite_id, p)),
+                );
                 let _ = self.edit_store_write_succeeded("お気に入りの標準", written);
             }
             None => {
                 self.adjustment_favorite_params.remove(&favorite_id);
-                let written = match &self.adjustment_db {
-                    Some(db) => db.remove_favorite_params(favorite_id),
-                    None => Ok(()),
-                };
+                let written = Self::edit_store_write(
+                    self.adjustment_db
+                        .as_ref()
+                        .map(|db| db.remove_favorite_params(favorite_id)),
+                );
                 let _ = self.edit_store_write_succeeded("お気に入りの標準の解除", written);
             }
         }

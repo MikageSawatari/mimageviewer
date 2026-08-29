@@ -14901,7 +14901,7 @@ mod favorite_adjustment_defaults_tests {
         let mut params = AdjustParams::default();
         params.brightness = 27.0;
 
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
 
         assert!(
             app.pinned_adjustment_refresh_keys
@@ -14923,14 +14923,14 @@ mod favorite_adjustment_defaults_tests {
         let mut params = AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
 
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
         assert!(
             !app.pinned_adjustment_refresh_keys
                 .contains(&target.page_key),
             "colorize is intentionally absent from thumbnail rendering"
         );
 
-        app.clear_page_params_for_target(&target).unwrap();
+        let _ = app.clear_page_params_for_target(&target);
         assert!(
             !app.pinned_adjustment_refresh_keys
                 .contains(&target.page_key),
@@ -14952,10 +14952,10 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.page_adjustment_indices(&target).is_empty());
         let mut params = AdjustParams::default();
         params.contrast = 19.0;
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
         app.pinned_adjustment_refresh_keys.clear();
 
-        app.clear_page_params_for_target(&target).unwrap();
+        let _ = app.clear_page_params_for_target(&target);
 
         assert!(
             app.pinned_adjustment_refresh_keys
@@ -15092,6 +15092,82 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.mask_pages.contains(&0),
             "保存に失敗しただけで、編集が画面から消えている"
+        );
+    }
+
+    /// **正本をそもそも開けていない**ときも、拒否されたときと同じ扱いにする。
+    ///
+    /// 起動時の `open().ok()` が `None` を返した状態を「書けた」と同じに畳むと、
+    /// `edit_store_write_succeeded` が真を返してサイドカーが書かれる。中央に古い行が
+    /// あると次回起動の import がそれを捨てるので、**利用者には何も表示されないまま
+    /// 編集が消える**。上のテストが `Some(読み取り専用 DB)` 経路、これが `None` 経路
+    /// (2026-08-29 レビュー R-26)。
+    #[test]
+    fn an_edit_with_no_store_open_is_not_mirrored_into_the_sidecar() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("pics");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image = folder.join("page.png");
+        std::fs::write(&image, b"x").unwrap();
+        app.settings.sidecar_backup_enabled = true;
+        app.items = vec![GridItem::Image(image.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        // 起動時に開けなかった状態。書き込みを試してすらいない。
+        drop(app.mask_db.take());
+        assert!(app.mask_db.is_none());
+
+        let mask = vec![true; 4];
+        app.save_mask_with_sidecar(0, &mask, &[], 2, 2);
+
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存先が無いことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        let mirrored = app
+            .sidecars
+            .get(&folder)
+            .is_some_and(|sidecar| sidecar.items().values().any(|entry| entry.mask.is_some()));
+        assert!(
+            !mirrored,
+            "正本を開けていないのにサイドカーへ写している (次回起動時に古い正本が勝つ)"
+        );
+        assert!(
+            app.mask_pages.contains(&0),
+            "保存できなかっただけで、編集が画面から消えている"
+        );
+    }
+
+    /// 3 値のどれがサイドカーを書いてよいかを 1 か所で固定する。
+    ///
+    /// 14 か所の保存経路はすべて `edit_store_write` を通るので、ここが崩れると
+    /// 全経路が同時に崩れる。
+    #[test]
+    fn only_a_committed_write_lets_the_sidecar_mirror_be_written() {
+        use crate::app::EditStoreOutcome;
+        let ok: Option<Result<(), String>> = Some(Ok(()));
+        let refused: Option<Result<(), String>> = Some(Err("disk full".to_string()));
+        let never_opened: Option<Result<(), String>> = None;
+        assert_eq!(App::edit_store_write(ok), EditStoreOutcome::Committed);
+        assert_eq!(
+            App::edit_store_write(refused),
+            EditStoreOutcome::Failed("disk full".to_string())
+        );
+        assert_eq!(
+            App::edit_store_write(never_opened),
+            EditStoreOutcome::Unavailable
+        );
+
+        let mut app = setup_app();
+        assert!(app.edit_store_write_succeeded("補正", EditStoreOutcome::Committed));
+        assert!(!app.edit_store_write_succeeded("補正", EditStoreOutcome::Unavailable));
+        assert!(
+            !app.edit_store_write_succeeded(
+                "補正",
+                EditStoreOutcome::Failed("disk full".to_string())
+            )
         );
     }
 
