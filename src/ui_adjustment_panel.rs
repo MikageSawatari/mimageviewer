@@ -13318,11 +13318,48 @@ impl App {
         );
         // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
         // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
-        if let Some(new_idx) = switch_target_to
-            && self.fullscreen_idx != Some(new_idx)
-        {
-            self.enter_page_edit_single_view(new_idx);
+        if let Some(new_idx) = switch_target_to {
+            self.switch_local_adjust_target_in_spread(new_idx);
         }
+    }
+
+    /// 見開きの左右で、補正レイヤーの編集対象ページを切り替える。
+    ///
+    /// **旧ページの未確定操作を新ページへ持ち越さない。**`enter_page_edit_single_view` は
+    /// `spread_mode` / `fullscreen_idx` / ズーム / パンだけを動かすので、進行中の投げ縄、
+    /// 選択中の図形、ドラッグ単位 Undo の退避、画像上で拾う操作はそのまま残る。残ると
+    /// **同じ数値 index を持つ別ページの図形やマスク**を編集できてしまう。
+    ///
+    /// 消しゴムの [`Self::switch_erase_target_in_spread`] は旧ページを確定してから入り直す
+    /// ので同じ問題を持たない。こちらは「退避 (`local_adjust_spread_ctx`) を触らない」と
+    /// いう片側だけを真似ていた (2026-08-29 レビュー R-03)。
+    ///
+    /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
+    /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
+    pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+        if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        // 保留中のブラシ再計算は捨てずに確定させる。捨てると旧ページの cache が
+        // 古い描画のまま残る (flush は保留が指す idx の generation を上げる)。
+        self.flush_deferred_local_adjust_brush_render();
+        // 進行中のジェスチャと、ドラッグ / ストローク単位 Undo の退避。
+        self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
+        self.local_adjust_selected_shape = None;
+        self.local_adjust_shape_drag = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_shape_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
+        // 画像上で 1 点を拾う操作も、旧ページの画素を指している。
+        self.local_adjust_rgb_pick_active = None;
+        self.local_adjust_repair_point_pick_active = None;
+        self.local_adjust_selective_color_pick_active = false;
+
+        self.enter_page_edit_single_view(new_idx);
     }
 
     fn draw_bookmark_panel_body(
@@ -14806,5 +14843,63 @@ impl App {
 
         // まだ開いている → state を書き戻す
         self.slot_save_dialog = Some((slot_idx, name_input, params));
+    }
+}
+
+#[cfg(test)]
+mod page_edit_switch_audit {
+    /// 補正レイヤーで表示ページを動かすのは、モード開始と typed な左右切替だけ。
+    ///
+    /// 欠陥は「切替の呼び出し側が `enter_page_edit_single_view` を直に呼んでいた」ことで、
+    /// メソッド本体のテストでは守れない (本体を直接呼ぶので、呼び出し側を戻しても緑のまま
+    /// だった)。**どの関数の中から呼んでいるか**を見ることで、3 つ目の生の呼び出しが
+    /// 増えた時点で落ちる (2026-08-29 レビュー R-03)。
+    ///
+    /// 件数ではなく所属関数で判定する。関数が増減しても、正しい関数の中にあれば通る。
+    #[test]
+    fn only_mode_entry_and_the_typed_switch_move_the_edited_page() {
+        /// 表示ページを動かしてよい関数。
+        const ALLOWED_CALLERS: &[&str] = &[
+            // モード開始: 見開きから入るとき、編集する 1 ページを単独表示にする。
+            "enter_local_adjust_mode",
+            // 左右切替: 旧ページの未確定操作を終わらせてから移る唯一の経路。
+            "switch_local_adjust_target_in_spread",
+        ];
+
+        let src = std::fs::read_to_string("src/ui_adjustment_panel.rs")
+            .expect("src/ui_adjustment_panel.rs を読めない (cwd はクレート root のはず)");
+
+        let mut current_fn = "<ファイル先頭>";
+        let mut offenders = Vec::new();
+        for (lineno, line) in src.lines().enumerate() {
+            // rustfmt 済みなので、メソッドの `fn` は必ずインデント 4。
+            if let Some(rest) = line.strip_prefix("    ")
+                && !rest.starts_with(' ')
+                && let Some(after_fn) = rest
+                    .strip_prefix("fn ")
+                    .or_else(|| rest.strip_prefix("pub(crate) fn "))
+                    .or_else(|| rest.strip_prefix("pub(super) fn "))
+                    .or_else(|| rest.strip_prefix("pub fn "))
+            {
+                current_fn = after_fn.split(['(', '<']).next().unwrap_or(after_fn);
+            }
+            // doc コメントの中の言及は呼び出しではない。
+            if line.trim_start().starts_with("///") {
+                continue;
+            }
+            // 綴りを分けて持つ。1 つの文字列にすると、この検査自身の行が引っかかる。
+            let needle = concat!("enter_page_edit", "_single_view(");
+            if line.contains(needle) && !ALLOWED_CALLERS.contains(&current_fn) {
+                offenders.push(format!("{}行目 (fn {current_fn})", lineno + 1));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "表示ページを直接動かしている: {}. 左右切替なら \r
+             `switch_local_adjust_target_in_spread` を通すこと。通さないと旧ページの \r
+             投げ縄・選択・ドラッグ退避が新ページへ持ち越される。",
+            offenders.join(", ")
+        );
     }
 }

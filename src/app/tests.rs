@@ -26809,6 +26809,88 @@ mod favorite_adjustment_defaults_tests {
     /// もう一方に切り替わり、`erase_spread_ctx` は維持されること (= パネルボタンが
     /// 引き続きトグルとして使える)。マスクが空の状態で呼んでも安全 (空 inpaint は
     /// 早期 return、reset 経由で spread_ctx が消えても再保存される)。
+    /// 補正レイヤーで左右ページを切り替えたら、旧ページの未確定操作は持ち越さない。
+    ///
+    /// 持ち越すと、投げ縄の途中や選択中の図形がそのまま生きたまま別ページに入り、
+    /// **同じ数値 index を指す別ページの図形やマスク**を編集できてしまう
+    /// (2026-08-29 レビュー R-03)。表示だけを動かす `enter_page_edit_single_view` を
+    /// 直に呼んでいたのが原因なので、経路が typed な切替へ通っていることを見る。
+    #[test]
+    fn switching_the_edited_page_does_not_carry_the_old_pages_unfinished_gesture() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single;
+        app.local_adjust_mode = true;
+        app.local_adjust_spread_ctx = Some(crate::app::PageEditSpreadPivot {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+
+        // 左ページで「投げ縄を描きかけ、図形を 1 つ選び、ドラッグ単位 Undo の退避も
+        // 持っている」状態を作る。
+        app.local_adjust_mask_lasso_points = vec![[0.1, 0.1], [0.2, 0.2]];
+        app.local_adjust_selected_shape = Some(0);
+        app.local_adjust_mask_shape_drag_start = Some([0.1, 0.1]);
+        app.local_adjust_mask_shape_drag_end = Some([0.3, 0.3]);
+        app.local_adjust_shape_drag_before_layers = Some(Vec::new());
+        app.local_adjust_canvas_drag_before_layers = Some(Vec::new());
+        app.local_adjust_mask_brush_before_layers = Some(Vec::new());
+        app.local_adjust_selective_color_pick_active = true;
+
+        app.switch_local_adjust_target_in_spread(1);
+
+        assert_eq!(app.fullscreen_idx, Some(1), "右ページへ切り替わる");
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "見開き表示には戻らない"
+        );
+        assert!(
+            app.local_adjust_spread_ctx.is_some(),
+            "退避は消さない (ボタンは左右トグルとして使い続けられる)"
+        );
+
+        assert!(
+            app.local_adjust_mask_lasso_points.is_empty(),
+            "描きかけの投げ縄が右ページへ残っている"
+        );
+        assert_eq!(
+            app.local_adjust_selected_shape, None,
+            "左ページで選んだ図形の index が右ページで生きている"
+        );
+        assert_eq!(app.local_adjust_mask_shape_drag_start, None);
+        assert_eq!(app.local_adjust_mask_shape_drag_end, None);
+        assert!(app.local_adjust_canvas_drag.is_none());
+        assert!(app.local_adjust_mask_brush_stroke.is_none());
+        assert!(
+            app.local_adjust_shape_drag_before_layers.is_none()
+                && app.local_adjust_canvas_drag_before_layers.is_none()
+                && app.local_adjust_mask_brush_before_layers.is_none(),
+            "ドラッグ単位 Undo の退避が旧ページのレイヤー配列を指したまま残っている"
+        );
+        assert!(
+            !app.local_adjust_selective_color_pick_active,
+            "旧ページの画素を拾うスポイトが有効なまま残っている"
+        );
+
+        // 同じページへの切替は何もしない。
+        app.local_adjust_selected_shape = Some(2);
+        app.switch_local_adjust_target_in_spread(1);
+        assert_eq!(
+            app.local_adjust_selected_shape,
+            Some(2),
+            "同じページへの切替で選択が落ちている"
+        );
+    }
+
     #[test]
     fn switch_erase_target_in_spread_moves_to_other_page_keeping_ctx() {
         use crate::grid_item::GridItem;
