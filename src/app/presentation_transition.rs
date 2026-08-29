@@ -939,6 +939,41 @@ fn terminal_close(
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
+    // commit 済みで retire を待っている間に閉じた場合。retire は既に走っているので
+    // abort は出さない — 出すと同じ request へ `[Retire, Abort]` を作る。画面は publish
+    // 済みの target へ移っているので、退場側ではなくそこで安定させる。退場側の session と
+    // host は `NativeRetired` の受理で畳むはずだったが、terminal close はそこへ到達しない。
+    //
+    // 置換を挟んだ場合は `RetiringCommitted` が同じことをする。**直接ここへ来る経路が
+    // 抜けていた** (2026-08-29 レビュー、Codex Q5)。
+    if let PresentationTransitionState::Committing {
+        request,
+        progress: CommittingProgress::AwaitingRetire,
+        ..
+    } = state
+    {
+        if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
+            effects.push(PresentationTransitionEffect::CloseDetachedSession {
+                request_id: request.id,
+            });
+            effects.push(PresentationTransitionEffect::DestroyHost {
+                request_id: request.id,
+                target: request.target,
+                hwnd,
+            });
+        }
+        effects.push(PresentationTransitionEffect::TerminalSessionClose {
+            request_id: request.id,
+            target: request.target,
+        });
+        effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
+        return (
+            PresentationTransitionState::Stable {
+                current: request.target,
+            },
+            effects,
+        );
+    }
     let request = request_from_state(state);
     let request_id = request.map_or(0, |request| request.id);
     if native_prepare_was_issued(state) {
@@ -1417,6 +1452,66 @@ mod tests {
             }
         )));
         // Killing mutation: invert native_prepare_was_issued in terminal_close.
+    }
+
+    /// commit 済みで retire を待っている間に閉じても、巻き戻さず publish 済みで安定する。
+    ///
+    /// 置換を挟むと `RetiringCommitted` が同じことをするが、**直接ここへ来る経路**は
+    /// `Committing` を一括で「native へ発行済み」と数えていたため、retire が積まれた後に
+    /// abort を出し、publish 前の `current` で安定していた (Codex Q5)。
+    #[test]
+    fn closing_while_awaiting_retire_keeps_what_was_published() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let committed_id = request(&mut owner, ViewerPresentation::Fullscreen, 0);
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, committed_id, 0);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Committing {
+                progress: CommittingProgress::AwaitingRetire,
+                ..
+            }
+        ));
+
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        let effects = owner.take_effects();
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, PresentationTransitionEffect::AbortNative { .. })),
+            "retire が積まれている request へ abort を出している: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::CloseDetachedSession { request_id }
+                    if *request_id == committed_id
+            )),
+            "退場側の session が閉じられていない: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::DestroyHost {
+                    hwnd: OUTGOING_HOST,
+                    ..
+                }
+            )),
+            "退場側の host が畳まれていない: {effects:?}"
+        );
+        assert_eq!(
+            owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::Fullscreen
+            },
+            "publish 済みの表示ではなく退場側で安定している"
+        );
     }
 
     /// commit 後 retire 前の置換は、abort ではなく retire の完了を待つ。
