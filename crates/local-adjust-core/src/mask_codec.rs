@@ -139,7 +139,7 @@ fn charge_document_budget<E: DeError>(count: usize, transient: usize) -> Result<
             Ok(())
         }
         Some(remaining) => Err(E::custom(format!(
-            "this document's masks decode to more than it may hold: another {retained} bytes              kept and {transient} while decoding, with {remaining} left"
+            "this document's masks decode to more than it may hold: another {retained} bytes kept and {transient} while decoding, with {remaining} left"
         ))),
     })
 }

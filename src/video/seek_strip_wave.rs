@@ -1287,7 +1287,7 @@ impl WaveWorkerRuntime {
             self.coarse = if let Some(scale) = CoarseScale::for_duration(duration_secs) {
                 if scale.bin_secs > COARSE_BIN_SECS {
                     crate::logger::log(format!(
-                        "[wave] coarse column coarsened: duration {duration_secs:.0}s at                          {:.3}s per bin, {} bins, {:.1} MiB",
+                        "[wave] coarse column coarsened: duration {duration_secs:.0}s at {:.3}s per bin, {} bins, {:.1} MiB",
                         scale.bin_secs,
                         scale.bin_count,
                         scale.bytes() as f64 / (1024.0 * 1024.0)
@@ -1296,7 +1296,7 @@ impl WaveWorkerRuntime {
                 CoarseBuildState::Building(CoarseWaveform::new(duration_secs, scale))
             } else {
                 crate::logger::log(format!(
-                    "[wave] no coarse column: duration {duration_secs:.0}s is past the                      {:.0}s a column can span at {MAX_COARSE_BIN_SECS}s per bin;                      wide spans will decode their own window",
+                    "[wave] no coarse column: duration {duration_secs:.0}s is past the {:.0}s a column can span at {MAX_COARSE_BIN_SECS}s per bin; wide spans will decode their own window",
                     MAX_COARSE_BIN_SECS * MAX_COARSE_BINS as f64
                 ));
                 CoarseBuildState::OverBudget
@@ -2379,7 +2379,7 @@ mod tests {
                 let produced = request.pixel_width(visible, visible_span_secs);
                 assert!(
                     produced >= effective_visible_pixel_width(visible),
-                    "visible={visible} span={visible_span_secs}: 作った {produced}px が                      表示済み判定の下限 {}px に届かない",
+                    "visible={visible} span={visible_span_secs}: 作った {produced}px が 表示済み判定の下限 {}px に届かない",
                     effective_visible_pixel_width(visible)
                 );
                 assert!(produced <= MAX_WAVEFORM_TEXTURE_WIDTH);
@@ -2526,7 +2526,7 @@ mod tests {
                     if route == WaveRenderRoute::WindowDecode {
                         assert!(
                             peak_pcm_bytes(visible_span_secs) <= ceiling,
-                            "{availability:?} / {visible_span_secs}s / bin {requested_bin_secs} が                              一括復号へ回り、PCM は {:.1} GiB になる",
+                            "{availability:?} / {visible_span_secs}s / bin {requested_bin_secs} が 一括復号へ回り、PCM は {:.1} GiB になる",
                             peak_pcm_bytes(visible_span_secs) / (1024.0 * 1024.0 * 1024.0)
                         );
                     }
@@ -2547,6 +2547,78 @@ mod tests {
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
     }
 
+    /// 粗くした bin 幅は、これを読む三者すべてが同じ格子に乗る。
+    ///
+    /// 読み手は `waveform_analysis_range` (µs 単位で位置合わせする)、音声解析器
+    /// (bin を整数フレームへ丸めて `frame / sample_rate` を報告する)、そして
+    /// `compose_coarse_chunk` (1µs の許容差で照合する) の三つ。幅が任意の f64 だと
+    /// 三者がずれ、解析済みのチャンクが**捨てられて二度と再解析されない**
+    /// (2026-08-29 第 6 回レビュー P1)。
+    ///
+    /// ここは PCM を作らない純粋な検査なので、実在し得る全長を掃ける。解析器を通した
+    /// 裏取りは下の `a_coarsened_column_still_stores_the_bins_that_were_actually_analyzed`。
+    #[test]
+    fn every_coarse_width_lands_on_the_grid_its_three_readers_share() {
+        let longest = MAX_COARSE_BIN_SECS * MAX_COARSE_BINS as f64;
+        for duration_secs in [
+            4.0 * 3_600.0,
+            86_400.0,
+            12.0 * 86_400.0,
+            30.0 * 86_400.0,
+            200.0 * 86_400.0,
+            300.0 * 86_400.0,
+            longest,
+        ] {
+            let scale = CoarseScale::for_duration(duration_secs).expect("scale");
+
+            // 幅は 100ms の整数倍。`waveform_analysis_range` が前提にする
+            // 「ミリ秒に丸められている」はここから来る。
+            let multiple = scale.bin_secs / COARSE_BIN_SECS;
+            assert!(
+                (multiple - multiple.round()).abs() < 1e-9,
+                "{duration_secs}s: bin {} は 100ms の整数倍でない",
+                scale.bin_secs
+            );
+            let bin_micros = (scale.bin_secs * 1_000_000.0).round() as u64;
+            assert_eq!(
+                bin_micros % 100_000,
+                0,
+                "{duration_secs}s: bin {bin_micros}µs が 100ms 格子から外れる"
+            );
+
+            // 解析が丸める整数フレーム数と、幅が指す秒数が一致する。
+            for sample_rate in [44_100_u32, 48_000] {
+                let frames_per_bin = (scale.bin_secs * sample_rate as f64).round();
+                assert!(
+                    (frames_per_bin / sample_rate as f64 - scale.bin_secs).abs() < 1e-12,
+                    "{sample_rate}Hz / {duration_secs}s: bin {} がフレーム格子に乗らない",
+                    scale.bin_secs
+                );
+            }
+
+            // 位置合わせの結果も、µs へ往復したうえで同じ格子の上に出る。
+            let chunk_secs = scale.chunk_secs();
+            for chunk_index in [0_usize, 1] {
+                let chunk_start_secs = chunk_index as f64 * chunk_secs;
+                let chunk_end_secs = (chunk_start_secs + chunk_secs).min(duration_secs);
+                let window = WaveWindow {
+                    start_secs: chunk_start_secs,
+                    end_secs: chunk_end_secs,
+                    content_start_secs: chunk_start_secs,
+                    content_end_secs: chunk_end_secs,
+                };
+                let range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
+                    .expect("analysis range");
+                let start_micros = (range.start_secs * 1_000_000.0).round() as u64;
+                assert_eq!(
+                    start_micros % bin_micros,
+                    0,
+                    "{duration_secs}s / chunk {chunk_index}: 解析開始 {start_micros}µs が bin 境界にない"
+                );
+            }
+        }
+    }
+
     /// 可変 bin 幅の列でも、実際に解析した bin がそのまま格納できる。
     ///
     /// **これは理論値のテストではない。**`analyze_window_samples` を実 sample rate で
@@ -2555,72 +2627,56 @@ mod tests {
     /// 幅が任意の f64 だと `compose_coarse_chunk` の 1µs 許容差を超えて**チャンクごと
     /// 捨てられ、二度と再解析されない**。12 日のファイルは 2 個目の bin で超えていた
     /// (2026-08-29 第 6 回レビュー P1)。
+    ///
+    /// 長さは**粗くなり始める最小のケース**だけにする。1 チャンク分の PCM を実際に
+    /// 確保するため、幅が粗いほど確保量が増える (300 日は 48kHz stereo で 615MiB)。
+    /// 幅ごとの違いは上の純粋テストが実在し得る全長を掃いて見ているので、ここで長さを
+    /// 足しても増えるのは確保量だけになる (2026-08-29 第 7 回レビュー P2)。
     #[test]
     fn a_coarsened_column_still_stores_the_bins_that_were_actually_analyzed() {
+        let duration_secs = 12.0 * 86_400.0;
+        let scale = CoarseScale::for_duration(duration_secs).expect("scale");
+        assert!(
+            scale.bin_secs > COARSE_BIN_SECS,
+            "{duration_secs}s で粗くならない"
+        );
+
         for sample_rate in [44_100_u32, 48_000] {
-            for duration_secs in [
-                12.0 * 86_400.0,
-                30.0 * 86_400.0,
-                200.0 * 86_400.0,
-                300.0 * 86_400.0,
-            ] {
-                let scale = CoarseScale::for_duration(duration_secs).expect("scale");
-                assert!(
-                    scale.bin_secs > COARSE_BIN_SECS,
-                    "{duration_secs}s で粗くならない"
-                );
+            // 先頭チャンクと、その次のチャンクの両方を実際に通す。
+            for chunk_index in [0_usize, 1] {
+                let chunk_secs = scale.chunk_secs();
+                let chunk_start_secs = chunk_index as f64 * chunk_secs;
+                let chunk_end_secs = (chunk_start_secs + chunk_secs).min(duration_secs);
+                let window = WaveWindow {
+                    start_secs: chunk_start_secs,
+                    end_secs: chunk_end_secs,
+                    content_start_secs: chunk_start_secs,
+                    content_end_secs: chunk_end_secs,
+                };
+                let range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
+                    .expect("analysis range");
+                let frames =
+                    ((range.end_secs - range.start_secs) * sample_rate as f64).ceil() as usize;
+                let samples = vec![0.05_f32; frames * 2];
+                let analysis = analyze_window_samples(
+                    &samples,
+                    sample_rate,
+                    range.start_secs,
+                    chunk_start_secs,
+                    chunk_end_secs,
+                    scale.bin_secs,
+                    chunk_secs,
+                    &|| false,
+                )
+                .expect("analysis");
 
-                // 幅は 100ms の整数倍。ここが崩れると下の 2 つの格子と合わなくなる。
-                let multiple = scale.bin_secs / COARSE_BIN_SECS;
+                let mut coarse = CoarseWaveform::new(duration_secs, scale);
                 assert!(
-                    (multiple - multiple.round()).abs() < 1e-9,
-                    "{sample_rate}Hz / {duration_secs}s: bin {} は 100ms の整数倍でない",
-                    scale.bin_secs
+                    coarse.apply_chunk(chunk_index, &analysis.bins),
+                    "{sample_rate}Hz / chunk {chunk_index}: 解析した bin を格納できない"
                 );
-                // 解析が丸める整数フレーム数と、幅が指す秒数が一致する。
-                let frames_per_bin = (scale.bin_secs * sample_rate as f64).round();
-                assert!(
-                    (frames_per_bin / sample_rate as f64 - scale.bin_secs).abs() < 1e-12,
-                    "{sample_rate}Hz: bin {} がフレーム格子に乗らない",
-                    scale.bin_secs
-                );
-
-                // 先頭チャンクと、その次のチャンクの両方を実際に通す。
-                for chunk_index in [0_usize, 1] {
-                    let chunk_secs = scale.chunk_secs();
-                    let chunk_start_secs = chunk_index as f64 * chunk_secs;
-                    let chunk_end_secs = (chunk_start_secs + chunk_secs).min(duration_secs);
-                    let window = WaveWindow {
-                        start_secs: chunk_start_secs,
-                        end_secs: chunk_end_secs,
-                        content_start_secs: chunk_start_secs,
-                        content_end_secs: chunk_end_secs,
-                    };
-                    let range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
-                        .expect("analysis range");
-                    let frames =
-                        ((range.end_secs - range.start_secs) * sample_rate as f64).ceil() as usize;
-                    let samples = vec![0.05_f32; frames * 2];
-                    let analysis = analyze_window_samples(
-                        &samples,
-                        sample_rate,
-                        range.start_secs,
-                        chunk_start_secs,
-                        chunk_end_secs,
-                        scale.bin_secs,
-                        chunk_secs,
-                        &|| false,
-                    )
-                    .expect("analysis");
-
-                    let mut coarse = CoarseWaveform::new(duration_secs, scale);
-                    assert!(
-                        coarse.apply_chunk(chunk_index, &analysis.bins),
-                        "{sample_rate}Hz / {duration_secs}s / chunk {chunk_index}:                          解析した bin を格納できない"
-                    );
-                    assert!(coarse.coverage.contains(chunk_index));
-                    assert!(!coarse.failed.contains(chunk_index));
-                }
+                assert!(coarse.coverage.contains(chunk_index));
+                assert!(!coarse.failed.contains(chunk_index));
             }
         }
     }

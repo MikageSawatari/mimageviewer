@@ -40770,7 +40770,7 @@ impl App {
                         Ok(summary) => Some(summary),
                         Err(error) => {
                             crate::logger::log(format!(
-                                "active_viewer_context_retire_failed id={id:?} +                                 reason=active_viewport_finalized error={error:?}"
+                                "active_viewer_context_retire_failed id={id:?} reason=active_viewport_finalized error={error:?}"
                             ));
                             None
                         }
@@ -42027,7 +42027,7 @@ impl App {
         drop(last);
         let matches = os_title == computed;
         crate::logger::log(format!(
-            "[detached-title] source={source} frame={frame} fs_idx={fs_idx}              items_gen={} items_len={} main_fs_idx={:?} mounted={} session={:?} hwnd=0x{hwnd_raw:x}              matches={matches} computed={computed:?} os={os_title:?}",
+            "[detached-title] source={source} frame={frame} fs_idx={fs_idx} items_gen={} items_len={} main_fs_idx={:?} mounted={} session={:?} hwnd=0x{hwnd_raw:x} matches={matches} computed={computed:?} os={os_title:?}",
             self.items_generation,
             self.items.len(),
             self.fullscreen_idx,
@@ -63522,7 +63522,7 @@ impl App {
             return;
         }
         let detail = format!(
-            "[passthrough] no stand-in for the page: idx={idx} reason={} frames={count}              items_generation={} key={:?}",
+            "[passthrough] no stand-in for the page: idx={idx} reason={} frames={count} items_generation={} key={:?}",
             reason.as_str(),
             self.items_generation,
             self.perf_item_key(idx),
