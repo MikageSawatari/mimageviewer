@@ -274,6 +274,9 @@ impl PresentationTransitionOwner {
         }
     }
 
+    /// R-27 以降、production は状態そのものではなく `awaited_detached_lease` /
+    /// `request_id` の型付きの問いを使う。生の状態を読むのは reducer のテストだけ。
+    #[cfg(test)]
     pub(crate) fn state(&self) -> PresentationTransitionState {
         self.state
     }
