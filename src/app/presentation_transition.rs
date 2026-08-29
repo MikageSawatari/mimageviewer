@@ -69,6 +69,19 @@ pub(crate) enum PreparingProgress {
         aborted_candidate_host_hwnd: u64,
         next_host_hwnd: u64,
     },
+    /// commit 済みの retire を待ちながら、次の要求を控えている。
+    ///
+    /// `NativeCommitted` は所有権の受け渡し点なので、そこから先の置換は**巻き戻しでは
+    /// ない**。native は既に retire を走らせており、ここで abort を出すと同じ request に
+    /// 対して `[Retire, Abort]` が並ぶ。native は retire を選ぶので abort は解決されず、
+    /// それを待つ側が永久に止まる。`Aborting` と別の状態にしてあるのは、待つ相手
+    /// (retire) も、終わったときに畳む物 (commit 済みの host) も違うため
+    /// (2026-08-29 レビュー R-17 の裁定)。
+    RetiringCommitted {
+        retiring: PresentationRequest,
+        retiring_generation: u64,
+        next_host_hwnd: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +217,21 @@ impl PresentationTransitionOwner {
         matches!(self.state, PresentationTransitionState::Stable { .. })
     }
 
+    /// いま画面を持っている表示。
+    ///
+    /// `NativeCommitted` を受理した時点で `ApplyPresentation` は既に出ており、画面は
+    /// target 側へ移っている。retire を待っている間もそこは変わらないので、**その間に
+    /// 来た要求は target を起点にする**。退場側を返すと、後継が持つ `current` が最初から
+    /// 誤りになり、host の始末先も分岐も狂う (Codex Q1)。
     pub(crate) fn current(&self) -> ViewerPresentation {
+        if let PresentationTransitionState::Committing {
+            request,
+            progress: CommittingProgress::AwaitingRetire,
+            ..
+        } = self.state
+        {
+            return request.target;
+        }
         request_from_state(self.state)
             .map(|request| request.current)
             .unwrap_or_else(|| match self.state {
@@ -389,6 +416,50 @@ fn reduce_replaced_request(
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
+    // commit 済みの retire を待っている間の置換は巻き戻しではない。abort を出すと
+    // 同じ request へ `[Retire, Abort]` が並び、native は retire を選ぶので abort は
+    // 解決されない。retire の完了を待って後継を始める (Codex Q2)。
+    if let PresentationTransitionState::Committing {
+        request: retiring,
+        candidate,
+        progress: CommittingProgress::AwaitingRetire,
+    } = state
+    {
+        return (
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::RetiringCommitted {
+                    retiring,
+                    retiring_generation: candidate.native_generation,
+                    next_host_hwnd: ready_host_hwnd,
+                },
+            },
+            effects,
+        );
+    }
+    // 更に置換されても、native が走らせている retire には触らない。後継だけ差し替える。
+    if let PresentationTransitionState::Preparing {
+        progress:
+            PreparingProgress::RetiringCommitted {
+                retiring,
+                retiring_generation,
+                ..
+            },
+        ..
+    } = state
+    {
+        return (
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::RetiringCommitted {
+                    retiring,
+                    retiring_generation,
+                    next_host_hwnd: ready_host_hwnd,
+                },
+            },
+            effects,
+        );
+    }
     // 既に abort が飛んでいるなら、native が持っているのは「中止した側」であって、
     // ここに居る後継ではない。差し替えてよいのは後継だけで、in-flight な abort の
     // identity には触らない。二重の `AbortNative` も出さない (R-01)。
@@ -649,8 +720,82 @@ fn reduce_completion_transition(
                 effects,
             )
         }
+        (
+            PresentationTransitionState::Preparing {
+                request,
+                progress:
+                    PreparingProgress::RetiringCommitted {
+                        retiring,
+                        retiring_generation,
+                        next_host_hwnd,
+                    },
+            },
+            PresentationTransitionEvent::NativeRetired {
+                request_id,
+                candidate_generation,
+            },
+        ) if retiring.id == request_id && retiring_generation == candidate_generation => {
+            finish_retired_then_start(retiring, request, next_host_hwnd, effects)
+        }
+        // retire が失敗で終わっても、commit 済みの表示が残らないことに変わりはない。
+        // ここで拾わないと後継が永久に始まらない (`Aborting` の同型)。
+        (
+            PresentationTransitionState::Preparing {
+                request,
+                progress:
+                    PreparingProgress::RetiringCommitted {
+                        retiring,
+                        next_host_hwnd,
+                        ..
+                    },
+            },
+            PresentationTransitionEvent::NativeFailed { request_id },
+        ) if retiring.id == request_id => {
+            finish_retired_then_start(retiring, request, next_host_hwnd, effects)
+        }
         pair => reduce_abort_transition(pair.0, pair.1, effects),
     }
+}
+
+/// commit 済みの retire が終わったので、控えていた要求を始める。
+///
+/// 畳む物は `Committing` の retire 完了と同じ。違うのは、そのまま `Stable` にせず
+/// 後継へ進むこと。
+fn finish_retired_then_start(
+    retiring: PresentationRequest,
+    successor: PresentationRequest,
+    next_host_hwnd: u64,
+    mut effects: Vec<PresentationTransitionEffect>,
+) -> (
+    PresentationTransitionState,
+    Vec<PresentationTransitionEffect>,
+) {
+    if let DetachedHostDisposition::RetireOutgoing { hwnd } = retiring.detached_host {
+        effects.push(PresentationTransitionEffect::CloseDetachedSession {
+            request_id: retiring.id,
+        });
+        effects.push(PresentationTransitionEffect::DestroyHost {
+            request_id: retiring.id,
+            target: retiring.target,
+            hwnd,
+        });
+    }
+    if successor.target == successor.current {
+        effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
+        return (
+            PresentationTransitionState::Stable {
+                current: successor.current,
+            },
+            effects,
+        );
+    }
+    (
+        PresentationTransitionState::Preparing {
+            request: successor,
+            progress: initial_progress(successor, next_host_hwnd),
+        },
+        effects,
+    )
 }
 
 fn finish_or_retire(
@@ -809,6 +954,23 @@ fn terminal_close(
             request_id: aborted_request_id,
             target: aborted_target,
             hwnd: aborted_candidate_host_hwnd,
+        });
+    }
+    // retire を待っている間に閉じた場合も同じ。abort は出さない (retire が走っている)。
+    // 退場側の session と host は `NativeRetired` の受理で畳むはずだったので、ここで畳む。
+    if let PresentationTransitionState::Preparing {
+        progress: PreparingProgress::RetiringCommitted { retiring, .. },
+        ..
+    } = state
+        && let DetachedHostDisposition::RetireOutgoing { hwnd } = retiring.detached_host
+    {
+        effects.push(PresentationTransitionEffect::CloseDetachedSession {
+            request_id: retiring.id,
+        });
+        effects.push(PresentationTransitionEffect::DestroyHost {
+            request_id: retiring.id,
+            target: retiring.target,
+            hwnd,
         });
     }
     let current = request.map_or_else(
@@ -1241,6 +1403,128 @@ mod tests {
             }
         )));
         // Killing mutation: invert native_prepare_was_issued in terminal_close.
+    }
+
+    /// commit 後 retire 前の置換は、abort ではなく retire の完了を待つ。
+    ///
+    /// abort を出すと同じ request へ `[Retire, Abort]` が並ぶ。native は retire を選ぶので
+    /// abort は解決されず、それを待つ側が永久に止まる。`NativeCommitted` は所有権の
+    /// 受け渡し点なので巻き戻さない (2026-08-29 レビュー R-17 の裁定、Codex Q2)。
+    #[test]
+    fn replacing_after_commit_waits_for_the_retire_instead_of_asking_for_a_rollback() {
+        // 退場側が別ウィンドウの向きにする。こうすると retire 完了で畳む物が実際にある。
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let committed_id = request(&mut owner, ViewerPresentation::Fullscreen, 0);
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, committed_id, 0);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Committing {
+                progress: CommittingProgress::AwaitingRetire,
+                ..
+            }
+        ));
+
+        // publish 済みなので、ここから見た「今の表示」は退場側ではなく target。
+        assert_eq!(owner.current(), ViewerPresentation::Fullscreen);
+
+        let successor_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        let effects = owner.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, PresentationTransitionEffect::AbortNative { .. })),
+            "commit 済みの request へ abort を出している: {effects:?}"
+        );
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::RetiringCommitted { retiring, .. },
+                } if retiring.id == committed_id && request.id == successor_id
+            ),
+            "retire 待ちになっていない: {:?}",
+            owner.state()
+        );
+
+        // retire が終わったら、退場側を畳んでから後継を始める。
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::CloseDetachedSession { request_id }
+                    if *request_id == committed_id
+            )),
+            "退場側の session が閉じられていない: {effects:?}"
+        );
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing { request, .. }
+                    if request.id == successor_id
+            ),
+            "retire 完了後に後継が始まらない: {:?}",
+            owner.state()
+        );
+    }
+
+    /// commit 後に要求した後継は、退場側ではなく publish 済みの表示を起点にする。
+    ///
+    /// 起点が退場側のままだと、`target == current` の判定も host の始末先も狂う。
+    /// ここでは「publish 済みの表示と同じ場所へ戻す」要求を出し、retire 完了で
+    /// そのまま安定することを見る。
+    #[test]
+    fn a_successor_asked_for_after_commit_starts_from_what_was_published() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let committed_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, committed_id, CANDIDATE_HOST);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+
+        // publish 済みの表示と同じ target を要求する。
+        request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        owner.take_effects();
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Stable {
+                    current: ViewerPresentation::DetachedWindow
+                }
+            ),
+            "publish 済みの表示を起点にしていれば、同じ場所への要求はそのまま安定する: {:?}",
+            owner.state()
+        );
     }
 
     /// 連打しても、native が処理している abort の identity は動かない。

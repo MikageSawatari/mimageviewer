@@ -5328,9 +5328,29 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetZOrderRecoveryPermit { permitted } => {
                     window_pump.set_z_order_recovery_permit(permitted)?;
                 }
-                NativeVideoOutputCommand::CommitPlacement { .. }
-                | NativeVideoOutputCommand::RetirePlacement { .. }
-                | NativeVideoOutputCommand::AbortPlacement { .. } => {}
+                // placement control が、待っている遷移が無い状態でここまで来た。
+                //
+                // 遅れて届く Abort は正当にあり得る (Commit が publish した後に、既に
+                // 発行済みの Abort が届く)。ただし**黙って捨ててはならない** — 元は空の
+                // arm で、どの request が失われたのか後から辿れなかった。無視すること
+                // 自体は変えず、識別子だけ残す (2026-08-29 レビュー R-17 / Codex Q3)。
+                NativeVideoOutputCommand::CommitPlacement {
+                    request_id,
+                    generation,
+                }
+                | NativeVideoOutputCommand::RetirePlacement {
+                    request_id,
+                    generation,
+                } => {
+                    crate::logger::log(format!(
+                        "[native-video] placement control with no active transition:                          request={request_id} generation={generation}"
+                    ));
+                }
+                NativeVideoOutputCommand::AbortPlacement { request_id } => {
+                    crate::logger::log(format!(
+                        "[native-video] late abort with no active transition: request={request_id}"
+                    ));
+                }
                 NativeVideoOutputCommand::PreparePlacement {
                     request_id,
                     placement,
