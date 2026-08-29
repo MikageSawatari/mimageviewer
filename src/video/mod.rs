@@ -1702,19 +1702,200 @@ fn wait_for_placement_transition_control(
         if cancel.load(Ordering::Acquire) {
             return Err("native presentation transition cancelled".to_string());
         }
-        for command in receiver.drain() {
-            if let Some(control) = placement_transition_control(
-                command,
-                deferred,
-                request_id,
-                generation,
-                retire_phase,
-            ) {
-                return Ok(control);
-            }
+        // 先に手元の保留分を見る。同じ batch の後半がここへ回っていることがあり、
+        // receiver だけを見ていると、既に届いている control を待ち続ける。
+        if let Some(control) =
+            take_placement_transition_control(deferred, request_id, generation, retire_phase)
+        {
+            return Ok(control);
+        }
+        if let Some(control) = consume_placement_transition_batch(
+            receiver.drain(),
+            deferred,
+            request_id,
+            generation,
+            retire_phase,
+        ) {
+            return Ok(control);
         }
         std::thread::park_timeout(std::time::Duration::from_millis(1));
     }
+}
+
+#[cfg(all(test, windows))]
+mod placement_transition_batch_tests {
+    use super::*;
+
+    const REQ: u64 = 41;
+    const GEN: u64 = 7;
+
+    fn is_abort_for(command: &NativeVideoOutputCommand, request_id: u64) -> bool {
+        matches!(
+            command,
+            NativeVideoOutputCommand::AbortPlacement { request_id: actual } if *actual == request_id
+        )
+    }
+
+    /// 一致した control より後ろの command も、必ず誰かの手元に残る。
+    ///
+    /// `drain` は queue と latest slot から全件外すので、ここで取りこぼすと消える。
+    /// 元の実装は最初の一致で `return` しており、retire 中に届いた `[Retire, Abort]` は
+    /// Retire を返して Abort を落とし、Abort を待っている遷移が永久に止まっていた。
+    #[test]
+    fn the_rest_of_a_drained_batch_is_never_dropped() {
+        let mut deferred = std::collections::VecDeque::new();
+        let control = consume_placement_transition_batch(
+            vec![
+                NativeVideoOutputCommand::RetirePlacement {
+                    request_id: REQ,
+                    generation: GEN,
+                },
+                NativeVideoOutputCommand::AbortPlacement { request_id: REQ },
+            ],
+            &mut deferred,
+            REQ,
+            GEN,
+            true,
+        );
+
+        assert!(
+            matches!(control, Some(PlacementTransitionControl::Retire)),
+            "retire 中なので Retire が返る"
+        );
+        assert_eq!(
+            deferred.len(),
+            1,
+            "batch の後半が消えた: {}",
+            deferred.len()
+        );
+        assert!(is_abort_for(&deferred[0], REQ), "残ったのが Abort ではない");
+    }
+
+    /// 一致より前の非 control も、順序を保ったまま残る。
+    #[test]
+    fn commands_around_the_match_keep_their_order() {
+        let mut deferred = std::collections::VecDeque::new();
+        let control = consume_placement_transition_batch(
+            vec![
+                NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: true },
+                NativeVideoOutputCommand::AbortPlacement { request_id: REQ },
+                NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: false },
+            ],
+            &mut deferred,
+            REQ,
+            GEN,
+            false,
+        );
+
+        assert!(matches!(control, Some(PlacementTransitionControl::Abort)));
+        assert_eq!(deferred.len(), 2);
+        assert!(matches!(
+            deferred[0],
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: true }
+        ));
+        assert!(matches!(
+            deferred[1],
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: false }
+        ));
+    }
+
+    /// 既に保留になっている control は、receiver を待たずに拾う。
+    ///
+    /// 直前の待機が同じ batch の後半をここへ返すことがある。receiver だけを見ていると、
+    /// 既に届いているものを待ち続けることになる。
+    #[test]
+    fn a_control_already_waiting_in_the_pending_queue_is_picked_up() {
+        let mut deferred = std::collections::VecDeque::from(vec![
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: true },
+            NativeVideoOutputCommand::AbortPlacement { request_id: REQ },
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: false },
+        ]);
+
+        let control = take_placement_transition_control(&mut deferred, REQ, GEN, true);
+
+        assert!(matches!(control, Some(PlacementTransitionControl::Abort)));
+        assert_eq!(deferred.len(), 2, "control 以外まで消費した");
+        assert!(matches!(
+            deferred[0],
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: true }
+        ));
+        assert!(matches!(
+            deferred[1],
+            NativeVideoOutputCommand::SetHoverPreviewPinned { pinned: false }
+        ));
+    }
+
+    /// 別 request / 別 generation の control は、この待機のものではないので消費しない。
+    #[test]
+    fn another_requests_control_stays_where_it_is() {
+        let mut deferred = std::collections::VecDeque::from(vec![
+            NativeVideoOutputCommand::RetirePlacement {
+                request_id: REQ + 1,
+                generation: GEN,
+            },
+            NativeVideoOutputCommand::RetirePlacement {
+                request_id: REQ,
+                generation: GEN + 1,
+            },
+        ]);
+
+        assert!(take_placement_transition_control(&mut deferred, REQ, GEN, true).is_none());
+        assert_eq!(deferred.len(), 2, "他の request の control を食べた");
+    }
+}
+
+/// drain 済みの batch から control を 1 つ取り出し、**残りは必ず `deferred` へ返す**。
+///
+/// `drain` は queue と latest slot から全件外すので、ここで取りこぼした分は誰の所有でも
+/// なくなって消える。元の実装は最初の一致で `return` しており、同じ batch の
+/// `[Retire, Abort]` は Retire を返して Abort を落としていた。落とされた側を待っている
+/// 遷移は永久に進まない (2026-08-29 レビュー R-17)。
+#[cfg(windows)]
+fn consume_placement_transition_batch(
+    batch: Vec<NativeVideoOutputCommand>,
+    deferred: &mut std::collections::VecDeque<NativeVideoOutputCommand>,
+    request_id: u64,
+    generation: u64,
+    retire_phase: bool,
+) -> Option<PlacementTransitionControl> {
+    let mut control = None;
+    for command in batch {
+        if control.is_some() {
+            deferred.push_back(command);
+            continue;
+        }
+        control =
+            placement_transition_control(command, deferred, request_id, generation, retire_phase);
+    }
+    control
+}
+
+/// 保留分の中から、この待機が待っている control を 1 つだけ取り出す。
+///
+/// 一致判定は [`placement_transition_control`] が唯一の所有者なので、保留分もそこへ
+/// 通す。順序は保つ (一致より後ろは、そのまま後ろに残す)。
+#[cfg(windows)]
+fn take_placement_transition_control(
+    deferred: &mut std::collections::VecDeque<NativeVideoOutputCommand>,
+    request_id: u64,
+    generation: u64,
+    retire_phase: bool,
+) -> Option<PlacementTransitionControl> {
+    if deferred.is_empty() {
+        return None;
+    }
+    let mut kept = std::collections::VecDeque::with_capacity(deferred.len());
+    let mut control = None;
+    while let Some(command) = deferred.pop_front() {
+        if control.is_some() {
+            kept.push_back(command);
+            continue;
+        }
+        control =
+            placement_transition_control(command, &mut kept, request_id, generation, retire_phase);
+    }
+    *deferred = kept;
+    control
 }
 
 #[cfg(windows)]
