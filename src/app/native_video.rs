@@ -1323,9 +1323,8 @@ impl App {
         if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
             return None;
         }
-        if target_presentation == ViewerPresentation::DetachedWindow {
-            self.ensure_detached_viewer_window_id();
-        }
+        let target_detached_window_id = (target_presentation == ViewerPresentation::DetachedWindow)
+            .then(|| self.ensure_detached_viewer_window_id());
         if target_presentation != ViewerPresentation::Fullscreen && self.show_vst3_manager {
             self.toggle_native_video_vst3_gui();
         }
@@ -1337,24 +1336,24 @@ impl App {
             }
             _ => (0, 0),
         };
-        let current_detached_host_hwnd = (self.viewer_presentation
-            == ViewerPresentation::DetachedWindow)
-            .then(|| self.detached_viewer_host_hwnd_raw())
-            .unwrap_or(0);
-        let ready_host_hwnd = (target_presentation == ViewerPresentation::DetachedWindow
-            && self.detached_viewer_video_host_ready())
-        .then(|| self.detached_viewer_host_hwnd_raw())
-        .unwrap_or(0);
+        let current_detached = (self.viewer_presentation == ViewerPresentation::DetachedWindow)
+            .then(|| self.current_detached_host_lease())
+            .flatten();
+        let target_detached = target_detached_window_id
+            .map(|window_id| self.detached_host_lease_for_window_id(window_id));
         let request_id = self.video_presentation_transition.request_transition(
             target_presentation,
             activate_on_show,
             false,
             outgoing_presenter_hwnd,
-            current_detached_host_hwnd,
-            ready_host_hwnd,
+            current_detached,
+            target_detached,
         );
         let probe_host = if target_presentation == ViewerPresentation::DetachedWindow {
-            ready_host_hwnd.max(current_detached_host_hwnd)
+            target_detached
+                .and_then(|lease| lease.host)
+                .or_else(|| current_detached.and_then(|lease| lease.host))
+                .map_or(0, |claim| claim.hwnd)
         } else {
             0
         };
@@ -1418,19 +1417,12 @@ impl App {
     pub(super) fn poll_video_presentation_transition(&mut self, ctx: &egui::Context) {
         self.video_presentation_transition
             .sync_stable(self.viewer_presentation);
-        match self.video_presentation_transition.state() {
-            super::PresentationTransitionState::Preparing {
-                request,
-                progress: super::PreparingProgress::AwaitingHost,
-            } if self.detached_viewer_video_host_ready() => {
-                self.video_presentation_transition.dispatch(
-                    super::PresentationTransitionEvent::HostReady {
-                        request_id: request.id,
-                        hwnd: self.detached_viewer_host_hwnd_raw(),
-                    },
-                );
-            }
-            _ => {}
+        if let Some(lease) = self.video_presentation_transition.awaited_detached_lease()
+            && let Some(claim) = self.detached_host_claim_for_lease(lease)
+        {
+            let request_id = self.video_presentation_transition.request_id().unwrap();
+            self.video_presentation_transition
+                .dispatch(super::PresentationTransitionEvent::HostReady { request_id, claim });
         }
         self.video_presentation_transition.drive();
         self.execute_video_presentation_transition_effects(ctx);
@@ -1466,7 +1458,7 @@ impl App {
             }
             for effect in effects {
                 match effect {
-                    super::PresentationTransitionEffect::PrepareNative { request, .. } => {
+                    super::PresentationTransitionEffect::PrepareNative { request, host } => {
                         let Some(idx) = self.native_video_presentation_switch_source() else {
                             self.video_presentation_transition.dispatch(
                                 super::PresentationTransitionEvent::NativeFailed {
@@ -1476,13 +1468,22 @@ impl App {
                             continue;
                         };
                         let Some((placement, rect, owner_hwnd)) =
-                            self.native_video_target_for_presentation(request.target)
+                            self.native_video_target_for_host_claim(request.target, host)
                         else {
-                            self.video_presentation_transition.dispatch(
-                                super::PresentationTransitionEvent::NativeFailed {
-                                    request_id: request.id,
-                                },
-                            );
+                            if let Some(claim) = host {
+                                self.video_presentation_transition.dispatch(
+                                    super::PresentationTransitionEvent::HostUnavailable {
+                                        request_id: request.id,
+                                        claim,
+                                    },
+                                );
+                            } else {
+                                self.video_presentation_transition.dispatch(
+                                    super::PresentationTransitionEvent::NativeFailed {
+                                        request_id: request.id,
+                                    },
+                                );
+                            }
                             continue;
                         };
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
@@ -1627,24 +1628,30 @@ impl App {
             super::PresentationTransitionEffect::DestroyHost {
                 request_id,
                 target,
+                lease,
                 hwnd,
             } => {
                 Self::log_presentation_transition_effect(request_id, target, "Destroy", hwnd);
-                if let Some(window_id) = self.detached_viewer_window_id {
-                    ctx.send_viewport_cmd_to(
-                        Self::detached_image_window_viewport_id(window_id),
-                        egui::ViewportCommand::Close,
-                    );
-                    crate::presentation_observer::observe_viewport_command_for_transition(
-                        request_id,
-                        Self::presentation_probe_target(target),
-                        crate::presentation_observer::WindowAction::Destroy,
-                        crate::presentation_observer::WindowRole::Host,
-                        hwnd,
-                        "transition_owner",
-                        "viewport_command=Close",
+                if self.detached_window_state(lease.window_id).is_some() {
+                    self.transition_detached_window_state(
+                        lease.window_id,
+                        super::DetachedWindowState::Closing,
+                        "video_presentation_transition_destroy_host",
                     );
                 }
+                ctx.send_viewport_cmd_to(
+                    Self::detached_image_window_viewport_id(lease.window_id),
+                    egui::ViewportCommand::Close,
+                );
+                crate::presentation_observer::observe_viewport_command_for_transition(
+                    request_id,
+                    Self::presentation_probe_target(target),
+                    crate::presentation_observer::WindowAction::Destroy,
+                    crate::presentation_observer::WindowRole::Host,
+                    hwnd,
+                    "transition_owner",
+                    "viewport_command=Close",
+                );
             }
             super::PresentationTransitionEffect::ApplyPresentation {
                 request,
@@ -1660,15 +1667,11 @@ impl App {
                     self.show_media_window_main_hint_toast();
                 }
             }
-            super::PresentationTransitionEffect::CloseDetachedSession { .. } => {
-                if self.active_detached_session.is_some() {
-                    self.begin_active_detached_session_close(
-                        "video_presentation_transition_non_detached",
-                    );
-                    self.finish_active_detached_session_close(
-                        "video_presentation_transition_non_detached",
-                    );
-                }
+            super::PresentationTransitionEffect::CloseDetachedSession { lease, .. } => {
+                self.close_active_detached_session_exact(
+                    lease,
+                    "video_presentation_transition_non_detached",
+                );
             }
             super::PresentationTransitionEffect::TerminalSessionClose { .. } => {
                 // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と

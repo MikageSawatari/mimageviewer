@@ -1459,6 +1459,48 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-29 R-27 host/session lease 移譲 (v3.3.0 出荷前レビュー R-27。ClaudeCode /
+Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の
+reducer / state / effect identity、[src/app/native_video.rs](../src/app/native_video.rs) の
+producer・poll・effect executor、[src/app.rs](../src/app.rs) の lease 指定 claim 取得・検証と
+exact session close、[src/app/detached_window_manager.rs](../src/app/detached_window_manager.rs) の
+per-runtime host incarnation、[src/app/tests.rs](../src/app/tests.rs) と reducer / manager の回帰証明。
+
+**不変条件と所有境界**:
+
+- `DetachedSessionLease { window_id }` は viewport/session の継続所有権、
+  `DetachedHostClaim { lease, incarnation, hwnd }` はその session 内の特定 OS host 世代を表す。
+  同じ live HWND の再観測では incarnation を保ち、clear / HWND 変更 / runtime 再作成では
+  manager-global allocator から新しい incarnation を払い出す。`Closing` または exact claim の
+  いずれかが違う host は prepare できない。
+- commit 済み retire の outgoing lease と successor の target lease が同じなら、lease を
+  `Transferred` として後継へ移し、同じ batch では `CloseDetachedSession` / `DestroyHost` を
+  出さない。要求時の raw HWND/claim は非同期 retire 境界で捨て、必ず
+  `AwaitingHost(transferred lease)` から現在の exact claim を取り直す。
+- producer → reducer → `PrepareNative` → executor は同じ full host claim を運ぶ。executor が
+  claim を再検証できなければ current global host へ解決し直さず、matching
+  `HostUnavailable { request_id, claim }` で `AwaitingHost` へ戻る。遅れて届いた旧 claim の拒否は
+  再取得済み claim を巻き戻さない。
+- `KeepLive` / 未 commit の `Candidate` / retire から受け取った `Transferred` を別 variant にし、
+  failure / replacement / abort / terminal close の解放責任を区別する。Close/Destroy は effect が
+  運ぶ session lease を使い、現在の sibling window/session を再解決しない。同一 batch 内は lease
+  で重複排除し、各 lifecycle で一度だけ解放する。full host claim は prepare の exact identity、
+  session lease は cleanup の単位である。同じ lease の host が再 incarnation していても、その
+  session/viewport を閉じる terminal effect は無効化しない (claim 一致を要求すると leak する)。
+- presentation enum が同じ `Detached` でも lease が違う H→J は no-op ではない。旧 H を outgoing、
+  新 J を candidate として扱い、J の exact claim だけへ prepare した後、native retire 完了で H
+  だけを close/destroy する。
+
+**なぜ症状パッチではないか**: ready 述語へ「retire 中なら unready」という例外を足さず、壊れて
+いた host/session の所有 identity を型と reducer の移譲規則で閉じた。新しい App-level bool /
+Option は足していない (規則 3 — 状態は `PresentationTransitionState` / `PreparingProgress` と
+`DetachedWindowRuntime.host_incarnation` が所有)。時間窓・retry・settle・sleep は無い (規則 5)。
+既存 detached テストは削除・弱体化せず、指定された R-27 再現だけを A′ の新契約へ書き換えて
+`#[ignore]` を外した (規則 8)。既存 Detached→Fullscreen と同一 lease の Detached→Detached
+KeepLive の期待値は変更していない。
+
 **2026-08-29 gamepad の配り先を前面の context にする (レビュー R-02。ClaudeCode / Codex
 双方が構造的修正と合意):**
 
