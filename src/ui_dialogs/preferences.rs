@@ -812,6 +812,10 @@ impl PreferencesState {
     }
 
     pub(super) fn add_external_tool(&mut self, mut tool: crate::external_tool::ExternalTool) {
+        // 新規ツールは既定 ON。ただし ON の登録が既に 10 件を超えている場合だけ
+        // メニューを伸ばさないよう OFF で追加する。複製も新規登録として同じ既定を使う。
+        tool.show_in_context_menu =
+            crate::external_tool::show_in_context_menu_by_default(&self.settings.external_tools);
         tool.id = crate::external_tool::next_id(&self.settings.external_tools);
         let id = tool.id;
         self.settings.external_tools.push(tool);
@@ -3082,6 +3086,35 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_page_add_applies_context_menu_default_at_ten_and_eleven() {
+        let mut settings = crate::settings::Settings::default();
+        settings.external_tools = (1..=10)
+            .map(|id| {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.id = crate::external_tool::ExternalToolId(id);
+                tool
+            })
+            .collect();
+        let mut state = PreferencesState::from_settings(
+            &settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut duplicate = crate::external_tool::ExternalTool::defaults_for_viewing();
+        duplicate.show_in_context_menu = false;
+
+        state.add_external_tool(duplicate.clone());
+        assert!(state.settings.external_tools[10].show_in_context_menu);
+
+        state.add_external_tool(duplicate);
+        assert!(!state.settings.external_tools[11].show_in_context_menu);
+    }
 
     #[test]
     fn preferences_search_results_snapshot() {

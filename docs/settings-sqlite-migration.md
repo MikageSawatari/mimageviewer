@@ -384,9 +384,7 @@ pub fn save_full(&self, s: &Settings) -> Result<(), SettingsDbError> {
     delete_and_insert_tags(&tx, &s.tags)?;
     delete_and_insert_video_resume_positions(&tx, &s.video_resume_positions)?;
     delete_and_insert_recent_apps(&tx, &s.recent_open_with_apps)?;
-    // custom_open_with_apps は移行元として残す。旧 UI がまだこのフィールドへ追加するので
-    // P1 で UI を external_tools へ載せ替えるまでは書き戻しも続ける
-    delete_and_insert_custom_apps(&tx, &s.custom_open_with_apps)?;
+    // custom_open_with_apps は読み取り専用の移行元として既存行を残し、書き戻さない
     delete_and_insert_external_tools(&tx, &s.external_tools)?;
     if chain_changed {
         delete_and_insert_vst3_plugins(&tx, &s.vst3_plugins)?;

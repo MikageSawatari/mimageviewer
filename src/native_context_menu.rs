@@ -53,6 +53,7 @@ pub enum NativeMivCommand {
     ToggleRepresentativeThumb,
     SetCurrentVideoFrameThumbnail,
     OpenFolderInExplorer,
+    ExternalTool(crate::external_tool::ExternalToolId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,8 @@ pub struct NativeMivMenuItem {
     pub command: NativeMivCommand,
     pub label: String,
     pub enabled: bool,
+    /// この項目の直前で既存 mIV 項目とのグループを分ける。
+    pub separator_before: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +93,19 @@ fn miv_command_id(index: usize) -> Option<u32> {
 fn miv_command_index(command_id: u32, len: usize) -> Option<usize> {
     let index = command_id.checked_sub(MIV_ID_FIRST)? as usize;
     (index < len).then_some(index)
+}
+
+fn miv_menu_position_count(items: &[NativeMivMenuItem]) -> Option<u32> {
+    let separator_count = items
+        .iter()
+        .enumerate()
+        .filter(|(index, item)| *index > 0 && item.separator_before)
+        .count();
+    u32::try_from(items.len().checked_add(separator_count)?).ok()
+}
+
+fn shell_menu_insert_position(items: &[NativeMivMenuItem]) -> Option<u32> {
+    miv_menu_position_count(items)?.checked_add(u32::from(!items.is_empty()))
 }
 
 fn shell_verb_offset(command_id: u32) -> Option<u32> {
@@ -385,6 +401,14 @@ mod windows_impl {
 
         let stage_t0 = Instant::now();
         for (index, item) in request.miv_items.iter().enumerate() {
+            if index > 0
+                && item.separator_before
+                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
+            {
+                return NativeContextMenuResult::Fallback {
+                    reason: "AppendMenuW(mIV separator) failed".to_string(),
+                };
+            }
             let Some(id) = miv_command_id(index) else {
                 return NativeContextMenuResult::Fallback {
                     reason: "too many mIV context menu commands".to_string(),
@@ -426,8 +450,11 @@ mod windows_impl {
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             };
             if let Some(shell_menu) = shell_menu.as_ref() {
-                let insert_at =
-                    request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
+                let Some(insert_at) = shell_menu_insert_position(&request.miv_items) else {
+                    return NativeContextMenuResult::Fallback {
+                        reason: "too many mIV context menu positions".to_string(),
+                    };
+                };
                 if let Err(reason) = query_shell_context_menu_timed(
                     shell_menu,
                     menu.handle(),
@@ -460,8 +487,11 @@ mod windows_impl {
                 Ok(menu) => menu,
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             };
-            let insert_at =
-                request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
+            let Some(insert_at) = shell_menu_insert_position(&request.miv_items) else {
+                return NativeContextMenuResult::Fallback {
+                    reason: "too many mIV context menu positions".to_string(),
+                };
+            };
             if let Err(reason) = query_shell_context_menu_timed(
                 &shell_menu,
                 menu.handle(),
@@ -1236,6 +1266,28 @@ mod tests {
         assert_eq!(miv_command_id(0), Some(MIV_ID_FIRST));
         assert_eq!(miv_command_index(MIV_ID_FIRST, 1), Some(0));
         assert_eq!(miv_command_index(MIV_ID_FIRST + 2, 2), None);
+    }
+
+    #[test]
+    fn shell_insert_position_counts_internal_and_shell_separators() {
+        let items = vec![
+            NativeMivMenuItem {
+                command: NativeMivCommand::CopyPath,
+                label: "copy".to_string(),
+                enabled: true,
+                separator_before: false,
+            },
+            NativeMivMenuItem {
+                command: NativeMivCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
+                label: "tool".to_string(),
+                enabled: true,
+                separator_before: true,
+            },
+        ];
+
+        assert_eq!(miv_menu_position_count(&items), Some(3));
+        assert_eq!(shell_menu_insert_position(&items), Some(4));
+        assert_eq!(shell_menu_insert_position(&[]), Some(0));
     }
 
     #[test]

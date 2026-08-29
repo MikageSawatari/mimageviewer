@@ -825,15 +825,8 @@ impl SettingsDb {
             "recent_open_with_apps",
             &settings.recent_open_with_apps,
         )?;
-        // `custom_open_with_apps` はリリース済みの legacy データ。移行後の突き合わせ用に
-        // 行を残す。**まだ書き戻しは続ける**: 旧「アプリケーションで開く…」の UI が
-        // このフィールドへ追加するため、ここで書くのをやめると登録が保存されなくなる。
-        // 旧 UI を `external_tools` へ載せ替える P1 で、この write ごと落とす。
-        write_recent_apps(
-            &tx,
-            "custom_open_with_apps",
-            &settings.custom_open_with_apps,
-        )?;
+        // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
+        // 外部ツール UI への載せ替え後は更新しない。
         write_external_tools(&tx, &settings.external_tools)?;
         if chain_changed {
             write_vst3_plugins(&tx, &settings.vst3_plugins)?;
@@ -2218,8 +2211,8 @@ fn write_recent_apps(
     table: &str,
     apps: &[RecentApp],
 ) -> rusqlite::Result<()> {
-    // テーブル名はコード内固定の 2 値のみ (`recent_open_with_apps`,
-    // `custom_open_with_apps`)。injection リスクなし。
+    // テーブル名はコード内固定の `recent_open_with_apps` だけ。
+    // legacy の `custom_open_with_apps` は意図的に書き戻さないため injection リスクなし。
     tx.execute(&format!("DELETE FROM {table}"), [])?;
     let mut stmt = tx.prepare(&format!(
         "INSERT INTO {table} (exe_path, display_name, sort_index) VALUES (?1, ?2, ?3)"
@@ -4133,7 +4126,7 @@ mod tests {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         seed_legacy_custom_apps(&db);
 
-        let loaded = db.load_into_settings().unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
 
         assert_eq!(loaded.external_tools.len(), 2);
         assert_eq!(loaded.external_tools[0].id, ExternalToolId(1));
@@ -4149,6 +4142,11 @@ mod tests {
         assert!(loaded.external_tools[1].show_in_context_menu);
         assert!(!loaded.external_tools[1].for_editing);
         assert!(external_tools_migration_marker_present(&db));
+
+        // save_full は読み取り専用の移行元フィールドを書き戻さない。旧 write が残って
+        // いれば、この clear によって legacy table も空になるため回帰を検出できる。
+        loaded.custom_open_with_apps.clear();
+        db.save_full(&loaded).unwrap();
 
         let inner = db.inner.lock().unwrap();
         let legacy_count: i64 = inner

@@ -251,7 +251,10 @@ fn apply_delete_confirm_action(
 
 #[derive(Debug)]
 enum NativeGridContextMenuOutcome {
-    Consumed(Option<ContextMenuAction>),
+    Consumed {
+        nav: Option<ContextMenuAction>,
+        close_fullscreen: bool,
+    },
     Fallback,
 }
 
@@ -259,6 +262,14 @@ enum NativeGridContextMenuOutcome {
 enum ContextMenuSurface {
     Grid,
     Fullscreen,
+}
+
+fn native_external_tool_closes_fullscreen(surface: ContextMenuSurface, tool_exists: bool) -> bool {
+    surface == ContextMenuSurface::Fullscreen && tool_exists
+}
+
+fn escape_native_menu_label(label: &str) -> String {
+    label.replace('&', "&&")
 }
 
 #[derive(Clone)]
@@ -719,7 +730,7 @@ impl crate::app::App {
                 folder_command_target.clone(),
                 ContextMenuSurface::Grid,
             ) {
-                NativeGridContextMenuOutcome::Consumed(nav) => {
+                NativeGridContextMenuOutcome::Consumed { nav, .. } => {
                     self.context_menu_idx = None;
                     self.cached_handlers = None;
                     ctx.request_repaint();
@@ -778,6 +789,8 @@ impl crate::app::App {
                     self.draw_legacy_xmp_context_entries(ui, legacy_xmp_paths, &mut close);
 
                     ui.separator();
+                    let _ = self.render_open_with_menu(ui, &item, &mut close);
+                    ui.separator();
 
                     // 削除 (ゴミ箱)
                     if ui
@@ -826,7 +839,7 @@ impl crate::app::App {
                             }
                             // ── アプリケーションで開く ──
                             ui.separator();
-                            let _ = self.render_open_with_menu(ui, p, &mut close);
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                             ui.separator();
                             ui.horizontal(|ui| {
                                 if ui.button("左に回転 (L)").clicked() {
@@ -944,7 +957,7 @@ impl crate::app::App {
                             }
                             // ── アプリケーションで開く (ZipFile/PdfFile) ──
                             ui.separator();
-                            let _ = self.render_open_with_menu(ui, p, &mut close);
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, p.clone())]);
@@ -970,6 +983,8 @@ impl crate::app::App {
                                 copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
                                 close = true;
                             }
+                            ui.separator();
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                         }
                         GridItem::ZipDir {
                             zip_path,
@@ -1002,6 +1017,8 @@ impl crate::app::App {
                                 copy_path_text(ctx, representative);
                                 close = true;
                             }
+                            ui.separator();
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                         }
                         GridItem::PdfPage {
                             pdf_path, page_num, ..
@@ -1016,6 +1033,8 @@ impl crate::app::App {
                                 ctx.copy_text(format!("Page {}", page_num + 1));
                                 close = true;
                             }
+                            ui.separator();
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                         }
                         GridItem::ConvertibleArchive { path, .. } => {
                             if ui.button("パスをコピー").clicked() {
@@ -1062,6 +1081,8 @@ impl crate::app::App {
                                     .map(ContextMenuAction::JumpFromSearch);
                                 close = true;
                             }
+                            ui.separator();
+                            let _ = self.render_open_with_menu(ui, &item, &mut close);
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, path.clone())]);
@@ -1322,11 +1343,27 @@ impl crate::app::App {
         }
         match native_result {
             NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
-                NativeGridContextMenuOutcome::Consumed(None)
+                NativeGridContextMenuOutcome::Consumed {
+                    nav: None,
+                    close_fullscreen: false,
+                }
             }
             NativeContextMenuResult::MivCommand(command) => {
+                let close_fullscreen = match command {
+                    NativeMivCommand::ExternalTool(id) => native_external_tool_closes_fullscreen(
+                        target.surface,
+                        self.settings
+                            .external_tools
+                            .iter()
+                            .any(|tool| tool.id == id),
+                    ),
+                    _ => false,
+                };
                 let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
-                NativeGridContextMenuOutcome::Consumed(nav)
+                NativeGridContextMenuOutcome::Consumed {
+                    nav,
+                    close_fullscreen,
+                }
             }
             NativeContextMenuResult::Fallback { reason } => {
                 crate::logger::log(format!(
@@ -1388,24 +1425,29 @@ impl crate::app::App {
                 command: NativeMivCommand::CopyPath,
                 label: "選択項目のパスをコピー".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateLeft,
                 label: "左に回転 (L)".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateRight,
                 label: "右に回転 (R)".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             if target.explorer_folder.is_some() {
                 items.push(NativeMivMenuItem {
                     command: NativeMivCommand::OpenFolderInExplorer,
                     label: "このフォルダをエクスプローラで開く".to_string(),
                     enabled: true,
+                    separator_before: false,
                 });
             }
+            self.append_external_tool_native_menu_items(&mut items, &target.item);
             return items;
         }
 
@@ -1420,11 +1462,13 @@ impl crate::app::App {
                 command: NativeMivCommand::NewFolder,
                 label: "新しいフォルダ...".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::Paste,
                 label: "貼り付け".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
 
@@ -1433,6 +1477,7 @@ impl crate::app::App {
                 command: NativeMivCommand::Rename,
                 label: "名前の変更...".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
 
@@ -1445,6 +1490,7 @@ impl crate::app::App {
             command: NativeMivCommand::CopyPath,
             label: copy_path_label.to_string(),
             enabled: true,
+            separator_before: false,
         });
         if !target.is_folder_context
             && target
@@ -1458,6 +1504,7 @@ impl crate::app::App {
                 command: NativeMivCommand::CopyFileName,
                 label: "ファイル名をコピー".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
         if matches!(target.item, GridItem::Image(_)) {
@@ -1465,6 +1512,7 @@ impl crate::app::App {
                 command: NativeMivCommand::CopyImageToClipboard,
                 label: "画像をクリップボードにコピー".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
         if matches!(
@@ -1475,12 +1523,14 @@ impl crate::app::App {
                 command: NativeMivCommand::CopyEditBundle,
                 label: "編集内容をコピー".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             if self.has_page_edit_bundle_clipboard() {
                 items.push(NativeMivMenuItem {
                     command: NativeMivCommand::PasteEditBundle,
                     label: "編集内容を貼り付け".to_string(),
                     enabled: true,
+                    separator_before: false,
                 });
             }
         }
@@ -1495,11 +1545,13 @@ impl crate::app::App {
                 command: NativeMivCommand::OpenContainerAsPage,
                 label: "ページを開く".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::OpenContainerAsList,
                 label: "一覧を開く".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
         if in_search && !target.is_folder_context {
@@ -1507,6 +1559,7 @@ impl crate::app::App {
                 command: NativeMivCommand::JumpToFolder,
                 label: "フォルダに移動".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
         if matches!(target.item, GridItem::Image(_))
@@ -1516,11 +1569,13 @@ impl crate::app::App {
                 command: NativeMivCommand::RotateLeft,
                 label: "左に回転 (L)".to_string(),
                 enabled: true,
+                separator_before: false,
             });
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::RotateRight,
                 label: "右に回転 (R)".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
         if fullscreen_video {
@@ -1528,12 +1583,14 @@ impl crate::app::App {
                 command: NativeMivCommand::SetCurrentVideoFrameThumbnail,
                 label: "📌 現在のフレームを動画サムネに設定".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         } else if let Some((label, enabled)) = self.native_folder_pin_context_state(target) {
             items.push(NativeMivMenuItem {
                 command: NativeMivCommand::ToggleRepresentativeThumb,
                 label,
                 enabled,
+                separator_before: false,
             });
         }
         if target.explorer_folder.is_some() {
@@ -1541,9 +1598,31 @@ impl crate::app::App {
                 command: NativeMivCommand::OpenFolderInExplorer,
                 label: "このフォルダをエクスプローラで開く".to_string(),
                 enabled: true,
+                separator_before: false,
             });
         }
+        self.append_external_tool_native_menu_items(&mut items, &target.item);
         items
+    }
+
+    fn append_external_tool_native_menu_items(
+        &self,
+        items: &mut Vec<NativeMivMenuItem>,
+        target: &GridItem,
+    ) {
+        let external_items = crate::external_tool::external_tool_menu_items(
+            &self.settings.external_tools,
+            crate::external_tool::ExternalToolMenuTarget::from_grid_item(target),
+        );
+        let separate_from_existing = !items.is_empty() && !external_items.is_empty();
+        items.extend(external_items.into_iter().enumerate().map(|(index, item)| {
+            NativeMivMenuItem {
+                command: NativeMivCommand::ExternalTool(item.tool_id),
+                label: escape_native_menu_label(&item.label),
+                enabled: item.enabled,
+                separator_before: separate_from_existing && index == 0,
+            }
+        }));
     }
 
     fn native_folder_pin_context_state(
@@ -1736,6 +1815,22 @@ impl crate::app::App {
                 }
                 None
             }
+            NativeMivCommand::ExternalTool(id) => {
+                let Some(tool) = self
+                    .settings
+                    .external_tools
+                    .iter()
+                    .find(|tool| tool.id == id)
+                    .cloned()
+                else {
+                    self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
+                    return None;
+                };
+                let launch_target =
+                    crate::external_tool::LaunchTarget::from_grid_item(Some(&target.item));
+                self.queue_external_tool_launch(&tool, &launch_target);
+                None
+            }
         }
     }
 
@@ -1819,11 +1914,13 @@ impl crate::app::App {
             None,
             ContextMenuSurface::Fullscreen,
         ) {
-            NativeGridContextMenuOutcome::Consumed(_) => {
+            NativeGridContextMenuOutcome::Consumed {
+                close_fullscreen, ..
+            } => {
                 self.fs_context_menu_idx = None;
                 self.cached_handlers = None;
                 ctx.request_repaint();
-                return false;
+                return close_fullscreen;
             }
             NativeGridContextMenuOutcome::Fallback => {}
         }
@@ -1864,7 +1961,7 @@ impl crate::app::App {
                         }
                         // ── アプリケーションで開く ──
                         ui.separator();
-                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
+                        close_fullscreen |= self.render_open_with_menu(ui, &item, &mut close);
                         self.draw_legacy_xmp_context_entries(ui, vec![p.clone()], &mut close);
                     }
                     GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
@@ -1874,7 +1971,7 @@ impl crate::app::App {
                         }
                         // ── アプリケーションで開く ──
                         ui.separator();
-                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
+                        close_fullscreen |= self.render_open_with_menu(ui, &item, &mut close);
                     }
                     GridItem::ZipImage {
                         zip_path,
@@ -1895,6 +1992,8 @@ impl crate::app::App {
                             copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
                             close = true;
                         }
+                        ui.separator();
+                        close_fullscreen |= self.render_open_with_menu(ui, &item, &mut close);
                     }
                     GridItem::PdfPage {
                         pdf_path, page_num, ..
@@ -1909,6 +2008,8 @@ impl crate::app::App {
                             ctx.copy_text(format!("Page {}", page_num + 1));
                             close = true;
                         }
+                        ui.separator();
+                        close_fullscreen |= self.render_open_with_menu(ui, &item, &mut close);
                     }
                     // ZipDir / Stack はフルスクリーン対象外 (仮想ナビコンテナ) なので FS では
                     // 最小限 (そもそも FS の items にはメンバーの実 Image しか入らない)。
@@ -1920,6 +2021,8 @@ impl crate::app::App {
                             copy_path_text(ctx, path);
                             close = true;
                         }
+                        ui.separator();
+                        close_fullscreen |= self.render_open_with_menu(ui, &item, &mut close);
                     }
                     GridItem::SearchContainer { path, .. } => {
                         // Ctrl+G 結果ビューのコンテナ (v0.8.0): コピー系のみ最低限
@@ -2035,86 +2138,108 @@ impl crate::app::App {
     }
 
     /// 「アプリケーションで開く」サブメニューを描画する。
-    /// Image / ZipFile / PdfFile で共通のロジック。
-    /// アプリが起動された場合は true を返す。
+    /// 外部ツールは右クリック対象 1 件だけを使い、複数チェックへはまだ広げない。
+    /// フルスクリーンを閉じて起動先を見せる場合は true を返す。
     fn render_open_with_menu(
         &mut self,
         ui: &mut egui::Ui,
-        file_path: &std::path::Path,
+        item: &GridItem,
         close: &mut bool,
     ) -> bool {
+        let launch_target = crate::external_tool::LaunchTarget::from_grid_item(Some(item));
+        let file_path = launch_target.real_file().ok().map(Path::to_path_buf);
         let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e.to_lowercase()))
+            .as_deref()
+            .and_then(Path::extension)
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!(".{}", extension.to_lowercase()))
             .unwrap_or_default();
-        let file_path_owned = file_path.to_path_buf();
-        let mut app_launched = false;
+        let mut close_fullscreen = false;
 
         // 直近使用アプリ（最大3件）
-        for recent in self.settings.recent_open_with_apps.clone() {
-            let label = format!("{}で開く", recent.display_name);
-            if ui.button(&label).clicked() {
-                self.start_legacy_open_with(
-                    recent.display_name.clone(),
-                    std::path::PathBuf::from(&recent.exe_path),
-                    file_path_owned.clone(),
-                );
-                self.settings
-                    .record_recent_open_with(recent.display_name, recent.exe_path);
-                self.settings.save();
-                *close = true;
-                app_launched = true;
+        if let Some(file_path) = file_path.as_ref() {
+            for recent in self.settings.recent_open_with_apps.clone() {
+                let label = format!("{}で開く", recent.display_name);
+                if ui.button(&label).clicked() {
+                    self.start_legacy_open_with(
+                        recent.display_name.clone(),
+                        PathBuf::from(&recent.exe_path),
+                        file_path.clone(),
+                    );
+                    self.settings
+                        .record_recent_open_with(recent.display_name, recent.exe_path);
+                    self.settings.save();
+                    *close = true;
+                    close_fullscreen = true;
+                }
             }
         }
 
         // アプリ一覧（折りたたみ展開）
         egui::CollapsingHeader::new("アプリケーションで開く…").show(ui, |ui| {
-            // カスタムアプリ
-            let custom_apps = self.settings.custom_open_with_apps.clone();
-            if !custom_apps.is_empty() {
-                for app in &custom_apps {
-                    if ui.button(&app.display_name).clicked() {
-                        self.start_legacy_open_with(
-                            app.display_name.clone(),
-                            std::path::PathBuf::from(&app.exe_path),
-                            file_path_owned.clone(),
-                        );
-                        self.settings.record_recent_open_with(
-                            app.display_name.clone(),
-                            app.exe_path.clone(),
-                        );
-                        self.settings.save();
-                        *close = true;
-                        app_launched = true;
-                    }
+            // 登録済み外部ツール。ネイティブメニューと同じ純関数で表示可否を決める。
+            let external_items = crate::external_tool::external_tool_menu_items(
+                &self.settings.external_tools,
+                crate::external_tool::ExternalToolMenuTarget::from_grid_item(item),
+            );
+            for menu_item in &external_items {
+                let response = ui.add_enabled(
+                    menu_item.enabled,
+                    egui::Button::new(menu_item.label.as_str()),
+                );
+                let response = if let Some(reason) = menu_item.disabled_reason {
+                    response.on_disabled_hover_text(reason)
+                } else {
+                    response
+                };
+                if response.clicked() {
+                    let Some(tool) = self
+                        .settings
+                        .external_tools
+                        .iter()
+                        .find(|tool| tool.id == menu_item.tool_id)
+                        .cloned()
+                    else {
+                        self.show_feedback_toast(format!(
+                            "外部ツールが見つかりません (ID: {})",
+                            menu_item.tool_id.0
+                        ));
+                        continue;
+                    };
+                    self.queue_external_tool_launch(&tool, &launch_target);
+                    *close = true;
+                    close_fullscreen = true;
                 }
+            }
+            if !external_items.is_empty() {
                 ui.separator();
             }
 
             // システム関連付けアプリ（キャッシュ）
-            let handlers = match &self.cached_handlers {
-                Some((cached_ext, h)) if cached_ext == &ext => h.clone(),
-                _ => {
-                    let h = crate::open_with::enumerate_handlers(&ext);
-                    self.cached_handlers = Some((ext.clone(), h.clone()));
-                    h
-                }
-            };
-            for handler in &handlers {
-                if ui.button(&handler.display_name).clicked() {
-                    self.start_legacy_open_with(
-                        handler.display_name.clone(),
-                        std::path::PathBuf::from(&handler.exe_path),
-                        file_path_owned.clone(),
-                    );
-                    self.settings.record_recent_open_with(
-                        handler.display_name.clone(),
-                        handler.exe_path.clone(),
-                    );
-                    self.settings.save();
-                    *close = true;
-                    app_launched = true;
+            if let Some(file_path) = file_path.as_ref() {
+                let handlers = match &self.cached_handlers {
+                    Some((cached_ext, handlers)) if cached_ext == &ext => handlers.clone(),
+                    _ => {
+                        let handlers = crate::open_with::enumerate_handlers(&ext);
+                        self.cached_handlers = Some((ext.clone(), handlers.clone()));
+                        handlers
+                    }
+                };
+                for handler in &handlers {
+                    if ui.button(&handler.display_name).clicked() {
+                        self.start_legacy_open_with(
+                            handler.display_name.clone(),
+                            PathBuf::from(&handler.exe_path),
+                            file_path.clone(),
+                        );
+                        self.settings.record_recent_open_with(
+                            handler.display_name.clone(),
+                            handler.exe_path.clone(),
+                        );
+                        self.settings.save();
+                        *close = true;
+                        close_fullscreen = true;
+                    }
                 }
             }
 
@@ -2122,24 +2247,40 @@ impl crate::app::App {
             ui.separator();
             if ui.button("アプリケーションを追加…").clicked() {
                 if let Some(app) = crate::open_with::pick_exe_dialog() {
+                    let executable = PathBuf::from(&app.exe_path);
                     let already = self
                         .settings
-                        .custom_open_with_apps
+                        .external_tools
                         .iter()
-                        .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
+                        .filter_map(|tool| tool.executable.as_deref())
+                        .any(|path| {
+                            path.as_os_str()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&app.exe_path)
+                        });
                     if !already {
-                        self.settings
-                            .custom_open_with_apps
-                            .push(crate::settings::RecentApp {
-                                display_name: app.display_name,
-                                exe_path: app.exe_path,
-                            });
+                        let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                        tool.id = crate::external_tool::next_id(&self.settings.external_tools);
+                        tool.name = executable
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                            .unwrap_or(app.display_name);
+                        tool.executable = Some(executable);
+                        tool.show_in_context_menu = true;
+                        self.settings.external_tools.push(tool);
                         self.settings.save();
                     }
                 }
             }
+            ui.separator();
+            if ui.button("外部ツールの設定…").clicked() {
+                self.open_preferences_page(
+                    crate::ui_dialogs::preferences::PreferencesPage::ExternalTools,
+                );
+                *close = true;
+            }
         });
-        app_launched
+        close_fullscreen
     }
 
     /// チェック済みアイテムのパスを収集する。
@@ -2902,6 +3043,104 @@ mod delete_confirm_tests {
             .into_iter()
             .map(|item| item.command)
             .collect()
+    }
+
+    #[test]
+    fn native_menu_appends_all_visible_external_tools_after_one_separator() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = (0..12)
+            .map(|index| {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.id = crate::external_tool::ExternalToolId(index + 1);
+                tool.name = format!("tool-{index}");
+                tool
+            })
+            .collect();
+        let mut hidden = crate::external_tool::ExternalTool::defaults_for_viewing();
+        hidden.id = crate::external_tool::ExternalToolId(99);
+        hidden.name = "hidden".to_string();
+        hidden.show_in_context_menu = false;
+        app.settings.external_tools.insert(4, hidden);
+
+        let target = NativeGridContextMenuTarget {
+            // checked の Shell paths と外部ツール対象 item は別 ownership。P1b は item 側。
+            paths: vec![PathBuf::from(r"C:\media\checked-other.jpg")],
+            item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            item_index: Some(0),
+            is_folder_context: false,
+            has_checked: true,
+            surface: ContextMenuSurface::Grid,
+            explorer_folder: Some(PathBuf::from(r"C:\media")),
+        };
+
+        let items = app.native_grid_context_menu_items(&target, false);
+        let external: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item.command {
+                NativeMivCommand::ExternalTool(id) => Some((id, item)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(external.len(), 12, "表示時に 10 件で打ち切らない");
+        assert_eq!(
+            external.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>()
+        );
+        assert!(external[0].1.separator_before);
+        assert!(
+            external
+                .iter()
+                .skip(1)
+                .all(|(_, item)| !item.separator_before)
+        );
+    }
+
+    #[test]
+    fn missing_external_tool_id_is_reported_instead_of_ignored() {
+        let mut app = crate::app::setup_app_for_test();
+        let target = NativeGridContextMenuTarget {
+            paths: vec![PathBuf::from(r"C:\media\clicked.jpg")],
+            item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            item_index: Some(0),
+            is_folder_context: false,
+            has_checked: false,
+            surface: ContextMenuSurface::Grid,
+            explorer_folder: Some(PathBuf::from(r"C:\media")),
+        };
+
+        let action = app.dispatch_native_grid_context_command(
+            &egui::Context::default(),
+            NativeMivCommand::ExternalTool(crate::external_tool::ExternalToolId(404)),
+            &target,
+        );
+
+        assert!(action.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("外部ツールが見つかりません") && text.contains("404")
+        }));
+    }
+
+    #[test]
+    fn native_external_tool_closes_only_fullscreen_surface_after_lookup() {
+        assert!(native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Fullscreen,
+            true
+        ));
+        assert!(!native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Grid,
+            true
+        ));
+        assert!(!native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Fullscreen,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_external_tool_label_escapes_windows_mnemonic_marker() {
+        assert_eq!(escape_native_menu_label("Foo & Bar"), "Foo && Bar");
+        assert_eq!(escape_native_menu_label("Paint"), "Paint");
     }
 
     #[test]

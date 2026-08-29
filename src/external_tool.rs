@@ -7,7 +7,9 @@ use std::sync::{Arc, mpsc};
 use eframe::egui;
 
 pub const DEFAULT_PDF_RENDER_LONG_EDGE: u32 = 4096;
+const CONTEXT_MENU_DEFAULT_ON_THRESHOLD: usize = 10;
 const ASSOCIATED_APP_DISPLAY_NAME: &str = "関連付けアプリ";
+pub(crate) const VIRTUAL_EDITING_DISABLED_REASON: &str = "圧縮ファイル内のページは編集用ツールで開けません。書き出してから編集してください (フルスクリーンで Ctrl+E)";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -73,6 +75,41 @@ pub struct ExternalTool {
     pub for_editing: bool,
     pub show_in_context_menu: bool,
     pub keep_temp: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalToolMenuTarget {
+    RealFile,
+    VirtualPage,
+    Unsupported,
+}
+
+impl ExternalToolMenuTarget {
+    pub(crate) fn from_grid_item(item: &crate::grid_item::GridItem) -> Self {
+        use crate::grid_item::GridItem;
+        match item {
+            GridItem::Image(_)
+            | GridItem::Video(_)
+            | GridItem::Audio(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. } => Self::RealFile,
+            GridItem::ZipImage { .. } | GridItem::PdfPage { .. } | GridItem::Stack { .. } => {
+                Self::VirtualPage
+            }
+            GridItem::Folder(_) | GridItem::ZipDir { .. } | GridItem::SearchContainer { .. } => {
+                Self::Unsupported
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalToolMenuItem {
+    pub tool_id: ExternalToolId,
+    pub label: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +246,45 @@ pub fn next_id(existing: &[ExternalTool]) -> ExternalToolId {
         .find(|candidate| !used.contains(candidate))
         .unwrap_or(u32::MAX);
     ExternalToolId(free)
+}
+
+/// 設定ページから新規登録するとき、右クリック表示を既定 ON にするかを返す。
+///
+/// 利用者指定どおり、既存の ON が 10 件なら新規も ON、10 件を超えている場合だけ OFF にする。
+pub(crate) fn show_in_context_menu_by_default(existing: &[ExternalTool]) -> bool {
+    existing
+        .iter()
+        .filter(|tool| tool.show_in_context_menu)
+        .count()
+        <= CONTEXT_MENU_DEFAULT_ON_THRESHOLD
+}
+
+/// 外部ツールの右クリック項目を登録順に組み立てる。
+///
+/// ファイル存在確認や補正 DB 参照は行わず、項目種別とツール定義だけで判定する。
+pub(crate) fn external_tool_menu_items(
+    tools: &[ExternalTool],
+    target: ExternalToolMenuTarget,
+) -> Vec<ExternalToolMenuItem> {
+    tools
+        .iter()
+        .filter(|tool| tool.show_in_context_menu)
+        .filter_map(|tool| match target {
+            ExternalToolMenuTarget::RealFile => Some(ExternalToolMenuItem {
+                tool_id: tool.id,
+                label: tool.display_name(),
+                enabled: true,
+                disabled_reason: None,
+            }),
+            ExternalToolMenuTarget::VirtualPage if tool.for_editing => Some(ExternalToolMenuItem {
+                tool_id: tool.id,
+                label: tool.display_name(),
+                enabled: false,
+                disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
+            }),
+            ExternalToolMenuTarget::VirtualPage | ExternalToolMenuTarget::Unsupported => None,
+        })
+        .collect()
 }
 
 /// Windows の `CommandLineToArgvW` と同じ引用符・バックスラッシュ規則で、
@@ -686,6 +762,100 @@ mod tests {
         ];
         // max + 1 が溢れるので、前から空いている ID を返す。panic しないことが要件。
         assert_eq!(next_id(&tools), ExternalToolId(2));
+    }
+
+    fn menu_tool(id: u32, name: &str, for_editing: bool, shown: bool) -> ExternalTool {
+        ExternalTool {
+            id: ExternalToolId(id),
+            name: name.to_string(),
+            executable: Some(PathBuf::from(format!(r"C:\Tools\{name}.exe"))),
+            for_editing,
+            show_in_context_menu: shown,
+            ..ExternalTool::defaults_for_viewing()
+        }
+    }
+
+    #[test]
+    fn context_menu_default_turns_off_only_after_more_than_ten_are_on() {
+        let ten_on: Vec<_> = (0..10)
+            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false, true))
+            .collect();
+        assert!(show_in_context_menu_by_default(&ten_on));
+
+        let mut eleven_on = ten_on.clone();
+        eleven_on.push(menu_tool(11, "tool-10", false, true));
+        assert!(!show_in_context_menu_by_default(&eleven_on));
+
+        eleven_on.extend((12..30).map(|id| menu_tool(id, &format!("hidden-{id}"), false, false)));
+        assert!(!show_in_context_menu_by_default(&eleven_on));
+    }
+
+    #[test]
+    fn real_file_menu_keeps_registration_order_and_does_not_cap_visible_tools() {
+        let mut tools: Vec<_> = (0..12)
+            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false, true))
+            .collect();
+        tools.insert(4, menu_tool(99, "hidden", false, false));
+
+        let items = external_tool_menu_items(&tools, ExternalToolMenuTarget::RealFile);
+
+        assert_eq!(items.len(), 12);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.tool_id.0, item.label.clone()))
+                .collect::<Vec<_>>(),
+            (0..12)
+                .map(|index| (index + 1, format!("tool-{index}")))
+                .collect::<Vec<_>>()
+        );
+        assert!(items.iter().all(|item| item.enabled));
+        assert!(items.iter().all(|item| item.disabled_reason.is_none()));
+    }
+
+    #[test]
+    fn virtual_page_menu_keeps_only_disabled_editing_tools_with_reason() {
+        let tools = vec![
+            menu_tool(1, "viewer", false, true),
+            menu_tool(2, "editor", true, true),
+            menu_tool(3, "hidden-editor", true, false),
+        ];
+
+        let items = external_tool_menu_items(&tools, ExternalToolMenuTarget::VirtualPage);
+
+        assert_eq!(
+            items,
+            vec![ExternalToolMenuItem {
+                tool_id: ExternalToolId(2),
+                label: "editor".to_string(),
+                enabled: false,
+                disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
+            }]
+        );
+        assert!(external_tool_menu_items(&tools, ExternalToolMenuTarget::Unsupported).is_empty());
+    }
+
+    #[test]
+    fn context_menu_target_classifies_real_virtual_and_unsupported_items() {
+        assert_eq!(
+            ExternalToolMenuTarget::from_grid_item(&crate::grid_item::GridItem::Image(
+                PathBuf::from(r"C:\Images\page.jpg"),
+            )),
+            ExternalToolMenuTarget::RealFile
+        );
+        assert_eq!(
+            ExternalToolMenuTarget::from_grid_item(&crate::grid_item::GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\Books\book.zip"),
+                entry_name: "page.jpg".to_string(),
+            }),
+            ExternalToolMenuTarget::VirtualPage
+        );
+        assert_eq!(
+            ExternalToolMenuTarget::from_grid_item(&crate::grid_item::GridItem::Folder(
+                PathBuf::from(r"C:\Images"),
+            )),
+            ExternalToolMenuTarget::Unsupported
+        );
     }
 
     #[test]
