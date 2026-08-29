@@ -6504,13 +6504,8 @@ pub(super) fn resolve_spread_state(
         requested.unwrap_or_else(|| remote_spread_mode(stored_mode.unwrap_or(default_mode)));
     let mut reading_direction = requested_direction
         .unwrap_or_else(|| remote_reading_direction(stored_direction.unwrap_or(default_direction)));
-    if configured.is_rtl() {
-        reading_direction = RemoteReadingDirection::Rtl;
-    } else if matches!(
-        configured,
-        RemoteSpreadMode::Ltr | RemoteSpreadMode::LtrCover
-    ) {
-        reading_direction = RemoteReadingDirection::Ltr;
+    if let Some(canonical) = configured.canonical_reading_direction() {
+        reading_direction = canonical;
     }
     // 縦持ち強制は「1 画面に 2 ページ出さない」ための表示限定 Single。
     // **分割は既にそれを達成している**ので重ねない。重ねると縦持ちで分割が消え、
@@ -10142,6 +10137,100 @@ mod tests {
                 RemoteReadingDirection::Rtl,
             )
         );
+    }
+
+    /// 分割モードは、切り出す左右の順番と操作方向が必ず一致する。
+    ///
+    /// `is_rtl()` は見開きのペア順の述語で、分割を意図的に除外している。読み方向を
+    /// それで代用していたため `SplitRtl` が canonical 化から漏れ、server は右→左に
+    /// ページを切りながら端末の tap / swipe / seek は左→右、という組み合わせを
+    /// 作れていた。要求・保存・既定のどこから来ても、mode が方向を決め切る。
+    #[test]
+    fn a_split_mode_decides_its_own_direction_whatever_direction_was_asked_for() {
+        for (remote_mode, core_mode, expected) in [
+            (
+                RemoteSpreadMode::SplitRtl,
+                crate::settings::SpreadMode::SplitRtl,
+                RemoteReadingDirection::Rtl,
+            ),
+            (
+                RemoteSpreadMode::SplitLtr,
+                crate::settings::SpreadMode::SplitLtr,
+                RemoteReadingDirection::Ltr,
+            ),
+        ] {
+            // 切り出し順は mode だけで決まる。方向はこれと一致しなければならない。
+            let slice_first = crate::page_split::SplitDirection::from_spread_mode(core_mode)
+                .expect("分割モードは切り出し方向を持つ")
+                .first();
+            let expected_first = match expected {
+                RemoteReadingDirection::Rtl => crate::page_split::PageSlice::Right,
+                RemoteReadingDirection::Ltr => crate::page_split::PageSlice::Left,
+            };
+            assert_eq!(
+                slice_first, expected_first,
+                "{core_mode:?}: 期待した方向と切り出し順が食い違っている"
+            );
+
+            // 反対向きを明示要求しても、保存値でも、既定でも、mode が勝つ。
+            for (requested_direction, stored_direction, default_direction) in [
+                (
+                    Some(RemoteReadingDirection::Ltr),
+                    Some(crate::settings::ReadingDirection::Ltr),
+                    crate::settings::ReadingDirection::Ltr,
+                ),
+                (
+                    Some(RemoteReadingDirection::Rtl),
+                    Some(crate::settings::ReadingDirection::Rtl),
+                    crate::settings::ReadingDirection::Rtl,
+                ),
+                (None, None, crate::settings::ReadingDirection::Ltr),
+            ] {
+                let (_, _, resolved) = resolve_spread_state(
+                    Some(remote_mode),
+                    requested_direction,
+                    Some(core_mode),
+                    stored_direction,
+                    crate::settings::SpreadMode::Single,
+                    default_direction,
+                    false,
+                );
+                assert_eq!(
+                    resolved, expected,
+                    "{remote_mode:?} + 要求 {requested_direction:?}: 方向が mode と割れた"
+                );
+
+                // 縦持ち強制でも分割は残るので、方向も残る。
+                let (_, effective, portrait_resolved) = resolve_spread_state(
+                    Some(remote_mode),
+                    requested_direction,
+                    Some(core_mode),
+                    stored_direction,
+                    crate::settings::SpreadMode::Single,
+                    default_direction,
+                    true,
+                );
+                assert_eq!(effective, remote_mode, "縦持ちで分割が消えている");
+                assert_eq!(portrait_resolved, expected, "縦持ちで方向が割れた");
+            }
+
+            // 本体側の写像も同じ答えを返す。
+            let core_direction = super::super::ui::core_reading_direction(
+                core_mode,
+                match expected {
+                    RemoteReadingDirection::Rtl => RemoteReadingDirection::Ltr,
+                    RemoteReadingDirection::Ltr => RemoteReadingDirection::Rtl,
+                },
+            );
+            let expected_core = match expected {
+                RemoteReadingDirection::Rtl => crate::settings::ReadingDirection::Rtl,
+                RemoteReadingDirection::Ltr => crate::settings::ReadingDirection::Ltr,
+            };
+            assert_eq!(
+                core_direction, expected_core,
+                "{core_mode:?}: 本体側の写像が反対向きの要求に引きずられた"
+            );
+        }
     }
 
     #[test]

@@ -3719,17 +3719,12 @@ fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
     }
 }
 
-fn core_reading_direction(
+pub(super) fn core_reading_direction(
     mode: crate::settings::SpreadMode,
     requested: RemoteReadingDirection,
 ) -> crate::settings::ReadingDirection {
-    if mode.is_rtl() {
-        crate::settings::ReadingDirection::Rtl
-    } else if matches!(
-        mode,
-        crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-    ) {
-        crate::settings::ReadingDirection::Ltr
+    if let Some(canonical) = mode.canonical_reading_direction() {
+        canonical
     } else if requested.is_rtl() {
         crate::settings::ReadingDirection::Rtl
     } else {

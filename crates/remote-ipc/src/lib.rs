@@ -248,6 +248,21 @@ impl RemoteSpreadMode {
         matches!(self, Self::Rtl | Self::RtlCover)
     }
 
+    /// このモード自身が読み方向を決めるなら、その方向。決めないなら `None`。
+    ///
+    /// **読み方向を mode から導く場所を、ここ以外に作らないこと。**分割モードを足した
+    /// とき `is_rtl()` は `Rtl | RtlCover` のままだったので、`SplitRtl` が container /
+    /// ui の両方の分岐から漏れ、右→左に切ったページを端末が左→右として操作する組み
+    /// 合わせを作れていた。**この match に `_` を置かない** — 変種を足したらここが
+    /// 壊れて気付けることが、この関数の存在理由。
+    pub fn canonical_reading_direction(self) -> Option<RemoteReadingDirection> {
+        match self {
+            Self::Ltr | Self::LtrCover | Self::SplitLtr => Some(RemoteReadingDirection::Ltr),
+            Self::Rtl | Self::RtlCover | Self::SplitRtl => Some(RemoteReadingDirection::Rtl),
+            Self::Single => None,
+        }
+    }
+
     /// 横長ページを左右へ分割して読むモードか。
     pub fn is_split(self) -> bool {
         matches!(self, Self::SplitLtr | Self::SplitRtl)
