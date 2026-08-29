@@ -138,8 +138,6 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod top_level_grid_view;
 mod viewer_context_registry;
 #[cfg(windows)]
-#[cfg(windows)]
-pub(crate) use viewer_context_registry::ActiveContextUpdate;
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
@@ -40631,9 +40629,9 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         gamepad_batch: Option<crate::app::gamepad_input::GamepadFrameBatch>,
-    ) -> ActiveContextUpdate {
+    ) -> crate::app::gamepad_input::ActiveContextUpdate {
         if !self.active_detached_context_is_at_rest() {
-            return ActiveContextUpdate {
+            return crate::app::gamepad_input::ActiveContextUpdate {
                 updated: false,
                 gamepad_batch,
                 gamepad_outcome: None,
@@ -40822,7 +40820,7 @@ impl App {
                 self.reconcile_closed_bookmark_detached_context(&closed);
             }
         }
-        ActiveContextUpdate {
+        crate::app::gamepad_input::ActiveContextUpdate {
             updated: true,
             gamepad_batch,
             gamepad_outcome,

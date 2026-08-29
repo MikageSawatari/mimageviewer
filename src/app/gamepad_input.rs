@@ -53,6 +53,24 @@ impl GamepadFrameBatch {
     }
 }
 
+/// [`crate::app::App::update_active_viewer_context`] の結果。
+///
+/// **置き場所は registry ではない。**registry の公開 API はリワークの監査対象で、
+/// この型はそこの概念ではない (中身は gamepad の batch と結果で、`updated` だけが
+/// context の話)。監査を allowlist で黙らせず、持ち主のいる側へ置く。
+///
+/// batch を値で持ち回るのは、配り先が「前面の別ウィンドウか root か」で変わり、その判定が
+/// mount できたかどうかと同じだから。App へ pending フラグを足すと、どの frame のどの
+/// context 向けだったかが状態から読めなくなる (リワーク憲法 規則 3)。
+#[cfg(windows)]
+pub(crate) struct ActiveContextUpdate {
+    pub(crate) updated: bool,
+    /// mount できなかったので配らなかった batch。呼び出し側が root へ配る。
+    pub(crate) gamepad_batch: Option<GamepadFrameBatch>,
+    /// この context が配った結果。frame 全体の後始末と、root が受け取るナビに使う。
+    pub(crate) gamepad_outcome: Option<GamepadDispatchOutcome>,
+}
+
 /// 配った結果。frame 全体の後始末に使う。
 pub(crate) struct GamepadDispatchOutcome {
     /// 配った先の context で解決すべきナビゲーション。**root の合流点へ流さないこと** —

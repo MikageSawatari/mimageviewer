@@ -4321,17 +4321,3 @@ mod tests {
         assert_eq!(table.residence(unknown), ContextResidence::Unknown);
     }
 }
-
-/// [`crate::app::App::update_active_viewer_context`] の結果。
-///
-/// gamepad の batch を持ち回るのは、配り先が「前面の別ウィンドウか root か」で変わり、
-/// **その判定が mount できたかどうかと同じ**だから。App へ pending フラグを足すと、
-/// どの frame のどの context 向けだったかが状態から読めなくなる (リワーク憲法 規則 3)。
-#[cfg(windows)]
-pub(crate) struct ActiveContextUpdate {
-    pub(crate) updated: bool,
-    /// mount できなかったので配らなかった batch。呼び出し側が root へ配る。
-    pub(crate) gamepad_batch: Option<crate::app::gamepad_input::GamepadFrameBatch>,
-    /// この context が配った結果。frame 全体の後始末に使う。
-    pub(crate) gamepad_outcome: Option<crate::app::gamepad_input::GamepadDispatchOutcome>,
-}
