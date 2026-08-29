@@ -362,11 +362,19 @@ fn transition_host_hwnd(state: PresentationTransitionState) -> u64 {
     }
 }
 
+/// この state が持つ `request` は、既に native へ渡してあるか。
+///
+/// **`Aborting` を含めてはならない。**`Aborting` の `request` は「abort が終わったら
+/// 始める後継」であって、native はそれを知らない。含めると、後継に対して abort を
+/// 出し、in-flight な abort の identity をその後継 id で上書きしてしまう。上書きすると
+/// native が返す元 request の `NativeAborted` / `NativeFailed` がどの照合にも一致せず、
+/// 遷移が永久に待つ (2026-08-29 レビュー R-01)。`Aborting` は
+/// [`reduce_replaced_request`] と [`terminal_close`] が専用の分岐で扱う。
 fn native_prepare_was_issued(state: PresentationTransitionState) -> bool {
     matches!(
         state,
         PresentationTransitionState::Preparing {
-            progress: PreparingProgress::AwaitingNative { .. } | PreparingProgress::Aborting { .. },
+            progress: PreparingProgress::AwaitingNative { .. },
             ..
         } | PresentationTransitionState::Ready { .. }
             | PresentationTransitionState::Committing { .. }
@@ -381,6 +389,35 @@ fn reduce_replaced_request(
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
+    // 既に abort が飛んでいるなら、native が持っているのは「中止した側」であって、
+    // ここに居る後継ではない。差し替えてよいのは後継だけで、in-flight な abort の
+    // identity には触らない。二重の `AbortNative` も出さない (R-01)。
+    if let PresentationTransitionState::Preparing {
+        progress:
+            PreparingProgress::Aborting {
+                aborted_request_id,
+                aborted_target,
+                aborted_candidate_hwnd,
+                aborted_candidate_host_hwnd,
+                ..
+            },
+        ..
+    } = state
+    {
+        return (
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::Aborting {
+                    aborted_request_id,
+                    aborted_target,
+                    aborted_candidate_hwnd,
+                    aborted_candidate_host_hwnd,
+                    next_host_hwnd: ready_host_hwnd,
+                },
+            },
+            effects,
+        );
+    }
     let old_request = request_from_state(state).unwrap();
     let aborted_candidate_host_hwnd = (old_request.current != ViewerPresentation::DetachedWindow
         && old_request.target == ViewerPresentation::DetachedWindow)
@@ -744,6 +781,29 @@ fn terminal_close(
         effects.push(PresentationTransitionEffect::AbortNative {
             request_id,
             candidate_hwnd: candidate_hwnd(state),
+        });
+    }
+    // `Aborting` では abort が既に飛んでいるので二度は出さない。ここで出すと
+    // `request_id` は後継 (native が知らない) なのに `candidate_hwnd` は中止した側、
+    // という食い違った command になる (R-01 と同じ取り違え)。
+    // 通常なら中止した側の host は `NativeAborted` の受理で壊すが、terminal close は
+    // そこへ到達しないため、作りかけの host をここで畳む。
+    if let PresentationTransitionState::Preparing {
+        progress:
+            PreparingProgress::Aborting {
+                aborted_request_id,
+                aborted_target,
+                aborted_candidate_host_hwnd,
+                ..
+            },
+        ..
+    } = state
+        && aborted_candidate_host_hwnd != 0
+    {
+        effects.push(PresentationTransitionEffect::DestroyHost {
+            request_id: aborted_request_id,
+            target: aborted_target,
+            hwnd: aborted_candidate_host_hwnd,
         });
     }
     let current = request.map_or_else(
@@ -1176,6 +1236,125 @@ mod tests {
             }
         )));
         // Killing mutation: invert native_prepare_was_issued in terminal_close.
+    }
+
+    /// 連打しても、native が処理している abort の identity は動かない。
+    ///
+    /// `Aborting` の `request` は「abort が終わったら始める後継」で、native はそれを
+    /// 知らない。3 回目の要求でそれを「発行済み」と見なすと、後継 id で
+    /// `aborted_request_id` を上書きし、native が返す元 request の terminal event が
+    /// どの照合にも一致しなくなって永久に待つ (2026-08-29 レビュー R-01)。
+    #[test]
+    fn replacing_again_while_aborting_does_not_move_the_abort_that_native_is_running() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let issued_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        drive_to_native_wait(&mut owner);
+
+        // 2 回目: ここで初めて abort が飛ぶ。
+        let second_id = request(&mut owner, ViewerPresentation::MainWindow, MAIN_HOST);
+        let effects = owner.take_effects();
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::AbortNative { request_id, .. }
+                    if *request_id == issued_id
+            )),
+            "abort は native へ渡した request に対して出る"
+        );
+
+        // 3 回目以降: 後継が入れ替わるだけ。abort は出し直さない。
+        let third_id = request(&mut owner, ViewerPresentation::Fullscreen, 0);
+        let fourth_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        let effects = owner.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, PresentationTransitionEffect::AbortNative { .. })),
+            "native へ渡していない後継に対して abort を出している"
+        );
+        assert_ne!(third_id, fourth_id);
+
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::Aborting {
+                        aborted_request_id,
+                        ..
+                    },
+                } if aborted_request_id == issued_id && request.id == fourth_id
+            ),
+            "abort の identity が後継で上書きされた: {:?}",
+            owner.state()
+        );
+
+        // 元 request の terminal event は、連打の後でも受理される。
+        owner.dispatch(PresentationTransitionEvent::NativeAborted {
+            request_id: issued_id,
+        });
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::AwaitingHost
+                        | PreparingProgress::ReadyToPrepare { .. },
+                } if request.id == fourth_id
+            ),
+            "元 request の abort 完了で最後の後継へ進めていない: {:?}",
+            owner.state()
+        );
+    }
+
+    /// `Aborting` 中に閉じても、abort を二重に出さず、identity も混ぜない。
+    ///
+    /// 素朴に書くと `request_id` は後継 (native が知らない)、`candidate_hwnd` は中止した
+    /// 側、という食い違った command になる。中止した側が作りかけた host は通常
+    /// `NativeAborted` の受理で壊すが、terminal close はそこへ到達しない。
+    #[test]
+    fn closing_while_aborting_neither_repeats_the_abort_nor_leaves_its_host() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let issued_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        drive_to_native_wait(&mut owner);
+        request(&mut owner, ViewerPresentation::MainWindow, MAIN_HOST);
+        owner.take_effects();
+
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        let effects = owner.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, PresentationTransitionEffect::AbortNative { .. })),
+            "既に飛んでいる abort をもう一度出している: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::DestroyHost {
+                    request_id,
+                    hwnd: CANDIDATE_HOST,
+                    ..
+                } if *request_id == issued_id
+            )),
+            "中止した側の host が畳まれずに残る: {effects:?}"
+        );
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Stable { .. }
+        ));
     }
 
     #[test]
