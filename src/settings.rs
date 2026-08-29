@@ -6137,12 +6137,18 @@ static MAIN_UNREADABLE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
 
 /// `Settings::save()` が **実際に書き込みへ成功した回数**。
 ///
-/// save は毎回 `Settings` 全体を書くので、「ある値を変えた後で 1 回でも save が
-/// 通ったなら、その値はもう永続化されている」が成り立つ。連続操作中に保存を
-/// 先送りしたい呼び出し側は、値を変えた時点の世代を覚えておき、書くべきときに
-/// `save_generation()` と比べれば「他の誰かの save が自分の分も書いたか」を
-/// 判定できる。**保存済みかどうかを別のフラグで二重に持たないため**の値で、
-/// 抑止中 (`MAIN_UNREADABLE_THIS_SESSION` / `save_suppressed`) や失敗時は進めない。
+/// save は毎回 `Settings` 全体を書くので、**save が 1 回通れば、その瞬間の
+/// `self.settings` はすべてディスクに載っている**。連続操作中に保存を先送りしたい
+/// 呼び出し側は、値を変えた時点の世代を覚えておき、書くべきときに `save_generation()`
+/// と比べれば「別経路の save が自分の分も書いたか」を判定できる。
+/// **保存済みかどうかを別のフラグで二重に持たないため**の値で、抑止中
+/// (`MAIN_UNREADABLE_THIS_SESSION` / `save_suppressed`) や失敗時は進めない。
+///
+/// 「変えた値がそのまま載った」とまでは言えない点に注意。環境設定ダイアログは開いた
+/// 時点の snapshot を持ち、OK でそれを live へ戻してから保存するので、開いている間に
+/// runtime 側で変えた値は上書きされ得る (`overwrite_non_preferences_from` が拾わない
+/// 項目)。これは本仕組み以前からある挙動で、先送りの判定としては正しく働く
+/// (上書き後の live 値こそが保存すべき値になるため)。
 static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// 直近までに成功した `Settings::save()` の世代。詳細は [`SAVE_GENERATION`]。

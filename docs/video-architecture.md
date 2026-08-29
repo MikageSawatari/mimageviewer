@@ -883,8 +883,13 @@ presenter payload の案内状態にはしない。
 外す一方、現在の raster の Arc とその旧可視 span を display-only holdover として session に残す。
 新 first paint が publish された frame で raster と可視 span を一緒に交換するため、再構築中に blank
 や一時的な誤スケールを挟まない。
-strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする typed command に変換し、該当する
-persisted range を即時保存する。旧版由来の段階外値は回した向きの直近段へ移す。native wheel の
+strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする typed command に変換する。
+**保存は 1 ノッチごとには行わない。** `Settings::save` は全設定の JSON 化 + SQLite transaction
+なので (実測 1.3ms、VST3 プラグイン状態 1MB を持つ環境で 17ms)、ホイール中はメモリ上の
+設定だけを進め、変えた時点の save 世代を session に控える。書くのは session を閉じる
+`stop_video_seek_strip_session` の 1 回だけで、世代が動いていれば別経路の save が既に
+書いている。終了 / トレイ退避は `persist_window_state_and_flush` の全体保存が拾う。
+旧版由来の段階外値は回した向きの直近段へ移す。native wheel の
 即時 item navigation は strip 矩形上で作らず、egui 側も MouseWheel event と scroll delta を消費する。
 背後の grid / item navigation へ再転送しない。右上の固定小文字は session の現在設定値を描き、
 波形再構築中の旧 raster scale とは別フィールドで運ぶ。

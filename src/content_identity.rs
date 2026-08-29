@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -876,6 +876,9 @@ impl ContentIdentityRecorder {
 
     /// UI thread では channel 送信だけを行う。metadata 取得を含む I/O は worker 側。
     pub(crate) fn record(&self, source: ContentIdentitySource, trigger: ContentIdentityTrigger) {
+        // 台帳の UPDATE は worker 側で遅れて起きる。掃除側が「今まさに編集された」ことを
+        // 知る手がかりはここしかないので、送信より前に上げる ([`RECORD_SEQUENCE`])。
+        RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let display = source.path.display().to_string();
         let request = RecordRequest {
             source,
@@ -1407,10 +1410,26 @@ fn drop_sources_with_nothing_to_restore(
         ));
     }
     for file_key in &outcome.restored {
+        // 「編集された」とは言い切らない。2 回目の probe で行が見えた、が観測したこと。
+        // store が読めなかった回も同じ経路を通る (読めない = 不在の証拠にしない)。
         crate::logger::log(format!(
-            "content_identity: restored origin {file_key} (edited while probing)"
+            "content_identity: restored origin {file_key} (rows present on re-probe)"
         ));
     }
+}
+
+/// 編集の記録要求を投げた回数。`ContentIdentityRecorder::record` が **UI スレッドで、
+/// channel へ送る前に** 上げる。
+///
+/// 台帳の `last_edit_at` は worker が後から書くので、「行はもうあるが台帳はまだ古い」
+/// 瞬間が必ずある。その瞬間に CAS を撃つと期待値が一致してしまい、編集したばかりの
+/// 復元元の flag を下ろせる。空の復元元を掃除する側は、観測を始める前後でこの値が
+/// 動いていないことを確かめてから下ろす (2026-08-29 レビュー R-05 / Codex 指摘)。
+static RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 直近までに投げた編集記録要求の回数。詳細は [`RECORD_SEQUENCE`]。
+fn record_sequence() -> u64 {
+    RECORD_SEQUENCE.load(Ordering::Relaxed)
 }
 
 /// [`drop_sources_with_nothing_to_restore`] が実際に台帳へ書いたこと。
@@ -1437,6 +1456,8 @@ fn drop_sources_with_nothing_to_restore_with_probe(
     if candidates.is_empty() {
         return outcome;
     }
+    // 観測の開始点。これ以降に編集が 1 件でも記録されたら、この回は flag を下ろさない。
+    let record_sequence_before = record_sequence();
     let file_keys = candidates
         .iter()
         .flat_map(|candidate| candidate.sources.iter())
@@ -1469,7 +1490,12 @@ fn drop_sources_with_nothing_to_restore_with_probe(
         .filter(|key| !backed.contains(*key))
         .cloned()
         .collect::<Vec<_>>();
-    for file_key in &unbacked {
+    // 編集は「store の行を書く」->「台帳の記録要求を投げる」の順で、台帳への UPDATE は
+    // さらに後の worker で起きる。行が現れた瞬間の台帳はまだ古いので、CAS だけでは
+    // 止まらない。観測中に 1 件でも記録要求が出ていたら、どの key が対象かに関わらず
+    // この回の掃除をやめる。掃除は次のフォルダ訪問でやり直せる。
+    let edited_while_probing = record_sequence() != record_sequence_before;
+    for file_key in unbacked.iter().filter(|_| !edited_while_probing) {
         // 台帳を読めなかった key は触らない。期待値が無いまま消すと CAS の意味が無い。
         let Some(&expected) = expected_last_edit_at.get(file_key) else {
             continue;
@@ -1483,8 +1509,9 @@ fn drop_sources_with_nothing_to_restore_with_probe(
         }
     }
     // clear の後にもう一度 store を読む。probe と clear の間に書かれた行はここで見つかる。
-    // timestamp ではなく **行の有無** を見るので、同じミリ秒に 2 つの編集が入って CAS が
-    // 見分けられなかった場合もここで拾える。候補を残すか消すかも、この後の観測で決める。
+    // timestamp ではなく **行の有無** を見るので、編集経路を通らずに行を足す書き手
+    // (サイドカー取り込みなど、`record` を呼ばないもの) も拾える。候補を残すか消すかも、
+    // この後の観測で決める。
     let re_backed = probe(&unbacked);
     // 戻すのは **自分が下ろした** key だけ。CAS が拒んだ key は flag が 1 のままなので
     // 触る必要が無い。
@@ -1862,14 +1889,24 @@ fn unix_time_millis() -> i64 {
 #[cfg(test)]
 mod tests {
 
+    /// `RECORD_SEQUENCE` はプロセス全体で 1 つなので、これを読むテストは直列化する。
+    /// 本番でも「観測中にどこかで編集が記録されたら今回は掃除しない」という粗い判定で、
+    /// per-key ではない。掃除は次のフォルダ訪問でやり直せるので、見送りは害にならない。
+    fn lock_record_sequence() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 「行がもう無い」という観測は store を何本も開く間に古くなる。その間に入った編集を
     /// 自分の clear で消してはいけない。
     ///
-    /// 欠陥は CAS の期待値を probe の **後** に読んでいたことで、期待値が既に並行編集の
-    /// timestamp になっているため CAS が必ず成立していた。守るはずの編集が消え、候補も
-    /// stale な観測で落ちていた (2026-08-29 レビュー R-05)。
+    /// **本番の順序を再現する**: 編集は store の行を先に commit し、台帳の記録要求は
+    /// その後に投げ、台帳への UPDATE はさらに後の worker で起きる。つまり行が現れた
+    /// 瞬間の `last_edit_at` はまだ古く、CAS だけでは止まらない。掃除側は
+    /// `RECORD_SEQUENCE` が動いたことで気付く (2026-08-29 レビュー R-05 / Codex 指摘)。
     #[test]
     fn an_edit_that_lands_while_probing_keeps_its_restore_origin() {
+        let _serial = lock_record_sequence();
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("content_identity.db");
         let db = ContentIdentityDb::open_at(&db_path).unwrap();
@@ -1903,34 +1940,33 @@ mod tests {
             }],
         }];
 
-        // 1 回目の probe の最中に編集が入る。probe 自身は古い観測 (= 行なし) を返す。
+        // 1 回目の probe の最中に編集が入る。本番と同じく、行が先・台帳は後。
+        // 台帳はここでは触らない (worker がまだ走っていない状態)。
         let mut probe_calls = 0;
         let outcome =
             drop_sources_with_nothing_to_restore_with_probe(&db, &mut candidates, |keys| {
                 probe_calls += 1;
                 if probe_calls == 1 {
-                    db.mark_restorable(&file_key, ContentKind::Image, Some(200))
-                        .unwrap();
+                    RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
                     std::collections::BTreeSet::new()
                 } else {
                     keys.iter().cloned().collect()
                 }
             });
 
-        assert_eq!(probe_calls, 2, "clear の後に観測し直していない");
-        // 再 probe による事後修復ではなく、CAS が止めたことを確かめる。消してから戻すと
-        // その間 flag が 0 で、そこで落ちれば復元の申し出が永久に消える。
+        // 事後修復ではなく、そもそも下ろさなかったことを確かめる。消してから戻すと
+        // その間 flag が 0 で、そこで落ちれば復元の申し出が永久に消える。台帳は
+        // worker がまだ書いていないので、CAS の期待値は一致してしまう点に注意。
         assert_eq!(
             outcome,
             EmptyOriginCleanup::default(),
-            "並行編集を CAS で止めず、一度消してから戻している"
+            "並行編集中に flag を下ろした (消してから戻すのでは足りない)"
         );
         let entry = db.ledger_entry(&file_key).unwrap().unwrap();
         assert!(
             entry.has_restorable_content,
             "probe 中に入った編集の復元元 flag を消した"
         );
-        assert_eq!(entry.last_edit_at, 200, "編集側の timestamp を書き換えた");
         assert_eq!(
             candidates.len(),
             1,
@@ -1938,9 +1974,74 @@ mod tests {
         );
     }
 
+    /// 記録要求はこちらの観測より前に出ていて、worker の台帳 UPDATE だけが probe 中に
+    /// 届く場合。`RECORD_SEQUENCE` は動かないので、止めるのは CAS の側。
+    ///
+    /// 期待値を probe の **後** に読むと、その値が既に worker の書いた新しい timestamp に
+    /// なっていて CAS が必ず成立する。probe の前に読むから止まる。
+    #[test]
+    fn a_ledger_update_that_lands_while_probing_still_refuses_the_clear() {
+        let _serial = lock_record_sequence();
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let origin_path = dir.path().join("origin.png");
+        let file_key = crate::path_key::normalize_keep_drive(&origin_path);
+        db.upsert(
+            &ContentIdentitySource::new(&origin_path, ContentKind::Image),
+            &RecordedFileState {
+                file_key: file_key.clone(),
+                size: 10,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            100,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+
+        let mut candidates = vec![RestoreCandidate {
+            target_key: "target".to_string(),
+            target_path: dir.path().join("target.png"),
+            target_kind: ContentKind::Image,
+            full_hash: "full".to_string(),
+            sources: vec![RestoreSourceCandidate {
+                file_key: file_key.clone(),
+                path: origin_path.clone(),
+                kind: ContentKind::Image,
+                last_edit_at: 100,
+                source_exists: true,
+            }],
+        }];
+
+        // worker が台帳だけを書く。行はまだどの store にも無い (= probe は空のまま)。
+        let mut probe_calls = 0;
+        let outcome = drop_sources_with_nothing_to_restore_with_probe(&db, &mut candidates, |_| {
+            probe_calls += 1;
+            if probe_calls == 1 {
+                db.mark_restorable(&file_key, ContentKind::Image, Some(200))
+                    .unwrap();
+            }
+            std::collections::BTreeSet::new()
+        });
+
+        assert_eq!(
+            outcome,
+            EmptyOriginCleanup::default(),
+            "probe 後に読んだ期待値で CAS が成立し、flag を下ろした"
+        );
+        let entry = db.ledger_entry(&file_key).unwrap().unwrap();
+        assert!(
+            entry.has_restorable_content,
+            "台帳が動いたのに復元元 flag を消した"
+        );
+    }
+
     /// 本当に何も残っていない復元元は、これまでどおり flag を下ろして候補から外す。
     #[test]
     fn a_restore_origin_with_nothing_behind_it_is_still_dropped() {
+        let _serial = lock_record_sequence();
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("content_identity.db");
         let db = ContentIdentityDb::open_at(&db_path).unwrap();
