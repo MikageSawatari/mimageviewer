@@ -87,6 +87,20 @@ pub(crate) enum StripThumbnailFailure {
     WindowTimedOut { timeout_secs: u64 },
 }
 
+impl StripThumbnailFailure {
+    /// 保持している説明文字列の長さ。メモリ予算の概算だけに使う。
+    fn detail_len(&self) -> usize {
+        match self {
+            Self::DecoderUnavailable(detail)
+            | Self::SeekFailed(detail)
+            | Self::DemuxFailed(detail)
+            | Self::DecodeFailed(detail)
+            | Self::ConvertFailed(detail) => detail.len(),
+            Self::InvalidCellTime | Self::NoFrame(_) | Self::WindowTimedOut { .. } => 0,
+        }
+    }
+}
+
 /// なぜセルにフレームを割り当てられなかったか。
 ///
 /// 実素材の sweep では `NoFrame` が最多の失敗理由で、しかも 87% が「最後のセルだけ」という
@@ -582,6 +596,88 @@ pub(crate) struct StripWindowWork {
     pub(crate) cache_lookup: Vec<PlannedStripCell>,
     /// 外部データが不正で安定したセル ID を作れなかった添字。
     pub(crate) invalid_cells: Vec<usize>,
+    /// この要求が扱う窓 (可視 + 先読み) の全セル ID。既決着かどうかは問わない。
+    /// 復号済みセルを予算内へ落とすとき、ここに載っているものは落とさない。
+    pub(crate) requested_ids: BTreeSet<StripCellId>,
+}
+
+/// 復号済みセルをメモリに残す上限。320x320 RGBA = 400 KiB/セルなので約 320 セル。
+///
+/// セルは要求されるたび増えるだけで、これが無いと 0.1 秒間隔の長尺動画を行き来した
+/// セッションが数 GiB を抱える。落として失うのは復号済み RGBA だけで、次に必要になれば
+/// WebP cache から数 ms で読み直せる (再復号ではない)。
+pub(crate) const MAX_RETAINED_CELL_BYTES: usize = 128 * 1024 * 1024;
+
+/// 決着セル 1 つがメモリに占める概算。
+///
+/// 失敗セルは画素を持たないが、0 と数えると失敗だけが無限に溜まる余地が残るので、
+/// 文字列ぶんに固定の器代を足して数える。
+fn retained_cell_bytes(outcome: &StripThumbnailOutcome) -> usize {
+    const OVERHEAD: usize = 128;
+    match outcome {
+        StripThumbnailOutcome::Ready(thumbnail) => thumbnail.rgba.len() + OVERHEAD,
+        StripThumbnailOutcome::Failed(failure) => failure.detail_len() + OVERHEAD,
+    }
+}
+
+/// 予算を超えたぶんだけ、今の窓から遠いセルを落とす純関数。落とす ID を返す。
+///
+/// **窓 (可視 + 先読み) のセルは落とさない。** 窓自体が予算より大きければ予算を超えたまま
+/// 残る。窓の外を一律に捨てるのではなく遠い順に必要な分だけ捨てるのは、少し戻るたびに
+/// 直前まで見ていた近傍を捨てて読み直す往復を作らないため (連結カラー化で同じ形の
+/// 予算超過 -> 破棄 -> 再計算ループを踏んでいる)。
+///
+/// 距離は窓の時間範囲からの秒数で測る。`StripCellId` は f64 の bit 表現なので、
+/// 順序ではなく `target_secs` で比べる。
+pub(crate) fn plan_strip_cell_eviction(
+    cells: &BTreeMap<StripCellId, StripThumbnailOutcome>,
+    pinned: &BTreeSet<StripCellId>,
+    budget_bytes: usize,
+) -> Vec<StripCellId> {
+    let total: usize = cells.values().map(retained_cell_bytes).sum();
+    if total <= budget_bytes {
+        return Vec::new();
+    }
+    let window_secs = pinned
+        .iter()
+        .map(|id| id.target_secs())
+        .fold(None::<(f64, f64)>, |acc, secs| {
+            Some(acc.map_or((secs, secs), |(lo, hi)| (lo.min(secs), hi.max(secs))))
+        });
+    let mut droppable = cells
+        .iter()
+        .filter(|(id, _)| !pinned.contains(*id))
+        .map(|(id, outcome)| {
+            let secs = id.target_secs();
+            let distance = match window_secs {
+                // 窓が空 (= 有効なセルが 1 つも無い要求) なら距離は測れない。
+                // 全部同じ扱いにして、あとは ID 順で古い側から落ちる。
+                None => 0.0,
+                Some((lo, hi)) if secs < lo => lo - secs,
+                Some((_, hi)) if secs > hi => secs - hi,
+                Some(_) => 0.0,
+            };
+            (distance, *id, retained_cell_bytes(outcome))
+        })
+        .collect::<Vec<_>>();
+    // 遠い順。同距離は ID 順で決めて、同じ入力から同じ答えが出るようにする。
+    droppable.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let mut remaining = total;
+    let mut dropped = Vec::new();
+    for (_, id, bytes) in droppable {
+        if remaining <= budget_bytes {
+            break;
+        }
+        remaining = remaining.saturating_sub(bytes);
+        dropped.push(id);
+    }
+    dropped
 }
 
 /// 窓と既決着セルから、DB 照会対象を中心優先で作る純関数。
@@ -611,6 +707,7 @@ pub(crate) fn plan_strip_window_work(
     let mut cache_lookup = Vec::new();
     let mut invalid_cells = Vec::new();
     let mut seen_ids = BTreeSet::new();
+    let mut requested_ids = BTreeSet::new();
     let exact_keyframe = matches!(axis, StripAxis::KeyframeIndex { .. });
 
     if let Some(range) = requested_range.as_ref() {
@@ -637,6 +734,7 @@ pub(crate) fn plan_strip_window_work(
             if visible && !visible_ids.contains(&id) {
                 visible_ids.push(id);
             }
+            requested_ids.insert(id);
             if settled.contains(&id) || !seen_ids.insert(id) {
                 continue;
             }
@@ -665,6 +763,7 @@ pub(crate) fn plan_strip_window_work(
         visible_ids,
         cache_lookup,
         invalid_cells,
+        requested_ids,
     }
 }
 
@@ -1368,6 +1467,26 @@ fn process_window_request(
 
     let settled = lock_recover(state).settled_ids();
     let work = plan_strip_window_work(&request.axis, request.spec, &settled);
+    // 窓が決まったこの時点で、窓の外の古いセルを予算まで落とす。落としたセルは
+    // `settled_ids` から消えるので、また必要になれば次の要求が WebP cache から拾い直す。
+    // UI へ渡す snapshot も `cells` の clone なので、ここを抑えると毎フレームの複製も
+    // 累積セル数ではなく予算に比例する。
+    {
+        let mut shared = lock_recover(state);
+        let dropped =
+            plan_strip_cell_eviction(&shared.cells, &work.requested_ids, MAX_RETAINED_CELL_BYTES);
+        if !dropped.is_empty() {
+            for id in &dropped {
+                shared.cells.remove(id);
+            }
+            crate::logger::log(format!(
+                "[video-seek-strip] evicted {} decoded cells over {} MiB budget ({} left)",
+                dropped.len(),
+                MAX_RETAINED_CELL_BYTES / (1024 * 1024),
+                shared.cells.len(),
+            ));
+        }
+    }
     for &index in &work.invalid_cells {
         lock_recover(state)
             .latest_request_failures
@@ -2611,6 +2730,116 @@ fn convert_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cell_of(secs: f64, bytes: usize) -> (StripCellId, StripThumbnailOutcome) {
+        let id = StripCellId::from_secs(secs).expect("finite seconds");
+        (
+            id,
+            StripThumbnailOutcome::Ready(StripThumbnail {
+                target_secs: secs,
+                width: 1,
+                height: 1,
+                rgba: Arc::new(vec![0u8; bytes]),
+            }),
+        )
+    }
+
+    fn cells_over(
+        range: std::ops::Range<i64>,
+        bytes: usize,
+    ) -> BTreeMap<StripCellId, StripThumbnailOutcome> {
+        range.map(|i| cell_of(i as f64, bytes)).collect()
+    }
+
+    fn pinned_over(range: std::ops::Range<i64>) -> BTreeSet<StripCellId> {
+        range
+            .map(|i| StripCellId::from_secs(i as f64).expect("finite seconds"))
+            .collect()
+    }
+
+    #[test]
+    fn nothing_is_dropped_while_the_decoded_cells_fit_the_budget() {
+        let cells = cells_over(0..10, 1_000);
+        let pinned = pinned_over(0..3);
+        assert!(plan_strip_cell_eviction(&cells, &pinned, 1_000_000).is_empty());
+    }
+
+    /// 予算を超えたら、今の窓から遠いセルから落とす。窓の中と、その近くは残す。
+    #[test]
+    fn eviction_takes_the_cells_furthest_from_the_window_first() {
+        // 0..20 秒の 21 セル、1 セル 1000 バイト + 器代。窓は 10..12 秒。
+        let cells = cells_over(0..21, 1_000);
+        let pinned = pinned_over(10..13);
+        let dropped = plan_strip_cell_eviction(&cells, &pinned, 10 * 1_128);
+        let dropped_secs = dropped
+            .iter()
+            .map(|id| id.target_secs() as i64)
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            !dropped_secs.is_empty(),
+            "予算を超えているのに 1 つも落としていない"
+        );
+        for pinned_id in &pinned {
+            assert!(
+                !dropped.contains(pinned_id),
+                "窓の中のセル {} 秒を落とした",
+                pinned_id.target_secs()
+            );
+        }
+        // 遠い端 (0 秒 / 20 秒) が落ち、窓のすぐ隣 (9 秒 / 13 秒) は残る。
+        assert!(dropped_secs.contains(&0), "一番遠い 0 秒が残っている");
+        assert!(dropped_secs.contains(&20), "一番遠い 20 秒が残っている");
+        assert!(!dropped_secs.contains(&9), "窓の隣の 9 秒まで落とした");
+        assert!(!dropped_secs.contains(&13), "窓の隣の 13 秒まで落とした");
+    }
+
+    /// 予算より窓が大きいときは、予算を超えたままでも窓は落とさない。
+    /// ここで落とすと、今見ている画がその場で消える。
+    #[test]
+    fn the_current_window_is_never_evicted_even_when_it_alone_exceeds_the_budget() {
+        let cells = cells_over(0..20, 1_000);
+        let pinned = pinned_over(0..20);
+        assert!(plan_strip_cell_eviction(&cells, &pinned, 1_000).is_empty());
+    }
+
+    /// 窓を何千回動かしても、保持量は予算のまわりで一定に留まる。
+    ///
+    /// 欠陥は「決着したセルを足すだけで、worker が生きている間 1 つも落とさない」ことで、
+    /// 0.1 秒間隔の長尺を行き来しただけで数 GiB に届く。件数ではなくバイト数で見る
+    /// (2026-08-29 レビュー R-20)。
+    #[test]
+    fn the_working_set_stays_bounded_after_thousands_of_windows() {
+        const CELL_BYTES: usize = 400 * 1024;
+        const BUDGET: usize = 8 * 1024 * 1024;
+        const WINDOW: i64 = 12;
+
+        let mut cells: BTreeMap<StripCellId, StripThumbnailOutcome> = BTreeMap::new();
+        let mut peak = 0usize;
+        for step in 0..3_000i64 {
+            let pinned = pinned_over(step..step + WINDOW);
+            for id in &pinned {
+                cells
+                    .entry(*id)
+                    .or_insert_with(|| cell_of(id.target_secs(), CELL_BYTES).1);
+            }
+            for id in plan_strip_cell_eviction(&cells, &pinned, BUDGET) {
+                cells.remove(&id);
+            }
+            let held: usize = cells.values().map(retained_cell_bytes).sum();
+            peak = peak.max(held);
+        }
+
+        assert!(
+            peak <= BUDGET + WINDOW as usize * (CELL_BYTES + 128),
+            "3000 窓のあと保持量が予算を超えて伸びた: {peak} バイト"
+        );
+        assert!(
+            cells.len() > WINDOW as usize,
+            "予算内なのに窓のぶんしか残っていない (毎回捨てて読み直す往復になる): {}",
+            cells.len()
+        );
+    }
 
     /// 実機報告 2026-08-26: 画像間隔を 15 秒にしても 1 秒間隔のセルが並ぶ動画があった。
     /// 索引が不完全で格子軸へ落ちると、間隔が尺だけから決まり設定を見ていなかった。
