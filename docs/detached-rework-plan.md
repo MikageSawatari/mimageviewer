@@ -1459,6 +1459,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-29 gamepad の配り先を前面の context にする (レビュー R-02。ClaudeCode / Codex
+双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の sample / dispatch 分割、
+[src/app.rs](../src/app.rs) の root pass routing と `apply_nav_without_the_root_join`、
+[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の `ActiveContextUpdate`、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明。commit は `4a19ed0a`。
+
+**不変条件と所有境界**: キーボード・マウス・タッチ・gamepad は同じ前面 context を操作する。
+gamepad だけが OS からグローバルに読まれるため、**サンプリング (drain / ボタン状態 /
+リピート生成) は App-global、dispatch は前面 context を mount した中**、という 2 段に分ける。
+`gamepad_dispatch_allowed` は mount 中の fullscreen / overlay / modal を読むので dispatch 側。
+`update_active_viewer_context` は closure の間だけ mount して root projection を復元するので、
+「その後に配る」では届かない。配って得た `AddressBarNav` は **root の合流点へ流さない** —
+流すとメインウィンドウが動き、同じ不具合が別の入口から再発する。
+
+**なぜ症状パッチではないか**: 述語 (`fullscreen_idx.is_some()`) を緩めるだけでは、dispatch が
+root projection の items / idx に対して走るので**別ページを操作する**。直したのは所有境界で、
+新しい App-level bool / Option は足していない (規則 3 — この frame の操作は値として持ち回る)。
+時間窓も heuristic も無い (規則 5)。既存 detached テストは削除・弱体化していない (規則 8)。
+mount 内 dispatch を止める mutation を独立テストが拒否する。
+
+**述語は古いが、踏めるようになったのは v3.3.0**: `gamepad_targets_viewer` は v3.2.0 と同一
+だが、`active_detached_context_is_at_rest` / `update_active_viewer_context` は v3.2.0 に存在
+しない。レビュー台帳の「既存残存」は述語だけを見た分類で、実際にはリワークで到達可能に
+なった。
+
+**未了として記録する**: ParkedLive が前面のときは通常の gamepad 操作を配らず捨てるのが
+正しい契約 (activation 優先) だが、「ParkedLive の窓が前面か」を判定する hwnd → window id
+の逆引きが存在しない。**機構を憶測で足さず**、現状 (root へ配る = v3.2.0 と同じ) のまま残す。
+
 **2026-08-29 presentation transition の所有境界 7 件 (v3.3.0 出荷前レビュー R-01 / R-17 /
 R-24 と、その調査で出た同型。ClaudeCode / Codex 双方が構造的修正と合意):**
 
