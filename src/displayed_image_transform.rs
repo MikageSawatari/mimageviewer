@@ -4,7 +4,25 @@ use crate::rotation_db::Rotation;
 use crate::settings::FullscreenFitMode;
 
 const EPSILON: f32 = 1.0e-6;
+
+/// この矩形に何を貼るのかを、矩形を作る側が宣言する。
+///
+/// `Texels` は **リサンプラが選んだ整数サイズのテクスチャをそのまま貼る**場所。矩形が
+/// 物理ピクセル格子からずれていると egui/wgpu がもう一度バイリニアを掛け、Lanczos の
+/// 結果がボケる (backlog §1.0e)。だから縮小時は原点もサイズも寄せる。
+///
+/// `Proportional` はナビゲータの縮図のように、**主表示の矩形を比例縮小した位置関係
+/// そのものが情報**である場所。ここを寄せると、画面の可視範囲を示す枠が主表示と
+/// 食い違う。貼るのもリサンプラの出力ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RectPixelFit {
+    Texels,
+    Proportional,
+}
 const PHYSICAL_SCALE_INTEGER_EPSILON: f32 = 1.0e-4;
+/// 整数サイズとみなす許容誤差。f32 の倍率が持つ相対誤差 (2^-24 程度) を、
+/// 実用的な画像の辺長 (数万 px) に掛けても収まる幅にしてある。
+const PHYSICAL_PIXEL_EXTENT_EPSILON: f64 = 1.0e-3;
 /// A cursor mapping span smaller than one logical point cannot provide a stable pair of distinct
 /// pointer positions. Fall back to the full pan band before either axis becomes sub-point thin.
 const MIN_Z_AIM_MAPPING_SPAN_POINTS: f32 = 1.0;
@@ -76,6 +94,8 @@ pub(crate) struct DisplayedImageTransformInput {
     pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
     pub(crate) pixels_per_point: f32,
     pub(crate) placement: ResolvedDisplayPlacement,
+    /// この矩形に貼るものの種類。詳細は [`RectPixelFit`]。
+    pub(crate) pixel_fit: RectPixelFit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,11 +207,15 @@ impl DisplayedImageTransform {
         if !total_scale.is_finite() || total_scale <= 0.0 {
             return None;
         }
-        let full_image_rect = snap_rect_origin_to_physical_pixel(
-            full_image_rect,
-            total_scale,
-            input.pixels_per_point,
-        );
+        let full_image_rect = match input.pixel_fit {
+            RectPixelFit::Texels => snap_rect_to_physical_pixels(
+                full_image_rect,
+                display_size,
+                total_scale,
+                input.pixels_per_point,
+            ),
+            RectPixelFit::Proportional => full_image_rect,
+        };
         // 描画位置は表示空間、UV は元画像空間。**同じ矩形を両方に使わない**のが、
         // 回転時に部分矩形を丸ごと捨てていた原因だった。
         let (paint_rect, uv_rect) = effective_bbox(input.free_rotation_rad, input.content_bbox)
@@ -714,6 +738,32 @@ pub(crate) fn quantize_points_to_physical_pixels(points: f32, pixels_per_point: 
     (points * pixels_per_point).round() / pixels_per_point
 }
 
+/// 画像 1 枚が実際に占める物理ピクセル数。
+///
+/// **リサンプラの出力サイズと描画矩形のサイズは、この 1 つの答えを共有する。**
+/// 別々に綴ると整数サイズのテクスチャを小数サイズの矩形へ貼ることになり、
+/// egui/wgpu が **もう一度バイリニアで貼り直す**ので Lanczos の結果がボケる
+/// (backlog §1.0e、利用者報告 2026-08-29。他ビューア 5 本のシャープさ 104.6 に対し
+/// mIV は 61.5 だった)。
+///
+/// 整数から 1e-3 以内なら丸め、それ以外は切り捨てる。単純な `floor` にできないのは、
+/// f32 の倍率が `1440/1600` を 0.899999976 にするため — `floor(1600 * s)` が 1439、
+/// `floor(1120 * s)` が 1007 と **両軸とも 1px 小さくなり**、1440x1008 へ引き伸ばされて
+/// 全面がボケる。切り捨て側を残すのは、本当に端数がある倍率で 1px はみ出さないため。
+pub(crate) fn physical_pixel_extent(source_len: f32, physical_scale: f32) -> u32 {
+    let exact = f64::from(source_len) * f64::from(physical_scale);
+    if !exact.is_finite() {
+        return 1;
+    }
+    let nearest = exact.round();
+    let resolved = if (exact - nearest).abs() <= PHYSICAL_PIXEL_EXTENT_EPSILON {
+        nearest
+    } else {
+        exact.floor()
+    };
+    (resolved.max(1.0) as u32).max(1)
+}
+
 pub(crate) fn physical_scale_is_near_integer(logical_scale: f32, pixels_per_point: f32) -> bool {
     let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
     if !physical_scale.is_finite() || physical_scale <= 0.0 {
@@ -732,19 +782,43 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
     }
 }
 
-fn snap_rect_origin_to_physical_pixel(
+/// 描画矩形を物理ピクセルへ寄せる。
+///
+/// 整数倍拡大では従来どおり原点だけ寄せる (サイズは元から整数)。**縮小では原点に加えて
+/// サイズも寄せる。** リサンプラは整数サイズのテクスチャを作るので、貼り先が小数サイズの
+/// ままだと egui/wgpu がもう一度バイリニアを掛け、Lanczos の結果がボケる
+/// (backlog §1.0e)。サイズは [`physical_pixel_extent`] で決める — リサンプラの出力サイズと
+/// **同じ関数**なので、2 か所で丸めが割れることがない。
+///
+/// 端数のある拡大には触らない。そちらの出力サイズは画像全体ではなく可視領域から
+/// 決まるので、ここで全体矩形を寄せても一致しない。
+fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
+    display_size: egui::Vec2,
     logical_scale: f32,
     pixels_per_point: f32,
 ) -> egui::Rect {
-    if !physical_scale_is_near_integer(logical_scale, pixels_per_point) {
+    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
+        let snapped_min = egui::pos2(
+            quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
+            quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
+        );
+        return egui::Rect::from_min_size(snapped_min, rect.size());
+    }
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    let physical_scale = logical_scale * pixels_per_point;
+    if !physical_scale.is_finite() || physical_scale <= 0.0 || physical_scale >= 1.0 {
         return rect;
     }
     let snapped_min = egui::pos2(
         quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
         quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
     );
-    egui::Rect::from_min_size(snapped_min, rect.size())
+    let snapped_size = egui::vec2(
+        physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
+        physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
+    );
+    egui::Rect::from_min_size(snapped_min, snapped_size)
 }
 
 fn size_is_valid(size: egui::Vec2) -> bool {
@@ -1114,6 +1188,7 @@ mod tests {
         content_bbox: Option<egui::Rect>,
     ) -> DisplayedImageTransformInput {
         DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 7,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(20.0, 30.0),
@@ -1147,6 +1222,7 @@ mod tests {
     fn page_transform(page_idx: usize, rect: egui::Rect) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx,
                 viewport_rect: egui::Rect::from_min_max(
                     egui::pos2(-1000.0, -1000.0),
@@ -1415,6 +1491,7 @@ mod tests {
         let trim = egui::Rect::from_min_max(egui::pos2(0.20, 0.10), egui::pos2(0.90, 0.80));
         let transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: 7,
                 viewport_rect: egui::Rect::from_min_max(
                     egui::pos2(25.0, 10.0),
@@ -1450,6 +1527,7 @@ mod tests {
     fn visible_source_rect_tracks_orthogonal_rotation() {
         let transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: 7,
                 viewport_rect: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -1528,6 +1606,7 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(420.0, -600.0), egui::pos2(1920.0, 1200.0));
         let start_pan = egui::vec2(43.0, -29.0);
         let page_input = |page_idx| DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx,
             viewport_rect: viewport,
             source_size: egui::vec2(1000.0, 1200.0),
@@ -1711,6 +1790,7 @@ mod tests {
         let pixels_per_point = 1.25;
         let texture_size = egui::vec2(101.0, 99.0);
         let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: egui::Rect::from_center_size(
                 egui::pos2(100.0, 100.0),
@@ -1754,6 +1834,7 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.25, 0.75), egui::vec2(130.0, 130.0));
         let transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: 0,
                 viewport_rect: egui::Rect::from_min_size(
                     egui::Pos2::ZERO,

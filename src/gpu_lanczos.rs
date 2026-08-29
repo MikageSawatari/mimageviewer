@@ -12,7 +12,10 @@ use std::{
 
 use wgpu::util::DeviceExt as _;
 
-use crate::{adjustment::PostFilter, displayed_image_transform::physical_scale_is_near_integer};
+use crate::{
+    adjustment::PostFilter,
+    displayed_image_transform::{physical_pixel_extent, physical_scale_is_near_integer},
+};
 use crate::{
     gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
     settings::AnimeUpscaleSourceLimit,
@@ -1096,7 +1099,9 @@ impl LanczosWorkPlan {
 fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u32; 2] {
     let quantum = quantum.max(1);
     let quantize = |source: u32| {
-        let exact = ((source as f64 * f64::from(scale)).floor() as u32).max(1);
+        // 描画矩形と同じ関数を通す。ここだけ floor にすると、貼り先が 1px 大きくなって
+        // egui/wgpu がもう一度バイリニアを掛ける (§1.0e)。
+        let exact = physical_pixel_extent(source as f32, scale);
         let quantized = exact
             .saturating_add(quantum - 1)
             .checked_div(quantum)
@@ -1142,15 +1147,10 @@ fn target_and_source_region_for_branch(
     }
 }
 
+/// 拡大時の可視領域も、縮小時の全体と同じ 1 つの規則でサイズを決める
+/// ([`physical_pixel_extent`])。
 fn stable_visible_target_len(source_len: f32, physical_scale: f32) -> u32 {
-    let exact = f64::from(source_len) * f64::from(physical_scale);
-    let nearest = exact.round();
-    let stable = if (exact - nearest).abs() <= 1.0e-3 {
-        nearest
-    } else {
-        exact.floor()
-    };
-    (stable as u32).max(1)
+    physical_pixel_extent(source_len, physical_scale)
 }
 
 fn sanitize_visible_source_rect(rect: egui::Rect) -> Option<egui::Rect> {
@@ -1952,6 +1952,127 @@ mod tests {
                 FullscreenPaintScaleBranch::OriginalOneToOne
             );
         }
+    }
+
+    /// リサンプラの出力サイズと、実際に貼る矩形の物理ピクセルサイズは一致しなければ
+    /// ならない。食い違うと egui/wgpu が **もう一度バイリニアで貼り直す**ので、
+    /// Lanczos の結果がボケる (backlog §1.0e、利用者報告 2026-08-29)。
+    ///
+    /// 実測: 2560x1440 100% で他ビューア 5 本のラプラシアン標準偏差 104.6 に対し
+    /// mIV は 61.5 だった。カーネルではなくサイズと矩形の食い違いが原因。
+    fn drawn_physical_size_rotated(
+        source: [u32; 2],
+        viewport: egui::Vec2,
+        ppp: f32,
+        rotation: crate::rotation_db::Rotation,
+    ) -> [u32; 2] {
+        let source_size = egui::vec2(source[0] as f32, source[1] as f32);
+        let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
+            crate::displayed_image_transform::DisplayedImageTransformInput {
+                pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, viewport),
+                source_size,
+                texture_size: source_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                pixels_per_point: ppp,
+                placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                    zoom_pan: None,
+                },
+            },
+        )
+        .expect("transform");
+        let size = transform.full_image_rect.size() * ppp;
+        [size.x.round() as u32, size.y.round() as u32]
+    }
+
+    fn drawn_physical_size(source: [u32; 2], viewport: egui::Vec2, ppp: f32) -> [u32; 2] {
+        drawn_physical_size_rotated(source, viewport, ppp, crate::rotation_db::Rotation::None)
+    }
+
+    fn page_fit_logical_scale(source: [u32; 2], viewport: egui::Vec2) -> f32 {
+        (viewport.x / source[0] as f32).min(viewport.y / source[1] as f32)
+    }
+
+    #[test]
+    fn the_resampled_texture_is_exactly_the_size_it_is_drawn_at() {
+        // 利用者が比較に使った 2 枚と、DPI 125% / 縦長ウィンドウを足した組み合わせ。
+        let cases: &[([u32; 2], egui::Vec2, f32)] = &[
+            ([1120, 1600], egui::vec2(2560.0, 1440.0), 1.0),
+            ([4248, 6048], egui::vec2(2560.0, 1440.0), 1.0),
+            ([2480, 3508], egui::vec2(1920.0, 1080.0), 1.0),
+            ([1120, 1600], egui::vec2(2048.0, 1152.0), 1.25),
+            ([3000, 2000], egui::vec2(1600.0, 1200.0), 1.0),
+        ];
+        for &(source, viewport, ppp) in cases {
+            let logical_scale = page_fit_logical_scale(source, viewport);
+            let physical = physical_scale(logical_scale, ppp);
+            if physical >= 1.0 {
+                continue;
+            }
+            let target = quantized_target_size(source, physical, TARGET_SIZE_QUANTUM);
+            let drawn = drawn_physical_size(source, viewport, ppp);
+            assert_eq!(
+                target, drawn,
+                "source={source:?} viewport={viewport:?} ppp={ppp}                  リサンプル先 {target:?} と描画サイズ {drawn:?} が違う (再度バイリニアが掛かる)"
+            );
+        }
+    }
+
+    /// 回転していても一致すること。回転後の表示サイズから倍率もサイズも決まるので、
+    /// 片方だけ回転前の辺を見ていると 90 度で崩れる。
+    #[test]
+    fn the_resampled_texture_matches_the_drawn_size_when_rotated() {
+        let source = [4248u32, 6048u32];
+        let viewport = egui::vec2(2560.0, 1440.0);
+        for rotation in [
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::Cw180,
+            crate::rotation_db::Rotation::Cw270,
+        ] {
+            let rotated = match rotation {
+                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+                    [source[1], source[0]]
+                }
+                _ => source,
+            };
+            let logical_scale = page_fit_logical_scale(rotated, viewport);
+            let physical = physical_scale(logical_scale, 1.0);
+            assert!(physical < 1.0, "この組み合わせは縮小のはず");
+            let target = quantized_target_size(rotated, physical, TARGET_SIZE_QUANTUM);
+            let drawn = drawn_physical_size_rotated(source, viewport, 1.0, rotation);
+            assert_eq!(target, drawn, "rotation={rotation:?}");
+        }
+    }
+
+    /// 端数が本物の倍率では切り捨てる。丸め上げると矩形が 1px はみ出す。
+    #[test]
+    fn a_real_fraction_still_truncates() {
+        // 2480 * (1080/3508) = 763.54... 整数から遠いので 763。
+        let scale = 1080.0f32 / 3508.0;
+        assert_eq!(
+            quantized_target_size([2480, 3508], scale, TARGET_SIZE_QUANTUM),
+            [763, 1080]
+        );
+    }
+
+    /// f32 の倍率が持つ誤差だけは吸収する。ここが floor に戻ると全面がボケる。
+    #[test]
+    fn the_f32_scale_error_does_not_shrink_the_target() {
+        let scale = 1440.0f32 / 1600.0;
+        assert!(
+            (f64::from(1600.0f32) * f64::from(scale)) < 1440.0,
+            "f32 の 1440/1600 は 1440 をわずかに下回るはず (この前提が崩れたら不要な test)"
+        );
+        assert_eq!(
+            quantized_target_size([1120, 1600], scale, TARGET_SIZE_QUANTUM),
+            [1008, 1440]
+        );
     }
 
     #[test]

@@ -33,9 +33,9 @@ use crate::app::{
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
-    FullscreenPageLayout, FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform,
-    ZAimBasis, ZTransformInput, physical_pixel_scale, physical_scale_is_near_integer,
-    quantize_points_to_physical_pixels, z_cursor_image_px,
+    FullscreenPageLayout, FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+    ResolvedZTransform, ZAimBasis, ZTransformInput, physical_pixel_scale,
+    physical_scale_is_near_integer, quantize_points_to_physical_pixels, z_cursor_image_px,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::gpu_lanczos::FullscreenPaintResource;
@@ -946,6 +946,9 @@ fn build_flat_navigator_layout(
     for (main, visible_uv) in main_pages.into_iter().zip(visible_uvs) {
         let navigator = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                // 縮図なので寄せない。主表示を比例縮小した位置関係そのものが情報で、
+                // 貼るのもリサンプラの出力ではない (カタログのサムネイル)。
+                pixel_fit: RectPixelFit::Proportional,
                 page_idx: main.page_idx,
                 viewport_rect: canvas_rect,
                 source_size: main.source_size,
@@ -4053,6 +4056,7 @@ fn fs_image_draw_rect_for_size(
     content_bbox: Option<egui::Rect>,
 ) -> Option<egui::Rect> {
     DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        pixel_fit: RectPixelFit::Texels,
         page_idx: 0,
         viewport_rect: full_rect,
         source_size: tex_size,
@@ -4243,6 +4247,7 @@ fn resolve_fs_image_transform(
     let layout_long = layout_source_size.x.max(layout_source_size.y).max(1.0);
     let layout_size = layout_source_size * (reference_long / layout_long);
     let layout = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        pixel_fit: RectPixelFit::Texels,
         texture_size: layout_size,
         ..input
     })?;
@@ -6775,6 +6780,7 @@ impl App {
             .unwrap_or(tex_size);
         let resolved = ResolvedZTransform::resolve(ZTransformInput {
             image: DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: fs_idx,
                 viewport_rect: image_rect,
                 source_size,
@@ -10643,6 +10649,7 @@ impl App {
                     .min(page.rect.height() / rotated_size.y.max(1.0));
                 let transform = DisplayedImageTransform::from_resolved_rect(
                     DisplayedImageTransformInput {
+                        pixel_fit: RectPixelFit::Texels,
                         page_idx: page.idx,
                         viewport_rect: full_rect,
                         source_size: resource.size_vec2(),
@@ -10856,6 +10863,7 @@ impl App {
                 .intersect(image_rect);
         let left_transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: left,
                 viewport_rect: image_rect,
                 source_size: left_texture.size_vec2(),
@@ -10872,6 +10880,7 @@ impl App {
         );
         let right_transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: right,
                 viewport_rect: image_rect,
                 source_size: right_texture.size_vec2(),
@@ -15065,6 +15074,7 @@ impl App {
                             if let Some(compare_size) = compare_size {
                                 single_transform = DisplayedImageTransform::resolve(
                                     DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
                                         page_idx: fs_idx,
                                         viewport_rect: image_rect,
                                         source_size: compare_size,
@@ -21496,6 +21506,7 @@ impl App {
         if let [page] = layout.pages.as_slice() {
             let main = page.main;
             let base = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: main.page_idx,
                 viewport_rect: main.viewport_rect,
                 source_size: main.source_size,
@@ -25600,6 +25611,7 @@ impl App {
             let fit_bbox =
                 crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox);
             let transform_input = DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx,
                 viewport_rect: full_rect,
                 source_size: source_size.unwrap_or(tex_size),
@@ -28038,6 +28050,7 @@ impl App {
     ) -> Option<egui::Rect> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: full_rect,
             source_size: tex_size,
@@ -29977,6 +29990,7 @@ impl App {
             let page_rect = fit_display_size_in_rect(rect, display_size);
             let transform = resolve_fs_transform_in_layout_rect(
                 DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
                     page_idx: idx,
                     viewport_rect,
                     source_size: source_size.unwrap_or(tex_size),
@@ -33053,6 +33067,7 @@ impl App {
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: idx,
             viewport_rect: page_rect,
             source_size: tex_size,
@@ -37759,6 +37774,7 @@ mod tests {
         content_bbox: Option<egui::Rect>,
     ) -> DisplayedImageTransform {
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(20.0, 30.0),
@@ -37800,6 +37816,7 @@ mod tests {
     ) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx,
                 viewport_rect,
                 source_size: egui::vec2(1600.0, 1200.0),
@@ -39868,6 +39885,7 @@ mod tests {
         let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         let source_size = egui::vec2(1000.0, 1501.0);
         let make_input = |texture_size| DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect,
             source_size,
@@ -39886,7 +39904,6 @@ mod tests {
                 .expect("pass-through transform");
         let final_image =
             resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
-
         assert!(
             final_image
                 .full_image_rect
@@ -39918,6 +39935,7 @@ mod tests {
         let layout_source_size = egui::vec2(409.0, 512.0);
         let transform = resolve_fs_image_transform(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: 0,
                 viewport_rect,
                 source_size: texture_size,
@@ -39951,6 +39969,7 @@ mod tests {
         // thumbnail and 1643x2375 display raster round that ratio differently.
         let page_box_layout = egui::vec2(691_792.0, 1_000_000.0);
         let make_input = |source_size, texture_size| DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect,
             source_size,
@@ -39974,18 +39993,27 @@ mod tests {
         )
         .expect("PDF final transform");
 
-        assert!(
-            final_image
-                .full_image_rect
-                .contains_rect(pass.full_image_rect)
-        );
+        // 差し替えでページが飛ばないこと。**完全一致では縛れない**: 最終ラスタは縮小
+        // なので描画矩形が物理ピクセル格子へ寄る (§1.0e — 寄せないと Lanczos の出力を
+        // もう一度バイリニアで貼り直すことになり、全面がボケる)。低解像度の下敷きは
+        // 拡大側なので寄らない。ずれは 1 物理ピクセル未満で、目視できる段差ではない。
+        // どちらの入力も pixels_per_point = 1.0 なので、1 物理ピクセル = 1 point。
+        const HALF_PIXEL: f32 = 0.5;
         assert!(
             (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
         );
         assert!(
             (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs()
+                <= 2.0 * HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
+                <= 2.0 * HALF_PIXEL
         );
         let texture_ratio = 327.0 / 473.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
@@ -47163,6 +47191,7 @@ mod tests {
     #[test]
     fn capture_region_maps_screen_rect_to_source_crop() {
         let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -47202,6 +47231,7 @@ mod tests {
     #[test]
     fn capture_region_maps_cw90_display_rect_back_to_source_crop() {
         let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),

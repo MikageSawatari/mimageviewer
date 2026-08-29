@@ -400,6 +400,7 @@ mod local_adjust_segmentation_tests {
     fn test_transform(rect: egui::Rect, size: (usize, usize)) -> DisplayedImageTransform {
         DisplayedImageTransform::resolve(
             crate::displayed_image_transform::DisplayedImageTransformInput {
+                pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
                 page_idx: 0,
                 viewport_rect: rect,
                 source_size: egui::vec2(size.0 as f32, size.1 as f32),

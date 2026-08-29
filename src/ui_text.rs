@@ -10688,6 +10688,7 @@ mod tests {
         let image_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 800.0));
         let transform = DisplayedImageTransform::resolve(
             crate::displayed_image_transform::DisplayedImageTransformInput {
+                pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
                 page_idx: 0,
                 viewport_rect: image_rect,
                 source_size: egui::vec2(sw, sh),
