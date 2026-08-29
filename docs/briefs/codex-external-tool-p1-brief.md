@@ -24,6 +24,10 @@
 - 仮想ページ・動画フレームの一時実体化 (P3 / P4)。`{container}` / `{entry}` / `{page}` /
   `{time}` の展開もこの phase では**まだ実装しない** (P4)。
 - コンテキストメニュー / ツールバー / キー割り当てへの導線 (P1b・P2)
+
+> ⚠ **旧「アプリケーションで開く…」には触らないこと。** `Settings.custom_open_with_apps` と
+> `settings_db` の書き戻しは、旧 UI を `external_tools` へ載せ替える P1b まで残す。
+> ここで write を落とすと、旧 UI からの登録が保存されなくなる (P0 レビューで一度踏んだ)。
 - 複数選択 (`SelectionPolicy`)、見開き (`SpreadPolicy`) の適用 (P2 / P4)
 
 この phase の対象は**単一の実ファイル**だけ。`PayloadPolicy` が `Container` / `RealFileOnly` /
