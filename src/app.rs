@@ -138,6 +138,8 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod top_level_grid_view;
 mod viewer_context_registry;
 #[cfg(windows)]
+#[cfg(windows)]
+pub(crate) use viewer_context_registry::ActiveContextUpdate;
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
@@ -16387,12 +16389,19 @@ impl App {
         None
     }
 
-    /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
+    /// root の `input_nav` 合流点を通さずにナビを消化する。
     ///
-    /// 通常は App::update 後段の input_nav 合流点で処理するが、Windows の
-    /// in-window 静止画フルスクリーンはグリッド描画を飛ばして return するため、
-    /// そこでナビを捨てないよう同じロード処理を先に適用する。
-    pub(crate) fn apply_fullscreen_close_nav_immediate(
+    /// 使うのは 2 経路。どちらも「合流点まで到達しない」ことが理由:
+    ///
+    /// - Windows の in-window 静止画フルスクリーンは、グリッド描画を飛ばして return する。
+    /// - 前面の別ウィンドウ (AtRest な active context) 向けの gamepad 操作は、その context を
+    ///   mount した中で配る。**合流点へ流すと root が動く** (2026-08-29 レビュー R-02)。
+    ///
+    /// 履歴戻る / 進むも扱う。扱わずに落とすと、別ウィンドウで B ボタンを押しても
+    /// 何も起きない。合流点側は、後段の open 結果まで見て rollback するため独自の
+    /// 経路を持つ (そちらは `history_nav_rollback` で `ConversionDialogOpened` /
+    /// `Ignored` を区別する)。ここは即時ロードなので、対象が取れなかった時点で戻す。
+    pub(crate) fn apply_nav_without_the_root_join(
         &mut self,
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
@@ -16423,7 +16432,30 @@ impl App {
                 true
             }
             crate::ui_main::AddressBarNav::HistoryBack
-            | crate::ui_main::AddressBarNav::HistoryForward => false,
+            | crate::ui_main::AddressBarNav::HistoryForward => {
+                let backward = matches!(nav, crate::ui_main::AddressBarNav::HistoryBack);
+                let snapshot = self.folder_nav_history_snapshot();
+                let target = if backward {
+                    self.navigate_folder_history_back()
+                } else {
+                    self.navigate_folder_history_forward()
+                };
+                let Some(target) = target else {
+                    return false;
+                };
+                match self.dispatch_synthetic_folder_history_target(&target) {
+                    SyntheticFolderHistoryDispatch::NotSynthetic => {
+                        self.load_folder_or_convert_archive(target);
+                        self.clear_pending_folder_nav_steps();
+                        true
+                    }
+                    SyntheticFolderHistoryDispatch::Restored => true,
+                    SyntheticFolderHistoryDispatch::Unavailable => {
+                        self.restore_folder_nav_history(snapshot);
+                        false
+                    }
+                }
+            }
         }
     }
 
@@ -40622,16 +40654,39 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn update_active_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+    pub(crate) fn update_active_viewer_context(
+        &mut self,
+        ctx: &egui::Context,
+        gamepad_batch: Option<crate::app::gamepad_input::GamepadFrameBatch>,
+    ) -> ActiveContextUpdate {
         if !self.active_detached_context_is_at_rest() {
-            return false;
+            return ActiveContextUpdate {
+                updated: false,
+                gamepad_batch,
+                gamepad_outcome: None,
+            };
         }
 
+        let mut gamepad_outcome = None;
+        let mut gamepad_batch = gamepad_batch;
         let (should_drop, detached_viewport_finalized) = self
             .with_active_viewer_context(|app| {
+                // 閉じる判定に使う識別子は **gamepad を配る前**に取る。Back は viewer を
+                // 閉じ得るので、配った後に読むと閉じた後の値になる。
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                // 前面の viewer への入力は、この context の polling / 描画より前に配る。
+                // ここは mount 済みなので、`fullscreen_idx` も items も**この viewer のもの**
+                // (2026-08-29 レビュー R-02)。
+                if let Some(batch) = gamepad_batch.take() {
+                    let mut outcome = app.dispatch_gamepad_batch(ctx, batch);
+                    if let Some(nav) = outcome.nav.take() {
+                        // **root の合流点へ流さない。**流すとメインウィンドウが動く。
+                        app.apply_nav_without_the_root_join(nav);
+                    }
+                    gamepad_outcome = Some(outcome);
+                }
                 if Self::detached_image_window_debug_enabled() && app.frame_counter % 60 == 0 {
                     app.log_detached_image_window_debug(format!(
                         "active_context_state frame={} window_id={:?} fs_idx={:?} \
@@ -40799,7 +40854,11 @@ impl App {
                 self.reconcile_closed_bookmark_detached_context(&closed);
             }
         }
-        true
+        ActiveContextUpdate {
+            updated: true,
+            gamepad_batch,
+            gamepad_outcome,
+        }
     }
 
     #[cfg(windows)]
@@ -51253,7 +51312,7 @@ impl App {
         let Some(nav) = self.take_pending_return_to_parent_nav() else {
             return;
         };
-        if !self.apply_fullscreen_close_nav_immediate(nav) {
+        if !self.apply_nav_without_the_root_join(nav) {
             // 現在 resolve_return_to_parent_nav が返すナビはすべて即時適用可能だが、
             // 将来対象外のナビが増えても要求を失わず通常の update 経路へ戻す。
             self.pending_return_to_parent = true;
@@ -66778,7 +66837,25 @@ impl eframe::App for App {
         } else {
             self.handle_keyboard(ctx)
         };
-        let gamepad_nav = self.handle_gamepad_input(ctx);
+        // 物理デバイスはここで読む。**配り先は前面の viewer なので、まだ決めない。**
+        // AtRest の active context が前面なら、その context を mount した中で配る
+        // (root projection で配ると、別ウィンドウを見ているのにメイングリッドが動く。
+        // 2026-08-29 レビュー R-02)。
+        let gamepad_batch = self.sample_gamepad_input(ctx);
+        #[cfg(windows)]
+        let gamepad_goes_to_active_context = self.active_detached_context_is_at_rest();
+        #[cfg(not(windows))]
+        let gamepad_goes_to_active_context = false;
+        let mut gamepad_nav = None;
+        let mut gamepad_outcome = None;
+        let mut gamepad_batch_for_active_context = None;
+        if gamepad_goes_to_active_context {
+            gamepad_batch_for_active_context = Some(gamepad_batch);
+        } else {
+            let mut outcome = self.dispatch_gamepad_batch(ctx, gamepad_batch);
+            gamepad_nav = outcome.nav.take();
+            gamepad_outcome = Some(outcome);
+        }
         let t_root_input = frame_t0.elapsed();
 
         // ── フルスクリーンビューポート ──────────────────────────────────
@@ -66796,9 +66873,26 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]
-        let active_detached_context_updated = self.update_active_viewer_context(ctx);
+        let active_detached_context_updated = {
+            let update =
+                self.update_active_viewer_context(ctx, gamepad_batch_for_active_context.take());
+            // mount が起きなければ batch は返ってくる。活性化がこの frame で変わった等。
+            gamepad_batch_for_active_context = update.gamepad_batch;
+            if let Some(outcome) = update.gamepad_outcome {
+                gamepad_outcome = Some(outcome);
+            }
+            update.updated
+        };
         #[cfg(not(windows))]
         let active_detached_context_updated = false;
+        if let Some(batch) = gamepad_batch_for_active_context.take() {
+            let mut outcome = self.dispatch_gamepad_batch(ctx, batch);
+            gamepad_nav = outcome.nav.take();
+            gamepad_outcome = Some(outcome);
+        }
+        if let Some(outcome) = gamepad_outcome.as_ref() {
+            self.finish_gamepad_frame(ctx, outcome);
+        }
         #[cfg(windows)]
         self.poll_parked_live_detached_windows(ctx);
         if !active_detached_context_updated {
@@ -66899,7 +66993,7 @@ impl eframe::App for App {
             );
             if unsupported_history_nav {
                 fullscreen_close_nav = Some(nav);
-            } else if self.apply_fullscreen_close_nav_immediate(nav) {
+            } else if self.apply_nav_without_the_root_join(nav) {
                 ctx.request_repaint();
                 return;
             }
@@ -67064,7 +67158,7 @@ impl eframe::App for App {
                 // in-window 静止画フルスクリーンではここで消化しないと親一覧への
                 // 直帰ナビが捨てられてしまう。
                 if let Some(nav) = fullscreen_close_nav.take() {
-                    if self.apply_fullscreen_close_nav_immediate(nav) {
+                    if self.apply_nav_without_the_root_join(nav) {
                         ctx.request_repaint();
                         return;
                     }

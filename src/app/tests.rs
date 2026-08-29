@@ -14100,7 +14100,7 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
             break;
         }
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx);
+            app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(
             std::time::Instant::now() < deadline,
@@ -14367,7 +14367,10 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             ));
         })
         .expect("active detached context");
-        assert!(app.update_active_viewer_context(&egui::Context::default()));
+        assert!(
+            app.update_active_viewer_context(&egui::Context::default(), None)
+                .updated
+        );
 
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.items_are_bookmark_view);
@@ -14404,7 +14407,10 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
         assert!(detached.bookmark_view_state.is_none());
     })
     .expect("active detached context");
-    assert!(app.update_active_viewer_context(&egui::Context::default()));
+    assert!(
+        app.update_active_viewer_context(&egui::Context::default(), None)
+            .updated
+    );
 
     assert!(app.active_viewer_context_id().is_none());
     assert!(!app.items_are_bookmark_view);
@@ -18747,7 +18753,7 @@ mod favorite_adjustment_defaults_tests {
         let nav = app
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become navigation");
-        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        assert!(app.apply_nav_without_the_root_join(nav));
 
         assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
         assert_eq!(app.fullscreen_idx, None);
@@ -18795,7 +18801,7 @@ mod favorite_adjustment_defaults_tests {
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become a direct nav");
         assert!(
-            app.apply_fullscreen_close_nav_immediate(nav),
+            app.apply_nav_without_the_root_join(nav),
             "embedded early-return path must apply the parent nav before returning"
         );
         assert_eq!(
@@ -36196,7 +36202,7 @@ mod still_window_mode_key_tests {
     fn run_active_detached_frame_for_test(app: &mut App, ctx: &egui::Context) {
         let mut updated = false;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx);
+            updated = app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(updated, "the active detached context must be updated");
     }
@@ -40055,7 +40061,7 @@ mod still_window_mode_key_tests {
 
         let mut updated = false;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx);
+            updated = app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(updated);
         assert!(
@@ -40079,7 +40085,7 @@ mod still_window_mode_key_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                updated = app.update_active_viewer_context(ctx);
+                updated = app.update_active_viewer_context(ctx, None).updated;
             });
             let opened = app
                 .with_active_viewer_context(|active| active.fullscreen_idx.is_some())
@@ -40238,7 +40244,7 @@ mod still_window_mode_key_tests {
 
         let mut updated = false;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx);
+            updated = app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(updated);
         assert!(
@@ -40301,7 +40307,7 @@ mod still_window_mode_key_tests {
         app.show_pdf_password_dialog = true;
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx);
+            app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(
             app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
@@ -40416,7 +40422,7 @@ mod still_window_mode_key_tests {
         });
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx);
+            app.update_active_viewer_context(ctx, None).updated;
         });
 
         assert!(
@@ -41389,7 +41395,7 @@ mod still_window_mode_key_tests {
         .unwrap();
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx);
+            app.update_active_viewer_context(ctx, None).updated;
         });
 
         assert!(app.active_viewer_context_id().is_none());
@@ -41441,7 +41447,7 @@ mod still_window_mode_key_tests {
         .expect("active detached context must mount");
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.update_active_viewer_context(ctx);
+            app.update_active_viewer_context(ctx, None).updated;
         });
         app.with_active_viewer_context(|active| {
             let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
@@ -41942,7 +41948,7 @@ mod still_window_mode_key_tests {
 
         let mut updated = false;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            updated = app.update_active_viewer_context(ctx);
+            updated = app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(updated);
 
@@ -42638,7 +42644,7 @@ mod still_window_mode_key_tests {
         });
         let mut updated = false;
         let _ = ctx.run(input, |ctx| {
-            updated = app.update_active_viewer_context(ctx);
+            updated = app.update_active_viewer_context(ctx, None).updated;
         });
         assert!(updated);
 
@@ -63494,6 +63500,63 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     assert_eq!(
         production_seams, 1,
         "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
+    );
+}
+
+/// 前面が別ウィンドウなら、gamepad の操作もその context が受け取る。
+///
+/// キーボード・マウス・タッチは別ウィンドウ自身の viewport が受けるので、context が
+/// mount された状態で処理される。gamepad だけは OS からグローバルに読むので root pass
+/// で処理され、`fullscreen_idx` が root projection のものになる。AtRest な active context
+/// が前面のとき root の `fullscreen_idx` は None なので、`gamepad_targets_viewer` が false
+/// になり、**別ウィンドウを見ているのにメイングリッドが動いていた**
+/// (2026-08-29 レビュー R-02)。
+///
+/// `update_active_viewer_context` は closure の間だけ mount して戻る前に root projection を
+/// 復元するので、「その後に配る」では届かない。batch がその mount に入ったかどうかを見る。
+#[test]
+#[cfg(windows)]
+fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+
+    // active context が無い = root が前面。batch は配られずに返る。
+    assert!(!app.active_detached_context_is_at_rest());
+    let update = app.update_active_viewer_context(
+        &ctx,
+        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+    );
+    assert!(!update.updated);
+    assert!(
+        update.gamepad_batch.is_some(),
+        "mount していないのに batch を消費している"
+    );
+    assert!(update.gamepad_outcome.is_none());
+
+    // AtRest の active context を前面に置く。今度は mount の中で配られる。
+    let window_id = 77;
+    let context_id = app.build_window_context_for_test(window_id, |bundle| {
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    app.detached_viewer_window_id = Some(window_id);
+    assert_eq!(app.active_viewer_context_id(), Some(context_id));
+    assert!(
+        app.active_detached_context_is_at_rest(),
+        "AtRest の active context を作れていない (residence={:?})",
+        app.viewer_context_residence(context_id)
+    );
+
+    let update = app.update_active_viewer_context(
+        &ctx,
+        Some(crate::app::gamepad_input::GamepadFrameBatch::empty_for_test()),
+    );
+    assert!(
+        update.gamepad_batch.is_none(),
+        "前面の別ウィンドウへ配らず、root へ返している"
+    );
+    assert!(
+        update.gamepad_outcome.is_some(),
+        "mount の中で配った結果が返っていない"
     );
 }
 

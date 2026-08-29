@@ -29,6 +29,39 @@ use crate::settings::{
     ThumbAspect, format_video_volume_db, step_video_volume_by_fader_key_step,
 };
 use crate::ui_main::AddressBarNav;
+
+/// この frame に発生した gamepad の操作。**配り先はまだ決まっていない。**
+///
+/// 値として持ち回るのは、配り先が「root か、前面の別ウィンドウか」で変わるため。
+/// App へ pending フラグを足すと、どの frame のどの context 向けだったかが状態から
+/// 読めなくなる (リワーク憲法 規則 3)。
+pub(crate) struct GamepadFrameBatch {
+    now: Instant,
+    actions: Vec<PadAction>,
+    saw_input_event: bool,
+}
+
+impl GamepadFrameBatch {
+    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            now: Instant::now(),
+            actions: Vec::new(),
+            saw_input_event: false,
+        }
+    }
+}
+
+/// 配った結果。frame 全体の後始末に使う。
+pub(crate) struct GamepadDispatchOutcome {
+    /// 配った先の context で解決すべきナビゲーション。**root の合流点へ流さないこと** —
+    /// 流すと、別ウィンドウ向けの操作でメインウィンドウが動く (R-02 そのもの)。
+    pub(crate) nav: Option<AddressBarNav>,
+    dispatched: bool,
+    dispatch_allowed: bool,
+    saw_input_event: bool,
+}
 use crate::undo_stack::RatingChange;
 use crate::video::VideoContinuousMode;
 
@@ -2110,7 +2143,14 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_gamepad_input(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    /// デバイスを読んで、この frame の操作を作る。**配り先はまだ決めない。**
+    ///
+    /// 物理デバイスは 1 つなので、drain・ボタン状態・リピート生成は App-global に置く。
+    /// context と一緒に入れ替えると、別ウィンドウへ切り替えた瞬間にリピートや軸の保持が
+    /// 飛ぶ。配り先 (= 前面の viewer) を決めて消費するのは
+    /// [`Self::dispatch_gamepad_batch`] の仕事で、そちらは context を mount した状態で
+    /// 呼ぶ (2026-08-29 レビュー R-02)。
+    pub(crate) fn sample_gamepad_input(&mut self, ctx: &egui::Context) -> GamepadFrameBatch {
         let now = Instant::now();
         let events = self.gamepad.drain(ctx);
         let mut actions = Vec::new();
@@ -2161,6 +2201,27 @@ impl App {
             }
         }
 
+        GamepadFrameBatch {
+            now,
+            actions,
+            saw_input_event,
+        }
+    }
+
+    /// 前面の context へ操作を配る。**その context を mount した状態で呼ぶこと。**
+    ///
+    /// `gamepad_dispatch_allowed` もここに含める。mount 中の fullscreen / overlay /
+    /// modal 状態を読むので、root projection で判定すると別ウィンドウの状況を無視する。
+    pub(crate) fn dispatch_gamepad_batch(
+        &mut self,
+        ctx: &egui::Context,
+        batch: GamepadFrameBatch,
+    ) -> GamepadDispatchOutcome {
+        let GamepadFrameBatch {
+            now,
+            actions,
+            saw_input_event,
+        } = batch;
         let dispatch_allowed = self.gamepad_dispatch_allowed(ctx);
         let mut nav = None;
         let mut dispatched = false;
@@ -2185,15 +2246,27 @@ impl App {
             self.gamepad_state.suppress_pending_actions();
         }
 
-        if saw_input_event || dispatched {
+        GamepadDispatchOutcome {
+            nav,
+            dispatched,
+            dispatch_allowed,
+            saw_input_event,
+        }
+    }
+
+    /// frame 全体の後始末。activity gate と repaint は App-global なので、配り先に
+    /// かかわらずここで 1 回だけ行う。
+    pub(crate) fn finish_gamepad_frame(
+        &mut self,
+        ctx: &egui::Context,
+        outcome: &GamepadDispatchOutcome,
+    ) {
+        if outcome.saw_input_event || outcome.dispatched {
             self.activity_gate.bump();
         }
-
-        if dispatch_allowed && self.gamepad_needs_repaint() {
+        if outcome.dispatch_allowed && self.gamepad_needs_repaint() {
             ctx.request_repaint_after(GAMEPAD_REPAINT_INTERVAL);
         }
-
-        nav
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
