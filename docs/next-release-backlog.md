@@ -14,6 +14,54 @@
 
 ## 1. 優先候補
 
+### 1.0b Settings::save が実環境で 43ms かかる (2026-08-29 の perf smoke で判明)
+
+v3.3.0 のリリース前 perf smoke (実機・実設定) で確認した。**退行ではない** (v3.2.0 に同じ
+コードがある) が、R-06 で使った合成データの実測 1.3ms は**実環境を 30 倍過小評価**していた。
+
+**観測**: フォルダ移動 1 回ごとに `Settings::save()` が走り (`app.rs` の `sli_settings_save`)、
+**1 回 43〜61ms**。38 回の移動で計 1.8 秒。`Ctrl+↓` 連打はこれを 1 フォルダごとに払う。
+プロセス最初の 1 回は世代ローテを伴い 129ms。
+
+**原因**: `%APPDATA%\mimageviewer\settings.db` が 36.7 MB あり、その 98% が VST3 の状態 BLOB。
+
+| テーブル | 行数 | サイズ |
+| --- | --- | --- |
+| `vst3_plugins` | 7 | 32.04 MB |
+| `vst3_chain_slots` | 2 | 4.16 MB |
+| 他すべて | — | 0.2 MB |
+
+`save_full` はハッシュ比較で**この 2 テーブルの行を書き直していない**。それでもここへ至るまでに
+
+1. `save_internal` の `self.clone()` (36 MB)
+2. `save_full` の `settings.clone()` (36 MB)
+3. `serde_json::to_value(&persisted)` — 32 MB の base64 を含む Value を構築してから
+   `extract_complex_fields` で捨てる
+4. `hash_vst3_plugins` / `hash_vst3_chain_slots` — 36 MB をハッシュ
+
+が走る。つまり **「書かないと決めるための準備」に 43ms** を払っている。
+
+**修正方向**: VST3 の状態を `Settings` 本体から外して別ハンドル (`Arc` 共有か遅延ロード) に
+するか、変更世代を持たせて clone / serialize / hash の対象から外す。`save_full` は隔離・
+世代ローテ・boot decision tree を持つ経路なので、**リリース直前に触らない**と判断した。
+
+R-06 (シークストリップのホイール) はこの実測を知る前に直したが、**判断は変わらない** —
+1 ノッチごとに 43ms は論外なので、先送りにしたのは正しかった。
+
+### 1.0c 設定バックアップが約 3 GB 残っている (2026-08-29 に観測)
+
+同じ実機で `settings.db*` が **124 ファイル・2,980 MB**。内訳は `preupgrade-v*` 36 個
+(1,053 MB)、隔離 `corrupted-*` 22 個 (775 MB)、その他 55 個 (748 MB)、`bak1..10` 10 個
+(367 MB)、main 1 個 (37 MB)。
+
+`bak1..10` は spec どおり。問題は **`preupgrade` と隔離ファイルに掃除の仕組みが無い**こと。
+36 MB × N が黙って積み上がる。2026-07-19 の誤判定隔離 (古い検証バイナリが
+`DetailsColumnId::PageCount` を `Corrupted` と誤分類) の残骸も含む。
+
+**修正方向**: `preupgrade` は最新 N 世代だけ残す、隔離ファイルは復旧に成功した時点で
+掃除するか、設定 UI から一覧・削除できるようにする (復元 UI が既に bak と preupgrade を
+一覧表示しているので、そこへ削除を足すのが自然)。
+
 ### 1.0 v3.3.0 レビューからの持ち越し (2026-08-29 に判断)
 
 正本は [docs/review-v3.3.0/README.md](review-v3.3.0/README.md)。v3.3.0 出荷時に
