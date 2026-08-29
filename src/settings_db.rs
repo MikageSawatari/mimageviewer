@@ -2562,6 +2562,15 @@ pub(crate) fn quarantine_with_suffix(data_dir: &Path, suffix: &str) -> Quarantin
             }
         }
     }
+    // 隔離も消える仕組みが無く、起きるたびに settings.db 1 個ぶんが積み上がっていた
+    // (§1.0c、実機で 22 セット 775MB)。**今回の隔離が完了してから**古い世代を落とす。
+    // 3 ファイルで 1 セットなので、セット単位で消す。
+    crate::db_backup::prune_backup_groups(
+        data_dir,
+        crate::db_backup::RETAINED_UNROTATED_BACKUPS,
+        &|msg| log_diag(&format!("settings_db: {msg}")),
+        &|name| crate::db_backup::quarantine_group_of("settings.db", name),
+    );
     QuarantineResult {
         moved: moved_pairs.len(),
         complete: true,

@@ -7087,11 +7087,21 @@ impl Settings {
                 // 既存ファイルがなければ snapshot を取る (= 同バージョンを複数回起動しても 1 回限り)。
                 let result = crate::settings_db::with_db_result(|db| db.backup_to(&pre_path));
                 match result {
-                    Ok(()) => settings_diag_log(&format!(
-                        "settings: pre-upgrade snapshot saved {} (prev v{})",
-                        pre_path.display(),
-                        prev_label
-                    )),
+                    Ok(()) => {
+                        settings_diag_log(&format!(
+                            "settings: pre-upgrade snapshot saved {} (prev v{})",
+                            pre_path.display(),
+                            prev_label
+                        ));
+                        // 版が変わるたびに 1 個増え、消える仕組みが無かった (§1.0c)。
+                        // **新しいものが手に入ってから**古い世代を落とす。
+                        crate::db_backup::prune_backup_groups(
+                            &data_dir,
+                            crate::db_backup::RETAINED_UNROTATED_BACKUPS,
+                            &|msg| settings_diag_log(&format!("settings: {msg}")),
+                            &|name| crate::db_backup::preupgrade_group_of("settings.db", name),
+                        );
+                    }
                     Err(e) => settings_diag_log(&format!(
                         "settings: pre-upgrade snapshot failed {}: {}",
                         pre_path.display(),

@@ -1544,6 +1544,12 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   `settings.db.preupgrade-v<old>` に複製する。スキーマ破壊が自動復旧で
   救えなかった場合の最終ライフライン。同じ前バージョン名の snapshot が既に
   存在するなら上書きしない。
+- **ローテートされないバックアップの保持世代 (3 世代)**: `preupgrade-v*` と隔離した
+  `.corrupted-*` には消える仕組みが無く、版が変わるたび / 隔離が起きるたびに
+  `settings.db` 1 個ぶんが積み上がっていた (実機で 124 ファイル 2,980 MB を観測)。
+  **新しいものが手に入ってから**、新しい順に 3 世代だけ残して削除する。隔離は
+  main / -wal / -shm の 3 ファイルで 1 世代なので、必ずセット単位で消す。
+  更新時刻が読めなかった世代は消さない (上限を一時的に超えるほうを選ぶ)。
 - **診断ログ**: 復旧経路で起きたイベント (SQLite open エラーの primary/extended code /
   quarantine / bak recovery / preupgrade / save 抑止) は
   **`<data_dir>/logs/settings.log` に常に append** される。logger の初期化状態に

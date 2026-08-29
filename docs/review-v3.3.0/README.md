@@ -708,3 +708,38 @@ R-07 の根本修正 (`(key, 不変スナップショット, generation)` を wo
   [detached-rework-plan](detached-rework-plan.md) への記録) に従う。
 - **既に予定済み**: R-07 (+ 図形のキー移動 / 塗りの毎フレーム複製)、§1.0b (対応済み)、§1.0c。
 - **格付け変更の提案**: R-14 は単独 P1 ではなく R-07 の一部として扱う。
+
+### 10.6 R-27 の設計判断 (ClaudeCode と Codex の合意、2026-08-29)
+
+凍結ルール (CLAUDE.md「Detached viewer リワーク中のルール」) に従い、着手前に
+[detached-rework-plan](../detached-rework-plan.md) §2 を読み、Codex に設計判断を当てた。
+
+**ClaudeCode の当初案は誤りだった。** 「破棄予定の host は ready host ではない」ので後継を
+`AwaitingHost` へ戻す (案 B) を推したが、Codex が事実で否定した:
+
+- `DestroyHost` は H に `DestroyWindow` していない。現在の `detached_viewer_window_id` から
+  ViewportId を再解決して `ViewportCommand::Close` を送るだけで、effect の `hwnd` はログにしか
+  使われない。
+- egui-winit 0.33.3 の `ViewportCommand::Close` は同期 destroy ではなく `ViewportEvent::Close`
+  を積むだけ。
+- 案 B には「旧 viewport の close 完了 → 新 window identity の確保 → 新 HWND 登録」という
+  因果経路が無い。同じ ViewportId を render し続けるので、**まだ生きている H を再び
+  `HostReady` にする**か、`ViewportEvent::Close` を利用者の close と解釈して**後継ごと閉じる**
+  かのどちらにもなる。永久待機だけが問題なのではなく、結果が lifecycle ordering 依存になる。
+
+**合意した設計は案 A′ (lease の移譲 + retire 後の再検証)。** native presenter は H 自身では
+なく H 配下の `WS_CHILD` で、retire が壊すのは child と render core / DComp / GPU 資源だけ。
+親 H には SetParent / style / subclass / DComp target のような再利用不能な状態が残らないので、
+**同じ egui parent を後継 presenter の親として再利用できる**。後継の `Switch` も retire と
+同じ native pump FIFO に後から入るので、旧 child の Destroy を追い越さない。
+
+ただし要求時に観測した H をそのまま信用はしない。`NativeRetired` の後に現在の host claim を
+採り直してから Prepare する (`{window_id, host incarnation, hwnd}` で producer → reducer →
+effect → executor を結ぶ)。これは規則 5 の「判断は問うている事柄と同じ時間・所有境界の
+事実で行う」に沿う — 要求時の HWND は非同期 retire 境界の向こうでは事実ではない。
+
+**単純な alias guard (同一 H なら Close/Destroy を省くだけ) では Codex は合意しない**と明示
+された。失敗・再置換・terminal close で session が残るため。
+
+ブリーフは [r27-fix-brief.md](r27-fix-brief.md)。実装は Codex、検収は ClaudeCode。
+完了後に [detached-rework-plan](../detached-rework-plan.md) §11 へ記録する。
