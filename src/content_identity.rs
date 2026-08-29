@@ -535,6 +535,23 @@ impl ContentIdentityDb {
             .map_err(|error| error.to_string())
     }
 
+    /// 自分が下ろした flag を戻す。`clear_restorable_if_unchanged` の直後に store を
+    /// 読み直して行が見つかった (= probe と clear の間に編集が入った) ときだけ呼ぶ。
+    ///
+    /// `kind` と `last_edit_at` は触らない。取り消すのは自分の clear だけで、その編集の
+    /// 記録は編集側の経路が持っている。
+    fn restore_restorable_flag(&self, file_key: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE edit_origin
+                    SET has_restorable_content = 1
+                  WHERE file_key = ?1",
+                rusqlite::params![file_key],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// 復元元 flag を下ろす。**store を全部読んで 1 行も無いと確認できたときだけ**呼ぶ。
     ///
     /// 通常の書き込みで flag は 0 -> 1 の単調遷移にしてある (遅れて届いた
@@ -543,6 +560,11 @@ impl ContentIdentityDb {
     ///
     /// `last_edit_at` の一致を条件にして compare-and-swap にする。probe 中に UI
     /// スレッドが新しい編集を記録していたら 0 行更新で終わり、その編集は残る。
+    ///
+    /// **期待値は probe より前に読んだものを渡すこと。** probe の後に読むと、その値が
+    /// 既に並行編集の timestamp になっていて CAS が必ず成立し、守るはずの編集を消す
+    /// (2026-08-29 レビュー R-05)。同じミリ秒に 2 つの編集が入って timestamp で
+    /// 見分けられない場合は、呼び出し側の clear 後の再 probe が行の有無で拾う。
     fn clear_restorable_if_unchanged(
         &self,
         file_key: &str,
@@ -1366,13 +1388,54 @@ fn run_detection_at_with_updates(
 /// 復元が運ぶのは `copy_stores_at` が写す `STORES` の行だけなので、そこに 1 行も無い
 /// 復元元は選ばれても no-op にしかならない。**候補から外しても失われるものは無い。**
 /// ついでに flag を下ろして、次のフォルダ訪問で同じ probe を繰り返さないようにする。
+///
+/// 「無い」という観測は store を何本も開く間に古くなる。そのため
+/// (1) CAS の期待値は probe より前に読み、(2) clear の後にもう一度 probe して、
+/// 間に書かれた行があれば flag を戻し候補も残す。候補を残すかどうかも最初の観測では
+/// なく 2 回目の観測で決めるので、clear と retain が同じ事実を見る。
 fn drop_sources_with_nothing_to_restore(
     db: &ContentIdentityDb,
     data_dir: &Path,
     candidates: &mut Vec<RestoreCandidate>,
 ) {
+    let outcome = drop_sources_with_nothing_to_restore_with_probe(db, candidates, |file_keys| {
+        crate::rename_key_migration::ledger_keys_with_restorable_rows_at(data_dir, file_keys)
+    });
+    for file_key in &outcome.cleared {
+        crate::logger::log(format!(
+            "content_identity: dropped empty restore origin {file_key}"
+        ));
+    }
+    for file_key in &outcome.restored {
+        crate::logger::log(format!(
+            "content_identity: restored origin {file_key} (edited while probing)"
+        ));
+    }
+}
+
+/// [`drop_sources_with_nothing_to_restore`] が実際に台帳へ書いたこと。
+///
+/// `restored` は「自分が下ろした flag を戻した」= probe と clear の間に編集が入り、
+/// CAS が **それを止められなかった** ことを意味する。CAS の期待値を probe より前に
+/// 読んでいれば `cleared` にも `restored` にも載らない。ここを返り値にしておかないと、
+/// 「止めた」のか「消してから戻した」のかを外から区別できない (レビュー R-05 の
+/// 修正を、再 probe による事後修復だけで通してしまわないため)。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EmptyOriginCleanup {
+    cleared: Vec<String>,
+    restored: Vec<String>,
+}
+
+/// store probe を差し替えられる本体。競合は「probe の途中で行が書かれる」ことなので、
+/// probe を閉包にしないと再現できない (`detect_target_with_opener` と同じ形)。
+fn drop_sources_with_nothing_to_restore_with_probe(
+    db: &ContentIdentityDb,
+    candidates: &mut Vec<RestoreCandidate>,
+    mut probe: impl FnMut(&[String]) -> std::collections::BTreeSet<String>,
+) -> EmptyOriginCleanup {
+    let mut outcome = EmptyOriginCleanup::default();
     if candidates.is_empty() {
-        return;
+        return outcome;
     }
     let file_keys = candidates
         .iter()
@@ -1381,35 +1444,71 @@ fn drop_sources_with_nothing_to_restore(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let backed =
-        crate::rename_key_migration::ledger_keys_with_restorable_rows_at(data_dir, &file_keys);
+    // CAS の期待値は **probe より前** に読む。probe は store を何本も開くので、その間に
+    // UI スレッドが編集を記録し得る。probe の後に読むと、期待値が既にその編集の
+    // timestamp になっていて CAS が必ず成立し、守るはずだった編集を自分で消す。
+    let expected_last_edit_at = file_keys
+        .iter()
+        .filter_map(|file_key| match db.ledger_entry(file_key) {
+            Ok(Some(entry)) => Some((file_key.clone(), entry.last_edit_at)),
+            Ok(None) => None,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "content_identity: could not read ledger for {file_key}: {error}"
+                ));
+                None
+            }
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let backed = probe(&file_keys);
     if backed.len() == file_keys.len() {
-        return;
+        return outcome;
     }
-    for file_key in file_keys.iter().filter(|key| !backed.contains(*key)) {
-        let cleared = db
-            .ledger_entry(file_key)
-            .map_err(|error| error.to_string())
-            .and_then(|entry| {
-                let entry = entry.ok_or_else(|| "ledger row vanished".to_string())?;
-                db.clear_restorable_if_unchanged(file_key, entry.last_edit_at)
-            });
-        match cleared {
-            Ok(true) => crate::logger::log(format!(
-                "content_identity: dropped empty restore origin {file_key}"
-            )),
+    let unbacked = file_keys
+        .iter()
+        .filter(|key| !backed.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for file_key in &unbacked {
+        // 台帳を読めなかった key は触らない。期待値が無いまま消すと CAS の意味が無い。
+        let Some(&expected) = expected_last_edit_at.get(file_key) else {
+            continue;
+        };
+        match db.clear_restorable_if_unchanged(file_key, expected) {
+            Ok(true) => outcome.cleared.push(file_key.clone()),
             Ok(false) => {}
             Err(error) => crate::logger::log(format!(
                 "content_identity: could not clear empty origin {file_key}: {error}"
             )),
         }
     }
+    // clear の後にもう一度 store を読む。probe と clear の間に書かれた行はここで見つかる。
+    // timestamp ではなく **行の有無** を見るので、同じミリ秒に 2 つの編集が入って CAS が
+    // 見分けられなかった場合もここで拾える。候補を残すか消すかも、この後の観測で決める。
+    let re_backed = probe(&unbacked);
+    // 戻すのは **自分が下ろした** key だけ。CAS が拒んだ key は flag が 1 のままなので
+    // 触る必要が無い。
+    for file_key in outcome
+        .cleared
+        .iter()
+        .filter(|file_key| re_backed.contains(*file_key))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        match db.restore_restorable_flag(&file_key) {
+            Ok(()) => outcome.restored.push(file_key.clone()),
+            Err(error) => crate::logger::log(format!(
+                "content_identity: could not restore origin {file_key}: {error}"
+            )),
+        }
+    }
     for candidate in candidates.iter_mut() {
-        candidate
-            .sources
-            .retain(|source| backed.contains(&source.file_key));
+        candidate.sources.retain(|source| {
+            backed.contains(&source.file_key) || re_backed.contains(&source.file_key)
+        });
     }
     candidates.retain(|candidate| !candidate.sources.is_empty());
+    outcome
 }
 
 fn detect_target(
@@ -1762,6 +1861,133 @@ fn unix_time_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 「行がもう無い」という観測は store を何本も開く間に古くなる。その間に入った編集を
+    /// 自分の clear で消してはいけない。
+    ///
+    /// 欠陥は CAS の期待値を probe の **後** に読んでいたことで、期待値が既に並行編集の
+    /// timestamp になっているため CAS が必ず成立していた。守るはずの編集が消え、候補も
+    /// stale な観測で落ちていた (2026-08-29 レビュー R-05)。
+    #[test]
+    fn an_edit_that_lands_while_probing_keeps_its_restore_origin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let origin_path = dir.path().join("origin.png");
+        let file_key = crate::path_key::normalize_keep_drive(&origin_path);
+        db.upsert(
+            &ContentIdentitySource::new(&origin_path, ContentKind::Image),
+            &RecordedFileState {
+                file_key: file_key.clone(),
+                size: 10,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            100,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+
+        let mut candidates = vec![RestoreCandidate {
+            target_key: "target".to_string(),
+            target_path: dir.path().join("target.png"),
+            target_kind: ContentKind::Image,
+            full_hash: "full".to_string(),
+            sources: vec![RestoreSourceCandidate {
+                file_key: file_key.clone(),
+                path: origin_path.clone(),
+                kind: ContentKind::Image,
+                last_edit_at: 100,
+                source_exists: true,
+            }],
+        }];
+
+        // 1 回目の probe の最中に編集が入る。probe 自身は古い観測 (= 行なし) を返す。
+        let mut probe_calls = 0;
+        let outcome =
+            drop_sources_with_nothing_to_restore_with_probe(&db, &mut candidates, |keys| {
+                probe_calls += 1;
+                if probe_calls == 1 {
+                    db.mark_restorable(&file_key, ContentKind::Image, Some(200))
+                        .unwrap();
+                    std::collections::BTreeSet::new()
+                } else {
+                    keys.iter().cloned().collect()
+                }
+            });
+
+        assert_eq!(probe_calls, 2, "clear の後に観測し直していない");
+        // 再 probe による事後修復ではなく、CAS が止めたことを確かめる。消してから戻すと
+        // その間 flag が 0 で、そこで落ちれば復元の申し出が永久に消える。
+        assert_eq!(
+            outcome,
+            EmptyOriginCleanup::default(),
+            "並行編集を CAS で止めず、一度消してから戻している"
+        );
+        let entry = db.ledger_entry(&file_key).unwrap().unwrap();
+        assert!(
+            entry.has_restorable_content,
+            "probe 中に入った編集の復元元 flag を消した"
+        );
+        assert_eq!(entry.last_edit_at, 200, "編集側の timestamp を書き換えた");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "行が見つかったのに候補から落とした: {candidates:?}"
+        );
+    }
+
+    /// 本当に何も残っていない復元元は、これまでどおり flag を下ろして候補から外す。
+    #[test]
+    fn a_restore_origin_with_nothing_behind_it_is_still_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let origin_path = dir.path().join("origin.png");
+        let file_key = crate::path_key::normalize_keep_drive(&origin_path);
+        db.upsert(
+            &ContentIdentitySource::new(&origin_path, ContentKind::Image),
+            &RecordedFileState {
+                file_key: file_key.clone(),
+                size: 10,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            100,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+
+        let mut candidates = vec![RestoreCandidate {
+            target_key: "target".to_string(),
+            target_path: dir.path().join("target.png"),
+            target_kind: ContentKind::Image,
+            full_hash: "full".to_string(),
+            sources: vec![RestoreSourceCandidate {
+                file_key: file_key.clone(),
+                path: origin_path.clone(),
+                kind: ContentKind::Image,
+                last_edit_at: 100,
+                source_exists: true,
+            }],
+        }];
+
+        drop_sources_with_nothing_to_restore_with_probe(&db, &mut candidates, |_| {
+            std::collections::BTreeSet::new()
+        });
+
+        let entry = db.ledger_entry(&file_key).unwrap().unwrap();
+        assert!(
+            !entry.has_restorable_content,
+            "実データが無い復元元の flag が残っている"
+        );
+        assert!(
+            candidates.is_empty(),
+            "実データが無い復元元が候補に残っている: {candidates:?}"
+        );
+    }
     use super::*;
     use std::io::{Cursor, SeekFrom};
 
