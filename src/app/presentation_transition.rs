@@ -1591,6 +1591,75 @@ mod tests {
         );
     }
 
+    /// 退場する別ウィンドウへ戻す要求は、**その窓を再利用先にしない**。
+    ///
+    /// `Detached(H) -> Fullscreen` の retire を待っている間に `Detached` を要求すると、
+    /// まだ生きている `H` が後継の ready host として渡ってくる (`native_video.rs` の
+    /// `ready_host_hwnd` は現在の detached host をそのまま読む)。retire 完了時に同じ
+    /// batch が `H` を `DestroyHost` する以上、後継の準備先に `H` を選ぶと、破棄した窓を
+    /// 相手に prepare することになる。
+    ///
+    /// **現在このテストは落ちる。** v3.3.0 の再レビューで見つかった R-27 の再現であり、
+    /// 修正はまだ入っていない。ここで期待している `AwaitingHost` が正しい着地かどうかは
+    /// host の所有権を移譲するのか作り直すのかの決着待ちで、detached リワークの凍結
+    /// ルール (CLAUDE.md) に従って構造的修正として合意を取ってから直す。
+    /// 直したら `#[ignore]` を外すこと。backlog §1.0d。
+    #[test]
+    #[ignore = "R-27 の再現。修正が入ったら ignore を外す (backlog §1.0d)"]
+    fn a_successor_does_not_reuse_the_host_the_same_batch_destroys() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let committed_id = request(&mut owner, ViewerPresentation::Fullscreen, 0);
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, committed_id, 0);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+
+        // 退場中の窓がまだ生きているので、ready host には同じ hwnd が入ってくる。
+        let successor_id = request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            OUTGOING_HOST,
+        );
+        owner.take_effects();
+
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: committed_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        let destroyed: Vec<u64> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                PresentationTransitionEffect::DestroyHost { hwnd, .. } => Some(*hwnd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(destroyed, vec![OUTGOING_HOST]);
+
+        assert!(
+            matches!(
+                owner.state(),
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::AwaitingHost,
+                } if request.id == successor_id
+            ),
+            "破棄した窓を準備先にしている: {:?}",
+            owner.state()
+        );
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::PrepareNative { host_hwnd, .. }
+                    if *host_hwnd == OUTGOING_HOST
+            )),
+            "破棄した窓へ prepare を出している: {effects:?}"
+        );
+    }
+
     /// commit 後に要求した後継は、退場側ではなく publish 済みの表示を起点にする。
     ///
     /// 起点が退場側のままだと、`target == current` の判定も host の始末先も狂う。

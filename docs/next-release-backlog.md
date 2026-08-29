@@ -14,7 +14,41 @@
 
 ## 1. 優先候補
 
-### 1.0b Settings::save が実環境で 43ms かかる (2026-08-29 の perf smoke で判明) — **v3.3.1 で対応**
+### 1.0d v3.3.0 リリースタグの再レビューが P1 5 件を指摘 (2026-08-29) — **最優先で裁定する**
+
+出典は [docs/review-v3.3.0/README.md](review-v3.3.0/README.md) §9 (Codex による、公開済み
+タグ `0d141615` に対する再レビュー)。**§9 は静的レビューであり、実行した 41 test は全て
+成功している** (§9.4 が自ら「成功した test は指摘した gap を覆っていない」と書いている)。
+つまり指摘は「テストが無いので反証されていない」段階で、実害の再現はまだ無い。
+
+| ID | 主張 | こちらの確認状況 |
+| --- | --- | --- |
+| R-27 (新規) | 退場中の detached host `H` を後継の Detached 要求が再利用先として掴み、同じ effect batch が `H` を `DestroyHost` する | **reducer 段は再現済み** (下記) |
+| R-02 | gamepad の batch mount 先 (detached) と action surface (MainWindow) が割れる | 未確認 |
+| R-14 | COW 化しても writer が snapshot 保持中の次の編集で `Arc::make_mut` が文書全体を複製する | **仕様どおり** (該当 doc comment に明記済み)。3 回の無条件複製が「重なった時だけ 1 回」になったのが v3.3.0 の修正。残るのが P1 かは要裁定 |
+| R-26 | edit DB が開けなかった状態を durable success と同じに扱う (`open().ok()` + `None => Ok(())`) | 未確認 |
+| R-07 | 補正マスク保存が UI スレッド | **既知・意図的に延期済み** (§1.0)。新規情報ではない |
+
+**R-27 は reducer 段を再現した**: `PresentationTransitionOwner` に
+`Detached(H) -> Fullscreen` を commit させ、retire 待ちの間に `Detached` を
+`ready_host = H` で要求すると、`NativeRetired` の同じ batch が
+`DestroyHost { hwnd: H }` を出しながら後継を `ReadyToPrepare { host_hwnd: H }` にする。
+再現テストは `src/app/presentation_transition.rs` の
+`a_successor_does_not_reuse_the_host_the_same_batch_destroys` (現在 `#[ignore]`)。
+production で `ready_host == H` になり得ることも確認済み — `native_video.rs` の
+`ready_host_hwnd` は `detached_viewer_video_host_ready()` が真なら現在の detached host を
+そのまま読み、retire 中の窓はまだ生きているため真になる。
+
+**まだ直していない理由**: 期待している `AwaitingHost` への差し替えが正しい着地か未確定。
+`AwaitingHost` は毎フレームの `poll_video_presentation_transition` が
+`detached_viewer_video_host_ready()` を見て解決するが、host を作るのは要求時の
+`ensure_detached_viewer_window_id()` で、**`DestroyHost` はその後に走る**。作り直す側に
+倒すなら「破棄後に誰が host を用意するか」を決める必要があり、所有権を移譲する側に
+倒すなら `RetireOutgoing` の Close/Destroy を出さない判断が要る。どちらも detached の
+所有権境界の設計判断で、CLAUDE.md の凍結ルール (症状パッチ禁止 / 構造的修正は
+ClaudeCode と Codex の合意 + プランへの記録) の対象。
+
+### 1.0b Settings::save が実環境で 43ms かかる (2026-08-29 の perf smoke で判明) — **v3.3.1 で対応済み**
 
 v3.3.0 のリリース前 perf smoke (実機・実設定) で確認した。**退行ではない** (v3.2.0 に同じ
 コードがある) が、R-06 で使った合成データの実測 1.3ms は**実環境を 30 倍過小評価**していた。
@@ -41,9 +75,21 @@ v3.3.0 のリリース前 perf smoke (実機・実設定) で確認した。**�
 
 が走る。つまり **「書かないと決めるための準備」に 43ms** を払っている。
 
-**修正方向**: VST3 の状態を `Settings` 本体から外して別ハンドル (`Arc` 共有か遅延ロード) に
-するか、変更世代を持たせて clone / serialize / hash の対象から外す。`save_full` は隔離・
-世代ローテ・boot decision tree を持つ経路なので、**リリース直前に触らない**と判断した。
+**修正済み** (`f5b9a50d`): `Vst3PluginEntry::state` を `Arc<str>` にして 2 回の clone を
+参照カウント加算にし、dirty 判定を「直近保存した中身と共有 `Arc` が同じか」の O(1) 比較に
+置き換え、`extract_complex_fields` がどうせ捨てる 2 フィールドを `Value` 構築前に外した。
+実機と同じ形 (7 行 32MB + 2 スロット 4.16MB) の release 実測で **41ms → 0.13ms**。
+
+| 段 | 修正前 | 修正後 |
+| --- | --- | --- |
+| clone (save_internal) | 10.4ms | 4.5µs |
+| dirty 判定 | 6.3ms | 0.2µs |
+| clone (save_full) | 10.2ms | 3.7µs |
+| to_value | 10.5ms | 94µs |
+| drop | 3.5ms | 25µs |
+
+**DB のサイズ自体は変わらない** — VST3 の行は今も `settings.db` に入る。バックアップの
+積み上がりは §1.0c で別に扱う。
 
 R-06 (シークストリップのホイール) はこの実測を知る前に直したが、**判断は変わらない** —
 1 ノッチごとに 43ms は論外なので、先送りにしたのは正しかった。
