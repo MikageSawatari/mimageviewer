@@ -1472,14 +1472,30 @@ gamepad だけが OS からグローバルに読まれるため、**サンプリ
 リピート生成) は App-global、dispatch は前面 context を mount した中**、という 2 段に分ける。
 `gamepad_dispatch_allowed` は mount 中の fullscreen / overlay / modal を読むので dispatch 側。
 `update_active_viewer_context` は closure の間だけ mount して root projection を復元するので、
-「その後に配る」では届かない。配って得た `AddressBarNav` は **root の合流点へ流さない** —
-流すとメインウィンドウが動き、同じ不具合が別の入口から再発する。
+「その後に配る」では届かない。
+
+**ただし `AddressBarNav` だけは root が受け取る。**別ウィンドウはビューアであって一覧を
+持たない (グリッドはメインウィンドウにしかない)。お気に入りピッカーの確定は
+`close_fullscreen` でビューアを閉じてから nav を返す = 「ビューアを出て閲覧へ行く」設計
+なので、行き先は一覧のある側しかない。**当初 mount 内で適用したところ、直後に破棄される
+context へフォルダを読み込み、選んだ移動が消えた** (2026-08-29 実機報告)。ページ送り・
+ズーム・スティックは mount 内で完結するので、所有境界は崩れない。
+
+**overlay の描画面も dispatch と同じ owner を使う。**`current_input_surface` を描画時に
+呼び直すと、その窓の描画パスで mount されている projection によって答えが変わり、
+メイン側は「自分はメイン」、detached 側は「自分はビューア」と答えて**両方が描く**。
+配った側が記録した `dispatched_input_surface` を読む。
 
 **なぜ症状パッチではないか**: 述語 (`fullscreen_idx.is_some()`) を緩めるだけでは、dispatch が
 root projection の items / idx に対して走るので**別ページを操作する**。直したのは所有境界で、
 新しい App-level bool / Option は足していない (規則 3 — この frame の操作は値として持ち回る)。
 時間窓も heuristic も無い (規則 5)。既存 detached テストは削除・弱体化していない (規則 8)。
 mount 内 dispatch を止める mutation を独立テストが拒否する。
+
+**Codex の助言を 1 点だけ修正した**: 「返る nav を root の合流点へ流すと所有権バグが
+再発する」という指摘は、別ウィンドウが閲覧を所有するという前提に立っていた。実際には
+一覧を持たないので、nav の行き先は root しかない。実機で「別ウィンドウは閉じるが移動
+しない」として現れた。
 
 **述語は古いが、踏めるようになったのは v3.3.0**: `gamepad_targets_viewer` は v3.2.0 と同一
 だが、`active_detached_context_is_at_rest` / `update_active_viewer_context` は v3.2.0 に存在
