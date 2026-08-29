@@ -120,10 +120,11 @@ mod presentation_transition;
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
 #[cfg(windows)]
 use presentation_transition::{
-    PreparingProgress, PresentationCandidate, PresentationEffectsOutcome,
+    DetachedHostLease, PresentationCandidate, PresentationEffectsOutcome,
     PresentationTransitionEffect, PresentationTransitionEvent, PresentationTransitionOwner,
-    PresentationTransitionState,
 };
+#[cfg(all(windows, test))]
+use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
@@ -156,8 +157,9 @@ pub(crate) use detached_window_manager::{
     DetachedActivationCloseHitTest, DetachedActivationDispatch, DetachedActivationRequest,
     DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
-    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedWindowHwndDiff,
-    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
+    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedHostClaim,
+    DetachedSessionLease, DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime,
+    DetachedWindowState, IdentifiedRightDragCommand,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -37453,6 +37455,27 @@ impl App {
         self.remove_detached_window_runtime(session.window_id, reason);
     }
 
+    /// Close exactly the detached session named by an effect-owned lease.
+    ///
+    /// Presentation effects can outlive the App-global active selection. A delayed close for
+    /// one window must never consume a sibling session that became current in the meantime.
+    #[cfg(windows)]
+    pub(crate) fn close_active_detached_session_exact(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        if self
+            .active_detached_session
+            .is_none_or(|session| session.window_id != lease.window_id)
+        {
+            return false;
+        }
+        self.begin_active_detached_session_close(reason);
+        self.finish_active_detached_session_close(reason);
+        true
+    }
+
     /// Active-to-passive is not terminal: the passive renderer keeps the runtime and OS viewport.
     #[cfg(windows)]
     #[track_caller]
@@ -38154,6 +38177,86 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn detached_window_hwnd_alive_for_window_id(&self, window_id: u64) -> Option<u64> {
         self.detached_window_hwnd_alive(window_id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_session_lease(window_id: u64) -> DetachedSessionLease {
+        DetachedSessionLease { window_id }
+    }
+
+    #[cfg(windows)]
+    fn detached_host_lease_for_window_id(&self, window_id: u64) -> DetachedHostLease {
+        let session = Self::detached_session_lease(window_id);
+        DetachedHostLease {
+            session,
+            host: self.detached_host_claim_for_lease(session),
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_detached_host_lease(&self) -> Option<DetachedHostLease> {
+        let window_id = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)?;
+        Some(self.detached_host_lease_for_window_id(window_id))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_host_claim_for_lease(
+        &self,
+        lease: DetachedSessionLease,
+    ) -> Option<DetachedHostClaim> {
+        if self.detached_viewer_window_id != Some(lease.window_id) {
+            return None;
+        }
+        let claim = self
+            .detached_window_manager
+            .host_claim_alive(lease.window_id)?;
+        self.detached_host_claim_has_client_rect(claim)
+            .then_some(claim)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_host_claim_is_current(&self, claim: DetachedHostClaim) -> bool {
+        self.detached_viewer_window_id == Some(claim.lease.window_id)
+            && self.detached_window_manager.host_claim_is_alive(claim)
+            && self.detached_host_claim_has_client_rect(claim)
+    }
+
+    #[cfg(windows)]
+    fn detached_host_claim_has_client_rect(&self, claim: DetachedHostClaim) -> bool {
+        self.detached_client_rect_for_host_claim(claim).is_some()
+    }
+
+    #[cfg(windows)]
+    fn detached_client_rect_for_host_claim(
+        &self,
+        claim: DetachedHostClaim,
+    ) -> Option<windows::Win32::Foundation::RECT> {
+        if !self.detached_window_manager.host_claim_is_alive(claim) {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            return Some(windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 480,
+            });
+        }
+        #[cfg(not(test))]
+        {
+            use windows::Win32::Foundation::{HWND, RECT};
+            use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(HWND(claim.hwnd as *mut _), &mut rect) }.is_err() {
+                return None;
+            }
+            (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+        }
     }
 
     #[cfg(windows)]
@@ -41060,6 +41163,7 @@ impl App {
         let visible_source_uv_rect =
             crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
                     page_idx: idx,
                     viewport_rect: snapshot_rect,
                     source_size: texture_size,
@@ -42259,6 +42363,31 @@ impl App {
                 Some((placement, rect, owner_hwnd))
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_target_for_host_claim(
+        &self,
+        presentation: ViewerPresentation,
+        host: Option<DetachedHostClaim>,
+    ) -> Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )> {
+        if presentation != ViewerPresentation::DetachedWindow {
+            return self.native_video_target_for_presentation(presentation);
+        }
+        let claim = host?;
+        if !self.detached_host_claim_is_current(claim) {
+            return None;
+        }
+        let rect = self.detached_client_rect_for_host_claim(claim)?;
+        Some((
+            crate::video::NativeVideoPlacement::DetachedViewerChild,
+            rect,
+            claim.hwnd,
+        ))
     }
 
     #[cfg(windows)]

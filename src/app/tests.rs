@@ -1,11 +1,28 @@
 #[cfg(windows)]
-use super::presentation_transition::{DetachedHostDisposition, PresentationRequest};
+use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 use crate::archive_converter::ArchiveFormat;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+#[cfg(windows)]
+fn test_detached_host_lease(
+    window_id: u64,
+    hwnd: Option<u64>,
+    incarnation: u64,
+) -> DetachedHostLease {
+    let session = DetachedSessionLease { window_id };
+    DetachedHostLease {
+        session,
+        host: hwnd.map(|hwnd| DetachedHostClaim {
+            lease: session,
+            incarnation,
+            hwnd,
+        }),
+    }
+}
 
 #[cfg(windows)]
 fn begin_test_video_presentation_transition(
@@ -15,18 +32,29 @@ fn begin_test_video_presentation_transition(
 ) -> u64 {
     app.video_presentation_transition
         .reset_stable(app.viewer_presentation);
-    let ready_host_hwnd = if target == ViewerPresentation::DetachedWindow {
-        0xD371
-    } else {
-        0
-    };
+    let current_detached =
+        (app.viewer_presentation == ViewerPresentation::DetachedWindow).then(|| {
+            let window_id = app
+                .active_detached_session
+                .map(|session| session.window_id)
+                .or(app.detached_viewer_window_id)
+                .unwrap_or(0xA056);
+            test_detached_host_lease(window_id, Some(0xA057), 1)
+        });
+    let target_detached = (target == ViewerPresentation::DetachedWindow).then(|| {
+        let window_id = current_detached
+            .map(|lease| lease.session.window_id)
+            .or(app.detached_viewer_window_id)
+            .unwrap_or(0xD370);
+        test_detached_host_lease(window_id, Some(0xD371), 2)
+    });
     let request_id = app.video_presentation_transition.request_transition(
         target,
         true,
         announce_main_hint,
         0xA117,
-        0xA057,
-        ready_host_hwnd,
+        current_detached,
+        target_detached,
     );
     app.video_presentation_transition.take_effects();
     app.video_presentation_transition.drive();
@@ -138,7 +166,12 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
                 activate: true,
                 announce_main_hint: false,
                 outgoing_presenter_hwnd: 0xA117,
-                detached_host: DetachedHostDisposition::None,
+                outgoing_detached: None,
+                target_detached: DetachedTargetLease::Candidate(test_detached_host_lease(
+                    12,
+                    Some(0xD371),
+                    1,
+                )),
             },
             hwnd: 0xD371,
         },
@@ -310,8 +343,8 @@ fn begin_test_detached_host_wait(app: &mut App) -> u64 {
         true,
         false,
         0xA117,
-        0,
-        0,
+        None,
+        Some(test_detached_host_lease(0xD370, None, 0)),
     );
     app.video_presentation_transition.take_effects();
     request_id
@@ -24618,6 +24651,7 @@ mod favorite_adjustment_defaults_tests {
             let rect = egui::Rect::from_min_size(min, egui::vec2(10.0, 10.0));
             let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
                     page_idx: idx,
                     viewport_rect: rect,
                     source_size: egui::vec2(10.0, 10.0),
@@ -53108,8 +53142,8 @@ mod still_window_mode_key_tests {
                 true,
                 false,
                 0xA117,
-                0,
-                0xD371,
+                None,
+                Some(test_detached_host_lease(9, Some(0xD371), 1)),
             );
         });
         app.transition_detached_window_state(9, DetachedWindowState::ParkedLive, "test_setup");
@@ -63776,6 +63810,225 @@ fn presentation_transition_poll_drives_prepare_without_a_forced_deadline() {
             ..
         }
     ));
+}
+
+#[test]
+#[cfg(windows)]
+fn stale_prepare_claim_returns_to_awaiting_host_instead_of_rerouting_to_global_sibling() {
+    const ACTIVE_WINDOW: u64 = 710;
+    const WINDOW_ID: u64 = 711;
+    const ACTIVE_HOST: u64 = 0x7100;
+    const HOST_H: u64 = 0x7110;
+    const HOST_J: u64 = 0x7111;
+
+    let mut app = phase_c_support::setup_app();
+    let idx = install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\exact-host.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    app.fullscreen_idx = Some(idx);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.detached_window_hwnd_set(ACTIVE_WINDOW, ACTIVE_HOST);
+    app.begin_active_detached_session(ACTIVE_WINDOW, DetachedSource::Video);
+    app.detached_viewer_window_id = Some(WINDOW_ID);
+    app.detached_window_hwnd_set(WINDOW_ID, HOST_H);
+    app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_H]);
+    let lease = DetachedSessionLease {
+        window_id: WINDOW_ID,
+    };
+    let claim_h = app
+        .detached_host_claim_for_lease(lease)
+        .expect("initial exact host claim");
+
+    app.video_presentation_transition
+        .reset_stable(ViewerPresentation::Fullscreen);
+    let request_id = app.video_presentation_transition.request_transition(
+        ViewerPresentation::DetachedWindow,
+        true,
+        false,
+        0xA117,
+        None,
+        Some(DetachedHostLease {
+            session: lease,
+            host: Some(claim_h),
+        }),
+    );
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition.drive();
+
+    app.detached_window_hwnd_set(WINDOW_ID, HOST_J);
+    app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_J]);
+    let claim_j = app
+        .detached_host_claim_for_lease(lease)
+        .expect("replacement exact host claim");
+    assert_ne!(claim_h.incarnation, claim_j.incarnation);
+
+    let ctx = egui::Context::default();
+    app.execute_video_presentation_transition_effects(&ctx);
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::AwaitingHost { lease: waiting },
+        } if request.id == request_id && waiting == lease
+    ));
+
+    app.poll_video_presentation_transition(&ctx);
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::AwaitingNative {
+                host: Some(prepared),
+            },
+        } if request.id == request_id && prepared == claim_j
+    ));
+    let before_stale_rejection = app.video_presentation_transition.state();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::HostUnavailable {
+            request_id,
+            claim: claim_h,
+        });
+    assert_eq!(
+        app.video_presentation_transition.state(),
+        before_stale_rejection,
+        "a late rejection for H must not rewind the request preparing exact claim J"
+    );
+    assert_eq!(
+        app.active_detached_session.map(|session| session.window_id),
+        Some(ACTIVE_WINDOW),
+        "preparing target J must not consume the outgoing active sibling"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport() {
+    const OLD_WINDOW: u64 = 721;
+    const SIBLING_WINDOW: u64 = 722;
+    const OLD_HOST: u64 = 0x7210;
+    const SIBLING_HOST: u64 = 0x7220;
+
+    let mut app = phase_c_support::setup_app();
+    app.detached_window_hwnd_set(OLD_WINDOW, OLD_HOST);
+    app.detached_window_hwnd_set(SIBLING_WINDOW, SIBLING_HOST);
+    app.set_detached_window_live_hwnds_for_test([OLD_HOST, SIBLING_HOST]);
+    app.begin_mounted_detached_session_for_test(SIBLING_WINDOW, DetachedSource::Video);
+    let sibling_context = app
+        .locate_window_context(SIBLING_WINDOW)
+        .expect("sibling binding before stale cleanup")
+        .0;
+
+    let old = test_detached_host_lease(OLD_WINDOW, Some(OLD_HOST), 1);
+    app.video_presentation_transition
+        .reset_stable(ViewerPresentation::DetachedWindow);
+    let request_id = app.video_presentation_transition.request_transition(
+        ViewerPresentation::Fullscreen,
+        true,
+        false,
+        0xA117,
+        Some(old),
+        None,
+    );
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeReady {
+            request_id,
+            candidate: PresentationCandidate {
+                presenter_hwnd: 0xCA11,
+                native_generation: 73,
+                host_hwnd: 0,
+                requires_retire: true,
+            },
+        });
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id,
+            candidate_generation: 73,
+        });
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id,
+            candidate_generation: 73,
+        });
+    let effects = app.video_presentation_transition.take_effects();
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        PresentationTransitionEffect::CloseDetachedSession { lease, .. }
+            if lease.window_id == OLD_WINDOW
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        PresentationTransitionEffect::DestroyHost { lease, .. }
+            if lease.window_id == OLD_WINDOW
+    )));
+    assert!(!app.close_active_detached_session_exact(
+        DetachedSessionLease {
+            window_id: OLD_WINDOW,
+        },
+        "test_stale_exact_close",
+    ));
+
+    let ctx = egui::Context::default();
+    let old_viewport = App::detached_image_window_viewport_id(OLD_WINDOW);
+    let sibling_viewport = App::detached_image_window_viewport_id(SIBLING_WINDOW);
+    ctx.set_embed_viewports(false);
+    ctx.begin_pass(egui::RawInput::default());
+    for effect in effects {
+        app.execute_video_presentation_host_effect(&ctx, effect);
+    }
+    ctx.show_viewport_deferred(
+        old_viewport,
+        egui::ViewportBuilder::default(),
+        |_ctx, _class| {},
+    );
+    ctx.show_viewport_deferred(
+        sibling_viewport,
+        egui::ViewportBuilder::default(),
+        |_ctx, _class| {},
+    );
+    let output = ctx.end_pass();
+
+    assert_eq!(
+        app.active_detached_session.map(|session| session.window_id),
+        Some(SIBLING_WINDOW)
+    );
+    assert_eq!(app.detached_viewer_window_id, Some(SIBLING_WINDOW));
+    assert_eq!(
+        app.locate_window_context(SIBLING_WINDOW)
+            .expect("sibling binding after stale cleanup")
+            .0,
+        sibling_context
+    );
+    assert_eq!(
+        app.detached_window_state(SIBLING_WINDOW),
+        Some(DetachedWindowState::Active)
+    );
+    assert_eq!(
+        app.detached_window_state(OLD_WINDOW),
+        Some(DetachedWindowState::Closing)
+    );
+    assert!(
+        output
+            .viewport_output
+            .get(&old_viewport)
+            .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
+    );
+    assert!(
+        output
+            .viewport_output
+            .get(&sibling_viewport)
+            .is_none_or(|viewport| !viewport.commands.contains(&egui::ViewportCommand::Close)),
+        "DestroyHost(old) must address only the effect-owned viewport identity"
+    );
 }
 
 #[test]
