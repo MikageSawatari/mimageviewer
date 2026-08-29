@@ -14896,9 +14896,11 @@ mod page_edit_switch_audit {
 
         assert!(
             offenders.is_empty(),
-            "表示ページを直接動かしている: {}. 左右切替なら \r
-             `switch_local_adjust_target_in_spread` を通すこと。通さないと旧ページの \r
-             投げ縄・選択・ドラッグ退避が新ページへ持ち越される。",
+            concat!(
+                "表示ページを直接動かしている: {}. 左右切替なら ",
+                "`switch_local_adjust_target_in_spread` を通すこと。通さないと旧ページの ",
+                "投げ縄・選択・ドラッグ退避が新ページへ持ち越される。"
+            ),
             offenders.join(", ")
         );
     }

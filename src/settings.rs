@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
@@ -6135,6 +6135,21 @@ static BACKUP_DONE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
 /// 入力消失」 vs 「本物の main 喪失」。後者の方が遥かに深刻なので前者を選ぶ。
 static MAIN_UNREADABLE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
 
+/// `Settings::save()` が **実際に書き込みへ成功した回数**。
+///
+/// save は毎回 `Settings` 全体を書くので、「ある値を変えた後で 1 回でも save が
+/// 通ったなら、その値はもう永続化されている」が成り立つ。連続操作中に保存を
+/// 先送りしたい呼び出し側は、値を変えた時点の世代を覚えておき、書くべきときに
+/// `save_generation()` と比べれば「他の誰かの save が自分の分も書いたか」を
+/// 判定できる。**保存済みかどうかを別のフラグで二重に持たないため**の値で、
+/// 抑止中 (`MAIN_UNREADABLE_THIS_SESSION` / `save_suppressed`) や失敗時は進めない。
+static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 直近までに成功した `Settings::save()` の世代。詳細は [`SAVE_GENERATION`]。
+pub(crate) fn save_generation() -> u64 {
+    SAVE_GENERATION.load(Ordering::Relaxed)
+}
+
 fn backup_path(main: &Path, n: usize) -> PathBuf {
     let mut name = main
         .file_name()
@@ -8037,7 +8052,18 @@ impl Settings {
         self.save_internal(false)
     }
 
+    /// 実書き込みは [`Self::save_internal_attempt`] が行い、ここは **成功したときだけ**
+    /// [`SAVE_GENERATION`] を進める唯一の場所。抑止による早期 return も、DB エラーも、
+    /// 同じ返り値 1 本を通るので「書けていないのに世代が進む」経路を作れない。
     fn save_internal(&self, allow_rotation: bool) -> bool {
+        let landed = self.save_internal_attempt(allow_rotation);
+        if landed {
+            SAVE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        landed
+    }
+
+    fn save_internal_attempt(&self, allow_rotation: bool) -> bool {
         // session-wide 抑止フラグ。
         // - `MAIN_UNREADABLE_THIS_SESSION`: settings.rs 上の抑止 (旧来から維持)
         // - `settings_db::save_suppressed()`: settings_db 側の抑止 (Phase 2 で追加)
@@ -13156,6 +13182,43 @@ mod tests {
             assert!(!loaded.fullscreen_boundary_notice_visible);
             assert!(!loaded.fullscreen_processing_status_visible);
             assert!(!loaded.fullscreen_prefetch_status_visible);
+        }
+
+        /// 連続操作中の保存先送りは「変えた時点の世代」と現在の世代を比べて決める。
+        /// 世代が進むのは **実際に書けたときだけ** で、抑止中に進むと「もう書けた」と
+        /// 誤判定して値を落とす。
+        ///
+        /// (2026-08-29 レビュー R-06: シークストリップのレンジをホイール 1 ノッチごとに
+        /// 全設定保存していた件の土台)
+        #[test]
+        fn save_generation_advances_only_when_the_write_landed() {
+            let _env = setup_backup_env();
+            let _initial = Settings::load();
+
+            let mut settings = Settings::default();
+            let before = save_generation();
+            assert!(settings.save_checked(), "temp DB への保存は成功するはず");
+            let after_first = save_generation();
+            assert!(
+                after_first > before,
+                "書けたのに世代が進んでいない: {before} -> {after_first}"
+            );
+
+            settings.video_seek_strip_waveform_span_secs = 42.0;
+            assert!(settings.save_checked());
+            let after_second = save_generation();
+            assert!(
+                after_second > after_first,
+                "2 回目も進むはず: {after_first} -> {after_second}"
+            );
+
+            // 抑止中は書いていないので進めてはいけない。ここで進めると、先送りしていた
+            // 呼び出し側が「他の誰かが書いてくれた」と誤解して自分の分を捨てる。
+            crate::settings_db::set_save_suppressed(true);
+            settings.video_seek_strip_waveform_span_secs = 43.0;
+            assert!(!settings.save_checked(), "抑止中の保存は失敗を返すはず");
+            assert_eq!(save_generation(), after_second, "抑止中に世代が進んだ");
+            crate::settings_db::set_save_suppressed(false);
         }
 
         #[test]

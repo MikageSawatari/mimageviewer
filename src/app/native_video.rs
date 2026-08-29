@@ -42,6 +42,19 @@ pub(super) struct VideoSeekStripSession {
     /// 手元でも再現しない。次に出たときに証拠が残るよう、ここで一度だけ理由を出す。
     visible_pending_since: Option<std::time::Instant>,
     visible_pending_reported: bool,
+    /// ホイールでレンジ設定を変えた時点の [`crate::settings::save_generation`]。
+    /// 変えていなければ `None`。
+    ///
+    /// ホイールは 1 ノッチ = 1 コマンドなので、その都度 `Settings::save` を呼ぶと
+    /// 全設定の JSON 化 + SQLite transaction が UI スレッドで連続する。実測は既定設定で
+    /// 1.3ms、VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)、さらに
+    /// プロセス最初の保存には世代ローテ 7ms が付く。操作中はメモリ上の `settings` だけを
+    /// 進め、セッションを閉じるときに 1 回だけ書く。
+    ///
+    /// 閉じる時点で世代が動いていれば、その save が全設定を書いた以上こちらの変更も
+    /// 一緒に入っているので書かない。「保存済みか」を各 save 呼び出し側で個別に
+    /// 記録し直さずに済ませるための持ち方。
+    range_edited_at_save_generation: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -7356,6 +7369,7 @@ impl App {
                 last_follow_recenter_at: None,
                 visible_pending_since: None,
                 visible_pending_reported: false,
+                range_edited_at_save_generation: None,
             }));
         true
     }
@@ -7405,6 +7419,13 @@ impl App {
         let VideoSeekStripRuntime::Open(session) = previous else {
             return false;
         };
+        // ホイールで動かしたレンジはここで 1 回だけ書く
+        // (`range_edited_at_save_generation` 参照)。セッションが死ぬ経路はこの関数だけ
+        // なので、開き直し・モード切替・動画切替・利用者の閉じるのどれでも同じ 1 箇所を
+        // 通る。世代が動いていれば別経路の save が既に書いている。
+        if session.range_edited_at_save_generation == Some(crate::settings::save_generation()) {
+            self.settings.save();
+        }
         if let Some(worker) = session.thumbnail_worker.as_ref() {
             worker.cancel();
         }
@@ -7555,7 +7576,14 @@ impl App {
                 self.settings.video_seek_strip_waveform_span_secs = next;
             }
         }
-        self.settings.save();
+        // ここでは保存せず、変えた時点の save 世代だけを覚える (実測値と理由は
+        // `range_edited_at_save_generation` の doc comment)。書くのはセッションを閉じる
+        // `stop_video_seek_strip_session` の 1 回だけで、そこまでの正本はメモリ上の
+        // `settings` が持つ。終了 / トレイ退避は `persist_window_state_and_flush` の
+        // 全体保存が拾う。
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
+            session.range_edited_at_save_generation = Some(crate::settings::save_generation());
+        }
         match mode {
             crate::settings::VideoSeekStripMode::Thumbnails => {
                 self.rebuild_video_seek_strip_adopted_list();
@@ -12603,6 +12631,92 @@ mod native_video_key_observation_tests {
                 true,
             ),
             Some(crate::settings::VideoSeekStripState::Thumbnails)
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod seek_strip_range_persist_audit {
+    /// ホイールでレンジを変える関数は保存しない。書くのはセッションを閉じる 1 箇所だけ。
+    ///
+    /// 欠陥は「1 ノッチ = 1 コマンド」なのに毎回 `Settings::save` を呼んでいたことで、
+    /// 実測は既定設定 1.3ms / VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)。
+    /// 保存 1 回分のコストを測るテストは環境で揺れるので、**どの関数の中で保存するか**を
+    /// 見る (2026-08-29 レビュー R-06)。
+    #[test]
+    fn the_wheel_defers_the_write_and_only_the_teardown_persists_it() {
+        let src = std::fs::read_to_string("src/app/native_video.rs")
+            .expect("src/app/native_video.rs を読めない (cwd はクレート root のはず)");
+
+        // 綴りを分けて持つ。1 つの文字列にすると、この検査自身の行が引っかかる。
+        let save_call = concat!("self.settings", ".save()");
+        let generation_field = concat!("range_edited", "_at_save_generation");
+
+        let mut current_fn = "<ファイル先頭>";
+        let mut wheel_saves = Vec::new();
+        let mut wheel_records_generation = false;
+        let mut teardown_save_is_guarded = false;
+        let mut saw_guard_line = false;
+        for (lineno, line) in src.lines().enumerate() {
+            // rustfmt 済みなので、メソッドの `fn` は必ずインデント 4。
+            if let Some(rest) = line.strip_prefix("    ")
+                && !rest.starts_with(' ')
+                && let Some(after_fn) = rest
+                    .strip_prefix("fn ")
+                    .or_else(|| rest.strip_prefix("pub(crate) fn "))
+                    .or_else(|| rest.strip_prefix("pub(super) fn "))
+                    .or_else(|| rest.strip_prefix("pub fn "))
+            {
+                current_fn = after_fn.split(['(', '<']).next().unwrap_or(after_fn);
+                saw_guard_line = false;
+            }
+            // doc コメントや通常コメントの中の言及は呼び出しではない。
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            match current_fn {
+                "step_video_seek_strip_range" => {
+                    if line.contains(save_call) {
+                        wheel_saves.push(lineno + 1);
+                    }
+                    if line.contains(generation_field) {
+                        wheel_records_generation = true;
+                    }
+                }
+                "stop_video_seek_strip_session" => {
+                    if line.contains(generation_field) {
+                        saw_guard_line = true;
+                    }
+                    if line.contains(save_call) && saw_guard_line {
+                        teardown_save_is_guarded = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            wheel_saves.is_empty(),
+            concat!(
+                "ホイール 1 ノッチごとに設定を保存している: {:?} 行目. ",
+                "メモリ上の settings だけ進めて、書くのは閉じるときの 1 回にすること。"
+            ),
+            wheel_saves
+        );
+        assert!(
+            wheel_records_generation,
+            concat!(
+                "ホイールが保存世代を記録していない。記録しないと、閉じるときに ",
+                "「変えたのか」「他の save が既に書いたのか」を区別できない。"
+            )
+        );
+        assert!(
+            teardown_save_is_guarded,
+            concat!(
+                "セッション終了時の保存が世代判定に守られていない。無条件に書くと、",
+                "レンジを触っていない開閉でも毎回 SQLite transaction が走る。"
+            )
         );
     }
 }
