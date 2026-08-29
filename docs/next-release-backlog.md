@@ -5008,6 +5008,33 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 
 **この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
 
+### 5.14 v3.3.0 の公開記録 (2026-08-29)
+
+測定値は [release-verification-records.md](release-verification-records.md) の v3.3.0 節。
+ここには**公開作業の到達点**だけ置く。
+
+1. ✅ **Phase 0 / 1** — README 更新履歴 (6,958 バイト、8KB 上限内なので短縮版なし)、
+   バージョン表記 4 箇所、製品ページの版・最終更新・ポータブル版リンク、
+   `changelog.html` 再生成 (差分なし)、`version_highlights.rs`、既知の問題 2 件は残置
+   (どちらも今回直していない)。
+2. ✅ **Phase 2** — 依存確認・`test-full.ps1` 7,604 passed / 0 failed・idle health 4 シナリオ
+   PASS・perf smoke 97.3%。
+3. ✅ **Phase 3** — `build-dist.ps1 -SkipVst3Bridge`。**1 回目は起動中の mIV を検出して停止**
+   (ガードが正しく働いた。core 8 = 本体 + PDF ワーカープール)。終了後に再実行して成功。
+   4 成果物すべて署名済み、`dumpbin` / `signtool` の回帰チェック合格。
+4. ✅ **Phase 4** — タグ `v3.3.0` 公開、Release body は README 節とバイト一致、
+   Assets 4 点。<https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.3.0>
+5. ✅ **Phase 5** — mikage.to 反映済み / Vector 申請済み (2026-08-29)。
+   窓の杜は**メジャーリリース時のみ**とする方針に変更。MS Store は更新を実施
+   (版付き直リンク `https://mikage.to/mimageviewer/download/v3.3.0/mImageViewer_setup.exe`
+   がリダイレクト 0・`Content-Length` 一致を確認済み)。X 告知済み。
+6. **公開後の目視確認 (未実施)** — 別マシンで起動し、更新通知ダイアログの body が
+   崩れずに出るか。
+7. **この版のレビュー** — 26 件中 11 件修正、1 件反証で取り下げ、12 件を v3.3.1 へ。
+   正本は [review-v3.3.0/README.md](review-v3.3.0/README.md)、先送りの判断根拠は §1.0。
+
+**この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
+
 ### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
 
 - 出典: v3.2.0 の配布ビルド (2026-08-23)。`Assert-MivSignReady` を通過したのに、

@@ -12,6 +12,54 @@
 
 ---
 
+## v3.3.0 (2026-08-29)
+
+- **依存**: PDFium `chromium/8021` は最新で更新なし。FFmpeg は現行
+  `n7.1.5-12-g1fdbca85aa` に対し `n7.1.5-16-g9a4bb2c579` が出ていたが**更新しない判断**
+  (同じ 7.1.5 系で 4 コミット差、DLL 名も不変。更新すると LGPL 対応ソースの再配置と
+  製品ページ改訂、動画再生の再確認が付く)。DLL の ProductVersion は `vendor/ffmpeg/VERSION`
+  と一致していて腐っていない。VST3 bridge は C++ 最終変更 2026-05-16 に対し exe が
+  08-23 ビルドなので再ビルド不要 (`-SkipVst3Bridge`)。
+- **Rust 全体テスト**: `test-full.ps1` で **7,604 passed / 0 failed** (exit 0)。
+- **idle health**: 4 シナリオ (`static-foreground` / `static-background` /
+  `video-pin-background` / `tray-residency`) とも **PASS** (利用者実施)。個々の数値は
+  この記録には残していない。
+- **perf smoke**: 4,708 フレーム中、間隔 16ms 以上が 126 件 = **16ms 未満が 97.3%**
+  (v3.1.0 の 97.74% / v2.9.1 の 97.7% と同等)。100ms 超は 24 件:
+  - `action: none` (入力待ちで就寝) **16 件** — 正常
+  - `request_repaint_after_idle_upgrade` **5 件** — 正常。実測ギャップが
+    `idle_upgrade_delay_ms` とほぼ一致 (418.9ms / 433.8ms など)
+  - `request_repaint` **2 件** — 原因特定済み。t=1.18s の 178ms は
+    プロセス最初の保存に伴う世代ローテ (`sli_settings_save` 129ms)、t=2.39s の 488ms は
+    PDF サムネイル生成中 (1 ページの `render_ms` 408ms)。perf_smoke 自身が
+    「PDF cold open 等が紐付いていれば許容」としている類型
+  - 最初の `tail_repaint` より前 1 件
+  - **説明のつかない UI スレッド同期 I/O は無し。**
+- **この版で新たに分かったこと (次版対象、§1.0b / §1.0c)**:
+  - `Settings::save()` が**フォルダ移動 1 回ごとに 43〜61ms**。38 回の移動で計 1.8 秒。
+    原因は `settings.db` が 36.7 MB で、その 98% が VST3 状態 BLOB (`vst3_plugins` 7 行
+    32.04 MB + `vst3_chain_slots` 2 行 4.16 MB、他すべてで 0.2 MB)。**行自体は
+    ハッシュ比較で書き直していない**が、そこへ至る clone 2 回・JSON 値構築・ハッシュに
+    43ms を払っている。**v3.2.0 に同じコードがあり退行ではない。**
+  - 合成データでの `save_full` 実測は既定設定 1.3ms / +500 resume positions 2.2ms /
+    +1MB VST3 状態 17.4ms、`rotate_backups` 10 世代 6.9ms、`Settings::clone` 34µs。
+    **実機の 43ms を 30 倍過小評価していた。** 次に同種を測るときは実機の settings.db で測る。
+  - `settings.db*` が **124 ファイル・2,980 MB** (`preupgrade` 36 個 1,053 MB /
+    隔離 22 個 775 MB / その他 55 個 748 MB / `bak1..10` 367 MB / main 37 MB)。
+- **補正マスクの圧縮 (R-07 判断材料)**: release ビルド実測で `encode_alpha` は
+  0.8MP 2.4ms / 3MP 8.1ms / 12MP 33ms / **24MP 70.6ms**。v3.2.0 の形式 (素の JSON 数値配列)
+  は同条件で 11.9 / 49.4 / 195 / **410ms** なので、**v3.3.0 の codec 変更が 5.8 倍速く・
+  600 分の 1 の大きさにした後の値**。マスクは画像原寸 (`local_adjust_image_dims`)。
+  レイヤー文書の 1 複製は 3MP 3.5ms / 12MP 14.3ms / **24MP 27.7ms (96 MB)**。
+- **Remote の寸法 probe (R-23 判断材料)**: `page_dims_without_catalog` はローカル SSD で
+  初回 454µs/件・キャッシュ後 23µs/件。1,000 件で 0.45 秒、10,000 件で 4.5 秒。
+  open のコストが支配的なので HDD / NAS では 1 件 1〜10ms に伸びる。
+- **配布物の回帰チェック**: `dumpbin /dependents` で launcher / core / remote / portable の
+  4 本とも `VCRUNTIME140.dll` / `MSVCP140.dll` **なし**。`signtool verify /pa` で単体exe /
+  setup.exe / portable の 3 本とも VALID + RFC3161 タイムスタンプ、チェーンは
+  `Certum Trusted Network CA → CA 2 → Certum Code Signing 2021 CA → Open Source Developer Taku Sano`。
+- **検索 bench**: 全文索引に触れていないため未実施。
+
 ## v3.1.0 (2026-08-16)
 
 - **依存**: PDFium `chromium/7988` / FFmpeg `n7.1.5-12-g1fdbca85aa` とも更新なし。DLL の
