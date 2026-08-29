@@ -4806,11 +4806,15 @@ fn run_native_video_output(
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
         let mut desired_scale_apply_due = false;
-        let commands: Vec<_> = deferred_transition_commands
-            .drain(..)
-            .chain(command_rx.drain())
-            .collect();
-        for command in commands {
+        // **この frame で処理する分は 1 つの queue が持つ。**入れ子の待機もここを見るので、
+        // 待機を始めた時点で残っていた分が、待機からは見えない局所 Vec に取り残されない。
+        // 取り残すと、同じ batch の `[Prepare, Abort]` で Prepare が待機に入り、その待機が
+        // 待っている Abort が手の届かない場所にあって永久に止まる (Codex Q4-1)。
+        // `deferred_transition_commands` は「次の frame へ送る分」専用に残す。
+        let mut pending_commands: std::collections::VecDeque<_> =
+            std::mem::take(&mut deferred_transition_commands);
+        pending_commands.extend(command_rx.drain());
+        while let Some(command) = pending_commands.pop_front() {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
                     presenter.set_overlay_hover_thumbnail(thumbnail);
@@ -5374,6 +5378,11 @@ fn run_native_video_output(
                                 visible,
                             },
                         );
+                        // この Prepare を次の frame へ送るなら、後ろに並んでいる分も
+                        // 一緒に送る。追い越させると、同じ request の Abort が Prepare
+                        // より先に処理され、待っている相手のいない control になる
+                        // (Codex Q5)。順序は queue が持つ。
+                        deferred_transition_commands.extend(pending_commands.drain(..));
                         continue;
                     }
                     if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
@@ -5475,7 +5484,7 @@ fn run_native_video_output(
                         );
                         match wait_for_placement_transition_control(
                             &command_rx,
-                            &mut deferred_transition_commands,
+                            &mut pending_commands,
                             request_id,
                             cur_generation,
                             false,
@@ -5689,7 +5698,7 @@ fn run_native_video_output(
                     );
                     match wait_for_placement_transition_control(
                         &command_rx,
-                        &mut deferred_transition_commands,
+                        &mut pending_commands,
                         request_id,
                         candidate_epoch,
                         false,
@@ -5773,7 +5782,7 @@ fn run_native_video_output(
                     );
                     let retire_control = wait_for_placement_transition_control(
                         &command_rx,
-                        &mut deferred_transition_commands,
+                        &mut pending_commands,
                         request_id,
                         candidate_epoch,
                         true,
