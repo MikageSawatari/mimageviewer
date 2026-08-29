@@ -25,8 +25,6 @@
 //! - 複合テーブルは hash skip (VST3) や hot-path upsert (video_resume_positions)
 //!   などの最適化を別個に適用できる
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -333,12 +331,18 @@ impl RemoteListingSettings {
 
 struct Inner {
     conn: Connection,
-    /// VST3 chain (= `Settings::vst3_plugins`) の **直近 commit 成功時** の hash。
-    /// `None` = 未確認 (= 起動直後 / load 前)。`Some(h)` = h と一致するなら DB と
-    /// in-memory は同じ内容なので DELETE+INSERT をスキップする。
-    last_saved_vst3_chain_hash: Option<u64>,
+    /// VST3 chain (= `Settings::vst3_plugins`) の **直近 commit 成功時** の中身。
+    /// `None` = 未確認 (= 起動直後 / load 前)。現在値と `vst3_chain_unchanged` で
+    /// 等しければ DB と in-memory は同じ内容なので DELETE+INSERT をスキップする。
+    ///
+    /// **hash ではなく現物を保持する理由** (v3.3.1 §1.0b): state chunk は 1 プラグイン
+    /// 数 MB あり、内容 hash は実測 6.3ms/保存を要した。`Arc<str>` を保持しておけば
+    /// 「同じ `Arc` を指しているか」の O(1) 判定で未変更を確定できる。保持している
+    /// 間その確保は生きているので、解放後のアドレス再利用による誤判定も起きない。
+    /// 追加のメモリは参照カウント 1 個分で、payload の複製は発生しない。
+    last_saved_vst3_chain: Option<Vec<Vst3PluginEntry>>,
     /// VST3 chain slots (preset 10 個) も同様。
-    last_saved_vst3_slots_hash: Option<u64>,
+    last_saved_vst3_slots: Option<Vst3ChainPresetSlots>,
 }
 
 /// The small live settings snapshot needed by still-image final composition.
@@ -558,8 +562,8 @@ impl SettingsDb {
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
-                last_saved_vst3_chain_hash: None,
-                last_saved_vst3_slots_hash: None,
+                last_saved_vst3_chain: None,
+                last_saved_vst3_slots: None,
             }),
         })
     }
@@ -583,8 +587,8 @@ impl SettingsDb {
             )),
         }
         let settings = build_settings_from_db(&inner.conn)?;
-        inner.last_saved_vst3_chain_hash = Some(hash_vst3_plugins(&settings.vst3_plugins));
-        inner.last_saved_vst3_slots_hash = Some(hash_vst3_chain_slots(&settings.vst3_chain_slots));
+        inner.last_saved_vst3_chain = Some(settings.vst3_plugins.clone());
+        inner.last_saved_vst3_slots = Some(settings.vst3_chain_slots.clone());
 
         Ok(settings)
     }
@@ -739,15 +743,15 @@ impl SettingsDb {
     pub fn save_full(&self, settings: &Settings) -> Result<(), SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
 
-        // 1. 事前 hash 計算 (transaction 外)
-        let chain_hash = hash_vst3_plugins(&settings.vst3_plugins);
-        let slots_hash = hash_vst3_chain_slots(&settings.vst3_chain_slots);
+        // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
         let chain_changed = inner
-            .last_saved_vst3_chain_hash
-            .map_or(true, |h| h != chain_hash);
+            .last_saved_vst3_chain
+            .as_deref()
+            .is_none_or(|prev| !vst3_chain_unchanged(prev, &settings.vst3_plugins));
         let slots_changed = inner
-            .last_saved_vst3_slots_hash
-            .map_or(true, |h| h != slots_hash);
+            .last_saved_vst3_slots
+            .as_ref()
+            .is_none_or(|prev| !vst3_slots_unchanged(prev, &settings.vst3_chain_slots));
 
         // 2. Settings 全体を Value::Object 化、複合フィールドを取り出す。
         // v2.5.0 が知らない enum variant は、旧版が無視できる追加フィールドへ退避した
@@ -769,6 +773,12 @@ impl SettingsDb {
                 rule.filter.stash_bookmark_states_for_persist();
             }
         }
+        // VST3 の 2 フィールドは `extract_complex_fields` が直後に捨てるだけなので、
+        // `Value` を組み立てる前に外す。残したままだと state chunk (実機で 32MB) を
+        // 毎回 JSON 文字列へ複製してから捨てることになる (v3.3.1 §1.0b、実測 10.5ms)。
+        // 実際の行の書き出しは下で `settings` (= 元の参照) から行う。
+        // `strip_vst3_payload_before_kv` が COMPLEX_FIELDS との対応を保証する。
+        strip_vst3_payload_before_kv(&mut persisted);
         let mut value = serde_json::to_value(&persisted)?;
         let map = match value.as_object_mut() {
             Some(m) => m,
@@ -832,12 +842,13 @@ impl SettingsDb {
         let _ = complex;
         tx.commit()?;
 
-        // 4. commit 成功してから hash 更新
+        // 4. commit 成功してから「直近保存した中身」を更新する。
+        // clone は `Arc` の参照カウント加算だけで、state chunk は複製されない。
         if chain_changed {
-            inner.last_saved_vst3_chain_hash = Some(chain_hash);
+            inner.last_saved_vst3_chain = Some(settings.vst3_plugins.clone());
         }
         if slots_changed {
-            inner.last_saved_vst3_slots_hash = Some(slots_hash);
+            inner.last_saved_vst3_slots = Some(settings.vst3_chain_slots.clone());
         }
         Ok(())
     }
@@ -955,8 +966,8 @@ impl SettingsDb {
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
-                last_saved_vst3_chain_hash: None,
-                last_saved_vst3_slots_hash: None,
+                last_saved_vst3_chain: None,
+                last_saved_vst3_slots: None,
             }),
         })
     }
@@ -1557,6 +1568,24 @@ fn normalize_tags_table_rows(conn: &Connection) -> rusqlite::Result<()> {
 // settings_kv (scalar / 小 array / 中 struct)
 // ---------------------------------------------------------------------------
 
+/// `settings_kv` へ載せる `Value` を組み立てる前に VST3 の payload を落とす。
+///
+/// この 2 フィールドは [`COMPLEX_FIELDS`] に含まれ、`extract_complex_fields` が
+/// `settings_kv` から取り除いて読み捨てる。つまり **`Value` に載せる意味が無い**。
+/// にもかかわらず `serde_json::to_value` は先に 32MB の base64 を複製するので、
+/// 保存のたびに 10ms を捨てていた。ここで空にしておけば、後段の
+/// `extract_complex_fields` は該当キーを見つけられず (= 何も取り出さず)、
+/// `write_settings_kv` に渡る map の内容は従来と厳密に同じになる。
+///
+/// **行そのものの書き出しには影響しない**: `write_vst3_plugins` /
+/// `write_vst3_chain_slots` は `persisted` ではなく元の `settings` を読む。
+fn strip_vst3_payload_before_kv(persisted: &mut Settings) {
+    debug_assert!(COMPLEX_FIELDS.contains(&"vst3_plugins"));
+    debug_assert!(COMPLEX_FIELDS.contains(&"vst3_chain_slots"));
+    persisted.vst3_plugins = Vec::new();
+    persisted.vst3_chain_slots = Vst3ChainPresetSlots::default();
+}
+
 fn extract_complex_fields(map: &mut Map<String, Value>) -> Map<String, Value> {
     let mut taken = Map::new();
     for name in COMPLEX_FIELDS {
@@ -2003,7 +2032,7 @@ fn read_vst3_plugins(conn: &Connection) -> Result<Vec<Vst3PluginEntry>, Settings
         out.push(Vst3PluginEntry {
             path,
             bypass: bypass != 0,
-            state,
+            state: state.map(std::sync::Arc::from),
             user_hidden: user_hidden != 0,
             gui_pos,
             gui_size,
@@ -2258,47 +2287,54 @@ fn classify_settings_deserialization_error(error: serde_json::Error) -> Settings
 }
 
 // ---------------------------------------------------------------------------
-// hash (VST3 dirty 検出用)
+// VST3 dirty 検出 (直近保存した中身との比較)
 // ---------------------------------------------------------------------------
 
-fn hash_vst3_plugins(plugins: &[Vst3PluginEntry]) -> u64 {
-    let mut h = DefaultHasher::new();
-    plugins.len().hash(&mut h);
-    for p in plugins {
-        p.path.hash(&mut h);
-        p.bypass.hash(&mut h);
-        p.user_hidden.hash(&mut h);
-        p.state.hash(&mut h);
-        p.gui_pos.hash(&mut h);
-        p.gui_size.hash(&mut h);
+/// state chunk が変わっていないか。
+///
+/// 同じ `Arc` を指していれば中身も同じ (`Vst3PluginEntry::state` は差し替えでしか
+/// 変わらない)。別の `Arc` になっていたときだけ内容比較へ落とす — 再確保だけで
+/// 中身が同じケースを「変更あり」と扱うと数十 MB の DELETE+INSERT が走るので、
+/// 稀な 1 回の memcmp のほうが安い。
+fn vst3_state_unchanged(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Arc::ptr_eq(x, y) || x == y,
+        _ => false,
     }
-    h.finish()
 }
 
-fn hash_vst3_chain_slots(slots: &Vst3ChainPresetSlots) -> u64 {
-    let mut h = DefaultHasher::new();
-    slots.slots.len().hash(&mut h);
-    for slot_opt in slots.slots.iter() {
-        match slot_opt {
-            None => 0u8.hash(&mut h),
-            Some(s) => {
-                1u8.hash(&mut h);
-                s.name.hash(&mut h);
-                s.gui_visible.hash(&mut h);
-                s.video_compact.hash(&mut h);
-                s.plugins.len().hash(&mut h);
-                for p in s.plugins.iter() {
-                    p.path.hash(&mut h);
-                    p.bypass.hash(&mut h);
-                    p.user_hidden.hash(&mut h);
-                    p.state.hash(&mut h);
-                    p.gui_pos.hash(&mut h);
-                    p.gui_size.hash(&mut h);
+fn vst3_entry_unchanged(a: &Vst3PluginEntry, b: &Vst3PluginEntry) -> bool {
+    a.path == b.path
+        && a.bypass == b.bypass
+        && a.user_hidden == b.user_hidden
+        && a.gui_pos == b.gui_pos
+        && a.gui_size == b.gui_size
+        && vst3_state_unchanged(&a.state, &b.state)
+}
+
+fn vst3_chain_unchanged(a: &[Vst3PluginEntry], b: &[Vst3PluginEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| vst3_entry_unchanged(x, y))
+}
+
+fn vst3_slots_unchanged(a: &Vst3ChainPresetSlots, b: &Vst3ChainPresetSlots) -> bool {
+    a.slots.len() == b.slots.len()
+        && a.slots
+            .iter()
+            .zip(b.slots.iter())
+            .all(|(x, y)| match (x, y) {
+                (None, None) => true,
+                (Some(x), Some(y)) => {
+                    x.name == y.name
+                        && x.gui_visible == y.gui_visible
+                        && x.video_compact == y.video_compact
+                        && vst3_chain_unchanged(&x.plugins, &y.plugins)
                 }
-            }
-        }
-    }
-    h.finish()
+                _ => false,
+            })
 }
 
 // ---------------------------------------------------------------------------
@@ -3436,7 +3472,7 @@ mod tests {
             Vst3PluginEntry {
                 path: r"C:\vst3\eq.vst3".to_string(),
                 bypass: false,
-                state: Some("AAAA".to_string()),
+                state: Some(std::sync::Arc::from("AAAA")),
                 user_hidden: false,
                 gui_pos: Some((100, 200)),
                 gui_size: Some((640, 480)),
@@ -4093,7 +4129,7 @@ mod tests {
     }
 
     /// `vst3_plugins` に「sentinel」行を直挿入する。次に `save_full` が `DELETE+INSERT`
-    /// を走らせれば消える。hash skip が効けば残る。これで「2 回目の save_full が VST3
+    /// を走らせれば消える。未変更 skip が効けば残る。これで「2 回目の save_full が VST3
     /// テーブルを実際に書き直したか」を観測する。
     fn inject_vst3_sentinel(db: &SettingsDb) {
         let inner = db.inner.lock().unwrap();
@@ -4121,8 +4157,8 @@ mod tests {
     }
 
     #[test]
-    fn vst3_hash_skip_on_unchanged_save() {
-        // 同じ Settings を 2 回保存したとき、2 回目の VST3 hash は一致するので
+    fn vst3_skip_on_unchanged_save() {
+        // 同じ Settings を 2 回保存したとき、2 回目は直近保存した中身と一致するので
         // DELETE+INSERT がスキップされる。sentinel 行を入れて生き残るか確認する。
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let s = sample_settings();
@@ -4137,14 +4173,14 @@ mod tests {
     }
 
     #[test]
-    fn vst3_hash_skip_invalidated_on_change() {
+    fn vst3_skip_invalidated_on_change() {
         // VST3 内容が変わったら DELETE+INSERT が走り、sentinel は消える。
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut s = sample_settings();
         db.save_full(&s).unwrap();
         inject_vst3_sentinel(&db);
         assert!(sentinel_present(&db));
-        // bypass を反転して 2 回目を保存する → hash が変わる → DELETE+INSERT
+        // bypass を反転して 2 回目を保存する → 未変更でなくなる → DELETE+INSERT
         s.vst3_plugins[0].bypass = !s.vst3_plugins[0].bypass;
         db.save_full(&s).unwrap();
         assert!(
@@ -4153,9 +4189,135 @@ mod tests {
         );
     }
 
+    /// state chunk の**中身**が変わったときも DELETE+INSERT が走ること。
+    ///
+    /// v3.3.1 で dirty 判定を内容 hash から共有 `Arc` の同一性比較へ変えた。
+    /// 同一性だけを見て内容比較の fallback を落とすと、**別の `Arc` に差し替えられた
+    /// 新しい state が保存されない**方向には倒れない (別 `Arc` = 変更ありと判定される)
+    /// が、逆に「同じ長さの別内容」を取りこぼす実装へ後退しないことをここで固定する。
     #[test]
-    fn vst3_slots_hash_skip_on_unchanged_save() {
-        // chain と同じく、slots 側も hash skip が効くか sentinel で確認する。
+    fn vst3_state_content_change_forces_rewrite() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut s = sample_settings();
+        s.vst3_plugins[0].state = Some(std::sync::Arc::from("AAAA"));
+        db.save_full(&s).unwrap();
+        inject_vst3_sentinel(&db);
+        assert!(sentinel_present(&db));
+
+        // 長さは同じで中身だけ違う state に差し替える。
+        s.vst3_plugins[0].state = Some(std::sync::Arc::from("BBBB"));
+        db.save_full(&s).unwrap();
+        assert!(
+            !sentinel_present(&db),
+            "state の中身が変われば DELETE+INSERT が走らなければならない"
+        );
+
+        let loaded = read_vst3_plugins(&db.inner.lock().unwrap().conn).unwrap();
+        assert_eq!(loaded[0].state.as_deref(), Some("BBBB"));
+    }
+
+    /// 同じ内容で確保し直しただけの `Arc` は「未変更」として扱うこと。
+    ///
+    /// `Arc::ptr_eq` だけで判定すると、`merge_from` などで entry を作り直した直後の
+    /// 保存が毎回 32MB の DELETE+INSERT を走らせてしまう。内容比較の fallback が
+    /// 効いていることを sentinel で観測する。
+    #[test]
+    fn vst3_reallocated_identical_state_is_not_a_change() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut s = sample_settings();
+        db.save_full(&s).unwrap();
+        inject_vst3_sentinel(&db);
+        assert!(sentinel_present(&db));
+
+        // 中身は同じだが別確保の Arc に差し替える (= ptr_eq は false になる)。
+        let same_text = s.vst3_plugins[0].state.as_deref().unwrap().to_string();
+        let reallocated: std::sync::Arc<str> = std::sync::Arc::from(same_text.as_str());
+        assert!(!std::sync::Arc::ptr_eq(
+            s.vst3_plugins[0].state.as_ref().unwrap(),
+            &reallocated
+        ));
+        s.vst3_plugins[0].state = Some(reallocated);
+
+        db.save_full(&s).unwrap();
+        assert!(
+            sentinel_present(&db),
+            "中身が同じなら確保し直しただけで書き直してはいけない"
+        );
+    }
+
+    /// `strip_vst3_payload_before_kv` が `settings_kv` の内容も往復も変えないこと。
+    ///
+    /// この関数は「`extract_complex_fields` がどうせ捨てる」ことを根拠に
+    /// `Value` 構築前へ前倒ししただけなので、**捨てる側が対象キーを持たなくなったら
+    /// 意味が変わる**。settings_kv に VST3 のキーが出ないことと、VST3 の行自体は
+    /// 従来どおり往復することを同時に固定する。
+    #[test]
+    fn vst3_payload_never_reaches_settings_kv_but_still_round_trips() {
+        // strip の前提: この 2 キーは complex 側が引き取る。ここが外れたら
+        // strip は「捨てられる値を先に外す」ではなく「保存すべき値を落とす」になる。
+        assert!(COMPLEX_FIELDS.contains(&"vst3_plugins"));
+        assert!(COMPLEX_FIELDS.contains(&"vst3_chain_slots"));
+
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let s = sample_settings();
+        db.save_full(&s).unwrap();
+
+        let inner = db.inner.lock().unwrap();
+        for key in ["vst3_plugins", "vst3_chain_slots"] {
+            let count: i64 = inner
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM settings_kv WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{key} は settings_kv に載ってはいけない");
+        }
+        // VST3 以外の設定は従来どおり settings_kv に載る。
+        let grid_cols: i64 = inner
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings_kv WHERE key = 'grid_cols'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grid_cols, 1);
+
+        let plugins = read_vst3_plugins(&inner.conn).unwrap();
+        assert_eq!(plugins.len(), s.vst3_plugins.len());
+        assert_eq!(plugins[0].path, s.vst3_plugins[0].path);
+        assert_eq!(plugins[0].state.as_deref(), Some("AAAA"));
+        let slots = read_vst3_chain_slots(&inner.conn).unwrap();
+        assert_eq!(
+            slots.slots[0].as_ref().unwrap().name,
+            s.vst3_chain_slots.slots[0].as_ref().unwrap().name
+        );
+        assert_eq!(
+            slots.slots[0].as_ref().unwrap().plugins[0].state.as_deref(),
+            Some("AAAA")
+        );
+    }
+
+    /// `Settings::clone` が state chunk を複製しないこと。
+    ///
+    /// 保存経路は `Settings` を 2 回 clone する。ここが deep copy に戻ると、
+    /// 書き直さないと分かっている行のために毎回数十 ms を払う状態に逆戻りする
+    /// (v3.3.1 §1.0b、実測 41ms → 0.13ms)。
+    #[test]
+    fn settings_clone_shares_the_vst3_state_payload() {
+        let s = sample_settings();
+        let cloned = s.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            s.vst3_plugins[0].state.as_ref().unwrap(),
+            cloned.vst3_plugins[0].state.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn vst3_slots_skip_on_unchanged_save() {
+        // chain と同じく、slots 側も未変更 skip が効くか sentinel で確認する。
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let s = sample_settings();
         db.save_full(&s).unwrap();

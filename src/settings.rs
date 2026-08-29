@@ -4772,9 +4772,16 @@ pub struct Vst3PluginEntry {
     pub bypass: bool,
     /// プラグイン側の現在状態 (= IComponent::getState chunk) を Base64 エンコードしたもの。
     /// 終了時に bridge から取得し、次回起動時に復元する (= EQ カーブ等が保持される)。
-    /// v0.9.0 では bridge 側 query_state プロトコル未実装のため未使用 (将来拡張)。
+    ///
+    /// **`Arc<str>` で持つ理由** (v3.3.1): 実測でこの chunk は 1 プラグインあたり
+    /// 数 MB に達し、実機では `settings.db` 36.7MB の 98% を占めていた。`Settings` は
+    /// 保存のたびに 2 回 clone されるため、`String` のままだと **書き直さないと
+    /// 分かっている** 行のために毎回 20ms 超の deep copy を払っていた。共有不変参照に
+    /// すると clone が参照カウントの加算だけになり、同時に `settings_db` 側の dirty
+    /// 判定を `Arc::ptr_eq` の O(1) 比較にできる (`vst3_chain_unchanged`)。
+    /// 中身を書き換えるのではなく、常に新しい `Arc` を差し替えること。
     #[serde(default)]
-    pub state: Option<String>,
+    pub state: Option<std::sync::Arc<str>>,
     /// ユーザーが個別に GUI × で閉じた状態を永続化する (= 2026-04 ユーザー要望)。
     /// true: 起動後の VST 一括表示 (= VST ボタン / `set_all_guis_visible(true)`) で
     /// このスロットの GUI は表示されない。`show_slot_gui` の明示呼び出し
@@ -7194,7 +7201,7 @@ impl Settings {
                 self.vst3_plugins.push(Vst3PluginEntry {
                     path: path.clone(),
                     bypass: false,
-                    state: self.vst3_plugin_state.clone(),
+                    state: self.vst3_plugin_state.as_deref().map(std::sync::Arc::from),
                     user_hidden: false,
                     gui_pos: None,
                     gui_size: None,
@@ -12376,7 +12383,7 @@ mod tests {
             plugins: vec![Vst3PluginEntry {
                 path: r"C:\VST3\Test.vst3".to_string(),
                 bypass: true,
-                state: Some("state".to_string()),
+                state: Some(std::sync::Arc::from("state")),
                 user_hidden: true,
                 gui_pos: Some((12, 34)),
                 gui_size: Some((640, 480)),

@@ -51,7 +51,11 @@ impl App {
         let mut updated = 0;
         for (path, state) in snapshots {
             if let Some(entry) = self.find_vst3_entry_mut(&path) {
-                let new_state = Some(state);
+                // 中身が同じなら **代入しない**。既存の `Arc` をそのまま残すことが、
+                // settings_db 側の `Arc::ptr_eq` による dirty 判定が「変わっていない」と
+                // 答えられる条件になる (v3.3.1 §1.0b)。
+                let new_state: Option<std::sync::Arc<str>> =
+                    Some(std::sync::Arc::from(state.as_str()));
                 if entry.state != new_state {
                     entry.state = new_state;
                     updated += 1;
