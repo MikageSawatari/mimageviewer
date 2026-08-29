@@ -16389,19 +16389,15 @@ impl App {
         None
     }
 
-    /// root の `input_nav` 合流点を通さずにナビを消化する。
+    /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
     ///
-    /// 使うのは 2 経路。どちらも「合流点まで到達しない」ことが理由:
+    /// 通常は App::update 後段の input_nav 合流点で処理するが、Windows の
+    /// in-window 静止画フルスクリーンはグリッド描画を飛ばして return するため、
+    /// そこでナビを捨てないよう同じロード処理を先に適用する。
     ///
-    /// - Windows の in-window 静止画フルスクリーンは、グリッド描画を飛ばして return する。
-    /// - 前面の別ウィンドウ (AtRest な active context) 向けの gamepad 操作は、その context を
-    ///   mount した中で配る。**合流点へ流すと root が動く** (2026-08-29 レビュー R-02)。
-    ///
-    /// 履歴戻る / 進むも扱う。扱わずに落とすと、別ウィンドウで B ボタンを押しても
-    /// 何も起きない。合流点側は、後段の open 結果まで見て rollback するため独自の
-    /// 経路を持つ (そちらは `history_nav_rollback` で `ConversionDialogOpened` /
-    /// `Ignored` を区別する)。ここは即時ロードなので、対象が取れなかった時点で戻す。
-    pub(crate) fn apply_nav_without_the_root_join(
+    /// 履歴戻る / 進むは扱わない (`false` を返す)。rollback は open 結果まで見る必要が
+    /// あり、その機構は合流点側だけが持つ。呼び出し側は履歴ナビを合流点へ回すこと。
+    pub(crate) fn apply_fullscreen_close_nav_immediate(
         &mut self,
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
@@ -16432,30 +16428,7 @@ impl App {
                 true
             }
             crate::ui_main::AddressBarNav::HistoryBack
-            | crate::ui_main::AddressBarNav::HistoryForward => {
-                let backward = matches!(nav, crate::ui_main::AddressBarNav::HistoryBack);
-                let snapshot = self.folder_nav_history_snapshot();
-                let target = if backward {
-                    self.navigate_folder_history_back()
-                } else {
-                    self.navigate_folder_history_forward()
-                };
-                let Some(target) = target else {
-                    return false;
-                };
-                match self.dispatch_synthetic_folder_history_target(&target) {
-                    SyntheticFolderHistoryDispatch::NotSynthetic => {
-                        self.load_folder_or_convert_archive(target);
-                        self.clear_pending_folder_nav_steps();
-                        true
-                    }
-                    SyntheticFolderHistoryDispatch::Restored => true,
-                    SyntheticFolderHistoryDispatch::Unavailable => {
-                        self.restore_folder_nav_history(snapshot);
-                        false
-                    }
-                }
-            }
+            | crate::ui_main::AddressBarNav::HistoryForward => false,
         }
     }
 
@@ -40680,12 +40653,7 @@ impl App {
                 // ここは mount 済みなので、`fullscreen_idx` も items も**この viewer のもの**
                 // (2026-08-29 レビュー R-02)。
                 if let Some(batch) = gamepad_batch.take() {
-                    let mut outcome = app.dispatch_gamepad_batch(ctx, batch);
-                    if let Some(nav) = outcome.nav.take() {
-                        // **root の合流点へ流さない。**流すとメインウィンドウが動く。
-                        app.apply_nav_without_the_root_join(nav);
-                    }
-                    gamepad_outcome = Some(outcome);
+                    gamepad_outcome = Some(app.dispatch_gamepad_batch(ctx, batch));
                 }
                 if Self::detached_image_window_debug_enabled() && app.frame_counter % 60 == 0 {
                     app.log_detached_image_window_debug(format!(
@@ -51312,7 +51280,7 @@ impl App {
         let Some(nav) = self.take_pending_return_to_parent_nav() else {
             return;
         };
-        if !self.apply_nav_without_the_root_join(nav) {
+        if !self.apply_fullscreen_close_nav_immediate(nav) {
             // 現在 resolve_return_to_parent_nav が返すナビはすべて即時適用可能だが、
             // 将来対象外のナビが増えても要求を失わず通常の update 経路へ戻す。
             self.pending_return_to_parent = true;
@@ -66878,7 +66846,16 @@ impl eframe::App for App {
                 self.update_active_viewer_context(ctx, gamepad_batch_for_active_context.take());
             // mount が起きなければ batch は返ってくる。活性化がこの frame で変わった等。
             gamepad_batch_for_active_context = update.gamepad_batch;
-            if let Some(outcome) = update.gamepad_outcome {
+            if let Some(mut outcome) = update.gamepad_outcome {
+                // **ナビだけは root が受け取る。**別ウィンドウはビューアであって一覧を
+                // 持たない。お気に入りピッカーの確定は `close_fullscreen` でビューアを
+                // 閉じてからナビを返す設計なので、行き先は「一覧のある側」= メイン
+                // ウィンドウしかない。mount 中の context へ適用すると、その context ごと
+                // 破棄されて**移動が消える** (2026-08-29 実機報告)。
+                //
+                // ページ送りやズームといった**ビューアの操作**は mount 内で完結して
+                // いるので、これは R-02 の所有境界を崩さない。
+                gamepad_nav = outcome.nav.take();
                 gamepad_outcome = Some(outcome);
             }
             update.updated
@@ -66993,7 +66970,7 @@ impl eframe::App for App {
             );
             if unsupported_history_nav {
                 fullscreen_close_nav = Some(nav);
-            } else if self.apply_nav_without_the_root_join(nav) {
+            } else if self.apply_fullscreen_close_nav_immediate(nav) {
                 ctx.request_repaint();
                 return;
             }
@@ -67158,7 +67135,7 @@ impl eframe::App for App {
                 // in-window 静止画フルスクリーンではここで消化しないと親一覧への
                 // 直帰ナビが捨てられてしまう。
                 if let Some(nav) = fullscreen_close_nav.take() {
-                    if self.apply_nav_without_the_root_join(nav) {
+                    if self.apply_fullscreen_close_nav_immediate(nav) {
                         ctx.request_repaint();
                         return;
                     }

@@ -18753,7 +18753,7 @@ mod favorite_adjustment_defaults_tests {
         let nav = app
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become navigation");
-        assert!(app.apply_nav_without_the_root_join(nav));
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
 
         assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
         assert_eq!(app.fullscreen_idx, None);
@@ -18801,7 +18801,7 @@ mod favorite_adjustment_defaults_tests {
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become a direct nav");
         assert!(
-            app.apply_nav_without_the_root_join(nav),
+            app.apply_fullscreen_close_nav_immediate(nav),
             "embedded early-return path must apply the parent nav before returning"
         );
         assert_eq!(
@@ -63557,6 +63557,12 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
     assert!(
         update.gamepad_outcome.is_some(),
         "mount の中で配った結果が返っていない"
+    );
+    // ナビだけは持ち帰る。別ウィンドウは一覧を持たないので、行き先はメインウィンドウ
+    // にしかない。mount の中で適用すると、context ごと破棄されて移動が消える。
+    assert!(
+        update.gamepad_outcome.as_ref().unwrap().nav.is_none(),
+        "空の batch からナビが出るはずがない"
     );
 }
 

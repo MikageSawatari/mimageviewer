@@ -536,7 +536,7 @@ impl App {
         if self.ring_picker.is_some() || !self.gamepad_state.west_ring_active() {
             return;
         }
-        if self.current_input_surface() != surface {
+        if self.dispatched_input_surface() != surface {
             return;
         }
         let context = self.ring_shortcut_context_for_surface(surface);
@@ -571,6 +571,21 @@ impl App {
             } else {
                 crate::app::ActionSurface::MainWindow
             }
+        }
+    }
+
+    /// 直近に配った面。overlay の表示先はこれで決める。
+    ///
+    /// `current_input_surface` は呼んだ時点の projection で答えが変わるので、描画時に
+    /// 呼び直すと窓ごとに違う結論になる。
+    fn dispatched_input_surface(&self) -> crate::app::ActionSurface {
+        #[cfg(windows)]
+        {
+            self.detached_window_manager.dispatched_input_surface()
+        }
+        #[cfg(not(windows))]
+        {
+            self.current_input_surface()
         }
     }
 
@@ -1626,7 +1641,7 @@ impl App {
         let Some(picker) = self.gamepad_favorite_picker.as_ref() else {
             return;
         };
-        if self.current_input_surface() != surface {
+        if self.dispatched_input_surface() != surface {
             return;
         }
         let painter = ui.painter();
@@ -1790,7 +1805,7 @@ impl App {
         let Some(picker) = self.gamepad_video_marker_picker.clone() else {
             return;
         };
-        if self.current_input_surface() != surface {
+        if self.dispatched_input_surface() != surface {
             return;
         }
         let Some(fs_idx) = self.fullscreen_idx else {

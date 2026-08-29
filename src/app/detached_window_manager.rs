@@ -898,6 +898,17 @@ impl DetachedWindowManager {
         self.last_input_surface = surface;
     }
 
+    /// 直近に**実際に配った**面。描画側はこれを見る。
+    ///
+    /// `resolve_input_surface` を描画時に呼び直すと、その時点で mount されている
+    /// projection によって答えが変わる。前面が別ウィンドウでも、メインウィンドウの
+    /// 描画パスは root projection (fullscreen_idx=None) で判定するので「自分が面だ」と
+    /// 答え、**両方の窓に overlay が出る** (2026-08-29 実機報告)。配った側が記録した
+    /// 1 つの答えを共有する。
+    pub(super) fn dispatched_input_surface(&self) -> ActionSurface {
+        self.last_input_surface
+    }
+
     pub(super) fn resolve_input_surface(
         &self,
         detached_viewer_active: bool,
