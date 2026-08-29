@@ -687,7 +687,6 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
-    // ⚠ 未リリース。版数は次のリリースを決めるときに確定させる (リリース手順 Phase 1)。
     VersionHighlights {
         version: "3.3.0",
         must_read: &[HighlightItem {
