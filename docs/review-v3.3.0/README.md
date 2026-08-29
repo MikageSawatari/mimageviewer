@@ -73,6 +73,31 @@ v3.3.0 の変更を機能単位で把握したうえで、次を静的レビュ�
 - parked bundle の retire が effect を drain しない → **調査のうえ benign と裁定**。
   `docs/detached-rework-plan.md` §11 に理由と「やってはいけない 2 つ」を記録
 
+**R-06 / R-05 / R-20 の修正に対する Codex レビュー** (2026-08-29):
+
+- **R-05 の修正が不完全** → `30b0ed8a`。編集は store の行を先に commit し、台帳の記録要求は
+  channel 経由で worker が後から適用する。行が現れた瞬間の `last_edit_at` はまだ古いので、
+  期待値をいつ読んでも CAS は成立する。**私のテストは本番の順序を再現しておらず**、
+  台帳を同期更新する自作の interleaving に対して「CAS が止めた」と主張していた。
+  UI スレッドで送信前に上げる `RECORD_SEQUENCE` を追加し、観測中に動いたらその回の掃除を
+  見送る形に変更。再 probe は `record` を通らない書き手 (サイドカー取り込み等) 用に残す
+- **ログ文言 / 設計文書の追随** → 同 commit。「edited while probing」は観測していないことを
+  主張していた (store が読めなかった回も同じ経路)。`docs/video-architecture.md` の
+  「即時保存する」も更新
+- **環境設定ダイアログの stale snapshot** (Medium) → **v3.2.0 以前からある挙動、結果は同一**。
+  ダイアログは開いた時点の snapshot を持ち、OK で live へ戻す。2 つのレンジ設定は
+  `overwrite_non_preferences_from` の対象外なので、開いている間にホイールで変えた値は
+  OK で上書きされる。**修正前も同じ結果** (ホイールが保存 → OK が上書き保存) なので
+  R-06 が作った欠陥ではない。世代の doc comment が言い過ぎていた点だけ訂正した。
+  一般解は「ダイアログが触っていない項目だけ live を採る」三方向マージで、
+  この 2 項目に限らない別件
+- **トレイ退避は queued wheel event に対して閉じていない** (Low) → 未対応。トレイ保存が
+  native video event の drain より先なので、その間に届いたホイールは hidden session に
+  残る。通常終了では保存される。電源断のみ 1 項目を失う
+- **`--play-test` は `on_exit` を通らない** (Low) → 未対応。開発用フラグ
+- **`backed` だった key は再 probe しない / store が読めない回は候補を残す** (Low) →
+  意図した fail-open。編集を失うより dead candidate を 1 回出す方を選ぶ
+
 **分類の訂正**: R-02 の「既存残存」は述語だけを見た分類。述語は v3.2.0 と同一だが、
 それが壊れる状態 (`active_detached_context_is_at_rest`) は v3.3.0 の新規。
 
