@@ -78,6 +78,7 @@ pub mod export_crop;
 pub mod export_dialog;
 pub mod external_links;
 pub mod external_metadata;
+pub mod external_tool;
 pub mod fast_resize;
 pub mod file_drag;
 pub mod filename_sort;

@@ -12,7 +12,7 @@
 //! 1. `serde_json::to_value(&settings)` で全フィールドを `Value::Object` に変換
 //! 2. **複合フィールド** (`favorites` / `tags` / `video_resume_positions` /
 //!    `vst3_plugins` / `vst3_chain_slots` / `recent_open_with_apps` /
-//!    `custom_open_with_apps`) は別テーブルに切り出してから Map から remove
+//!    `custom_open_with_apps` / `external_tools`) は別テーブルに切り出してから Map から remove
 //! 3. 残り全部を `settings_kv (key, value)` に JSON 値そのままで格納
 //!
 //! ロード時は逆に複合テーブル → typed struct → JSON Value → Map に挿入してから
@@ -32,12 +32,16 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::external_tool::{
+    ExternalTool, ExternalToolId, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy,
+};
 use crate::settings::{
     FavoriteEntry, RecentApp, Settings, TagDef, Vst3ChainPresetSlot, Vst3ChainPresetSlots,
     Vst3PluginEntry,
 };
 
 const SCHEMA_VERSION: &str = "1";
+const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'show_hidden_files', 'grid_display_order',
@@ -63,6 +67,10 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
 ///      完了後 `settings_kv` 側の row を削除する、
 ///
 /// のどちらかを行うこと。**何もせず追加すると初回起動でユーザー設定が消える。**
+///
+/// `external_tools` は新規キーで、旧版が `settings_kv` に書いたことはない。したがって
+/// legacy JSON の上書き問題は起きず、リリース済みデータは専用の
+/// `custom_open_with_apps` → `external_tools` migration で保護する。
 const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
@@ -71,6 +79,7 @@ const COMPLEX_FIELDS: &[&str] = &[
     "vst3_chain_slots",
     "recent_open_with_apps",
     "custom_open_with_apps",
+    "external_tools",
 ];
 
 // ---------------------------------------------------------------------------
@@ -574,6 +583,21 @@ impl SettingsDb {
     /// (= 起動後最初の `save_full` で無駄に DELETE+INSERT しないため)。
     pub fn load_into_settings(&self) -> Result<Settings, SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        // 未知 enum の Incompatible だけは返す。これは「新しい版が書いた設定」の合図で、
+        // 上層が save 抑止へ倒すために要る。それ以外 (書き込み失敗など) で load 全体を
+        // 失敗させない: transaction rollback により旧値のまま + marker 無しで残るので次の
+        // load で再試行できる。ここで Err を返すと健全な DB を quarantine 経路へ落とす
+        // 危険がある (`migrate_folder_thumb_sort_default_v2` と同じ方針)。
+        match migrate_external_tools_from_custom_open_with(&inner.conn) {
+            Ok(true) => {
+                log_diag("settings_db: migrated custom open-with applications to external tools")
+            }
+            Ok(false) => {}
+            Err(e @ SettingsDbError::Incompatible(_)) => return Err(e),
+            Err(e) => log_diag(&format!(
+                "settings_db: external tool migration failed; retrying on the next load: {e}"
+            )),
+        }
         // 既定値だけを揃える移行なので、書き込み失敗は設定ロード全体を失敗させない。
         // transaction rollback により旧値のまま + marker 無しとなり、次の load で再試行する。
         match migrate_folder_thumb_sort_default_v2(&inner.conn) {
@@ -801,11 +825,16 @@ impl SettingsDb {
             "recent_open_with_apps",
             &settings.recent_open_with_apps,
         )?;
+        // `custom_open_with_apps` はリリース済みの legacy データ。移行後の突き合わせ用に
+        // 行を残す。**まだ書き戻しは続ける**: 旧「アプリケーションで開く…」の UI が
+        // このフィールドへ追加するため、ここで書くのをやめると登録が保存されなくなる。
+        // 旧 UI を `external_tools` へ載せ替える P1 で、この write ごと落とす。
         write_recent_apps(
             &tx,
             "custom_open_with_apps",
             &settings.custom_open_with_apps,
         )?;
+        write_external_tools(&tx, &settings.external_tools)?;
         if chain_changed {
             write_vst3_plugins(&tx, &settings.vst3_plugins)?;
         }
@@ -829,6 +858,10 @@ impl SettingsDb {
         tx.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
             params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+            params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
         )?;
         // app_version は DB を「開いた版」ではなく、設定内容を最後に正常保存した版を示す。
         // backup rotation はこの save より前に走るため、bak1 側には直前の保存版が残る。
@@ -1270,6 +1303,46 @@ fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbErr
             )));
         }
     }
+    // `external_tools` did not exist in released databases, so it cannot be in the
+    // unconditional list above: doing so would reject every legitimate upgrade before
+    // `init_schema` can create the table. Once the migration marker exists, however, the
+    // table is authoritative and must receive the same missing-table protection.
+    let external_tools_are_authoritative = conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            classify_rusqlite_error_for_open(
+                error,
+                "ensure_existing_db_initialized:external_tools_marker",
+            )
+        })?
+        .is_some();
+    if external_tools_are_authoritative {
+        let exists = stmt
+            .query_row(["external_tools"], |_| Ok(true))
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                _ => Err(error),
+            })
+            .map_err(|error| {
+                classify_rusqlite_error_for_open(
+                    error,
+                    "ensure_existing_db_initialized:external_tools_table",
+                )
+            })?;
+        if !exists {
+            log_diag(
+                "settings_db: RequireExisting open: authoritative external_tools table missing",
+            );
+            return Err(SettingsDbError::Corrupted(
+                "RequireExisting: required table 'external_tools' missing".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1447,7 +1520,26 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             sort_index    INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS custom_apps_sort
-            ON custom_open_with_apps(sort_index);",
+            ON custom_open_with_apps(sort_index);
+
+         CREATE TABLE IF NOT EXISTS external_tools (
+            id                   INTEGER PRIMARY KEY,
+            name                 TEXT NOT NULL,
+            executable           TEXT,
+            arguments            TEXT NOT NULL,
+            working_directory    TEXT,
+            payload              TEXT NOT NULL,
+            video                TEXT NOT NULL,
+            spread               TEXT NOT NULL,
+            selection            TEXT NOT NULL,
+            pdf_render_long_edge INTEGER NOT NULL,
+            for_editing          INTEGER NOT NULL,
+            show_in_context_menu INTEGER NOT NULL,
+            keep_temp            INTEGER NOT NULL,
+            sort_index           INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS external_tools_sort
+            ON external_tools(sort_index);",
     )?;
     migrate_tags_table(conn)?;
 
@@ -2157,6 +2249,220 @@ fn read_recent_apps(conn: &Connection, table: &str) -> Result<Vec<RecentApp>, Se
 }
 
 // ---------------------------------------------------------------------------
+// external tools
+// ---------------------------------------------------------------------------
+
+fn payload_policy_text(value: PayloadPolicy) -> &'static str {
+    match value {
+        PayloadPolicy::AsDisplayed => "AsDisplayed",
+        PayloadPolicy::Original => "Original",
+        PayloadPolicy::Container => "Container",
+        PayloadPolicy::RealFileOnly => "RealFileOnly",
+    }
+}
+
+fn video_policy_text(value: VideoPolicy) -> &'static str {
+    match value {
+        VideoPolicy::File => "File",
+        VideoPolicy::CurrentFrame => "CurrentFrame",
+    }
+}
+
+fn spread_policy_text(value: SpreadPolicy) -> &'static str {
+    match value {
+        SpreadPolicy::Merged => "Merged",
+        SpreadPolicy::BothPages => "BothPages",
+        SpreadPolicy::MainPageOnly => "MainPageOnly",
+    }
+}
+
+fn selection_policy_text(value: SelectionPolicy) -> &'static str {
+    match value {
+        SelectionPolicy::Single => "Single",
+        SelectionPolicy::Each => "Each",
+        SelectionPolicy::Batch => "Batch",
+    }
+}
+
+fn write_external_tools(
+    tx: &rusqlite::Transaction<'_>,
+    tools: &[ExternalTool],
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM external_tools", [])?;
+    let mut stmt = tx.prepare(
+        "INSERT INTO external_tools (
+            id, name, executable, arguments, working_directory,
+            payload, video, spread, selection, pdf_render_long_edge,
+            for_editing, show_in_context_menu, keep_temp, sort_index
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?;
+    // パスは既存の recent/custom テーブルと同じく TEXT (UTF-8) で持つ。Windows の
+    // ファイルダイアログが返すパスは有効な UTF-16 なので、ここで lossy になるのは
+    // 手で不正な値を入れた場合だけ。その場合も spawn 時に「起動できません」として
+    // 表面化するので、保存全体を失敗させるより局所化する方を採る。
+    for (sort_index, tool) in tools.iter().enumerate() {
+        let executable = tool
+            .executable
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let working_directory = tool
+            .working_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        stmt.execute(params![
+            i64::from(tool.id.0),
+            tool.name,
+            executable,
+            tool.arguments,
+            working_directory,
+            payload_policy_text(tool.payload),
+            video_policy_text(tool.video),
+            spread_policy_text(tool.spread),
+            selection_policy_text(tool.selection),
+            i64::from(tool.pdf_render_long_edge),
+            i64::from(tool.for_editing),
+            i64::from(tool.show_in_context_menu),
+            i64::from(tool.keep_temp),
+            sort_index as i64,
+        ])?;
+    }
+    Ok(())
+}
+
+struct ExternalToolRow {
+    id: i64,
+    name: String,
+    executable: Option<String>,
+    arguments: String,
+    working_directory: Option<String>,
+    payload: String,
+    video: String,
+    spread: String,
+    selection: String,
+    pdf_render_long_edge: i64,
+    for_editing: i64,
+    show_in_context_menu: i64,
+    keep_temp: i64,
+}
+
+fn parse_external_tool_enum<T>(text: String) -> Result<T, SettingsDbError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(Value::String(text)).map_err(classify_settings_deserialization_error)
+}
+
+fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsDbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, executable, arguments, working_directory,
+                payload, video, spread, selection, pdf_render_long_edge,
+                for_editing, show_in_context_menu, keep_temp
+         FROM external_tools
+         ORDER BY sort_index ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ExternalToolRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            executable: row.get(2)?,
+            arguments: row.get(3)?,
+            working_directory: row.get(4)?,
+            payload: row.get(5)?,
+            video: row.get(6)?,
+            spread: row.get(7)?,
+            selection: row.get(8)?,
+            pdf_render_long_edge: row.get(9)?,
+            for_editing: row.get(10)?,
+            show_in_context_menu: row.get(11)?,
+            keep_temp: row.get(12)?,
+        })
+    })?;
+    let mut tools = Vec::new();
+    for row in rows {
+        let row = row?;
+        let id = u32::try_from(row.id).map_err(|_| {
+            SettingsDbError::Corrupted(format!("external_tools.id out of range: {}", row.id))
+        })?;
+        let pdf_render_long_edge = u32::try_from(row.pdf_render_long_edge).map_err(|_| {
+            SettingsDbError::Corrupted(format!(
+                "external_tools.pdf_render_long_edge out of range: {}",
+                row.pdf_render_long_edge
+            ))
+        })?;
+        tools.push(ExternalTool {
+            id: ExternalToolId(id),
+            name: row.name,
+            executable: row.executable.map(PathBuf::from),
+            arguments: row.arguments,
+            working_directory: row.working_directory.map(PathBuf::from),
+            payload: parse_external_tool_enum(row.payload)?,
+            video: parse_external_tool_enum(row.video)?,
+            spread: parse_external_tool_enum(row.spread)?,
+            selection: parse_external_tool_enum(row.selection)?,
+            pdf_render_long_edge,
+            for_editing: row.for_editing != 0,
+            show_in_context_menu: row.show_in_context_menu != 0,
+            keep_temp: row.keep_temp != 0,
+        });
+    }
+    Ok(tools)
+}
+
+fn external_tools_from_legacy_apps(apps: &[RecentApp]) -> Vec<ExternalTool> {
+    apps.iter()
+        .enumerate()
+        .map(|(index, app)| ExternalTool {
+            id: ExternalToolId((index as u32) + 1),
+            name: app.display_name.clone(),
+            executable: Some(PathBuf::from(&app.exe_path)),
+            ..ExternalTool::defaults_for_viewing()
+        })
+        .collect()
+}
+
+/// Migrate released `custom_open_with_apps` rows exactly once.
+///
+/// The marker and inserted rows share one transaction. If a marker is lost while
+/// external tools remain, only the marker is restored so registrations are never duplicated.
+fn migrate_external_tools_from_custom_open_with(
+    conn: &Connection,
+) -> Result<bool, SettingsDbError> {
+    let tx = conn.unchecked_transaction()?;
+    let already_migrated = tx
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if already_migrated {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let external_tool_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))?;
+    let migrated = if external_tool_count == 0 {
+        let legacy_apps = read_recent_apps(&tx, "custom_open_with_apps")?;
+        let tools = external_tools_from_legacy_apps(&legacy_apps);
+        write_external_tools(&tx, &tools)?;
+        !tools.is_empty()
+    } else {
+        // Validate before publishing the marker. An unknown future enum must leave the
+        // database unchanged and surface as Incompatible, just like settings_kv values.
+        let _ = read_external_tools(&tx)?;
+        false
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+        params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(migrated)
+}
+
+// ---------------------------------------------------------------------------
 // load 側: 全テーブル → Settings
 // ---------------------------------------------------------------------------
 
@@ -2171,6 +2477,7 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
     let recent_apps = read_recent_apps(conn, "recent_open_with_apps")?;
     let custom_apps = read_recent_apps(conn, "custom_open_with_apps")?;
+    let external_tools = read_external_tools(conn)?;
 
     map.insert("favorites".into(), serde_json::to_value(favorites)?);
     map.insert("tags".into(), serde_json::to_value(tags)?);
@@ -2190,6 +2497,10 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "custom_open_with_apps".into(),
         serde_json::to_value(custom_apps)?,
+    );
+    map.insert(
+        "external_tools".into(),
+        serde_json::to_value(external_tools)?,
     );
 
     // 型不一致は通常 Corrupted だが、unknown variant / unknown field は「新しい版で追加された
@@ -2668,6 +2979,9 @@ pub fn migrate_from_settings_json(
     // - 旧 vst3_plugin_path/state が新 Vec に流れない
     // - 旧 video_loop=true が video_loop_mode に伝わらない
     crate::settings::apply_load_time_migrations(&mut loaded);
+    if loaded.external_tools.is_empty() {
+        loaded.external_tools = external_tools_from_legacy_apps(&loaded.custom_open_with_apps);
+    }
     // JSON 時代から初めて SQLite へ移る利用者も既存利用者に含まれる。save_full が
     // この値と folder_thumb_sort_default_v2 marker を同じ transaction で保存する。
     loaded.folder_thumb_sort = crate::settings::SortOrder::FileName;
@@ -3385,6 +3699,9 @@ impl Drop for DataDirOverrideGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external_tool::{
+        PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
+    };
     use crate::settings::{RecentApp, Settings, SortOrder, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -3441,9 +3758,11 @@ mod tests {
             display_name: "Editor".to_string(),
             exe_path: r"C:\bin\edit.exe".to_string(),
         }];
-        s.custom_open_with_apps = vec![RecentApp {
-            display_name: "Photoshop".to_string(),
-            exe_path: r"C:\bin\ps.exe".to_string(),
+        s.external_tools = vec![ExternalTool {
+            id: ExternalToolId(12),
+            name: "Photoshop".to_string(),
+            executable: Some(PathBuf::from(r"C:\bin\ps.exe")),
+            ..ExternalTool::defaults_for_editing()
         }];
         s.detached_viewer_open_images_in_window = true;
         s.menu_layout = crate::keymap::MenuLayoutSettings {
@@ -3510,6 +3829,87 @@ mod tests {
         let aj = serde_json::to_value(a).unwrap();
         let bj = serde_json::to_value(&restored).unwrap();
         assert_eq!(aj, bj, "Settings did not round-trip via SQLite");
+    }
+
+    fn nondefault_external_tools() -> Vec<ExternalTool> {
+        vec![
+            ExternalTool {
+                id: ExternalToolId(41),
+                name: "Editor A".to_string(),
+                executable: Some(PathBuf::from(r"C:\Tools\a.exe")),
+                arguments: "--edit {file}".to_string(),
+                working_directory: Some(PathBuf::from(r"C:\Work A")),
+                payload: PayloadPolicy::Original,
+                video: VideoPolicy::CurrentFrame,
+                spread: SpreadPolicy::BothPages,
+                selection: SelectionPolicy::Each,
+                pdf_render_long_edge: 2048,
+                for_editing: true,
+                show_in_context_menu: false,
+                keep_temp: true,
+            },
+            ExternalTool {
+                id: ExternalToolId(7),
+                name: "Container Tool".to_string(),
+                executable: None,
+                arguments: "--container {file}".to_string(),
+                working_directory: None,
+                payload: PayloadPolicy::Container,
+                video: VideoPolicy::CurrentFrame,
+                spread: SpreadPolicy::MainPageOnly,
+                selection: SelectionPolicy::Batch,
+                pdf_render_long_edge: 8192,
+                for_editing: false,
+                show_in_context_menu: true,
+                keep_temp: false,
+            },
+            ExternalTool {
+                id: ExternalToolId(90),
+                name: String::new(),
+                executable: Some(PathBuf::from(r"D:\Viewer\view.exe")),
+                arguments: "{file} --readonly".to_string(),
+                working_directory: Some(PathBuf::from(r"D:\Viewer")),
+                payload: PayloadPolicy::RealFileOnly,
+                video: VideoPolicy::CurrentFrame,
+                spread: SpreadPolicy::BothPages,
+                selection: SelectionPolicy::Each,
+                pdf_render_long_edge: 1024,
+                for_editing: false,
+                show_in_context_menu: false,
+                keep_temp: true,
+            },
+        ]
+    }
+
+    fn seed_legacy_custom_apps(db: &SettingsDb) {
+        let inner = db.inner.lock().unwrap();
+        inner
+            .conn
+            .execute_batch(
+                "DELETE FROM external_tools;
+                 DELETE FROM custom_open_with_apps;
+                 DELETE FROM schema_meta
+                   WHERE key = 'external_tools_migrated_from_custom_open_with';
+                 INSERT INTO custom_open_with_apps (exe_path, display_name, sort_index)
+                   VALUES ('C:\\Tools\\second.exe', 'Second', 20);
+                 INSERT INTO custom_open_with_apps (exe_path, display_name, sort_index)
+                   VALUES ('C:\\Tools\\first.exe', 'First', 10);",
+            )
+            .unwrap();
+    }
+
+    fn external_tools_migration_marker_present(db: &SettingsDb) -> bool {
+        let inner = db.inner.lock().unwrap();
+        inner
+            .conn
+            .query_row(
+                "SELECT 1 FROM schema_meta WHERE key = ?1",
+                params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
     }
 
     fn set_folder_thumb_sort_migration_state(
@@ -3698,6 +4098,146 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn external_tools_roundtrip_preserves_order_and_every_field() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.external_tools = nondefault_external_tools();
+
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.external_tools, settings.external_tools);
+    }
+
+    #[test]
+    fn external_tool_ids_survive_reordering_and_next_id_uses_maximum() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.external_tools = nondefault_external_tools();
+        settings.external_tools.rotate_left(1);
+        let expected_ids: Vec<_> = settings.external_tools.iter().map(|tool| tool.id).collect();
+
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        let loaded_ids: Vec<_> = loaded.external_tools.iter().map(|tool| tool.id).collect();
+
+        assert_eq!(loaded_ids, expected_ids);
+        assert_eq!(next_id(&loaded.external_tools), ExternalToolId(91));
+    }
+
+    #[test]
+    fn migrates_legacy_custom_apps_in_order_and_keeps_source_rows() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        seed_legacy_custom_apps(&db);
+
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.external_tools.len(), 2);
+        assert_eq!(loaded.external_tools[0].id, ExternalToolId(1));
+        assert_eq!(loaded.external_tools[0].name, "First");
+        assert_eq!(
+            loaded.external_tools[0].executable,
+            Some(PathBuf::from(r"C:\Tools\first.exe"))
+        );
+        assert_eq!(loaded.external_tools[0].arguments, "{file}");
+        assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
+        assert_eq!(loaded.external_tools[1].name, "Second");
+        assert_eq!(loaded.external_tools[1].payload, PayloadPolicy::AsDisplayed);
+        assert!(loaded.external_tools[1].show_in_context_menu);
+        assert!(!loaded.external_tools[1].for_editing);
+        assert!(external_tools_migration_marker_present(&db));
+
+        let inner = db.inner.lock().unwrap();
+        let legacy_count: i64 = inner
+            .conn
+            .query_row("SELECT COUNT(*) FROM custom_open_with_apps", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy_count, 2, "legacy source rows must remain intact");
+    }
+
+    #[test]
+    fn external_tools_migration_runs_only_once() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        seed_legacy_custom_apps(&db);
+        let mut loaded = db.load_into_settings().unwrap();
+        loaded.external_tools[0].name = "Edited after migration".to_string();
+        loaded.external_tools.remove(1);
+        db.save_full(&loaded).unwrap();
+
+        let reloaded = db.load_into_settings().unwrap();
+
+        assert_eq!(reloaded.external_tools.len(), 1);
+        assert_eq!(reloaded.external_tools[0].name, "Edited after migration");
+    }
+
+    #[test]
+    fn markerless_database_with_external_tools_does_not_duplicate_legacy_apps() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.external_tools = vec![nondefault_external_tools().remove(0)];
+        db.save_full(&settings).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO custom_open_with_apps (exe_path, display_name, sort_index)
+                     VALUES ('C:\\Legacy\\legacy.exe', 'Legacy', 0)",
+                    [],
+                )
+                .unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+                )
+                .unwrap();
+        }
+
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.external_tools.len(), 1);
+        assert_eq!(loaded.external_tools[0].id, ExternalToolId(41));
+        assert!(external_tools_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn unknown_external_tool_policy_returns_incompatible() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.external_tools = vec![nondefault_external_tools().remove(0)];
+        db.save_full(&settings).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute("UPDATE external_tools SET payload = 'FuturePolicy'", [])
+                .unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+                )
+                .unwrap();
+        }
+
+        let error = match db.load_into_settings() {
+            Ok(_) => panic!("unknown enum variant must not load"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, SettingsDbError::Incompatible(_)),
+            "expected Incompatible, got: {error:?}"
+        );
+        assert!(!external_tools_migration_marker_present(&db));
     }
 
     #[test]
@@ -4597,6 +5137,54 @@ mod tests {
     }
 
     #[test]
+    fn require_existing_rejects_missing_external_tools_after_migration() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute_batch("DROP TABLE external_tools;").unwrap();
+        drop(conn);
+
+        let error = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("missing external_tools table should fail RequireExisting"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn markerless_legacy_database_can_create_and_migrate_external_tools_table() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE external_tools;
+             DELETE FROM schema_meta
+               WHERE key = 'external_tools_migrated_from_custom_open_with';
+             INSERT INTO custom_open_with_apps (exe_path, display_name, sort_index)
+               VALUES ('C:\\Legacy\\editor.exe', 'Legacy Editor', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.external_tools.len(), 1);
+        assert_eq!(loaded.external_tools[0].name, "Legacy Editor");
+        assert!(external_tools_migration_marker_present(&db));
+    }
+
+    #[test]
     fn corrupted_settings_kv_value_returns_corrupted() {
         // Codex P2 v10 (2026-05-14): settings_kv の value 文字列が JSON として
         // parse できなければ Corrupted を返す。
@@ -5432,6 +6020,10 @@ mod tests {
             .favorites
             .push(FavoriteEntry::new("Pics".into(), PathBuf::from(r"C:\Pics")));
         original.tags.push(TagDef::new("原神".into()));
+        original.custom_open_with_apps = vec![RecentApp {
+            display_name: "Legacy Editor".to_string(),
+            exe_path: r"C:\Legacy\editor.exe".to_string(),
+        }];
         write_legacy_json(dir, "settings.json", &original);
         // bak1 も置いて読み比較で main 優先を確認 (= main があれば bak は読まない)。
         let mut bak = original.clone();
@@ -5445,12 +6037,16 @@ mod tests {
         assert_eq!(loaded.folder_thumb_sort, SortOrder::FileName);
         assert_eq!(loaded.favorites.len(), 1);
         assert_eq!(loaded.tags.len(), 1);
+        assert_eq!(loaded.external_tools.len(), 1);
+        assert_eq!(loaded.external_tools[0].name, "Legacy Editor");
         // settings.db が物理的に存在し、再 open で同じ内容が出てくる。
         assert!(dir.join("settings.db").exists());
         let reloaded = db.load_into_settings().unwrap();
         assert_eq!(reloaded.grid_cols, 9);
         assert_eq!(reloaded.folder_thumb_sort, SortOrder::FileName);
+        assert_eq!(reloaded.external_tools, loaded.external_tools);
         assert!(folder_thumb_sort_migration_marker_present(&db));
+        assert!(external_tools_migration_marker_present(&db));
         // 旧 JSON ファイルは .migrated-<ts> にリネームされて消えている。
         assert!(!dir.join("settings.json").exists());
         assert!(!dir.join("settings.json.bak1").exists());

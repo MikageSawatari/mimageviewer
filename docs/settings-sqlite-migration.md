@@ -329,7 +329,31 @@ CREATE TABLE custom_open_with_apps (
     sort_index    INTEGER NOT NULL
 );
 CREATE INDEX custom_apps_sort ON custom_open_with_apps(sort_index);
+
+-- external tools (stable id + Vec order; same executable may be registered repeatedly)
+CREATE TABLE external_tools (
+    id                   INTEGER PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    executable           TEXT,
+    arguments            TEXT NOT NULL,
+    working_directory    TEXT,
+    payload              TEXT NOT NULL,
+    video                TEXT NOT NULL,
+    spread               TEXT NOT NULL,
+    selection            TEXT NOT NULL,
+    pdf_render_long_edge INTEGER NOT NULL,
+    for_editing          INTEGER NOT NULL,
+    show_in_context_menu INTEGER NOT NULL,
+    keep_temp            INTEGER NOT NULL,
+    sort_index           INTEGER NOT NULL
+);
+CREATE INDEX external_tools_sort ON external_tools(sort_index);
 ```
+
+`custom_open_with_apps` はリリース済みの移行元として行を残し、mIV からは以後更新しない。
+`schema_meta.external_tools_migrated_from_custom_open_with = '1'` が無い場合だけ、
+`sort_index` 順に `external_tools` へ変換し、行と marker を同じ transaction で commit する。
+marker が失われても `external_tools` に行があれば追加移行せず、二重登録を防ぐ。
 
 ### 4.1 PRAGMA 設定 (open 時)
 
@@ -360,7 +384,10 @@ pub fn save_full(&self, s: &Settings) -> Result<(), SettingsDbError> {
     delete_and_insert_tags(&tx, &s.tags)?;
     delete_and_insert_video_resume_positions(&tx, &s.video_resume_positions)?;
     delete_and_insert_recent_apps(&tx, &s.recent_open_with_apps)?;
+    // custom_open_with_apps は移行元として残す。旧 UI がまだこのフィールドへ追加するので
+    // P1 で UI を external_tools へ載せ替えるまでは書き戻しも続ける
     delete_and_insert_custom_apps(&tx, &s.custom_open_with_apps)?;
+    delete_and_insert_external_tools(&tx, &s.external_tools)?;
     if chain_changed {
         delete_and_insert_vst3_plugins(&tx, &s.vst3_plugins)?;
     }

@@ -4320,12 +4320,17 @@ pub struct Settings {
     pub folder_thumb_depth: u32,
 
     // ── アプリケーションで開く ──────────────────────────────────
-    /// 最近使ったアプリケーション（最大3件、最新が先頭）
+    /// 最近使ったアプリケーション（最大3件、最新が先頭）。
+    /// 次リリースまでの legacy 候補リストで、外部ツール UI 移行後に削除予定。
     #[serde(default)]
     pub recent_open_with_apps: Vec<RecentApp>,
-    /// ユーザーが手動で追加したアプリケーション
+    /// ユーザーが手動で追加した legacy アプリケーション。
+    /// `external_tools` への移行元として読むだけで、以後は書かない。次リリース後に削除予定。
     #[serde(default)]
     pub custom_open_with_apps: Vec<RecentApp>,
+    /// 安定 ID 付きの外部ツール登録。表示順は Vec の順序。
+    #[serde(default)]
+    pub external_tools: Vec<crate::external_tool::ExternalTool>,
 
     // ── AI セッション設定 ────────────────────────────────────
     /// AI アップスケール: フルスクリーン表示時に有効にするか（デフォルト: false）
@@ -5972,6 +5977,7 @@ impl Default for Settings {
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
+            external_tools: Vec::new(),
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
@@ -7992,6 +7998,7 @@ impl Settings {
         // ── 「アプリケーションで開く」履歴 ──
         self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
         self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);
+        self.external_tools = std::mem::take(&mut src.external_tools);
         // ── AI アップスケール runtime 選択 ──
         self.ai_upscale_enabled = src.ai_upscale_enabled;
         self.ai_upscale_model_override = src.ai_upscale_model_override.take();
@@ -10469,6 +10476,26 @@ mod tests {
     }
 
     #[test]
+    fn preferences_ok_keeps_live_external_tools_before_their_ui_exists() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        live.external_tools = vec![crate::external_tool::ExternalTool {
+            id: crate::external_tool::ExternalToolId(17),
+            name: "Editor".to_string(),
+            ..crate::external_tool::ExternalTool::defaults_for_editing()
+        }];
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.external_tools.len(), 1);
+        assert_eq!(
+            edited.external_tools[0].id,
+            crate::external_tool::ExternalToolId(17)
+        );
+        assert_eq!(edited.external_tools[0].name, "Editor");
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -10483,6 +10510,7 @@ mod tests {
             crate::reading_history_db::READING_HISTORY_LIMIT_DEFAULT
         );
         assert!(s.recent_folders.is_empty());
+        assert!(s.external_tools.is_empty());
         assert_eq!(s.quick_folder_slots, [None, None]);
         assert_eq!(
             s.quick_folder_drive_current_dirs,

@@ -316,6 +316,7 @@ pub struct ExternalTool {
     pub video: VideoPolicy,          // 動画のときに何を渡すか (§4.3)
     pub spread: SpreadPolicy,        // 見開き表示中の扱い (§4.5)
     pub selection: SelectionPolicy,  // 複数選択の扱い (§4.5)
+    pub pdf_render_long_edge: u32,   // PDF レンダリング長辺 (既定 4096、§4.3 / §6)
     pub for_editing: bool,           // 編集用。round-trip 監視の対象 (§4.8)
     pub show_in_context_menu: bool,  // 右クリックメニューに出す (§4.9)
     pub keep_temp: bool,             // 起動後に temp を残すか (既定 false)
@@ -618,7 +619,7 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 
 | Phase | 内容 | 規模 |
 | --- | --- | --- |
-| **P0** | `ExternalTool` 型 + 設定 DB (complex field) + 既存 `custom_open_with_apps` からの移行 + 移行テスト | S |
+| **P0 (実装済み 2026-08-29)** | `ExternalTool` 型 + 設定 DB (complex field) + 既存 `custom_open_with_apps` からの移行 + 移行テスト | S |
 | **P1** | 環境設定「外部ツール」ページ、引数テンプレート、作業フォルダー、起動失敗通知、`OsStr` 化 | M |
 | **P2** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、メニュー / ツールバー / キースロット | M |
 | **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
