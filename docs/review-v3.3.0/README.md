@@ -617,3 +617,94 @@ R-03 / R-05 / R-06 / R-20 には追跡すべき residual があるが、元 find
 合計 41 test execution は成功した。ただし成功した test は上記の gap を直接覆っていないため、残存 P1 を反証しない。
 特に R-02 は空 batch、R-14 は小規模 COW、R-26 は `Some(read-only DB)` の単一路、R-27 は異なる HWND の
 reducer state までしか検証していない。本節は read-only 再レビューであり、source code は変更していない。
+
+## 10. §9 の裏取り (2026-08-29, ClaudeCode)
+
+§9 は静的レビューで、§9.4 自身が「成功した 41 test は指摘した gap を覆っていない」と書いている。
+そこで 5 件それぞれについて、**実在するか / 何が壊れるか / v3.3.1 に入れるか** を独立に確認した。
+結論: **5 件とも実在する。ただし 2 件は「新しい問題」ではない。**
+
+| ID | 実在 | 確認方法 | 深刻度 | v3.3.1 |
+| --- | --- | --- | --- | --- |
+| R-27 | ✅ | **失敗するテストで再現** | 高 — 複数ウィンドウ操作で表示と設定が食い違う | **入れる** |
+| R-02 | ✅ | コード確認 (実装が**自分のコメントの意図を裏切っている**) | 中〜高 — 誤った窓を操作する。データ破壊は無し | **入れる** |
+| R-26 | ✅ | コード確認 (無言のデータ損失の連鎖を特定) | 高 — 頻度は低いが編集が黙って消える | **入れる** |
+| R-14 | ✅ (残存) | doc comment に既に明記済みの設計上のトレードオフ | 中 — R-07 と同一の構造問題 | R-07 と 1 件として扱う |
+| R-07 | ✅ | 既知 | 中 | **既に v3.3.1 予定** (§1.0) |
+
+### 10.1 R-27 — 再現済み
+
+`src/app/presentation_transition.rs` の
+`a_successor_does_not_reuse_the_host_the_same_batch_destroys` が現状落ちる (`#[ignore]` 中)。
+`Detached(H) -> Fullscreen` の retire 待ちに `Detached` を要求すると、`NativeRetired` の
+**同じ effect batch** が `DestroyHost { hwnd: H }` を出しつつ後継を
+`ReadyToPrepare { host_hwnd: H }` にする。
+
+production で `ready_host == H` になることも確認した。`native_video.rs` の `ready_host_hwnd` は
+`detached_viewer_video_host_ready()` が真なら現在の detached host をそのまま読み、その述語は
+`detached_viewer_client_rect_physical().is_some()` — retire 中の窓はまだ生きているので真になる。
+
+既存テストが見逃していた理由も特定した。`OUTGOING_HOST = 0x202` と `CANDIDATE_HOST = 0x404` を
+**別値に固定**しており、production で実際に起きる「同じ値」の場合を一度も通していない。
+
+### 10.2 R-02 — 実装が自分のコメントの意図を裏切っている
+
+配り先の判定と surface の判定が**別々の情報源**を使う。
+
+- 配り先: `app.rs` の `gamepad_goes_to_active_context = self.active_detached_context_is_at_rest()`。
+  この述語は `active_viewer_context_id()` の residence だけを見ており、**前面ウィンドウを見ていない**。
+- surface: `gamepad_input.rs` の `current_input_surface()` →
+  `resolve_input_surface(.., foreground_app_hwnd(), ..)` は**前面を見る**。前面がメインなら
+  `ActionSurface::MainWindow`。
+
+同じ frame の同じ batch で、前者が「detached bundle を mount」、後者が「対象はメイン」と答え得る。
+そして `handle_gamepad_y_tap` のコメントはこう書いてある:
+
+> グリッド面: Y でツリーをトグル。detached viewer が同時表示中でも
+> **foreground / last-touched がメインならこちらを操作する。**
+
+ところが `handle_gamepad_direction_for_grid` が読み書きする `self.selected` /
+`self.scroll_to_selected` / `self.items` は、mount 中は `ViewerContextBundle` が所有する
+detached 側の field である (`viewer_context_registry.rs:704` 以降に `items` / `selected` /
+`scroll_offset_y` / `scroll_to_selected` を確認)。**意図した挙動をコードが実現できていない。**
+
+根本修正の境界は §9.2 のとおり: batch の宛先を前面 / last-touched から**先に一度**決め、
+Viewer 宛のときだけ context を mount する。
+
+### 10.3 R-26 — 無言のデータ損失の連鎖
+
+損失経路を最後まで辿れた。
+
+1. 起動時に各 edit DB を `open().ok()` で保持する (`app.rs:13170` 以降、adjustment /
+   local_adjust / export_crop / mask / conceal / comic の 6 つすべて)。開けなければ `None`。
+2. 保存経路は `None => Ok(())` (13 か所)。`edit_store_write_succeeded` は `Err` のときだけ
+   失敗を報告するので、**開けていない状態は durable 成功と区別されない**。
+3. そのまま `set_page_key_presence(.., true)` が立ち、sidecar ミラーが書かれる。
+4. 次回起動で DB が開けると `sidecar::import_to_dbs` が走るが、その doc は
+   「中央 DB に既にエントリがあるものは **上書きしない** (中央が authoritative)」。
+   → 中央に古い行があると、`None` の間に書いた sidecar は**捨てられる**。
+
+利用者にはエラーもトーストも出ない。到達条件は「以前の行が中央にあり、今回 DB が開けない」で、
+別インスタンスの排他ロック・DB 破損・ディスク満杯などで成立する。頻度は低いが、
+起きたときの結果が編集の消失なので P1 の格付けは妥当。
+
+### 10.4 R-14 は R-07 と同じ構造問題
+
+`SidecarFile::items` の doc comment に既に書いてあるとおり、`Arc::make_mut` は
+**writer が前の snapshot を持っている間だけ 1 回**複製する。v3.3.0 の修正は
+「flush・読み直し・worker 取り出しの 3 か所が毎回 map 全体を deep clone」を
+「重なったときだけ 1 回」にしたもので、常用経路は 3 回 → 0 回になっている。
+
+残るのは「編集文書という大きな値を UI スレッドが所有して複製する」という一点で、
+**これは R-07 (マスクの直列化・圧縮・DB 保存が UI スレッド) と同じ問題**である。
+R-07 の根本修正 (`(key, 不変スナップショット, generation)` を worker が処理し、
+最新 generation の応答だけを publish する) を入れれば、sidecar ミラー側も同じ
+所有権に乗せられる。**2 件を別々に直さず、1 つの作業として扱うほうがよい。**
+
+### 10.5 v3.3.1 への割り当て
+
+- **新規に入れる**: R-27 / R-02 / R-26。R-27 と R-02 は detached の所有権境界に触るので、
+  CLAUDE.md の凍結ルール (症状パッチ禁止・構造的修正は ClaudeCode と Codex の合意 +
+  [detached-rework-plan](detached-rework-plan.md) への記録) に従う。
+- **既に予定済み**: R-07 (+ 図形のキー移動 / 塗りの毎フレーム複製)、§1.0b (対応済み)、§1.0c。
+- **格付け変更の提案**: R-14 は単独 P1 ではなく R-07 の一部として扱う。
