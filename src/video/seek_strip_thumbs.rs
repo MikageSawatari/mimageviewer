@@ -653,7 +653,7 @@ pub(crate) fn plan_strip_cell_eviction(
                 // 窓が空 (= 有効なセルが 1 つも無い要求) なら距離は測れない。
                 // 全部同じ扱いにして、あとは ID 順で古い側から落ちる。
                 None => 0.0,
-                Some((lo, hi)) if secs < lo => lo - secs,
+                Some((lo, _)) if secs < lo => lo - secs,
                 Some((_, hi)) if secs > hi => secs - hi,
                 Some(_) => 0.0,
             };
