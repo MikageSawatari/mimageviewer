@@ -35,6 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use base64::Engine;
@@ -66,8 +67,10 @@ struct SidecarJson {
     app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saved_at: Option<String>,
+    /// `SidecarFile::items` と同じ `Arc`。読み書きのどちらでも map を複製しない
+    /// (serde の `rc` feature。復元時は共有を持ち越さず新しい `Arc` になる)。
     #[serde(default)]
-    items: BTreeMap<String, SidecarEntry>,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -150,7 +153,15 @@ impl SidecarMask {
 /// フォルダごとに 1 個。dirty 管理と flush タイミングを保持する。
 pub struct SidecarFile {
     folder: PathBuf,
-    items: BTreeMap<String, SidecarEntry>,
+    /// **writer と共有する不変スナップショット。** flush は `Arc` を 1 つ渡すだけで、
+    /// map も、その中の全ページ分のラスターマスク (`Vec<f32>`、原寸なので 24MP なら
+    /// 1 面 96 MB) も複製しない。書き換えは `items_mut` の `Arc::make_mut` を通り、
+    /// writer がまだ前の snapshot を持っているときだけ 1 回複製する。
+    ///
+    /// 以前は flush・pending からの読み直し・worker の取り出しの 3 か所がそれぞれ
+    /// map 全体を deep clone しており、フォルダ切替や編集終了のたびに数百 MB を
+    /// UI スレッドで写していた (2026-08-29 レビュー R-14)。
+    items: Arc<BTreeMap<String, SidecarEntry>>,
     dirty: bool,
     /// ディスク上の内容を**上書きしてはいけない**と分かっているフラグ。パース失敗や
     /// 新しいバージョンが書いたファイルがこれに当たる。書き込み自体の失敗 (読み取り
@@ -175,11 +186,17 @@ impl SidecarFile {
     pub fn new(folder: PathBuf) -> Self {
         Self {
             folder,
-            items: BTreeMap::new(),
+            items: Arc::new(BTreeMap::new()),
             dirty: false,
             disabled: false,
             dirty_since: None,
         }
+    }
+
+    /// 書き換え用の可変参照。writer がまだ前の snapshot を持っていれば、ここで
+    /// **1 回だけ** 複製する (`Arc::make_mut`)。誰も持っていなければ複製しない。
+    fn items_mut(&mut self) -> &mut BTreeMap<String, SidecarEntry> {
+        Arc::make_mut(&mut self.items)
     }
 
     /// フォルダから `mimageviewer.dat` を読み込む。無ければ空のサイドカーを返す。
@@ -276,9 +293,9 @@ impl SidecarFile {
     pub fn replace_edit_bundle(&mut self, rel_key: &str, mut replacement: SidecarEntry) {
         replacement.tags = self.items.get(rel_key).and_then(|entry| entry.tags.clone());
         if replacement.is_empty() {
-            self.items.remove(rel_key);
+            self.items_mut().remove(rel_key);
         } else {
-            self.items.insert(rel_key.to_string(), replacement);
+            self.items_mut().insert(rel_key.to_string(), replacement);
         }
         self.mark_dirty();
     }
@@ -286,17 +303,17 @@ impl SidecarFile {
     // ── 変更 ──────────────────────────────────────────────────────
 
     pub fn set_adjust(&mut self, rel_key: &str, params: AdjustParams) {
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.adjust = Some(params);
         self.mark_dirty();
     }
 
     pub fn remove_adjust(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.adjust.is_some() {
                 entry.adjust = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -304,17 +321,17 @@ impl SidecarFile {
     }
 
     pub fn set_mask(&mut self, rel_key: &str, mask: SidecarMask) {
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.mask = Some(mask);
         self.mark_dirty();
     }
 
     pub fn remove_mask(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.mask.is_some() {
                 entry.mask = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -323,18 +340,18 @@ impl SidecarFile {
 
     /// 隠蔽加工マスクをセットする (Phase 4)。形式は `SidecarMask` と共通。
     pub fn set_conceal(&mut self, rel_key: &str, conceal: SidecarMask) {
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.conceal = Some(conceal);
         self.mark_dirty();
     }
 
     /// 隠蔽加工マスクを取り除く (Phase 4)。
     pub fn remove_conceal(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.conceal.is_some() {
                 entry.conceal = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -351,18 +368,18 @@ impl SidecarFile {
             self.remove_local_adjust_layers(rel_key);
             return;
         }
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.local_adjust_layers = Some(layers);
         self.mark_dirty();
     }
 
     /// 補正レイヤー配列を取り除く。
     pub fn remove_local_adjust_layers(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.local_adjust_layers.is_some() {
                 entry.local_adjust_layers = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -375,18 +392,18 @@ impl SidecarFile {
             self.remove_comic(rel_key);
             return;
         }
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.comic = Some(objects);
         self.mark_dirty();
     }
 
     /// テキスト注釈ドキュメントを取り除く。
     pub fn remove_comic(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.comic.is_some() {
                 entry.comic = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -407,18 +424,18 @@ impl SidecarFile {
             self.remove_tags(rel_key);
             return;
         }
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.tags = Some(normalized);
         self.mark_dirty();
     }
 
     /// mIV タグのバックアップを取り除く。
     pub fn remove_tags(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.tags.is_some() {
                 entry.tags = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -427,18 +444,18 @@ impl SidecarFile {
 
     /// 最後段 crop 設定をセットする。
     pub fn set_export_crop(&mut self, rel_key: &str, settings: crate::export_crop::CropSettings) {
-        let entry = self.items.entry(rel_key.to_string()).or_default();
+        let entry = self.items_mut().entry(rel_key.to_string()).or_default();
         entry.export_crop = Some(settings);
         self.mark_dirty();
     }
 
     /// 最後段 crop 設定を取り除く。
     pub fn remove_export_crop(&mut self, rel_key: &str) {
-        if let Some(entry) = self.items.get_mut(rel_key) {
+        if let Some(entry) = self.items_mut().get_mut(rel_key) {
             if entry.export_crop.is_some() {
                 entry.export_crop = None;
                 if entry.is_empty() {
-                    self.items.remove(rel_key);
+                    self.items_mut().remove(rel_key);
                 }
                 self.mark_dirty();
             }
@@ -451,7 +468,7 @@ impl SidecarFile {
         let container_prefix = format!("{rel_root}::");
         let folder_prefix = format!("{rel_root}/");
         let before = self.items.len();
-        self.items.retain(|key, _| {
+        self.items_mut().retain(|key, _| {
             key != rel_root
                 && !key.starts_with(&container_prefix)
                 && !key.starts_with(&folder_prefix)
@@ -471,7 +488,7 @@ impl SidecarFile {
     {
         let mut changed = false;
         for rel_key in iter {
-            let entry = self.items.entry(rel_key).or_default();
+            let entry = self.items_mut().entry(rel_key).or_default();
             entry.adjust = Some(params.clone());
             changed = true;
         }
@@ -488,7 +505,7 @@ impl SidecarFile {
         let mut changed = false;
         let keys: Vec<String> = iter.into_iter().collect();
         for rel_key in &keys {
-            if let Some(entry) = self.items.get_mut(rel_key) {
+            if let Some(entry) = self.items_mut().get_mut(rel_key) {
                 if entry.adjust.is_some() {
                     entry.adjust = None;
                     changed = true;
@@ -496,7 +513,7 @@ impl SidecarFile {
             }
         }
         if changed {
-            self.items.retain(|_, e| !e.is_empty());
+            self.items_mut().retain(|_, e| !e.is_empty());
             self.mark_dirty();
         }
     }
@@ -526,14 +543,19 @@ impl SidecarFile {
             self.dirty_since = None;
             return;
         }
-        let request = if self.items.is_empty() {
-            WriteRequest::Remove
-        } else {
-            WriteRequest::Write(self.items.clone())
-        };
-        writer().enqueue(self.folder.clone(), request);
+        writer().enqueue(self.folder.clone(), self.write_request());
         self.dirty = false;
         self.dirty_since = None;
+    }
+
+    /// flush で積む内容。`items` の `Arc` をそのまま渡すので map は複製しない
+    /// (`items` の doc comment 参照)。空なら削除要求。
+    fn write_request(&self) -> WriteRequest {
+        if self.items.is_empty() {
+            WriteRequest::Remove
+        } else {
+            WriteRequest::Write(Arc::clone(&self.items))
+        }
     }
 
     /// この内容がディスクに載っているか。積んだだけで**まだ待っていない**間は false
@@ -557,7 +579,9 @@ impl SidecarFile {
 /// 1 フォルダぶんの書き出し要求。
 #[derive(Clone)]
 enum WriteRequest {
-    Write(BTreeMap<String, SidecarEntry>),
+    /// 積んだ時点の内容そのもの。`SidecarFile::items` と同じ `Arc` を共有するので、
+    /// 積む側も worker も map を複製しない。
+    Write(Arc<BTreeMap<String, SidecarEntry>>),
     Remove,
 }
 
@@ -662,11 +686,11 @@ impl WriterState {
         }
     }
 
-    fn pending_items(&self, folder: &Path) -> Option<BTreeMap<String, SidecarEntry>> {
+    fn pending_items(&self, folder: &Path) -> Option<Arc<BTreeMap<String, SidecarEntry>>> {
         let pending = self.pending.lock().ok()?;
         match &pending.get(folder)?.request {
-            WriteRequest::Write(items) => Some(items.clone()),
-            WriteRequest::Remove => Some(BTreeMap::new()),
+            WriteRequest::Write(items) => Some(Arc::clone(items)),
+            WriteRequest::Remove => Some(Arc::new(BTreeMap::new())),
         }
     }
 
@@ -743,7 +767,7 @@ fn write_sidecar_to_disk(folder: &Path, request: &WriteRequest) -> bool {
         version: CURRENT_VERSION,
         app: Some(format!("mimageviewer {}", env!("CARGO_PKG_VERSION"))),
         saved_at: Some(current_timestamp()),
-        items: items.clone(),
+        items: Arc::clone(items),
     };
     // pretty ではなく compact。人が読むファイルではないし、マスクを packed 文字列に
     // したあとは pretty の改行とインデントが残りの大半になる。
@@ -1817,9 +1841,8 @@ mod writer_tests {
         let folder = dir.path().to_path_buf();
         let state = WriterState::default();
 
-        let mut items = BTreeMap::new();
-        items.insert("img.jpg".to_string(), SidecarEntry::default());
-        state.queue(folder.clone(), WriteRequest::Write(items.clone()));
+        let items = items_named(&["img.jpg"]);
+        state.queue(folder.clone(), WriteRequest::Write(Arc::clone(&items)));
 
         assert!(
             !folder.join(SIDECAR_FILENAME).exists(),
@@ -1839,11 +1862,75 @@ mod writer_tests {
         );
     }
 
-    fn items_named(names: &[&str]) -> BTreeMap<String, SidecarEntry> {
-        names
-            .iter()
-            .map(|name| (name.to_string(), SidecarEntry::default()))
-            .collect()
+    /// flush は writer へ **同じ割り当て** を渡す。map もその中の原寸ラスターマスクも
+    /// 複製しない。
+    ///
+    /// 欠陥は `queue_flush` / `pending_items` / 書き出しの 3 か所がそれぞれ map 全体を
+    /// deep clone していたことで、`local_adjust_layers` の `Vec<f32>` は画像原寸
+    /// (24MP なら 1 面 96 MB) なので、フォルダ切替や編集終了のたびに数百 MB を
+    /// UI スレッドで写していた (2026-08-29 レビュー R-14)。
+    #[test]
+    fn queueing_a_flush_hands_the_writer_the_same_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = SidecarFile::new(dir.path().to_path_buf());
+        file.set_adjust("a.jpg", crate::adjustment::AdjustParams::default());
+
+        let WriteRequest::Write(queued) = file.write_request() else {
+            panic!("中身があるのに削除要求になった");
+        };
+        assert!(
+            Arc::ptr_eq(&queued, &file.items),
+            "flush のたびに map 全体を複製している"
+        );
+
+        let state = WriterState::default();
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::clone(&queued)),
+        );
+        let read_back = state.pending_items(dir.path()).expect("積んだものが読める");
+        assert!(
+            Arc::ptr_eq(&read_back, &queued),
+            "pending から読み直すたびに map 全体を複製している"
+        );
+    }
+
+    /// 積んだ後の編集は、積んだ内容に混ざらない。
+    ///
+    /// `Arc` を共有するので、ここを `get_mut` の unwrap などにすると、writer が
+    /// 「積んだ時点の内容」ではなく後から足した編集まで書いてしまう。
+    #[test]
+    fn an_edit_after_the_flush_does_not_reach_the_queued_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = SidecarFile::new(dir.path().to_path_buf());
+        file.set_adjust("a.jpg", crate::adjustment::AdjustParams::default());
+        let WriteRequest::Write(queued) = file.write_request() else {
+            panic!("中身があるのに削除要求になった");
+        };
+
+        file.set_adjust("b.jpg", crate::adjustment::AdjustParams::default());
+
+        assert!(
+            !queued.contains_key("b.jpg"),
+            "積んだ後の編集が、積んだ内容に混ざった"
+        );
+        assert!(
+            file.items.contains_key("b.jpg"),
+            "編集が手元にも入っていない"
+        );
+        assert!(
+            !Arc::ptr_eq(&queued, &file.items),
+            "共有したまま書き換えている"
+        );
+    }
+
+    fn items_named(names: &[&str]) -> Arc<BTreeMap<String, SidecarEntry>> {
+        Arc::new(
+            names
+                .iter()
+                .map(|name| (name.to_string(), SidecarEntry::default()))
+                .collect(),
+        )
     }
 
     #[test]

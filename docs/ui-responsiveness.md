@@ -540,6 +540,16 @@ Codex P3 (confidence 0.76-0.78)。§4 チェックリスト違反なので新し
 届いていない内容は writer の pending に残り、`SidecarFile::load` がディスクより先に
 そちらを見るため。詳細は [preset-and-adjustment.md](preset-and-adjustment.md) §9.3.2。
 
+**「渡すだけ」は 2026-08-29 まで嘘だった。**渡す・pending から読み直す・worker が
+書き出す、の 3 か所がそれぞれ `items` map 全体を deep clone していた。map の中身には
+`local_adjust_layers` の `Vec<f32>` マスクが**画像原寸で**入る (24MP で 1 面 96 MB、
+codec の document budget は保持データだけで最大 1 GiB を許す) ため、フォルダ切替・
+編集終了・10 分周期・トレイ退避の**積む操作そのもの**が数百 MB の copy になっていた。
+`items` を `Arc<BTreeMap<..>>` にし、書き換えを `Arc::make_mut` に通す copy-on-write へ
+変更 (レビュー R-14)。複製が起きるのは「writer がまだ前の snapshot を持っている間に
+書き換えた」ときだけで、そのときも 1 回。**新しくサイドカーへフィールドを足すときは、
+UI スレッドが渡すのは `Arc` 1 個だけである性質を壊さないこと。**
+
 ### フォルダオープン時の巨大 local_adjust JSON 読み (2026-06 解決済み)
 
 `h:\home\mimageviewer_old\testimage` の cold open 調査で、`sli_local_adjust_db` が
