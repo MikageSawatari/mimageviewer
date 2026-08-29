@@ -1501,14 +1501,30 @@ App と native の presentation が分裂する」は**成立しない**。effec
 留まる。観測されるのは R-17 のハングであって rollback ではない。モデリングの穴 (`Aborting` が
 publication phase を持たない) は実在したので、そちらは `ce663f82` で型に持たせた。
 
-**未了として引き継ぐもの** (Codex Q4 / Q5、2026-08-29 時点):
+**その後の追跡 (2026-08-29 中に決着)**:
 
-- `teardown_paused_media_bundles_for_window_ids` が `retire_context` を直接呼び、bundle の
-  transition owner を drain していない。passive close / mode change / removed-path close /
-  parked-poll close / new-media replacement が該当する。
-- `Committing::AwaitingRetire` に直接 `TerminalClose` が来る経路は、retire が積まれた後に
-  `AbortNative` を出し、publish 前の `request.current` で安定する。`RetiringCommitted` は
-  正しく扱えているので、同じ扱いを明示分岐として足す必要がある。
+- `Committing::AwaitingRetire` への直接 `TerminalClose` → **修正済み** (`02390035`)。
+  retire が積まれた後に `AbortNative` を出し、publish 前の `request.current` で安定して
+  いた。`RetiringCommitted` と同じ扱いを明示分岐として足した。
+- parked bundle の retire が transition owner を drain しない件 → **調査のうえ benign と
+  裁定** (fix しない。`effects.is_empty()` の assert も置かない)。理由:
+  - 5 つの caller (passive close / mode change / removed-path close / parked-poll close /
+    new-media replacement) は**いずれも既に detached window の close を所有**している。
+    `DestroyHost` は raw `DestroyWindow` ではなく viewport への `Close` なので、失われても
+    同じ close が別経路で走る。HWND leak は起きない。
+  - candidate の `host_hwnd` は既存の egui host。新規生成される native child は
+    `presenter_hwnd` で、その owner (`NativeVideoOutput`) は retire 前に drop される。
+  - ParkedLive owner は `poll_parked_live_detached_windows` の一時 mount 経由で
+    `Ready` / `Committing` まで進み得るが、そこで失われる effect にも具体的な損失は無い。
+  - **`TerminalClose` を bundle owner へ dispatch するだけでは無意味**で (effect を足して
+    から捨てるだけ)、汎用の App executor を流用するのは**危険**。`CloseDetachedSession` は
+    App-global の active session を参照するため、**別の生きている兄弟窓を閉じ得る**。
+  - `retire ⇒ 未実行 effect なし` という不変条件は**成立しない**。既存テスト
+    `parked_close_clears_bundle_owned_tile_companion_without_pending` が積む
+    `SetZOrderRecoveryPermit(false)` が反例。assert を置くなら、その手前の
+    「AtRest / binding 済み / outer が Closing かつ close 済み」という domination contract。
+  - 正しい terminal owner は、bundle・output・detached window の close をまとめて所有する
+    **外側の parked teardown** であり、それは既に存在する。
 
 
 **2026-08-28 hidden detached host の maximize を既存 Visible commit owner へ移管
