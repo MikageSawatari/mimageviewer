@@ -54080,7 +54080,40 @@ impl App {
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
     /// - 最大化 flag は矩形とは別のフィールドへ書く。矩形側は最大化中に更新されないので、
     ///   「最大化で終了したが、解いたら元のサイズに戻る」を両方保てる。
+    /// 終了 / トレイ退避時に、`last_folder` と**対で**保存するカーソル名を決める。
+    ///
+    /// `Some(name)` は「いま選んでいる項目は `last_folder` が指す場所の中身だ」という主張。
+    /// **`None` は積極的な破棄**であって「不明だから前回値を残す」ではない。検索結果や
+    /// 別ウィンドウの文脈で終了したとき、`last_folder` は更新されないまま名前だけ別の場所の
+    /// ものになると、次回起動で無関係な項目にカーソルが乗る。
+    ///
+    /// 2 つの問いに答える。**そもそも場所か** (合成ビューは場所ではない) と、
+    /// **それは次回開き直す場所か**。ドライブ一覧では `effective_folder` が `None` を
+    /// 返すので、sentinel を名指しする 3 つ目の分岐は要らない。
+    ///
+    /// `detached_viewer_suppresses_main_history_persistence` は**足していない**。あれは
+    /// `with_detached_viewer_main_history_suppressed` の中だけ非ゼロになるスコープ
+    /// カウンタで、終了 / トレイ退避はそのスコープの外から来る。ここで呼んでも常に
+    /// false なので、動いているように見えるだけの分岐になる。
+    pub(crate) fn cursor_name_to_persist(&self) -> Option<String> {
+        let folder = self.effective_folder()?;
+        if is_synthetic_view_path(&folder) {
+            return None;
+        }
+        if !crate::known_folders::startup_folder_is_last_folder(
+            &folder,
+            self.settings.last_folder.as_deref(),
+        ) {
+            return None;
+        }
+        let name = self.items.get(self.selected?)?.name().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
     pub(crate) fn persist_window_state_and_flush(&mut self) {
+        // カーソル名は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
+        // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
+        self.settings.last_cursor_name = self.cursor_name_to_persist();
         // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
         // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
         // より前に正規化・検証・反映だけを行う（再走査 worker は開始しない）。

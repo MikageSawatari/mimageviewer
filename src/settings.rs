@@ -3576,6 +3576,17 @@ pub struct Settings {
     pub startup_folder_mode: StartupFolderMode,
     #[serde(default)]
     pub startup_folder_path: Option<PathBuf>,
+    /// 前回終了時に選んでいた項目を、同じ場所を開き直したときに選び直す。
+    ///
+    /// 既定 ON。フィールドの無い旧設定を読むと `default_true` が入るので、更新した
+    /// 利用者も自動で ON になる。
+    #[serde(default = "default_true")]
+    pub restore_last_cursor: bool,
+    /// 前回終了時に選んでいた項目の**名前**。`last_folder` と対で意味を持つので、
+    /// 保存も破棄も `last_folder` を書ける文脈かどうかで決める (`App::on_exit_inner`)。
+    /// パスではなく名前なのは、既存の `select_after_load` と同じ照合規則に乗るため。
+    #[serde(default)]
+    pub last_cursor_name: Option<String>,
     /// 旧形式 (〜v1.5.0) のグローバルな最近開いたフォルダ一覧。v1.6.0 で A/B
     /// スロット別 (`quick_folder_recent_folders`) へ移行したが、初回移行のシード元 +
     /// 旧バージョンへのダウングレード互換のため残し、主スロット A の一覧を書き戻す。
@@ -5772,6 +5783,8 @@ impl Default for Settings {
             favorites: Vec::new(),
             smart_folders: Vec::new(),
             last_folder: None,
+            restore_last_cursor: true,
+            last_cursor_name: None,
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
             recent_folders: Vec::new(),
@@ -7978,6 +7991,9 @@ impl Settings {
         self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
+        // カーソル名は `last_folder` と対の実行時状態。環境設定 OK の全体差し替えで
+        // 片方だけ live 値、片方だけダイアログ側の値になると対応が崩れる。
+        self.last_cursor_name = src.last_cursor_name.take();
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);

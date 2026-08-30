@@ -1728,6 +1728,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `active_book_name` | String | `名前なし` | 製本メニュー / ツールバー / 追加ショートカットからページを追加する先の本名。製本ルート直下のフォルダ名として使う |
 | `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了した場所、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
+| `restore_last_cursor` | bool | true | 前回終了時に選んでいた項目へカーソルを戻すか。**前回いた場所そのものを開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。既存利用者は `serde(default)` で ON になる |
+| `last_cursor_name` | Option\<String\> | None | 前回終了時に選んでいた項目の名前。`last_folder` と対でしか意味を持たないので、合成ビュー (検索結果など) やドライブ一覧で終了したときは `None` を書いて破棄する。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。フォルダバー左端の `フォルダ:` ラベルの右クリックメニューからクリアできる |
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |

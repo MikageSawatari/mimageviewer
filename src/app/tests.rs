@@ -16826,6 +16826,76 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 終了時のカーソル名は、`last_folder` と**対で**しか保存しない (backlog §1.0g)。
+    ///
+    /// `None` は「不明だから前回値を残す」ではなく**破棄**。検索結果や別ウィンドウで
+    /// 終了したとき `last_folder` は更新されないので、名前だけ別の場所のものを残すと
+    /// 次回起動で無関係な項目にカーソルが乗る。
+    #[test]
+    fn the_cursor_we_persist_belongs_to_the_folder_we_persist() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/pics");
+        app.items.push(GridItem::Image(folder.join("a.jpg")));
+        app.items.push(GridItem::Image(folder.join("b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.current_folder = Some(folder.clone());
+        app.settings.last_folder = Some(folder.clone());
+
+        app.selected = Some(1);
+        assert_eq!(app.cursor_name_to_persist().as_deref(), Some("b.jpg"));
+
+        // 未選択なら書くものが無い。
+        app.selected = None;
+        assert_eq!(app.cursor_name_to_persist(), None);
+        app.selected = Some(1);
+
+        // 合成ビュー (検索結果など) の項目は `last_folder` の中身ではない。
+        // `last_folder` 側も合成パスに揃えてある: 通常は `load_folder` が合成パスを
+        // `last_folder` へ書かないので下の「別の場所」判定に吸収されてしまい、**合成ビュー
+        // 判定そのものが働いているか確かめられない**。書き込み側の前提が将来崩れても
+        // ここで止まることを、この 1 本が保証する。
+        let synthetic = crate::app::search_results_synthetic_path();
+        app.current_folder = Some(synthetic.clone());
+        app.settings.last_folder = Some(synthetic);
+        assert_eq!(
+            app.cursor_name_to_persist(),
+            None,
+            "合成ビューの選択を last_folder のカーソルとして残してはいけない"
+        );
+        app.settings.last_folder = Some(folder.clone());
+
+        // last_folder と別の場所を見ている状態でも残さない。
+        app.current_folder = Some(std::path::PathBuf::from("c:/other"));
+        assert_eq!(app.cursor_name_to_persist(), None);
+
+        // 元に戻せばまた書ける (上の None が「壊れた」わけではないことの確認)。
+        app.current_folder = Some(folder.clone());
+        assert_eq!(app.cursor_name_to_persist().as_deref(), Some("b.jpg"));
+    }
+
+    /// ドライブ一覧で終了したときもカーソル名を残さない。
+    ///
+    /// `last_folder` にはドライブ一覧の sentinel が入り得る。`effective_folder` が
+    /// ドライブ一覧で `None` を返すので、sentinel を名指しする分岐は要らない —
+    /// **その前提が壊れていないこと**をここで固定する。
+    #[test]
+    fn the_drive_list_leaves_no_cursor_behind() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items.push(GridItem::Folder("C:/".into()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.items_are_drive_list = true;
+        app.current_folder = Some(std::path::PathBuf::from("c:/pics"));
+        app.settings.last_folder = Some(std::path::PathBuf::from("c:/pics"));
+
+        assert_eq!(app.cursor_name_to_persist(), None);
+    }
+
     /// Codex P3 (2026-04): BS で深い階層から戻ったとき、`select_after_load` が
     /// `folder_history` の古い選択より優先されること。Ctrl+↓ で進んだ先から
     /// 戻ったとき「最初に入った位置」ではなく「今いる位置」にカーソルを合わせる

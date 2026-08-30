@@ -135,6 +135,36 @@ pub fn startup_folder(
     }
 }
 
+/// 起動フォルダが、前回終了時にいた場所**そのもの**か。
+///
+/// カーソルの復元は「同じ場所を開き直した」ときだけ意味を持つ。`Previous` 以外のモードにも
+/// `last_folder` へ落ちてくる経路があるので、**モードではなく解決結果**で判定する。
+///
+/// [`resolve_startup_last_folder`] は消えたフォルダを**祖先へ遡上**して返すので、比較相手は
+/// 解決後ではなく `last_folder` そのもの。遡上した先へ前のカーソル名を持ち込まないため。
+pub fn startup_folder_is_last_folder(resolved: &Path, last_folder: Option<&Path>) -> bool {
+    last_folder.is_some_and(|last| crate::folder_tree::path_eq(last, resolved))
+}
+
+/// 起動時にカーソルを戻す項目名。戻さないときは `None`。
+///
+/// 保存側 (`App::cursor_name_to_persist`) と対になる判断で、**同じ
+/// [`startup_folder_is_last_folder`] を通す**。片方だけ条件が増えると、保存はするのに
+/// 復元しない (またはその逆) という噛み合わない状態になる。
+pub fn startup_cursor_hint(settings: &Settings, resolved_folder: &Path) -> Option<String> {
+    if !settings.restore_last_cursor {
+        return None;
+    }
+    if !startup_folder_is_last_folder(resolved_folder, settings.last_folder.as_deref()) {
+        return None;
+    }
+    settings
+        .last_cursor_name
+        .as_ref()
+        .filter(|name| !name.is_empty())
+        .cloned()
+}
+
 /// 起動時の last_folder を復元する。フォルダ (または仮想フォルダ ZIP/PDF) がそのまま
 /// 開けるならそれを、消えていたら**直近の存在する親フォルダ**を返す。どの親も辿れない
 /// (ドライブ自体が無い等) ときだけ None で、呼び出し側が Desktop にフォールバックする。
@@ -248,7 +278,7 @@ pub fn available_drives() -> Vec<PathBuf> {
 mod tests {
     use super::{
         LocationMenuEntry, QuickLocation, location_menu_entries_from, push_unique_location,
-        startup_folder,
+        startup_cursor_hint, startup_folder, startup_folder_is_last_folder,
     };
     use crate::settings::{Settings, StartupFolderMode};
     use std::path::PathBuf;
@@ -433,6 +463,78 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// 復元側の判断。設定 OFF・別の場所・名前が無い、のどれでも `None`。
+    #[test]
+    fn the_startup_cursor_hint_needs_the_setting_and_the_same_place() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let folder = tmp.path().join("Photos");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+
+        let mut settings = Settings::default();
+        assert!(
+            settings.restore_last_cursor,
+            "既定 ON。旧設定を読んだ利用者も serde default で ON になる"
+        );
+        settings.last_folder = Some(folder.clone());
+        settings.last_cursor_name = Some("b.jpg".to_string());
+        assert_eq!(
+            startup_cursor_hint(&settings, &folder).as_deref(),
+            Some("b.jpg")
+        );
+
+        settings.restore_last_cursor = false;
+        assert_eq!(startup_cursor_hint(&settings, &folder), None);
+        settings.restore_last_cursor = true;
+
+        // 別の場所を開くなら、前回の名前は無関係。
+        assert_eq!(startup_cursor_hint(&settings, tmp.path()), None);
+
+        // 保存側が「対にならない」と判断して破棄した後。
+        settings.last_cursor_name = None;
+        assert_eq!(startup_cursor_hint(&settings, &folder), None);
+
+        // 空文字は名前として使えない (items のどれにも一致しないので実害は無いが、
+        // 「復元した」と誤解する状態を作らない)。
+        settings.last_cursor_name = Some(String::new());
+        assert_eq!(startup_cursor_hint(&settings, &folder), None);
+    }
+
+    /// 前回いた場所をそのまま開いたときだけ true。カーソル復元の可否はこれで決まる。
+    #[test]
+    fn the_cursor_belongs_to_the_place_we_actually_reopened() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let folder = tmp.path().join("Photos");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+
+        assert!(startup_folder_is_last_folder(&folder, Some(&folder)));
+        // Windows の大文字小文字非区別。`path_eq` に委ねているのでここは確認だけ。
+        let shouted = std::path::PathBuf::from(folder.to_string_lossy().to_uppercase());
+        assert!(startup_folder_is_last_folder(&shouted, Some(&folder)));
+        // 初回起動 (last_folder が無い) では復元する相手がいない。
+        assert!(!startup_folder_is_last_folder(&folder, None));
+        // 別の場所を開いたなら、前回のカーソル名は使えない。
+        assert!(!startup_folder_is_last_folder(tmp.path(), Some(&folder)));
+    }
+
+    /// 末端フォルダが消えて**祖先へ遡上**したときは復元しない。
+    ///
+    /// `resolve_startup_last_folder` は開けない場所を親へ辿るので、素朴に「起動フォルダが
+    /// 決まったなら前回の続き」と扱うと、消えたフォルダのカーソル名を親フォルダへ
+    /// 持ち込むことになる。判定を解決**後**ではなく `last_folder` そのものと突き合わせて
+    /// いるのはこのため。
+    #[test]
+    fn walking_up_to_a_surviving_ancestor_does_not_carry_the_cursor() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let parent = tmp.path().join("Photos");
+        std::fs::create_dir_all(&parent).expect("mkdir");
+        let gone = parent.join("2024-Jan");
+
+        let resolved = startup_folder(StartupFolderMode::Previous, Some(&gone), None)
+            .expect("親へ遡上して開けるはず");
+        assert_eq!(resolved, parent, "この前提が崩れたらテストの意味が変わる");
+        assert!(!startup_folder_is_last_folder(&resolved, Some(&gone)));
     }
 
     #[test]

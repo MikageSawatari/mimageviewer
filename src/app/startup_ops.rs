@@ -867,6 +867,14 @@ impl App {
             // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
             // キャッシュ ZIP だが address/override は元アーカイブ)、無ければ変換ダイアログを
             // 出す。通常フォルダ / ネイティブ ZIP/PDF は format=None なので load_folder に委譲され挙動不変。
+            //
+            // 前回のカーソルは、開くのが**前回いた場所そのもの**のときだけ復元する。
+            // 選択機構は増やさず、BS 戻りや親フォルダボタンが使っている `select_after_load`
+            // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
+            // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
+            // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
+            self.select_after_load =
+                crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             let _ = self.load_folder_or_convert_archive(folder);
         }
     }
