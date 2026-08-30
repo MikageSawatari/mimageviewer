@@ -3630,6 +3630,12 @@ pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) paint: bool,
     pub(crate) edge_seed: Option<[u8; 3]>,
     pub(crate) previous: [f32; 2],
+    /// このストロークで **1 画素でも塗れたか**。
+    ///
+    /// 塗れなかったストロークを release で保存すると、マスクの材質化 (Raster から
+    /// RasterVector への昇格など) だけで before と after が食い違い、何も起きていない
+    /// クリックに Undo が 1 件増える。確定するかはこの値で決める。
+    pub(crate) applied: bool,
 }
 
 pub(crate) const LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS: u64 = 150;

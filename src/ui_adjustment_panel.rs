@@ -311,27 +311,55 @@ pub(crate) enum LocalAdjustCanvasEdit {
     /// 要求された編集自体は効かなかった。文書は変わっているのでメモリ上の状態は
     /// 更新するが、保存も Undo も行わない。
     PreparedOnly,
+    /// 空のオーバーライドスロットを作ったが、要求された編集は効かなかった。
+    ///
+    /// 空のオーバーライドマスクは文書として意味を持たない
+    /// (`compact_local_adjust_manual_override` が保存前に落とす対象) 一方、残ると UI は
+    /// `is_some()` で「マスクあり」と表示し、原寸の全ゼロ配列を抱え続ける。複製を捨てて
+    /// 巻き戻す仕組みが無くなったので、[`Self::resolve`] が seam で作成を取り消す。
+    CreatedButUnused(LocalAdjustMaskEditTarget),
     /// 要求された編集が効いた。
     Applied,
 }
 
 impl LocalAdjustCanvasEdit {
-    /// 材質化しか起きなかったときの結果。`prepared` が false なら文書は無傷。
-    fn prepared_only(prepared: bool) -> Self {
-        if prepared {
-            Self::PreparedOnly
-        } else {
-            Self::Untouched
+    /// 材質化しか起きなかったときの結果。
+    fn prepared_only(
+        preparation: LocalAdjustMaskPreparation,
+        target: LocalAdjustMaskEditTarget,
+    ) -> Self {
+        match preparation {
+            LocalAdjustMaskPreparation::Untouched => Self::Untouched,
+            LocalAdjustMaskPreparation::Normalized => Self::PreparedOnly,
+            LocalAdjustMaskPreparation::Created => Self::CreatedButUnused(target),
         }
     }
 
     /// 材質化のうえで編集を試した結果。
-    fn from_edit(edited: bool, prepared: bool) -> Self {
+    fn from_edit(
+        edited: bool,
+        preparation: LocalAdjustMaskPreparation,
+        target: LocalAdjustMaskEditTarget,
+    ) -> Self {
         if edited {
             Self::Applied
         } else {
-            Self::prepared_only(prepared)
+            Self::prepared_only(preparation, target)
         }
+    }
+
+    /// [`Self::CreatedButUnused`] を解決する。**seam が `mutate` の直後に必ず呼ぶ。**
+    ///
+    /// 作ったばかりの空スロットをここで捨てるので、これ以降の判定に
+    /// `CreatedButUnused` は現れない。
+    fn resolve(self, layer: &mut local_adjust_core::LocalAdjustmentLayer) -> Self {
+        let Self::CreatedButUnused(target) = self else {
+            return self;
+        };
+        if let Some(slot) = local_mask_override_slot_mut(layer, target) {
+            *slot = None;
+        }
+        Self::Untouched
     }
 
     /// 材質化を伴わない純粋な編集の結果。**false を返す前に 1 バイトも書かないこと。**
@@ -1995,13 +2023,28 @@ fn flood_fill_local_adjust_alpha_mask(
     outcome
 }
 
+/// [`local_adjust_prepare_target_raster_vector_mask`] が文書へ何をしたか。
+///
+/// 3 つに分けているのは、**取り消してよい書き込みとそうでない書き込みがある**ため。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAdjustMaskPreparation {
+    /// 既にあるマスクをそのまま貸した。文書は無傷。
+    Untouched,
+    /// 既存のマスクを整えた (Raster から RasterVector への昇格 / 画像サイズへのリサイズ)。
+    /// 内容を保つ正規化なので、編集が効かなくても残してよい。
+    Normalized,
+    /// 空のスロットを新しく作った。**編集が効かなければ取り消す** (作成前は `None`
+    /// だったので、捨てても利用者のマスクは失われない)。
+    Created,
+}
+
 /// [`local_adjust_prepare_target_raster_vector_mask`] の結果。
 ///
-/// `prepared` は「この呼び出しが文書を書き換えたか」。編集を諦めるときも、これを
+/// `preparation` は「この呼び出しが文書へ何を書いたか」。編集を諦めるときも、これを
 /// [`LocalAdjustCanvasEdit::prepared_only`] へ載せて返さないと書き込みが宙に浮く。
 struct LocalAdjustPreparedMask<'a> {
     mask: &'a mut local_adjust_core::RasterVectorMask,
-    prepared: bool,
+    preparation: LocalAdjustMaskPreparation,
 }
 
 /// 編集対象の RasterVector マスクを用意して貸す。**この関数は文書を書き換える**
@@ -2016,7 +2059,7 @@ fn local_adjust_prepare_target_raster_vector_mask<'a>(
     create: bool,
 ) -> Option<LocalAdjustPreparedMask<'a>> {
     let (width, height) = (image_dims.0.max(1), image_dims.1.max(1));
-    let mut prepared = false;
+    let mut preparation = LocalAdjustMaskPreparation::Untouched;
     if target == LocalAdjustMaskEditTarget::Base
         && matches!(layer.mask, local_adjust_core::LocalMask::Raster(_))
     {
@@ -2029,7 +2072,7 @@ fn local_adjust_prepare_target_raster_vector_mask<'a>(
                     alpha: mask.alpha,
                     shapes: Vec::new(),
                 });
-            prepared = true;
+            preparation = LocalAdjustMaskPreparation::Normalized;
         }
     }
 
@@ -2038,9 +2081,9 @@ fn local_adjust_prepare_target_raster_vector_mask<'a>(
             local_adjust_core::LocalMask::RasterVector(mask) => {
                 if !mask.matches_dims(width, height) {
                     mask.resize_to(width, height);
-                    prepared = true;
+                    preparation = LocalAdjustMaskPreparation::Normalized;
                 }
-                Some(LocalAdjustPreparedMask { mask, prepared })
+                Some(LocalAdjustPreparedMask { mask, preparation })
             }
             _ => None,
         },
@@ -2050,15 +2093,15 @@ fn local_adjust_prepare_target_raster_vector_mask<'a>(
                 Some(mask) => {
                     if !mask.matches_dims(width, height) {
                         mask.resize_to(width, height);
-                        prepared = true;
+                        preparation = LocalAdjustMaskPreparation::Normalized;
                     }
-                    Some(LocalAdjustPreparedMask { mask, prepared })
+                    Some(LocalAdjustPreparedMask { mask, preparation })
                 }
                 None if create => {
                     *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
                     Some(LocalAdjustPreparedMask {
                         mask: slot.as_mut().unwrap(),
-                        prepared: true,
+                        preparation: LocalAdjustMaskPreparation::Created,
                     })
                 }
                 None => None,
@@ -2097,7 +2140,7 @@ mod local_adjust_canvas_edit_contract_tests {
                 false,
             )
             .unwrap();
-            assert!(!handle.prepared);
+            assert_eq!(handle.preparation, LocalAdjustMaskPreparation::Untouched);
             assert!(handle.mask.matches_dims(3, 2));
         }
 
@@ -2118,7 +2161,7 @@ mod local_adjust_canvas_edit_contract_tests {
                 false,
             )
             .unwrap();
-            assert!(handle.prepared);
+            assert_eq!(handle.preparation, LocalAdjustMaskPreparation::Normalized);
             assert_eq!(handle.mask.alpha, vec![1.0; 6]);
             assert!(handle.mask.shapes.is_empty());
         }
@@ -2142,7 +2185,7 @@ mod local_adjust_canvas_edit_contract_tests {
                 false,
             )
             .unwrap();
-            assert!(handle.prepared);
+            assert_eq!(handle.preparation, LocalAdjustMaskPreparation::Normalized);
             assert!(handle.mask.matches_dims(4, 3));
         }
 
@@ -2191,28 +2234,34 @@ mod local_adjust_canvas_edit_contract_tests {
 
     #[test]
     fn canvas_edit_constructors_separate_preparation_from_application() {
+        let target = LocalAdjustMaskEditTarget::OverrideAdd;
         assert_eq!(
-            LocalAdjustCanvasEdit::prepared_only(false),
+            LocalAdjustCanvasEdit::prepared_only(LocalAdjustMaskPreparation::Untouched, target),
             LocalAdjustCanvasEdit::Untouched
         );
         assert_eq!(
-            LocalAdjustCanvasEdit::prepared_only(true),
+            LocalAdjustCanvasEdit::prepared_only(LocalAdjustMaskPreparation::Normalized, target),
             LocalAdjustCanvasEdit::PreparedOnly
         );
         assert_eq!(
-            LocalAdjustCanvasEdit::from_edit(false, false),
+            LocalAdjustCanvasEdit::prepared_only(LocalAdjustMaskPreparation::Created, target),
+            LocalAdjustCanvasEdit::CreatedButUnused(target)
+        );
+        assert_eq!(
+            LocalAdjustCanvasEdit::from_edit(false, LocalAdjustMaskPreparation::Untouched, target),
             LocalAdjustCanvasEdit::Untouched
         );
         assert_eq!(
-            LocalAdjustCanvasEdit::from_edit(false, true),
+            LocalAdjustCanvasEdit::from_edit(false, LocalAdjustMaskPreparation::Normalized, target),
             LocalAdjustCanvasEdit::PreparedOnly
         );
+        // 編集が効いたなら、作ったスロットは残す。
         assert_eq!(
-            LocalAdjustCanvasEdit::from_edit(true, false),
+            LocalAdjustCanvasEdit::from_edit(true, LocalAdjustMaskPreparation::Created, target),
             LocalAdjustCanvasEdit::Applied
         );
         assert_eq!(
-            LocalAdjustCanvasEdit::from_edit(true, true),
+            LocalAdjustCanvasEdit::from_edit(true, LocalAdjustMaskPreparation::Untouched, target),
             LocalAdjustCanvasEdit::Applied
         );
         assert_eq!(
@@ -2224,6 +2273,7 @@ mod local_adjust_canvas_edit_contract_tests {
             LocalAdjustCanvasEdit::Applied
         );
         assert!(!LocalAdjustCanvasEdit::Untouched.touched_document());
+        assert!(LocalAdjustCanvasEdit::CreatedButUnused(target).touched_document());
         assert!(LocalAdjustCanvasEdit::PreparedOnly.touched_document());
         assert!(!LocalAdjustCanvasEdit::PreparedOnly.did_apply());
         assert!(LocalAdjustCanvasEdit::Applied.did_apply());
@@ -2319,6 +2369,158 @@ mod local_adjust_canvas_edit_contract_tests {
             undo_before + 1,
             "確定した編集は Undo 1 件になる"
         );
+    }
+
+    /// 空のオーバーライドスロットは、編集が効かなければ文書に残さない。
+    ///
+    /// 残すと UI が `is_some()` で「マスクあり」と表示し、原寸の全ゼロ配列を抱え、
+    /// 次の保存でそのまま DB とサイドカーへ載る。複製を捨てて巻き戻す仕組みが
+    /// 無くなったので、seam が明示的に取り消す。
+    #[test]
+    fn a_slot_created_for_an_edit_that_did_not_take_is_dropped_again() {
+        let mut app = seam_test_app();
+
+        let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
+            let handle = local_adjust_prepare_target_raster_vector_mask(
+                layer,
+                LocalAdjustMaskEditTarget::OverrideAdd,
+                (4, 3),
+                true,
+            )
+            .expect("create = true なので空スロットが作られる");
+            assert_eq!(handle.preparation, LocalAdjustMaskPreparation::Created);
+            LocalAdjustCanvasEdit::prepared_only(
+                handle.preparation,
+                LocalAdjustMaskEditTarget::OverrideAdd,
+            )
+        });
+
+        assert!(!applied);
+        assert!(
+            app.local_adjust_page_layers[&0][0]
+                .manual_override
+                .add
+                .is_none(),
+            "効かなかった編集のために作ったスロットを残してはいけない"
+        );
+        assert!(!seam_took_the_save_path(&app));
+    }
+
+    /// 逆に、編集が効いたなら作ったスロットは残す。
+    #[test]
+    fn a_slot_created_for_an_edit_that_took_is_kept() {
+        let mut app = seam_test_app();
+
+        let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, false, |layer| {
+            let handle = local_adjust_prepare_target_raster_vector_mask(
+                layer,
+                LocalAdjustMaskEditTarget::OverrideAdd,
+                (4, 3),
+                true,
+            )
+            .expect("create = true なので空スロットが作られる");
+            handle.mask.alpha[0] = 1.0;
+            LocalAdjustCanvasEdit::from_edit(
+                true,
+                handle.preparation,
+                LocalAdjustMaskEditTarget::OverrideAdd,
+            )
+        });
+
+        assert!(applied);
+        assert!(
+            app.local_adjust_page_layers[&0][0]
+                .manual_override
+                .add
+                .is_some()
+        );
+    }
+
+    /// 境界筆は「変えていない」と答えたときに 1 バイトも書いていないこと。
+    ///
+    /// 代入してから差を見る書き方だと、`f32::EPSILON` 未満の差を「変えていない」と
+    /// 報告しながら書き込みだけが残る。`Untouched` を返す根拠が崩れるので、書く前に
+    /// 判定する。前半の assert は、後半が空振りでないこと (実際にスタンプが届く設定で
+    /// あること) を保証するために置いている。
+    #[test]
+    fn the_edge_brush_does_not_write_when_it_reports_no_change() {
+        let image = egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16]);
+        let args = |alpha: &mut [f32]| {
+            paint_local_adjust_alpha_edge_brush_line(
+                alpha,
+                &image,
+                [0.5, 0.5],
+                [0.5, 0.5],
+                2.0,
+                true,
+                Some([255, 255, 255]),
+                255.0,
+                (255.0, 255.0, 0),
+                false,
+            )
+        };
+
+        let mut fresh = vec![0.0_f32; 16];
+        assert!(args(&mut fresh), "この設定でスタンプが届くこと");
+        assert!(fresh.iter().any(|value| *value == 1.0));
+
+        // 1.0 との差が EPSILON 未満。塗る値と実質同じなので「変えていない」が正しい。
+        let nearly_one = 1.0 - f32::EPSILON / 2.0;
+        let mut already = vec![nearly_one; 16];
+        assert!(!args(&mut already), "差が EPSILON 未満なら変更なしと答える");
+        assert!(
+            already.iter().all(|value| *value == nearly_one),
+            "変更なしと答えたのに書き込んでいる"
+        );
+    }
+
+    fn brush_stroke(applied: bool) -> crate::app::LocalAdjustMaskBrushStroke {
+        crate::app::LocalAdjustMaskBrushStroke {
+            fs_idx: 0,
+            layer_idx: 0,
+            target: LocalAdjustMaskEditTarget::OverrideAdd,
+            tool: LocalAdjustMaskTool::Brush,
+            paint: true,
+            edge_seed: None,
+            previous: [0.0, 0.0],
+            applied,
+        }
+    }
+
+    /// 1 画素も塗れなかったストロークは確定しない。
+    ///
+    /// マスクの材質化 (Raster から RasterVector への昇格など) だけで before と after が
+    /// 食い違うので、無条件に確定すると「何も起きていないクリック」に Undo が 1 件増える。
+    #[test]
+    fn a_brush_stroke_that_painted_nothing_is_not_saved_or_undoable() {
+        let mut app = seam_test_app();
+        let undo_before = app.meta_undo.undo_len();
+        app.local_adjust_mask_brush_before_layers =
+            Some(vec![layer_with_mask(local_adjust_core::LocalMask::Full)]);
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(false));
+
+        app.persist_local_adjust_mask_brush_stroke();
+
+        assert!(!seam_took_the_save_path(&app));
+        assert_eq!(app.meta_undo.undo_len(), undo_before);
+        assert!(
+            app.local_adjust_mask_brush_before_layers.is_none(),
+            "押下時の before を次のストロークへ持ち越さない"
+        );
+    }
+
+    #[test]
+    fn a_brush_stroke_that_painted_is_saved_and_undoable() {
+        let mut app = seam_test_app();
+        let undo_before = app.meta_undo.undo_len();
+        app.local_adjust_mask_brush_before_layers =
+            Some(vec![layer_with_mask(local_adjust_core::LocalMask::Full)]);
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+
+        app.persist_local_adjust_mask_brush_stroke();
+
+        assert!(seam_took_the_save_path(&app));
+        assert_eq!(app.meta_undo.undo_len(), undo_before + 1);
     }
 
     #[test]
@@ -4772,9 +4974,14 @@ fn paint_local_adjust_edge_brush_stamp(
     let mut changed = false;
     for idx in targets {
         if let Some(alpha) = alpha.get_mut(idx) {
-            let before = *alpha;
+            // 代入してから差を見ると、EPSILON 未満の差を「変えていない」と報告しながら
+            // 書き込みだけが残る。closure が `Untouched` を返す根拠が崩れるので、
+            // **書く前に**判定する (通常筆と多角形は元からこの順)。
+            if (value - *alpha).abs() <= f32::EPSILON {
+                continue;
+            }
             *alpha = value;
-            changed |= (*alpha - before).abs() > f32::EPSILON;
+            changed = true;
         }
     }
     changed
@@ -4907,10 +5114,12 @@ fn paint_local_adjust_gap_fill_stamp(
             if src.get(idx).copied().unwrap_or(0.0) > 0.5 {
                 continue;
             }
-            if local_adjust_gap_between_masked_pixels(src, width, height, x, y, gap) {
-                let before = alpha[idx];
+            if local_adjust_gap_between_masked_pixels(src, width, height, x, y, gap)
+                && (1.0 - alpha[idx]).abs() > f32::EPSILON
+            {
+                // 境界筆と同じ理由で、書く前に差を判定する。
                 alpha[idx] = 1.0;
-                changed |= (alpha[idx] - before).abs() > f32::EPSILON;
+                changed = true;
             }
         }
     }
@@ -9957,7 +10166,10 @@ impl App {
             else {
                 return false;
             };
-            mutate(layer)
+            // 作ったばかりの空スロットの取り消しはここで済ませる。以降の判定に
+            // `CreatedButUnused` は現れない。
+            let outcome = mutate(layer);
+            outcome.resolve(layer)
         };
         if !outcome.touched_document() {
             return false;
@@ -10007,10 +10219,10 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 let expected_len = mask.width.saturating_mul(mask.height);
                 if expected_len == 0 || mask.alpha.len() < expected_len {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, active_target);
                 }
                 let next = local_adjust_morph_alpha_1px(
                     &mask.alpha,
@@ -10019,7 +10231,7 @@ impl App {
                     op == LocalAdjustBitmapMaskOp::Expand,
                 );
                 if next == mask.alpha {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, active_target);
                 }
                 mask.alpha = next;
                 LocalAdjustCanvasEdit::Applied
@@ -10082,9 +10294,9 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 if source.size != [mask.width, mask.height] {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 outcome = flood_fill_local_adjust_alpha_mask(
                     &mut mask.alpha,
@@ -10095,7 +10307,8 @@ impl App {
                 );
                 LocalAdjustCanvasEdit::from_edit(
                     matches!(&outcome, crate::mask_db::BucketFillOutcome::Filled),
-                    prepared,
+                    preparation,
+                    target,
                 )
             });
         match outcome {
@@ -10306,7 +10519,7 @@ impl App {
                         return LocalAdjustCanvasEdit::Untouched;
                     };
                     let (width, height) = (image_dims.0.max(1), image_dims.1.max(1));
-                    let mut prepared = false;
+                    let mut preparation = LocalAdjustMaskPreparation::Untouched;
                     if slot
                         .as_ref()
                         .is_none_or(|mask| mask.width != width || mask.height != height)
@@ -10314,11 +10527,19 @@ impl App {
                         if !paint {
                             return LocalAdjustCanvasEdit::Untouched;
                         }
+                        // 寸法違いの既存マスクを **置き換える** のはこの経路だけ
+                        // (他はリサイズする)。置き換えた場合は元の内容がもう無いので
+                        // 取り消せない。空へ戻すと利用者のマスクを消すことになるため、
+                        // 新規作成のときだけ取り消し可能として扱う。
+                        preparation = if slot.is_none() {
+                            LocalAdjustMaskPreparation::Created
+                        } else {
+                            LocalAdjustMaskPreparation::Normalized
+                        };
                         *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
-                        prepared = true;
                     }
                     let Some(mask) = slot.as_mut() else {
-                        return LocalAdjustCanvasEdit::prepared_only(prepared);
+                        return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                     };
                     LocalAdjustCanvasEdit::from_edit(
                         paint_local_adjust_alpha_line(
@@ -10330,7 +10551,8 @@ impl App {
                             radius,
                             paint,
                         ),
-                        prepared,
+                        preparation,
+                        target,
                     )
                 }
                 LocalAdjustMaskEditTarget::None => LocalAdjustCanvasEdit::Untouched,
@@ -10371,9 +10593,9 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 if source.size != [mask.width, mask.height] {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 LocalAdjustCanvasEdit::from_edit(
                     paint_local_adjust_alpha_edge_brush_line(
@@ -10388,7 +10610,8 @@ impl App {
                         thresholds,
                         include_boundary,
                     ),
-                    prepared,
+                    preparation,
+                    target,
                 )
             },
         )
@@ -10417,7 +10640,7 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 LocalAdjustCanvasEdit::from_edit(
                     paint_local_adjust_alpha_gap_fill_line(
                         &mut mask.alpha,
@@ -10429,7 +10652,8 @@ impl App {
                         paint,
                         gap,
                     ),
-                    prepared,
+                    preparation,
+                    target,
                 )
             },
         )
@@ -10494,7 +10718,7 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 LocalAdjustCanvasEdit::from_edit(
                     fill_local_adjust_alpha_polygon(
                         &mut mask.alpha,
@@ -10503,7 +10727,8 @@ impl App {
                         &points,
                         paint,
                     ),
-                    prepared,
+                    preparation,
+                    target,
                 )
             });
         if changed {
@@ -10608,9 +10833,9 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 let Some(slot) = mask.shapes.get_mut(selected) else {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 };
                 *slot = update(*slot);
                 LocalAdjustCanvasEdit::Applied
@@ -10666,9 +10891,9 @@ impl App {
                 ) else {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
-                let LocalAdjustPreparedMask { mask, prepared } = handle;
+                let LocalAdjustPreparedMask { mask, preparation } = handle;
                 if selected >= mask.shapes.len() {
-                    return LocalAdjustCanvasEdit::prepared_only(prepared);
+                    return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 mask.shapes.remove(selected);
                 LocalAdjustCanvasEdit::Applied
@@ -10823,9 +11048,9 @@ impl App {
             ) else {
                 return LocalAdjustCanvasEdit::Untouched;
             };
-            let LocalAdjustPreparedMask { mask, prepared } = handle;
+            let LocalAdjustPreparedMask { mask, preparation } = handle;
             let Some(slot) = mask.shapes.get_mut(drag.shape_idx) else {
-                return LocalAdjustCanvasEdit::prepared_only(prepared);
+                return LocalAdjustCanvasEdit::prepared_only(preparation, drag.target);
             };
             let vector_shape =
                 crate::vector_edit::apply_drag(&drag.vector_drag, (point[0], point[1]), &modifiers);
@@ -10868,6 +11093,14 @@ impl App {
         };
         // 手描きマスク確定 = マスク操作 → マスク表示 ON (ラボ mark_mask_changed 相当)。
         self.local_adjust_show_mask = true;
+        if !stroke.applied {
+            // 1 画素も塗れなかった。マスクの材質化だけがメモリに残ることはあるが、
+            // それは保存にも Undo にも値しない (見た目も変わっていない)。押下時に
+            // 取った before は次のストロークへ持ち越さず捨てる。
+            self.local_adjust_mask_brush_before_layers = None;
+            self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
+            return;
+        }
         let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
@@ -11119,7 +11352,7 @@ impl App {
                 if let Some(pos) = pointer_pos
                     && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
                 {
-                    self.paint_local_adjust_mask_tool_segment(
+                    stroke.applied |= self.paint_local_adjust_mask_tool_segment(
                         stroke.fs_idx,
                         stroke.layer_idx,
                         stroke.target,
@@ -11577,9 +11810,10 @@ impl App {
                             paint: self.local_adjust_mask_paint_add,
                             edge_seed,
                             previous: norm,
+                            applied: false,
                         };
                         self.local_adjust_mask_brush_stroke = Some(stroke);
-                        self.paint_local_adjust_mask_tool_segment(
+                        let applied = self.paint_local_adjust_mask_tool_segment(
                             fs_idx,
                             layer_idx,
                             target,
@@ -11591,6 +11825,9 @@ impl App {
                             ctrl_held,
                             false,
                         );
+                        if let Some(stroke) = self.local_adjust_mask_brush_stroke.as_mut() {
+                            stroke.applied |= applied;
+                        }
                     }
                     LocalAdjustMaskTool::Lasso => {
                         self.local_adjust_mask_lasso_points.clear();
