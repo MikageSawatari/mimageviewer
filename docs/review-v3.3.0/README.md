@@ -763,3 +763,32 @@ effect → executor を結ぶ)。これは規則 5 の「判断は問うてい�
 
 ブリーフは [r27-fix-brief.md](r27-fix-brief.md)。実装は Codex、検収は ClaudeCode。
 完了後に [detached-rework-plan](../detached-rework-plan.md) §11 へ記録する。
+
+### 10.7 内部 Close と利用者 Close の取り違え (ClaudeCode と Codex の合意、2026-08-30)
+
+実機で F12 連打すると再生が止まって別ウィンドウが閉じる。**ログで原因を確定した** —
+自分が送った `ViewportCommand::Close` が、再利用された同じ ViewportId の新しい viewport に
+届き、利用者の × と同じ扱いになっている。詳細は backlog §1.0f (a)。
+
+**ClaudeCode が最初に立てた仮説 (`push_detached_release` が移譲した lease を畳む) は外れ。**
+コードを読んだ根拠はあったが、ログを取れば確かめられる状況で先に仮説を出したのは順序が
+逆だった。実ログは 112ms の因果関係まで示している。
+
+**ClaudeCode が出した 2 案は、どちらも Codex が証拠つきで否定した:**
+
+- **「送った Close を identity 付きで覚え、対応する `close_requested` を 1 回だけ消費する」**
+  → egui 0.33.3 では内部 Close と OS の × / Alt+F4 が**同じ `ViewportEvent::Close`**
+  になり、`close_requested()` は送信元も incarnation も個数も持たない。照合できないので、
+  内部 Close が未配達のまま利用者の × が来ると**その × を誤消費し得る**。
+- **「host incarnation ごとに ViewportId を変える」**
+  → incarnation は HWND 取得後の `set_hwnd` で採番されるのに、ViewportId は HWND を作る
+  `show_viewport_immediate` より前に要る。**循環している。**
+
+**合意した設計 (Codex の第三案)**: **内部 teardown では Close を送らず、viewport を
+desired set から外して破棄する。terminal になった `window_id` / `ViewportId` は再利用せず、
+再入場時に新しい ID を割り当てる。非終端の移譲 (terminal 前の反転・folder navigation・
+active↔passive) は従来どおり同じ ID を維持する** (R-27 の lease 移譲を壊さない)。
+
+利用者の × の保証は**抑制ではなく「内部 Close を生成しない」ことで得る**。live viewport に
+届く Close は利用者 / OS 由来だけになるので、`close_requested()` の処理は無条件のまま
+維持できる。ブリーフは [close-identity-brief.md](close-identity-brief.md)。

@@ -48,7 +48,59 @@ ViewportId の新しい viewport に届き、利用者が × を押したのと�
 (「`ViewportEvent::Close` を利用者の close と解釈して後継ごと閉じる」) が、
 現行経路にも存在していた**ということ。
 
-**修正方向は 2 つ。どちらも detached の identity 設計なので Codex と合意してから直す。**
+**修正方針は Codex と合意済み** ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
+
+# 次リリース検討バックログ
+
+このファイルは、まだ着手していない作業候補だけを置く恒久バックログ。
+完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
+
+運用ルール:
+
+- 着手前に `docs/README.md` から該当領域の設計ドキュメントを読む。
+- 着手中のものだけ `対応中` と明記してよい。完了したらこのファイルから削除する。
+- 判断保留・見送りの理由は、次に再判断する人が困らない最小限だけ残す。
+- 依存ライブラリ更新は `CLAUDE.md` のリリース手順チェックリスト Phase 2 と整合させる。
+
+---
+
+## 1. 優先候補
+
+### 1.0f 実機確認で見つかった 3 件 (2026-08-30)
+
+**(a) F12 連打で動画再生が止まり、別ウィンドウが閉じる。** 利用者報告。
+**v3.3.0 でも起きる (連打を続けると再現)。退行ではなく、起きやすくなった。**
+
+**原因はログで確定した。私が最初に立てた仮説 (`push_detached_release` が移譲した lease を
+畳む) は外れ。**実際は **自分で送った `ViewportCommand::Close` が、再利用された同じ
+ViewportId の新しい viewport に届き、利用者が × を押したのと同じ扱いになる**。
+
+実ログ (`mimageviewer.log`、transition 29 → 30):
+
+```
+1545.452  transition=29 target=fullscreen action=Destroy ... viewport_command=Close  ← 自分で送る
+1545.532  F12 → transition=30 target=detached phase=begin host=0x0
+1545.564  [detached-viewer] show viewport: ... host=hwnd=0        ← 同じ ViewportId を再表示
+1545.564  [detached-viewer] viewport close_requested: presentation=None host=hwnd=0  ← ★
+1545.566  active-detached-session action=clear reason=handle_fullscreen_close_request
+1545.575  presentation-transition id=30 target=DetachedWindow effect=Destroy hwnd=0x0
+1545.594  [decoder-lifecycle] video-decode thread exit: live_count=0                 ← 再生停止
+```
+
+★ の行は **`presentation=None` かつ `host=hwnd=0`** — まだ窓が無い viewport なので、
+**利用者が閉じられるはずがない**。112ms 前に自分が送った Close が届いている。
+
+[ui_fullscreen.rs:14591](../src/ui_fullscreen.rs) は
+`ctx.input(|i| i.viewport().close_requested())` を無条件に `close_fs = true` にしており、
+**自分が送った Close と利用者の × を区別できない**。
+
+**なぜ v3.3.0 より起きやすいか**: R-27 の lease 移譲で同じ window_id / ViewportId が
+そのまま後継へ渡るため、viewport の再表示が早く・同一 id で起きる。stale な Close が
+新しい viewer に当たる確率が上がる。**Codex が案 B を否定したときに挙げた危険
+(「`ViewportEvent::Close` を利用者の close と解釈して後継ごと閉じる」) が、
+現行経路にも存在していた**ということ。
+
+**修正方針は Codex と合意済み** ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
 
 1. 送った Close を identity 付き (window_id + host incarnation) で覚え、対応する
    `close_requested` を 1 回だけ消費する。時間窓ではなく世代照合。
