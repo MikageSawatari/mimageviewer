@@ -21,9 +21,15 @@ floor しても正しいサイズになる。判定用の画像はむしろ「�
 
 ## 何を見るか
 
-旧コードは 1439px を 1440px へ引き伸ばすので、再サンプルの位相が左端 0 -> 中央 0.5 ->
-右端 1 と流れる。位相 0.5 が 2 タップ平均になって最もボケるため、**細かい縞のコントラスト
-が中央で落ちる**。上下方向も同じで、画像の縦中央が最悪点。修正後は全面で均一になる。
+**修正後は、どの帯も全面で均一。旧挙動はムラが出る。** ムラの形は原因によって違う:
+
+- 原因 1 (テクスチャが 1px 短い) が効く軸は、位相が端から端へ 0 -> 1 と流れる。位相 0.5 が
+  2 タップ平均で最もボケるので、**中央がいちばん薄い**山なりになる。帯がその最悪点に
+  重なっていれば帯ごと薄くなる。
+- 原因 2 (矩形が小数サイズ) が効く軸は、位相が 0 から端数ぶんだけ流れる。端数が 0.43 なら
+  **片側から反対側へ一方向に薄くなる**。
+
+どちらも「均一かどうか」で判定できる。方向や形を覚える必要はない。
 """
 
 import argparse
@@ -68,14 +74,34 @@ def dpi_setups(view_w, view_h):
     ]
 
 
-def triggers_on_both_axes(src_w, src_h, view_w, view_h):
-    """どの表示倍率でも両軸とも 1px 短くなるか。"""
+# 原因 2 を炙り出すのに必要な、描画矩形の端数の下限 (物理ピクセル)。0.5 に近いほど
+# 追加バイリニアの 2 タップ平均が効き、コントラストの落ち方が大きくなる。
+CROSS_AXIS_FRACTION_MIN = 0.3
+
+
+def triggers_both_causes(src_w, src_h, view_w, view_h):
+    """どの表示倍率でも、**原因 1 と原因 2 の両方**が出るか。
+
+    - 原因 1 (丸め): フィットする軸で `floor` が 1px 短くする。理論値がちょうど
+      ビューポート幅/高さなので、f32 の誤差でぎりぎり整数を下回るときに起きる。
+    - 原因 2 (矩形の端数): もう一方の軸で描画矩形が小数サイズになる。テクスチャは
+      整数なので、寄せないと横方向だけ再サンプルされる。
+
+    **両方を要求するのが要点。** 「両軸とも 1px 短くなる」だけを条件にすると、もう一方の
+    軸も整数近傍に固定されてしまい、**原因 2 が出ない寸法しか選ばれない** (実際、最初の
+    版で選ばれた 1612x2418 は矩形の端数が 0.00002px しかなく、サイズ寄せを外しても
+    見た目が変わらなかった)。
+    """
     for _, vw, vh, ppp in dpi_setups(view_w, view_h):
         r = emulate(src_w, src_h, vw, vh, ppp)
         if r["scale"] >= 1.0:
             return False
-        if not (r["x"]["old"] < r["x"]["new"] and r["y"]["old"] < r["y"]["new"]):
-            return False
+        fit_axis, cross_axis = ("y", "x") if vh / src_h < vw / src_w else ("x", "y")
+        if r[fit_axis]["old"] >= r[fit_axis]["new"]:
+            return False  # 原因 1 が出ない
+        cross = r[cross_axis]["exact"]
+        if abs(cross - round(cross)) < CROSS_AXIS_FRACTION_MIN:
+            return False  # 原因 2 が出ない
     return True
 
 
@@ -83,7 +109,7 @@ def search(view_w, view_h, limit=10):
     found = []
     for h in range(int(view_h * 1.05), int(view_h * 3.0)):
         for w in range(int(h * 0.55), min(int(h * 0.80), view_w)):
-            if triggers_on_both_axes(w, h, view_w, view_h):
+            if triggers_both_causes(w, h, view_w, view_h):
                 found.append((w, h))
                 break
         if len(found) >= limit:
@@ -91,7 +117,33 @@ def search(view_w, view_h, limit=10):
     return found
 
 
-def build_chart(src_w, src_h, dst_w, dst_h, out_dir):
+def draw_into_fractional_rect(texture, rect_w, rect_h):
+    """整数サイズのテクスチャを、**小数サイズの矩形**へ貼った結果を再現する。
+
+    これが原因 2 の本体。GPU は出力画素の中心 `(i + 0.5)` を矩形座標とみなしてテクスチャを
+    サンプルするので、矩形幅が 1187.43px でテクスチャが 1187px だと、テクセル中心が端から
+    端へ最大 0.43px ずれていく。整数リサイズでは再現できない (両者とも 1187 になる)。
+    """
+    tex = np.asarray(texture.convert("L"), dtype=np.float64)
+    tex_h, tex_w = tex.shape
+    out_w, out_h = round(rect_w), round(rect_h)
+    us = (np.arange(out_w) + 0.5) * (tex_w / rect_w) - 0.5
+    vs = (np.arange(out_h) + 0.5) * (tex_h / rect_h) - 0.5
+    us = np.clip(us, 0, tex_w - 1)
+    vs = np.clip(vs, 0, tex_h - 1)
+    u0 = np.floor(us).astype(int)
+    v0 = np.floor(vs).astype(int)
+    u1 = np.minimum(u0 + 1, tex_w - 1)
+    v1 = np.minimum(v0 + 1, tex_h - 1)
+    fu = (us - u0)[None, :]
+    fv = (vs - v0)[:, None]
+    top = tex[np.ix_(v0, u0)] * (1 - fu) + tex[np.ix_(v0, u1)] * fu
+    bottom = tex[np.ix_(v1, u0)] * (1 - fu) + tex[np.ix_(v1, u1)] * fu
+    out = top * (1 - fv) + bottom * fv
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "L").convert("RGB")
+
+
+def build_chart(src_w, src_h, dst_w, dst_h, out_dir, old_size=None, rect_size=None):
     scale = dst_h / src_h
     img = np.full((src_h, src_w), 0.5)
     xs, ys = np.meshgrid(
@@ -117,10 +169,10 @@ def build_chart(src_w, src_h, dst_w, dst_h, out_dir):
             band_h,
             2.5,
             True,
-            "縦縞 2.5px 相当 — 左右方向。左端・中央・右端でコントラストを比べる",
+            "縦縞 2.5px 相当 — 左右方向。左端から右端までコントラストが均一か",
         ),
         (round(src_h * 0.227), band_h, 3.0, True, "縦縞 3.0px 相当"),
-        (h_top, h_height, 2.5, False, "横縞 2.5px 相当 — 上下方向。この帯の中央が最悪点"),
+        (h_top, h_height, 2.5, False, "横縞 2.5px 相当 — 上下方向。帯ごと薄くなっていないか"),
         (round(src_h * 0.637), band_h, 4.0, True, "縦縞 4.0px 相当"),
     ]
     for y0, height, period, vertical, _ in plan:
@@ -154,7 +206,7 @@ def build_chart(src_w, src_h, dst_w, dst_h, out_dir):
     draw.rectangle([0, 0, src_w, 88], fill=(255, 255, 255))
     draw.text(
         (24, 20),
-        "縞のコントラストが中央で落ちたら旧挙動 / 全面で均一なら修正済み",
+        "どの帯も全面で均一なら修正済み / ムラがあれば旧挙動",
         fill=(200, 0, 0),
         font=big,
     )
@@ -171,9 +223,12 @@ def build_chart(src_w, src_h, dst_w, dst_h, out_dir):
     im.save(chart)
 
     fixed = im.resize((dst_w, dst_h), Image.LANCZOS)
-    # 旧挙動 = 1px 小さいテクスチャを作ってから、描画矩形へバイリニアで引き伸ばす。
-    old = im.resize((dst_w - 1, dst_h - 1), Image.LANCZOS).resize(
-        (dst_w, dst_h), Image.BILINEAR
+    # 旧挙動 = 旧規則で決まるサイズのテクスチャを作ってから、**寄せていない小数サイズの
+    # 矩形**へ貼る。原因 1 (テクスチャが 1px 短い) と原因 2 (矩形が小数) の両方が乗る。
+    old_size = old_size or (dst_w - 1, dst_h - 1)
+    rect_size = rect_size or (float(dst_w), float(dst_h))
+    old = draw_into_fractional_rect(
+        im.resize(old_size, Image.LANCZOS), rect_size[0], rect_size[1]
     )
     fixed.save(os.path.join(out_dir, "expected-fixed.png"))
     old.save(os.path.join(out_dir, "expected-v3.3.0.png"))
@@ -261,12 +316,27 @@ def main():
             raise SystemExit(f"{view_w}x{view_h} で条件を満たす寸法が見つかりません")
         src_w, src_h = found[0]
 
-    if not triggers_on_both_axes(src_w, src_h, view_w, view_h):
-        print(f"警告: {src_w}x{src_h} は全ての表示倍率で両軸短縮にはなりません")
+    if not triggers_both_causes(src_w, src_h, view_w, view_h):
+        print(f"警告: {src_w}x{src_h} は全ての表示倍率で原因 1 と 2 の両方を出しません")
+    r0 = emulate(src_w, src_h, view_w, view_h, 1.0)
+    for axis in ("x", "y"):
+        exact = r0[axis]["exact"]
+        print(
+            f"  {axis}: 理論値 {exact:.5f}  旧 {r0[axis]['old']}  新 {r0[axis]['new']}"
+            f"  矩形の端数 {abs(exact - round(exact)):.5f}px"
+        )
 
     r = emulate(src_w, src_h, view_w, view_h, 1.0)
     dst_w, dst_h = r["x"]["new"], r["y"]["new"]
-    chart, fixed, old, plan, scale = build_chart(src_w, src_h, dst_w, dst_h, args.out)
+    chart, fixed, old, plan, scale = build_chart(
+        src_w,
+        src_h,
+        dst_w,
+        dst_h,
+        args.out,
+        old_size=(r["x"]["old"], r["y"]["old"]),
+        rect_size=(r["x"]["exact"], r["y"]["exact"]),
+    )
     build_comparisons(fixed, old, args.out)
     print(f"chart: {chart}  ({src_w}x{src_h} -> {dst_w}x{dst_h}, scale {r['scale']:.9f})")
     for y0, height, period, vertical, _ in plan:

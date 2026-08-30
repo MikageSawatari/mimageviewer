@@ -20,8 +20,11 @@ pub(crate) enum RectPixelFit {
     Proportional,
 }
 const PHYSICAL_SCALE_INTEGER_EPSILON: f32 = 1.0e-4;
-/// 整数サイズとみなす許容誤差。f32 の倍率が持つ相対誤差 (2^-24 程度) を、
-/// 実用的な画像の辺長 (数万 px) に掛けても収まる幅にしてある。
+/// 整数サイズとみなす許容誤差。
+///
+/// f32 の倍率が持つ相対誤差 (2^-24 ≈ 6e-8) は **積 = 出力サイズ** に比例して効くので、
+/// この幅が意味を持つのは出力が `1e-3 / 2^-24` ≈ 16,777 物理ピクセルまで。表示先の
+/// 物理サイズが上限である限り安全で、ソース側の辺長がいくら大きくても関係しない。
 const PHYSICAL_PIXEL_EXTENT_EPSILON: f64 = 1.0e-3;
 /// A cursor mapping span smaller than one logical point cannot provide a stable pair of distinct
 /// pointer positions. Fall back to the full pan band before either axis becomes sub-point thin.
@@ -792,6 +795,20 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
 ///
 /// 端数のある拡大には触らない。そちらの出力サイズは画像全体ではなく可視領域から
 /// 決まるので、ここで全体矩形を寄せても一致しない。
+/// [`DisplayedImageTransform`] を経由しない描画経路から、同じ寄せ規則を使うための入口。
+///
+/// **規則を 2 か所に綴らないためだけに存在する。** 通常は transform 側 (`RectPixelFit`)
+/// を通ること。手で矩形を組んでリサンプラ出力を貼る場所 (detached の keepalive backstop
+/// など) は transform を持たないので、ここから同じ関数へ入る。
+pub(crate) fn snap_image_rect_to_physical_pixels(
+    rect: egui::Rect,
+    display_size: egui::Vec2,
+    logical_scale: f32,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    snap_rect_to_physical_pixels(rect, display_size, logical_scale, pixels_per_point)
+}
+
 fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
     display_size: egui::Vec2,

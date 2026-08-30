@@ -4247,7 +4247,10 @@ fn resolve_fs_image_transform(
     let layout_long = layout_source_size.x.max(layout_source_size.y).max(1.0);
     let layout_size = layout_source_size * (reference_long / layout_long);
     let layout = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-        pixel_fit: RectPixelFit::Texels,
+        // ここは最終的な描画先ではなく、**アスペクトを決めるための中間枠**。寄せると
+        // 「中間枠で 1 回・最終矩形で 1 回」の二重丸めになり、理想フィットより最大
+        // 1 物理ピクセル小さくなる。寄せるのは下の最終 transform 側だけにする。
+        pixel_fit: RectPixelFit::Proportional,
         texture_size: layout_size,
         ..input
     })?;
@@ -10643,10 +10646,6 @@ impl App {
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
                 let resource = self.fullscreen_paint_resource_for_texture(page.idx, source_texture);
-                let rotated_size =
-                    rotated_display_size(resource.size_vec2(), self.get_rotation(page.idx));
-                let logical_scale = (page.rect.width() / rotated_size.x.max(1.0))
-                    .min(page.rect.height() / rotated_size.y.max(1.0));
                 let transform = DisplayedImageTransform::from_resolved_rect(
                     DisplayedImageTransformInput {
                         pixel_fit: RectPixelFit::Texels,
@@ -10664,13 +10663,17 @@ impl App {
                     },
                     page.rect,
                 )?;
+                // リサンプラと貼り先は **transform が持つ 1 つの答え** を共有する。
+                // 自前で min を計算して渡すと、transform 内部の倍率と食い違ったまま
+                // 整数サイズのテクスチャを小数サイズの矩形へ貼ることになる (§1.0e)。
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
-                    logical_scale,
+                    transform.total_scale,
                     pixels_per_point,
                     transform.visible_source_uv_rect(full_rect),
                 );
-                let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
+                let rect_norm =
+                    Self::normalize_rect_to_full_rect(transform.full_image_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
                 let clip_rect_norm = rect_norm;
                 self.log_detached_frozen_page_bake_debug(
@@ -10895,23 +10898,35 @@ impl App {
             },
             rects.right_rect,
         );
+        // 連結読みと同じく、リサンプラと貼り先は transform の 1 つの答えを共有する。
+        // transform が組めなかったときだけ、従来どおり layout の矩形と自前の倍率へ落ちる。
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
-            total_scale * geometry.left.scale_factor,
+            left_transform.map_or(total_scale * geometry.left.scale_factor, |transform| {
+                transform.total_scale
+            }),
             pixels_per_point,
             left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
-            total_scale * geometry.right.scale_factor,
+            right_transform.map_or(total_scale * geometry.right.scale_factor, |transform| {
+                transform.total_scale
+            }),
             pixels_per_point,
             right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
-        let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
-        let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
+        let left_rect_norm = Self::normalize_rect_to_full_rect(
+            left_transform.map_or(rects.left_rect, |transform| transform.full_image_rect),
+            full_rect,
+        );
+        let right_rect_norm = Self::normalize_rect_to_full_rect(
+            right_transform.map_or(rects.right_rect, |transform| transform.full_image_rect),
+            full_rect,
+        );
         let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
@@ -13782,10 +13797,20 @@ impl App {
                         let tex_size = resource.size_vec2();
                         if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
                             let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                            let img_rect = egui::Rect::from_center_size(
-                                ui.max_rect().center(),
-                                egui::vec2(tex_size.x * scale, tex_size.y * scale),
-                            );
+                            // ここは transform を通らないので `RectPixelFit` が届かない。
+                            // 同じ寄せ規則を明示的に呼ぶ (§1.0e — 寄せないとリサンプラの
+                            // 整数サイズ出力を小数サイズの矩形へ貼り、もう一度バイリニアが
+                            // 掛かる)。
+                            let img_rect =
+                                crate::displayed_image_transform::snap_image_rect_to_physical_pixels(
+                                    egui::Rect::from_center_size(
+                                        ui.max_rect().center(),
+                                        egui::vec2(tex_size.x * scale, tex_size.y * scale),
+                                    ),
+                                    tex_size,
+                                    scale,
+                                    vp_ctx.pixels_per_point(),
+                                );
                             let paint_resource = self.prepare_fullscreen_paint_resource(
                                 resource,
                                 scale,
@@ -39904,18 +39929,26 @@ mod tests {
                 .expect("pass-through transform");
         let final_image =
             resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
-        assert!(
-            final_image
-                .full_image_rect
-                .contains_rect(pass.full_image_rect)
-        );
+        // 差し替えでページが飛ばないこと。**内包では縛れない**: 最終ラスタは縮小なので
+        // 描画矩形が物理ピクセル格子へ寄り、低解像度の下敷きは拡大側なので寄らない。
+        // どちらが大きくなるかは倍率次第で、差は 1 物理ピクセル未満 (§1.0e)。
+        // 中心は一致し続けなければならない — ここがずれると本当に飛んで見える。
+        const HALF_PIXEL: f32 = 0.5;
         assert!(
             (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
         );
         assert!(
             (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs()
+                <= 2.0 * HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
+                <= 2.0 * HALF_PIXEL
         );
         let texture_ratio = 300.0 / 450.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
