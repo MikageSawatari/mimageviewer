@@ -1988,6 +1988,49 @@ const ZIP_HEADER_PROBE_BYTES: u64 = 64 * 1024;
 /// ネストパス (`inner.zip/p01.jpg`) と旧形式の名前はこの経路では解決できない。RAR は
 /// 部分読みの経路が無く、1 エントリごとに全体展開になるので**対象にしない**。解決できな
 /// かったものは寸法不明のまま残り、件数がログに出る。
+/// カタログに行が無い**実ファイル画像**の寸法を、ZIP / PDF と同じ「一括で 1 回」に揃える。
+///
+/// キーは catalog と同じファイル名。同じフォルダに同名は存在しないので衝突しない。
+fn collect_file_image_dims(
+    items: &[crate::grid_item::GridItem],
+    cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    dims: &mut std::collections::HashMap<String, (u32, u32)>,
+) {
+    let missing = items
+        .iter()
+        .filter_map(|item| match item {
+            crate::grid_item::GridItem::Image(path) => {
+                let name = path.file_name()?.to_str()?;
+                (!cached.contains_key(name)).then(|| (name.to_owned(), path.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    let paths = missing
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let resolved = file_image_dims_batch(&paths);
+    let mut undecodable = 0usize;
+    for ((name, _), size) in missing.iter().zip(resolved) {
+        match size {
+            Some(size) => {
+                dims.insert(name.clone(), size);
+            }
+            None => undecodable += 1,
+        }
+    }
+    if undecodable > 0 {
+        crate::logger::log(format!(
+            "remote_ipc: file image dims incomplete attempted={} undecodable={undecodable}",
+            paths.len()
+        ));
+    }
+}
+
 fn collect_zip_entry_dims(
     container_path: &Path,
     items: &[crate::grid_item::GridItem],
@@ -2059,14 +2102,38 @@ fn collect_zip_entry_dims(
 
 pub(super) fn page_dims_without_catalog(item: &crate::grid_item::GridItem) -> Option<(u32, u32)> {
     match item {
-        crate::grid_item::GridItem::Image(path) => image::ImageReader::open(path)
-            .ok()?
-            .with_guessed_format()
-            .ok()?
-            .into_dimensions()
-            .ok(),
+        crate::grid_item::GridItem::Image(path) => file_image_dims(path),
         _ => None,
     }
+}
+
+fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// カタログに行が無い**実ファイル画像**の寸法を、まとめて並列に読む。
+///
+/// ZIP は書庫を 1 回開いて一括、PDF は worker 1 往復で一括なのに、実ファイルだけが
+/// item ごとの逐次読みだった。3 種類のうち 2 種類が束ねてあって 1 種類だけ束ねていない、
+/// というのが構造上の欠けで、件数が増えたときにその 1 種類だけが線形に伸びる。
+///
+/// 1 件 454µs は小さく見えるが、コレクションは 100,000 件まで許すので直列だと 45 秒に
+/// なる (R-23。v3.2.0 は寸法を一切持たなかったので**退行**)。**答えは変えない** — 同じ
+/// 読み取りを同じ対象へ行い、順番だけを並べる。件数そのものを削るかは見開きの組み方が
+/// 変わってしまうので別の判断 (backlog §1.0i)。
+///
+/// 同時に開くファイル数は rayon の既定プール (CPU 数) が上限で、ここで別に増やさない。
+pub(super) fn file_image_dims_batch(paths: &[PathBuf]) -> Vec<Option<(u32, u32)>> {
+    use rayon::prelude::*;
+    if paths.len() <= 1 {
+        return paths.iter().map(|path| file_image_dims(path)).collect();
+    }
+    paths.par_iter().map(|path| file_image_dims(path)).collect()
 }
 
 impl ContainerEngine {
@@ -5068,7 +5135,7 @@ impl ContainerEngine {
     ///   レンダリング 1 枚より安い。
     /// - ZIP: 書庫を 1 回だけ開き、各エントリの**先頭だけ**を読む。全体を展開すると、
     ///   寸法のためだけに 1 冊分の画像を伸長することになる。
-    /// - 画像ファイル: ここでは扱わない (1 件ずつ `page_dims_without_catalog` で足りる)。
+    /// - 画像ファイル: `file_image_dims_batch` で並列に一括読み (R-23)。
     ///
     /// カタログに寸法がある間は 1 件も読まないので、既にサムネイルを作った本に追加費用は
     /// 出ない。取得できなければ従来どおり「寸法不明」とし、件数はログへ残す。
@@ -5101,6 +5168,7 @@ impl ContainerEngine {
             }
         }
         collect_zip_entry_dims(container_path, items, cached, &mut dims);
+        collect_file_image_dims(items, cached, &mut dims);
         dims
     }
 
@@ -5168,11 +5236,10 @@ impl ContainerEngine {
                                     crate::catalog::decode_thumb_dims(&entry.jpeg_data)
                                 })
                         }),
-                        // カタログ行が 1 つも無い場合。まとめて求めた辞書、無ければ 1 件読み。
-                        None => fallback_dims
-                            .get(&key)
-                            .copied()
-                            .or_else(|| page_dims_without_catalog(item)),
+                        // カタログ行が 1 つも無い場合。ZIP / PDF / 実ファイルのどれも
+                        // `catalog_free_dims` が一括で求めてあるので、ここで 1 件ずつ
+                        // 読み直す枝は無い (あると「束ねたのに逐次経路も残る」になる)。
+                        None => fallback_dims.get(&key).copied(),
                     }
                 });
                 if dims.is_none() {
@@ -7708,6 +7775,80 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    /// 一括読みは 1 件ずつ読んだのと**同じ答え**を、同じ並びで返す。
+    ///
+    /// R-23 で実ファイルの寸法読みを ZIP / PDF と同じ「まとめて 1 回」へ揃えた。
+    /// 速くするだけの変更なので、答えが 1 つでも変わったら意味がない。読めない
+    /// ファイルと存在しないファイルが混ざっても位置がずれないことを含める。
+    fn reading_the_dimensions_together_gives_the_same_answers_as_one_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut paths = Vec::new();
+        for (index, (w, h)) in [(120u32, 40u32), (40, 120), (64, 64)].iter().enumerate() {
+            let path = dir.path().join(format!("img{index}.png"));
+            image::RgbImage::new(*w, *h).save(&path).expect("write");
+            paths.push(path);
+        }
+        // 読めないファイルと存在しないファイルを挟む。
+        let broken = dir.path().join("broken.png");
+        std::fs::write(&broken, b"not an image").expect("write broken");
+        paths.insert(1, broken);
+        paths.insert(3, dir.path().join("missing.png"));
+
+        let one_at_a_time = paths
+            .iter()
+            .map(|path| page_dims_without_catalog(&crate::grid_item::GridItem::Image(path.clone())))
+            .collect::<Vec<_>>();
+        assert_eq!(file_image_dims_batch(&paths), one_at_a_time);
+        assert_eq!(
+            one_at_a_time,
+            vec![Some((120, 40)), None, Some((40, 120)), None, Some((64, 64))],
+            "この並びが崩れたら、読めないファイルの分だけ後続がずれている"
+        );
+        // 空でも 1 件でも同じ入口を通る (並列に入らない枝を持っているため)。
+        assert!(file_image_dims_batch(&[]).is_empty());
+        assert_eq!(
+            file_image_dims_batch(&paths[..1]),
+            vec![Some((120, 40))],
+            "1 件のときの枝も同じ答えを返すこと"
+        );
+    }
+
+    #[test]
+    /// カタログ行があるものは**一括読みの対象にしない**。
+    ///
+    /// 「束ねた」あとで逐次経路も残っていると、行が揃っているフォルダでも
+    /// ファイルを開いてしまう。ここは 1 件も読まないのが正しい。
+    fn images_that_already_have_a_catalog_row_are_not_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cataloged = dir.path().join("known.png");
+        image::RgbImage::new(120, 40)
+            .save(&cataloged)
+            .expect("write");
+        // わざと壊す: 開いたら失敗するので、開いていないことが答えで分かる。
+        let uncataloged = dir.path().join("unknown.png");
+        std::fs::write(&uncataloged, b"not an image").expect("write");
+
+        let items = vec![
+            crate::grid_item::GridItem::Image(cataloged),
+            crate::grid_item::GridItem::Image(uncataloged),
+        ];
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("known.png".to_string(), Some((999u32, 111u32)));
+
+        let mut dims = std::collections::HashMap::new();
+        collect_file_image_dims(&items, &cached, &mut dims);
+        assert!(
+            !dims.contains_key("known.png"),
+            "カタログ行があるものを読み直している"
+        );
+        assert!(
+            !dims.contains_key("unknown.png"),
+            "壊れたファイルは寸法不明として残る"
+        );
+        assert!(dims.is_empty());
     }
 
     #[test]

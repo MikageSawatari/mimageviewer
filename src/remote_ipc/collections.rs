@@ -885,6 +885,29 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             .as_ref()
             .and_then(|catalog| catalog.load_source_dims().ok())
             .unwrap_or_default();
+        // カタログ行が 1 つも無いものは、**この親フォルダ分をまとめて並列に**読む。
+        // コンテナ側と同じ入口を通す。ここを抜かすと、同じ本がフォルダから開けば分割され、
+        // レーティング一覧から開けば分割されない、という食い違いになる。
+        // 1 件ずつ読んでいたときはコレクション上限 100,000 件で 45 秒かかった (R-23)。
+        let uncataloged = parent
+            .images
+            .iter()
+            .filter(|(_, filename)| !cached.contains_key(filename))
+            .map(|(index, filename)| (filename.clone(), PathBuf::from(&entries[*index].path)))
+            .collect::<Vec<_>>();
+        // 位置ではなく名前で引く。位置で対応させると「2 つのループが同じ順に回る」ことが
+        // 暗黙の前提になり、片方の絞り込みを変えた瞬間に**別のページの寸法**を返す。
+        let probed = super::container::file_image_dims_batch(
+            &uncataloged
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>(),
+        );
+        let probed = uncataloged
+            .into_iter()
+            .map(|(filename, _)| filename)
+            .zip(probed)
+            .collect::<HashMap<_, _>>();
         for (index, filename) in parent.images {
             let dims = match cached.get(&filename) {
                 Some(recorded) => recorded.or_else(|| {
@@ -893,12 +916,7 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
                         .and_then(|catalog| catalog.load_one(&filename).ok().flatten())
                         .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
                 }),
-                // カタログ行が 1 つも無い場合。コンテナ側と同じ読み取りを通す。
-                // ここを抜かすと、同じ本がフォルダから開けば分割され、レーティング一覧から
-                // 開けば分割されない、という食い違いになる。
-                None => super::container::page_dims_without_catalog(&GridItem::Image(
-                    PathBuf::from(&entries[index].path),
-                )),
+                None => probed.get(&filename).copied().flatten(),
             };
             landscape[index] = dims.is_some_and(|(width, height)| {
                 let rotation = rotation_keys[index]

@@ -89,6 +89,30 @@ transform。これは `resolve_fs_image_transform` の中間枠に対して v3.3
 - 見開き capture の source mapping — 寄せ済み矩形の再 resolve だが、描画ではないので
   同じボケにはならない
 
+### 1.0i Remote の寸法 probe を「近傍だけ」にするか — R-23 の残り (2026-08-30)
+
+**一括・並列化は v3.3.1 で済んだ** (R-23)。実ファイル画像の寸法読みが 1 件ずつだった
+のを、ZIP (書庫を 1 回開く) / PDF (worker 1 往復) と同じ「まとめて 1 回」へ揃え、
+rayon の既定プールで並べた。**答えは 1 つも変えていない** (等価性テストあり)。
+
+**残っているのは「件数そのものを減らすか」という判断で、これは答えが変わる。**
+`build_remote_spread_page_groups` は横長ページを境に以降の組み方が変わるので、
+近傍だけ読んで残りを後から埋めると、**埋まった瞬間に見開きの組が組み替わる**。
+
+選択肢:
+
+- **A. 現状維持**: 全件読む。並列化で 3〜4 倍速いが、件数に比例する。
+- **B. 近傍だけ + 非同期補完**: 初期応答は一定。ただし表示中にページの組が動く。
+- **C. 永続化**: 一度読んだ寸法をカタログ側へ書き戻す。2 回目以降が無料になる。
+  ただし remote service (別プロセス) がカタログへ書く所有権の設計が要る。
+
+**利用者に聞くべきは B の見た目の変化を受け入れるか。** C は答えを変えないので
+B より先に検討する価値がある。
+
+**計測について**: 合成ファイル (1200x1800 PNG/JPEG、OS キャッシュ温) では 1 件 32µs、
+並列化で 3.28 倍。レビューの実測は初回 454µs/件。**合成の数字を実機の見積もりに使わない**
+(過去に 30 倍外している)。NAS のように I/O が支配する環境ほど並列化の効きは大きい。
+
 ### 1.0f 実機確認で見つかった 3 件 (2026-08-30)
 
 **(a) F12 連打で動画再生が止まり、別ウィンドウが閉じる。** 利用者報告。
@@ -123,7 +147,7 @@ ViewportId の新しい viewport に届き、利用者が × を押したのと�
 (「`ViewportEvent::Close` を利用者の close と解釈して後継ごと閉じる」) が、
 現行経路にも存在していた**ということ。
 
-**修正方針は Codex と合意済み** ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
+**v3.3.1 で修正済み** (`edf1c5ed`)。方針は Codex と合意 ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
 
 **(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
 利用者報告。**v3.2.0 / v3.3.0 でも同じなので退行ではない。** 別ウィンドウ側にキー入力が
@@ -179,7 +203,11 @@ production で `ready_host == H` になり得ることも確認済み — `nativ
 `ready_host_hwnd` は `detached_viewer_video_host_ready()` が真なら現在の detached host を
 そのまま読み、retire 中の窓はまだ生きているため真になる。
 
-**まだ直していない理由**: 期待している `AwaitingHost` への差し替えが正しい着地か未確定。
+**着地 (2026-08-30)**: 案 A′ (retiring が持つ session/window lease を後継へ移譲し、
+`NativeRetired` 後に現在の host claim を採り直してから Prepare する) を実装した。
+下は着手前に迷っていた記録として残す。
+
+~~期待している `AwaitingHost` への差し替えが正しい着地か未確定。~~
 `AwaitingHost` は毎フレームの `poll_video_presentation_transition` が
 `detached_viewer_video_host_ready()` を見て解決するが、host を作るのは要求時の
 `ensure_detached_viewer_window_id()` で、**`DestroyHost` はその後に走る**。作り直す側に
@@ -416,7 +444,7 @@ VST3 状態を `Settings` 本体から外せば DB が 0.2 MB 級に戻り、1.0
 | R-07 (d) | 補正マスクの圧縮・DB 保存が UI スレッド | v3.2.0 以前から。**v3.3.0 が 5.8 倍速く**した後 | 24MP で 70.6ms/ストローク (v3.2.0 形式は 410ms) |
 | (b) | 図形のキー移動 / 回転がキーリピートごとに全文書を保存 | v3.2.0 以前から | リピート 1 回ごとに 70ms + undo 2 文書 |
 | (c) | 塗りの毎フレームに文書 1 複製が残る | v3.2.0 以前から | 24MP で 27.7ms/フレーム (もう 1 枚は `3315fd05` で削除済み) |
-| R-23 | Remote の catalog 無し寸法 probe が直列・無制限 | **退行** (v3.2.0 は probe せず即返した) | ローカル SSD 初回 454µs/件 = 1,000 件で 0.45 秒。NAS なら 1〜10 秒。10,000 件で 4.5 秒 |
+| R-23 | Remote の catalog 無し寸法 probe が直列・無制限 | **退行** (v3.2.0 は probe せず即返した) | ローカル SSD 初回 454µs/件 = 1,000 件で 0.45 秒。NAS なら 1〜10 秒。10,000 件で 4.5 秒。**v3.3.1 で一括・並列化 (答え不変)。件数を減らすかは §1.0i** |
 | R-18 | Remote の ZIP 寸法 probe が 64KiB で打ち切る | いいえ (経路ごと v3.3.0 の新規) | v3.2.0 は寸法を一切持たず見開きが効かなかった。**見送っても v3.2.0 より悪くならない** |
 | R-21 | 波形→サムネイル切替後も不可視の全尺解析が続く | いいえ (シークストリップが新機能) | 今回の目玉機能が裏で CPU/IO を食う |
 | R-12 | detached parked fallback が UI で `parent().is_dir()` | いいえ | クリック 1 回につき 1 syscall。コード側にも「恒常経路ではない」と明記 |
