@@ -17658,12 +17658,24 @@ impl App {
             "external_folder_change folder={}",
             folder.display()
         ));
+        // **利用者が選択を引き取ったなら、ここで要求を捨てる。** 再読込は `checked` を
+        // 消すので、判定できるのはこの時点だけ。以後に届く出力で利用者の選択を
+        // 上書きしない (R-09 の「届いた分を足す」を安全にする条件)。
+        if let Some(request) = self.post_operation_selection.as_ref() {
+            let cursor = self.selected_real_file_path();
+            let checked = self.checked_real_file_paths();
+            if !request.still_owns_selection(cursor.as_deref(), &checked) {
+                self.cancel_post_operation_selection("user_changed_selection");
+            }
+        }
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
-        // ただし操作の結果へ選択を移す要求が生きている間は、そちらに任せて手を出さない
+        // まだ 1 度も適用していない要求が生きている間は、そちらに任せて手を出さない
         // (貼り付けの完了はこの自動再読込で拾うので、ここで元の選択へ戻すと打ち消し合う)。
+        // 適用済みなら「元の選択」はこちらが置いたものなので、通常どおり保存して戻す。
         let selected_path: Option<PathBuf> = self
             .post_operation_selection
-            .is_none()
+            .as_ref()
+            .is_none_or(|request| request.has_applied())
             .then(|| self.selected)
             .flatten()
             .and_then(|idx| self.items.get(idx))
@@ -47232,6 +47244,24 @@ impl App {
         self.selected = Some(idx);
         self.scroll_to_selected = true;
         self.redirect_selected_to_visible();
+    }
+
+    /// 選択中の実ファイル / 実フォルダのパス。仮想項目・未選択では `None`。
+    fn selected_real_file_path(&self) -> Option<std::path::PathBuf> {
+        let selected = self.selected?;
+        self.visible_real_file_paths()
+            .into_iter()
+            .find(|(index, _)| *index == selected)
+            .map(|(_, path)| path)
+    }
+
+    /// チェック中の実ファイル / 実フォルダのパス。
+    fn checked_real_file_paths(&self) -> Vec<std::path::PathBuf> {
+        self.visible_real_file_paths()
+            .into_iter()
+            .filter(|(index, _)| self.checked.contains(index))
+            .map(|(_, path)| path)
+            .collect()
     }
 
     /// 表示中の実ファイル / 実フォルダ項目を items 順で返す。
