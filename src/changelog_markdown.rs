@@ -218,6 +218,56 @@ fn kbd_chip(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
 
+    /// README の最新の更新履歴が、**この描画器で描ける記法だけ**でできていること。
+    ///
+    /// 更新通知ダイアログは GitHub release の body をここで描く。README の該当節が
+    /// そのまま body になるので、対応していない記法 (リンク・画像・表) を書くと
+    /// **そのまま文字として出る**。しかも気付くのは公開した後になる。
+    ///
+    /// これはリリース手順が「公開後に別マシンで目視」としていた確認の代わり
+    /// (CLAUDE.md Phase 4)。目視は体裁しか見られず、しかも公開前には試せない。
+    /// 閉じ忘れた `**` は描画器が**わざと文字のまま残す**ので、`Seg::Text` に
+    /// マーカーが残っていればそれが検出結果になる。
+    #[test]
+    fn the_newest_changelog_entry_only_uses_markup_this_renderer_handles() {
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("README.md");
+        let mut lines = readme.lines().skip_while(|l| !l.starts_with("## 更新履歴"));
+        lines.next();
+        let section: Vec<&str> = lines
+            .skip_while(|l| !l.starts_with("### v"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("### v"))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert!(
+            section.len() >= 3,
+            "最新の更新履歴が読めていない ({} 行)",
+            section.len()
+        );
+
+        for line in section {
+            let trimmed = line.trim_start();
+            let body = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .unwrap_or(trimmed);
+            for seg in parse_inline(body) {
+                let Seg::Text { text, .. } = seg else {
+                    continue;
+                };
+                for marker in ["**", "`", "<kbd", "</kbd", "](", "!["] {
+                    assert!(
+                        !text.contains(marker),
+                        "描画器が解釈できない記法が残っている: {marker:?} in {text:?}
+                         (対応しているのは **強調** / `コード` / <kbd>キー</kbd> と、
+                          行頭の `### ` 見出し・`- ` 箇条書きだけ)"
+                    );
+                }
+            }
+        }
+    }
+
     fn text(s: &str) -> Seg {
         Seg::Text {
             text: s.to_string(),
