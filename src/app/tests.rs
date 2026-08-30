@@ -5349,14 +5349,33 @@ fn content_identity_physical_listing_predicate_excludes_mixed_and_archive_surfac
         entry_name: "page.png".to_string(),
     }];
     assert!(!app.is_physical_folder_listing(), "ZIP 内一覧は対象外");
+    // PDF を開くと current_folder は PDF 自身になる (両方の PdfPage 構築経路が
+    // `start_loading_items(pdf_path, ..)` を呼ぶ)。marker も PDF に揃えて、他の guard を
+    // すべて通した状態で「PDF ページ一覧だから対象外」だけが効くことを確かめる。
+    let pdf = folder.join("book.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: pdf.clone(),
+        counts: Default::default(),
+    });
     app.items = vec![GridItem::PdfPage {
-        pdf_path: folder.join("book.pdf"),
+        pdf_path: pdf.clone(),
         page_num: 0,
         content_type: None,
     }];
     assert!(!app.is_physical_folder_listing(), "PDF 内一覧も対象外");
 
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: folder.clone(),
+        counts: Default::default(),
+    });
     app.items = vec![GridItem::Image(folder.join("page.png"))];
+    assert!(
+        app.is_physical_folder_listing(),
+        "通常フォルダへ戻れば再び物理一覧"
+    );
+
     app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
         folder: app.tmp.path().join("other"),
         counts: Default::default(),
@@ -26709,8 +26728,9 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn grid_container_kind_checks_use_homogeneous_leading_item() {
+    fn grid_container_kind_checks_follow_what_is_open() {
         let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from("c:/book.pdf"));
         app.items = vec![
             GridItem::PdfPage {
                 pdf_path: PathBuf::from("c:/book.pdf"),
@@ -26726,6 +26746,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
 
+        app.current_folder = Some(PathBuf::from("c:/book.zip"));
         app.items = vec![GridItem::ZipImage {
             zip_path: PathBuf::from("c:/book.zip"),
             entry_name: "chapter/page.jpg".into(),
@@ -26733,9 +26754,33 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.grid_is_pdf_pages());
         assert!(app.grid_is_zip_entries());
 
+        app.current_folder = Some(PathBuf::from("c:/p"));
         app.items = vec![GridItem::Image(PathBuf::from("c:/p/a.jpg"))];
         assert!(!app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
+    }
+
+    /// ★ 横断一覧は実ファイルと PDF ページを同じ一覧に並べる。ここで Ctrl+F の可否を
+    /// 先頭 item で決めると、並び順の偶然で一覧全体の絞り込みが落ちる
+    /// (docs/item-kind-capability-matrix.md §6-11)。開いているのは合成パスであって
+    /// PDF ではないので、先頭がページでも Ctrl+F は生きていること。
+    #[test]
+    fn mixed_rating_list_keeps_ctrl_f_even_when_a_pdf_page_leads() {
+        let mut app = setup_app();
+        app.current_folder = Some(crate::app::rating_view_synthetic_path());
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("c:/book.pdf"),
+                page_num: 3,
+                content_type: None,
+            },
+            GridItem::Image(PathBuf::from("c:/p/a.jpg")),
+        ];
+        assert!(!app.grid_is_pdf_pages());
+
+        // 逆順でも同じ答えになること (= 並び順に依存しない)。
+        app.items.reverse();
+        assert!(!app.grid_is_pdf_pages());
     }
 
     #[test]

@@ -47417,10 +47417,22 @@ impl App {
     /// グリッドが PDF のページ表示で構成されているか (= PDF を開いている)。
     /// PDF ページは連番の合成名しか持たず検索の意味が無いため、true のとき
     /// Ctrl+F を無効化する (docs/search-container-item-redesign.md §4.1.1)。
+    ///
+    /// 判定は「今 PDF 自身を開いているか」で行い、items の中身は見ない。先頭 item が
+    /// `PdfPage` かで決めていた頃は、★ 横断一覧のように実ファイルと `PdfPage` が同じ
+    /// 一覧に混ざる view で、**先頭がページかどうかという並び順の偶然で一覧全体の
+    /// Ctrl+F が落ちていた** (docs/item-kind-capability-matrix.md §6-11)。
+    /// `PdfPage` を items へ積む経路は 2 つともソースパスを PDF 自身にして
+    /// `start_loading_items` を呼ぶので、PDF のページ一覧のときだけ true になる。
+    /// 横断一覧は合成パスで読み込まれるため false になり、`PdfPage` 行は
+    /// `Page N` の名前照合で拾われる。
     pub(crate) fn grid_is_pdf_pages(&self) -> bool {
-        self.items
-            .first()
-            .is_some_and(|it| matches!(it, crate::grid_item::GridItem::PdfPage { .. }))
+        self.current_folder.as_deref().is_some_and(|folder| {
+            folder
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
+        })
     }
 
     /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
