@@ -17637,6 +17637,47 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.select_after_load.as_deref(), Some("a.jpg"));
     }
 
+    /// 起きなかった貼り付けの要求を残さない (R-08)。
+    ///
+    /// 差分で拾う要求は「呼ぶ前の一覧」が要るので Shell 呼び出しより先に積むしかない。
+    /// その場で失敗したときに取り下げないと、続く 10 秒の間の**無関係なファイル追加**が
+    /// 貼り付け結果として選ばれる。
+    #[test]
+    fn a_paste_that_never_happened_does_not_claim_the_next_files_to_appear() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        app.items.push(GridItem::Image(folder.join("a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+
+        // Shell を呼ぶ直前の控え。
+        app.request_post_operation_selection_for_added_items(folder.clone());
+        assert!(app.post_operation_selection.is_some());
+
+        // 呼び出しがその場で失敗した。
+        app.cancel_post_operation_selection("shell_paste_failed");
+        assert!(
+            app.post_operation_selection.is_none(),
+            "失敗した操作の要求が残っている"
+        );
+
+        // 別の理由でファイルが増えても、貼り付け結果として拾わない。
+        app.items
+            .push(GridItem::Image(folder.join("unrelated.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        assert!(
+            !app.apply_post_operation_selection(),
+            "取り下げたのに適用された"
+        );
+
+        // 二重に取り下げても壊れない (成功経路と失敗経路が同じフレームで来ても安全)。
+        app.cancel_post_operation_selection("again");
+        assert!(app.post_operation_selection.is_none());
+    }
+
     #[test]
     fn pasted_items_get_checked_and_the_first_one_gets_the_cursor() {
         use crate::grid_item::GridItem;

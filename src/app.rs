@@ -36718,6 +36718,8 @@ impl App {
                     Ok(()) => ctx.request_repaint(),
                     Err(err) => {
                         crate::logger::log(format!("shell_clipboard: Paste failed: {err}"));
+                        // 貼り付けは起きなかった。控えた差分要求もここで捨てる (R-08)。
+                        self.cancel_post_operation_selection("shell_paste_failed");
                     }
                 }
             }
@@ -47279,6 +47281,20 @@ impl App {
                 std::time::Instant::now(),
             ),
         );
+    }
+
+    /// 積んだ要求を取り下げる。
+    ///
+    /// 差分で拾う要求は「呼ぶ**前**の一覧」が要るので、Shell を呼ぶより先に積むしかない。
+    /// その代わり、呼び出しがその場で失敗したら**必ずここを通す** — 残したままだと、
+    /// 続く 10 秒の間に起きた**無関係なファイル追加**を貼り付け結果として選んでしまう
+    /// (R-08)。成功後の取り下げは適用側 (`apply_post_operation_selection`) が持つ。
+    pub(crate) fn cancel_post_operation_selection(&mut self, reason: &str) {
+        if self.post_operation_selection.take().is_some() {
+            crate::logger::log(format!(
+                "post_operation_selection: cancelled before any result arrived ({reason})"
+            ));
+        }
     }
 
     /// 貼り付けのように **mIV が出力パスを知らない**操作の直前に、今の一覧を控える。
