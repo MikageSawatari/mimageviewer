@@ -1559,8 +1559,10 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 - 失敗したフォルダ (読み取り専用メディア等) は writer が folder 単位で覚え、以降積まない。
   `SidecarFile::disabled` は別概念 (**ディスク上の内容を上書きしてはいけない** = パース
   失敗・新しいバージョンが書いたファイル)。
-- プロセスが止まる直前 (終了・トレイ退避) だけ `sidecar::wait_for_pending_writes()` で待つ。
-  削除移行のように結果を報告する必要がある経路は `flush_blocking()`。
+- **待つのは終了経路だけ** (`PersistScope::ProcessIsStopping`)。待つ理由は「このあと
+  プロセスが止まるので、積んだだけの書き込みが失われる」ことだけなので、トレイ退避のように
+  プロセスが動き続ける経路では待たない (writer も読み手も生きたままで、読み手は pending を
+  先に見る)。削除移行のように結果を報告する必要がある経路は `flush_blocking()`。
 - UI スレッドが払うのは `items` の clone だけ。マスクはメモリ上では `Vec<f32>` のままなので
   これはゼロコストではない —— 実測で **415 items / 31.5M 画素の最大ケースが 38ms**
   (元の同期 flush は 6059ms)。`Arc<SidecarEntry>` にすればほぼ 0 にできるが、
@@ -1572,7 +1574,8 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 | --- | --- |
 | 編集ツールを抜けた | `App::flush_sidecars_when_page_edit_ends` (`page_edit_tool_owns_canvas` が true → false) |
 | フォルダ切替 | `start_loading_items` の `flush_all_sidecars` |
-| アプリ終了 / トレイ退避 | `persist_window_state_and_flush` (+ 待つ) |
+| アプリ終了 | `persist_window_state_and_flush(ProcessIsStopping)` (+ 待つ) |
+| トレイ退避 | `persist_window_state_and_flush(ProcessKeepsRunning)` (積むだけ) |
 | 定期 (`PERIODIC_FLUSH_INTERVAL` = 10 分) | `App::flush_periodic_sidecars` |
 
 定期フラッシュは**クラッシュ・電源断でしか使われない保険**なので頻度は低くてよい。
