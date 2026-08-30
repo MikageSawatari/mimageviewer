@@ -280,6 +280,30 @@ pub(crate) enum FolderOpenOutcome {
     Ignored,
 }
 
+/// `App::persist_window_state_and_flush` を呼んだあと、このプロセスが続くかどうか。
+///
+/// **待つ理由は「このあとプロセスが止まるので、積んだだけの書き込みが失われる」ことだけ**
+/// である。サイドカー writer はプロセス内に 1 本しかなく、読み手はディスクより先に writer の
+/// pending を見る (`SidecarFile::load_from`) ので、プロセスが動き続ける限り、待たなくても
+/// 内容は失われないし、読み直しが古い内容を見ることもない。
+///
+/// 既定値を置かず呼び出し側に選ばせるのは、**忘れると危ないのが `ProcessIsStopping` の側**
+/// だからである (終了経路で待ち忘れると、積んだだけの最後の編集がプロセスごと消える)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistScope {
+    /// トレイ退避のように、このあともプロセスが動き続ける経路。積むだけで戻る。
+    ProcessKeepsRunning,
+    /// 終了経路。writer が捌き終わるまで待つ。
+    ProcessIsStopping,
+}
+
+impl PersistScope {
+    /// サイドカー writer が捌き終わるのを待つか。
+    fn waits_for_sidecar_writer(self) -> bool {
+        matches!(self, Self::ProcessIsStopping)
+    }
+}
+
 /// The navigation domain owned by the currently mounted viewer context.
 ///
 /// Detached independent still viewers intentionally use only the physical
@@ -54111,7 +54135,7 @@ impl App {
         row.saturating_sub(top_row).min(u32::MAX as usize) as u32
     }
 
-    pub(crate) fn persist_window_state_and_flush(&mut self) {
+    pub(crate) fn persist_window_state_and_flush(&mut self, scope: PersistScope) {
         // カーソル名と行位置は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
         // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
         // **対で書き、対で捨てる。** 片方だけ残ると、名前は前回のもので位置は前々回、
@@ -54180,8 +54204,11 @@ impl App {
         self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
         self.flush_all_sidecars();
-        // 終了・トレイ退避はここから先プロセスが止まり得るので、writer が捌き終わるまで待つ。
-        crate::sidecar::wait_for_pending_writes();
+        if scope.waits_for_sidecar_writer() {
+            // 終了経路だけ待つ。ここから先プロセスが止まるので、積んだだけの書き込みは
+            // 失われる。トレイ退避では writer も読み手も生きたままなので待たない。
+            crate::sidecar::wait_for_pending_writes();
+        }
     }
 
     /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。

@@ -315,7 +315,12 @@ impl App {
         }
         // settings / sidecar は従来どおり hide 時にも保存する。トレイ「終了」は DWM cloak 後に
         // 通常 close を通るため、リネーム journal writer の終了 flush は on_exit が担当する。
-        self.persist_window_state_and_flush();
+        //
+        // ここでは **writer を待たない**。プロセスも writer スレッドも動き続けるので、積んだ
+        // 書き込みは失われないし、読み手はディスクより先に writer の pending を見る。待つと、
+        // 退避のたびに UI スレッドが全サイドカーの直列化・圧縮・ファイル書き込みを終えるまで
+        // 止まる (補正マスクを含むフォルダでは秒単位)。
+        self.persist_window_state_and_flush(crate::app::PersistScope::ProcessKeepsRunning);
 
         // トレイの表示を更新
         self.update_tray_tooltip();

@@ -63131,7 +63131,7 @@ fn common_persistence_boundary_commits_smart_folder_editor_draft_without_worker(
     app.settings.smart_folders = vec![saved];
     app.smart_folder_editor_draft = Some(draft);
 
-    app.persist_window_state_and_flush();
+    app.persist_window_state_and_flush(PersistScope::ProcessIsStopping);
 
     assert_eq!(app.settings.smart_folders[0].name, "新しい名前");
     assert!(app.settings.smart_folders[0].rules[0].include_descendants);
@@ -64024,11 +64024,36 @@ fn the_exit_maximized_flag_is_saved_without_touching_the_restore_rect() {
     app.last_inner_size = None;
     app.last_window_maximized = true;
 
-    app.persist_window_state_and_flush();
+    app.persist_window_state_and_flush(PersistScope::ProcessIsStopping);
 
     assert!(app.settings.window_maximized);
     assert_eq!(app.settings.window_pos, Some([100.0, 60.0]));
     assert_eq!(app.settings.window_size, Some([1440.0, 900.0]));
+}
+
+/// トレイ退避は writer を待たないが、**積むことはやめない**。
+///
+/// 待つのをやめる根拠は「読み手はディスクより先に writer の pending を見る」ことなので、
+/// 積み忘れた瞬間にその根拠が崩れて、退避中の読み直しが編集前の内容を返すようになる。
+/// ここは待たない側の経路で、積んだ内容が新しい読み手に見えることを確かめる。
+#[test]
+fn retreating_to_the_tray_still_queues_the_sidecar_it_no_longer_waits_for() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("photos");
+    std::fs::create_dir_all(&folder).expect("folder");
+    app.settings.sidecar_backup_enabled = true;
+    app.sidecar_mut(&folder)
+        .expect("sidecar backup is on")
+        .set_adjust("a.jpg", crate::adjustment::AdjustParams::default());
+
+    app.persist_window_state_and_flush(PersistScope::ProcessKeepsRunning);
+
+    // 新しい読み手。writer がまだ書き終えていなくても pending 経由で見えること。
+    let reloaded = crate::sidecar::SidecarFile::load(&folder);
+    assert!(
+        reloaded.items().contains_key("a.jpg"),
+        "退避時に積んでいないと、この読み直しは編集前の内容を返す"
+    );
 }
 
 #[cfg(windows)]
@@ -64264,6 +64289,50 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
             app.current_input_surface_for_test(),
             surface,
             "面の解決が直近の面と食い違っている: {surface:?}"
+        );
+    }
+}
+
+/// 別ウィンドウで開いているものが動画なら、十字キーは動画の面へ行く。
+///
+/// 利用者報告 (§1.0f(b)): 別ウィンドウで動画を開いていると十字キーでシークできない。
+/// **静止画では効く**ので、配り先そのものは届いている。対比をそのままテストにする。
+///
+/// 配り先は mount 済みの context で決まる (`dispatch_gamepad_batch` の doc) ので、
+/// root projection ではなく `with_active_viewer_context` の中で問う。
+#[test]
+#[cfg(windows)]
+fn what_the_detached_window_holds_decides_which_dpad_branch_runs() {
+    for (label, item, expected) in [
+        (
+            "動画",
+            GridItem::Video(PathBuf::from("C:/videos/clip.mp4")),
+            crate::app::gamepad_input::DpadRoute::Video(0),
+        ),
+        (
+            "静止画",
+            GridItem::Image(PathBuf::from("C:/photos/page.jpg")),
+            crate::app::gamepad_input::DpadRoute::Still(0),
+        ),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let window_id = 81;
+        app.build_window_context_for_test(window_id, |bundle| {
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.items = vec![item];
+            bundle.fullscreen_idx = Some(0);
+        });
+        app.detached_viewer_window_id = Some(window_id);
+        // 前面が別ウィンドウ = 直近に配った面がビューア。前面 HWND はテストから触れない。
+        app.detached_window_manager
+            .note_input_surface(crate::app::ActionSurface::Viewer);
+
+        let route = app.with_active_viewer_context(|app| app.dpad_route_for_test());
+
+        assert_eq!(
+            route,
+            Some(expected),
+            "別ウィンドウが{label}を持っているときの配り先が違う"
         );
     }
 }
