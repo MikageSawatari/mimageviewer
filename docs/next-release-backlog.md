@@ -14,6 +14,37 @@
 
 ## 1. 優先候補
 
+### 1.0f 実機確認で見つかった 3 件 (2026-08-30)
+
+**(a) R-27 の修正後も、F12 連打で動画再生が止まり別ウィンドウが閉じる。** 利用者報告。
+v3.3.0 でも同じかは未確認 (= 退行か元からかの切り分けが要る)。
+
+コードを読んだ限りの**有力な仮説**: `NativeFailed` の汎用分岐
+([presentation_transition.rs](../src/app/presentation_transition.rs) の
+`reduce_abort_transition`) が `DetachedTargetLease::Transferred(lease)` に対して
+`push_detached_release` を呼び、**後継へ移譲したばかりの session を
+`CloseDetachedSession` + `DestroyHost` で畳む**。`DestroyHost` は
+`ViewportCommand::Close` を送るので窓が閉じ、再生も止まる。
+
+確かめ方: `%APPDATA%\mimageviewer\logs\mimageviewer.log` (常時記録、起動時に前回分は
+`.prev` へ退避) の `[presentation-transition]` 行。窓が閉じる直前に
+`effect=Destroy target=DetachedWindow` が出ていれば仮説どおり。
+
+**移譲した lease を失敗時にどう扱うか**は所有権の設計判断 (leak させないことと、利用者が
+開いている窓を勝手に閉じないことの両立)。凍結ルールどおり Codex と合意してから直す。
+
+**(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
+利用者報告。**v3.2.0 / v3.3.0 でも同じなので退行ではない。** 別ウィンドウ側にキー入力が
+届いていないか、動画面の分岐に入っていない。§1.0d の R-02 と同じ「gamepad の配り先」
+まわりだが、静止画では動くので別の原因。
+
+**(c) R-02 の症状は利用者環境では再現しなかった。** 別ウィンドウを開いたままメインを
+前面にして十字キーを押すと、**v3.3.0 でもメイン一覧が動いて見えた**との報告。
+§10.2 で確認したのは「配り先と面の判定が別の情報源を使っており、食い違い得る」ことまでで、
+`active_detached_context_is_at_rest()` が真になる条件は限られる。修正 (`7f064a57`) は
+2 つの判定を 1 つにするもので構造的には正しいが、**利用者に見えていた症状の説明としては
+私の記述が証拠より強かった**。§10.2 の書き方を弱める。
+
 ### 1.0d v3.3.0 リリースタグの再レビューが P1 5 件を指摘 (2026-08-29) — **v3.3.1 の中心**
 
 出典は [docs/review-v3.3.0/README.md](review-v3.3.0/README.md) §9 (Codex による、公開済み
