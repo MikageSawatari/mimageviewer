@@ -10,7 +10,9 @@ use crate::context_menu_model::{
     ContextMenuSurface, ContextMenuViewFlags, ExternalToolMenuEntry, MenuCommand, MenuNode,
 };
 use crate::grid_item::GridItem;
-use crate::native_context_menu::{NativeContextMenuRequest, NativeContextMenuResult};
+use crate::native_context_menu::{
+    NativeContextMenuRequest, NativeContextMenuResult, ShellMenuPlacement,
+};
 
 #[cfg(windows)]
 fn primary_mouse_button_physically_down() -> bool {
@@ -264,6 +266,36 @@ fn native_external_tool_closes_fullscreen(surface: ContextMenuSurface, tool_exis
     surface == ContextMenuSurface::Fullscreen && tool_exists
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckedFileOperationSelection {
+    Empty,
+    RealOnly,
+    VirtualOnly,
+    Mixed,
+}
+
+/// チェック選択全体と、ある実ファイル操作が扱える対象数の関係を分類する。
+///
+/// 呼び出し側は `supported_count` に操作別の resolver 結果を渡す。これにより
+/// 削除・パスコピーが仮想項目を黙って除外する分岐を共有せず、同じ拒否規則を使える。
+fn classify_checked_file_operation_selection(
+    checked_count: usize,
+    supported_count: usize,
+) -> CheckedFileOperationSelection {
+    match (checked_count, supported_count) {
+        (0, _) => CheckedFileOperationSelection::Empty,
+        (_, 0) => CheckedFileOperationSelection::VirtualOnly,
+        (checked, supported) if checked == supported => CheckedFileOperationSelection::RealOnly,
+        _ => CheckedFileOperationSelection::Mixed,
+    }
+}
+
+fn checked_virtual_selection_message(operation: &str) -> String {
+    format!(
+        "圧縮ファイル / PDF 内のページが選択に含まれています。ページは{operation}できません。ページの選択を外してから実行してください"
+    )
+}
+
 #[derive(Clone)]
 struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
@@ -273,6 +305,7 @@ struct NativeGridContextMenuTarget {
     item_index: Option<usize>,
     is_folder_context: bool,
     has_checked: bool,
+    checked_count: usize,
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
@@ -287,8 +320,10 @@ impl NativeGridContextMenuTarget {
 fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) -> &'static str {
     if target.is_folder_context {
         "background"
-    } else if target.has_checked {
+    } else if target.has_checked && target.shell_paths.is_some() {
         "checked_paths"
+    } else if target.has_checked {
+        "checked_virtual_or_mixed"
     } else if target.shell_paths.is_none() {
         "virtual_item"
     } else {
@@ -955,9 +990,6 @@ impl crate::app::App {
         folder_command_target: Option<PathBuf>,
         surface: ContextMenuSurface,
     ) -> NativeGridContextMenuOutcome {
-        if !self.settings.use_native_shell_context_menu {
-            return NativeGridContextMenuOutcome::Fallback;
-        }
         let Some(hwnd) = self.main_hwnd else {
             return NativeGridContextMenuOutcome::Fallback;
         };
@@ -977,8 +1009,11 @@ impl crate::app::App {
             surface,
             explorer_folder,
         );
-        let Some(shell_paths) = target.shell_paths.clone() else {
-            return NativeGridContextMenuOutcome::Fallback;
+        let include_windows_menu = self.settings.use_native_shell_context_menu;
+        let shell_paths = if include_windows_menu {
+            target.shell_paths.clone().unwrap_or_default()
+        } else {
+            Vec::new()
         };
         let miv_items = self.context_menu_nodes(&target, in_search);
         let miv_count = menu_leaf_count(&miv_items);
@@ -1012,7 +1047,9 @@ impl crate::app::App {
                 miv_count
             ));
         }
-        let background_folder = target.is_folder_context.then(|| shell_paths[0].clone());
+        let background_folder = (include_windows_menu && target.is_folder_context)
+            .then(|| target.folder_command_target.clone())
+            .flatten();
         let request = NativeContextMenuRequest {
             hwnd,
             screen_pos: (pos.x.round() as i32, pos.y.round() as i32),
@@ -1023,6 +1060,11 @@ impl crate::app::App {
                 shell_paths
             },
             miv_items,
+            shell_menu_placement: if self.settings.show_windows_context_menu_inline {
+                ShellMenuPlacement::Inline
+            } else {
+                ShellMenuPlacement::Submenu
+            },
         };
         let native_result = crate::native_context_menu::show_native_context_menu(request);
         Self::resync_egui_modifiers_from_os(ctx);
@@ -1132,6 +1174,7 @@ impl crate::app::App {
             item_index: (!is_folder_context).then_some(idx),
             is_folder_context,
             has_checked,
+            checked_count: if has_checked { self.checked.len() } else { 0 },
             surface,
             explorer_folder,
             folder_command_target,
@@ -1180,16 +1223,7 @@ impl crate::app::App {
             surface: target.surface,
             is_folder_context: target.is_folder_context,
             has_checked: target.has_checked,
-            checked_count: if target.has_checked {
-                self.checked.len()
-            } else {
-                0
-            },
-            real_checked_count: if target.has_checked {
-                target.real_paths.len()
-            } else {
-                0
-            },
+            checked_count: target.checked_count,
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
@@ -1332,6 +1366,17 @@ impl crate::app::App {
                 None
             }
             MenuCommand::CopyPath | MenuCommand::CopyRepresentativePath => {
+                if target.has_checked
+                    && classify_checked_file_operation_selection(
+                        target.checked_count,
+                        target.real_paths.len(),
+                    ) != CheckedFileOperationSelection::RealOnly
+                {
+                    self.show_feedback_toast(checked_virtual_selection_message(
+                        "ファイルのパスとしてコピー",
+                    ));
+                    return None;
+                }
                 let text = if target.has_checked {
                     target
                         .real_paths
@@ -1516,6 +1561,15 @@ impl crate::app::App {
                 None
             }
             MenuCommand::MoveToRecycleBin => {
+                if target.has_checked
+                    && classify_checked_file_operation_selection(
+                        target.checked_count,
+                        target.delete_targets.len(),
+                    ) != CheckedFileOperationSelection::RealOnly
+                {
+                    self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                    return None;
+                }
                 if !target.delete_targets.is_empty() {
                     self.request_delete_confirm(target.delete_targets.clone());
                 }
@@ -1874,6 +1928,12 @@ impl crate::app::App {
         if !self.checked.is_empty() {
             // チェック済みがある → まとめて削除
             let targets = self.collect_checked_indexed_paths();
+            if classify_checked_file_operation_selection(self.checked.len(), targets.len())
+                != CheckedFileOperationSelection::RealOnly
+            {
+                self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                return;
+            }
             self.request_delete_confirm(targets);
         } else if let Some(idx) = self.selected {
             // 単一選択
@@ -2426,6 +2486,7 @@ mod delete_confirm_tests {
             item_index: Some(0),
             is_folder_context: false,
             has_checked: false,
+            checked_count: 0,
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
@@ -2450,6 +2511,81 @@ mod delete_confirm_tests {
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
+    }
+
+    #[test]
+    fn checked_file_operation_selection_classifies_real_virtual_and_mixed() {
+        assert_eq!(
+            classify_checked_file_operation_selection(0, 0),
+            CheckedFileOperationSelection::Empty
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 3),
+            CheckedFileOperationSelection::RealOnly
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 0),
+            CheckedFileOperationSelection::VirtualOnly
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 2),
+            CheckedFileOperationSelection::Mixed
+        );
+    }
+
+    #[test]
+    fn mixed_selection_menu_commands_toast_without_copying_or_deleting() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let mut target = target(
+            GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        target.has_checked = true;
+        target.checked_count = 2;
+        target.real_paths = vec![PathBuf::from(r"C:\media\real.jpg")];
+        target.delete_targets = vec![(0, PathBuf::from(r"C:\media\real.jpg"))];
+
+        let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ファイルのパスとしてコピーできません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+
+        app.fs_feedback_toast = None;
+        let _ =
+            app.dispatch_native_grid_context_command(&ctx, MenuCommand::MoveToRecycleBin, &target);
+        assert!(!app.show_delete_confirm);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ページは削除できません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+    }
+
+    #[test]
+    fn virtual_item_keeps_a_native_miv_only_target() {
+        let mut app = crate::app::setup_app_for_test();
+        let item = GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+            page_num: 2,
+            content_type: None,
+        };
+        let target = app.context_menu_target(
+            0,
+            item,
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+
+        assert!(target.shell_paths.is_none());
+        assert_eq!(
+            native_grid_context_menu_target_kind(&target),
+            "virtual_item"
+        );
+        assert!(!app.context_menu_nodes(&target, false).is_empty());
     }
 
     #[test]
@@ -2478,6 +2614,7 @@ mod delete_confirm_tests {
             item_index: Some(0),
             is_folder_context: false,
             has_checked: true,
+            checked_count: 1,
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,

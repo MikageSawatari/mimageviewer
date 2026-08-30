@@ -180,7 +180,6 @@ pub struct ContextMenuInput {
     pub is_folder_context: bool,
     pub has_checked: bool,
     pub checked_count: usize,
-    pub real_checked_count: usize,
     pub can_use_folder_commands: bool,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
@@ -263,14 +262,13 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     let mut nodes = Vec::new();
 
     if input.has_checked {
-        let copy_label = if input.real_checked_count == input.checked_count {
-            "選択項目のパスをコピー".to_string()
-        } else {
-            format!("選択項目のパスをコピー [{}件]", input.real_checked_count)
-        };
-        if input.real_checked_count > 0 {
-            push_group(&mut nodes, [item(MenuCommand::CopyPath, copy_label)]);
-        }
+        push_group(
+            &mut nodes,
+            [item(
+                MenuCommand::CopyPath,
+                format!("選択項目のパスをコピー [{}件]", input.checked_count),
+            )],
+        );
         if input.surface == ContextMenuSurface::Grid {
             push_group(
                 &mut nodes,
@@ -293,14 +291,14 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         if let Some(open_with) = open_with_submenu(input) {
             push_group(&mut nodes, [open_with]);
         }
-        if input.surface == ContextMenuSurface::Grid && input.real_checked_count > 0 {
+        if input.surface == ContextMenuSurface::Grid {
             push_group(
                 &mut nodes,
                 [item(
                     MenuCommand::MoveToRecycleBin,
                     format!(
                         "ゴミ箱へ移動 (タグ・評価も整理) [{}件]",
-                        input.real_checked_count
+                        input.checked_count
                     ),
                 )],
             );
@@ -540,7 +538,6 @@ mod tests {
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
-            real_checked_count: 0,
             can_use_folder_commands: false,
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
@@ -747,21 +744,20 @@ mod tests {
     }
 
     #[test]
-    fn checked_virtual_mix_uses_only_real_target_counts() {
+    fn checked_virtual_mix_displays_the_full_selection_count() {
         let mut mixed = input(ContextMenuItemKind::ZipImage, ContextMenuSurface::Grid);
         mixed.has_checked = true;
         mixed.checked_count = 5;
-        mixed.real_checked_count = 2;
         assert_labels(
             mixed,
             &[
-                "選択項目のパスをコピー [2件]",
+                "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
                 "アプリケーションで開く…",
                 "アプリケーションを追加…",
                 "外部ツールの設定…",
-                "ゴミ箱へ移動 (タグ・評価も整理) [2件]",
+                "ゴミ箱へ移動 (タグ・評価も整理) [5件]",
                 "選択解除 (Ctrl+D)",
             ],
         );
@@ -831,7 +827,6 @@ mod tests {
                     let mut case = input(kind, surface);
                     case.has_checked = has_checked;
                     case.checked_count = usize::from(has_checked) * 3;
-                    case.real_checked_count = usize::from(has_checked) * 2;
                     let nodes = build_context_menu(&case);
                     assert_eq!(nodes, normalize_menu(nodes.clone()));
                     let actual = labels(&nodes);

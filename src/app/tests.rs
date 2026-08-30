@@ -55950,6 +55950,43 @@ mod file_operation_selection_tests {
     }
 
     #[test]
+    fn delete_key_rejects_mixed_real_and_virtual_selection() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        let pdf_page = push_item(
+            &mut app,
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        );
+        app.checked = HashSet::from([image, pdf_page]);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        app.handle_delete_key(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(!app.show_delete_confirm);
+        assert!(app.delete_targets.is_empty());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ページは削除できません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+    }
+
+    #[test]
     fn shell_clipboard_paths_include_real_folders_and_reject_virtual_pages() {
         let mut app = setup_app();
 

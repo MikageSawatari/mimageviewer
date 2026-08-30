@@ -44,6 +44,13 @@ pub struct NativeContextMenuRequest {
     pub background_folder: Option<PathBuf>,
     pub paths: Vec<PathBuf>,
     pub miv_items: Vec<MenuNode>,
+    pub shell_menu_placement: ShellMenuPlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMenuPlacement {
+    Submenu,
+    Inline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,9 +89,14 @@ fn leaf_commands(nodes: &[MenuNode]) -> Vec<&MenuCommand> {
     commands
 }
 
-fn shell_menu_insert_position(nodes: &[MenuNode]) -> Option<u32> {
-    let top_level_positions = u32::try_from(nodes.len()).ok()?;
-    top_level_positions.checked_add(u32::from(!nodes.is_empty()))
+fn shell_menu_insert_position(placement: ShellMenuPlacement, nodes: &[MenuNode]) -> Option<u32> {
+    match placement {
+        ShellMenuPlacement::Submenu => Some(0),
+        ShellMenuPlacement::Inline => {
+            let top_level_positions = u32::try_from(nodes.len()).ok()?;
+            top_level_positions.checked_add(u32::from(!nodes.is_empty()))
+        }
+    }
 }
 
 fn shell_verb_offset(command_id: u32) -> Option<u32> {
@@ -145,6 +157,7 @@ pub fn invoke_shell_folder_background_verb(
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::ffi::CString;
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
@@ -171,9 +184,10 @@ mod windows_impl {
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_POPUP,
-        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+        AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetCursorPos, HMENU, MF_BYPOSITION,
+        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
+        WM_MENUCHAR,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
 
@@ -396,15 +410,7 @@ mod windows_impl {
 
         let hwnd = HWND(request.hwnd as *mut core::ffi::c_void);
         let shell_menu = if let Some(folder) = request.background_folder.as_ref() {
-            if !request.miv_items.is_empty()
-                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
-            {
-                return NativeContextMenuResult::Fallback {
-                    reason: "AppendMenuW(separator) failed".to_string(),
-                };
-            }
-
-            let shell_menu = match shell_context_menu_for_folder_background_timed(
+            match shell_context_menu_for_folder_background_timed(
                 hwnd,
                 folder,
                 target_kind,
@@ -413,70 +419,73 @@ mod windows_impl {
             ) {
                 Ok(menu) => Some(menu),
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
-            };
-            if let Some(shell_menu) = shell_menu.as_ref() {
-                let Some(insert_at) = shell_menu_insert_position(&request.miv_items) else {
-                    return NativeContextMenuResult::Fallback {
-                        reason: "too many mIV context menu positions".to_string(),
-                    };
-                };
-                if let Err(reason) = query_shell_context_menu_timed(
-                    shell_menu,
-                    menu.handle(),
-                    insert_at,
-                    target_kind,
-                    path_count,
-                    miv_count,
-                ) {
-                    return NativeContextMenuResult::Fallback { reason };
-                }
             }
-            shell_menu
         } else if request.paths.is_empty() {
             None
         } else {
-            if !request.miv_items.is_empty()
-                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
-            {
-                return NativeContextMenuResult::Fallback {
-                    reason: "AppendMenuW(separator) failed".to_string(),
-                };
-            }
-
-            let shell_menu = match shell_context_menu_for_paths_timed(
+            match shell_context_menu_for_paths_timed(
                 &request.paths,
                 target_kind,
                 path_count,
                 miv_count,
             ) {
-                Ok(menu) => menu,
+                Ok(menu) => Some(menu),
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
-            };
-            let Some(insert_at) = shell_menu_insert_position(&request.miv_items) else {
-                return NativeContextMenuResult::Fallback {
-                    reason: "too many mIV context menu positions".to_string(),
-                };
-            };
-            if let Err(reason) = query_shell_context_menu_timed(
-                &shell_menu,
-                menu.handle(),
-                insert_at,
-                target_kind,
-                path_count,
-                miv_count,
-            ) {
+            }
+        };
+
+        let mut lazy_shell_submenu = None;
+        if let Some(shell_menu) = shell_menu.as_ref() {
+            if let Err(reason) = append_root_separator(menu.handle(), !request.miv_items.is_empty())
+            {
                 return NativeContextMenuResult::Fallback { reason };
             }
-            Some(shell_menu)
-        };
+            match request.shell_menu_placement {
+                ShellMenuPlacement::Inline => {
+                    let Some(insert_at) =
+                        shell_menu_insert_position(ShellMenuPlacement::Inline, &request.miv_items)
+                    else {
+                        return NativeContextMenuResult::Fallback {
+                            reason: "too many mIV context menu positions".to_string(),
+                        };
+                    };
+                    if let Err(reason) = query_shell_context_menu_timed(
+                        shell_menu,
+                        menu.handle(),
+                        insert_at,
+                        target_kind,
+                        path_count,
+                        miv_count,
+                    ) {
+                        return NativeContextMenuResult::Fallback { reason };
+                    }
+                }
+                ShellMenuPlacement::Submenu => {
+                    let submenu = match append_lazy_shell_submenu(menu.handle()) {
+                        Ok(submenu) => submenu,
+                        Err(reason) => return NativeContextMenuResult::Fallback { reason },
+                    };
+                    lazy_shell_submenu = Some(LazyShellSubmenu::new(
+                        submenu,
+                        target_kind,
+                        path_count,
+                        miv_count,
+                    ));
+                }
+            }
+        }
 
         let stage_t0 = Instant::now();
         let forwarder = shell_menu
             .as_ref()
-            .map(ContextMenuMessageForwarder::from_context_menu);
-        let _subclass_guard = forwarder
-            .as_ref()
-            .and_then(|forwarder| MenuSubclassGuard::install(hwnd, forwarder));
+            .map(|menu| ContextMenuMessageForwarder::new(menu, lazy_shell_submenu));
+        let _subclass_guard = match forwarder.as_ref() {
+            Some(forwarder) => match MenuSubclassGuard::install(hwnd, forwarder) {
+                Ok(guard) => guard,
+                Err(reason) => return NativeContextMenuResult::Fallback { reason },
+            },
+            None => None,
+        };
         emit_native_menu_timing(
             "show_subclass",
             Some(target_kind),
@@ -524,6 +533,12 @@ mod windows_impl {
             &[("selected_id", Value::from(selected as u64))],
         );
         if selected == 0 {
+            if let Some(reason) = forwarder
+                .as_ref()
+                .and_then(ContextMenuMessageForwarder::lazy_query_error)
+            {
+                return NativeContextMenuResult::Fallback { reason };
+            }
             return NativeContextMenuResult::Canceled;
         }
 
@@ -884,6 +899,37 @@ mod windows_impl {
         result
     }
 
+    fn append_root_separator(menu: HMENU, needed: bool) -> Result<(), String> {
+        if !needed {
+            return Ok(());
+        }
+        unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
+            .map_err(|error| format!("AppendMenuW(separator) failed: {error}"))
+    }
+
+    fn append_lazy_shell_submenu(menu: HMENU) -> Result<HMENU, String> {
+        let mut submenu = MenuGuard::new(
+            unsafe { CreatePopupMenu() }
+                .map_err(|error| format!("CreatePopupMenu(Windows submenu) failed: {error}"))?,
+        );
+        append_menu_string(submenu.handle(), 0, "読み込み中…", false)
+            .map_err(|error| format!("AppendMenuW(Windows placeholder) failed: {error}"))?;
+        let label = wide_null("Windows のメニュー");
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_STRING,
+                submenu.handle().0 as usize,
+                PCWSTR(label.as_ptr()),
+            )
+        }
+        .map_err(|error| format!("AppendMenuW(Windows submenu) failed: {error}"))?;
+        let handle = submenu.handle();
+        // root menu が子 HMENU を再帰所有する。
+        submenu.release();
+        Ok(handle)
+    }
+
     fn append_miv_menu_nodes(
         menu: HMENU,
         nodes: &[MenuNode],
@@ -1140,20 +1186,111 @@ mod windows_impl {
         }
     }
 
-    struct ContextMenuMessageForwarder {
-        menu2: Option<IContextMenu2>,
-        menu3: Option<IContextMenu3>,
+    struct LazyShellSubmenu {
+        handle: HMENU,
+        initialized: Cell<bool>,
+        query_error: RefCell<Option<String>>,
+        target_kind: &'static str,
+        path_count: usize,
+        miv_count: usize,
     }
 
-    impl ContextMenuMessageForwarder {
-        fn from_context_menu(menu: &IContextMenu) -> Self {
+    impl LazyShellSubmenu {
+        fn new(
+            handle: HMENU,
+            target_kind: &'static str,
+            path_count: usize,
+            miv_count: usize,
+        ) -> Self {
             Self {
-                menu2: menu.cast::<IContextMenu2>().ok(),
-                menu3: menu.cast::<IContextMenu3>().ok(),
+                handle,
+                initialized: Cell::new(false),
+                query_error: RefCell::new(None),
+                target_kind,
+                path_count,
+                miv_count,
             }
         }
 
+        fn initialize(&self, shell_menu: &IContextMenu) {
+            if self.initialized.replace(true) {
+                return;
+            }
+            let result = (|| {
+                unsafe { DeleteMenu(self.handle, 0, MF_BYPOSITION) }
+                    .map_err(|error| format!("DeleteMenu(Windows placeholder) failed: {error}"))?;
+                let insert_at = shell_menu_insert_position(ShellMenuPlacement::Submenu, &[])
+                    .expect("submenu insertion position is always zero");
+                query_shell_context_menu_timed(
+                    shell_menu,
+                    self.handle,
+                    insert_at,
+                    self.target_kind,
+                    self.path_count,
+                    self.miv_count,
+                )
+            })();
+            if let Err(reason) = result {
+                crate::logger::log(format!(
+                    "native_context_menu: lazy Windows submenu failed: {reason}"
+                ));
+                let _ = append_menu_string(
+                    self.handle,
+                    0,
+                    "Windows のメニューを読み込めませんでした",
+                    false,
+                );
+                *self.query_error.borrow_mut() = Some(reason);
+            }
+        }
+    }
+
+    struct ContextMenuMessageForwarder {
+        shell_menu: IContextMenu,
+        menu2: Option<IContextMenu2>,
+        menu3: Option<IContextMenu3>,
+        lazy_shell_submenu: Option<LazyShellSubmenu>,
+    }
+
+    impl ContextMenuMessageForwarder {
+        fn new(menu: &IContextMenu, lazy_shell_submenu: Option<LazyShellSubmenu>) -> Self {
+            Self {
+                shell_menu: menu.clone(),
+                menu2: menu.cast::<IContextMenu2>().ok(),
+                menu3: menu.cast::<IContextMenu3>().ok(),
+                lazy_shell_submenu,
+            }
+        }
+
+        fn needs_subclass(&self) -> bool {
+            self.lazy_shell_submenu.is_some() || self.menu2.is_some() || self.menu3.is_some()
+        }
+
+        fn lazy_query_error(&self) -> Option<String> {
+            self.lazy_shell_submenu
+                .as_ref()
+                .and_then(|submenu| submenu.query_error.borrow().clone())
+        }
+
+        fn shell_messages_are_ready(&self) -> bool {
+            self.lazy_shell_submenu.as_ref().is_none_or(|submenu| {
+                submenu.initialized.get() && submenu.query_error.borrow().is_none()
+            })
+        }
+
         unsafe fn forward(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+            if msg == WM_INITMENUPOPUP
+                && let Some(submenu) = &self.lazy_shell_submenu
+                && submenu.handle.0 as usize == wparam.0
+            {
+                submenu.initialize(&self.shell_menu);
+            }
+            // 遅延 submenu をまだ開いていない間は QueryContextMenu 前なので、Shell
+            // extension へ root 側の menu message を渡さない。Query 後にだけ、Shell が
+            // 作った owner-draw / nested submenu の message を従来どおり転送する。
+            if !self.shell_messages_are_ready() {
+                return None;
+            }
             if !matches!(
                 msg,
                 WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
@@ -1185,9 +1322,12 @@ mod windows_impl {
     }
 
     impl MenuSubclassGuard {
-        fn install(hwnd: HWND, forwarder: &ContextMenuMessageForwarder) -> Option<Self> {
-            if forwarder.menu2.is_none() && forwarder.menu3.is_none() {
-                return None;
+        fn install(
+            hwnd: HWND,
+            forwarder: &ContextMenuMessageForwarder,
+        ) -> Result<Option<Self>, String> {
+            if !forwarder.needs_subclass() {
+                return Ok(None);
             }
             let installed = unsafe {
                 SetWindowSubclass(
@@ -1199,9 +1339,9 @@ mod windows_impl {
                 .as_bool()
             };
             if !installed {
-                crate::logger::log("native_context_menu: SetWindowSubclass failed");
+                return Err("SetWindowSubclass failed".to_string());
             }
-            Some(Self { hwnd, installed })
+            Ok(Some(Self { hwnd, installed }))
         }
     }
 
@@ -1285,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_insert_position_counts_only_top_level_nodes() {
+    fn inline_shell_insert_position_counts_only_top_level_nodes() {
         let item = |command, label: &str| MenuNode::Item {
             command,
             label: label.to_string(),
@@ -1308,8 +1448,29 @@ mod tests {
             },
         ];
 
-        assert_eq!(shell_menu_insert_position(&nodes), Some(4));
-        assert_eq!(shell_menu_insert_position(&[]), Some(0));
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Inline, &nodes),
+            Some(4)
+        );
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Inline, &[]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn shell_submenu_queries_from_its_own_first_position() {
+        let nodes = vec![
+            MenuNode::Separator,
+            MenuNode::Submenu {
+                label: "mIV submenu".to_string(),
+                children: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Submenu, &nodes),
+            Some(0)
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@
     <p class="note">最大化を解いたときは、前回終了時の位置とサイズに戻ります。最小化したまま終了した場合、次回は最小化されず、その前に表示していた状態で起動します。</p>
 
     <h2>環境設定（起動と連携 → エクスプローラ連携）</h2>
-    <p>環境設定の「起動と連携 → エクスプローラ連携」では、グリッド右クリックで Windows 標準メニューを使うかどうか、Windows の「送る」メニューへの登録を設定できます。SendTo 登録後はエクスプローラーでファイルやフォルダを右クリックし、送る → mImageViewer から開けます。</p>
+    <p>環境設定の「起動と連携 → エクスプローラ連携」では、グリッド右クリックへ Windows の項目を含めるか、同じ階層へ併記するか、Windows の「送る」メニューへの登録を設定できます。SendTo 登録後はエクスプローラーでファイルやフォルダを右クリックし、送る → mImageViewer から開けます。</p>
     <p class="note">複数のファイルを選択してまとめて送った場合は、そのうちの 1 つを開きます。複数を同時に開くことはできません（画像はフルスクリーン表示、フォルダや本はその中身を一覧表示します）。</p>
     <div class="table-wrap">
       <table>
@@ -147,7 +147,8 @@
           <tr><th>設定 / ボタン</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>実ファイル/実フォルダでは Windows 標準の右クリックメニューを使う</td><td>右クリックメニューの表示を切り替えます。ON のとき、実ファイル / 実フォルダでは Windows Shell 標準項目を表示します。OFF のときや ZIP/PDF 内ページなど仮想項目では mImageViewer 独自メニューを使います。<kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> / <kbd>V</kbd> のファイル操作は、この設定に関わらず Windows 標準動作です。</td></tr>
+          <tr><td>実ファイル/実フォルダの右クリックに Windows のメニューを含める</td><td>ON のとき、実ファイル / 実フォルダの native メニューへ Windows Shell 項目を追加します。OFF でも mImageViewer 項目は Windows と同じ見た目のメニューで表示します。<kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> / <kbd>V</kbd> のファイル操作は、この設定に関わらず Windows 標準動作です。</td></tr>
+          <tr><td>Windows のメニューを併記する</td><td>OFF（既定）では Windows 項目を末尾の「Windows のメニュー」にまとめ、サブメニューを開くまで読み込みません。ON では従来どおり mImageViewer 項目と同じ階層へ並べます。</td></tr>
           <tr><td>SendTo に登録</td><td>ユーザーごとの SendTo フォルダに <code>mImageViewer.lnk</code> を作成します。インストーラー版では配布用の <code>mimageviewer.exe</code> を登録します。</td></tr>
           <tr><td>SendTo から削除</td><td>登録済みの <code>mImageViewer.lnk</code> を削除します。mImageViewer 本体や設定は削除しません。</td></tr>
           <tr><td>SendTo フォルダを開く</td><td>現在の SendTo フォルダをエクスプローラーで開き、登録されたショートカットを確認できます。</td></tr>
