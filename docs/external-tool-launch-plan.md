@@ -310,7 +310,7 @@ Codex Sol による read-only 調査。file:line は調査時点の master (6464
 pub struct ExternalTool {
     pub id: ExternalToolId,          // 安定 ID (並べ替えやキー割り当てと独立)
     pub name: String,                // 表示名。空なら exe の file_stem
-    pub executable: Option<PathBuf>, // None = OS の関連付けで開く
+    pub launch: ExternalToolLaunch,  // 何として起動するか (下記)
     pub arguments: String,           // 引数テンプレート (既定 "{file}")
     pub working_directory: Option<PathBuf>,
     pub payload: PayloadPolicy,      // 何を渡すか (§4.3)
@@ -324,8 +324,30 @@ pub struct ExternalTool {
 }
 ```
 
-`executable: None` を「関連付けで開く」とするのは NeeView と同じ。これで登録リストに関連付け起動も混ぜられ、
-いまの `recent_open_with_apps` / `custom_open_with_apps` の 2 本立てを 1 本に畳める。
+```rust
+pub enum ExternalToolLaunch {
+    Executable(PathBuf),                // 自分で spawn する。引数テンプレートが効く
+    Association { handler_id: String },  // シェルに起動させる。引数は使えない
+    OsDefault,                          // OS の既定アプリで開く。引数は使えない
+}
+```
+
+登録リストに関連付け起動も混ぜられるようにするのは NeeView と同じ。これで
+`recent_open_with_apps` / `custom_open_with_apps` の 2 本立てを 1 本に畳める。
+
+**`Association` を `Executable(パス)` で代用してはならない (2026-08-30、実機で踏んだ)。**
+関連付けアプリの実行ファイルパスを `IAssocHandler::GetName()` から取っていたが、この API が
+実行ファイルのパスを返すのは素の Win32 アプリのときだけで、**UWP / Store アプリでは ProgID や
+パッケージ識別子が返る**。利用者の環境では「フォト」「TsubameViewer」の 2 件が文字列
+`フォト` / `TsubameViewer` として保存され、「ペイント」は `C:\Program Files\WindowsApps\...` という
+ACL 保護下の到達できないパスとして保存されていた。3 件とも `Command::new` では起動できない。
+関連付けは**パスを取り出さずシェルに起動させる** (`IAssocHandler::Invoke` に対象ファイルの
+`IDataObject` を渡す) こと。ハンドラは起動時に拡張子から再列挙し、`handler_id` と
+`GetName()` の一致で引き当てる (COM ポインタは永続化できない)。
+
+`Association` と `OsDefault` では**引数テンプレートと作業フォルダーが効かない**。
+起動を決めるのはシェルなので、設定 UI 側でも入力を無効化する。`payload` / `spread` などの
+「何を渡すか」のポリシーはどの起動型でも意味があるので残す。
 
 `for_editing` は round-trip 監視 (§4.8) の対象を決めるだけでなく、**追加ダイアログの既定値を出し分ける**
 のに使う。「編集に使う」を選んだツールは `payload = Original` / `spread = MainPageOnly` を既定にする。
@@ -601,9 +623,18 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 (action 名 = 設定保存名 = 既定キー = scope が固定 enum に結び付いている) を壊さないため。
 スロット番号とツールの対応は並べ替えで変わるので、UI 上でスロット番号を明示する。
 
-**既存データの移行 (必須)**: `custom_open_with_apps: Vec<RecentApp>` は**リリース済み**なので、
-`RecentApp { display_name, exe_path }` → `ExternalTool { name, executable, arguments: "{file}", ... }` へ
-移行する。`recent_open_with_apps` は履歴なので移行せず、「関連付けアプリから選ぶ」の候補として残す。
+**既存データの移行 (必須)**
+
+- `custom_open_with_apps: Vec<RecentApp>` は**リリース済み**なので、
+  `RecentApp { display_name, exe_path }` → `ExternalTool` へ移行する。中身は利用者が自分で選んだ
+  EXE なので `ExternalToolLaunch::Executable` になる。
+- `recent_open_with_apps` は履歴なので `external_tools` へは移さず、「関連付けアプリから選ぶ」の
+  候補として残す。**ただしこちらもリリース済みで、`exe_path` に起動できない値が入っている**
+  (§4.1 の実機事例)。**テーブル内で一度だけ分類し直す**: 実在するファイルパスなら `Executable`、
+  それ以外は `Association { handler_id: その文字列 }`。分類は純関数にしてテストし、
+  移行は `schema_meta` の marker で一度きりにする。
+- `external_tools` テーブルは**未出荷**なので、起動型を入れるためのスキーマ変更に
+  マイグレーションは要らない (CLAUDE.md「永続データ・スキーマ変更時の判断」)。
 
 ### 4.11 安全性
 
@@ -623,6 +654,7 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 | **P0 (実装済み 2026-08-29)** | `ExternalTool` 型 + 設定 DB (complex field) + 既存 `custom_open_with_apps` からの移行 + 移行テスト | S |
 | **P1 (実装済み 2026-08-30)** | 環境設定「外部ツール」ページ、引数テンプレート、作業フォルダー、起動失敗通知、`OsStr` 化 | M |
 | **P1b (実装済み 2026-08-30)** | ネイティブ / フォールバック右クリックへの差し込み、フォールバックの登録先を `external_tools` へ載せ替え、legacy 書き戻しの停止 | S |
+| **P1c (実装中 2026-08-30)** | 関連付けアプリをシェルに起動させる (`ExternalToolLaunch` 3 分岐、`IAssocHandler::Invoke`、`recent_open_with_apps` の分類移行)。実機で踏んだ不具合の修正 | M |
 | **P2** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、ツールバー / キースロット | M |
 | **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
 | **P4** | `VideoPolicy::CurrentFrame`、`SpreadPolicy::Merged` の合成、`{container}`/`{entry}`/`{page}`/`{time}` | M |
