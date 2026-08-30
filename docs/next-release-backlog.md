@@ -16,22 +16,44 @@
 
 ### 1.0f 実機確認で見つかった 3 件 (2026-08-30)
 
-**(a) R-27 の修正後も、F12 連打で動画再生が止まり別ウィンドウが閉じる。** 利用者報告。
-v3.3.0 でも同じかは未確認 (= 退行か元からかの切り分けが要る)。
+**(a) F12 連打で動画再生が止まり、別ウィンドウが閉じる。** 利用者報告。
+**v3.3.0 でも起きる (連打を続けると再現)。退行ではなく、起きやすくなった。**
 
-コードを読んだ限りの**有力な仮説**: `NativeFailed` の汎用分岐
-([presentation_transition.rs](../src/app/presentation_transition.rs) の
-`reduce_abort_transition`) が `DetachedTargetLease::Transferred(lease)` に対して
-`push_detached_release` を呼び、**後継へ移譲したばかりの session を
-`CloseDetachedSession` + `DestroyHost` で畳む**。`DestroyHost` は
-`ViewportCommand::Close` を送るので窓が閉じ、再生も止まる。
+**原因はログで確定した。私が最初に立てた仮説 (`push_detached_release` が移譲した lease を
+畳む) は外れ。**実際は **自分で送った `ViewportCommand::Close` が、再利用された同じ
+ViewportId の新しい viewport に届き、利用者が × を押したのと同じ扱いになる**。
 
-確かめ方: `%APPDATA%\mimageviewer\logs\mimageviewer.log` (常時記録、起動時に前回分は
-`.prev` へ退避) の `[presentation-transition]` 行。窓が閉じる直前に
-`effect=Destroy target=DetachedWindow` が出ていれば仮説どおり。
+実ログ (`mimageviewer.log`、transition 29 → 30):
 
-**移譲した lease を失敗時にどう扱うか**は所有権の設計判断 (leak させないことと、利用者が
-開いている窓を勝手に閉じないことの両立)。凍結ルールどおり Codex と合意してから直す。
+```
+1545.452  transition=29 target=fullscreen action=Destroy ... viewport_command=Close  ← 自分で送る
+1545.532  F12 → transition=30 target=detached phase=begin host=0x0
+1545.564  [detached-viewer] show viewport: ... host=hwnd=0        ← 同じ ViewportId を再表示
+1545.564  [detached-viewer] viewport close_requested: presentation=None host=hwnd=0  ← ★
+1545.566  active-detached-session action=clear reason=handle_fullscreen_close_request
+1545.575  presentation-transition id=30 target=DetachedWindow effect=Destroy hwnd=0x0
+1545.594  [decoder-lifecycle] video-decode thread exit: live_count=0                 ← 再生停止
+```
+
+★ の行は **`presentation=None` かつ `host=hwnd=0`** — まだ窓が無い viewport なので、
+**利用者が閉じられるはずがない**。112ms 前に自分が送った Close が届いている。
+
+[ui_fullscreen.rs:14591](../src/ui_fullscreen.rs) は
+`ctx.input(|i| i.viewport().close_requested())` を無条件に `close_fs = true` にしており、
+**自分が送った Close と利用者の × を区別できない**。
+
+**なぜ v3.3.0 より起きやすいか**: R-27 の lease 移譲で同じ window_id / ViewportId が
+そのまま後継へ渡るため、viewport の再表示が早く・同一 id で起きる。stale な Close が
+新しい viewer に当たる確率が上がる。**Codex が案 B を否定したときに挙げた危険
+(「`ViewportEvent::Close` を利用者の close と解釈して後継ごと閉じる」) が、
+現行経路にも存在していた**ということ。
+
+**修正方向は 2 つ。どちらも detached の identity 設計なので Codex と合意してから直す。**
+
+1. 送った Close を identity 付き (window_id + host incarnation) で覚え、対応する
+   `close_requested` を 1 回だけ消費する。時間窓ではなく世代照合。
+2. host の incarnation ごとに ViewportId を変える。stale Close が新しい viewport に
+   そもそも届かなくなる。
 
 **(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
 利用者報告。**v3.2.0 / v3.3.0 でも同じなので退行ではない。** 別ウィンドウ側にキー入力が
