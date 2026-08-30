@@ -56598,7 +56598,9 @@ mod file_operation_selection_tests {
         app.checked.insert(zip_page);
         assert_eq!(
             app.collect_shell_clipboard_paths(),
-            Err(ShellClipboardSelectionError::UncopyableItem),
+            Err(ShellClipboardSelectionError::UncopyableItem(Some(
+                crate::grid_item::FileOperationRefusal::VirtualPage
+            ))),
             "mixed real + virtual checked selections must not silently copy only the real subset",
         );
 
@@ -56615,7 +56617,9 @@ mod file_operation_selection_tests {
         app.selected = Some(zip_page);
         assert_eq!(
             app.collect_shell_clipboard_paths(),
-            Err(ShellClipboardSelectionError::UncopyableItem),
+            Err(ShellClipboardSelectionError::UncopyableItem(Some(
+                crate::grid_item::FileOperationRefusal::VirtualPage
+            ))),
             "a selected virtual item should produce the same visible rejection path",
         );
     }

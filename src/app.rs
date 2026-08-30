@@ -3193,7 +3193,9 @@ pub(crate) struct CurrentFolderWatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellClipboardSelectionError {
-    UncopyableItem,
+    /// 実パスを持たない item が選択に含まれていた。理由を持たせるのは、断り方を
+    /// 種別ごとに正しく言うため (docs/item-kind-capability-matrix.md §6-8)。
+    UncopyableItem(Option<crate::grid_item::FileOperationRefusal>),
 }
 
 /// ユーザー画像スタンプの埋め込み worker (R2-6) の進行状態。file picker で選んだ画像を
@@ -36428,7 +36430,11 @@ impl App {
             let mut paths = Vec::with_capacity(self.checked.len());
             for &idx in &self.checked {
                 let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
-                    return Err(ShellClipboardSelectionError::UncopyableItem);
+                    return Err(ShellClipboardSelectionError::UncopyableItem(
+                        self.items
+                            .get(idx)
+                            .and_then(GridItem::file_operation_refusal),
+                    ));
                 };
                 paths.push(path.to_path_buf());
             }
@@ -36442,7 +36448,9 @@ impl App {
             return Ok(Vec::new());
         };
         let Some(path) = item.drag_source_path() else {
-            return Err(ShellClipboardSelectionError::UncopyableItem);
+            return Err(ShellClipboardSelectionError::UncopyableItem(
+                item.file_operation_refusal(),
+            ));
         };
         Ok(vec![path.to_path_buf()])
     }
@@ -36454,10 +36462,14 @@ impl App {
     ) {
         let paths = match self.collect_shell_clipboard_paths() {
             Ok(paths) => paths,
-            Err(ShellClipboardSelectionError::UncopyableItem) => {
-                self.show_feedback_toast(
-                    "ZIP内の画像やPDFページはファイルとしてコピー/カットできません".to_string(),
-                );
+            Err(ShellClipboardSelectionError::UncopyableItem(reason)) => {
+                let message = reason
+                    .map(|reason| reason.message("コピー / カット"))
+                    .unwrap_or_else(|| {
+                        crate::grid_item::FileOperationRefusal::VirtualPage
+                            .message("コピー / カット")
+                    });
+                self.show_feedback_toast(message);
                 return;
             }
         };

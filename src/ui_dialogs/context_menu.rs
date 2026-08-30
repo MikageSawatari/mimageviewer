@@ -1905,13 +1905,16 @@ impl crate::app::App {
             }
             self.request_delete_confirm(targets);
         } else if let Some(idx) = self.selected {
-            // 単一選択
-            let Some(path) = self
-                .items
-                .get(idx)
-                .and_then(GridItem::drag_source_path)
-                .map(|p| p.to_path_buf())
-            else {
+            // 単一選択。実パスが無いときは黙って戻らず理由を出す。右クリックでは
+            // そもそも削除項目を出さないので、`Delete` キーだけが無反応だった
+            // (docs/item-kind-capability-matrix.md §6-5)。
+            let Some(item) = self.items.get(idx) else {
+                return;
+            };
+            let Some(path) = item.drag_source_path().map(|p| p.to_path_buf()) else {
+                if let Some(reason) = item.file_operation_refusal() {
+                    self.show_feedback_toast(reason.message("削除"));
+                }
                 return;
             };
             self.request_delete_confirm(vec![(idx, path)]);
