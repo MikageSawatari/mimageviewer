@@ -199,6 +199,8 @@ fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
     }
 }
 
+pub(crate) const CHECKED_SELECTION_OVERLAY_ID: &str = "checked_selection_count_overlay";
+
 /// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
 fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
     let Some(count_label) = checked_selection_overlay_label(checked_count) else {
@@ -206,7 +208,7 @@ fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> 
     };
     let top_offset = ctx.available_rect().top() + 8.0;
     let mut clear_clicked = false;
-    egui::Area::new(egui::Id::new("checked_selection_count_overlay"))
+    egui::Area::new(egui::Id::new(CHECKED_SELECTION_OVERLAY_ID))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
         .show(ctx, |ui| {

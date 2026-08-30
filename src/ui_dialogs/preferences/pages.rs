@@ -932,15 +932,31 @@ pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut Preferenc
     refresh_send_to_status_if_needed(state);
 
     anchored(ui, state, "explorer/context-menu-inline", |ui, state| {
-        ui.label(egui::RichText::new("右クリックメニュー").strong());
+        // 見出しで「mIV の」と言い切る。同じページの下にある SendTo は
+        // **エクスプローラー側**の右クリックの話なので、区別が要る (2026-08-30 利用者指摘)。
+        ui.label(egui::RichText::new("mIV の右クリックメニュー").strong());
         ui.add_space(4.0);
-        ui.checkbox(
-            &mut state.settings.show_windows_context_menu_inline,
-            "Windows のメニューを併記する",
-        )
-        .on_hover_text(
-            "ON では Windows 由来の項目を mImageViewer の項目と同じ階層へ並べます。\
-             OFF (既定) では末尾の「Windows のメニュー」内へまとめます。",
+        // チェックボックスをやめてラジオにする。ON/OFF のどちらが何なのかが読めず、
+        // しかも一番使われる既定 (= サブメニュー) 側が文言に出てこなかった。
+        let mut inline = state.settings.show_windows_context_menu_inline;
+        ui.radio_value(&mut inline, false, "Windows のメニューをサブメニューにする");
+        ui.radio_value(
+            &mut inline,
+            true,
+            "Windows のメニューを mIV のメニューと一緒に表示する",
+        );
+        state.settings.show_windows_context_menu_inline = inline;
+        ui.add_space(4.0);
+        // 説明はホバーではなく常時見せる。意味が読めなかった原因がホバー任せだったため。
+        // 設定検索から直接この項目へ飛ぶと見出しが視界に入らないことがあるので、
+        // 1 行目でどちらの右クリックの話かを明示する。
+        ui.label(
+            egui::RichText::new(
+                "mIV でファイルやフォルダを右クリックしたときに出る Windows の項目の並べ方です。\n\
+                 Windows のメニューは表示に少し時間がかかることがあるため、サブメニューにすると\n\
+                 最初の表示が速くなります。",
+            )
+            .weak(),
         );
     });
     ui.add_space(10.0);

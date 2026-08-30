@@ -142,8 +142,14 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "explorer/context-menu-inline",
         ExplorerIntegration,
-        "Windows のメニューを併記する",
-        ["コンテキストメニュー", "shell", "サブメニュー", "同じ階層"]
+        "mIV の右クリックメニュー",
+        [
+            "コンテキストメニュー",
+            "shell",
+            "サブメニュー",
+            "併記",
+            "windows のメニュー"
+        ]
     ),
     entry!(
         "explorer/sendto",
