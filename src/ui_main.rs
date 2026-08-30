@@ -1485,27 +1485,44 @@ fn toolbar_combo_width(ui: &egui::Ui, inner_width: f32, selected_text: &str) -> 
     actual + 2.0 * padding
 }
 
-/// ComboBox を置く前に、入らなければ明示的に次の行へ送る。
+/// ツールバーの ComboBox を、**実測幅の場所を親に取ってから**描く。
 ///
 /// **`ComboBox` は単体では折り返さない。** egui の `button_frame` は
 /// `ui.advance_cursor_after_rect` でカーソルを進めるだけで、**折り返し判定
 /// (`Layout::next_frame`) を一度も通らない**。残り幅にそのまま置かれ、入らなければ
-/// 右端からはみ出したまま描かれる。ツールバーの ComboBox は必ずこれを先に呼ぶこと。
+/// 右端からはみ出したまま描かれる。
 ///
-/// 判定は egui の `Layout::next_frame` と同じ — 残り幅が足りず、かつ行頭でないときだけ
-/// 折り返す (行頭なら折り返しても状況は変わらないので置く)。
+/// そこで、先に `allocate_ui_with_layout` で実測幅の矩形を取る。この確保は
+/// `Layout::next_frame` を通るので、**入らなければ egui が自分で次の行へ送る**。
+/// `toolbar_label` と、お気に入り / スマートフォルダ / タグの ComboBox が元から
+/// 使っていた手法で、ツールバーの折り返しはこの 1 つの機構に揃える。
 ///
-/// ⚠ **`ui.available_width()` は使えない。** 折り返しレイアウトでは
-/// 「折り返した後に使える最大幅」(= 行の全幅) を返す仕様で、**置くたびに減らない**。
-/// egui 自身が折り返し判定に使うのは `available_rect_before_wrap`(= カーソルから
-/// max_rect 右端までの残り) のほうなので、こちらを使う。
-fn toolbar_wrap_before_combo(ui: &mut egui::Ui, inner_width: f32, selected_text: &str) {
-    let needed = toolbar_combo_width(ui, inner_width, selected_text);
-    let remaining = ui.available_rect_before_wrap().width();
-    let at_row_start = ui.cursor().left() <= ui.max_rect().left();
-    if !at_row_start && remaining < needed {
-        ui.end_row();
-    }
+/// `enabled` を引数に取るのは順序を型で固定するため。**`add_enabled_ui` の中で
+/// 折り返そうとしても効かない** — 子 `Ui` は今のカーソル位置から始まるので
+/// `max_rect().left()` が行頭と一致し、折り返しは子の内側だけで起きる。呼んでいるのに
+/// 何も起きないまま右端からはみ出す (利用者報告 2026-08-30、ソートのドロップダウン)。
+/// ここで先に場所を取ってから子を作れば、その並びを間違えようがない。
+///
+/// 表示文字列を**受け取って closure へ渡す**のは、測る文字列と出す文字列が別々に
+/// 綴られないようにするため。借りて渡す形にすると、呼び出し側が別の値を
+/// `selected_text` に入れても気付けない。
+fn toolbar_combo_slot<R>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    inner_width: f32,
+    selected_text: String,
+    add: impl FnOnce(&mut egui::Ui, String) -> R,
+) -> R {
+    let width = toolbar_combo_width(ui, inner_width, &selected_text);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_enabled_ui(enabled, |ui| add(ui, selected_text))
+                .inner
+        },
+    )
+    .inner
 }
 
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
@@ -7744,11 +7761,11 @@ impl App {
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
-                    toolbar_wrap_before_combo(ui, 160.0, &active_book_name);
-                    let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
+                    let combo = toolbar_combo_slot(ui, true, 160.0, active_book_name.clone(), |ui, text| {
+egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         .width(160.0)
                         .height(320.0)
-                        .selected_text(active_book_name.clone())
+                        .selected_text(text)
                         .show_ui(ui, |ui| {
                             apply_toolbar_style(ui);
                             match toolbar_book_rows.as_ref() {
@@ -7769,7 +7786,8 @@ impl App {
                                     ui.label(egui::RichText::new("本棚を読み込み中…").weak());
                                 }
                             }
-                        });
+                        })
+});
                     toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
                     let add_resp = ui
                         .add_enabled(has_book_add_target, egui::Button::new("追加"))
@@ -7870,11 +7888,11 @@ impl App {
                             } else {
                                 format!("{} 列", self.settings.grid_cols)
                             };
-                            toolbar_wrap_before_combo(ui, 64.0, &current_text);
-                            let combo = egui::ComboBox::from_id_salt("toolbar_cols_combo")
+                            let combo = toolbar_combo_slot(ui, true, 64.0, current_text, |ui, text| {
+egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .width(64.0)
                                 .height(TOOLBAR_COLS_COMBO_HEIGHT)
-                                .selected_text(current_text)
+                                .selected_text(text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
                                     for &cols in &tb_cols {
@@ -7898,7 +7916,8 @@ impl App {
                                             self.set_grid_view_mode(GridViewMode::Details);
                                         }
                                     }
-                                });
+                                })
+});
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -7976,11 +7995,11 @@ impl App {
                             } else {
                                 self.settings.thumb_aspect.label().to_string()
                             };
-                            toolbar_wrap_before_combo(ui, 120.0, &current_text);
-                            let combo = egui::ComboBox::from_id_salt("toolbar_aspect_combo")
+                            let combo = toolbar_combo_slot(ui, true, 120.0, current_text, |ui, text| {
+egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 .width(120.0)
                                 .height(TOOLBAR_ASPECT_COMBO_HEIGHT)
-                                .selected_text(current_text)
+                                .selected_text(text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
                                     if auto_visible {
@@ -8000,7 +8019,8 @@ impl App {
                                             activate_aspect(self, aspect);
                                         }
                                     }
-                                });
+                                })
+});
                             toolbar_combo_popup_open |=
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
@@ -8113,21 +8133,27 @@ impl App {
                             }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            ui.add_enabled_ui(!sort_disabled, |ui| {
-                                let current_text = if book_sort_locked {
-                                    "固定".to_string()
-                                } else if self.items_are_bookmark_view {
-                                    self.bookmark_view_sort.short_label().to_string()
-                                } else if self.items_are_rating_view {
-                                    self.rating_view_sort.short_label().to_string()
-                                } else {
-                                    self.settings.sort_order.short_label().to_string()
-                                };
-                                toolbar_wrap_before_combo(ui, 100.0, &current_text);
-                                let combo = egui::ComboBox::from_id_salt("toolbar_sort_combo")
+                            let current_text = if book_sort_locked {
+                                "固定".to_string()
+                            } else if self.items_are_bookmark_view {
+                                self.bookmark_view_sort.short_label().to_string()
+                            } else if self.items_are_rating_view {
+                                self.rating_view_sort.short_label().to_string()
+                            } else {
+                                self.settings.sort_order.short_label().to_string()
+                            };
+                            // 場所を先に取ってから無効化する。逆順だと折り返しが子 UI の
+                            // 中だけで起き、右端からはみ出したまま描かれる。
+                            let combo = toolbar_combo_slot(
+                                ui,
+                                !sort_disabled,
+                                100.0,
+                                current_text,
+                                |ui, text| {
+                                egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
                                     .height(TOOLBAR_SORT_COMBO_HEIGHT)
-                                    .selected_text(current_text)
+                                    .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
                                         for &order in &tb_sorts {
@@ -8192,24 +8218,24 @@ impl App {
                                                 }
                                             }
                                         }
-                                    });
-                                // 固定中はコンボが無効なので、disabled 専用ツールチップで
-                                // 「固定」表示のホバー時に固定理由を出す。
-                                let combo_id = combo.response.id;
-                                if book_sort_locked {
-                                    combo.response.hover_tip_disabled(
-                                        "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                    );
-                                }
-                                toolbar_combo_popup_open |=
-                                    egui::ComboBox::is_open(ctx, combo_id);
-                            });
+                                    })
+                                },
+                            );
+                            // 固定中はコンボが無効なので、disabled 専用ツールチップで
+                            // 「固定」表示のホバー時に固定理由を出す。
+                            let combo_id = combo.response.id;
+                            if book_sort_locked {
+                                combo.response.hover_tip_disabled(
+                                    "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
+                                );
+                            }
+                            toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo_id);
                         }
                     }
                     if self.items_are_subfolder_expansion_view {
                         let current_mode = self.settings.subfolder_expansion_order;
-                        toolbar_wrap_before_combo(ui, 132.0, current_mode.label());
-                        let combo = egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
+                        let combo = toolbar_combo_slot(ui, true, 132.0, current_mode.label().to_string(), |ui, text| {
+egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .width(132.0)
                             .height(TOOLBAR_SORT_COMBO_HEIGHT)
                             .selected_text(current_mode.label())
@@ -8228,7 +8254,8 @@ impl App {
                                         toolbar_sort_changed = true;
                                     }
                                 }
-                            });
+                            })
+});
                         toolbar_combo_popup_open |=
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     }
@@ -21747,7 +21774,7 @@ mod decide_drag_payload_tests {
 /// `advance_cursor_after_rect` を使うので **折り返し判定を一度も通らない**。
 #[cfg(test)]
 mod toolbar_wrap_tests {
-    use super::{toolbar_combo_width, toolbar_text_width, toolbar_wrap_before_combo};
+    use super::{toolbar_combo_slot, toolbar_combo_width, toolbar_text_width};
     use eframe::egui;
 
     const SELECTED_TEXTS: &[&str] = &[
@@ -21819,10 +21846,10 @@ mod toolbar_wrap_tests {
         }
     }
 
-    /// **ComboBox は折り返し判定を通らない** ので、`toolbar_wrap_before_combo` を
-    /// 先に呼ばないとパネル右端からはみ出す。呼べば出ない。
+    /// **ComboBox は折り返し判定を通らない** ので、`toolbar_combo_slot` で場所を
+    /// 取らないとパネル右端からはみ出す。取れば出ない。
     #[test]
-    fn a_combo_stays_inside_the_panel_only_when_we_wrap_for_it() {
+    fn a_combo_stays_inside_the_panel_only_when_we_reserve_its_place() {
         let mut without = 0usize;
         let mut with = 0usize;
         for w in 500..1200 {
@@ -21842,11 +21869,12 @@ mod toolbar_wrap_tests {
             });
             let b = run(panel, |ui, right, out| {
                 for &text in SELECTED_TEXTS {
-                    toolbar_wrap_before_combo(ui, 120.0, text);
-                    let combo = egui::ComboBox::from_id_salt(text)
-                        .width(120.0)
-                        .selected_text(text)
-                        .show_ui(ui, |_| {});
+                    let combo = toolbar_combo_slot(ui, true, 120.0, text.to_string(), |ui, t| {
+                        egui::ComboBox::from_id_salt(text)
+                            .width(120.0)
+                            .selected_text(t)
+                            .show_ui(ui, |_| {})
+                    });
                     if combo.response.rect.right() > right + 0.5 {
                         out.lock()
                             .unwrap()
@@ -21862,6 +21890,49 @@ mod toolbar_wrap_tests {
             "この前提が崩れたらテストの意味がない (折り返さない ComboBox は溢れるはず): {without}"
         );
         assert_eq!(with, 0, "折り返しを入れてもはみ出した幅が {with} 件ある");
+    }
+
+    /// **無効化しても折り返しが効くこと。**
+    ///
+    /// 元の実装は `add_enabled_ui` の中で折り返そうとしていた。子 `Ui` は今のカーソル
+    /// 位置から始まるので `max_rect().left()` が行頭と一致し、折り返しは子の内側だけで
+    /// 起きる。**呼んでいるのに何も起きない**まま右端からはみ出していた
+    /// (利用者報告 2026-08-30、ソートのドロップダウン)。
+    ///
+    /// `toolbar_combo_slot` は場所を取ってから無効化するので、有効・無効のどちらでも
+    /// 同じように折り返す。`enabled` を無視する変異はこの 2 行目で落ちる。
+    #[test]
+    fn a_disabled_combo_wraps_exactly_like_an_enabled_one() {
+        for enabled in [true, false] {
+            let mut overflowed = 0usize;
+            for w in 500..1200 {
+                let panel = w as f32;
+                let over = run(panel, |ui, right, out| {
+                    for &text in SELECTED_TEXTS {
+                        let combo =
+                            toolbar_combo_slot(ui, enabled, 120.0, text.to_string(), |ui, t| {
+                                // 場所を取るだけでなく、確かに無効化していること。
+                                // これが無いと `enabled` を捨てる変異を検出できない。
+                                assert_eq!(ui.is_enabled(), enabled);
+                                egui::ComboBox::from_id_salt(text)
+                                    .width(120.0)
+                                    .selected_text(t)
+                                    .show_ui(ui, |_| {})
+                            });
+                        if combo.response.rect.right() > right + 0.5 {
+                            out.lock()
+                                .unwrap()
+                                .push(combo.response.rect.right() - right);
+                        }
+                    }
+                });
+                overflowed += usize::from(!over.is_empty());
+            }
+            assert_eq!(
+                overflowed, 0,
+                "enabled={enabled} で {overflowed} 通りの幅がはみ出した"
+            );
+        }
     }
 
     /// ラベルの固定幅は下限であって上限ではない。
