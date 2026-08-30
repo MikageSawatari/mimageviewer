@@ -11834,8 +11834,8 @@ pub struct App {
     pub(crate) favorite_default_clear_confirm: Option<FavoriteDefaultClearConfirm>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻, 表示秒数)。
     /// フルスクリーン / グリッド共通。命名の `fs_` プレフィックスはフルスクリーン
-    /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
-    /// `FEEDBACK_TOAST_DURATION`、複数行の案内文は長めを使う。
+    /// 専用だった頃の名残。通常は本文の文字数から表示秒数を決め、必要な箇所だけ
+    /// `show_feedback_toast_with_duration` で明示する。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
     /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
     /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
@@ -59767,10 +59767,10 @@ impl App {
         self.pdf_native_rerender_pending(idx, true, false)
     }
 
-    /// 右上フィードバック表示を設定する (既定の表示時間)。
-    /// 短い確認系トースト (レーティング変更 / スロット適用など) 向け。
+    /// 右上フィードバック表示を設定する (本文の文字数に応じた表示時間)。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
-        self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
+        let duration_secs = crate::ui_fullscreen::feedback_toast_duration(&text);
+        self.show_feedback_toast_with_duration(text, duration_secs);
     }
 
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
@@ -60096,8 +60096,7 @@ impl App {
     }
 
     /// 右上フィードバック表示を設定する (表示時間を明示指定)。
-    /// 複数行の案内文 (例: 動画 pin の操作ガイド) は既定 1.2 秒では読み切れないため、
-    /// 長め (4〜5 秒) を渡す。
+    /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
     pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
         self.show_native_video_overlay_toast(text.clone(), false);

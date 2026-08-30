@@ -103,6 +103,10 @@ fn shell_verb_offset(command_id: u32) -> Option<u32> {
     command_id.checked_sub(SHELL_ID_FIRST)
 }
 
+fn can_keep_miv_menu_after_shell_failure(miv_count: usize) -> bool {
+    miv_count > 0
+}
+
 #[cfg(windows)]
 pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeContextMenuResult {
     windows_impl::show_native_context_menu(request)
@@ -418,6 +422,12 @@ mod windows_impl {
                 miv_count,
             ) {
                 Ok(menu) => Some(menu),
+                Err(reason) if can_keep_miv_menu_after_shell_failure(miv_count) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: Windows menu unavailable; showing mIV-only menu: {reason}"
+                    ));
+                    None
+                }
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             }
         } else if request.paths.is_empty() {
@@ -430,6 +440,12 @@ mod windows_impl {
                 miv_count,
             ) {
                 Ok(menu) => Some(menu),
+                Err(reason) if can_keep_miv_menu_after_shell_failure(miv_count) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: Windows menu unavailable; showing mIV-only menu: {reason}"
+                    ));
+                    None
+                }
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             }
         };
@@ -1493,7 +1509,7 @@ mod tests {
                         },
                         "Viewer",
                     ),
-                    leaf(MenuCommand::AddApplication, "add"),
+                    leaf(MenuCommand::OpenExternalToolSettings, "settings"),
                 ],
             },
             leaf(MenuCommand::Deselect, "deselect"),
@@ -1510,8 +1526,15 @@ mod tests {
             commands[1],
             MenuCommand::OpenWithAssociation { .. }
         ));
-        assert!(matches!(commands[2], MenuCommand::AddApplication));
+        assert!(matches!(commands[2], MenuCommand::OpenExternalToolSettings));
         assert!(matches!(commands[3], MenuCommand::Deselect));
+    }
+
+    #[test]
+    fn shell_acquisition_failure_keeps_miv_items_available() {
+        assert!(can_keep_miv_menu_after_shell_failure(1));
+        assert!(can_keep_miv_menu_after_shell_failure(12));
+        assert!(!can_keep_miv_menu_after_shell_failure(0));
     }
 
     #[test]

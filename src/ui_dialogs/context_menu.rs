@@ -1009,12 +1009,7 @@ impl crate::app::App {
             surface,
             explorer_folder,
         );
-        let include_windows_menu = self.settings.use_native_shell_context_menu;
-        let shell_paths = if include_windows_menu {
-            target.shell_paths.clone().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let shell_paths = target.shell_paths.clone().unwrap_or_default();
         let miv_items = self.context_menu_nodes(&target, in_search);
         let miv_count = menu_leaf_count(&miv_items);
         let target_kind = native_grid_context_menu_target_kind(&target);
@@ -1047,7 +1042,8 @@ impl crate::app::App {
                 miv_count
             ));
         }
-        let background_folder = (include_windows_menu && target.is_folder_context)
+        let background_folder = target
+            .is_folder_context
             .then(|| target.folder_command_target.clone())
             .flatten();
         let request = NativeContextMenuRequest {
@@ -1522,35 +1518,6 @@ impl crate::app::App {
                         crate::external_tool::ExternalToolLaunch::Association { handler_id },
                         file.to_path_buf(),
                     );
-                }
-                None
-            }
-            MenuCommand::AddApplication => {
-                if let Some(app) = crate::open_with::pick_exe_dialog() {
-                    let executable = app.executable;
-                    let already = self
-                        .settings
-                        .external_tools
-                        .iter()
-                        .filter_map(|tool| tool.launch.executable())
-                        .any(|path| {
-                            path.as_os_str()
-                                .as_encoded_bytes()
-                                .eq_ignore_ascii_case(executable.as_os_str().as_encoded_bytes())
-                        });
-                    if !already {
-                        let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
-                        tool.id = crate::external_tool::next_id(&self.settings.external_tools);
-                        tool.name = executable
-                            .file_stem()
-                            .map(|stem| stem.to_string_lossy().into_owned())
-                            .unwrap_or(app.display_name);
-                        tool.launch =
-                            crate::external_tool::ExternalToolLaunch::Executable(executable);
-                        tool.show_in_context_menu = true;
-                        self.settings.external_tools.push(tool);
-                        self.settings.save();
-                    }
                 }
                 None
             }
@@ -2475,6 +2442,22 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 #[cfg(test)]
 mod delete_confirm_tests {
     use super::*;
+
+    /// 拒否文は「なぜ実行されなかったか」と対処を伝えるので、読み切れる表示時間が要る。
+    /// 表示時間は文字数から決まる (`feedback_toast_duration`) ので、文言を伸ばしたときに
+    /// 上限で頭打ちになって読めなくなることがないよう、実際の文言でここを固定する。
+    #[test]
+    fn virtual_selection_refusal_toast_is_long_enough_to_read() {
+        let message = checked_virtual_selection_message("削除");
+        let chars = message.chars().count();
+        assert!(chars >= 50, "文言が想定より短い: {chars} 文字");
+        let secs = crate::ui_fullscreen::feedback_toast_duration(&message);
+        // 日本語の読字速度 (毎秒 8 文字程度) で読み切れること。
+        assert!(
+            secs >= 5.0,
+            "拒否文 {chars} 文字に対して表示時間が短い: {secs} 秒"
+        );
+    }
 
     fn target(item: GridItem, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
         let path = item.drag_source_path().map(Path::to_path_buf);

@@ -48,7 +48,6 @@ pub enum MenuCommand {
         display_name: String,
         handler_id: String,
     },
-    AddApplication,
     OpenExternalToolSettings,
     MoveToRecycleBin,
     Deselect,
@@ -246,10 +245,10 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     }
     push_group(
         &mut children,
-        [
-            item(MenuCommand::AddApplication, "アプリケーションを追加…"),
-            item(MenuCommand::OpenExternalToolSettings, "外部ツールの設定…"),
-        ],
+        [item(
+            MenuCommand::OpenExternalToolSettings,
+            "外部ツールの設定…",
+        )],
     );
     Some(MenuNode::Submenu {
         label: "アプリケーションで開く…".to_string(),
@@ -595,7 +594,6 @@ mod tests {
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -609,7 +607,6 @@ mod tests {
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -623,7 +620,6 @@ mod tests {
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -646,7 +642,6 @@ mod tests {
                     "ページを開く",
                     "一覧を開く",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -660,7 +655,6 @@ mod tests {
                     "ページを開く",
                     "一覧を開く",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -674,7 +668,6 @@ mod tests {
                     "ページを開く",
                     "一覧を開く",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
@@ -690,7 +683,6 @@ mod tests {
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                 ][..],
             ),
@@ -704,7 +696,6 @@ mod tests {
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                 ][..],
             ),
@@ -713,7 +704,6 @@ mod tests {
                 &[
                     "代表画像のパスをコピー",
                     "アプリケーションで開く…",
-                    "アプリケーションを追加…",
                     "外部ツールの設定…",
                 ][..],
             ),
@@ -755,7 +745,6 @@ mod tests {
                 "左に回転 (L)",
                 "右に回転 (R)",
                 "アプリケーションで開く…",
-                "アプリケーションを追加…",
                 "外部ツールの設定…",
                 "ゴミ箱へ移動 (タグ・評価も整理) [5件]",
                 "選択解除 (Ctrl+D)",
@@ -852,7 +841,7 @@ mod tests {
             ContextMenuSurface::Grid,
         )));
         assert!(image.contains(&"名前の変更…".to_string()));
-        assert!(image.contains(&"アプリケーションを追加…".to_string()));
+        assert!(!image.contains(&"アプリケーションを追加…".to_string()));
         assert!(image.contains(&"外部ツールの設定…".to_string()));
     }
 
@@ -867,6 +856,11 @@ mod tests {
             let actual = labels(&build_context_menu(&input(kind, ContextMenuSurface::Grid)));
             assert!(!actual.iter().any(|label| label.contains("最近使った")));
             assert!(!actual.iter().any(|label| label.contains("旧XMP")));
+            assert!(
+                !actual
+                    .iter()
+                    .any(|label| label.contains("アプリケーションを追加"))
+            );
         }
     }
 

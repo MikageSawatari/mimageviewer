@@ -140,12 +140,6 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
-        "explorer/context-menu",
-        ExplorerIntegration,
-        "実ファイル/実フォルダの右クリックに Windows のメニューを含める",
-        ["コンテキストメニュー", "shell", "右クリック"]
-    ),
-    entry!(
         "explorer/context-menu-inline",
         ExplorerIntegration,
         "Windows のメニューを併記する",

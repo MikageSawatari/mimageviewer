@@ -4511,8 +4511,25 @@ fn format_duration_mm_ss(secs: f64) -> String {
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
-/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
 pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+const FEEDBACK_TOAST_BASE_CHARS: usize = 20;
+/// 1 文字あたりの加算秒。**日本語の読字速度は毎秒 8 文字程度**なので、その逆数を取る。
+/// 0.06 (= 毎秒 17 文字) では読み切る前に消えた (2026-08-30、混在選択の拒否文で実測報告)。
+const FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR: f32 = 0.12;
+/// 上限。長すぎるトーストは邪魔になるが、拒否理由と対処を書いた 60 文字級の案内は
+/// 読み切れる必要がある。既存の長文ヒント (`NO_IMAGE_FOLDER_HINT_DURATION` = 4.0) より長い。
+const FEEDBACK_TOAST_MAX_DURATION: f32 = 6.5;
+
+/// 短文は従来の 1.2 秒を維持し、20 文字を超えた分だけ表示時間を延ばす。
+/// 日本語を 1 文字として扱うため、byte 長ではなく Unicode scalar value 数で計算する。
+pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
+    let extra_chars = text
+        .chars()
+        .count()
+        .saturating_sub(FEEDBACK_TOAST_BASE_CHARS);
+    (FEEDBACK_TOAST_DURATION + extra_chars as f32 * FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR)
+        .min(FEEDBACK_TOAST_MAX_DURATION)
+}
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -36205,6 +36222,29 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn feedback_toast_short_text_keeps_default_duration() {
+        assert_eq!(
+            feedback_toast_duration("短い確認メッセージ"),
+            FEEDBACK_TOAST_DURATION
+        );
+    }
+
+    #[test]
+    fn feedback_toast_long_japanese_text_extends_by_character_count() {
+        let text = "あ".repeat(FEEDBACK_TOAST_BASE_CHARS + 1);
+        let expected = FEEDBACK_TOAST_DURATION + FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR;
+        assert!((feedback_toast_duration(&text) - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn feedback_toast_duration_is_capped() {
+        assert_eq!(
+            feedback_toast_duration(&"長".repeat(10_000)),
+            FEEDBACK_TOAST_MAX_DURATION
+        );
+    }
 
     #[test]
     fn edit_brush_wheel_owner_covers_all_radius_bearing_brushes() {

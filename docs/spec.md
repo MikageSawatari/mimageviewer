@@ -1605,9 +1605,8 @@ runtime 展開や本体起動を行う前に、最初の位置引数を Named Pi
 activate event を送る。Pipe がまだ準備されていない起動直後だけ短く再試行し、
 Explorer の SendTo 起動側が数秒単位で残らないようにする。
 
-同じ設定ページで `use_native_shell_context_menu` を切り替えられる。既定 ON のとき、
-実ファイル / 実フォルダの native 右クリックメニューに Win32 `IContextMenu` 由来の項目を含める。
-OFF でも mIV 項目は native HMENU で表示する。Shell 項目は既定で末尾の
+実ファイル / 実フォルダの native 右クリックメニューには、常に Win32 `IContextMenu` 由来の
+Windows 項目を含める。Shell 項目は既定で末尾の
 「Windows のメニュー」サブメニューへまとめ、`WM_INITMENUPOPUP` まで
 `IContextMenu::QueryContextMenu` を遅延する。既定 OFF の `show_windows_context_menu_inline` を
 ON にすると、Shell 項目を mIV 項目と同じ階層へ併記する。
@@ -1639,8 +1638,7 @@ mIV が削除成功を確認した path は、
 各 mIV メニューの末尾には「このフォルダをエクスプローラで開く」を表示する。実フォルダは
 そのフォルダ自身、実ファイルと ZIP / PDF 等のコンテナ・仮想ページは格納元の実フォルダを
 Explorer で開く。検索結果など複数チェックから単一の実フォルダを決められない場合は表示しない。
-Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わらず同じ Shell verb
-ヘルパーを使い、コピー / カット / ペースト時のフォルダ対応、衝突確認、進捗 UI は Windows 側に委ねる。Ctrl+C / Ctrl+X で ZIP/PDF 内ページなどファイルとして扱えない項目が選択に含まれる場合は、実ファイルだけを部分的に処理せずトーストで中止する。
+Ctrl+C / Ctrl+X / Ctrl+V も同じ Shell verb ヘルパーを使い、コピー / カット / ペースト時のフォルダ対応、衝突確認、進捗 UI は Windows 側に委ねる。Ctrl+C / Ctrl+X で ZIP/PDF 内ページなどファイルとして扱えない項目が選択に含まれる場合は、実ファイルだけを部分的に処理せずトーストで中止する。
 現在表示中の実フォルダは notify-rs (`ReadDirectoryChangesW`) で常時監視し、外部 Explorer 操作や Shell メニュー操作による追加・削除・リネームを debounce 後に既存の外部変更チェックへ流して一覧を更新する。
 
 ### 8.1 主要設定
@@ -1733,7 +1731,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
-| `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を含めるかどうか。OFF でも mIV 項目は native HMENU で表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
+| `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
 | `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` のとき、実フォルダと ZIP / PDF / 変換対象アーカイブを含め、対象種類に関係なく mIV 側の削除確認を省略する。複数選択は 1 件でも `MayPermanent` なら確認を維持し、キャンセルを初期選択にする。`FOF_WANTNUKEWARNING` には影響しない |
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`short_right_click_image` / `short_right_click_video` は画像 / 動画ビューアの短い右クリックを閉じる / 何もしない / メニュー表示から個別に選ぶ（既定は閉じる）。`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、マウスジェスチャ実行後の通知表示設定 (`mouse_gesture_result_toast_visible`、既定 true)、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。通知を OFF にしてもジェスチャのアクションと、そのアクション自身が出す結果・エラー表示は抑止しない。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |

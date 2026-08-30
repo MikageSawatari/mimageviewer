@@ -931,29 +931,17 @@ fn draw_external_tool_path_status(ui: &mut egui::Ui, label: &str, status: &Exter
 pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut PreferencesState) {
     refresh_send_to_status_if_needed(state);
 
-    anchored(ui, state, "explorer/context-menu", |ui, state| {
+    anchored(ui, state, "explorer/context-menu-inline", |ui, state| {
         ui.label(egui::RichText::new("右クリックメニュー").strong());
         ui.add_space(4.0);
         ui.checkbox(
-            &mut state.settings.use_native_shell_context_menu,
-            "実ファイル/実フォルダの右クリックに Windows のメニューを含める",
+            &mut state.settings.show_windows_context_menu_inline,
+            "Windows のメニューを併記する",
         )
         .on_hover_text(
-            "OFF でも mImageViewer の項目は Windows と同じ見た目のメニューで表示します。\
-             Ctrl+C/X/V のファイル操作は、この設定に関わらず Windows 標準の動作を使います。",
+            "ON では Windows 由来の項目を mImageViewer の項目と同じ階層へ並べます。\
+             OFF (既定) では末尾の「Windows のメニュー」内へまとめます。",
         );
-    });
-    anchored(ui, state, "explorer/context-menu-inline", |ui, state| {
-        ui.add_enabled_ui(state.settings.use_native_shell_context_menu, |ui| {
-            ui.checkbox(
-                &mut state.settings.show_windows_context_menu_inline,
-                "Windows のメニューを併記する",
-            )
-            .on_hover_text(
-                "ON では Windows 由来の項目を mImageViewer の項目と同じ階層へ並べます。\
-                     OFF (既定) では末尾の「Windows のメニュー」内へまとめます。",
-            );
-        });
     });
     ui.add_space(10.0);
 

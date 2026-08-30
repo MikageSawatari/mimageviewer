@@ -3948,8 +3948,8 @@ pub struct Settings {
     pub show_location_drive_roots: bool,
 
     // ── エクスプローラ連携 ────────────────────────────────────
-    /// 実ファイル / 実フォルダの native 右クリックメニューに Windows Shell 項目を含める。
-    /// OFF でも mIV 項目は native HMENU で表示する。
+    /// リリース済み設定との読み書き互換だけのために残す旧フィールド。
+    /// 現在は値にかかわらず Windows Shell 項目を常に含め、この値は動作に影響しない。
     #[serde(default = "default_true")]
     pub use_native_shell_context_menu: bool,
     /// Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の
