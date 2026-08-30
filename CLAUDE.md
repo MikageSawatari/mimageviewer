@@ -1217,6 +1217,22 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 同時にコミットすること。詳細な設計方針・新規テスト追加手順は
 [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) を参照。
 
+## 利用者へ渡すコマンドは PowerShell で書く ⚠️
+
+**利用者は常に PowerShell を使う。`bash ...` を渡さない。** PATH に bash が無いので
+`用語 'bash' は ... 認識されません` で止まり、毎回シェルの話に往復が発生する
+(2026-08-30 のリリース作業で実際に発生)。
+
+- 実行を頼む手順・チェックリスト・最終回答のコード塊は `.\scripts\foo.ps1` 形式にする
+- エージェント自身が Bash tool で `.sh` を回すのは構わない (setup スクリプト等)。
+  **渡すときだけ** PowerShell 版に置き換える
+- PowerShell 版が無い手順を渡す必要が出たら、その場で `.ps1` を追加する。
+  「bash.exe をフルパスで叩いてください」で回避しない
+- 新しい `.ps1` は **ASCII オンリー**で書く。PowerShell 5.1 は BOM 無し UTF-8 を
+  ANSI コードページとして読むので、日本語を入れると文字化けする
+  (既存の `check-idle-health.ps1` / `build-dev.ps1` も ASCII のみ)。
+  日本語の説明は Markdown 側に置く
+
 ## 開発中のビルド・テスト選択
 
 通常の編集ループで毎回 `cargo test --workspace` を実行しない。まず変更範囲に応じて
@@ -1738,8 +1754,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      Tantivy 等の依存更新で正当な変動なら `--save` で baseline を更新する。
 
 9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
-   ```bash
-   bash scripts/perf_smoke.sh
+   ```powershell
+   .\scripts\perf_smoke.ps1
    ```
    - `--perf-log` 付きで mImageViewer を起動 → 手動で起動・Ctrl+↓ 連打・Ctrl+G 検索を実行
      → スクリプトが `analyze_perf.py hitches` で 16ms 超のフレーム間隔を集計。
@@ -1752,9 +1768,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
        (docs/ui-responsiveness.md §4)
    - 全体の目安は「16ms 未満のギャップが 97% 以上」。v2.9.1 実測は 4723 フレーム中
      97.7%、100ms 超の 24 件はすべて就寝または遅延 wake 由来だった。
-   - bash が PATH に無い環境では `"C:\Program Files\Git\bin\bash.exe" scripts/perf_smoke.sh`。
-     スクリプトの実体は「FFmpeg DLL を target/release へコピー → perf log を退避 →
-     core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
+   - **先に `.\scripts\build-release.ps1` が要る** (idle health と同じく `target\release` の
+     core を起動する)。`build-dev.ps1` だけでは古い release バイナリが動く。
+   - `scripts/perf_smoke.sh` は同じ内容の bash 版。中身は「FFmpeg DLL を target/release へ
+     コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
    ```powershell
