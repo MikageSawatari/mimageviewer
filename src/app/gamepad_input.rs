@@ -5248,6 +5248,18 @@ impl App {
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
         // ピン留めタグ KeyAction は Grid コンテキスト専用 (keymap テストで固定) なので
         // 発火面はメイングリッド。
+        //
+        // 対象 0 件のときは `request_tag_toggle_for_selection` が黙って return するため、
+        // ZIP / PDF のページやスタックを選んだ状態では何も起きず何も出なかった。
+        // `T` (タグ付与ダイアログ) は同じ状況で「[タグ対象なし]」を出すので、答えを揃える
+        // (docs/item-kind-capability-matrix.md §6-4)。
+        if self
+            .tag_target_paths(crate::app::ActionSurface::MainWindow)
+            .is_empty()
+        {
+            self.show_feedback_toast("[タグ対象なし]".to_string());
+            return;
+        }
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
     }
 

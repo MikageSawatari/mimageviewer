@@ -3217,7 +3217,9 @@ pub(crate) struct CurrentFolderWatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellClipboardSelectionError {
-    UncopyableItem,
+    /// 実パスを持たない item が選択に含まれていた。理由を持たせるのは、断り方を
+    /// 種別ごとに正しく言うため (docs/item-kind-capability-matrix.md §6-8)。
+    UncopyableItem(Option<crate::grid_item::FileOperationRefusal>),
 }
 
 /// ユーザー画像スタンプの埋め込み worker (R2-6) の進行状態。file picker で選んだ画像を
@@ -10725,8 +10727,6 @@ pub struct App {
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
     /// 旧 XMP `#タグ` を `tags.db` へ一度だけ seed する保険 worker。
     pub(crate) tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
-    /// ユーザー明示の旧 XMP タグ取り込み / 取り込み後削除 worker。
-    pub(crate) tag_legacy_xmp_pending: Option<crate::tag_legacy_xmp_worker::LegacyXmpImportPending>,
     /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
@@ -11619,6 +11619,14 @@ pub struct App {
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
     pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
+    /// 外部ツールの process spawn を UI スレッド外で待つ短命 worker。
+    /// 実行中の外部ツール起動。**Vec で持つ**: 単一 slot にすると 2 つ続けて起動した
+    /// ときに先の結果 (失敗 toast を含む) が捨てられる。UNC 上の EXE では spawn 自体が
+    /// 秒単位で待たされ得るので、この窓は実際に踏める。
+    pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
+    /// ネットワークパス上の登録 EXE を起動する前の確認要求。
+    pub(crate) external_tool_launch_confirmation:
+        Option<crate::external_tool::ExternalLaunchRequest>,
 
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
@@ -11955,8 +11963,8 @@ pub struct App {
     pub(crate) favorite_default_clear_confirm: Option<FavoriteDefaultClearConfirm>,
     /// 右上フィードバック表示: (テキスト, 表示開始時刻, 表示秒数)。
     /// フルスクリーン / グリッド共通。命名の `fs_` プレフィックスはフルスクリーン
-    /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
-    /// `FEEDBACK_TOAST_DURATION`、複数行の案内文は長めを使う。
+    /// 専用だった頃の名残。通常は本文の文字数から表示秒数を決め、必要な箇所だけ
+    /// `show_feedback_toast_with_duration` で明示する。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
     /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
     /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
@@ -13864,7 +13872,6 @@ impl App {
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
             tag_legacy_seed_pending: None,
-            tag_legacy_xmp_pending: None,
             delete_pending: None,
             batch_convert: None,
             delete_purge_retry_pending: None,
@@ -14176,6 +14183,8 @@ impl App {
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
             cached_handlers: None,
+            external_tool_launch_pending: Vec::new(),
+            external_tool_launch_confirmation: None,
             cached_nav_indices: None,
             cached_fs_seek_info: None,
 
@@ -15810,6 +15819,7 @@ impl App {
             self.book_reorder.is_some() => "book_reorder",
             self.show_preferences => "preferences",
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
+            self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
             self.show_settings_restore => "settings_restore",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
@@ -26236,122 +26246,6 @@ impl App {
         }
     }
 
-    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリ (separator + ボタン)
-    /// を**まとめて**追加する。アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
-    ///
-    /// **separator 込みで描画する**ことに注意 (Codex Phase D P3 指摘: 呼び出し側で
-    /// 先に `ui.separator()` を打つと、本関数が早期 return する条件 (アグリゲートビュー
-    /// / 変換 drill-down / pin 不能 variant 等) で孤立 separator が残るバグになる)。
-    /// 本関数は描画が確定する直前まで separator を打たない。
-    ///
-    /// 戻り値: メニューを閉じるべきなら `true` (= ピン書き換え操作が走った)。
-    /// 描画スキップ / disabled / クリック未発生は `false`。
-    pub(crate) fn render_folder_pin_menu_entry(
-        &mut self,
-        ui: &mut egui::Ui,
-        item: &GridItem,
-    ) -> bool {
-        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / Ctrl+T タグビュー / 変換キャッシュ drill-down
-        // / pin 不能 variant では一切描画しない (separator も打たない)。
-        let Some(container) = self.current_folder.clone() else {
-            return false;
-        };
-        if self.items_are_global_search_view || self.items_are_tag_view {
-            return false;
-        }
-        if is_synthetic_view_path(&container) {
-            return false;
-        }
-        // zip_nav がある変換キャッシュ閲覧中は元アーカイブパスへピンできる。
-        // zip_nav が無い override 状態だけは dead pin を避ける。
-        if self.archive_source_override.is_some() && self.zip_nav.is_none() {
-            return false;
-        }
-        // pin 不能 variant: 描画スキップ
-        if matches!(item, GridItem::SearchContainer { .. }) {
-            return false;
-        }
-        // 未変換 ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
-        if matches!(
-            item,
-            GridItem::ConvertibleArchive { path, .. }
-                if !self.converted_archive_cache_paths
-                    .get(&crate::path_key::normalize_keep_drive(path))
-                    .is_some_and(ConvertedArchiveSourceState::is_available)
-        ) {
-            ui.separator();
-            ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
-                .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
-            return false;
-        }
-        // ピン対象コンテナ / source。ネスト ZIP では P キーと同じく本キーへ保存する。
-        let (pin_container, source) = if let Some(nav) = self.zip_nav.as_ref() {
-            match item {
-                GridItem::ZipImage { entry_name, .. } => {
-                    let Some(bk) = self.pin_container_key() else {
-                        return false;
-                    };
-                    (
-                        bk,
-                        crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                            zip_rel: String::new(),
-                            entry: entry_name.clone(),
-                        },
-                    )
-                }
-                GridItem::ZipDir { dir_prefix, .. } => {
-                    let Some(bk) = self.pin_container_key() else {
-                        return false;
-                    };
-                    let segs = zip_dir_prefix_segments(dir_prefix);
-                    let effective = nav.tree.collapse_redundant(&segs);
-                    let dir_prefix = zip_dir_prefix_from_segs(&effective);
-                    if dir_prefix.is_empty() {
-                        return false;
-                    }
-                    (
-                        bk,
-                        crate::folder_thumb_pins::FolderPinSource::ZipDir {
-                            zip_rel: String::new(),
-                            dir_prefix,
-                        },
-                    )
-                }
-                _ => return false,
-            }
-        } else {
-            let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item)
-            else {
-                // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
-                return false;
-            };
-            (container.clone(), source)
-        };
-        let existing = self.folder_thumb_pin_for(&pin_container).cloned();
-        let is_current = existing.as_ref() == Some(&source);
-        let label = if is_current {
-            "📌 代表サムネ固定を解除"
-        } else {
-            "📌 代表サムネに固定"
-        };
-        ui.separator();
-        if ui.button(label).clicked() {
-            let in_zip = self.zip_nav.is_some();
-            if is_current {
-                self.remove_folder_thumb_pin(&pin_container);
-            } else {
-                self.try_set_folder_thumb_pin_with_guard(&pin_container, source);
-            }
-            // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
-            // リセット) は不要。dirty を消して読書位置を保つ (親へ戻れば refresh が拾う)。
-            if in_zip {
-                self.folder_thumb_pin_dirty = false;
-            }
-            return true;
-        }
-        false
-    }
-
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
     ///
     /// 呼び出し元: `remove_items_batch` (削除完了時の idx シフト) と
@@ -36560,7 +36454,11 @@ impl App {
             let mut paths = Vec::with_capacity(self.checked.len());
             for &idx in &self.checked {
                 let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
-                    return Err(ShellClipboardSelectionError::UncopyableItem);
+                    return Err(ShellClipboardSelectionError::UncopyableItem(
+                        self.items
+                            .get(idx)
+                            .and_then(GridItem::file_operation_refusal),
+                    ));
                 };
                 paths.push(path.to_path_buf());
             }
@@ -36574,7 +36472,9 @@ impl App {
             return Ok(Vec::new());
         };
         let Some(path) = item.drag_source_path() else {
-            return Err(ShellClipboardSelectionError::UncopyableItem);
+            return Err(ShellClipboardSelectionError::UncopyableItem(
+                item.file_operation_refusal(),
+            ));
         };
         Ok(vec![path.to_path_buf()])
     }
@@ -36586,10 +36486,14 @@ impl App {
     ) {
         let paths = match self.collect_shell_clipboard_paths() {
             Ok(paths) => paths,
-            Err(ShellClipboardSelectionError::UncopyableItem) => {
-                self.show_feedback_toast(
-                    "ZIP内の画像やPDFページはファイルとしてコピー/カットできません".to_string(),
-                );
+            Err(ShellClipboardSelectionError::UncopyableItem(reason)) => {
+                let message = reason
+                    .map(|reason| reason.message("コピー / カット"))
+                    .unwrap_or_else(|| {
+                        crate::grid_item::FileOperationRefusal::VirtualPage
+                            .message("コピー / カット")
+                    });
+                self.show_feedback_toast(message);
                 return;
             }
         };
@@ -47549,10 +47453,22 @@ impl App {
     /// グリッドが PDF のページ表示で構成されているか (= PDF を開いている)。
     /// PDF ページは連番の合成名しか持たず検索の意味が無いため、true のとき
     /// Ctrl+F を無効化する (docs/search-container-item-redesign.md §4.1.1)。
+    ///
+    /// 判定は「今 PDF 自身を開いているか」で行い、items の中身は見ない。先頭 item が
+    /// `PdfPage` かで決めていた頃は、★ 横断一覧のように実ファイルと `PdfPage` が同じ
+    /// 一覧に混ざる view で、**先頭がページかどうかという並び順の偶然で一覧全体の
+    /// Ctrl+F が落ちていた** (docs/item-kind-capability-matrix.md §6-11)。
+    /// `PdfPage` を items へ積む経路は 2 つともソースパスを PDF 自身にして
+    /// `start_loading_items` を呼ぶので、PDF のページ一覧のときだけ true になる。
+    /// 横断一覧は合成パスで読み込まれるため false になり、`PdfPage` 行は
+    /// `Page N` の名前照合で拾われる。
     pub(crate) fn grid_is_pdf_pages(&self) -> bool {
-        self.items
-            .first()
-            .is_some_and(|it| matches!(it, crate::grid_item::GridItem::PdfPage { .. }))
+        self.current_folder.as_deref().is_some_and(|folder| {
+            folder
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
+        })
     }
 
     /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
@@ -60247,10 +60163,10 @@ impl App {
         self.pdf_native_rerender_pending(idx, true, false)
     }
 
-    /// 右上フィードバック表示を設定する (既定の表示時間)。
-    /// 短い確認系トースト (レーティング変更 / スロット適用など) 向け。
+    /// 右上フィードバック表示を設定する (本文の文字数に応じた表示時間)。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
-        self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
+        let duration_secs = crate::ui_fullscreen::feedback_toast_duration(&text);
+        self.show_feedback_toast_with_duration(text, duration_secs);
     }
 
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
@@ -60576,8 +60492,7 @@ impl App {
     }
 
     /// 右上フィードバック表示を設定する (表示時間を明示指定)。
-    /// 複数行の案内文 (例: 動画 pin の操作ガイド) は既定 1.2 秒では読み切れないため、
-    /// 長め (4〜5 秒) を渡す。
+    /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
     pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
         self.show_native_video_overlay_toast(text.clone(), false);
@@ -66957,10 +66872,10 @@ impl eframe::App for App {
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
         self.poll_tag_legacy_seed_results();
-        self.poll_legacy_xmp_import_results();
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_file_drop_pending();
+        self.poll_external_tool_launch(ctx);
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_rename_migration_pending(ctx);
@@ -67033,7 +66948,6 @@ impl eframe::App for App {
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
             || self.tag_legacy_seed_pending.is_some()
-            || self.tag_legacy_xmp_pending.is_some()
             || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
@@ -67621,6 +67535,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_external_tool_launch_confirmation(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。

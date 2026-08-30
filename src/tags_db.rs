@@ -1038,9 +1038,7 @@ pub use crate::adjustment_db::escape_like_pattern;
 /// dc:subject 値のうち「mIV v1.0 が付けた legacy タグ」(= `#` 始まり) だけを抽出し、
 /// 表示形 (`#` 付き) で返す。
 ///
-/// 自動 seed (`tag_legacy_seed_worker`) と明示インポート (`tag_legacy_xmp_worker`) の
-/// **両方がこの 1 実装を使うこと**。判定規則が分かれると、同じファイルから
-/// 取り込まれるタグ集合が経路によって変わる再現困難な不整合になる。
+/// 自動 seed (`tag_legacy_seed_worker`) が使う判定の正本。
 pub fn miv_legacy_tags(subjects: Vec<String>) -> Vec<String> {
     collapse_tags(
         subjects
