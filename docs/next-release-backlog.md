@@ -5607,6 +5607,37 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 
 **この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
 
+### 5.15 v3.3.1 の公開記録 (2026-08-30)
+
+測定値は [release-verification-records.md](release-verification-records.md) の v3.3.1 節。
+ここには**公開作業の到達点**だけ置く。
+
+1. ✅ **Phase 0 / 1** — README 更新履歴 (4,359 バイト、8KB 上限内なので短縮版なし)、
+   バージョン表記 5 箇所、製品ページの版・最終更新・ポータブル版リンク、
+   `changelog.html` 再生成、`version_highlights.rs` に must_read 1 件
+   (カーソル位置の復元 = 既定で挙動が変わるもの)。既知の問題は 2 件残置し、
+   **未修正のゲームパッド十字キーによる別ウィンドウ動画シーク不可を 1 件追加**。
+2. ✅ **Phase 2** — PDFium は最新。**FFmpeg を更新** (H.264 フレームスレッド同期の修正 2 件、
+   詳細は verification-records)。`check-non-windows-shadow.ps1` PASS。
+   `test-full.ps1` 全緑。idle health 4 シナリオ PASS。perf smoke は 2 回取得。
+3. ✅ **Phase 3** — `build-dist.ps1 -SkipVst3Bridge`。4 成果物すべて署名 +
+   RFC3161 タイムスタンプ、`dumpbin` で VCRUNTIME/MSVCP 不在を確認。
+4. ✅ **Phase 4** — タグ `v3.3.1` 公開、Assets 4 点。
+   <https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.3.1>
+   公開 body は 4,321 バイトで、**記法が `changelog_markdown` の対応範囲に収まることを
+   機械的に確認** (13 行すべて箇条書き、`**` 28 個で釣り合い、`<kbd>` 2 組、
+   他の HTML タグ・見出し・リンク・画像なし)。
+5. ✅ **Phase 5** — mikage.to 反映済み。**3 つのダウンロードリンクは GitHub Releases 向けで、
+   実際に辿って 200 + サイズ一致を確認。FFmpeg 対応ソースは実際に落として sha256 照合済み**
+   (LGPL 義務)。Vector 申請済み。窓の杜は見送り。**MS Store は保留** — v3.3.0 がまだ審査中のため。
+6. **公開後の目視確認 (未実施)** — 別マシンで更新通知ダイアログを見る。ただし崩れの主因で
+   ある記法は上記 4 で機械確認済みなので、残るのは体裁の最終確認のみ。
+7. **積み残しの掃除**: mikage.to の `/mimageviewer/mimageviewer.exe` に**ページから
+   参照されていない 273MB の古い単体exe**が残っている。直リンクを知っている人が古い版を
+   掴む。整理するか、最新へ差し替えるか決める。
+
+**この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
+
 ### 5.14 v3.3.0 の公開記録 (2026-08-29)
 
 測定値は [release-verification-records.md](release-verification-records.md) の v3.3.0 節。
