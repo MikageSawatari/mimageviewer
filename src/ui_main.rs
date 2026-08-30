@@ -8238,7 +8238,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
 egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .width(132.0)
                             .height(TOOLBAR_SORT_COMBO_HEIGHT)
-                            .selected_text(current_mode.label())
+                            .selected_text(text)
                             .show_ui(ui, |ui| {
                                 apply_toolbar_style(ui);
                                 for &mode in crate::settings::SubfolderExpansionOrder::all() {
