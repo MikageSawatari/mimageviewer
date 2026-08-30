@@ -2024,6 +2024,51 @@ mod tests {
         }
     }
 
+    /// **transform を経由しない描画経路**でも、リサンプラの出力サイズと描画矩形の
+    /// 物理サイズが一致すること。
+    ///
+    /// detached の keepalive backstop は `DisplayedImageTransform` を通らず、
+    /// `scale = min(avail / tex)` から矩形を手で組んでリサンプラ出力を貼る。
+    /// **元のバグがそこだけ残っていた** (2026-08-30 レビュー指摘 1(a))。矩形側は
+    /// `snap_image_rect_to_physical_pixels`、リサンプラ側は `quantized_target_size` と
+    /// 別の入口だが、どちらも同じ `physical_pixel_extent` に行き着く必要がある。
+    ///
+    /// 寄せをやめると落ちる。**この経路にはテストが 1 本も無かった。**
+    #[test]
+    fn the_backstop_rect_matches_the_resampler_even_without_a_transform() {
+        let cases: &[([u32; 2], egui::Vec2, f32)] = &[
+            ([1612, 2418], egui::vec2(2560.0, 1440.0), 1.0),
+            ([1249, 2272], egui::vec2(2560.0, 1440.0), 1.0),
+            ([4248, 6048], egui::vec2(1707.0, 960.0), 1.5),
+            ([2480, 3508], egui::vec2(1280.0, 720.0), 1.25),
+            ([3000, 2000], egui::vec2(1600.0, 1200.0), 1.0),
+        ];
+        for &(source, avail, ppp) in cases {
+            let tex = egui::vec2(source[0] as f32, source[1] as f32);
+            // backstop と同じ組み方。
+            let scale = (avail.x / tex.x).min(avail.y / tex.y);
+            let physical = physical_scale(scale, ppp);
+            if physical >= 1.0 {
+                continue;
+            }
+            let rect = crate::displayed_image_transform::snap_image_rect_to_physical_pixels(
+                egui::Rect::from_center_size(egui::Pos2::ZERO, tex * scale),
+                tex,
+                scale,
+                ppp,
+            );
+            let drawn = [
+                (rect.width() * ppp).round() as u32,
+                (rect.height() * ppp).round() as u32,
+            ];
+            let target = quantized_target_size(source, physical, TARGET_SIZE_QUANTUM);
+            assert_eq!(
+                target, drawn,
+                "source={source:?} avail={avail:?} ppp={ppp}                  リサンプル先 {target:?} と backstop の描画サイズ {drawn:?} が違う"
+            );
+        }
+    }
+
     /// 回転していても一致すること。回転後の表示サイズから倍率もサイズも決まるので、
     /// 片方だけ回転前の辺を見ていると 90 度で崩れる。
     #[test]

@@ -1449,6 +1449,65 @@ fn draw_omitted_entries_chip(
     open_settings
 }
 
+/// ツールバーの文字幅を、確保せずに測る。
+///
+/// **`horizontal_wrapped` は折り返すかどうかを *要求サイズ* で決め、カーソルの前進は
+/// *実サイズ* で行う** (`egui::Layout::next_frame` と `advance_after_rects`)。要求より
+/// 広く描く widget は入らない場所に置かれ、**右端からはみ出す**。カーソルはその後で
+/// 実サイズぶん進むので次の項目からは正しく折り返す — 利用者からは「1 個だけ右端に
+/// 残り、次は普通に次の行へ行く」と見える。だから幅は目視の固定値ではなく実測で決める。
+fn toolbar_text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_string(),
+            style.resolve(ui.style()),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+}
+
+/// ComboBox が実際に占める幅。
+///
+/// egui の `ComboBox::width()` は **下限にしかならない**
+/// (`actual_width = (galley + icon_spacing + icon_width).at_least(width - 2 * padding)`)。
+/// ツールバーは `wrap_mode = Extend` なので選択テキストは折り返さず、長い項目名では
+/// `.width()` をいくらでも超える。
+///
+/// egui 側の式を写しているので egui を上げるとずれ得る。
+/// `a_combo_never_paints_wider_than_we_predict` がそれを検出する。
+fn toolbar_combo_width(ui: &egui::Ui, inner_width: f32, selected_text: &str) -> f32 {
+    let icon_width = ui.spacing().icon_width;
+    let icon_spacing = ui.spacing().icon_spacing;
+    let padding = ui.spacing().button_padding.x;
+    let text = toolbar_text_width(ui, selected_text, egui::TextStyle::Button);
+    let actual = (text + icon_spacing + icon_width).max(inner_width - 2.0 * padding);
+    actual + 2.0 * padding
+}
+
+/// ComboBox を置く前に、入らなければ明示的に次の行へ送る。
+///
+/// **`ComboBox` は単体では折り返さない。** egui の `button_frame` は
+/// `ui.advance_cursor_after_rect` でカーソルを進めるだけで、**折り返し判定
+/// (`Layout::next_frame`) を一度も通らない**。残り幅にそのまま置かれ、入らなければ
+/// 右端からはみ出したまま描かれる。ツールバーの ComboBox は必ずこれを先に呼ぶこと。
+///
+/// 判定は egui の `Layout::next_frame` と同じ — 残り幅が足りず、かつ行頭でないときだけ
+/// 折り返す (行頭なら折り返しても状況は変わらないので置く)。
+///
+/// ⚠ **`ui.available_width()` は使えない。** 折り返しレイアウトでは
+/// 「折り返した後に使える最大幅」(= 行の全幅) を返す仕様で、**置くたびに減らない**。
+/// egui 自身が折り返し判定に使うのは `available_rect_before_wrap`(= カーソルから
+/// max_rect 右端までの残り) のほうなので、こちらを使う。
+fn toolbar_wrap_before_combo(ui: &mut egui::Ui, inner_width: f32, selected_text: &str) {
+    let needed = toolbar_combo_width(ui, inner_width, selected_text);
+    let remaining = ui.available_rect_before_wrap().width();
+    let at_row_start = ui.cursor().left() <= ui.max_rect().left();
+    if !at_row_start && remaining < needed {
+        ui.end_row();
+    }
+}
+
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -7580,6 +7639,9 @@ impl App {
                     drag_enabled: bool,
                 ) -> egui::Response {
                     let h = ui.spacing().interact_size.y;
+                    // 固定値は列を揃えるための **下限**。フォントや DPI で文字が広くなったら
+                    // 実測を採る (`toolbar_text_width` の doc 参照)。
+                    let width = width.max(toolbar_text_width(ui, text, egui::TextStyle::Body));
                     let rect = ui
                         .allocate_ui_with_layout(
                             egui::vec2(width, h),
@@ -7682,6 +7744,7 @@ impl App {
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
+                    toolbar_wrap_before_combo(ui, 160.0, &active_book_name);
                     let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         .width(160.0)
                         .height(320.0)
@@ -7807,6 +7870,7 @@ impl App {
                             } else {
                                 format!("{} 列", self.settings.grid_cols)
                             };
+                            toolbar_wrap_before_combo(ui, 64.0, &current_text);
                             let combo = egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .width(64.0)
                                 .height(TOOLBAR_COLS_COMBO_HEIGHT)
@@ -7912,6 +7976,7 @@ impl App {
                             } else {
                                 self.settings.thumb_aspect.label().to_string()
                             };
+                            toolbar_wrap_before_combo(ui, 120.0, &current_text);
                             let combo = egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 .width(120.0)
                                 .height(TOOLBAR_ASPECT_COMBO_HEIGHT)
@@ -8058,6 +8123,7 @@ impl App {
                                 } else {
                                     self.settings.sort_order.short_label().to_string()
                                 };
+                                toolbar_wrap_before_combo(ui, 100.0, &current_text);
                                 let combo = egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
                                     .height(TOOLBAR_SORT_COMBO_HEIGHT)
@@ -8142,6 +8208,7 @@ impl App {
                     }
                     if self.items_are_subfolder_expansion_view {
                         let current_mode = self.settings.subfolder_expansion_order;
+                        toolbar_wrap_before_combo(ui, 132.0, current_mode.label());
                         let combo = egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .width(132.0)
                             .height(TOOLBAR_SORT_COMBO_HEIGHT)
@@ -8317,9 +8384,12 @@ impl App {
                             .unwrap_or_else(|| "選択".to_string());
                         // ComboBox を固定サイズ領域に包んで `horizontal_wrapped` の折返しを効かせる
                         // (右端でそのまま置くと見切れるため。toolbar_label と同じ手法)。
+                        // 枠の幅も実測にする。固定値だと選択テキストが長いときに
+                        // 中身がはみ出す (`toolbar_combo_width` の doc 参照)。
+                        let frame_w = toolbar_combo_width(ui, 160.0, &sel_text);
                         let combo = ui
                             .allocate_ui_with_layout(
-                                egui::vec2(168.0, ui.spacing().interact_size.y),
+                                egui::vec2(frame_w, ui.spacing().interact_size.y),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     egui::ComboBox::from_id_salt("toolbar_fav_combo")
@@ -8393,9 +8463,10 @@ impl App {
                             })
                             .map(|definition| definition.name.clone())
                             .unwrap_or_else(|| "選択".to_string());
+                        let frame_w = toolbar_combo_width(ui, 172.0, &selected_text);
                         let combo = ui
                             .allocate_ui_with_layout(
-                                egui::vec2(180.0, ui.spacing().interact_size.y),
+                                egui::vec2(frame_w, ui.spacing().interact_size.y),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     egui::ComboBox::from_id_salt("toolbar_smart_folder_combo")
@@ -8488,9 +8559,10 @@ impl App {
                                 .cloned()
                                 .unwrap_or_else(|| toolbar_tags[0].clone());
                             let mut new_pick: Option<String> = None;
+                            let frame_w = toolbar_combo_width(ui, 140.0, &format!("#{pick}"));
                             let combo = ui
                                 .allocate_ui_with_layout(
-                                    egui::vec2(148.0, ui.spacing().interact_size.y),
+                                    egui::vec2(frame_w, ui.spacing().interact_size.y),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
                                         egui::ComboBox::from_id_salt("toolbar_tag_combo")
@@ -21664,5 +21736,145 @@ mod decide_drag_payload_tests {
             decide_drag_payload(&items, &checked, 0),
             DragDecision::ImmediateToast(_)
         ));
+    }
+}
+
+/// ツールバーの折り返しを固定する。
+///
+/// `horizontal_wrapped` は **折り返し判定に要求サイズ、カーソル前進に実サイズ** を使う
+/// (`egui::Layout::next_frame` と `advance_after_rects`)。要求より広く描く widget は
+/// 入らない場所に置かれ、右端からはみ出す。さらに `ComboBox` は
+/// `advance_cursor_after_rect` を使うので **折り返し判定を一度も通らない**。
+#[cfg(test)]
+mod toolbar_wrap_tests {
+    use super::{toolbar_combo_width, toolbar_text_width, toolbar_wrap_before_combo};
+    use eframe::egui;
+
+    const SELECTED_TEXTS: &[&str] = &[
+        "名前",
+        "4 列",
+        "自動 (2:3)",
+        "#プリキュア",
+        "とても長いスマートフォルダの名前をここに入れて折り返しを試す",
+        "C:/very/long/favorite/folder/name/that/keeps/going",
+    ];
+
+    /// パネル幅 `panel_w` で折り返し行を 1 回描き、`build` が集めた値を返す。
+    ///
+    /// 収集先を `Vec<f32>` に固定しているのは、closure 引数の型が推論できるようにするため
+    /// (汎用にすると呼び出し側で毎回注釈が要る)。溢れ幅を集める用途しかない。
+    fn run(
+        panel_w: f32,
+        build: impl Fn(&mut egui::Ui, f32, &std::sync::Mutex<Vec<f32>>) + Copy,
+    ) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(panel_w, 700.0),
+        ));
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // フォント atlas とレイアウトが落ち着くまで 2 パス。
+        for _ in 0..2 {
+            sink.lock().unwrap().clear();
+            let out = sink.clone();
+            ctx.run(input.clone(), |ctx| {
+                egui::TopBottomPanel::top("t").show(ctx, |ui| {
+                    let right = ui.max_rect().right();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        build(ui, right, out.as_ref());
+                    });
+                });
+            });
+        }
+        let v = sink.lock().unwrap().clone();
+        v
+    }
+
+    /// `toolbar_combo_width` の見積もりが、egui が実際に描く幅を下回らないこと。
+    ///
+    /// egui 側の式を写しているので、egui を上げて式が変わるとここが落ちる。
+    /// **それがこのテストの役目。**
+    #[test]
+    fn a_combo_never_paints_wider_than_we_predict() {
+        for &text in SELECTED_TEXTS {
+            for inner in [64.0f32, 100.0, 120.0, 132.0, 160.0] {
+                let bad = run(1600.0, move |ui, _right, out| {
+                    let predicted = toolbar_combo_width(ui, inner, text);
+                    let combo = egui::ComboBox::from_id_salt("probe")
+                        .width(inner)
+                        .selected_text(text)
+                        .show_ui(ui, |_| {});
+                    let actual = combo.response.rect.width();
+                    if predicted + 0.01 < actual {
+                        out.lock().unwrap().push(actual - predicted);
+                    }
+                });
+                assert!(
+                    bad.is_empty(),
+                    "見積もりが実幅を下回った (text={text:?} inner={inner}): {bad:?}"
+                );
+            }
+        }
+    }
+
+    /// **ComboBox は折り返し判定を通らない** ので、`toolbar_wrap_before_combo` を
+    /// 先に呼ばないとパネル右端からはみ出す。呼べば出ない。
+    #[test]
+    fn a_combo_stays_inside_the_panel_only_when_we_wrap_for_it() {
+        let mut without = 0usize;
+        let mut with = 0usize;
+        for w in 500..1200 {
+            let panel = w as f32;
+            let a = run(panel, |ui, right, out| {
+                for &text in SELECTED_TEXTS {
+                    let combo = egui::ComboBox::from_id_salt(text)
+                        .width(120.0)
+                        .selected_text(text)
+                        .show_ui(ui, |_| {});
+                    if combo.response.rect.right() > right + 0.5 {
+                        out.lock()
+                            .unwrap()
+                            .push(combo.response.rect.right() - right);
+                    }
+                }
+            });
+            let b = run(panel, |ui, right, out| {
+                for &text in SELECTED_TEXTS {
+                    toolbar_wrap_before_combo(ui, 120.0, text);
+                    let combo = egui::ComboBox::from_id_salt(text)
+                        .width(120.0)
+                        .selected_text(text)
+                        .show_ui(ui, |_| {});
+                    if combo.response.rect.right() > right + 0.5 {
+                        out.lock()
+                            .unwrap()
+                            .push(combo.response.rect.right() - right);
+                    }
+                }
+            });
+            without += usize::from(!a.is_empty());
+            with += usize::from(!b.is_empty());
+        }
+        assert!(
+            without > 100,
+            "この前提が崩れたらテストの意味がない (折り返さない ComboBox は溢れるはず): {without}"
+        );
+        assert_eq!(with, 0, "折り返しを入れてもはみ出した幅が {with} 件ある");
+    }
+
+    /// ラベルの固定幅は下限であって上限ではない。
+    #[test]
+    fn a_label_frame_is_never_narrower_than_its_text() {
+        let measured = run(1600.0, |ui, _right, out| {
+            let text = "とても長いセクション名:";
+            out.lock()
+                .unwrap()
+                .push(toolbar_text_width(ui, text, egui::TextStyle::Body));
+        });
+        let measured = measured[0];
+        assert!(measured > 24.0, "前提が崩れている: {measured}");
+        assert_eq!(24.0f32.max(measured), measured, "実測を採るはず");
     }
 }
