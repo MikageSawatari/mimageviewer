@@ -377,9 +377,6 @@ impl App {
         if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
             pending.cancel();
         }
-        if let Some(pending) = self.tag_legacy_xmp_pending.as_ref() {
-            pending.cancel();
-        }
         self.cancel_smart_folder_pending();
         // 再生中の動画 / 音声の現在位置を resume map に確定してから保存する
         // (角度⑤ Sol P2: `close_fullscreen` を経ない終了では最後の再生位置が

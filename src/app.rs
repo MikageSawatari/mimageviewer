@@ -10598,8 +10598,6 @@ pub struct App {
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
     /// 旧 XMP `#タグ` を `tags.db` へ一度だけ seed する保険 worker。
     pub(crate) tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
-    /// ユーザー明示の旧 XMP タグ取り込み / 取り込み後削除 worker。
-    pub(crate) tag_legacy_xmp_pending: Option<crate::tag_legacy_xmp_worker::LegacyXmpImportPending>,
     /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
@@ -13745,7 +13743,6 @@ impl App {
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
             tag_legacy_seed_pending: None,
-            tag_legacy_xmp_pending: None,
             delete_pending: None,
             batch_convert: None,
             delete_purge_retry_pending: None,
@@ -26106,122 +26103,6 @@ impl App {
         if in_zip {
             self.folder_thumb_pin_dirty = false;
         }
-    }
-
-    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリ (separator + ボタン)
-    /// を**まとめて**追加する。アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
-    ///
-    /// **separator 込みで描画する**ことに注意 (Codex Phase D P3 指摘: 呼び出し側で
-    /// 先に `ui.separator()` を打つと、本関数が早期 return する条件 (アグリゲートビュー
-    /// / 変換 drill-down / pin 不能 variant 等) で孤立 separator が残るバグになる)。
-    /// 本関数は描画が確定する直前まで separator を打たない。
-    ///
-    /// 戻り値: メニューを閉じるべきなら `true` (= ピン書き換え操作が走った)。
-    /// 描画スキップ / disabled / クリック未発生は `false`。
-    pub(crate) fn render_folder_pin_menu_entry(
-        &mut self,
-        ui: &mut egui::Ui,
-        item: &GridItem,
-    ) -> bool {
-        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / Ctrl+T タグビュー / 変換キャッシュ drill-down
-        // / pin 不能 variant では一切描画しない (separator も打たない)。
-        let Some(container) = self.current_folder.clone() else {
-            return false;
-        };
-        if self.items_are_global_search_view || self.items_are_tag_view {
-            return false;
-        }
-        if is_synthetic_view_path(&container) {
-            return false;
-        }
-        // zip_nav がある変換キャッシュ閲覧中は元アーカイブパスへピンできる。
-        // zip_nav が無い override 状態だけは dead pin を避ける。
-        if self.archive_source_override.is_some() && self.zip_nav.is_none() {
-            return false;
-        }
-        // pin 不能 variant: 描画スキップ
-        if matches!(item, GridItem::SearchContainer { .. }) {
-            return false;
-        }
-        // 未変換 ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
-        if matches!(
-            item,
-            GridItem::ConvertibleArchive { path, .. }
-                if !self.converted_archive_cache_paths
-                    .get(&crate::path_key::normalize_keep_drive(path))
-                    .is_some_and(ConvertedArchiveSourceState::is_available)
-        ) {
-            ui.separator();
-            ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
-                .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
-            return false;
-        }
-        // ピン対象コンテナ / source。ネスト ZIP では P キーと同じく本キーへ保存する。
-        let (pin_container, source) = if let Some(nav) = self.zip_nav.as_ref() {
-            match item {
-                GridItem::ZipImage { entry_name, .. } => {
-                    let Some(bk) = self.pin_container_key() else {
-                        return false;
-                    };
-                    (
-                        bk,
-                        crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                            zip_rel: String::new(),
-                            entry: entry_name.clone(),
-                        },
-                    )
-                }
-                GridItem::ZipDir { dir_prefix, .. } => {
-                    let Some(bk) = self.pin_container_key() else {
-                        return false;
-                    };
-                    let segs = zip_dir_prefix_segments(dir_prefix);
-                    let effective = nav.tree.collapse_redundant(&segs);
-                    let dir_prefix = zip_dir_prefix_from_segs(&effective);
-                    if dir_prefix.is_empty() {
-                        return false;
-                    }
-                    (
-                        bk,
-                        crate::folder_thumb_pins::FolderPinSource::ZipDir {
-                            zip_rel: String::new(),
-                            dir_prefix,
-                        },
-                    )
-                }
-                _ => return false,
-            }
-        } else {
-            let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item)
-            else {
-                // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
-                return false;
-            };
-            (container.clone(), source)
-        };
-        let existing = self.folder_thumb_pin_for(&pin_container).cloned();
-        let is_current = existing.as_ref() == Some(&source);
-        let label = if is_current {
-            "📌 代表サムネ固定を解除"
-        } else {
-            "📌 代表サムネに固定"
-        };
-        ui.separator();
-        if ui.button(label).clicked() {
-            let in_zip = self.zip_nav.is_some();
-            if is_current {
-                self.remove_folder_thumb_pin(&pin_container);
-            } else {
-                self.try_set_folder_thumb_pin_with_guard(&pin_container, source);
-            }
-            // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
-            // リセット) は不要。dirty を消して読書位置を保つ (親へ戻れば refresh が拾う)。
-            if in_zip {
-                self.folder_thumb_pin_dirty = false;
-            }
-            return true;
-        }
-        false
     }
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
@@ -66591,7 +66472,6 @@ impl eframe::App for App {
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
         self.poll_tag_legacy_seed_results();
-        self.poll_legacy_xmp_import_results();
         self.poll_delete_pending();
         self.poll_batch_convert();
         self.poll_file_drop_pending();
@@ -66668,7 +66548,6 @@ impl eframe::App for App {
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
             || self.tag_legacy_seed_pending.is_some()
-            || self.tag_legacy_xmp_pending.is_some()
             || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {

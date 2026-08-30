@@ -568,21 +568,10 @@ pub(super) struct ExternalToolLaunchCandidate {
     pub launch: crate::external_tool::ExternalToolLaunch,
 }
 
-/// リリース済み履歴を候補の先頭に保ち、現在の関連付け列挙結果を重複なく足す。
-///
-/// 履歴の `Executable` / `Association` 分類は一度きりの migration 結果なので、ここで
-/// ファイルシステムを見て再分類しない。
-fn merge_external_tool_launch_candidates(
-    recent: &[crate::settings::RecentApp],
+fn external_tool_launch_candidates(
     handlers: &[crate::open_with::AppHandler],
 ) -> Vec<ExternalToolLaunchCandidate> {
-    let mut candidates: Vec<_> = recent
-        .iter()
-        .map(|app| ExternalToolLaunchCandidate {
-            display_name: app.display_name.clone(),
-            launch: app.launch.clone(),
-        })
-        .collect();
+    let mut candidates: Vec<ExternalToolLaunchCandidate> = Vec::new();
     for handler in handlers {
         let launch = crate::external_tool::ExternalToolLaunch::Association {
             handler_id: handler.handler_id.clone(),
@@ -932,8 +921,7 @@ impl PreferencesState {
         ctx: &egui::Context,
     ) {
         self.external_tool_handlers_pending = None;
-        self.external_tool_candidates =
-            merge_external_tool_launch_candidates(&self.settings.recent_open_with_apps, &[]);
+        self.external_tool_candidates.clear();
         self.external_tool_handlers_for_editing = for_editing;
         let extension = self
             .external_tool_target
@@ -1054,10 +1042,7 @@ impl PreferencesState {
         if let Some(result) = handlers_result {
             self.external_tool_handlers_pending = None;
             if let Some(handlers) = result {
-                self.external_tool_candidates = merge_external_tool_launch_candidates(
-                    &self.settings.recent_open_with_apps,
-                    &handlers,
-                );
+                self.external_tool_candidates = external_tool_launch_candidates(&handlers);
                 if self.external_tool_candidates.is_empty() {
                     self.external_tool_message =
                         Some("関連付けアプリが見つかりませんでした".to_string());
@@ -3135,21 +3120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recent_launch_candidates_keep_their_kind_and_precede_new_handlers() {
-        let recent = vec![
-            crate::settings::RecentApp {
-                display_name: "フォト".to_string(),
-                launch: crate::external_tool::ExternalToolLaunch::Association {
-                    handler_id: "Photos.App".to_string(),
-                },
-            },
-            crate::settings::RecentApp {
-                display_name: "Legacy editor".to_string(),
-                launch: crate::external_tool::ExternalToolLaunch::Executable(PathBuf::from(
-                    r"C:\Tools\viewer.exe",
-                )),
-            },
-        ];
+    fn associated_app_candidates_come_only_from_current_handlers() {
         let handlers = vec![
             crate::open_with::AppHandler {
                 display_name: "Photos".to_string(),
@@ -3165,13 +3136,11 @@ mod tests {
             },
         ];
 
-        let candidates = merge_external_tool_launch_candidates(&recent, &handlers);
+        let candidates = external_tool_launch_candidates(&handlers);
 
         assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].display_name, "フォト");
-        assert_eq!(candidates[0].launch, recent[0].launch);
-        assert_eq!(candidates[1].display_name, "Legacy editor");
-        assert_eq!(candidates[1].launch, recent[1].launch);
+        assert_eq!(candidates[0].display_name, "Photos");
+        assert_eq!(candidates[1].display_name, "Same legacy target");
         assert_eq!(
             candidates[2],
             ExternalToolLaunchCandidate {
@@ -3181,11 +3150,7 @@ mod tests {
                 },
             }
         );
-        assert_eq!(
-            merge_external_tool_launch_candidates(&recent, &[]).len(),
-            2,
-            "recent entries remain selectable even when Shell enumeration is empty"
-        );
+        assert!(external_tool_launch_candidates(&[]).is_empty());
     }
 
     #[test]

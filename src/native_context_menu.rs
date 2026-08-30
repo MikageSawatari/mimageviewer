@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use crate::context_menu_model::{MenuCommand, MenuNode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellClipboardVerb {
     Copy,
@@ -35,49 +37,19 @@ fn preferred_drop_effect_for_file_verb(verb: ShellClipboardVerb) -> Option<u32> 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeMivCommand {
-    NewFolder,
-    Paste,
-    Rename,
-    CopyPath,
-    CopyFileName,
-    CopyImageToClipboard,
-    CopyEditBundle,
-    PasteEditBundle,
-    JumpToFolder,
-    OpenContainerAsPage,
-    OpenContainerAsList,
-    RotateLeft,
-    RotateRight,
-    ToggleRepresentativeThumb,
-    SetCurrentVideoFrameThumbnail,
-    OpenFolderInExplorer,
-    ExternalTool(crate::external_tool::ExternalToolId),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeMivMenuItem {
-    pub command: NativeMivCommand,
-    pub label: String,
-    pub enabled: bool,
-    /// この項目の直前で既存 mIV 項目とのグループを分ける。
-    pub separator_before: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct NativeContextMenuRequest {
     pub hwnd: isize,
     pub screen_pos: (i32, i32),
     pub background_folder: Option<PathBuf>,
     pub paths: Vec<PathBuf>,
-    pub miv_items: Vec<NativeMivMenuItem>,
+    pub miv_items: Vec<MenuNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeContextMenuResult {
     Canceled,
-    MivCommand(NativeMivCommand),
+    MivCommand(MenuCommand),
     ShellCommandInvoked,
     Fallback { reason: String },
 }
@@ -95,17 +67,24 @@ fn miv_command_index(command_id: u32, len: usize) -> Option<usize> {
     (index < len).then_some(index)
 }
 
-fn miv_menu_position_count(items: &[NativeMivMenuItem]) -> Option<u32> {
-    let separator_count = items
-        .iter()
-        .enumerate()
-        .filter(|(index, item)| *index > 0 && item.separator_before)
-        .count();
-    u32::try_from(items.len().checked_add(separator_count)?).ok()
+fn leaf_commands(nodes: &[MenuNode]) -> Vec<&MenuCommand> {
+    fn visit<'a>(nodes: &'a [MenuNode], out: &mut Vec<&'a MenuCommand>) {
+        for node in nodes {
+            match node {
+                MenuNode::Item { command, .. } => out.push(command),
+                MenuNode::Submenu { children, .. } => visit(children, out),
+                MenuNode::Separator => {}
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    visit(nodes, &mut commands);
+    commands
 }
 
-fn shell_menu_insert_position(items: &[NativeMivMenuItem]) -> Option<u32> {
-    miv_menu_position_count(items)?.checked_add(u32::from(!items.is_empty()))
+fn shell_menu_insert_position(nodes: &[MenuNode]) -> Option<u32> {
+    let top_level_positions = u32::try_from(nodes.len()).ok()?;
+    top_level_positions.checked_add(u32::from(!nodes.is_empty()))
 }
 
 fn shell_verb_offset(command_id: u32) -> Option<u32> {
@@ -192,9 +171,9 @@ mod windows_impl {
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_SEPARATOR,
-        MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM,
-        WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_POPUP,
+        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
 
@@ -365,7 +344,7 @@ mod windows_impl {
         } else {
             request.paths.len()
         };
-        let miv_count = request.miv_items.len();
+        let miv_count = leaf_commands(&request.miv_items).len();
 
         let stage_t0 = Instant::now();
         let _com = match ComStaGuard::new() {
@@ -400,25 +379,11 @@ mod windows_impl {
         );
 
         let stage_t0 = Instant::now();
-        for (index, item) in request.miv_items.iter().enumerate() {
-            if index > 0
-                && item.separator_before
-                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
-            {
-                return NativeContextMenuResult::Fallback {
-                    reason: "AppendMenuW(mIV separator) failed".to_string(),
-                };
-            }
-            let Some(id) = miv_command_id(index) else {
-                return NativeContextMenuResult::Fallback {
-                    reason: "too many mIV context menu commands".to_string(),
-                };
-            };
-            if let Err(e) = append_menu_string(menu.handle(), id, &item.label, item.enabled) {
-                return NativeContextMenuResult::Fallback {
-                    reason: format!("AppendMenuW(mIV) failed: {e}"),
-                };
-            }
+        let mut leaf_index = 0;
+        if let Err(reason) =
+            append_miv_menu_nodes(menu.handle(), &request.miv_items, &mut leaf_index)
+        {
+            return NativeContextMenuResult::Fallback { reason };
         }
         emit_native_menu_timing(
             "show_append_miv",
@@ -562,8 +527,9 @@ mod windows_impl {
             return NativeContextMenuResult::Canceled;
         }
 
-        if let Some(index) = miv_command_index(selected, request.miv_items.len()) {
-            return NativeContextMenuResult::MivCommand(request.miv_items[index].command);
+        let commands = leaf_commands(&request.miv_items);
+        if let Some(index) = miv_command_index(selected, commands.len()) {
+            return NativeContextMenuResult::MivCommand(commands[index].clone());
         }
 
         let Some(shell_menu) = shell_menu else {
@@ -918,13 +884,57 @@ mod windows_impl {
         result
     }
 
+    fn append_miv_menu_nodes(
+        menu: HMENU,
+        nodes: &[MenuNode],
+        leaf_index: &mut usize,
+    ) -> Result<(), String> {
+        for node in nodes {
+            match node {
+                MenuNode::Separator => {
+                    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
+                        .map_err(|error| format!("AppendMenuW(mIV separator) failed: {error}"))?;
+                }
+                MenuNode::Item { label, enabled, .. } => {
+                    let id = miv_command_id(*leaf_index)
+                        .ok_or_else(|| "too many mIV context menu commands".to_string())?;
+                    append_menu_string(menu, id, label, *enabled)
+                        .map_err(|error| format!("AppendMenuW(mIV) failed: {error}"))?;
+                    *leaf_index += 1;
+                }
+                MenuNode::Submenu { label, children } => {
+                    let mut child =
+                        MenuGuard::new(unsafe { CreatePopupMenu() }.map_err(|error| {
+                            format!("CreatePopupMenu(submenu) failed: {error}")
+                        })?);
+                    append_miv_menu_nodes(child.handle(), children, leaf_index)?;
+                    let escaped = label.replace('&', "&&");
+                    let wide = wide_null(&escaped);
+                    unsafe {
+                        AppendMenuW(
+                            menu,
+                            MF_POPUP | MF_STRING,
+                            child.handle().0 as usize,
+                            PCWSTR(wide.as_ptr()),
+                        )
+                    }
+                    .map_err(|error| format!("AppendMenuW(mIV submenu) failed: {error}"))?;
+                    // Once attached, the root menu owns the child recursively.
+                    child.release();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn append_menu_string(
         menu: HMENU,
         id: u32,
         label: &str,
         enabled: bool,
     ) -> windows::core::Result<()> {
-        let wide = wide_null(label);
+        let escaped = label.replace('&', "&&");
+        let wide = wide_null(&escaped);
         let flags = if enabled {
             MF_STRING
         } else {
@@ -1079,21 +1089,27 @@ mod windows_impl {
             .then_some((point.x, point.y))
     }
 
-    struct MenuGuard(HMENU);
+    struct MenuGuard(Option<HMENU>);
 
     impl MenuGuard {
         fn new(menu: HMENU) -> Self {
-            Self(menu)
+            Self(Some(menu))
         }
 
         fn handle(&self) -> HMENU {
-            self.0
+            self.0.expect("menu guard must own a handle")
+        }
+
+        fn release(&mut self) {
+            self.0 = None;
         }
     }
 
     impl Drop for MenuGuard {
         fn drop(&mut self) {
-            let _ = unsafe { DestroyMenu(self.0) };
+            if let Some(menu) = self.0.take() {
+                let _ = unsafe { DestroyMenu(menu) };
+            }
         }
     }
 
@@ -1269,25 +1285,72 @@ mod tests {
     }
 
     #[test]
-    fn shell_insert_position_counts_internal_and_shell_separators() {
-        let items = vec![
-            NativeMivMenuItem {
-                command: NativeMivCommand::CopyPath,
-                label: "copy".to_string(),
-                enabled: true,
-                separator_before: false,
-            },
-            NativeMivMenuItem {
-                command: NativeMivCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
-                label: "tool".to_string(),
-                enabled: true,
-                separator_before: true,
+    fn shell_insert_position_counts_only_top_level_nodes() {
+        let item = |command, label: &str| MenuNode::Item {
+            command,
+            label: label.to_string(),
+            enabled: true,
+            disabled_reason: None,
+        };
+        let nodes = vec![
+            item(MenuCommand::CopyPath, "copy"),
+            MenuNode::Separator,
+            MenuNode::Submenu {
+                label: "apps".to_string(),
+                children: vec![
+                    item(
+                        MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
+                        "tool",
+                    ),
+                    MenuNode::Separator,
+                    item(MenuCommand::OpenExternalToolSettings, "settings"),
+                ],
             },
         ];
 
-        assert_eq!(miv_menu_position_count(&items), Some(3));
-        assert_eq!(shell_menu_insert_position(&items), Some(4));
+        assert_eq!(shell_menu_insert_position(&nodes), Some(4));
         assert_eq!(shell_menu_insert_position(&[]), Some(0));
+    }
+
+    #[test]
+    fn leaf_command_order_matches_preorder_id_assignment() {
+        let leaf = |command, label: &str| MenuNode::Item {
+            command,
+            label: label.to_string(),
+            enabled: true,
+            disabled_reason: None,
+        };
+        let nodes = vec![
+            leaf(MenuCommand::CopyPath, "copy"),
+            MenuNode::Submenu {
+                label: "apps".to_string(),
+                children: vec![
+                    leaf(
+                        MenuCommand::OpenWithAssociation {
+                            display_name: "Viewer".to_string(),
+                            handler_id: "viewer.id".to_string(),
+                        },
+                        "Viewer",
+                    ),
+                    leaf(MenuCommand::AddApplication, "add"),
+                ],
+            },
+            leaf(MenuCommand::Deselect, "deselect"),
+        ];
+        let commands = leaf_commands(&nodes);
+        assert_eq!(commands.len(), 4);
+        for (index, expected) in commands.iter().enumerate() {
+            let id = miv_command_id(index).unwrap();
+            let reverse = miv_command_index(id, commands.len()).unwrap();
+            assert_eq!(commands[reverse], *expected);
+        }
+        assert!(matches!(commands[0], MenuCommand::CopyPath));
+        assert!(matches!(
+            commands[1],
+            MenuCommand::OpenWithAssociation { .. }
+        ));
+        assert!(matches!(commands[2], MenuCommand::AddApplication));
+        assert!(matches!(commands[3], MenuCommand::Deselect));
     }
 
     #[test]

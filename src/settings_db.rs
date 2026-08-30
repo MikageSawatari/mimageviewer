@@ -16,7 +16,9 @@
 //! 3. 残り全部を `settings_kv (key, value)` に JSON 値そのままで格納
 //!
 //! ロード時は逆に複合テーブル → typed struct → JSON Value → Map に挿入してから
-//! `serde_json::from_value::<Settings>(Map)` で復元する。
+//! `serde_json::from_value::<Settings>(Map)` で復元する。ただし
+//! `recent_open_with_apps` は互換性維持専用で、テーブル・行・移行だけを残し、通常の
+//! 読み書きでは触らない。
 //!
 //! これにより:
 //! - `Settings` に新フィールドが追加されても schema を変えずに自動的に永続化される
@@ -830,11 +832,6 @@ impl SettingsDb {
         write_favorites(&tx, &settings.favorites)?;
         write_tags(&tx, &settings.tags)?;
         write_video_resume_positions(&tx, &settings.video_resume_positions)?;
-        write_recent_apps(
-            &tx,
-            "recent_open_with_apps",
-            &settings.recent_open_with_apps,
-        )?;
         // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
         // 外部ツール UI への載せ替え後は更新しない。
         write_external_tools(&tx, &settings.external_tools)?;
@@ -2265,30 +2262,6 @@ fn read_vst3_chain_slots(conn: &Connection) -> Result<Vst3ChainPresetSlots, Sett
 // recent / custom open-with apps
 // ---------------------------------------------------------------------------
 
-fn write_recent_apps(
-    tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    apps: &[RecentApp],
-) -> rusqlite::Result<()> {
-    // テーブル名はコード内固定の `recent_open_with_apps` だけ。
-    // legacy の `custom_open_with_apps` は意図的に書き戻さないため injection リスクなし。
-    tx.execute(&format!("DELETE FROM {table}"), [])?;
-    let mut stmt = tx.prepare(&format!(
-        "INSERT INTO {table} (exe_path, display_name, sort_index, launch_kind)
-         VALUES (?1, ?2, ?3, ?4)"
-    ))?;
-    for (idx, app) in apps.iter().enumerate() {
-        let (launch_kind, launch_value) = external_tool_launch_storage(&app.launch);
-        stmt.execute(params![
-            launch_value.unwrap_or_default(),
-            app.display_name,
-            idx as i64,
-            launch_kind
-        ])?;
-    }
-    Ok(())
-}
-
 fn read_recent_apps(conn: &Connection) -> Result<Vec<RecentApp>, SettingsDbError> {
     let mut stmt = conn.prepare(
         "SELECT exe_path, display_name, launch_kind
@@ -2660,7 +2633,6 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let video_resume_positions = read_video_resume_positions(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
-    let recent_apps = read_recent_apps(conn)?;
     let custom_apps = read_legacy_open_with_apps(conn)?;
     let external_tools = read_external_tools(conn)?;
 
@@ -2674,10 +2646,6 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "vst3_chain_slots".into(),
         serde_json::to_value(vst3_chain_slots)?,
-    );
-    map.insert(
-        "recent_open_with_apps".into(),
-        serde_json::to_value(recent_apps)?,
     );
     map.insert(
         "custom_open_with_apps".into(),
@@ -3887,7 +3855,7 @@ mod tests {
     use crate::external_tool::{
         ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
     };
-    use crate::settings::{LegacyOpenWithApp, RecentApp, Settings, SortOrder, TagDef};
+    use crate::settings::{LegacyOpenWithApp, Settings, SortOrder, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -3939,10 +3907,6 @@ mod tests {
                 ..Default::default()
             },
         });
-        s.recent_open_with_apps = vec![RecentApp {
-            display_name: "Editor".to_string(),
-            launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\bin\edit.exe")),
-        }];
         s.external_tools = vec![ExternalTool {
             id: ExternalToolId(12),
             name: "Photoshop".to_string(),
@@ -4450,19 +4414,21 @@ mod tests {
         }
 
         let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.recent_open_with_apps.is_empty());
+        let migrated = {
+            let inner = db.inner.lock().unwrap();
+            read_recent_apps(&inner.conn).unwrap()
+        };
 
+        assert_eq!(migrated[0].launch, ExternalToolLaunch::Executable(existing));
         assert_eq!(
-            loaded.recent_open_with_apps[0].launch,
-            ExternalToolLaunch::Executable(existing)
-        );
-        assert_eq!(
-            loaded.recent_open_with_apps[1].launch,
+            migrated[1].launch,
             ExternalToolLaunch::Association {
                 handler_id: "フォト".to_string()
             }
         );
         assert_eq!(
-            loaded.recent_open_with_apps[2].launch,
+            migrated[2].launch,
             ExternalToolLaunch::Association {
                 handler_id: missing.to_string_lossy().into_owned()
             }
@@ -4500,8 +4466,13 @@ mod tests {
                 .unwrap();
         }
         let first = db.load_into_settings().unwrap();
+        assert!(first.recent_open_with_apps.is_empty());
+        let first_rows = {
+            let inner = db.inner.lock().unwrap();
+            read_recent_apps(&inner.conn).unwrap()
+        };
         assert!(matches!(
-            first.recent_open_with_apps[0].launch,
+            first_rows[0].launch,
             ExternalToolLaunch::Association { .. }
         ));
 
@@ -4518,7 +4489,13 @@ mod tests {
         }
 
         let reloaded = db.load_into_settings().unwrap();
-        assert_eq!(reloaded.recent_open_with_apps, first.recent_open_with_apps);
+        assert!(reloaded.recent_open_with_apps.is_empty());
+        let reloaded_rows = {
+            let inner = db.inner.lock().unwrap();
+            read_recent_apps(&inner.conn).unwrap()
+        };
+        assert_eq!(reloaded_rows, first_rows);
+        db.save_full(&reloaded).unwrap();
         assert!(recent_launch_migration_marker_present(&db));
         let inner = db.inner.lock().unwrap();
         let stored_kind: String = inner

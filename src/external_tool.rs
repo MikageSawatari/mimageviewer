@@ -687,9 +687,6 @@ fn write_back_association_handler_id(
             handler_id.clone_from(&refresh.current_id);
         }
     };
-    for recent in &mut settings.recent_open_with_apps {
-        update(&mut recent.launch);
-    }
     for tool in &mut settings.external_tools {
         update(&mut tool.launch);
     }
@@ -853,14 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn handler_refresh_updates_recent_apps_and_registered_tools() {
+    fn handler_refresh_updates_registered_tools() {
         let mut settings = crate::settings::Settings::default();
-        settings.recent_open_with_apps = vec![crate::settings::RecentApp {
-            display_name: "ペイント".to_string(),
-            launch: ExternalToolLaunch::Association {
-                handler_id: "old.Paint".to_string(),
-            },
-        }];
         let mut tool = ExternalTool::defaults_for_viewing();
         tool.launch = ExternalToolLaunch::Association {
             handler_id: "old.Paint".to_string(),
@@ -875,10 +866,6 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            &settings.recent_open_with_apps[0].launch,
-            ExternalToolLaunch::Association { handler_id } if handler_id == "current.Paint"
-        ));
         assert!(matches!(
             &settings.external_tools[0].launch,
             ExternalToolLaunch::Association { handler_id } if handler_id == "current.Paint"

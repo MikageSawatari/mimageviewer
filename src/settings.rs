@@ -4366,8 +4366,7 @@ pub struct Settings {
     pub folder_thumb_depth: u32,
 
     // ── アプリケーションで開く ──────────────────────────────────
-    /// 最近使ったアプリケーション（最大3件、最新が先頭）。
-    /// 次リリースまでの legacy 候補リストで、外部ツール UI 移行後に削除予定。
+    /// 未使用。リリース済みデータの読み取り互換キャリアとして残し、次の版で削除を検討する。
     #[serde(default, deserialize_with = "deserialize_recent_open_with_apps")]
     pub recent_open_with_apps: Vec<RecentApp>,
     /// ユーザーが手動で追加した legacy アプリケーション。
@@ -8227,26 +8226,6 @@ impl Settings {
     pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
         self.try_add_favorite(name, path).is_ok()
     }
-
-    /// 「アプリケーションで開く」で使用したアプリを履歴に記録する。
-    /// 同じ起動先が既にあれば先頭に移動。最大3件。
-    pub fn record_recent_open_with(
-        &mut self,
-        display_name: String,
-        launch: crate::external_tool::ExternalToolLaunch,
-    ) {
-        const MAX_RECENT_OPEN_WITH: usize = 3;
-        self.recent_open_with_apps
-            .retain(|app| !app.launch.same_target(&launch));
-        self.recent_open_with_apps.insert(
-            0,
-            RecentApp {
-                display_name,
-                launch,
-            },
-        );
-        self.recent_open_with_apps.truncate(MAX_RECENT_OPEN_WITH);
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -10598,30 +10577,6 @@ mod tests {
                 exe_path: missing_custom.to_string_lossy().into_owned(),
             }]
         );
-    }
-
-    #[test]
-    fn recording_a_handler_replaces_the_same_legacy_executable_identity() {
-        let mut settings = Settings::default();
-        settings.record_recent_open_with(
-            "Legacy".to_string(),
-            crate::external_tool::ExternalToolLaunch::Executable(PathBuf::from(
-                r"C:\Tools\viewer.exe",
-            )),
-        );
-        settings.record_recent_open_with(
-            "Shell".to_string(),
-            crate::external_tool::ExternalToolLaunch::Association {
-                handler_id: r"c:\tools\VIEWER.exe".to_string(),
-            },
-        );
-
-        assert_eq!(settings.recent_open_with_apps.len(), 1);
-        assert_eq!(settings.recent_open_with_apps[0].display_name, "Shell");
-        assert!(matches!(
-            settings.recent_open_with_apps[0].launch,
-            crate::external_tool::ExternalToolLaunch::Association { .. }
-        ));
     }
 
     #[test]
