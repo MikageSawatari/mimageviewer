@@ -15563,6 +15563,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 let viewport_h = ui.available_height().max(0.0);
                 self.last_viewport_h = viewport_h;
+                // 行高・ビューポート高と同じく「最後に描いた形」。終了時にカーソルが
+                // 上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
+                self.last_grid_cols = cols;
 
                 if scroll_to {
                     self.apply_scroll_to_selected(cols, cell_h);

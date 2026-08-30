@@ -873,8 +873,9 @@ impl App {
             // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
             // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
             // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
-            self.select_after_load =
-                crate::known_folders::startup_cursor_hint(&self.settings, &folder);
+            let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
+            self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
+            self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
             let _ = self.load_folder_or_convert_archive(folder);
         }
     }

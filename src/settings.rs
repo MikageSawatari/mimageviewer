@@ -3587,6 +3587,13 @@ pub struct Settings {
     /// パスではなく名前なのは、既存の `select_after_load` と同じ照合規則に乗るため。
     #[serde(default)]
     pub last_cursor_name: Option<String>,
+    /// そのカーソルが、画面の一番上の行から**何行下**にあったか。
+    ///
+    /// スクロール位置そのもの (pt) を保存しない。ウィンドウ幅や列数が変わると同じ pt が
+    /// 別の行を指すので、**現在のレイアウトで計算し直せる形**で持つ。復元は
+    /// `App::apply_scroll_to_selected` が現在の列数と行高から行う。
+    #[serde(default)]
+    pub last_cursor_rows_above: Option<u32>,
     /// 旧形式 (〜v1.5.0) のグローバルな最近開いたフォルダ一覧。v1.6.0 で A/B
     /// スロット別 (`quick_folder_recent_folders`) へ移行したが、初回移行のシード元 +
     /// 旧バージョンへのダウングレード互換のため残し、主スロット A の一覧を書き戻す。
@@ -5785,6 +5792,7 @@ impl Default for Settings {
             last_folder: None,
             restore_last_cursor: true,
             last_cursor_name: None,
+            last_cursor_rows_above: None,
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
             recent_folders: Vec::new(),
@@ -7994,6 +8002,7 @@ impl Settings {
         // カーソル名は `last_folder` と対の実行時状態。環境設定 OK の全体差し替えで
         // 片方だけ live 値、片方だけダイアログ側の値になると対応が崩れる。
         self.last_cursor_name = src.last_cursor_name.take();
+        self.last_cursor_rows_above = src.last_cursor_rows_above;
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);

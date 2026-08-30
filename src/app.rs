@@ -9644,6 +9644,14 @@ pub struct App {
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+    /// 直近フレームのグリッド列数。行高・ビューポート高と同じ「最後に描いた形」の一部で、
+    /// 終了時にカーソルが上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
+    pub(crate) last_grid_cols: usize,
+    /// 起動時のカーソル復元で、選択行を上から何行目に置くか。
+    ///
+    /// `select_after_load` と同じ寿命 — 次の `apply_scroll_to_selected` が取り出して使い切る。
+    /// 無いときは従来どおり「見える最小限だけ動かす」。
+    pub(crate) scroll_selected_to_rows_above: Option<u32>,
     /// 詳細表示で前フレームに描画した名前列の実効幅（ヘッダ右クリックで「固定幅へ」する際に使う）
     pub(crate) last_details_name_width: f32,
 
@@ -13450,6 +13458,8 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            last_grid_cols: 4,
+            scroll_selected_to_rows_above: None,
             last_details_name_width: 140.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             auto_aspect_cache_db,
@@ -36372,6 +36382,14 @@ impl App {
         let row = vis_pos / cols;
         let row_top = row as f32 * cell_h;
         let row_bottom = row_top + cell_h;
+        // 起動時のカーソル復元だけは「見えるように最小限動かす」ではなく、**前回と同じ
+        // 行位置に置く**。前回いた場所をそのまま開いたときに、選んでいた項目が画面の
+        // 違う高さに現れると別の場所に見える (利用者報告 2026-08-30)。
+        if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
+            let top_row = row.saturating_sub(rows_above as usize);
+            self.scroll_offset_y = top_row as f32 * cell_h;
+            return;
+        }
         let vp_top = self.scroll_offset_y;
         let vp_bottom = self.scroll_offset_y + self.last_viewport_h;
 
@@ -54111,7 +54129,7 @@ impl App {
     /// `with_detached_viewer_main_history_suppressed` の中だけ非ゼロになるスコープ
     /// カウンタで、終了 / トレイ退避はそのスコープの外から来る。ここで呼んでも常に
     /// false なので、動いているように見えるだけの分岐になる。
-    pub(crate) fn cursor_name_to_persist(&self) -> Option<String> {
+    pub(crate) fn cursor_to_persist(&self) -> Option<(String, u32)> {
         let folder = self.effective_folder()?;
         if is_synthetic_view_path(&folder) {
             return None;
@@ -54122,14 +54140,39 @@ impl App {
         ) {
             return None;
         }
-        let name = self.items.get(self.selected?)?.name().to_string();
-        (!name.is_empty()).then_some(name)
+        let selected = self.selected?;
+        let name = self.items.get(selected)?.name().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, self.selected_rows_below_view_top(selected)))
+    }
+
+    /// 選択行が、画面の一番上に見えている行から何行下にあるか。
+    ///
+    /// スクロール位置 (pt) ではなくこれを保存する。ウィンドウ幅や列数が変わると同じ pt が
+    /// 別の行を指すが、「上から何行目に見えていたか」は次回のレイアウトでも計算し直せる。
+    fn selected_rows_below_view_top(&self, selected: usize) -> u32 {
+        let cols = self.last_grid_cols.max(1);
+        let cell_h = self.last_cell_h.max(1.0);
+        let position = self
+            .current_grid_order()
+            .iter()
+            .position(|&idx| idx == selected)
+            .unwrap_or(selected);
+        let row = position / cols;
+        let top_row = (self.scroll_offset_y / cell_h).round().max(0.0) as usize;
+        row.saturating_sub(top_row).min(u32::MAX as usize) as u32
     }
 
     pub(crate) fn persist_window_state_and_flush(&mut self) {
-        // カーソル名は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
+        // カーソル名と行位置は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
         // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
-        self.settings.last_cursor_name = self.cursor_name_to_persist();
+        // **対で書き、対で捨てる。** 片方だけ残ると、名前は前回のもので位置は前々回、
+        // という組み合わせが生まれる。
+        let cursor = self.cursor_to_persist();
+        self.settings.last_cursor_name = cursor.as_ref().map(|(name, _)| name.clone());
+        self.settings.last_cursor_rows_above = cursor.map(|(_, rows)| rows);
         // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
         // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
         // より前に正規化・検証・反映だけを行う（再走査 worker は開始しない）。

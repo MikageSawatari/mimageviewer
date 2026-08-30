@@ -16845,11 +16845,14 @@ mod favorite_adjustment_defaults_tests {
         app.settings.last_folder = Some(folder.clone());
 
         app.selected = Some(1);
-        assert_eq!(app.cursor_name_to_persist().as_deref(), Some("b.jpg"));
+        assert_eq!(
+            app.cursor_to_persist().map(|(name, _)| name).as_deref(),
+            Some("b.jpg")
+        );
 
         // 未選択なら書くものが無い。
         app.selected = None;
-        assert_eq!(app.cursor_name_to_persist(), None);
+        assert_eq!(app.cursor_to_persist(), None);
         app.selected = Some(1);
 
         // 合成ビュー (検索結果など) の項目は `last_folder` の中身ではない。
@@ -16861,7 +16864,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(synthetic.clone());
         app.settings.last_folder = Some(synthetic);
         assert_eq!(
-            app.cursor_name_to_persist(),
+            app.cursor_to_persist(),
             None,
             "合成ビューの選択を last_folder のカーソルとして残してはいけない"
         );
@@ -16869,11 +16872,63 @@ mod favorite_adjustment_defaults_tests {
 
         // last_folder と別の場所を見ている状態でも残さない。
         app.current_folder = Some(std::path::PathBuf::from("c:/other"));
-        assert_eq!(app.cursor_name_to_persist(), None);
+        assert_eq!(app.cursor_to_persist(), None);
 
         // 元に戻せばまた書ける (上の None が「壊れた」わけではないことの確認)。
         app.current_folder = Some(folder.clone());
-        assert_eq!(app.cursor_name_to_persist().as_deref(), Some("b.jpg"));
+        assert_eq!(
+            app.cursor_to_persist().map(|(name, _)| name).as_deref(),
+            Some("b.jpg")
+        );
+    }
+
+    /// カーソルの行位置は、保存したときと同じ見え方に戻る。
+    ///
+    /// スクロール位置 (pt) ではなく「上から何行目か」を保存している。**列数や行高が
+    /// 変わっても同じ見え方になる**のがその狙いなので、保存時と復元時でレイアウトを
+    /// 変えて往復させる。
+    #[test]
+    fn the_cursor_comes_back_the_same_number_of_rows_down_the_screen() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for i in 0..40 {
+            app.items
+                .push(GridItem::Image(folder.join(format!("{i:02}.jpg"))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.rebuild_visible_indices();
+        app.current_folder = Some(folder.clone());
+        app.settings.last_folder = Some(folder);
+
+        // 保存時: 4 列 / 行高 200。idx 22 は 5 行目、画面の一番上は 3 行目 → 2 行下。
+        app.last_grid_cols = 4;
+        app.last_cell_h = 200.0;
+        app.scroll_offset_y = 600.0;
+        app.selected = Some(22);
+        let (name, rows_above) = app.cursor_to_persist().expect("保存できるはず");
+        assert_eq!(name, "22.jpg");
+        assert_eq!(rows_above, 2);
+
+        // 復元時: 5 列 / 行高 150 に変わった。idx 22 は 4 行目なので、2 行下に見せるには
+        // 一番上を 2 行目にする → 2 * 150。**保存した pt (600) をそのまま使うと違う行になる。**
+        app.scroll_offset_y = 0.0;
+        app.scroll_selected_to_rows_above = Some(rows_above);
+        app.apply_scroll_to_selected(5, 150.0);
+        assert_eq!(app.scroll_offset_y, 300.0);
+        assert!(
+            app.scroll_selected_to_rows_above.is_none(),
+            "1 回で使い切ること (次のカーソル移動まで効き続けない)"
+        );
+
+        // 使い切った後は従来どおり「見える最小限だけ動かす」に戻る。
+        app.last_viewport_h = 600.0;
+        app.scroll_offset_y = 0.0;
+        app.apply_scroll_to_selected(5, 150.0);
+        assert_eq!(
+            app.scroll_offset_y, 150.0,
+            "行 4 が下端に入る最小の移動。行位置の復元ではない"
+        );
     }
 
     /// ドライブ一覧で終了したときもカーソル名を残さない。
@@ -16893,7 +16948,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(std::path::PathBuf::from("c:/pics"));
         app.settings.last_folder = Some(std::path::PathBuf::from("c:/pics"));
 
-        assert_eq!(app.cursor_name_to_persist(), None);
+        assert_eq!(app.cursor_to_persist(), None);
     }
 
     /// Codex P3 (2026-04): BS で深い階層から戻ったとき、`select_after_load` が

@@ -151,18 +151,27 @@ pub fn startup_folder_is_last_folder(resolved: &Path, last_folder: Option<&Path>
 /// 保存側 (`App::cursor_name_to_persist`) と対になる判断で、**同じ
 /// [`startup_folder_is_last_folder`] を通す**。片方だけ条件が増えると、保存はするのに
 /// 復元しない (またはその逆) という噛み合わない状態になる。
-pub fn startup_cursor_hint(settings: &Settings, resolved_folder: &Path) -> Option<String> {
+/// 戻す項目名と、分かっていればその行位置。
+///
+/// 行位置が `None` なのは「一番上の行にいた」ではなく**分からない**。`Some(0)` は本当に
+/// 一番上にいたという意味なので、この 2 つを同じ値にしない。分からないときは
+/// `apply_scroll_to_selected` が従来どおり見える最小限だけ動かす。
+pub fn startup_cursor_hint(
+    settings: &Settings,
+    resolved_folder: &Path,
+) -> Option<(String, Option<u32>)> {
     if !settings.restore_last_cursor {
         return None;
     }
     if !startup_folder_is_last_folder(resolved_folder, settings.last_folder.as_deref()) {
         return None;
     }
-    settings
+    let name = settings
         .last_cursor_name
         .as_ref()
         .filter(|name| !name.is_empty())
-        .cloned()
+        .cloned()?;
+    Some((name, settings.last_cursor_rows_above))
 }
 
 /// 起動時の last_folder を復元する。フォルダ (または仮想フォルダ ZIP/PDF) がそのまま
@@ -479,9 +488,23 @@ mod tests {
         );
         settings.last_folder = Some(folder.clone());
         settings.last_cursor_name = Some("b.jpg".to_string());
+        settings.last_cursor_rows_above = Some(3);
         assert_eq!(
-            startup_cursor_hint(&settings, &folder).as_deref(),
-            Some("b.jpg")
+            startup_cursor_hint(&settings, &folder),
+            Some(("b.jpg".to_string(), Some(3)))
+        );
+
+        // 行位置だけ分からない場合。**`Some(0)` にしない** — 0 は「一番上の行にいた」で、
+        // 分からないのとは別。分からないときは従来どおり見える最小限だけ動かす。
+        settings.last_cursor_rows_above = None;
+        assert_eq!(
+            startup_cursor_hint(&settings, &folder),
+            Some(("b.jpg".to_string(), None))
+        );
+        settings.last_cursor_rows_above = Some(0);
+        assert_eq!(
+            startup_cursor_hint(&settings, &folder),
+            Some(("b.jpg".to_string(), Some(0)))
         );
 
         settings.restore_last_cursor = false;
