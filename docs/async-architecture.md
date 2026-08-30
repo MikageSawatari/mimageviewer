@@ -77,7 +77,7 @@
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
 | 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
-| タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Clear を serial に処理: XMP 書込 → 共有 writer で Tantivy upsert (タグ含む全 STORED 原文を更新) → 32 件 or 500ms でバッチ commit |
+| タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Add / Remove / Clear / SetTags を serial に処理し、**`tags.db` だけ**を更新する。メディア本体 / XMP / Tantivy には書かない (`docs/tag-catalog-redesign-plan.md` D13)。サイドカー `mimageviewer.dat` へのミラーは結果を受けた UI スレッド側が行う |
 | タスクトレイ (v0.9) | `std::thread` (常駐) | 1 (設定 ON 時のみ) | `mimv-tray` スレッド。`tray-icon` クレートで隠し HWND を作成 → `PeekMessageW` ポンプ (50ms 周期) + `TrayIconEvent` / `MenuEvent` の try_recv → `TrayEvent::Open / TogglePause / Quit` を UI に送信。`ActivityGate::set_paused` + `GlobalIoSemaphore::set_throttled` はメインスレッドで適用 |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
@@ -113,7 +113,8 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 | `cache_gen_done` | `Arc<AtomicUsize>` | キャッシュ生成 rayon | UI | 進捗カウンタ |
 | `SupervisorHandle.cancel` | `Arc<AtomicBool>` | UI (お気に入り OFF, App drop) | メタ / 名前索引 supervisor | supervisor 全体の停止シグナル |
 | `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
-| `tag_write_worker.cancel` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループ + commit の中断 |
+| `tag_write_worker.shutdown` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループの停止 |
+| `tag_write_worker.release_db_requested` / `.db_released` | `Arc<AtomicBool>` | UI (明示メタ情報 import) / worker | タグ書き込みワーカー | import が WAL → rollback journal へ切り替える間、worker に `TagsDb` 接続を手放させる要求と、その ACK |
 | `ContentIdentityDetectionPending.cancel` | `Arc<AtomicBool>` | UI (フォルダ切替、設定 OFF、App drop) | content identity 検出 worker | Low permit 待ち、target 境界、段 1 / 2 の read 境界で検出を中断する |
 | `ContentIdentityIndexLoadPending.cancel` | `Arc<AtomicBool>` | UI (台帳 snapshot 再失効、設定 OFF、App drop) | content identity index load worker | Low permit 待ちと台帳行境界で全件 snapshot 読込を中断し、cancel 後の結果を publish しない |
 | `ContentIdentityBackfillPending.cancel` | `Arc<AtomicBool>` | UI (フォルダ切替、設定 OFF、App drop) | content identity backfill worker | Low permit 待ち、物理ファイル境界、hash chunk 境界で既存編集の遡り記録を中断する |

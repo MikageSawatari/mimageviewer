@@ -1283,15 +1283,51 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 フルスクリーン、動画→音声モードなどcore内のWindows native挙動は、上の通常profile
 `build-dev.ps1` でユーザー実機確認できる。
 
-## タグ書き込みの互換性検証 (ExifTool)
+## タグ / レーティングの保存先と ExifTool 検証
 
-mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
-そのため **Windows エクスプローラーの「タグ」欄には表示されない** (Explorer は IPTC Keywords を
-優先して読むため)。`docs/archive/search-metadata/tag-feature.md` および `htdocs/mimageviewer/manual/tags.html` の互換性
-記述はこの前提を反映している。
+### 通常のタグ操作はメディアファイルを書き換えない
 
-Lightroom / Bridge / digiKam / XnView MP 等の XMP 対応ソフトとは互換があるが、開発環境で
-Adobe 製品を持っていなくても **ExifTool でラウンドトリップ検証できる**:
+**mIV タグの正本は `%APPDATA%/mimageviewer/tags.db`** ([src/tags_db.rs](src/tags_db.rs))。
+通常のタグ付与 / 削除 / クリアは **メディア本体 / XMP / IPTC を一切書き換えない**
+([src/tag_write_worker.rs](src/tag_write_worker.rs))。Tantivy 全文索引にも投影しない
+([docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) D13「書き込み投影ゼロ」)。
+
+そのため:
+
+- **タグは他ソフトへ持ち出せない**。Lightroom / Bridge / digiKam / XnView MP でも、
+  Windows エクスプローラーの「タグ」欄でも見えない。比較資料・製品ページ・紹介文で
+  「mIV のタグはファイル本体に書かれるので他ソフトと共有できる」と書かない。
+  これは **v1.0 の旧仕様** で、現行仕様ではない (2026-08 に旧記述を信じたまま誤った
+  比較資料を作り、全面訂正した経緯がある)。
+- 移動耐性は **フォルダごとのサイドカー `mimageviewer.dat`** へのミラーで確保する
+  ([src/sidecar.rs](src/sidecar.rs))。ミラー先はサイドカーであって**メディアファイルではない**。
+  設定 `tag_sidecar_backup_enabled` は **既定 OFF**。
+- 外部書き出し (XMP / CSV / JSON) は現行仕様では **行わない**
+  ([docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) D19)。
+
+正本は [docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md)、現行の全体像は
+[docs/search-architecture.md](docs/search-architecture.md) §4.9。ユーザー向け記述は
+`htdocs/mimageviewer/manual/tags.html` が現行仕様に一致しているので、迷ったらそちらを読む。
+`docs/archive/search-metadata/tag-feature.md` は **v1.0 の履歴** なので現行仕様の根拠にしない。
+
+### いま実際にファイルへ XMP を書く 2 経路
+
+`src/xmp_writer.rs` はタグ用途では縮退したが、消えてはいない。以下の 2 つは **今もユーザーの
+ファイルを書き換える**ので、変更したら ExifTool で検証する。
+
+| 経路 | 呼び出し元 | 書き込む物 | 条件 |
+| --- | --- | --- | --- |
+| レーティング | `rating_write_worker` → `xmp_writer::apply_rating` | `xmp:Rating` | 設定 `write_rating_to_xmp` (**既定 OFF**) + `GridItem::Image` かつ JPEG / PNG / WebP。製本ページは除外 |
+| 旧 XMP タグの取り込み後削除 | `tag_legacy_xmp_worker` → `xmp_writer::apply_tag_op(TagOp::ClearMiv)` | `dc:subject` から `#` 始まりの要素だけ除去 | ユーザーが「旧XMPタグを取り込んでファイルから削除」を明示実行したときのみ |
+
+どちらも `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
+並走させると後勝ちで相手の編集を消すため)。**新しい書き込み経路を足すときもこのロックを通す**。
+
+### ExifTool でのラウンドトリップ検証
+
+上記 2 経路を変更したときの検証手順。ExifTool (exiftool.org) は業界標準の XMP 解釈
+リファレンス実装なので、ここで期待どおり出れば Lightroom / Bridge / digiKam / XnView MP でも
+同じに見える。
 
 ```powershell
 # UTF-8 対応のためコンソールを切り替え (CP932 のままだと日本語タグが化ける)
@@ -1299,14 +1335,20 @@ chcp 65001
 # または
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-exiftool -XMP-dc:Subject -IPTC:Keywords "path\to\tagged.jpg"
-# 期待される出力:
-#   Subject: #原神, #風景       ← mIV で付与したタグ (XMP 側)
-#   Keywords:                    ← 空 (IPTC は書いていない前提)
+# (1) レーティング書き込み (write_rating_to_xmp = ON) の確認
+exiftool -XMP:Rating "path\to\rated.jpg"
+#   Rating: 4                    ← mIV で付けた★の数。0 / 未評価なら要素ごと消える
+
+# (2) 「旧XMPタグを取り込んでファイルから削除」の前後比較
+exiftool -XMP-dc:Subject -IPTC:Keywords "path\to\legacy.jpg"
+#   削除前: Subject: #原神, #風景, landscape
+#   削除後: Subject: landscape    ← "#" 始まりだけ消え、他ソフト由来のタグは残る
+#   Keywords:                     ← mIV は IPTC を読み書きしないので前後とも不変
 ```
 
-ExifTool (exiftool.org) は業界標準の XMP 解釈リファレンス実装。ここで期待どおり出れば
-Lightroom / Bridge / digiKam / XnView MP でも同じタグが見える。
+**旧タグ削除の検証で一番大事なのは「他ソフト由来のタグが残ること」**。`#` 始まりだけが消え、
+`#` の付かない既存キーワードと `xtw:*` 等の Extended XMP が保持されているかを、削除の前後で
+必ず比較する (`apply_tag_op` は最小差分編集なので、パケット再構築の退行はここでしか出ない)。
 
 ### 文字化け対処
 
@@ -1321,12 +1363,16 @@ exiftool -j -XMP:Subject "path\to\tagged.jpg" | ConvertFrom-Json
 
 JSON は仕様上 UTF-8 固定なのでコンソール設定に依存しない。
 
-### 将来的な IPTC 併記 (dual-write) 検討メモ
+### Windows エクスプローラー互換 / IPTC 併記について
 
-Windows エクスプローラー互換も取りたいときは、APP13 Photoshop Image Resource Block 中の
-IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バイナリ構築は工数大
-(200-400 行 + 相互作用テスト)。現状は優先度低、マニュアル側でエクスプローラー非対応を
-明記して回避。
+**現行設計では検討対象外**。mIV はタグをファイルへ書かない (`tags.db` 正本) ので、
+「XMP `dc:subject` に加えて IPTC Keywords へも併記する」という v1.0 前提の dual-write 案は
+**前提ごと消えている**。エクスプローラーの「タグ」欄に出したいという要望が来た場合、論点は
+IPTC 併記ではなく **「タグを外部形式へ書き出す明示コマンドを設けるか」** という設計判断になる。
+
+これは [docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) §10 (非対象 / 将来) と
+D19 で「v1 では外部書き出しをしない (非破壊・外部書き込み無し方針の維持)。将来の明示
+エクスポートは検討余地」と整理済み。要望が来たらこの節ではなく **そちらで判断する**。
 
 ## 動画メタ情報の扱いと外部ダウンローダの言及禁止ポリシー
 
@@ -1506,7 +1552,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 | アトミック rename | (削除して「ファイル本体を書き換えます」だけにする) |
 | STORE モード / 無圧縮 STORE 方式 | 再圧縮なし / そのまま格納 |
 | マルチプロセス並列レンダリング | 並列処理 |
-| RDF Bag | (削除、XMP dc:subject だけで十分) |
+| RDF Bag / XMP dc:subject | (削除。旧タグ取り込みの話なら「ファイル内の旧タグ」で十分) |
 | ONNX Runtime DLL (カテゴリ名として) | AI 機能用 DLL |
 | panic ログ | エラーログ |
 
