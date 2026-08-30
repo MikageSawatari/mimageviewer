@@ -64207,6 +64207,50 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
     }
 }
 
+/// 別ウィンドウで開いているものが動画なら、十字キーは動画の面へ行く。
+///
+/// 利用者報告 (§1.0f(b)): 別ウィンドウで動画を開いていると十字キーでシークできない。
+/// **静止画では効く**ので、配り先そのものは届いている。対比をそのままテストにする。
+///
+/// 配り先は mount 済みの context で決まる (`dispatch_gamepad_batch` の doc) ので、
+/// root projection ではなく `with_active_viewer_context` の中で問う。
+#[test]
+#[cfg(windows)]
+fn what_the_detached_window_holds_decides_which_dpad_branch_runs() {
+    for (label, item, expected) in [
+        (
+            "動画",
+            GridItem::Video(PathBuf::from("C:/videos/clip.mp4")),
+            crate::app::gamepad_input::DpadRoute::Video(0),
+        ),
+        (
+            "静止画",
+            GridItem::Image(PathBuf::from("C:/photos/page.jpg")),
+            crate::app::gamepad_input::DpadRoute::Still(0),
+        ),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let window_id = 81;
+        app.build_window_context_for_test(window_id, |bundle| {
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.items = vec![item];
+            bundle.fullscreen_idx = Some(0);
+        });
+        app.detached_viewer_window_id = Some(window_id);
+        // 前面が別ウィンドウ = 直近に配った面がビューア。前面 HWND はテストから触れない。
+        app.detached_window_manager
+            .note_input_surface(crate::app::ActionSurface::Viewer);
+
+        let route = app.with_active_viewer_context(|app| app.dpad_route_for_test());
+
+        assert_eq!(
+            route,
+            Some(expected),
+            "別ウィンドウが{label}を持っているときの配り先が違う"
+        );
+    }
+}
+
 /// 遷移中に context を畳む経路でも、通常の teardown まで到達する。
 ///
 /// `close_fullscreen` は遷移中なら `TerminalClose` を出して戻り、teardown を「後で

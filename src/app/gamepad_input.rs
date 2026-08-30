@@ -649,6 +649,71 @@ impl App {
             && self.current_input_surface() == crate::app::ActionSurface::Viewer
     }
 
+    /// 十字キーの配り先。**決めるのはここだけ。** Y 修飾の有無で入口は 2 つあるが、
+    /// どちらも同じ答えを使う。
+    ///
+    /// 呼ぶ側が mount 済みの context であることが前提 (`dispatch_gamepad_batch` の doc)。
+    /// root projection のまま呼ぶと、別ウィンドウのビューアは `fullscreen_idx` に現れず
+    /// `Grid` に落ちる。
+    fn dpad_route(&self) -> DpadRoute {
+        if !self.gamepad_targets_viewer() {
+            return DpadRoute::Grid;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return DpadRoute::Grid;
+        };
+        if self.current_fullscreen_is_video(fs_idx) {
+            DpadRoute::Video(fs_idx)
+        } else {
+            DpadRoute::Still(fs_idx)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dpad_route_for_test(&self) -> DpadRoute {
+        self.dpad_route()
+    }
+
+    /// 十字キーの配り先を、**変わったときだけ** 1 行残す。
+    ///
+    /// この分岐は 4 つの述語の積で決まるのに、どれが外れても外から見える結果は
+    /// 「何も起きない」か「別の面が動く」で、区別が付かない (§1.0f(b): 別ウィンドウで
+    /// 動画を開いているとき十字キーでシークできない。静止画では動くので、配り先そのものは
+    /// 届いている)。
+    ///
+    /// repeat が毎フレーム来るので同じ状況の連投は捨てるが、**捨てる条件は記録する値
+    /// そのものの一致だけ**にしてある。調べたい信号 (面はどれか / 動画と見えているか) を
+    /// 抑制条件に混ぜると、肝心のときだけ出力が消える。
+    fn log_dpad_route_if_changed(&self, route: DpadRoute) {
+        let surface = self.current_input_surface();
+        let fs_idx = self.fullscreen_idx;
+        let is_music = fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
+        #[cfg(windows)]
+        let at_rest = self.active_detached_context_is_at_rest();
+        #[cfg(not(windows))]
+        let at_rest = false;
+        let detached = self.viewer_session_is_detached_or_switching();
+
+        // 記録する値だけを畳んだ鍵。fs_idx は項目ごとに変わって連投になるので鍵に入れない
+        // (値としては下の行に出す)。最上位ビットは「未記録 (0)」と「全部 false」の区別。
+        let key = (matches!(route, DpadRoute::Grid) as u64)
+            | ((fs_idx.is_some() as u64) << 1)
+            | ((matches!(route, DpadRoute::Video(_)) as u64) << 2)
+            | ((is_music as u64) << 3)
+            | ((at_rest as u64) << 4)
+            | ((detached as u64) << 5)
+            | (((surface == crate::app::ActionSurface::Viewer) as u64) << 6)
+            | (1 << 7);
+        if LAST_LOGGED_DPAD_ROUTE.swap(key, std::sync::atomic::Ordering::Relaxed) == key {
+            return;
+        }
+        crate::logger::log(format!(
+            "[gamepad] dpad route: {route:?} surface={surface:?} fs_idx={fs_idx:?} \
+             is_music={is_music} detached_context_at_rest={at_rest} \
+             session_detached_or_switching={detached}"
+        ));
+    }
+
     pub(crate) fn ring_shortcut_context_for_surface(
         &self,
         surface: crate::app::ActionSurface,
@@ -6164,30 +6229,26 @@ impl App {
     }
 
     fn handle_gamepad_direction(&mut self, ctx: &egui::Context, dir: PadDir, repeat: bool) {
-        let targets_viewer = self.gamepad_targets_viewer();
-        if self.gamepad_state.button_down(PadButton::North) {
+        let route = self.dpad_route();
+        self.log_dpad_route_if_changed(route);
+        let y_modifier = self.gamepad_state.button_down(PadButton::North);
+        if y_modifier {
             self.gamepad_state.mark_y_modifier_used();
-            if targets_viewer
-                && let Some(fs_idx) = self.fullscreen_idx
-                && !self.current_fullscreen_is_video(fs_idx)
-            {
-                self.handle_gamepad_still_y_direction(ctx, fs_idx, dir);
-            } else if targets_viewer && let Some(fs_idx) = self.fullscreen_idx {
-                self.handle_gamepad_video_y_direction(ctx, fs_idx, dir, repeat);
-            } else {
-                self.handle_gamepad_direction_for_grid(dir);
-            }
-            return;
         }
-
-        if targets_viewer && let Some(fs_idx) = self.fullscreen_idx {
-            if self.current_fullscreen_is_video(fs_idx) {
-                self.handle_gamepad_video_direction(ctx, fs_idx, dir, repeat);
-            } else {
-                self.handle_gamepad_still_direction(ctx, fs_idx, dir);
+        match (route, y_modifier) {
+            (DpadRoute::Grid, _) => self.handle_gamepad_direction_for_grid(dir),
+            (DpadRoute::Still(fs_idx), false) => {
+                self.handle_gamepad_still_direction(ctx, fs_idx, dir)
             }
-        } else {
-            self.handle_gamepad_direction_for_grid(dir);
+            (DpadRoute::Still(fs_idx), true) => {
+                self.handle_gamepad_still_y_direction(ctx, fs_idx, dir)
+            }
+            (DpadRoute::Video(fs_idx), false) => {
+                self.handle_gamepad_video_direction(ctx, fs_idx, dir, repeat)
+            }
+            (DpadRoute::Video(fs_idx), true) => {
+                self.handle_gamepad_video_y_direction(ctx, fs_idx, dir, repeat)
+            }
         }
     }
 
@@ -6856,6 +6917,20 @@ impl App {
     ) {
     }
 }
+
+/// 十字キーをどの面へ配るか。`App::dpad_route` だけが作る。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DpadRoute {
+    /// 一覧のカーソル移動。ビューアが前面でないか、そもそも開いていない。
+    Grid,
+    /// 静止画ビューア。ページ送り / 連続読みのスクロール。
+    Still(usize),
+    /// 動画ビューア。シーク / コマ送り (native presenter へ仮想キーとして渡す)。
+    Video(usize),
+}
+
+/// [`App::log_dpad_route_if_changed`] の dedupe 鍵。診断専用で、挙動には影響しない。
+static LAST_LOGGED_DPAD_ROUTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn gamepad_grid_nav_target_pos(
     vis_pos: usize,
