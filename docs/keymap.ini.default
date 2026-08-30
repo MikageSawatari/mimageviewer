@@ -586,4 +586,5 @@
 # LaToolRect = R ; 矩形ツールに切り替える
 # LaToolEllipse = O ; 楕円ツールに切り替える
 # LaConfirmPolygon = Enter ; 補正レイヤーの多角形マスクを確定する
+# LaDeleteShape = Delete ; 選択中の補正図形を削除する
 # LaSpacePan = Space ; 押している間だけ画像をパン操作する

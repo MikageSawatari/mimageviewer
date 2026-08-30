@@ -19144,7 +19144,10 @@ impl App {
                 ctx.request_repaint();
                 return action;
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            // 消しゴム / 隠蔽の図形削除と同じく `KeyAction` を通す。ここだけ raw consume
+            // だったので、再割り当てできず、Delete を別の Local Adjust 操作へ割り当てても
+            // conflict 検出がこの消費者を見ていなかった (R-25)。
+            if self.keymap.consume_action(ctx, KeyAction::LaDeleteShape)
                 && self.delete_selected_local_adjust_shape_from_shortcut(fs_idx)
             {
                 self.show_feedback_toast("図形マスクを削除しました".to_string());
