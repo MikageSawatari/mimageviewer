@@ -41197,23 +41197,20 @@ impl App {
         let pixels_per_point = ctx
             .map(egui::Context::pixels_per_point)
             .unwrap_or(self.detached_viewer_last_pixels_per_point);
-        let (image_rect_norm, image_content_bbox) = self.detached_single_image_snapshot_layout(
-            idx,
-            placement,
-            pixels_per_point,
-            texture_size,
-            rotation,
-            zoom_pan,
-            free_rotation,
-        );
-        let rotated_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(texture_size.y, texture_size.x)
-            }
-            _ => texture_size,
-        };
-        let logical_scale = (image_rect_norm.width() * placement.w / rotated_size.x.max(1.0))
-            .min(image_rect_norm.height() * placement.h / rotated_size.y.max(1.0));
+        // 貼り先と倍率は layout が対で返す。ここで `min(rect / tex)` を組み直すと、
+        // **既に物理ピクセルへ寄せた矩形**からの逆算になり、軸ごとの floor の分だけ
+        // 倍率が小さくなる。リサンプラの出力が子ウィンドウの貼り先より 1〜2 物理
+        // ピクセル短くなり、egui/wgpu がもう一度バイリニアを掛ける (§1.0e)。
+        let (image_rect_norm, logical_scale, image_content_bbox) = self
+            .detached_single_image_snapshot_layout(
+                idx,
+                placement,
+                pixels_per_point,
+                texture_size,
+                rotation,
+                zoom_pan,
+                free_rotation,
+            );
         let snapshot_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -41231,7 +41228,10 @@ impl App {
         let visible_source_uv_rect =
             crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
-                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                    // 貼り先ではなく **UV を取るためだけ**の transform。渡す矩形は layout が
+                    // 既に寄せ済みなので、ここで `Texels` を宣言すると二重に寄って 1px 縮む。
+                    // 寄せるのは 1 回だけという規則をこちら側でも守る。
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Proportional,
                     page_idx: idx,
                     viewport_rect: snapshot_rect,
                     source_size: texture_size,

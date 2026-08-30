@@ -4043,7 +4043,13 @@ fn continuous_spread_fit_width(
     }
 }
 
-fn fs_image_draw_rect_for_size(
+/// 画像 1 枚の**貼り先と倍率**を、テクスチャの寸法だけから解く。
+///
+/// 対で返すのは `DisplayedImageTransform::paint_geometry` と同じ理由 (§1.0e)。
+/// 矩形だけ返すと、受け取った側が `min(rect / tex)` で倍率を作り直してしまう。
+/// **寄せ済みの矩形から倍率を逆算すると、軸ごとの floor の分だけ小さい倍率になり、
+/// リサンプラの出力が貼り先より 1〜2 物理ピクセル短くなる。**
+pub(crate) fn fs_image_draw_geometry_for_size(
     full_rect: egui::Rect,
     tex_size: egui::Vec2,
     rotation: crate::rotation_db::Rotation,
@@ -4053,7 +4059,7 @@ fn fs_image_draw_rect_for_size(
     fit_scale_limits: FullscreenFitScaleLimits,
     pixels_per_point: f32,
     content_bbox: Option<egui::Rect>,
-) -> Option<egui::Rect> {
+) -> Option<(egui::Rect, f32)> {
     DisplayedImageTransform::resolve(DisplayedImageTransformInput {
         pixel_fit: RectPixelFit::Texels,
         page_idx: 0,
@@ -4068,7 +4074,7 @@ fn fs_image_draw_rect_for_size(
         pixels_per_point,
         placement: ResolvedDisplayPlacement::Normal { zoom_pan },
     })
-    .map(|transform| transform.full_image_rect)
+    .map(|transform| transform.paint_geometry())
 }
 
 /// 部分矩形を描画矩形と UV へ落とす。**座標系の扱いは
@@ -10663,16 +10669,15 @@ impl App {
                     page.rect,
                 )?;
                 // リサンプラと貼り先は **transform が持つ 1 つの答え** を共有する。
-                // 自前で min を計算して渡すと、transform 内部の倍率と食い違ったまま
-                // 整数サイズのテクスチャを小数サイズの矩形へ貼ることになる (§1.0e)。
+                // 対で受け取るので、片方だけ自前の min() で綴ることができない (§1.0e)。
+                let (bake_rect, bake_scale) = transform.paint_geometry();
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
-                    transform.total_scale,
+                    bake_scale,
                     pixels_per_point,
                     transform.visible_source_uv_rect(full_rect),
                 );
-                let rect_norm =
-                    Self::normalize_rect_to_full_rect(transform.full_image_rect, full_rect);
+                let rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
                 let clip_rect_norm = rect_norm;
                 self.log_detached_frozen_page_bake_debug(
@@ -10729,7 +10734,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation: f32,
-    ) -> (egui::Rect, Option<egui::Rect>) {
+    ) -> (egui::Rect, f32, Option<egui::Rect>) {
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -10740,7 +10745,10 @@ impl App {
         // (2026-08-26 の実機報告)。トリムの扱いは従来どおり (回転時の可否を変えない)。
         let trim = self.view_trim_single_content_bbox(idx);
         let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
-        let draw_rect = fs_image_draw_rect_for_size(
+        // 倍率を捨てて矩形だけ持ち出さない。呼び出し側が `min(rect / tex)` で作り直すと、
+        // 寄せ済み矩形からの逆算になってリサンプラの出力が貼り先より短くなる (§1.0e)。
+        // transform が組めないときだけ、layout 矩形とそこから解いた等方倍率へ落ちる。
+        let (draw_rect, draw_scale) = fs_image_draw_geometry_for_size(
             image_rect,
             texture_size,
             rotation,
@@ -10751,9 +10759,15 @@ impl App {
             pixels_per_point,
             content_bbox,
         )
-        .unwrap_or(image_rect);
+        .unwrap_or_else(|| {
+            let rotated = rotated_display_size(texture_size, rotation);
+            let scale = (image_rect.width() / rotated.x.max(1.0))
+                .min(image_rect.height() / rotated.y.max(1.0));
+            (image_rect, scale)
+        });
         (
             Self::normalize_rect_to_full_rect(draw_rect, full_rect),
+            draw_scale,
             content_bbox,
         )
     }
@@ -10899,33 +10913,32 @@ impl App {
         );
         // 連結読みと同じく、リサンプラと貼り先は transform の 1 つの答えを共有する。
         // transform が組めなかったときだけ、従来どおり layout の矩形と自前の倍率へ落ちる。
+        // fallback も対で綴るので、片側だけ transform 由来になることがない。
+        let (left_bake_rect, left_bake_scale) = left_transform.map_or(
+            (rects.left_rect, total_scale * geometry.left.scale_factor),
+            |transform| transform.paint_geometry(),
+        );
+        let (right_bake_rect, right_bake_scale) = right_transform.map_or(
+            (rects.right_rect, total_scale * geometry.right.scale_factor),
+            |transform| transform.paint_geometry(),
+        );
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
-            left_transform.map_or(total_scale * geometry.left.scale_factor, |transform| {
-                transform.total_scale
-            }),
+            left_bake_scale,
             pixels_per_point,
             left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
-            right_transform.map_or(total_scale * geometry.right.scale_factor, |transform| {
-                transform.total_scale
-            }),
+            right_bake_scale,
             pixels_per_point,
             right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
-        let left_rect_norm = Self::normalize_rect_to_full_rect(
-            left_transform.map_or(rects.left_rect, |transform| transform.full_image_rect),
-            full_rect,
-        );
-        let right_rect_norm = Self::normalize_rect_to_full_rect(
-            right_transform.map_or(rects.right_rect, |transform| transform.full_image_rect),
-            full_rect,
-        );
+        let left_rect_norm = Self::normalize_rect_to_full_rect(left_bake_rect, full_rect);
+        let right_rect_norm = Self::normalize_rect_to_full_rect(right_bake_rect, full_rect);
         let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
@@ -13771,7 +13784,7 @@ impl App {
                             // 整数サイズ出力を小数サイズの矩形へ貼り、もう一度バイリニアが
                             // 掛かる)。
                             let img_rect =
-                                crate::displayed_image_transform::snap_image_rect_to_physical_pixels(
+                                crate::displayed_image_transform::snap_rect_to_physical_pixels(
                                     egui::Rect::from_center_size(
                                         ui.max_rect().center(),
                                         egui::vec2(tex_size.x * scale, tex_size.y * scale),

@@ -255,6 +255,19 @@ impl DisplayedImageTransform {
         })
     }
 
+    /// 貼り先の矩形と、そこへ貼るテクスチャを作るときの倍率。
+    ///
+    /// **2 つで 1 つの答え。** リサンプラは倍率から整数サイズのテクスチャを作り、
+    /// その結果をこの矩形へ貼る。片方をここから取り、もう片方を呼び出し側で計算すると、
+    /// 整数サイズのテクスチャを小数サイズの矩形へ貼ることになり、egui/wgpu が
+    /// **もう一度バイリニアで貼り直す**ので Lanczos の結果がボケる (backlog §1.0e)。
+    /// 対で返すのは、呼び出し側がその 2 つを別々に綴れないようにするため —
+    /// 実際に detached の焼き込み 2 か所が、矩形は transform から取りながら倍率だけ
+    /// 自前の `min()` で計算していた。
+    pub(crate) fn paint_geometry(&self) -> (egui::Rect, f32) {
+        (self.full_image_rect, self.total_scale)
+    }
+
     pub(crate) fn screen_to_source(&self, screen: egui::Pos2) -> egui::Pos2 {
         let p = self.screen_to_source_normalized(screen);
         egui::pos2(p.x * self.source_size.x, p.y * self.source_size.y)
@@ -795,21 +808,11 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
 ///
 /// 端数のある拡大には触らない。そちらの出力サイズは画像全体ではなく可視領域から
 /// 決まるので、ここで全体矩形を寄せても一致しない。
-/// [`DisplayedImageTransform`] を経由しない描画経路から、同じ寄せ規則を使うための入口。
 ///
-/// **規則を 2 か所に綴らないためだけに存在する。** 通常は transform 側 (`RectPixelFit`)
-/// を通ること。手で矩形を組んでリサンプラ出力を貼る場所 (detached の keepalive backstop
-/// など) は transform を持たないので、ここから同じ関数へ入る。
-pub(crate) fn snap_image_rect_to_physical_pixels(
-    rect: egui::Rect,
-    display_size: egui::Vec2,
-    logical_scale: f32,
-    pixels_per_point: f32,
-) -> egui::Rect {
-    snap_rect_to_physical_pixels(rect, display_size, logical_scale, pixels_per_point)
-}
-
-fn snap_rect_to_physical_pixels(
+/// 通常は [`DisplayedImageTransform`] 側 (`RectPixelFit`) が呼ぶ。手で矩形を組んで
+/// リサンプラ出力を貼る場所 (detached の keepalive backstop など) は transform を
+/// 持たないので、そこだけがこの関数を直接呼ぶ。
+pub(crate) fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
     display_size: egui::Vec2,
     logical_scale: f32,

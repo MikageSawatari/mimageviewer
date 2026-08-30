@@ -2024,13 +2024,146 @@ mod tests {
         }
     }
 
+    /// `paint_geometry()` が返す **対** が、それだけで矛盾しないこと。
+    ///
+    /// detached の焼き込み 2 か所は、矩形を transform から取りながら倍率だけ自前の
+    /// `min()` で計算していた (§1.0e、2026-08-30 レビュー指摘 1(b)(c))。対で返す入口に
+    /// したので、**この 1 本がその対の不変条件を持つ**。
+    ///
+    /// 表示 trim を含む組み合わせを入れてあるのは、`full_image_rect` と `paint_rect` が
+    /// 違う値になる唯一の状況だから。trim を返すように変えると落ちる。
+    #[test]
+    fn the_pair_paint_geometry_returns_agrees_with_itself() {
+        let cases: &[([u32; 2], egui::Vec2, f32, Option<egui::Rect>)] = &[
+            ([1120, 1600], egui::vec2(2560.0, 1440.0), 1.0, None),
+            ([4248, 6048], egui::vec2(2560.0, 1440.0), 1.0, None),
+            ([1249, 2272], egui::vec2(2560.0, 1440.0), 1.0, None),
+            ([2480, 3508], egui::vec2(2048.0, 1152.0), 1.25, None),
+            (
+                [4248, 6048],
+                egui::vec2(2560.0, 1440.0),
+                1.0,
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.05, 0.05),
+                    egui::pos2(0.95, 0.95),
+                )),
+            ),
+        ];
+        let mut trimmed_cases = 0usize;
+        for &(source, viewport, ppp, content_bbox) in cases {
+            let source_size = egui::vec2(source[0] as f32, source[1] as f32);
+            let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
+                crate::displayed_image_transform::DisplayedImageTransformInput {
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+                    page_idx: 0,
+                    viewport_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, viewport),
+                    source_size,
+                    texture_size: source_size,
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox,
+                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    pixels_per_point: ppp,
+                    placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                        zoom_pan: None,
+                    },
+                },
+            )
+            .expect("transform");
+            let (rect, scale) = transform.paint_geometry();
+            if content_bbox.is_some() {
+                assert_ne!(
+                    rect, transform.paint_rect,
+                    "trim のある組み合わせで 2 つが同じでは、取り違えを検出できない"
+                );
+                trimmed_cases += 1;
+            }
+            let physical = physical_scale(scale, ppp);
+            if physical >= 1.0 {
+                continue;
+            }
+            let target = quantized_target_size(source, physical, TARGET_SIZE_QUANTUM);
+            // **`round()` してから比べない。** 整数へ丸めてから突き合わせると、矩形が
+            // 1439.44 物理 px でリサンプル先が 1439 のような「0.44px ずれているのに
+            // 丸めれば一致する」状態を見逃す。その 0.44px でも GPU はバイリニアを掛ける。
+            let drawn = [rect.width() * ppp, rect.height() * ppp];
+            for axis in 0..2 {
+                let gap = (drawn[axis] - target[axis] as f32).abs();
+                assert!(
+                    gap <= 1.0e-3,
+                    "source={source:?} viewport={viewport:?} ppp={ppp} bbox={content_bbox:?}                      軸 {axis}: 倍率 {scale} が作る {} に対し、対で返した矩形は {} 物理 px (差 {gap})",
+                    target[axis],
+                    drawn[axis]
+                );
+            }
+        }
+        assert!(trimmed_cases > 0, "trim の組み合わせが 1 つも通っていない");
+    }
+
+    /// detached の静止画スナップショットは、**貼り先と倍率を対で**受け取らなければならない。
+    ///
+    /// 以前は `build_active_snapshot` が矩形だけ受け取り、`min(rect / tex)` で倍率を
+    /// 組み直していた。渡ってくる矩形は既に物理ピクセルへ寄っているので、その逆算は
+    /// 軸ごとの floor の分だけ小さい倍率になり、リサンプラの出力が子ウィンドウの貼り先より
+    /// 1〜2 物理ピクセル短くなる (§1.0e、2026-08-30 に計測)。
+    ///
+    /// 丸めてから比べない。0.44px のずれでも GPU はもう一度バイリニアを掛ける。
+    #[test]
+    fn the_detached_snapshot_geometry_is_a_pair_the_resampler_can_reproduce() {
+        // 利用者の 4K と、DPI 125% / 150%、横長・縦長を混ぜる。
+        let cases: &[([u32; 2], egui::Vec2, f32)] = &[
+            ([1120, 1600], egui::vec2(2560.0, 1440.0), 1.0),
+            ([4248, 6048], egui::vec2(2560.0, 1440.0), 1.0),
+            ([1249, 2272], egui::vec2(2560.0, 1440.0), 1.0),
+            ([2480, 3508], egui::vec2(2048.0, 1152.0), 1.25),
+            ([3000, 2000], egui::vec2(1600.0, 1200.0), 1.0),
+            ([1612, 2418], egui::vec2(1707.0, 960.0), 1.5),
+        ];
+        let mut downscales = 0usize;
+        for &(source, window, ppp) in cases {
+            let tex = egui::vec2(source[0] as f32, source[1] as f32);
+            let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, window);
+            let (rect, scale) = crate::ui_fullscreen::fs_image_draw_geometry_for_size(
+                full_rect,
+                tex,
+                crate::rotation_db::Rotation::None,
+                None,
+                0.0,
+                crate::settings::FullscreenFitMode::Page,
+                crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                ppp,
+                None,
+            )
+            .expect("geometry");
+            let physical = scale * ppp;
+            if physical >= 1.0 {
+                continue;
+            }
+            downscales += 1;
+            let target = quantized_target_size(source, physical, TARGET_SIZE_QUANTUM);
+            let drawn = [rect.width() * ppp, rect.height() * ppp];
+            for axis in 0..2 {
+                let gap = (drawn[axis] - target[axis] as f32).abs();
+                assert!(
+                    gap <= 1.0e-3,
+                    "source={source:?} window={window:?} ppp={ppp} 軸 {axis}:                      リサンプル先 {} に対し貼り先は {} 物理 px (差 {gap})",
+                    target[axis],
+                    drawn[axis]
+                );
+            }
+        }
+        assert!(downscales >= 4, "縮小のケースが足りない: {downscales}");
+    }
+
     /// **transform を経由しない描画経路**でも、リサンプラの出力サイズと描画矩形の
     /// 物理サイズが一致すること。
     ///
     /// detached の keepalive backstop は `DisplayedImageTransform` を通らず、
     /// `scale = min(avail / tex)` から矩形を手で組んでリサンプラ出力を貼る。
     /// **元のバグがそこだけ残っていた** (2026-08-30 レビュー指摘 1(a))。矩形側は
-    /// `snap_image_rect_to_physical_pixels`、リサンプラ側は `quantized_target_size` と
+    /// `snap_rect_to_physical_pixels`、リサンプラ側は `quantized_target_size` と
     /// 別の入口だが、どちらも同じ `physical_pixel_extent` に行き着く必要がある。
     ///
     /// 寄せをやめると落ちる。**この経路にはテストが 1 本も無かった。**
@@ -2051,7 +2184,7 @@ mod tests {
             if physical >= 1.0 {
                 continue;
             }
-            let rect = crate::displayed_image_transform::snap_image_rect_to_physical_pixels(
+            let rect = crate::displayed_image_transform::snap_rect_to_physical_pixels(
                 egui::Rect::from_center_size(egui::Pos2::ZERO, tex * scale),
                 tex,
                 scale,
