@@ -73,6 +73,15 @@ pub(super) enum VideoSeekStripRuntime {
     Open(Box<VideoSeekStripSession>),
 }
 
+/// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
+///
+/// 表示しているモードが背景の仕事の持ち主、という規則をここ 1 か所に置く。
+/// サムネイル側の worker は要求駆動なので、対になる述語は要らない (要求が止まれば寝る)。
+#[cfg(windows)]
+fn wave_background_paused_for_mode(mode: crate::settings::VideoSeekStripMode) -> bool {
+    mode != crate::settings::VideoSeekStripMode::Waveform
+}
+
 #[cfg(windows)]
 fn requested_video_seek_strip_state(
     action: KeyAction,
@@ -7665,6 +7674,16 @@ impl App {
         if let Some(worker) = new_wave_worker {
             session.wave_worker = Some(worker);
         }
+        // **表示しているモードが、背景で走ってよい仕事の持ち主**。波形 worker は要求が
+        // 無くても全尺の粗い解析を進めるので、切り替えた側で止めないと不可視のまま
+        // 再生とサムネイル生成の I/O・CPU を奪い続ける (R-21)。
+        //
+        // 破棄ではなく一時停止。長い動画の粗い解析は高価なので、戻ってきたときに
+        // 作り直させない。サムネイル側は要求駆動で、要求が止まれば自分で寝るため
+        // 対になる操作は要らない (両方の worker loop を読んで確認した)。
+        if let Some(worker) = session.wave_worker.as_ref() {
+            worker.set_background_paused(wave_background_paused_for_mode(mode));
+        }
         match mode {
             crate::settings::VideoSeekStripMode::Thumbnails => match &mut session.axis {
                 VideoSeekStripAxisState::Resolving { initial_time_secs } => {
@@ -12606,6 +12625,40 @@ mod native_video_key_observation_tests {
             ),
             "[video-audio] enter result source=native_key fs_idx=9 outcome=entered"
         );
+    }
+
+    /// 見えていないモードは背景で全尺を解析しない (R-21)。
+    ///
+    /// 波形 worker は要求が無くても粗い全尺解析を進める。モードを切り替えても止めて
+    /// いなかったので、不可視のまま再生とサムネイル生成の I/O・CPU を奪い続けていた。
+    /// サムネイル側は要求駆動で、要求が止まれば自分で寝る (両方の worker loop を読んで
+    /// 確認した) ので、対になる述語は無い。
+    #[test]
+    fn only_the_visible_waveform_keeps_analysing_in_the_background() {
+        assert!(!wave_background_paused_for_mode(
+            crate::settings::VideoSeekStripMode::Waveform
+        ));
+        assert!(wave_background_paused_for_mode(
+            crate::settings::VideoSeekStripMode::Thumbnails
+        ));
+    }
+
+    /// 一時停止は worker loop が読むのと**同じ場所**へ書く。
+    ///
+    /// 破棄ではなく一時停止なのは、長い動画の粗い解析が高価で、戻ってきたときに作り
+    /// 直させないため。実際に coarse chunk を飛ばす所は実メディアが要るので自動テストは
+    /// 無く、loop の 2 行の gate は読んで確認している。
+    #[test]
+    fn pausing_the_background_analysis_is_visible_where_the_worker_reads_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
+        let worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(dir.path().join("none.mp4"));
+        assert!(!worker.background_is_paused(), "作った直後は動いている");
+        worker.set_background_paused(true);
+        assert!(worker.background_is_paused());
+        worker.set_background_paused(false);
+        assert!(!worker.background_is_paused());
     }
 
     #[test]
