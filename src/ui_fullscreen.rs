@@ -33,9 +33,9 @@ use crate::app::{
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
-    FullscreenPageLayout, FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform,
-    ZAimBasis, ZTransformInput, physical_pixel_scale, physical_scale_is_near_integer,
-    quantize_points_to_physical_pixels, z_cursor_image_px,
+    FullscreenPageLayout, FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+    ResolvedZTransform, ZAimBasis, ZTransformInput, physical_pixel_scale,
+    physical_scale_is_near_integer, quantize_points_to_physical_pixels, z_cursor_image_px,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::gpu_lanczos::FullscreenPaintResource;
@@ -946,6 +946,9 @@ fn build_flat_navigator_layout(
     for (main, visible_uv) in main_pages.into_iter().zip(visible_uvs) {
         let navigator = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                // 縮図なので寄せない。主表示を比例縮小した位置関係そのものが情報で、
+                // 貼るのもリサンプラの出力ではない (カタログのサムネイル)。
+                pixel_fit: RectPixelFit::Proportional,
                 page_idx: main.page_idx,
                 viewport_rect: canvas_rect,
                 source_size: main.source_size,
@@ -3250,7 +3253,6 @@ pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect)
 #[derive(Default)]
 struct DetachedImageWindowEventBatch {
     close_ids: Vec<u64>,
-    close_command_ids: Vec<u64>,
     activate_ids: Vec<u64>,
     placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
     focus_updates: Vec<(u64, bool)>,
@@ -4041,7 +4043,13 @@ fn continuous_spread_fit_width(
     }
 }
 
-fn fs_image_draw_rect_for_size(
+/// 画像 1 枚の**貼り先と倍率**を、テクスチャの寸法だけから解く。
+///
+/// 対で返すのは `DisplayedImageTransform::paint_geometry` と同じ理由 (§1.0e)。
+/// 矩形だけ返すと、受け取った側が `min(rect / tex)` で倍率を作り直してしまう。
+/// **寄せ済みの矩形から倍率を逆算すると、軸ごとの floor の分だけ小さい倍率になり、
+/// リサンプラの出力が貼り先より 1〜2 物理ピクセル短くなる。**
+pub(crate) fn fs_image_draw_geometry_for_size(
     full_rect: egui::Rect,
     tex_size: egui::Vec2,
     rotation: crate::rotation_db::Rotation,
@@ -4051,8 +4059,9 @@ fn fs_image_draw_rect_for_size(
     fit_scale_limits: FullscreenFitScaleLimits,
     pixels_per_point: f32,
     content_bbox: Option<egui::Rect>,
-) -> Option<egui::Rect> {
+) -> Option<(egui::Rect, f32)> {
     DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        pixel_fit: RectPixelFit::Texels,
         page_idx: 0,
         viewport_rect: full_rect,
         source_size: tex_size,
@@ -4065,7 +4074,7 @@ fn fs_image_draw_rect_for_size(
         pixels_per_point,
         placement: ResolvedDisplayPlacement::Normal { zoom_pan },
     })
-    .map(|transform| transform.full_image_rect)
+    .map(|transform| transform.paint_geometry())
 }
 
 /// 部分矩形を描画矩形と UV へ落とす。**座標系の扱いは
@@ -4243,6 +4252,10 @@ fn resolve_fs_image_transform(
     let layout_long = layout_source_size.x.max(layout_source_size.y).max(1.0);
     let layout_size = layout_source_size * (reference_long / layout_long);
     let layout = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        // ここは最終的な描画先ではなく、**アスペクトを決めるための中間枠**。寄せると
+        // 「中間枠で 1 回・最終矩形で 1 回」の二重丸めになり、理想フィットより最大
+        // 1 物理ピクセル小さくなる。寄せるのは下の最終 transform 側だけにする。
+        pixel_fit: RectPixelFit::Proportional,
         texture_size: layout_size,
         ..input
     })?;
@@ -6823,6 +6836,7 @@ impl App {
             .unwrap_or(tex_size);
         let resolved = ResolvedZTransform::resolve(ZTransformInput {
             image: DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: fs_idx,
                 viewport_rect: image_rect,
                 source_size,
@@ -6850,14 +6864,17 @@ impl App {
             ResolvedDisplayPlacement::Normal { .. } => None,
         };
         let bg_style = self.fs_bg_style(ctx);
-        let transform = resolved.transform;
-        self.draw_fs_image(
+        // **返すのは実際に描いた transform。** `draw_fs_image` は渡した矩形をテクスチャに
+        // 合わせ直してから貼るので、ここで自分の中間枠を返すと、当たり判定・ナビゲータ・
+        // カーソル写像が「画面に出ていない矩形」を基準にする (backlog §1.0h)。
+        // 通常表示の枝 (`single_transform = self.draw_fs_image(...)`) は元からこうなっている。
+        let painted = self.draw_fs_image(
             ui,
             image_rect,
             fs_idx,
             Some(source_size),
             FsPageLayoutSource::CurrentItem,
-            Some(transform),
+            Some(resolved.transform),
             paint_resource.as_ref(),
             state.thumb_tex.as_ref(),
             false,
@@ -6899,7 +6916,7 @@ impl App {
                 egui::StrokeKind::Outside,
             );
         }
-        Some(transform)
+        painted
     }
 
     /// 利用者入力から通常表示の pan を変更する唯一の入口。
@@ -10685,12 +10702,9 @@ impl App {
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
                 let resource = self.fullscreen_paint_resource_for_texture(page.idx, source_texture);
-                let rotated_size =
-                    rotated_display_size(resource.size_vec2(), self.get_rotation(page.idx));
-                let logical_scale = (page.rect.width() / rotated_size.x.max(1.0))
-                    .min(page.rect.height() / rotated_size.y.max(1.0));
                 let transform = DisplayedImageTransform::from_resolved_rect(
                     DisplayedImageTransformInput {
+                        pixel_fit: RectPixelFit::Texels,
                         page_idx: page.idx,
                         viewport_rect: full_rect,
                         source_size: resource.size_vec2(),
@@ -10705,13 +10719,16 @@ impl App {
                     },
                     page.rect,
                 )?;
+                // リサンプラと貼り先は **transform が持つ 1 つの答え** を共有する。
+                // 対で受け取るので、片方だけ自前の min() で綴ることができない (§1.0e)。
+                let (bake_rect, bake_scale) = transform.paint_geometry();
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
-                    logical_scale,
+                    bake_scale,
                     pixels_per_point,
                     transform.visible_source_uv_rect(full_rect),
                 );
-                let rect_norm = Self::normalize_rect_to_full_rect(page.rect, full_rect);
+                let rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
                 let clip_rect_norm = rect_norm;
                 self.log_detached_frozen_page_bake_debug(
@@ -10768,7 +10785,7 @@ impl App {
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation: f32,
-    ) -> (egui::Rect, Option<egui::Rect>) {
+    ) -> (egui::Rect, f32, Option<egui::Rect>) {
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -10779,7 +10796,10 @@ impl App {
         // (2026-08-26 の実機報告)。トリムの扱いは従来どおり (回転時の可否を変えない)。
         let trim = self.view_trim_single_content_bbox(idx);
         let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
-        let draw_rect = fs_image_draw_rect_for_size(
+        // 倍率を捨てて矩形だけ持ち出さない。呼び出し側が `min(rect / tex)` で作り直すと、
+        // 寄せ済み矩形からの逆算になってリサンプラの出力が貼り先より短くなる (§1.0e)。
+        // transform が組めないときだけ、layout 矩形とそこから解いた等方倍率へ落ちる。
+        let (draw_rect, draw_scale) = fs_image_draw_geometry_for_size(
             image_rect,
             texture_size,
             rotation,
@@ -10790,9 +10810,15 @@ impl App {
             pixels_per_point,
             content_bbox,
         )
-        .unwrap_or(image_rect);
+        .unwrap_or_else(|| {
+            let rotated = rotated_display_size(texture_size, rotation);
+            let scale = (image_rect.width() / rotated.x.max(1.0))
+                .min(image_rect.height() / rotated.y.max(1.0));
+            (image_rect, scale)
+        });
         (
             Self::normalize_rect_to_full_rect(draw_rect, full_rect),
+            draw_scale,
             content_bbox,
         )
     }
@@ -10904,6 +10930,7 @@ impl App {
                 .intersect(image_rect);
         let left_transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: left,
                 viewport_rect: image_rect,
                 source_size: left_texture.size_vec2(),
@@ -10920,6 +10947,7 @@ impl App {
         );
         let right_transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: right,
                 viewport_rect: image_rect,
                 source_size: right_texture.size_vec2(),
@@ -10934,23 +10962,34 @@ impl App {
             },
             rects.right_rect,
         );
+        // 連結読みと同じく、リサンプラと貼り先は transform の 1 つの答えを共有する。
+        // transform が組めなかったときだけ、従来どおり layout の矩形と自前の倍率へ落ちる。
+        // fallback も対で綴るので、片側だけ transform 由来になることがない。
+        let (left_bake_rect, left_bake_scale) = left_transform.map_or(
+            (rects.left_rect, total_scale * geometry.left.scale_factor),
+            |transform| transform.paint_geometry(),
+        );
+        let (right_bake_rect, right_bake_scale) = right_transform.map_or(
+            (rects.right_rect, total_scale * geometry.right.scale_factor),
+            |transform| transform.paint_geometry(),
+        );
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
-            total_scale * geometry.left.scale_factor,
+            left_bake_scale,
             pixels_per_point,
             left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
-            total_scale * geometry.right.scale_factor,
+            right_bake_scale,
             pixels_per_point,
             right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
-        let left_rect_norm = Self::normalize_rect_to_full_rect(rects.left_rect, full_rect);
-        let right_rect_norm = Self::normalize_rect_to_full_rect(rects.right_rect, full_rect);
+        let left_rect_norm = Self::normalize_rect_to_full_rect(left_bake_rect, full_rect);
+        let right_rect_norm = Self::normalize_rect_to_full_rect(right_bake_rect, full_rect);
         let left_clip_rect_norm = Self::normalize_rect_to_full_rect(left_clip_rect, full_rect);
         let right_clip_rect_norm = Self::normalize_rect_to_full_rect(right_clip_rect, full_rect);
         let left_uv_rect = Self::full_uv_rect();
@@ -11848,7 +11887,6 @@ impl App {
                 let window_placement =
                     self.ensure_detached_window_runtime_placement(id, "deferred_passive_event");
                 if bar_close_requested {
-                    batch.close_command_ids.push(id);
                     batch.close_ids.push(id);
                 } else if viewport_close_requested {
                     batch.close_ids.push(id);
@@ -12115,13 +12153,10 @@ impl App {
         }
         batch.close_ids.sort_unstable();
         batch.close_ids.dedup();
-        batch.close_command_ids.sort_unstable();
-        batch.close_command_ids.dedup();
         if !batch.close_ids.is_empty() {
             self.close_detached_image_windows_by_ids(
                 ctx,
                 &batch.close_ids,
-                &batch.close_command_ids,
                 "passive_close",
                 Some(&batch.activate_ids),
             );
@@ -12187,7 +12222,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         close_ids: &[u64],
-        close_command_ids: &[u64],
         reason: &'static str,
         activate_ids: Option<&[u64]>,
     ) {
@@ -12197,20 +12231,14 @@ impl App {
         let mut close_ids = close_ids.to_vec();
         close_ids.sort_unstable();
         close_ids.dedup();
-        let mut close_command_ids = close_command_ids.to_vec();
-        close_command_ids.sort_unstable();
-        close_command_ids.dedup();
         let activate_ids = activate_ids.unwrap_or(&[]);
         self.log_detached_image_window_debug(format!(
-            "{reason} ids={:?} command_ids={:?} passive_before={} activate_ids={:?}",
+            "{reason} ids={:?} passive_before={} activate_ids={:?}",
             close_ids,
-            close_command_ids,
             self.detached_image_windows.len(),
             activate_ids
         ));
-        if !close_command_ids.is_empty() {
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-        }
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
         for id in &close_ids {
             self.transition_detached_window_state(
                 *id,
@@ -12223,10 +12251,6 @@ impl App {
                 ));
             }
         }
-        for id in &close_command_ids {
-            let viewport_id = Self::detached_image_window_viewport_id(*id);
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-        }
         self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
@@ -12235,6 +12259,7 @@ impl App {
             self.deferred_detached_image_window_views.remove(id);
         }
         self.focus_main_after_detached_window_close_if_idle(ctx, reason);
+        ctx.request_repaint();
     }
 
     #[cfg(all(windows, test))]
@@ -12304,21 +12329,6 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
-        let pending_close_ids: Vec<u64> =
-            self.detached_image_window_close_pending.drain(..).collect();
-        if !pending_close_ids.is_empty() {
-            self.log_detached_image_window_debug(format!(
-                "pending_close ids={pending_close_ids:?} passive_windows={} active_context={}",
-                self.detached_image_windows.len(),
-                self.active_detached_context_is_at_rest()
-            ));
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-        }
-        for id in pending_close_ids {
-            let viewport_id = Self::detached_image_window_viewport_id(id);
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-        }
-
         // Active -> Passive handoff は OS window を閉じず同じ ViewportId を引き継ぐ。
         // active 静止画が auto-hide 中だった場合の window 単位 cursor flag を、passive
         // renderer を登録する前に 1 回だけ表示へ戻す。
@@ -12719,7 +12729,6 @@ impl App {
             }
 
             if bar_close_requested {
-                render_batch.close_command_ids.push(window.id);
                 render_batch.close_ids.push(window.id);
             } else if viewport_close_requested {
                 render_batch.close_ids.push(window.id);
@@ -13821,10 +13830,20 @@ impl App {
                         let tex_size = resource.size_vec2();
                         if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
                             let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
-                            let img_rect = egui::Rect::from_center_size(
-                                ui.max_rect().center(),
-                                egui::vec2(tex_size.x * scale, tex_size.y * scale),
-                            );
+                            // ここは transform を通らないので `RectPixelFit` が届かない。
+                            // 同じ寄せ規則を明示的に呼ぶ (§1.0e — 寄せないとリサンプラの
+                            // 整数サイズ出力を小数サイズの矩形へ貼り、もう一度バイリニアが
+                            // 掛かる)。
+                            let img_rect =
+                                crate::displayed_image_transform::snap_rect_to_physical_pixels(
+                                    egui::Rect::from_center_size(
+                                        ui.max_rect().center(),
+                                        egui::vec2(tex_size.x * scale, tex_size.y * scale),
+                                    ),
+                                    tex_size,
+                                    scale,
+                                    vp_ctx.pixels_per_point(),
+                                );
                             let paint_resource = self.prepare_fullscreen_paint_resource(
                                 resource,
                                 scale,
@@ -15113,6 +15132,7 @@ impl App {
                             if let Some(compare_size) = compare_size {
                                 single_transform = DisplayedImageTransform::resolve(
                                     DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
                                         page_idx: fs_idx,
                                         viewport_rect: image_rect,
                                         source_size: compare_size,
@@ -19175,7 +19195,10 @@ impl App {
                 ctx.request_repaint();
                 return action;
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            // 消しゴム / 隠蔽の図形削除と同じく `KeyAction` を通す。ここだけ raw consume
+            // だったので、再割り当てできず、Delete を別の Local Adjust 操作へ割り当てても
+            // conflict 検出がこの消費者を見ていなかった (R-25)。
+            if self.keymap.consume_action(ctx, KeyAction::LaDeleteShape)
                 && self.delete_selected_local_adjust_shape_from_shortcut(fs_idx)
             {
                 self.show_feedback_toast("図形マスクを削除しました".to_string());
@@ -21544,6 +21567,7 @@ impl App {
         if let [page] = layout.pages.as_slice() {
             let main = page.main;
             let base = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: main.page_idx,
                 viewport_rect: main.viewport_rect,
                 source_size: main.source_size,
@@ -25648,6 +25672,7 @@ impl App {
             let fit_bbox =
                 crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox);
             let transform_input = DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx,
                 viewport_rect: full_rect,
                 source_size: source_size.unwrap_or(tex_size),
@@ -28086,6 +28111,7 @@ impl App {
     ) -> Option<egui::Rect> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: full_rect,
             source_size: tex_size,
@@ -30025,6 +30051,7 @@ impl App {
             let page_rect = fit_display_size_in_rect(rect, display_size);
             let transform = resolve_fs_transform_in_layout_rect(
                 DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
                     page_idx: idx,
                     viewport_rect,
                     source_size: source_size.unwrap_or(tex_size),
@@ -33115,6 +33142,7 @@ impl App {
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: idx,
             viewport_rect: page_rect,
             source_size: tex_size,
@@ -37877,6 +37905,7 @@ mod tests {
         content_bbox: Option<egui::Rect>,
     ) -> DisplayedImageTransform {
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(20.0, 30.0),
@@ -37918,6 +37947,7 @@ mod tests {
     ) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx,
                 viewport_rect,
                 source_size: egui::vec2(1600.0, 1200.0),
@@ -39986,6 +40016,7 @@ mod tests {
         let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         let source_size = egui::vec2(1000.0, 1501.0);
         let make_input = |texture_size| DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect,
             source_size,
@@ -40004,19 +40035,26 @@ mod tests {
                 .expect("pass-through transform");
         let final_image =
             resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
-
-        assert!(
-            final_image
-                .full_image_rect
-                .contains_rect(pass.full_image_rect)
-        );
+        // 差し替えでページが飛ばないこと。**内包では縛れない**: 最終ラスタは縮小なので
+        // 描画矩形が物理ピクセル格子へ寄り、低解像度の下敷きは拡大側なので寄らない。
+        // どちらが大きくなるかは倍率次第で、差は 1 物理ピクセル未満 (§1.0e)。
+        // 中心は一致し続けなければならない — ここがずれると本当に飛んで見える。
+        const HALF_PIXEL: f32 = 0.5;
         assert!(
             (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
         );
         assert!(
             (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs()
+                <= 2.0 * HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
+                <= 2.0 * HALF_PIXEL
         );
         let texture_ratio = 300.0 / 450.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
@@ -40036,6 +40074,7 @@ mod tests {
         let layout_source_size = egui::vec2(409.0, 512.0);
         let transform = resolve_fs_image_transform(
             DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
                 page_idx: 0,
                 viewport_rect,
                 source_size: texture_size,
@@ -40069,6 +40108,7 @@ mod tests {
         // thumbnail and 1643x2375 display raster round that ratio differently.
         let page_box_layout = egui::vec2(691_792.0, 1_000_000.0);
         let make_input = |source_size, texture_size| DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect,
             source_size,
@@ -40092,18 +40132,27 @@ mod tests {
         )
         .expect("PDF final transform");
 
-        assert!(
-            final_image
-                .full_image_rect
-                .contains_rect(pass.full_image_rect)
-        );
+        // 差し替えでページが飛ばないこと。**完全一致では縛れない**: 最終ラスタは縮小
+        // なので描画矩形が物理ピクセル格子へ寄る (§1.0e — 寄せないと Lanczos の出力を
+        // もう一度バイリニアで貼り直すことになり、全面がボケる)。低解像度の下敷きは
+        // 拡大側なので寄らない。ずれは 1 物理ピクセル未満で、目視できる段差ではない。
+        // どちらの入力も pixels_per_point = 1.0 なので、1 物理ピクセル = 1 point。
+        const HALF_PIXEL: f32 = 0.5;
         assert!(
             (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
         );
         assert!(
             (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
-                < 1.0e-4
+                <= HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs()
+                <= 2.0 * HALF_PIXEL
+        );
+        assert!(
+            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
+                <= 2.0 * HALF_PIXEL
         );
         let texture_ratio = 327.0 / 473.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
@@ -47281,6 +47330,7 @@ mod tests {
     #[test]
     fn capture_region_maps_screen_rect_to_source_crop() {
         let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -47320,6 +47370,7 @@ mod tests {
     #[test]
     fn capture_region_maps_cw90_display_rect_back_to_source_crop() {
         let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
             page_idx: 0,
             viewport_rect: egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),

@@ -1217,6 +1217,22 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
 同時にコミットすること。詳細な設計方針・新規テスト追加手順は
 [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) を参照。
 
+## 利用者へ渡すコマンドは PowerShell で書く ⚠️
+
+**利用者は常に PowerShell を使う。`bash ...` を渡さない。** PATH に bash が無いので
+`用語 'bash' は ... 認識されません` で止まり、毎回シェルの話に往復が発生する
+(2026-08-30 のリリース作業で実際に発生)。
+
+- 実行を頼む手順・チェックリスト・最終回答のコード塊は `.\scripts\foo.ps1` 形式にする
+- エージェント自身が Bash tool で `.sh` を回すのは構わない (setup スクリプト等)。
+  **渡すときだけ** PowerShell 版に置き換える
+- PowerShell 版が無い手順を渡す必要が出たら、その場で `.ps1` を追加する。
+  「bash.exe をフルパスで叩いてください」で回避しない
+- 新しい `.ps1` は **ASCII オンリー**で書く。PowerShell 5.1 は BOM 無し UTF-8 を
+  ANSI コードページとして読むので、日本語を入れると文字化けする
+  (既存の `check-idle-health.ps1` / `build-dev.ps1` も ASCII のみ)。
+  日本語の説明は Markdown 側に置く
+
 ## 開発中のビルド・テスト選択
 
 通常の編集ループで毎回 `cargo test --workspace` を実行しない。まず変更範囲に応じて
@@ -1283,15 +1299,51 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 フルスクリーン、動画→音声モードなどcore内のWindows native挙動は、上の通常profile
 `build-dev.ps1` でユーザー実機確認できる。
 
-## タグ書き込みの互換性検証 (ExifTool)
+## タグ / レーティングの保存先と ExifTool 検証
 
-mIV は JPEG / PNG / WebP のタグを XMP `dc:subject` にだけ書く (IPTC Keywords は書かない)。
-そのため **Windows エクスプローラーの「タグ」欄には表示されない** (Explorer は IPTC Keywords を
-優先して読むため)。`docs/archive/search-metadata/tag-feature.md` および `htdocs/mimageviewer/manual/tags.html` の互換性
-記述はこの前提を反映している。
+### 通常のタグ操作はメディアファイルを書き換えない
 
-Lightroom / Bridge / digiKam / XnView MP 等の XMP 対応ソフトとは互換があるが、開発環境で
-Adobe 製品を持っていなくても **ExifTool でラウンドトリップ検証できる**:
+**mIV タグの正本は `%APPDATA%/mimageviewer/tags.db`** ([src/tags_db.rs](src/tags_db.rs))。
+通常のタグ付与 / 削除 / クリアは **メディア本体 / XMP / IPTC を一切書き換えない**
+([src/tag_write_worker.rs](src/tag_write_worker.rs))。Tantivy 全文索引にも投影しない
+([docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) D13「書き込み投影ゼロ」)。
+
+そのため:
+
+- **タグは他ソフトへ持ち出せない**。Lightroom / Bridge / digiKam / XnView MP でも、
+  Windows エクスプローラーの「タグ」欄でも見えない。比較資料・製品ページ・紹介文で
+  「mIV のタグはファイル本体に書かれるので他ソフトと共有できる」と書かない。
+  これは **v1.0 の旧仕様** で、現行仕様ではない (2026-08 に旧記述を信じたまま誤った
+  比較資料を作り、全面訂正した経緯がある)。
+- 移動耐性は **フォルダごとのサイドカー `mimageviewer.dat`** へのミラーで確保する
+  ([src/sidecar.rs](src/sidecar.rs))。ミラー先はサイドカーであって**メディアファイルではない**。
+  設定 `tag_sidecar_backup_enabled` は **既定 OFF**。
+- 外部書き出し (XMP / CSV / JSON) は現行仕様では **行わない**
+  ([docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) D19)。
+
+正本は [docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md)、現行の全体像は
+[docs/search-architecture.md](docs/search-architecture.md) §4.9。ユーザー向け記述は
+`htdocs/mimageviewer/manual/tags.html` が現行仕様に一致しているので、迷ったらそちらを読む。
+`docs/archive/search-metadata/tag-feature.md` は **v1.0 の履歴** なので現行仕様の根拠にしない。
+
+### いま実際にファイルへ XMP を書く 2 経路
+
+`src/xmp_writer.rs` はタグ用途では縮退したが、消えてはいない。以下の 2 つは **今もユーザーの
+ファイルを書き換える**ので、変更したら ExifTool で検証する。
+
+| 経路 | 呼び出し元 | 書き込む物 | 条件 |
+| --- | --- | --- | --- |
+| レーティング | `rating_write_worker` → `xmp_writer::apply_rating` | `xmp:Rating` | 設定 `write_rating_to_xmp` (**既定 OFF**) + `GridItem::Image` かつ JPEG / PNG / WebP。製本ページは除外 |
+| 旧 XMP タグの取り込み後削除 | `tag_legacy_xmp_worker` → `xmp_writer::apply_tag_op(TagOp::ClearMiv)` | `dc:subject` から `#` 始まりの要素だけ除去 | ユーザーが「旧XMPタグを取り込んでファイルから削除」を明示実行したときのみ |
+
+どちらも `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
+並走させると後勝ちで相手の編集を消すため)。**新しい書き込み経路を足すときもこのロックを通す**。
+
+### ExifTool でのラウンドトリップ検証
+
+上記 2 経路を変更したときの検証手順。ExifTool (exiftool.org) は業界標準の XMP 解釈
+リファレンス実装なので、ここで期待どおり出れば Lightroom / Bridge / digiKam / XnView MP でも
+同じに見える。
 
 ```powershell
 # UTF-8 対応のためコンソールを切り替え (CP932 のままだと日本語タグが化ける)
@@ -1299,14 +1351,20 @@ chcp 65001
 # または
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-exiftool -XMP-dc:Subject -IPTC:Keywords "path\to\tagged.jpg"
-# 期待される出力:
-#   Subject: #原神, #風景       ← mIV で付与したタグ (XMP 側)
-#   Keywords:                    ← 空 (IPTC は書いていない前提)
+# (1) レーティング書き込み (write_rating_to_xmp = ON) の確認
+exiftool -XMP:Rating "path\to\rated.jpg"
+#   Rating: 4                    ← mIV で付けた★の数。0 / 未評価なら要素ごと消える
+
+# (2) 「旧XMPタグを取り込んでファイルから削除」の前後比較
+exiftool -XMP-dc:Subject -IPTC:Keywords "path\to\legacy.jpg"
+#   削除前: Subject: #原神, #風景, landscape
+#   削除後: Subject: landscape    ← "#" 始まりだけ消え、他ソフト由来のタグは残る
+#   Keywords:                     ← mIV は IPTC を読み書きしないので前後とも不変
 ```
 
-ExifTool (exiftool.org) は業界標準の XMP 解釈リファレンス実装。ここで期待どおり出れば
-Lightroom / Bridge / digiKam / XnView MP でも同じタグが見える。
+**旧タグ削除の検証で一番大事なのは「他ソフト由来のタグが残ること」**。`#` 始まりだけが消え、
+`#` の付かない既存キーワードと `xtw:*` 等の Extended XMP が保持されているかを、削除の前後で
+必ず比較する (`apply_tag_op` は最小差分編集なので、パケット再構築の退行はここでしか出ない)。
 
 ### 文字化け対処
 
@@ -1321,12 +1379,16 @@ exiftool -j -XMP:Subject "path\to\tagged.jpg" | ConvertFrom-Json
 
 JSON は仕様上 UTF-8 固定なのでコンソール設定に依存しない。
 
-### 将来的な IPTC 併記 (dual-write) 検討メモ
+### Windows エクスプローラー互換 / IPTC 併記について
 
-Windows エクスプローラー互換も取りたいときは、APP13 Photoshop Image Resource Block 中の
-IIM データセット 25 (Keywords) への併記が必要。Adobe IRB / IIM バイナリ構築は工数大
-(200-400 行 + 相互作用テスト)。現状は優先度低、マニュアル側でエクスプローラー非対応を
-明記して回避。
+**現行設計では検討対象外**。mIV はタグをファイルへ書かない (`tags.db` 正本) ので、
+「XMP `dc:subject` に加えて IPTC Keywords へも併記する」という v1.0 前提の dual-write 案は
+**前提ごと消えている**。エクスプローラーの「タグ」欄に出したいという要望が来た場合、論点は
+IPTC 併記ではなく **「タグを外部形式へ書き出す明示コマンドを設けるか」** という設計判断になる。
+
+これは [docs/tag-catalog-redesign-plan.md](docs/tag-catalog-redesign-plan.md) §10 (非対象 / 将来) と
+D19 で「v1 では外部書き出しをしない (非破壊・外部書き込み無し方針の維持)。将来の明示
+エクスポートは検討余地」と整理済み。要望が来たらこの節ではなく **そちらで判断する**。
 
 ## 動画メタ情報の扱いと外部ダウンローダの言及禁止ポリシー
 
@@ -1506,7 +1568,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 | アトミック rename | (削除して「ファイル本体を書き換えます」だけにする) |
 | STORE モード / 無圧縮 STORE 方式 | 再圧縮なし / そのまま格納 |
 | マルチプロセス並列レンダリング | 並列処理 |
-| RDF Bag | (削除、XMP dc:subject だけで十分) |
+| RDF Bag / XMP dc:subject | (削除。旧タグ取り込みの話なら「ファイル内の旧タグ」で十分) |
 | ONNX Runtime DLL (カテゴリ名として) | AI 機能用 DLL |
 | panic ログ | エラーログ |
 
@@ -1692,8 +1754,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      Tantivy 等の依存更新で正当な変動なら `--save` で baseline を更新する。
 
 9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
-   ```bash
-   bash scripts/perf_smoke.sh
+   ```powershell
+   .\scripts\perf_smoke.ps1
    ```
    - `--perf-log` 付きで mImageViewer を起動 → 手動で起動・Ctrl+↓ 連打・Ctrl+G 検索を実行
      → スクリプトが `analyze_perf.py hitches` で 16ms 超のフレーム間隔を集計。
@@ -1704,11 +1766,20 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
-   - 全体の目安は「16ms 未満のギャップが 97% 以上」。v2.9.1 実測は 4723 フレーム中
-     97.7%、100ms 超の 24 件はすべて就寝または遅延 wake 由来だった。
-   - bash が PATH に無い環境では `"C:\Program Files\Git\bin\bash.exe" scripts/perf_smoke.sh`。
-     スクリプトの実体は「FFmpeg DLL を target/release へコピー → perf log を退避 →
-     core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
+   - ⚠️ **「16ms 未満が 97% 以上」を全フレームで測らない。** この比率は**正しい就寝を
+     ヒッチとして数える**ので、短い / 暇なセッションほど悪く出る。実際 v3.3.1 の計測では、
+     健全そのものの 11 秒セッションが 91.4% になり、v3.3.0 の 97.3% (4,708 フレーム) と
+     並べると退行に見えた。**セッションの長さと内容が違う比率は比較に使えない。**
+   - 比較してよいのは **直前が `request_repaint` の「実際に描いているフレーム」だけに
+     絞った比率**。v3.3.1 のキャッシュ済みフォルダで 92.4% / p95 17ms / **最大 25ms**、
+     動画サムネの多いフォルダで 75.6% / 最大 47ms (差はサムネイル処理そのもの)。
+   - もう 1 つ見る値: `ui.pre_grid_breakdown` の `total_ms`。UI スレッドの各段の合計で、
+     健全なら **p95 0.3ms 以下**。ここが膨らんでいれば同期 I/O 退行が濃厚で、
+     どの段かも同じイベントの内訳で分かる。
+   - **先に `.\scripts\build-release.ps1` が要る** (idle health と同じく `target\release` の
+     core を起動する)。`build-dev.ps1` だけでは古い release バイナリが動く。
+   - `scripts/perf_smoke.sh` は同じ内容の bash 版。中身は「FFmpeg DLL を target/release へ
+     コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
    ```powershell

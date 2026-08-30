@@ -1349,6 +1349,8 @@ impl crate::app::App {
                     Self::resync_egui_modifiers_from_os(ctx);
                     if let Err(err) = result {
                         crate::logger::log(format!("native_context_menu: mIV Paste failed: {err}"));
+                        // Ctrl+V と同じ約束。起きなかった貼り付けの要求は残さない (R-08)。
+                        self.cancel_post_operation_selection("shell_paste_failed");
                     }
                 }
                 None

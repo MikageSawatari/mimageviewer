@@ -3622,6 +3622,24 @@ pub struct Settings {
     pub startup_folder_mode: StartupFolderMode,
     #[serde(default)]
     pub startup_folder_path: Option<PathBuf>,
+    /// 前回終了時に選んでいた項目を、同じ場所を開き直したときに選び直す。
+    ///
+    /// 既定 ON。フィールドの無い旧設定を読むと `default_true` が入るので、更新した
+    /// 利用者も自動で ON になる。
+    #[serde(default = "default_true")]
+    pub restore_last_cursor: bool,
+    /// 前回終了時に選んでいた項目の**名前**。`last_folder` と対で意味を持つので、
+    /// 保存も破棄も `last_folder` を書ける文脈かどうかで決める (`App::on_exit_inner`)。
+    /// パスではなく名前なのは、既存の `select_after_load` と同じ照合規則に乗るため。
+    #[serde(default)]
+    pub last_cursor_name: Option<String>,
+    /// そのカーソルが、画面の一番上の行から**何行下**にあったか。
+    ///
+    /// スクロール位置そのもの (pt) を保存しない。ウィンドウ幅や列数が変わると同じ pt が
+    /// 別の行を指すので、**現在のレイアウトで計算し直せる形**で持つ。復元は
+    /// `App::apply_scroll_to_selected` が現在の列数と行高から行う。
+    #[serde(default)]
+    pub last_cursor_rows_above: Option<u32>,
     /// 旧形式 (〜v1.5.0) のグローバルな最近開いたフォルダ一覧。v1.6.0 で A/B
     /// スロット別 (`quick_folder_recent_folders`) へ移行したが、初回移行のシード元 +
     /// 旧バージョンへのダウングレード互換のため残し、主スロット A の一覧を書き戻す。
@@ -5826,6 +5844,9 @@ impl Default for Settings {
             favorites: Vec::new(),
             smart_folders: Vec::new(),
             last_folder: None,
+            restore_last_cursor: true,
+            last_cursor_name: None,
+            last_cursor_rows_above: None,
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
             recent_folders: Vec::new(),
@@ -7143,11 +7164,21 @@ impl Settings {
                 // 既存ファイルがなければ snapshot を取る (= 同バージョンを複数回起動しても 1 回限り)。
                 let result = crate::settings_db::with_db_result(|db| db.backup_to(&pre_path));
                 match result {
-                    Ok(()) => settings_diag_log(&format!(
-                        "settings: pre-upgrade snapshot saved {} (prev v{})",
-                        pre_path.display(),
-                        prev_label
-                    )),
+                    Ok(()) => {
+                        settings_diag_log(&format!(
+                            "settings: pre-upgrade snapshot saved {} (prev v{})",
+                            pre_path.display(),
+                            prev_label
+                        ));
+                        // 版が変わるたびに 1 個増え、消える仕組みが無かった (§1.0c)。
+                        // **新しいものが手に入ってから**古い世代を落とす。
+                        crate::db_backup::prune_backup_groups(
+                            &data_dir,
+                            crate::db_backup::RETAINED_UNROTATED_BACKUPS,
+                            &|msg| settings_diag_log(&format!("settings: {msg}")),
+                            &|name| crate::db_backup::preupgrade_group_of("settings.db", name),
+                        );
+                    }
                     Err(e) => settings_diag_log(&format!(
                         "settings: pre-upgrade snapshot failed {}: {}",
                         pre_path.display(),
@@ -8024,6 +8055,10 @@ impl Settings {
         self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
+        // カーソル名は `last_folder` と対の実行時状態。環境設定 OK の全体差し替えで
+        // 片方だけ live 値、片方だけダイアログ側の値になると対応が崩れる。
+        self.last_cursor_name = src.last_cursor_name.take();
+        self.last_cursor_rows_above = src.last_cursor_rows_above;
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);

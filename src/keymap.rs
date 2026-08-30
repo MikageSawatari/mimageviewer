@@ -1798,6 +1798,7 @@ pub enum KeyAction {
     LaToolRect,
     LaToolEllipse,
     LaConfirmPolygon,
+    LaDeleteShape,
     LaSpacePan,
 }
 
@@ -2267,6 +2268,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaToolRect,
     KeyAction::LaToolEllipse,
     KeyAction::LaConfirmPolygon,
+    KeyAction::LaDeleteShape,
     KeyAction::LaSpacePan,
 ];
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
@@ -3800,6 +3802,7 @@ impl KeyAction {
             LaToolRect => "LaToolRect",
             LaToolEllipse => "LaToolEllipse",
             LaConfirmPolygon => "LaConfirmPolygon",
+            LaDeleteShape => "LaDeleteShape",
             LaSpacePan => "LaSpacePan",
         }
     }
@@ -4373,6 +4376,7 @@ impl KeyAction {
             LaToolRect => "矩形ツールに切り替える",
             LaToolEllipse => "楕円ツールに切り替える",
             LaConfirmPolygon => "補正レイヤーの多角形マスクを確定する",
+            LaDeleteShape => "選択中の補正図形を削除する",
             LaSpacePan => "押している間だけ画像をパン操作する",
         }
     }
@@ -4771,7 +4775,7 @@ impl KeyAction {
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush | LaToolBucket
             | LaToolEdgeBrush | LaToolGapFill | LaToolLasso | LaToolPolygon | LaToolSelect
             | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse
-            | LaConfirmPolygon | LaSpacePan => KeyContext::LocalAdjust,
+            | LaConfirmPolygon | LaDeleteShape | LaSpacePan => KeyContext::LocalAdjust,
         }
     }
 
@@ -5211,7 +5215,8 @@ impl KeyAction {
             | LaToolHLine
             | LaToolRect
             | LaToolEllipse
-            | LaConfirmPolygon => KeyTrigger::Press,
+            | LaConfirmPolygon
+            | LaDeleteShape => KeyTrigger::Press,
         }
     }
 
@@ -5672,6 +5677,7 @@ impl KeyAction {
             LaToolRect => ChordList::one(Chord::key(R)),
             LaToolEllipse => ChordList::one(Chord::key(O)),
             LaConfirmPolygon => ChordList::one(Chord::key(Enter)),
+            LaDeleteShape => ChordList::one(Chord::key(Delete)),
             LaSpacePan => ChordList::one(Chord::key(Space)),
         }
     }

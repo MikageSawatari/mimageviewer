@@ -124,9 +124,24 @@ pub(crate) fn decide(
 
     let paths: Vec<PathBuf> = found.iter().map(|(_, path)| path.clone()).collect();
     if paths == request.applied {
-        // 前回適用した集合から増えていない = 操作は落ち着いた。ここで再適用すると、
-        // その後ユーザーが自分で変えた選択を無関係な再読込のたびに奪ってしまう。
-        return Step::Drop;
+        // 前回適用した集合から増えていない。**まだ捨てない。**大きい貼り付けは途中で
+        // 止まって見えることがあり (置き換え確認ダイアログなど)、ここで捨てると
+        // 遅れて届いた残りが選択に入らない (R-09)。期限まで待って、増えたら足す。
+        //
+        // 「利用者が自分で変えた選択を奪わない」という守りは、以前ここが兼ねていたが
+        // 代理でしかなかった。再読込は `checked` を消すので、この時点の選択は利用者の
+        // 意思を表していない。判定は**再読込より前**、選択がまだ残っているうちに
+        // `App::check_external_folder_changes` が行う ([`PostOperationSelection::
+        // still_owns_selection`])。
+        //
+        // ただし**永遠には待たない**。出力が見えている限り上の期限切れ判定は通らない
+        // ので、増えないまま期限を過ぎたらここで手を引く。これが無いと要求が不死身に
+        // なり、自動再読込の選択保存をいつまでも止めてしまう。
+        return if now >= request.expires_at {
+            Step::Drop
+        } else {
+            Step::Wait
+        };
     }
     Step::Apply(found.iter().map(|(index, _)| *index).collect())
 }
@@ -157,6 +172,41 @@ pub(crate) fn plan_selection(indices: &[usize]) -> Option<SelectionPlan> {
 }
 
 impl PostOperationSelection {
+    /// 前回置いた選択が、そのまま残っているか。
+    ///
+    /// **再読込より前に呼ぶこと。** 再読込は `checked` を消すので、その後では利用者が
+    /// 何をしたか分からない。残っていなければ利用者が選択を引き取ったということで、
+    /// 以後の出力でそれを上書きしない (要求を捨てる)。
+    ///
+    /// まだ 1 度も適用していない要求は「奪うものが無い」ので常に true。
+    pub(crate) fn still_owns_selection(&self, cursor: Option<&Path>, checked: &[PathBuf]) -> bool {
+        if self.applied.is_empty() {
+            return true;
+        }
+        // 置き方は [`plan_selection`] と対。1 件ならチェックは付けず、複数件なら全部。
+        let expected_checked: &[PathBuf] = if self.applied.len() > 1 {
+            &self.applied
+        } else {
+            &[]
+        };
+        let cursor_kept = match (cursor, self.applied.first()) {
+            (Some(cursor), Some(applied)) => crate::folder_tree::path_eq(applied, cursor),
+            _ => false,
+        };
+        cursor_kept
+            && checked.len() == expected_checked.len()
+            && expected_checked.iter().all(|expected| {
+                checked
+                    .iter()
+                    .any(|path| crate::folder_tree::path_eq(expected, path))
+            })
+    }
+
+    /// 1 度でも選択を置いたか。まだなら自動再読込は従来どおり手を出さない。
+    pub(crate) fn has_applied(&self) -> bool {
+        !self.applied.is_empty()
+    }
+
     /// [`decide`] が `Apply` を返した後に呼ぶ。
     pub(crate) fn record_applied(
         &mut self,
@@ -325,7 +375,8 @@ mod tests {
         assert_eq!(indices, vec![1, 2, 3]);
         request.record_applied(&second, &indices, later);
 
-        // 増えなくなったら手を引く。以後ユーザーが選択を変えても奪い返さない。
+        // 増えていない再読込が挟まっても**捨てない**。置き換え確認ダイアログなどで
+        // 途中に間が空くと、ここで捨てた場合に残りが選択に入らなくなる (R-09)。
         assert_eq!(
             decide(
                 &request,
@@ -333,7 +384,94 @@ mod tests {
                 &second,
                 later + Duration::from_secs(1)
             ),
+            Step::Wait,
+        );
+
+        // その後に本当に残りが届けば、ちゃんと足す。
+        let third = visible(&["a", "b", "c", "d", "e"]);
+        let last = later + Duration::from_secs(2);
+        let Step::Apply(indices) = decide(&request, Some(&folder()), &third, last) else {
+            panic!("遅れて届いた分を拾えていない");
+        };
+        assert_eq!(indices, vec![1, 2, 3, 4]);
+
+        // 増えないまま期限を過ぎたら手を引く。
+        assert_eq!(
+            decide(
+                &request,
+                Some(&folder()),
+                &second,
+                later + OUTPUT_WAIT_TIMEOUT + Duration::from_secs(1)
+            ),
             Step::Drop,
+        );
+    }
+
+    /// 利用者が選択を引き取ったら、以後の出力で上書きしない。
+    ///
+    /// **判定は再読込より前。** 再読込は `checked` を消すので、その後では利用者が何を
+    /// したか分からない。以前は「集合が増えなくなったら捨てる」で代用していたが、
+    /// それだと遅れて届いた分まで一緒に捨てていた (R-09)。
+    #[test]
+    fn the_request_lets_go_once_the_user_moves_the_selection() {
+        let now = Instant::now();
+        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let listing = visible(&["a", "b", "c"]);
+        let Step::Apply(indices) = decide(&request, Some(&folder()), &listing, now) else {
+            panic!("should apply");
+        };
+        request.record_applied(&listing, &indices, now);
+
+        // こちらが置いたまま = まだこちらのもの。
+        let ours = [folder().join("b"), folder().join("c")];
+        assert!(request.still_owns_selection(Some(&folder().join("b")), &ours));
+        // 大文字小文字は Windows の比較に合わせる。
+        assert!(request.still_owns_selection(Some(&folder().join("B")), &ours));
+
+        // カーソルを動かした。
+        assert!(!request.still_owns_selection(Some(&folder().join("a")), &ours));
+        // チェックを外した。
+        assert!(!request.still_owns_selection(Some(&folder().join("b")), &[folder().join("b")]));
+        // チェックを足した。
+        assert!(!request.still_owns_selection(
+            Some(&folder().join("b")),
+            &[folder().join("a"), folder().join("b"), folder().join("c")]
+        ));
+        // 件数は同じまま、別の項目へ入れ替えた。**数だけ見ていると素通りする。**
+        assert!(!request.still_owns_selection(
+            Some(&folder().join("b")),
+            &[folder().join("b"), folder().join("a")]
+        ));
+        // 選択そのものを解除した。
+        assert!(!request.still_owns_selection(None, &[]));
+    }
+
+    /// まだ 1 度も置いていない要求は、奪うものが無いので手放さない。
+    ///
+    /// 貼り付け直後の 1 回目の再読込がこれ。ここで「選択が違う」と判断して捨てると、
+    /// 貼り付け結果を 1 度も選べない。
+    #[test]
+    fn a_request_that_has_not_applied_yet_owns_nothing_and_keeps_waiting() {
+        let request = PostOperationSelection::new(folder(), added_since(&["a"]), Instant::now());
+        assert!(!request.has_applied());
+        assert!(request.still_owns_selection(Some(&folder().join("a")), &[]));
+        assert!(request.still_owns_selection(None, &[]));
+    }
+
+    /// 1 件だけのときはチェックを付けないので、「チェック無し」が正しい姿。
+    #[test]
+    fn a_single_output_is_still_ours_with_nothing_checked() {
+        let now = Instant::now();
+        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let listing = visible(&["a", "b"]);
+        let Step::Apply(indices) = decide(&request, Some(&folder()), &listing, now) else {
+            panic!("should apply");
+        };
+        request.record_applied(&listing, &indices, now);
+        assert!(request.still_owns_selection(Some(&folder().join("b")), &[]));
+        assert!(
+            !request.still_owns_selection(Some(&folder().join("b")), &[folder().join("b")]),
+            "1 件のときにチェックが付いていたら、それは利用者が付けたもの"
         );
     }
 

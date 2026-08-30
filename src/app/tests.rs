@@ -1,11 +1,28 @@
 #[cfg(windows)]
-use super::presentation_transition::{DetachedHostDisposition, PresentationRequest};
+use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 use crate::archive_converter::ArchiveFormat;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+#[cfg(windows)]
+fn test_detached_host_lease(
+    window_id: u64,
+    hwnd: Option<u64>,
+    incarnation: u64,
+) -> DetachedHostLease {
+    let session = DetachedSessionLease { window_id };
+    DetachedHostLease {
+        session,
+        host: hwnd.map(|hwnd| DetachedHostClaim {
+            lease: session,
+            incarnation,
+            hwnd,
+        }),
+    }
+}
 
 #[cfg(windows)]
 fn begin_test_video_presentation_transition(
@@ -15,18 +32,29 @@ fn begin_test_video_presentation_transition(
 ) -> u64 {
     app.video_presentation_transition
         .reset_stable(app.viewer_presentation);
-    let ready_host_hwnd = if target == ViewerPresentation::DetachedWindow {
-        0xD371
-    } else {
-        0
-    };
+    let current_detached =
+        (app.viewer_presentation == ViewerPresentation::DetachedWindow).then(|| {
+            let window_id = app
+                .active_detached_session
+                .map(|session| session.window_id)
+                .or(app.detached_viewer_window_id)
+                .unwrap_or(0xA056);
+            test_detached_host_lease(window_id, Some(0xA057), 1)
+        });
+    let target_detached = (target == ViewerPresentation::DetachedWindow).then(|| {
+        let window_id = current_detached
+            .map(|lease| lease.session.window_id)
+            .or(app.detached_viewer_window_id)
+            .unwrap_or(0xD370);
+        test_detached_host_lease(window_id, Some(0xD371), 2)
+    });
     let request_id = app.video_presentation_transition.request_transition(
         target,
         true,
         announce_main_hint,
         0xA117,
-        0xA057,
-        ready_host_hwnd,
+        current_detached,
+        target_detached,
     );
     app.video_presentation_transition.take_effects();
     app.video_presentation_transition.drive();
@@ -138,7 +166,12 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
                 activate: true,
                 announce_main_hint: false,
                 outgoing_presenter_hwnd: 0xA117,
-                detached_host: DetachedHostDisposition::None,
+                outgoing_detached: None,
+                target_detached: DetachedTargetLease::Candidate(test_detached_host_lease(
+                    12,
+                    Some(0xD371),
+                    1,
+                )),
             },
             hwnd: 0xD371,
         },
@@ -173,6 +206,8 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
 #[test]
 #[cfg(windows)]
 fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_placement() {
+    const OLD_WINDOW: u64 = 12;
+
     let mut app = phase_c_support::setup_app();
     app.items.push(GridItem::Image(PathBuf::from(
         r"C:\pics\borderless-observation.jpg",
@@ -183,15 +218,15 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
         y: 160.0,
         w: 1500.0,
         h: 1000.0,
-        maximized: false,
+        maximized: true,
     };
     app.fullscreen_idx = Some(idx);
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.settings.detached_viewer_enabled = true;
-    app.detached_viewer_window_id = Some(12);
-    app.begin_active_detached_session(12, DetachedSource::Image);
-    app.set_detached_window_runtime_placement(12, restore, "test_borderless_observation");
+    app.detached_viewer_window_id = Some(OLD_WINDOW);
+    app.begin_active_detached_session(OLD_WINDOW, DetachedSource::Image);
+    app.set_detached_window_runtime_placement(OLD_WINDOW, restore, "test_borderless_observation");
     app.write_detached_viewer_borderless_state(
         true,
         Some(restore),
@@ -207,7 +242,7 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     );
     assert_eq!(app.detached_viewer_restore_placement, Some(restore));
     assert_eq!(
-        app.detached_window_runtime_placement(12),
+        app.detached_window_runtime_placement(OLD_WINDOW),
         None,
         "F12 OFF terminally removes the old OS-window runtime"
     );
@@ -216,10 +251,27 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
     assert!(app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, Some(restore));
+    let recreated_window = app
+        .detached_viewer_window_id
+        .expect("F12 ON must allocate a detached viewport identity");
+    assert_ne!(
+        recreated_window, OLD_WINDOW,
+        "a terminally retired detached lease must never be reused"
+    );
+    assert_ne!(
+        App::detached_image_window_viewport_id(recreated_window),
+        App::detached_image_window_viewport_id(OLD_WINDOW),
+        "the recreated OS window must also have a distinct egui ViewportId"
+    );
+    assert_eq!(
+        app.detached_window_runtime_placement(recreated_window),
+        Some(restore),
+        "the fresh lease inherits position, size, and maximized state through the existing placement path"
+    );
 
     // The recreated host consumes the preserved presentation intent through the existing builder.
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
-    app.detached_window_hwnd_clear(12);
+    app.detached_window_hwnd_clear(recreated_window);
     let builder = app.build_inactive_fullscreen_viewport_builder(idx);
     assert_eq!(
         builder.decorations,
@@ -235,7 +287,145 @@ fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_place
     app.apply_detached_viewer_borderless_target(&egui::Context::default(), false);
     assert!(!app.detached_viewer_borderless_fullscreen);
     assert_eq!(app.detached_viewer_restore_placement, None);
-    assert_eq!(app.detached_window_runtime_placement(12), Some(restore));
+    assert_eq!(
+        app.detached_window_runtime_placement(recreated_window),
+        Some(restore)
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_exact() {
+    const OLD_WINDOW_H: u64 = 41;
+
+    let mut app = phase_c_support::setup_app();
+    app.items.push(GridItem::Image(PathBuf::from(
+        r"C:\pics\close-identity.jpg",
+    )));
+    app.fullscreen_idx = Some(0);
+    app.settings.detached_viewer_enabled = true;
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.fs_viewport_shown = true;
+    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Image);
+
+    app.toggle_detached_viewer_mode();
+    assert!(
+        app.detached_window_manager.runtime(OLD_WINDOW_H).is_none(),
+        "terminal F12 OFF retires H"
+    );
+
+    app.toggle_detached_viewer_mode();
+    let current_window_j = app
+        .detached_viewer_window_id
+        .expect("immediate F12 ON must create J");
+    assert_ne!(current_window_j, OLD_WINDOW_H);
+    assert_ne!(
+        App::detached_image_window_viewport_id(current_window_j),
+        App::detached_image_window_viewport_id(OLD_WINDOW_H)
+    );
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.fs_viewport_shown = true;
+
+    // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
+    app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
+    assert_eq!(app.detached_viewer_window_id, Some(current_window_j));
+    assert_eq!(
+        app.active_detached_session.map(|session| session.window_id),
+        Some(current_window_j)
+    );
+    assert_eq!(
+        app.detached_window_state(current_window_j),
+        Some(DetachedWindowState::Active)
+    );
+    assert!(app.fs_viewport_shown);
+    assert_eq!(
+        app.fs_viewport_presentation,
+        Some(ViewerPresentation::DetachedWindow)
+    );
+
+    // The real close for current J stays unconditional and retires that exact lease.
+    app.handle_fullscreen_close_request();
+    assert_eq!(app.fullscreen_idx, None);
+    assert_eq!(app.detached_viewer_window_id, None);
+    assert!(app.active_detached_session.is_none());
+    assert!(
+        app.detached_window_manager
+            .runtime(current_window_j)
+            .is_none()
+    );
+    assert!(!app.fs_viewport_shown);
+}
+
+#[test]
+#[cfg(windows)]
+fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
+    const OLD_WINDOW_H: u64 = 52;
+    const LATE_HWND: u64 = 0x5200;
+
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let old_viewport_h = App::detached_image_window_viewport_id(OLD_WINDOW_H);
+    app.detached_viewer_window_id = Some(OLD_WINDOW_H);
+    app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Video);
+
+    app.begin_active_detached_session_close("test_late_registration_closing");
+    assert!(
+        app.detached_window_hwnd_snapshot_before_show(
+            OLD_WINDOW_H,
+            "test_late_registration_closing",
+            old_viewport_h,
+        )
+        .is_none(),
+        "pre-show registration must reject a Closing lease"
+    );
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
+    assert_eq!(
+        app.detached_window_state(OLD_WINDOW_H),
+        Some(DetachedWindowState::Closing),
+        "the actual deferred producer must not revive a Closing lease"
+    );
+    assert!(
+        app.detached_window_hwnd_set_for_reusable_lease(
+            OLD_WINDOW_H,
+            LATE_HWND,
+            "test_late_registration_closing",
+        )
+        .is_err(),
+        "a Closing lease must reject post-show HWND registration"
+    );
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(OLD_WINDOW_H), 0);
+
+    app.finish_active_detached_session_close("test_late_registration_removed");
+    assert!(app.detached_window_manager.runtime(OLD_WINDOW_H).is_none());
+    assert!(
+        app.detached_window_hwnd_snapshot_before_show(
+            OLD_WINDOW_H,
+            "test_late_registration_removed",
+            old_viewport_h,
+        )
+        .is_none(),
+        "a stale pre-show path must not recreate a removed lease"
+    );
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
+    assert!(
+        app.detached_window_manager.runtime(OLD_WINDOW_H).is_none(),
+        "the actual deferred callback producer must not recreate removed H"
+    );
+    assert!(
+        app.detached_window_hwnd_set_for_reusable_lease(
+            OLD_WINDOW_H,
+            LATE_HWND,
+            "test_late_registration_removed",
+        )
+        .is_err(),
+        "a removed lease must not be recreated by the tail of its old viewport callback"
+    );
+    assert!(app.detached_window_manager.runtime(OLD_WINDOW_H).is_none());
+
+    let current_window_j = app.ensure_detached_viewer_window_id();
+    assert_ne!(current_window_j, OLD_WINDOW_H);
 }
 
 #[test]
@@ -301,6 +491,34 @@ fn borderless_runtime_state_writes_stay_on_the_observed_path() {
     );
 }
 
+#[test]
+#[cfg(windows)]
+fn detached_child_teardown_has_no_programmatic_viewport_close_producers() {
+    let app_source = include_str!("../app.rs");
+    let native_video_source = include_str!("native_video.rs");
+    let fullscreen_source = include_str!("../ui_fullscreen.rs");
+
+    assert_eq!(
+        app_source.matches("egui::ViewportCommand::Close").count(),
+        1,
+        "app.rs may retain only the test-script root-window Close producer"
+    );
+    assert!(
+        app_source.contains(
+            "ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close)"
+        ),
+        "the sole remaining producer must still target the root viewport"
+    );
+    assert!(
+        !native_video_source.contains("egui::ViewportCommand::Close"),
+        "native transition teardown must retire detached desired output without Close"
+    );
+    assert!(
+        !fullscreen_source.contains("egui::ViewportCommand::Close"),
+        "detached image-window teardown must retire desired output without Close"
+    );
+}
+
 #[cfg(windows)]
 fn begin_test_detached_host_wait(app: &mut App) -> u64 {
     app.video_presentation_transition
@@ -310,8 +528,8 @@ fn begin_test_detached_host_wait(app: &mut App) -> u64 {
         true,
         false,
         0xA117,
-        0,
-        0,
+        None,
+        Some(test_detached_host_lease(0xD370, None, 0)),
     );
     app.video_presentation_transition.take_effects();
     request_id
@@ -14901,7 +15119,7 @@ mod favorite_adjustment_defaults_tests {
         let mut params = AdjustParams::default();
         params.brightness = 27.0;
 
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
 
         assert!(
             app.pinned_adjustment_refresh_keys
@@ -14923,14 +15141,14 @@ mod favorite_adjustment_defaults_tests {
         let mut params = AdjustParams::default();
         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
 
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
         assert!(
             !app.pinned_adjustment_refresh_keys
                 .contains(&target.page_key),
             "colorize is intentionally absent from thumbnail rendering"
         );
 
-        app.clear_page_params_for_target(&target).unwrap();
+        let _ = app.clear_page_params_for_target(&target);
         assert!(
             !app.pinned_adjustment_refresh_keys
                 .contains(&target.page_key),
@@ -14952,10 +15170,10 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.page_adjustment_indices(&target).is_empty());
         let mut params = AdjustParams::default();
         params.contrast = 19.0;
-        app.set_page_params_for_target(&target, params).unwrap();
+        let _ = app.set_page_params_for_target(&target, params);
         app.pinned_adjustment_refresh_keys.clear();
 
-        app.clear_page_params_for_target(&target).unwrap();
+        let _ = app.clear_page_params_for_target(&target);
 
         assert!(
             app.pinned_adjustment_refresh_keys
@@ -15092,6 +15310,82 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.mask_pages.contains(&0),
             "保存に失敗しただけで、編集が画面から消えている"
+        );
+    }
+
+    /// **正本をそもそも開けていない**ときも、拒否されたときと同じ扱いにする。
+    ///
+    /// 起動時の `open().ok()` が `None` を返した状態を「書けた」と同じに畳むと、
+    /// `edit_store_write_succeeded` が真を返してサイドカーが書かれる。中央に古い行が
+    /// あると次回起動の import がそれを捨てるので、**利用者には何も表示されないまま
+    /// 編集が消える**。上のテストが `Some(読み取り専用 DB)` 経路、これが `None` 経路
+    /// (2026-08-29 レビュー R-26)。
+    #[test]
+    fn an_edit_with_no_store_open_is_not_mirrored_into_the_sidecar() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("pics");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image = folder.join("page.png");
+        std::fs::write(&image, b"x").unwrap();
+        app.settings.sidecar_backup_enabled = true;
+        app.items = vec![GridItem::Image(image.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        // 起動時に開けなかった状態。書き込みを試してすらいない。
+        drop(app.mask_db.take());
+        assert!(app.mask_db.is_none());
+
+        let mask = vec![true; 4];
+        app.save_mask_with_sidecar(0, &mask, &[], 2, 2);
+
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存先が無いことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        let mirrored = app
+            .sidecars
+            .get(&folder)
+            .is_some_and(|sidecar| sidecar.items().values().any(|entry| entry.mask.is_some()));
+        assert!(
+            !mirrored,
+            "正本を開けていないのにサイドカーへ写している (次回起動時に古い正本が勝つ)"
+        );
+        assert!(
+            app.mask_pages.contains(&0),
+            "保存できなかっただけで、編集が画面から消えている"
+        );
+    }
+
+    /// 3 値のどれがサイドカーを書いてよいかを 1 か所で固定する。
+    ///
+    /// 14 か所の保存経路はすべて `edit_store_write` を通るので、ここが崩れると
+    /// 全経路が同時に崩れる。
+    #[test]
+    fn only_a_committed_write_lets_the_sidecar_mirror_be_written() {
+        use crate::app::EditStoreOutcome;
+        let ok: Option<Result<(), String>> = Some(Ok(()));
+        let refused: Option<Result<(), String>> = Some(Err("disk full".to_string()));
+        let never_opened: Option<Result<(), String>> = None;
+        assert_eq!(App::edit_store_write(ok), EditStoreOutcome::Committed);
+        assert_eq!(
+            App::edit_store_write(refused),
+            EditStoreOutcome::Failed("disk full".to_string())
+        );
+        assert_eq!(
+            App::edit_store_write(never_opened),
+            EditStoreOutcome::Unavailable
+        );
+
+        let mut app = setup_app();
+        assert!(app.edit_store_write_succeeded("補正", EditStoreOutcome::Committed));
+        assert!(!app.edit_store_write_succeeded("補正", EditStoreOutcome::Unavailable));
+        assert!(
+            !app.edit_store_write_succeeded(
+                "補正",
+                EditStoreOutcome::Failed("disk full".to_string())
+            )
         );
     }
 
@@ -16532,6 +16826,131 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 終了時のカーソル名は、`last_folder` と**対で**しか保存しない (backlog §1.0g)。
+    ///
+    /// `None` は「不明だから前回値を残す」ではなく**破棄**。検索結果や別ウィンドウで
+    /// 終了したとき `last_folder` は更新されないので、名前だけ別の場所のものを残すと
+    /// 次回起動で無関係な項目にカーソルが乗る。
+    #[test]
+    fn the_cursor_we_persist_belongs_to_the_folder_we_persist() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/pics");
+        app.items.push(GridItem::Image(folder.join("a.jpg")));
+        app.items.push(GridItem::Image(folder.join("b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.current_folder = Some(folder.clone());
+        app.settings.last_folder = Some(folder.clone());
+
+        app.selected = Some(1);
+        assert_eq!(
+            app.cursor_to_persist().map(|(name, _)| name).as_deref(),
+            Some("b.jpg")
+        );
+
+        // 未選択なら書くものが無い。
+        app.selected = None;
+        assert_eq!(app.cursor_to_persist(), None);
+        app.selected = Some(1);
+
+        // 合成ビュー (検索結果など) の項目は `last_folder` の中身ではない。
+        // `last_folder` 側も合成パスに揃えてある: 通常は `load_folder` が合成パスを
+        // `last_folder` へ書かないので下の「別の場所」判定に吸収されてしまい、**合成ビュー
+        // 判定そのものが働いているか確かめられない**。書き込み側の前提が将来崩れても
+        // ここで止まることを、この 1 本が保証する。
+        let synthetic = crate::app::search_results_synthetic_path();
+        app.current_folder = Some(synthetic.clone());
+        app.settings.last_folder = Some(synthetic);
+        assert_eq!(
+            app.cursor_to_persist(),
+            None,
+            "合成ビューの選択を last_folder のカーソルとして残してはいけない"
+        );
+        app.settings.last_folder = Some(folder.clone());
+
+        // last_folder と別の場所を見ている状態でも残さない。
+        app.current_folder = Some(std::path::PathBuf::from("c:/other"));
+        assert_eq!(app.cursor_to_persist(), None);
+
+        // 元に戻せばまた書ける (上の None が「壊れた」わけではないことの確認)。
+        app.current_folder = Some(folder.clone());
+        assert_eq!(
+            app.cursor_to_persist().map(|(name, _)| name).as_deref(),
+            Some("b.jpg")
+        );
+    }
+
+    /// カーソルの行位置は、保存したときと同じ見え方に戻る。
+    ///
+    /// スクロール位置 (pt) ではなく「上から何行目か」を保存している。**列数や行高が
+    /// 変わっても同じ見え方になる**のがその狙いなので、保存時と復元時でレイアウトを
+    /// 変えて往復させる。
+    #[test]
+    fn the_cursor_comes_back_the_same_number_of_rows_down_the_screen() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for i in 0..40 {
+            app.items
+                .push(GridItem::Image(folder.join(format!("{i:02}.jpg"))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.rebuild_visible_indices();
+        app.current_folder = Some(folder.clone());
+        app.settings.last_folder = Some(folder);
+
+        // 保存時: 4 列 / 行高 200。idx 22 は 5 行目、画面の一番上は 3 行目 → 2 行下。
+        app.last_grid_cols = 4;
+        app.last_cell_h = 200.0;
+        app.scroll_offset_y = 600.0;
+        app.selected = Some(22);
+        let (name, rows_above) = app.cursor_to_persist().expect("保存できるはず");
+        assert_eq!(name, "22.jpg");
+        assert_eq!(rows_above, 2);
+
+        // 復元時: 5 列 / 行高 150 に変わった。idx 22 は 4 行目なので、2 行下に見せるには
+        // 一番上を 2 行目にする → 2 * 150。**保存した pt (600) をそのまま使うと違う行になる。**
+        app.scroll_offset_y = 0.0;
+        app.scroll_selected_to_rows_above = Some(rows_above);
+        app.apply_scroll_to_selected(5, 150.0);
+        assert_eq!(app.scroll_offset_y, 300.0);
+        assert!(
+            app.scroll_selected_to_rows_above.is_none(),
+            "1 回で使い切ること (次のカーソル移動まで効き続けない)"
+        );
+
+        // 使い切った後は従来どおり「見える最小限だけ動かす」に戻る。
+        app.last_viewport_h = 600.0;
+        app.scroll_offset_y = 0.0;
+        app.apply_scroll_to_selected(5, 150.0);
+        assert_eq!(
+            app.scroll_offset_y, 150.0,
+            "行 4 が下端に入る最小の移動。行位置の復元ではない"
+        );
+    }
+
+    /// ドライブ一覧で終了したときもカーソル名を残さない。
+    ///
+    /// `last_folder` にはドライブ一覧の sentinel が入り得る。`effective_folder` が
+    /// ドライブ一覧で `None` を返すので、sentinel を名指しする分岐は要らない —
+    /// **その前提が壊れていないこと**をここで固定する。
+    #[test]
+    fn the_drive_list_leaves_no_cursor_behind() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items.push(GridItem::Folder("C:/".into()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.items_are_drive_list = true;
+        app.current_folder = Some(std::path::PathBuf::from("c:/pics"));
+        app.settings.last_folder = Some(std::path::PathBuf::from("c:/pics"));
+
+        assert_eq!(app.cursor_to_persist(), None);
+    }
+
     /// Codex P3 (2026-04): BS で深い階層から戻ったとき、`select_after_load` が
     /// `folder_history` の古い選択より優先されること。Ctrl+↓ で進んだ先から
     /// 戻ったとき「最初に入った位置」ではなく「今いる位置」にカーソルを合わせる
@@ -17271,6 +17690,47 @@ mod favorite_adjustment_defaults_tests {
         app.select_after_load = None;
         app.preserve_cursor_hint_for_reload();
         assert_eq!(app.select_after_load.as_deref(), Some("a.jpg"));
+    }
+
+    /// 起きなかった貼り付けの要求を残さない (R-08)。
+    ///
+    /// 差分で拾う要求は「呼ぶ前の一覧」が要るので Shell 呼び出しより先に積むしかない。
+    /// その場で失敗したときに取り下げないと、続く 10 秒の間の**無関係なファイル追加**が
+    /// 貼り付け結果として選ばれる。
+    #[test]
+    fn a_paste_that_never_happened_does_not_claim_the_next_files_to_appear() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        app.items.push(GridItem::Image(folder.join("a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+
+        // Shell を呼ぶ直前の控え。
+        app.request_post_operation_selection_for_added_items(folder.clone());
+        assert!(app.post_operation_selection.is_some());
+
+        // 呼び出しがその場で失敗した。
+        app.cancel_post_operation_selection("shell_paste_failed");
+        assert!(
+            app.post_operation_selection.is_none(),
+            "失敗した操作の要求が残っている"
+        );
+
+        // 別の理由でファイルが増えても、貼り付け結果として拾わない。
+        app.items
+            .push(GridItem::Image(folder.join("unrelated.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        assert!(
+            !app.apply_post_operation_selection(),
+            "取り下げたのに適用された"
+        );
+
+        // 二重に取り下げても壊れない (成功経路と失敗経路が同じフレームで来ても安全)。
+        app.cancel_post_operation_selection("again");
+        assert!(app.post_operation_selection.is_none());
     }
 
     #[test]
@@ -24542,6 +25002,7 @@ mod favorite_adjustment_defaults_tests {
             let rect = egui::Rect::from_min_size(min, egui::vec2(10.0, 10.0));
             let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
                     page_idx: idx,
                     viewport_rect: rect,
                     source_size: egui::vec2(10.0, 10.0),
@@ -37293,7 +37754,7 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(41, DetachedWindowState::Parked, "test");
         app.queue_recognized_detached_right_drag_command(41, passive_rotate_command(), "test");
 
-        app.close_detached_image_windows_by_ids(&ctx, &[41], &[], "test_close", None);
+        app.close_detached_image_windows_by_ids(&ctx, &[41], "test_close", None);
 
         assert!(app.detached_window_manager.runtime(41).is_none());
         assert!(app.rotation_cache.is_empty());
@@ -37686,6 +38147,7 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn detached_hwnd_no_change_path_adopts_single_unclaimed_egui_window() {
         let mut app = setup_app();
+        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
         app.detached_window_hwnd_set(8, 0x800);
         app.set_detached_window_live_hwnds_for_test([0x800]);
 
@@ -38574,7 +39036,10 @@ mod still_window_mode_key_tests {
             app.detached_window_state(62),
             Some(DetachedWindowState::ParkedLive)
         );
-        assert!(app.detached_image_window_close_pending.is_empty());
+        assert!(
+            app.detached_window_manager.runtime(62).is_some(),
+            "cursor sync must not retire the parked media lease"
+        );
     }
 
     /// §1.7: bundle 化前の連動 detached メディアセッションは、grid open の直前に
@@ -38665,6 +39130,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\a.mp4");
         app.fullscreen_idx = Some(video);
+        app.transition_detached_window_state(123, DetachedWindowState::Opening, "test");
         app.detached_viewer_window_id = Some(123);
 
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
@@ -38778,6 +39244,7 @@ mod still_window_mode_key_tests {
     fn prepare_detached_video_placement_switch(app: &mut App, window_id: u64) {
         let video = push_video(app, r"C:\clips\placement-switch.mp4");
         app.fullscreen_idx = Some(video);
+        app.transition_detached_window_state(window_id, DetachedWindowState::Opening, "test");
         app.detached_viewer_window_id = Some(window_id);
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
@@ -43732,6 +44199,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.selected = Some(video);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.transition_detached_window_state(120, DetachedWindowState::Opening, "test");
         app.detached_viewer_window_id = Some(120);
         app.bind_mounted_context_for_test(120);
         begin_test_video_presentation_transition(
@@ -44799,8 +45267,8 @@ mod still_window_mode_key_tests {
             "対象を再生中の parked-live 窓は閉じられる"
         );
         assert!(
-            app.detached_image_window_close_pending.contains(&61),
-            "viewport close が予約される"
+            app.detached_window_manager.runtime(61).is_none(),
+            "terminal path removal must retire the viewport lease immediately"
         );
 
         app.purge_video_resume_positions_for_removed_paths(&removed);
@@ -45944,7 +46412,7 @@ mod still_window_mode_key_tests {
             _join: std::thread::spawn(|| {}),
         });
 
-        app.close_detached_image_windows_by_ids(&ctx, &[97], &[], "test_close", None);
+        app.close_detached_image_windows_by_ids(&ctx, &[97], "test_close", None);
 
         assert!(app.detached_image_windows.is_empty());
         assert!(app.music_analysis_path.is_none());
@@ -47121,6 +47589,9 @@ mod still_window_mode_key_tests {
 
     #[test]
     fn passive_detached_book_window_reactivation_reopens_descriptor_in_active_context() {
+        const WINDOW_ID: u64 = 42;
+        const RAW_HWND: u64 = 0x4200;
+
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -47142,11 +47613,28 @@ mod still_window_mode_key_tests {
             pixels,
             egui::TextureOptions::LINEAR,
         );
-        let placement = app.detached_viewer_window_placement();
-        app.set_detached_window_runtime_placement(42, placement, "test_passive_book_reactivate");
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: 170.0,
+            y: 190.0,
+            w: 1320.0,
+            h: 880.0,
+            maximized: true,
+        };
+        let viewport_id_before = App::detached_image_window_viewport_id(WINDOW_ID);
+        app.set_detached_window_runtime_placement(
+            WINDOW_ID,
+            placement,
+            "test_passive_book_reactivate",
+        );
+        app.detached_window_hwnd_set(WINDOW_ID, RAW_HWND);
+        app.set_detached_window_live_hwnds_for_test([RAW_HWND]);
+        let host_claim_before = app
+            .detached_window_manager
+            .host_claim_alive(WINDOW_ID)
+            .expect("passive lease must own its observed HWND");
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
-                id: 42,
+                id: WINDOW_ID,
                 texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
@@ -47171,12 +47659,51 @@ mod still_window_mode_key_tests {
                 initial_placement_applied: false,
             });
 
-        assert!(app.activate_detached_image_window_snapshot(&ctx, 42));
+        app.queue_deferred_detached_window_activation(
+            WINDOW_ID,
+            "test_descriptor_activation_intent",
+        );
+        assert!(app.activate_detached_image_window_snapshot(&ctx, WINDOW_ID));
 
         assert!(app.detached_image_windows.is_empty());
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(WINDOW_ID)
+        );
+        assert_eq!(
+            App::detached_image_window_viewport_id(WINDOW_ID),
+            viewport_id_before,
+            "descriptor fallback is a pre-terminal handoff and keeps the ViewportId"
+        );
+        assert_eq!(
+            app.detached_window_runtime_placement(WINDOW_ID),
+            Some(placement),
+            "descriptor fallback keeps the existing runtime placement"
+        );
+        assert_eq!(
+            app.detached_window_hwnd_raw_for_window_id(WINDOW_ID),
+            RAW_HWND,
+            "descriptor fallback must not clear the existing OS host"
+        );
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(WINDOW_ID),
+            Some(DetachedActivationIntent::ActivateOnly)
+        ));
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert!(matches!(app.items[0], GridItem::PdfFile(_)));
         app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.detached_viewer_window_id,
+                Some(WINDOW_ID),
+                "the resumed active context must retain the original window identity"
+            );
+            assert_eq!(
+                active.detached_host_claim_for_lease(DetachedSessionLease {
+                    window_id: WINDOW_ID,
+                }),
+                Some(host_claim_before),
+                "descriptor fallback keeps the same host claim and incarnation"
+            );
             assert!(
                 active.pdf_enumerate_pending.is_some(),
                 "reactivation should re-enumerate in the active detached context"
@@ -47275,9 +47802,9 @@ mod still_window_mode_key_tests {
         assert!(app.activate_detached_image_window_snapshot(&ctx, 42));
 
         assert_eq!(
-            app.settings.detached_viewer_window_placement,
+            app.detached_window_runtime_placement(42),
             Some(first_placement),
-            "reactivated window should open at its own saved placement"
+            "reactivated window keeps its own runtime placement without a terminal settings write"
         );
         assert_eq!(app.detached_image_windows.len(), 1);
         let parked_id = app.detached_image_windows[0].id;
@@ -47977,6 +48504,7 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_window_placement = Some(placement);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
+        app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
         app.detached_viewer_window_id = Some(73);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
@@ -51292,8 +51820,13 @@ mod still_window_mode_key_tests {
             app.detached_window_state(71),
             Some(DetachedWindowState::Parked)
         );
-        assert!(app.detached_image_window_close_pending.contains(&72));
         assert_eq!(app.detached_window_state(72), None);
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == 72),
+            "the terminal media lease must be absent from the desired viewport set"
+        );
         assert_eq!(
             app.detached_window_runtime_placement(new_id),
             Some(media_placement),
@@ -51403,13 +51936,7 @@ mod still_window_mode_key_tests {
         );
 
         let media_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, video);
-        app.close_detached_image_windows_by_ids(
-            &ctx,
-            &[131],
-            &[],
-            "test_close_linked_one_shot",
-            None,
-        );
+        app.close_detached_image_windows_by_ids(&ctx, &[131], "test_close_linked_one_shot", None);
         assert_eq!(app.detached_window_state(131), None);
 
         let new_still_window_id = complete_detached_grid_open_for_test(&mut app, &ctx, image);
@@ -51448,7 +51975,11 @@ mod still_window_mode_key_tests {
         assert!(app.activate_existing_detached_viewer_for_grid_open(&ctx, video));
 
         assert!(app.detached_image_windows.is_empty());
-        assert!(app.detached_image_window_close_pending.is_empty());
+        assert_eq!(
+            app.detached_window_state(72),
+            Some(DetachedWindowState::Active),
+            "same-media activation keeps the existing viewport lease"
+        );
         app.with_active_viewer_context(|active| {
             assert!(viewer_context_bundle_displays_media_path(
                 ContextRef::mounted(active),
@@ -51500,7 +52031,11 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.detached_viewer_window_id, Some(82));
         assert!(app.active_viewer_context_id().is_some());
-        assert!(app.detached_image_window_close_pending.is_empty());
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            Some(82),
+            "promotion must keep the same lease instead of terminally replacing it"
+        );
     }
 
     #[test]
@@ -51581,7 +52116,11 @@ mod still_window_mode_key_tests {
 
         assert!(app.active_viewer_context_id().is_some());
         assert!(app.detached_image_windows.is_empty());
-        assert!(app.detached_image_window_close_pending.is_empty());
+        assert_eq!(
+            app.detached_window_state(74),
+            Some(DetachedWindowState::Active),
+            "same-media grid routing must promote the existing lease without retiring it"
+        );
         assert_eq!(app.input_seq, input_seq_before, "open path did not run");
     }
 
@@ -51660,7 +52199,10 @@ mod still_window_mode_key_tests {
 
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(app.detached_window_state(71), None);
-        assert_eq!(app.detached_image_window_close_pending, vec![71]);
+        assert!(
+            app.detached_window_manager.runtime(71).is_none(),
+            "the terminally closed media lease must leave the desired/runtime set"
+        );
     }
 
     #[test]
@@ -52841,7 +53383,7 @@ mod still_window_mode_key_tests {
         app.video_tile_reopen_pending = true;
         app.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
         app.native_video_deferred_nav_delta = Some(1);
-        app.close_detached_image_windows_by_ids(&ctx, &[7], &[], "test_close", None);
+        app.close_detached_image_windows_by_ids(&ctx, &[7], "test_close", None);
 
         assert!(app.native_video_source_swap_pending.is_none());
         assert!(app.video_tile_swap_pending.is_none());
@@ -52877,7 +53419,7 @@ mod still_window_mode_key_tests {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         app.native_video_deferred_nav_delta = Some(-1);
 
-        app.close_detached_image_windows_by_ids(&ctx, &[8], &[], "test_close", None);
+        app.close_detached_image_windows_by_ids(&ctx, &[8], "test_close", None);
 
         assert!(app.video_tile_mode_active);
         assert!(app.video_tile_reopen_pending);
@@ -53032,8 +53574,8 @@ mod still_window_mode_key_tests {
                 true,
                 false,
                 0xA117,
-                0,
-                0xD371,
+                None,
+                Some(test_detached_host_lease(9, Some(0xD371), 1)),
             );
         });
         app.transition_detached_window_state(9, DetachedWindowState::ParkedLive, "test_setup");
@@ -53042,7 +53584,7 @@ mod still_window_mode_key_tests {
         app.video_tile_reopen_deadline =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
         app.native_video_deferred_nav_delta = Some(1);
-        app.close_detached_image_windows_by_ids(&ctx, &[9], &[], "test_close", None);
+        app.close_detached_image_windows_by_ids(&ctx, &[9], "test_close", None);
 
         assert!(!app.video_tile_mode_active);
         assert!(!app.video_tile_reopen_pending);
@@ -63603,6 +64145,80 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
     );
 }
 
+/// 前面がメインなら、別ウィンドウが開いていても batch は root で配る。
+///
+/// v3.3.0 では配り先が `active_detached_context_is_at_rest()` だけを見ており、**前面を
+/// 見ていなかった**。別ウィンドウを開いたままメイン一覧を操作すると、batch が
+/// 別ウィンドウの context へ入り、`handle_gamepad_direction_for_grid` が mount 中の
+/// bundle の `selected` を動かしていた (メイン一覧は動かない)。`handle_gamepad_y_tap` の
+/// コメントは当時から「前面 / last-touched がメインならメインを操作する」と書いてある。
+///
+/// 前面 HWND はテストから触れないが、`resolve_input_surface` は前面が取れないとき
+/// 直近に配った面へ落ちるので、そこを使って両方の向きを確かめる。
+#[test]
+#[cfg(windows)]
+fn the_gamepad_goes_to_the_main_window_when_that_is_the_surface() {
+    let mut app = phase_c_support::setup_app();
+    let window_id = 79;
+    let context_id = app.build_window_context_for_test(window_id, |bundle| {
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    app.detached_viewer_window_id = Some(window_id);
+    assert_eq!(app.active_viewer_context_id(), Some(context_id));
+    assert!(
+        app.active_detached_context_is_at_rest(),
+        "AtRest の active context を作れていない"
+    );
+
+    // 直近に操作したのがメイン = メインが前面という状況。
+    app.detached_window_manager
+        .note_input_surface(crate::app::ActionSurface::MainWindow);
+    assert!(
+        !app.gamepad_batch_goes_to_active_context(),
+        "前面がメインなのに別ウィンドウへ配ろうとしている"
+    );
+
+    // 直近に操作したのが別ウィンドウなら、そちらへ配る (v3.3.0 の修正を維持)。
+    app.detached_window_manager
+        .note_input_surface(crate::app::ActionSurface::Viewer);
+    assert!(
+        app.gamepad_batch_goes_to_active_context(),
+        "前面が別ウィンドウなのに root で配ろうとしている"
+    );
+}
+
+/// 配り先と、その batch の中で解決される面が同じ答えになること。
+///
+/// 割れていると、メイン宛と解決した操作が別ウィンドウの bundle を書き換える。
+/// **同じ 1 つの関数から導く**のが不変条件なので、両方を並べて確かめる。
+#[test]
+#[cfg(windows)]
+fn the_gamepad_destination_and_the_action_surface_agree() {
+    let mut app = phase_c_support::setup_app();
+    let window_id = 80;
+    app.build_window_context_for_test(window_id, |bundle| {
+        bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+    });
+    app.detached_viewer_window_id = Some(window_id);
+
+    for (surface, goes_to_context) in [
+        (crate::app::ActionSurface::MainWindow, false),
+        (crate::app::ActionSurface::Viewer, true),
+    ] {
+        app.detached_window_manager.note_input_surface(surface);
+        assert_eq!(
+            app.gamepad_batch_goes_to_active_context(),
+            goes_to_context,
+            "配り先が面と食い違っている: {surface:?}"
+        );
+        assert_eq!(
+            app.current_input_surface_for_test(),
+            surface,
+            "面の解決が直近の面と食い違っている: {surface:?}"
+        );
+    }
+}
+
 /// 遷移中に context を畳む経路でも、通常の teardown まで到達する。
 ///
 /// `close_fullscreen` は遷移中なら `TerminalClose` を出して戻り、teardown を「後で
@@ -63737,6 +64353,219 @@ fn presentation_transition_poll_drives_prepare_without_a_forced_deadline() {
             ..
         }
     ));
+}
+
+#[test]
+#[cfg(windows)]
+fn stale_prepare_claim_returns_to_awaiting_host_instead_of_rerouting_to_global_sibling() {
+    const ACTIVE_WINDOW: u64 = 710;
+    const WINDOW_ID: u64 = 711;
+    const ACTIVE_HOST: u64 = 0x7100;
+    const HOST_H: u64 = 0x7110;
+    const HOST_J: u64 = 0x7111;
+
+    let mut app = phase_c_support::setup_app();
+    let idx = install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\exact-host.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    app.fullscreen_idx = Some(idx);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.detached_window_hwnd_set(ACTIVE_WINDOW, ACTIVE_HOST);
+    app.begin_active_detached_session(ACTIVE_WINDOW, DetachedSource::Video);
+    app.detached_viewer_window_id = Some(WINDOW_ID);
+    app.detached_window_hwnd_set(WINDOW_ID, HOST_H);
+    app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_H]);
+    let lease = DetachedSessionLease {
+        window_id: WINDOW_ID,
+    };
+    let claim_h = app
+        .detached_host_claim_for_lease(lease)
+        .expect("initial exact host claim");
+
+    app.video_presentation_transition
+        .reset_stable(ViewerPresentation::Fullscreen);
+    let request_id = app.video_presentation_transition.request_transition(
+        ViewerPresentation::DetachedWindow,
+        true,
+        false,
+        0xA117,
+        None,
+        Some(DetachedHostLease {
+            session: lease,
+            host: Some(claim_h),
+        }),
+    );
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition.drive();
+
+    app.detached_window_hwnd_set(WINDOW_ID, HOST_J);
+    app.set_detached_window_live_hwnds_for_test([ACTIVE_HOST, HOST_J]);
+    let claim_j = app
+        .detached_host_claim_for_lease(lease)
+        .expect("replacement exact host claim");
+    assert_ne!(claim_h.incarnation, claim_j.incarnation);
+
+    let ctx = egui::Context::default();
+    app.execute_video_presentation_transition_effects(&ctx);
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::AwaitingHost { lease: waiting },
+        } if request.id == request_id && waiting == lease
+    ));
+
+    app.poll_video_presentation_transition(&ctx);
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::AwaitingNative {
+                host: Some(prepared),
+            },
+        } if request.id == request_id && prepared == claim_j
+    ));
+    let before_stale_rejection = app.video_presentation_transition.state();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::HostUnavailable {
+            request_id,
+            claim: claim_h,
+        });
+    assert_eq!(
+        app.video_presentation_transition.state(),
+        before_stale_rejection,
+        "a late rejection for H must not rewind the request preparing exact claim J"
+    );
+    assert_eq!(
+        app.active_detached_session.map(|session| session.window_id),
+        Some(ACTIVE_WINDOW),
+        "preparing target J must not consume the outgoing active sibling"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport() {
+    const OLD_WINDOW: u64 = 721;
+    const SIBLING_WINDOW: u64 = 722;
+    const OLD_HOST: u64 = 0x7210;
+    const SIBLING_HOST: u64 = 0x7220;
+
+    let mut app = phase_c_support::setup_app();
+    app.detached_window_hwnd_set(OLD_WINDOW, OLD_HOST);
+    app.detached_window_hwnd_set(SIBLING_WINDOW, SIBLING_HOST);
+    app.set_detached_window_live_hwnds_for_test([OLD_HOST, SIBLING_HOST]);
+    app.begin_mounted_detached_session_for_test(SIBLING_WINDOW, DetachedSource::Video);
+    let sibling_context = app
+        .locate_window_context(SIBLING_WINDOW)
+        .expect("sibling binding before stale cleanup")
+        .0;
+
+    let old = test_detached_host_lease(OLD_WINDOW, Some(OLD_HOST), 1);
+    app.video_presentation_transition
+        .reset_stable(ViewerPresentation::DetachedWindow);
+    let request_id = app.video_presentation_transition.request_transition(
+        ViewerPresentation::Fullscreen,
+        true,
+        false,
+        0xA117,
+        Some(old),
+        None,
+    );
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeReady {
+            request_id,
+            candidate: PresentationCandidate {
+                presenter_hwnd: 0xCA11,
+                native_generation: 73,
+                host_hwnd: 0,
+                requires_retire: true,
+            },
+        });
+    app.video_presentation_transition.drive();
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id,
+            candidate_generation: 73,
+        });
+    app.video_presentation_transition.take_effects();
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id,
+            candidate_generation: 73,
+        });
+    let effects = app.video_presentation_transition.take_effects();
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        PresentationTransitionEffect::CloseDetachedSession { lease, .. }
+            if lease.window_id == OLD_WINDOW
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        PresentationTransitionEffect::DestroyHost { lease, .. }
+            if lease.window_id == OLD_WINDOW
+    )));
+    assert!(!app.close_active_detached_session_exact(
+        DetachedSessionLease {
+            window_id: OLD_WINDOW,
+        },
+        "test_stale_exact_close",
+    ));
+
+    let ctx = egui::Context::default();
+    let old_viewport = App::detached_image_window_viewport_id(OLD_WINDOW);
+    let sibling_viewport = App::detached_image_window_viewport_id(SIBLING_WINDOW);
+    ctx.set_embed_viewports(false);
+    ctx.begin_pass(egui::RawInput::default());
+    for effect in effects {
+        app.execute_video_presentation_host_effect(&ctx, effect);
+    }
+    ctx.show_viewport_deferred(
+        sibling_viewport,
+        egui::ViewportBuilder::default(),
+        |_ctx, _class| {},
+    );
+    let output = ctx.end_pass();
+
+    assert_eq!(
+        app.active_detached_session.map(|session| session.window_id),
+        Some(SIBLING_WINDOW)
+    );
+    assert_eq!(app.detached_viewer_window_id, Some(SIBLING_WINDOW));
+    assert_eq!(
+        app.locate_window_context(SIBLING_WINDOW)
+            .expect("sibling binding after stale cleanup")
+            .0,
+        sibling_context
+    );
+    assert_eq!(
+        app.detached_window_state(SIBLING_WINDOW),
+        Some(DetachedWindowState::Active)
+    );
+    assert_eq!(
+        app.detached_window_state(OLD_WINDOW),
+        None,
+        "terminal cleanup retires the exact old runtime"
+    );
+    assert!(
+        !output.viewport_output.contains_key(&old_viewport),
+        "retired H must be absent from desired viewport output, not published with Close"
+    );
+    assert!(
+        output
+            .viewport_output
+            .get(&sibling_viewport)
+            .is_some_and(|viewport| !viewport.commands.contains(&egui::ViewportCommand::Close)),
+        "DestroyHost(old) must address only the effect-owned viewport identity"
+    );
 }
 
 #[test]

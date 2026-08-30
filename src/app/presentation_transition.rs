@@ -1,35 +1,65 @@
-use super::ViewerPresentation;
+use super::{DetachedHostClaim, DetachedSessionLease, ViewerPresentation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DetachedHostDisposition {
-    None,
-    KeepLive { hwnd: u64 },
-    RetireOutgoing { hwnd: u64 },
+pub(crate) struct DetachedHostLease {
+    pub(crate) session: DetachedSessionLease,
+    pub(crate) host: Option<DetachedHostClaim>,
 }
 
-impl DetachedHostDisposition {
-    fn for_transition(
-        current: ViewerPresentation,
-        target: ViewerPresentation,
-        current_host_hwnd: u64,
-    ) -> Self {
-        match (current, target) {
-            (ViewerPresentation::DetachedWindow, ViewerPresentation::DetachedWindow) => {
-                Self::KeepLive {
-                    hwnd: current_host_hwnd,
-                }
-            }
-            (ViewerPresentation::DetachedWindow, _) => Self::RetireOutgoing {
-                hwnd: current_host_hwnd,
-            },
-            _ => Self::None,
+impl DetachedHostLease {
+    fn without_host(self) -> Self {
+        Self {
+            session: self.session,
+            host: None,
         }
     }
 
-    fn current_hwnd(self) -> u64 {
+    fn hwnd(self) -> u64 {
+        self.host.map_or(0, |claim| claim.hwnd)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedTargetLease {
+    None,
+    Candidate(DetachedHostLease),
+    KeepLive(DetachedHostLease),
+    Transferred(DetachedHostLease),
+}
+
+impl DetachedTargetLease {
+    fn lease(self) -> Option<DetachedHostLease> {
         match self {
-            Self::None => 0,
-            Self::KeepLive { hwnd } | Self::RetireOutgoing { hwnd } => hwnd,
+            Self::None => None,
+            Self::Candidate(lease) | Self::KeepLive(lease) | Self::Transferred(lease) => {
+                Some(lease)
+            }
+        }
+    }
+
+    fn session(self) -> Option<DetachedSessionLease> {
+        self.lease().map(|lease| lease.session)
+    }
+
+    fn host(self) -> Option<DetachedHostClaim> {
+        self.lease().and_then(|lease| lease.host)
+    }
+
+    fn with_host(self, host: Option<DetachedHostClaim>) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Candidate(lease) => Self::Candidate(DetachedHostLease {
+                session: lease.session,
+                host,
+            }),
+            Self::KeepLive(lease) => Self::KeepLive(DetachedHostLease {
+                session: lease.session,
+                host,
+            }),
+            Self::Transferred(lease) => Self::Transferred(DetachedHostLease {
+                session: lease.session,
+                host,
+            }),
         }
     }
 }
@@ -42,7 +72,28 @@ pub(crate) struct PresentationRequest {
     pub(crate) activate: bool,
     pub(crate) announce_main_hint: bool,
     pub(crate) outgoing_presenter_hwnd: u64,
-    pub(crate) detached_host: DetachedHostDisposition,
+    pub(crate) outgoing_detached: Option<DetachedHostLease>,
+    pub(crate) target_detached: DetachedTargetLease,
+}
+
+impl PresentationRequest {
+    fn target_session(self) -> Option<DetachedSessionLease> {
+        self.target_detached.session()
+    }
+
+    fn target_host(self) -> Option<DetachedHostClaim> {
+        self.target_detached.host()
+    }
+
+    fn with_target_host(mut self, host: Option<DetachedHostClaim>) -> Self {
+        self.target_detached = self.target_detached.with_host(host);
+        self
+    }
+
+    fn transfer_target(mut self, lease: DetachedHostLease) -> Self {
+        self.target_detached = DetachedTargetLease::Transferred(lease.without_host());
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,19 +106,18 @@ pub(crate) struct PresentationCandidate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreparingProgress {
-    AwaitingHost,
+    AwaitingHost {
+        lease: DetachedSessionLease,
+    },
     ReadyToPrepare {
-        host_hwnd: u64,
+        host: Option<DetachedHostClaim>,
     },
     AwaitingNative {
-        host_hwnd: u64,
+        host: Option<DetachedHostClaim>,
     },
     Aborting {
-        aborted_request_id: u64,
-        aborted_target: ViewerPresentation,
+        aborted: PresentationRequest,
         aborted_candidate_hwnd: u64,
-        aborted_candidate_host_hwnd: u64,
-        next_host_hwnd: u64,
     },
     /// commit 済みの retire を待ちながら、次の要求を控えている。
     ///
@@ -80,7 +130,6 @@ pub(crate) enum PreparingProgress {
     RetiringCommitted {
         retiring: PresentationRequest,
         retiring_generation: u64,
-        next_host_hwnd: u64,
     },
 }
 
@@ -115,7 +164,11 @@ pub(crate) enum PresentationTransitionEvent {
     Drive,
     HostReady {
         request_id: u64,
-        hwnd: u64,
+        claim: DetachedHostClaim,
+    },
+    HostUnavailable {
+        request_id: u64,
+        claim: DetachedHostClaim,
     },
     NativeReady {
         request_id: u64,
@@ -142,7 +195,7 @@ pub(crate) enum PresentationTransitionEvent {
 pub(crate) enum PresentationTransitionEffect {
     PrepareNative {
         request: PresentationRequest,
-        host_hwnd: u64,
+        host: Option<DetachedHostClaim>,
     },
     PublishNative {
         request: PresentationRequest,
@@ -167,6 +220,7 @@ pub(crate) enum PresentationTransitionEffect {
     DestroyHost {
         request_id: u64,
         target: ViewerPresentation,
+        lease: DetachedSessionLease,
         hwnd: u64,
     },
     ApplyPresentation {
@@ -175,6 +229,7 @@ pub(crate) enum PresentationTransitionEffect {
     },
     CloseDetachedSession {
         request_id: u64,
+        lease: DetachedSessionLease,
     },
     TerminalSessionClose {
         request_id: u64,
@@ -219,6 +274,9 @@ impl PresentationTransitionOwner {
         }
     }
 
+    /// R-27 以降、production は状態そのものではなく `awaited_detached_lease` /
+    /// `request_id` の型付きの問いを使う。生の状態を読むのは reducer のテストだけ。
+    #[cfg(test)]
     pub(crate) fn state(&self) -> PresentationTransitionState {
         self.state
     }
@@ -275,9 +333,19 @@ impl PresentationTransitionOwner {
                     target: ViewerPresentation::DetachedWindow,
                     ..
                 },
-                progress: PreparingProgress::AwaitingHost,
+                progress: PreparingProgress::AwaitingHost { .. },
             }
         )
+    }
+
+    pub(crate) fn awaited_detached_lease(&self) -> Option<DetachedSessionLease> {
+        match self.state {
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::AwaitingHost { lease },
+                ..
+            } => Some(lease),
+            _ => None,
+        }
     }
 
     pub(crate) fn set_announce_main_hint(&mut self, request_id: u64) {
@@ -311,12 +379,28 @@ impl PresentationTransitionOwner {
         activate: bool,
         announce_main_hint: bool,
         outgoing_presenter_hwnd: u64,
-        current_detached_host_hwnd: u64,
-        ready_host_hwnd: u64,
+        current_detached: Option<DetachedHostLease>,
+        target_detached: Option<DetachedHostLease>,
     ) -> u64 {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let id = self.next_request_id;
         let current = self.current();
+        let same_detached_lease = current_detached
+            .zip(target_detached)
+            .is_some_and(|(current, target)| current.session == target.session);
+        let outgoing_detached = (current == ViewerPresentation::DetachedWindow
+            && !same_detached_lease)
+            .then_some(current_detached)
+            .flatten();
+        let target_detached = if target != ViewerPresentation::DetachedWindow {
+            DetachedTargetLease::None
+        } else if same_detached_lease {
+            DetachedTargetLease::KeepLive(target_detached.unwrap())
+        } else {
+            target_detached
+                .map(DetachedTargetLease::Candidate)
+                .unwrap_or(DetachedTargetLease::None)
+        };
         let (state, effects) = reduce_presentation_request(
             self.state,
             PresentationRequest {
@@ -326,13 +410,9 @@ impl PresentationTransitionOwner {
                 activate,
                 announce_main_hint,
                 outgoing_presenter_hwnd,
-                detached_host: DetachedHostDisposition::for_transition(
-                    current,
-                    target,
-                    current_detached_host_hwnd,
-                ),
+                outgoing_detached,
+                target_detached,
             },
-            ready_host_hwnd,
         );
         self.state = state;
         self.effects.extend(effects);
@@ -363,14 +443,68 @@ fn request_from_state(state: PresentationTransitionState) -> Option<Presentation
     }
 }
 
-fn initial_progress(request: PresentationRequest, ready_host_hwnd: u64) -> PreparingProgress {
-    if matches!(request.target, ViewerPresentation::DetachedWindow) && ready_host_hwnd == 0 {
-        PreparingProgress::AwaitingHost
-    } else {
-        PreparingProgress::ReadyToPrepare {
-            host_hwnd: ready_host_hwnd,
-        }
+fn initial_progress(request: PresentationRequest) -> PreparingProgress {
+    match request.target_session() {
+        Some(lease) => match request.target_host() {
+            Some(host) => PreparingProgress::ReadyToPrepare { host: Some(host) },
+            None => PreparingProgress::AwaitingHost { lease },
+        },
+        None => PreparingProgress::ReadyToPrepare { host: None },
     }
+}
+
+fn request_already_has_current_target(request: PresentationRequest) -> bool {
+    request.target == request.current
+        && (request.target != ViewerPresentation::DetachedWindow
+            || matches!(request.target_detached, DetachedTargetLease::KeepLive(_)))
+}
+
+fn pending_successor_session_is_protected(
+    session: DetachedSessionLease,
+    protected_requests: &[PresentationRequest],
+) -> bool {
+    protected_requests.iter().any(|request| {
+        request.target_session() == Some(session)
+            || request
+                .outgoing_detached
+                .is_some_and(|lease| lease.session == session)
+    })
+}
+
+/// Replace a successor that has not crossed the native boundary yet.
+///
+/// Its outgoing lease still belongs to the published presentation and must not be closed here.
+/// A distinct candidate viewport, however, is owned only by the discarded successor. Leases also
+/// named by the in-flight abort/retire request stay with that request until its terminal event.
+fn replace_pending_successor(
+    discarded: PresentationRequest,
+    mut replacement: PresentationRequest,
+    protected_requests: &[PresentationRequest],
+    effects: &mut Vec<PresentationTransitionEffect>,
+) -> PresentationRequest {
+    match discarded.target_detached {
+        DetachedTargetLease::Transferred(lease)
+            if replacement.target_session() == Some(lease.session) =>
+        {
+            replacement = replacement.transfer_target(lease);
+        }
+        DetachedTargetLease::Transferred(lease)
+            if !pending_successor_session_is_protected(lease.session, protected_requests) =>
+        {
+            push_detached_release(discarded.id, discarded.target, lease, effects);
+        }
+        DetachedTargetLease::Candidate(lease)
+            if replacement.target_session() != Some(lease.session)
+                && !pending_successor_session_is_protected(lease.session, protected_requests) =>
+        {
+            push_detached_destroy(discarded.id, discarded.target, lease, effects);
+        }
+        DetachedTargetLease::None
+        | DetachedTargetLease::Candidate(_)
+        | DetachedTargetLease::KeepLive(_)
+        | DetachedTargetLease::Transferred(_) => {}
+    }
+    replacement
 }
 
 fn candidate_hwnd(state: PresentationTransitionState) -> u64 {
@@ -385,20 +519,6 @@ fn candidate_hwnd(state: PresentationTransitionState) -> u64 {
                 },
             ..
         } => aborted_candidate_hwnd,
-        _ => 0,
-    }
-}
-
-fn transition_host_hwnd(state: PresentationTransitionState) -> u64 {
-    match state {
-        PresentationTransitionState::Preparing {
-            progress:
-                PreparingProgress::ReadyToPrepare { host_hwnd }
-                | PreparingProgress::AwaitingNative { host_hwnd },
-            ..
-        } => host_hwnd,
-        PresentationTransitionState::Ready { candidate, .. }
-        | PresentationTransitionState::Committing { candidate, .. } => candidate.host_hwnd,
         _ => 0,
     }
 }
@@ -424,7 +544,6 @@ fn native_prepare_was_issued(state: PresentationTransitionState) -> bool {
 fn reduce_replaced_request(
     state: PresentationTransitionState,
     request: PresentationRequest,
-    ready_host_hwnd: u64,
     mut effects: Vec<PresentationTransitionEffect>,
 ) -> (
     PresentationTransitionState,
@@ -445,7 +564,6 @@ fn reduce_replaced_request(
                 progress: PreparingProgress::RetiringCommitted {
                     retiring,
                     retiring_generation: candidate.native_generation,
-                    next_host_hwnd: ready_host_hwnd,
                 },
             },
             effects,
@@ -453,6 +571,7 @@ fn reduce_replaced_request(
     }
     // 更に置換されても、native が走らせている retire には触らない。後継だけ差し替える。
     if let PresentationTransitionState::Preparing {
+        request: discarded,
         progress:
             PreparingProgress::RetiringCommitted {
                 retiring,
@@ -462,13 +581,13 @@ fn reduce_replaced_request(
         ..
     } = state
     {
+        let request = replace_pending_successor(discarded, request, &[retiring], &mut effects);
         return (
             PresentationTransitionState::Preparing {
                 request,
                 progress: PreparingProgress::RetiringCommitted {
                     retiring,
                     retiring_generation,
-                    next_host_hwnd: ready_host_hwnd,
                 },
             },
             effects,
@@ -478,36 +597,28 @@ fn reduce_replaced_request(
     // ここに居る後継ではない。差し替えてよいのは後継だけで、in-flight な abort の
     // identity には触らない。二重の `AbortNative` も出さない (R-01)。
     if let PresentationTransitionState::Preparing {
+        request: discarded,
         progress:
             PreparingProgress::Aborting {
-                aborted_request_id,
-                aborted_target,
+                aborted,
                 aborted_candidate_hwnd,
-                aborted_candidate_host_hwnd,
-                ..
             },
         ..
     } = state
     {
+        let request = replace_pending_successor(discarded, request, &[aborted], &mut effects);
         return (
             PresentationTransitionState::Preparing {
                 request,
                 progress: PreparingProgress::Aborting {
-                    aborted_request_id,
-                    aborted_target,
+                    aborted,
                     aborted_candidate_hwnd,
-                    aborted_candidate_host_hwnd,
-                    next_host_hwnd: ready_host_hwnd,
                 },
             },
             effects,
         );
     }
     let old_request = request_from_state(state).unwrap();
-    let aborted_candidate_host_hwnd = (old_request.current != ViewerPresentation::DetachedWindow
-        && old_request.target == ViewerPresentation::DetachedWindow)
-        .then(|| transition_host_hwnd(state))
-        .unwrap_or(0);
     if native_prepare_was_issued(state) {
         let aborted_candidate_hwnd = candidate_hwnd(state);
         effects.push(PresentationTransitionEffect::AbortNative {
@@ -518,43 +629,40 @@ fn reduce_replaced_request(
             PresentationTransitionState::Preparing {
                 request,
                 progress: PreparingProgress::Aborting {
-                    aborted_request_id: old_request.id,
-                    aborted_target: old_request.target,
+                    aborted: old_request,
                     aborted_candidate_hwnd,
-                    aborted_candidate_host_hwnd,
-                    next_host_hwnd: ready_host_hwnd,
                 },
             },
             effects,
         );
     }
-    reduce_unprepared_replacement(
-        old_request,
-        request,
-        aborted_candidate_host_hwnd,
-        ready_host_hwnd,
-        effects,
-    )
+    finish_replaced_then_start(old_request, request, false, effects)
 }
 
-fn reduce_unprepared_replacement(
+fn finish_replaced_then_start(
     old_request: PresentationRequest,
-    request: PresentationRequest,
-    aborted_candidate_host_hwnd: u64,
-    ready_host_hwnd: u64,
+    mut request: PresentationRequest,
+    crossed_native_boundary: bool,
     mut effects: Vec<PresentationTransitionEffect>,
 ) -> (
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
-    if aborted_candidate_host_hwnd != 0 && request.target != ViewerPresentation::DetachedWindow {
-        effects.push(PresentationTransitionEffect::DestroyHost {
-            request_id: old_request.id,
-            target: old_request.target,
-            hwnd: aborted_candidate_host_hwnd,
-        });
+    match old_request.target_detached {
+        DetachedTargetLease::Transferred(old) if request.target_session() == Some(old.session) => {
+            request = request.transfer_target(old);
+        }
+        DetachedTargetLease::Transferred(old) => {
+            push_detached_release(old_request.id, old_request.target, old, &mut effects);
+        }
+        DetachedTargetLease::Candidate(old) if request.target_session() != Some(old.session) => {
+            push_detached_destroy(old_request.id, old_request.target, old, &mut effects);
+        }
+        DetachedTargetLease::None
+        | DetachedTargetLease::Candidate(_)
+        | DetachedTargetLease::KeepLive(_) => {}
     }
-    if request.target == request.current {
+    if request_already_has_current_target(request) {
         effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
         (
             PresentationTransitionState::Stable {
@@ -565,8 +673,16 @@ fn reduce_unprepared_replacement(
     } else {
         (
             PresentationTransitionState::Preparing {
-                request,
-                progress: initial_progress(request, ready_host_hwnd),
+                request: if crossed_native_boundary {
+                    request.with_target_host(None)
+                } else {
+                    request
+                },
+                progress: if crossed_native_boundary {
+                    initial_progress(request.with_target_host(None))
+                } else {
+                    initial_progress(request)
+                },
             },
             effects,
         )
@@ -585,15 +701,15 @@ fn reduce_presentation_transition(
         (
             PresentationTransitionState::Preparing {
                 request,
-                progress: PreparingProgress::ReadyToPrepare { host_hwnd },
+                progress: PreparingProgress::ReadyToPrepare { host },
             },
             PresentationTransitionEvent::Drive,
         ) => {
-            effects.push(PresentationTransitionEffect::PrepareNative { request, host_hwnd });
+            effects.push(PresentationTransitionEffect::PrepareNative { request, host });
             (
                 PresentationTransitionState::Preparing {
                     request,
-                    progress: PreparingProgress::AwaitingNative { host_hwnd },
+                    progress: PreparingProgress::AwaitingNative { host },
                 },
                 effects,
             )
@@ -614,21 +730,40 @@ fn reduce_presentation_transition(
         }
         (
             PresentationTransitionState::Preparing {
-                request,
-                progress: PreparingProgress::AwaitingHost,
+                mut request,
+                progress: PreparingProgress::AwaitingHost { lease },
             },
-            PresentationTransitionEvent::HostReady { request_id, hwnd },
-        ) if request.id == request_id && hwnd != 0 => (
-            PresentationTransitionState::Preparing {
-                request,
-                progress: PreparingProgress::ReadyToPrepare { host_hwnd: hwnd },
-            },
-            effects,
-        ),
+            PresentationTransitionEvent::HostReady { request_id, claim },
+        ) if request.id == request_id && claim.lease == lease && claim.hwnd != 0 => {
+            request = request.with_target_host(Some(claim));
+            (
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::ReadyToPrepare { host: Some(claim) },
+                },
+                effects,
+            )
+        }
         (
             PresentationTransitionState::Preparing {
                 request,
-                progress: PreparingProgress::AwaitingNative { host_hwnd },
+                progress: PreparingProgress::AwaitingNative { host: Some(host) },
+            },
+            PresentationTransitionEvent::HostUnavailable { request_id, claim },
+        ) if request.id == request_id && claim == host => {
+            let request = request.with_target_host(None);
+            (
+                PresentationTransitionState::Preparing {
+                    request,
+                    progress: PreparingProgress::AwaitingHost { lease: host.lease },
+                },
+                effects,
+            )
+        }
+        (
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::AwaitingNative { host },
             },
             PresentationTransitionEvent::NativeReady {
                 request_id,
@@ -636,7 +771,7 @@ fn reduce_presentation_transition(
             },
         ) if request.id == request_id
             && (request.target != ViewerPresentation::DetachedWindow
-                || candidate.host_hwnd == host_hwnd) =>
+                || host.is_some_and(|claim| candidate.host_hwnd == claim.hwnd)) =>
         {
             (
                 PresentationTransitionState::Ready { request, candidate },
@@ -692,8 +827,75 @@ fn reduce_late_transition(
             // the effect order while making their completion independent.
             finish_or_retire(request, candidate, effects)
         }
+        (
+            PresentationTransitionState::Committing {
+                request,
+                progress: CommittingProgress::AwaitingRetire,
+                ..
+            },
+            PresentationTransitionEvent::NativeFailed { request_id },
+        ) if request.id == request_id => {
+            if let Some(outgoing) = request.outgoing_detached {
+                push_detached_release(request.id, request.target, outgoing, &mut effects);
+            }
+            effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
+            (
+                PresentationTransitionState::Stable {
+                    current: request.target,
+                },
+                effects,
+            )
+        }
         pair => reduce_completion_transition(pair.0, pair.1, effects),
     }
+}
+
+fn push_detached_destroy(
+    request_id: u64,
+    target: ViewerPresentation,
+    lease: DetachedHostLease,
+    effects: &mut Vec<PresentationTransitionEffect>,
+) {
+    if effects.iter().any(|effect| {
+        matches!(
+            effect,
+            PresentationTransitionEffect::DestroyHost {
+                lease: existing,
+                ..
+            } if *existing == lease.session
+        )
+    }) {
+        return;
+    }
+    effects.push(PresentationTransitionEffect::DestroyHost {
+        request_id,
+        target,
+        lease: lease.session,
+        hwnd: lease.hwnd(),
+    });
+}
+
+fn push_detached_release(
+    request_id: u64,
+    target: ViewerPresentation,
+    lease: DetachedHostLease,
+    effects: &mut Vec<PresentationTransitionEffect>,
+) {
+    if !effects.iter().any(|effect| {
+        matches!(
+            effect,
+            PresentationTransitionEffect::CloseDetachedSession {
+                lease: existing,
+                ..
+            } if *existing == lease.session
+        )
+    }) {
+        effects.push(PresentationTransitionEffect::CloseDetachedSession {
+            request_id,
+            lease: lease.session,
+        });
+    }
+    push_detached_destroy(request_id, target, lease, effects);
 }
 
 fn reduce_completion_transition(
@@ -716,15 +918,8 @@ fn reduce_completion_transition(
                 candidate_generation,
             },
         ) if request.id == request_id && candidate.native_generation == candidate_generation => {
-            if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
-                effects.push(PresentationTransitionEffect::CloseDetachedSession {
-                    request_id: request.id,
-                });
-                effects.push(PresentationTransitionEffect::DestroyHost {
-                    request_id: request.id,
-                    target: request.target,
-                    hwnd,
-                });
+            if let Some(outgoing) = request.outgoing_detached {
+                push_detached_release(request.id, request.target, outgoing, &mut effects);
             }
             effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
             (
@@ -741,7 +936,6 @@ fn reduce_completion_transition(
                     PreparingProgress::RetiringCommitted {
                         retiring,
                         retiring_generation,
-                        next_host_hwnd,
                     },
             },
             PresentationTransitionEvent::NativeRetired {
@@ -749,24 +943,17 @@ fn reduce_completion_transition(
                 candidate_generation,
             },
         ) if retiring.id == request_id && retiring_generation == candidate_generation => {
-            finish_retired_then_start(retiring, request, next_host_hwnd, effects)
+            finish_retired_then_start(retiring, request, effects)
         }
         // retire が失敗で終わっても、commit 済みの表示が残らないことに変わりはない。
         // ここで拾わないと後継が永久に始まらない (`Aborting` の同型)。
         (
             PresentationTransitionState::Preparing {
                 request,
-                progress:
-                    PreparingProgress::RetiringCommitted {
-                        retiring,
-                        next_host_hwnd,
-                        ..
-                    },
+                progress: PreparingProgress::RetiringCommitted { retiring, .. },
             },
             PresentationTransitionEvent::NativeFailed { request_id },
-        ) if retiring.id == request_id => {
-            finish_retired_then_start(retiring, request, next_host_hwnd, effects)
-        }
+        ) if retiring.id == request_id => finish_retired_then_start(retiring, request, effects),
         pair => reduce_abort_transition(pair.0, pair.1, effects),
     }
 }
@@ -777,24 +964,20 @@ fn reduce_completion_transition(
 /// 後継へ進むこと。
 fn finish_retired_then_start(
     retiring: PresentationRequest,
-    successor: PresentationRequest,
-    next_host_hwnd: u64,
+    mut successor: PresentationRequest,
     mut effects: Vec<PresentationTransitionEffect>,
 ) -> (
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
-    if let DetachedHostDisposition::RetireOutgoing { hwnd } = retiring.detached_host {
-        effects.push(PresentationTransitionEffect::CloseDetachedSession {
-            request_id: retiring.id,
-        });
-        effects.push(PresentationTransitionEffect::DestroyHost {
-            request_id: retiring.id,
-            target: retiring.target,
-            hwnd,
-        });
+    if let Some(outgoing) = retiring.outgoing_detached {
+        if successor.target_session() == Some(outgoing.session) {
+            successor = successor.transfer_target(outgoing);
+        } else {
+            push_detached_release(retiring.id, retiring.target, outgoing, &mut effects);
+        }
     }
-    if successor.target == successor.current {
+    if request_already_has_current_target(successor) {
         effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
         return (
             PresentationTransitionState::Stable {
@@ -805,8 +988,8 @@ fn finish_retired_then_start(
     }
     (
         PresentationTransitionState::Preparing {
-            request: successor,
-            progress: initial_progress(successor, next_host_hwnd),
+            request: successor.with_target_host(None),
+            progress: initial_progress(successor.with_target_host(None)),
         },
         effects,
     )
@@ -831,15 +1014,8 @@ fn finish_or_retire(
             effects,
         )
     } else {
-        if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
-            effects.push(PresentationTransitionEffect::CloseDetachedSession {
-                request_id: request.id,
-            });
-            effects.push(PresentationTransitionEffect::DestroyHost {
-                request_id: request.id,
-                target: request.target,
-                hwnd,
-            });
+        if let Some(outgoing) = request.outgoing_detached {
+            push_detached_release(request.id, request.target, outgoing, &mut effects);
         }
         effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
         (
@@ -863,14 +1039,7 @@ fn reduce_abort_transition(
         (
             PresentationTransitionState::Preparing {
                 request,
-                progress:
-                    PreparingProgress::Aborting {
-                        aborted_request_id,
-                        aborted_target,
-                        aborted_candidate_host_hwnd,
-                        next_host_hwnd,
-                        ..
-                    },
+                progress: PreparingProgress::Aborting { aborted, .. },
             },
             // native が abort を「失敗」で終えた場合も、その request が終わったこと
             // に変わりはない。ここで拾わないと、下の汎用 `NativeFailed` 分岐が後継の
@@ -878,46 +1047,21 @@ fn reduce_abort_transition(
             // Codex の Q5 指摘で発覚)。
             PresentationTransitionEvent::NativeAborted { request_id }
             | PresentationTransitionEvent::NativeFailed { request_id },
-        ) if aborted_request_id == request_id => {
-            if aborted_candidate_host_hwnd != 0
-                && request.target != ViewerPresentation::DetachedWindow
-            {
-                effects.push(PresentationTransitionEffect::DestroyHost {
-                    request_id,
-                    target: aborted_target,
-                    hwnd: aborted_candidate_host_hwnd,
-                });
-            }
-            if request.target == request.current {
-                effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
-                (
-                    PresentationTransitionState::Stable {
-                        current: request.current,
-                    },
-                    effects,
-                )
-            } else {
-                (
-                    PresentationTransitionState::Preparing {
-                        request,
-                        progress: initial_progress(request, next_host_hwnd),
-                    },
-                    effects,
-                )
-            }
+        ) if aborted.id == request_id => {
+            finish_replaced_then_start(aborted, request, true, effects)
         }
         (active_state, PresentationTransitionEvent::NativeFailed { request_id })
             if request_from_state(active_state).is_some_and(|request| request.id == request_id) =>
         {
             let request = request_from_state(active_state).unwrap();
-            if request.current != ViewerPresentation::DetachedWindow
-                && request.target == ViewerPresentation::DetachedWindow
-            {
-                effects.push(PresentationTransitionEffect::DestroyHost {
-                    request_id,
-                    target: request.target,
-                    hwnd: transition_host_hwnd(active_state),
-                });
+            match request.target_detached {
+                DetachedTargetLease::Candidate(lease) => {
+                    push_detached_destroy(request_id, request.target, lease, &mut effects);
+                }
+                DetachedTargetLease::Transferred(lease) => {
+                    push_detached_release(request_id, request.target, lease, &mut effects);
+                }
+                DetachedTargetLease::None | DetachedTargetLease::KeepLive(_) => {}
             }
             effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
             (
@@ -939,119 +1083,95 @@ fn terminal_close(
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
 ) {
-    // commit 済みで retire を待っている間に閉じた場合。retire は既に走っているので
-    // abort は出さない — 出すと同じ request へ `[Retire, Abort]` を作る。画面は publish
-    // 済みの target へ移っているので、退場側ではなくそこで安定させる。退場側の session と
-    // host は `NativeRetired` の受理で畳むはずだったが、terminal close はそこへ到達しない。
-    //
-    // 置換を挟んだ場合は `RetiringCommitted` が同じことをする。**直接ここへ来る経路が
-    // 抜けていた** (2026-08-29 レビュー、Codex Q5)。
-    if let PresentationTransitionState::Committing {
-        request,
-        progress: CommittingProgress::AwaitingRetire,
-        ..
-    } = state
-    {
-        if let DetachedHostDisposition::RetireOutgoing { hwnd } = request.detached_host {
-            effects.push(PresentationTransitionEffect::CloseDetachedSession {
-                request_id: request.id,
-            });
-            effects.push(PresentationTransitionEffect::DestroyHost {
-                request_id: request.id,
-                target: request.target,
-                hwnd,
-            });
-        }
-        effects.push(PresentationTransitionEffect::TerminalSessionClose {
-            request_id: request.id,
-            target: request.target,
-        });
-        effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
-        return (
-            PresentationTransitionState::Stable {
-                current: request.target,
-            },
-            effects,
-        );
-    }
     let request = request_from_state(state);
     let request_id = request.map_or(0, |request| request.id);
-    if native_prepare_was_issued(state) {
+    let retiring_is_running = matches!(
+        state,
+        PresentationTransitionState::Committing {
+            progress: CommittingProgress::AwaitingRetire,
+            ..
+        } | PresentationTransitionState::Preparing {
+            progress: PreparingProgress::RetiringCommitted { .. },
+            ..
+        }
+    );
+    if native_prepare_was_issued(state) && !retiring_is_running {
         effects.push(PresentationTransitionEffect::AbortNative {
             request_id,
             candidate_hwnd: candidate_hwnd(state),
         });
     }
-    // `Aborting` では abort が既に飛んでいるので二度は出さない。ここで出すと
-    // `request_id` は後継 (native が知らない) なのに `candidate_hwnd` は中止した側、
-    // という食い違った command になる (R-01 と同じ取り違え)。
-    // 通常なら中止した側の host は `NativeAborted` の受理で壊すが、terminal close は
-    // そこへ到達しないため、作りかけの host をここで畳む。
-    if let PresentationTransitionState::Preparing {
-        progress:
-            PreparingProgress::Aborting {
-                aborted_request_id,
-                aborted_target,
-                aborted_candidate_host_hwnd,
-                ..
-            },
-        ..
-    } = state
-        && aborted_candidate_host_hwnd != 0
-    {
-        effects.push(PresentationTransitionEffect::DestroyHost {
-            request_id: aborted_request_id,
-            target: aborted_target,
-            hwnd: aborted_candidate_host_hwnd,
-        });
+    match state {
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::Aborting { aborted, .. },
+        } => {
+            push_terminal_request_cleanup(aborted, false, &mut effects);
+            push_terminal_request_cleanup(request, false, &mut effects);
+        }
+        PresentationTransitionState::Preparing {
+            request,
+            progress: PreparingProgress::RetiringCommitted { retiring, .. },
+        } => {
+            push_terminal_request_cleanup(retiring, true, &mut effects);
+            push_terminal_request_cleanup(request, false, &mut effects);
+        }
+        PresentationTransitionState::Committing {
+            request,
+            progress: CommittingProgress::AwaitingRetire,
+            ..
+        } => push_terminal_request_cleanup(request, true, &mut effects),
+        PresentationTransitionState::Preparing { request, .. }
+        | PresentationTransitionState::Ready { request, .. }
+        | PresentationTransitionState::Committing { request, .. } => {
+            push_terminal_request_cleanup(request, false, &mut effects);
+        }
+        PresentationTransitionState::Stable { .. } => {}
     }
-    // retire を待っている間に閉じた場合も同じ。abort は出さない (retire が走っている)。
-    // 退場側の session と host は `NativeRetired` の受理で畳むはずだったので、ここで畳む。
-    if let PresentationTransitionState::Preparing {
-        progress: PreparingProgress::RetiringCommitted { retiring, .. },
-        ..
-    } = state
-        && let DetachedHostDisposition::RetireOutgoing { hwnd } = retiring.detached_host
-    {
-        effects.push(PresentationTransitionEffect::CloseDetachedSession {
-            request_id: retiring.id,
-        });
-        effects.push(PresentationTransitionEffect::DestroyHost {
-            request_id: retiring.id,
-            target: retiring.target,
-            hwnd,
-        });
-    }
-    let current = request.map_or_else(
-        || match state {
-            PresentationTransitionState::Stable { current } => current,
-            _ => unreachable!(),
-        },
-        |request| request.current,
-    );
-    let target = request.map_or(current, |request| request.target);
-    let detached_host_hwnd = if current == ViewerPresentation::DetachedWindow {
-        request.map_or(0, |request| request.detached_host.current_hwnd())
-    } else {
-        transition_host_hwnd(state)
+    let current = match state {
+        PresentationTransitionState::Stable { current } => current,
+        PresentationTransitionState::Committing {
+            request,
+            progress: CommittingProgress::AwaitingRetire,
+            ..
+        } => request.target,
+        PresentationTransitionState::Preparing {
+            progress: PreparingProgress::RetiringCommitted { retiring, .. },
+            ..
+        } => retiring.target,
+        _ => request.unwrap().current,
     };
-    if current == ViewerPresentation::DetachedWindow || target == ViewerPresentation::DetachedWindow
-    {
-        effects.push(PresentationTransitionEffect::DestroyHost {
-            request_id,
-            target,
-            hwnd: detached_host_hwnd,
-        });
-    }
+    let target = request.map_or(current, |request| request.target);
     effects.push(PresentationTransitionEffect::TerminalSessionClose { request_id, target });
     effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
     (PresentationTransitionState::Stable { current }, effects)
 }
 
+fn push_terminal_request_cleanup(
+    request: PresentationRequest,
+    target_committed: bool,
+    effects: &mut Vec<PresentationTransitionEffect>,
+) {
+    if let Some(outgoing) = request.outgoing_detached {
+        push_detached_release(request.id, request.target, outgoing, effects);
+    }
+    match request.target_detached {
+        DetachedTargetLease::None => {}
+        DetachedTargetLease::Candidate(lease) if target_committed => {
+            push_detached_release(request.id, request.target, lease, effects);
+        }
+        DetachedTargetLease::Candidate(lease) => {
+            push_detached_destroy(request.id, request.target, lease, effects);
+        }
+        DetachedTargetLease::KeepLive(lease) | DetachedTargetLease::Transferred(lease) => {
+            push_detached_release(request.id, request.target, lease, effects);
+        }
+    }
+}
+
 fn reduce_presentation_request(
     state: PresentationTransitionState,
     request: PresentationRequest,
-    ready_host_hwnd: u64,
 ) -> (
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
@@ -1062,12 +1182,12 @@ fn reduce_presentation_request(
         return (
             PresentationTransitionState::Preparing {
                 request,
-                progress: initial_progress(request, ready_host_hwnd),
+                progress: initial_progress(request),
             },
             effects,
         );
     }
-    reduce_replaced_request(state, request, ready_host_hwnd, effects)
+    reduce_replaced_request(state, request, effects)
 }
 
 #[cfg(test)]
@@ -1075,8 +1195,10 @@ mod tests {
     use super::*;
 
     const OUTGOING_PRESENTER: u64 = 0x101;
+    const OUTGOING_WINDOW: u64 = 0x201;
     const OUTGOING_HOST: u64 = 0x202;
     const CANDIDATE_PRESENTER: u64 = 0x303;
+    const CANDIDATE_WINDOW: u64 = 0x403;
     const CANDIDATE_HOST: u64 = 0x404;
     const MAIN_HOST: u64 = 0x505;
     const GENERATION: u64 = 7;
@@ -1086,14 +1208,47 @@ mod tests {
         target: ViewerPresentation,
         ready_host: u64,
     ) -> u64 {
+        let current = owner.current();
+        let current_detached = (current == ViewerPresentation::DetachedWindow)
+            .then(|| host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1));
+        let target_detached = (target == ViewerPresentation::DetachedWindow).then(|| {
+            if ready_host == OUTGOING_HOST {
+                host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1)
+            } else {
+                DetachedHostLease {
+                    session: DetachedSessionLease {
+                        window_id: CANDIDATE_WINDOW,
+                    },
+                    host: (ready_host != 0).then_some(DetachedHostClaim {
+                        lease: DetachedSessionLease {
+                            window_id: CANDIDATE_WINDOW,
+                        },
+                        incarnation: 1,
+                        hwnd: ready_host,
+                    }),
+                }
+            }
+        });
         owner.request_transition(
             target,
             true,
             false,
             OUTGOING_PRESENTER,
-            OUTGOING_HOST,
-            ready_host,
+            current_detached,
+            target_detached,
         )
+    }
+
+    fn host_lease(window_id: u64, hwnd: u64, incarnation: u64) -> DetachedHostLease {
+        let session = DetachedSessionLease { window_id };
+        DetachedHostLease {
+            session,
+            host: Some(DetachedHostClaim {
+                lease: session,
+                incarnation,
+                hwnd,
+            }),
+        }
     }
 
     fn candidate(host_hwnd: u64) -> PresentationCandidate {
@@ -1139,6 +1294,108 @@ mod tests {
             owner.take_effects().as_slice(),
             [PresentationTransitionEffect::PublishNative { .. }]
         ));
+    }
+
+    fn explicit_request(
+        owner: &mut PresentationTransitionOwner,
+        target: ViewerPresentation,
+        current_detached: Option<DetachedHostLease>,
+        target_detached: Option<DetachedHostLease>,
+    ) -> u64 {
+        owner.request_transition(
+            target,
+            true,
+            false,
+            OUTGOING_PRESENTER,
+            current_detached,
+            target_detached,
+        )
+    }
+
+    fn begin_transferred_successor(owner: &mut PresentationTransitionOwner) -> u64 {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let retiring_id = explicit_request(owner, ViewerPresentation::Fullscreen, Some(old), None);
+        drive_to_native_wait(owner);
+        drive_to_committing(owner, retiring_id, 0);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: retiring_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+
+        let successor_id =
+            explicit_request(owner, ViewerPresentation::DetachedWindow, None, Some(old));
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0),
+            "requesting an alias successor must not release the retiring lease early"
+        );
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: retiring_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::CloseDetachedSession { .. }
+                | PresentationTransitionEffect::DestroyHost { .. }
+        )));
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::AwaitingHost { lease },
+            } if request.id == successor_id && lease == old.session
+        ));
+        successor_id
+    }
+
+    fn reacquire_transferred_host(
+        owner: &mut PresentationTransitionOwner,
+        request_id: u64,
+    ) -> DetachedHostClaim {
+        let claim = host_lease(OUTGOING_WINDOW, CANDIDATE_HOST, 2).host.unwrap();
+        owner.dispatch(PresentationTransitionEvent::HostReady { request_id, claim });
+        owner.drive();
+        assert!(matches!(
+            owner.take_effects().as_slice(),
+            [PresentationTransitionEffect::PrepareNative {
+                host: Some(prepared),
+                ..
+            }] if *prepared == claim
+        ));
+        claim
+    }
+
+    fn detached_cleanup_counts(
+        effects: &[PresentationTransitionEffect],
+        lease: DetachedSessionLease,
+    ) -> (usize, usize) {
+        let closes = effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    PresentationTransitionEffect::CloseDetachedSession {
+                        lease: closed,
+                        ..
+                    } if *closed == lease
+                )
+            })
+            .count();
+        let destroys = effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    PresentationTransitionEffect::DestroyHost {
+                        lease: destroyed,
+                        ..
+                    } if *destroyed == lease
+                )
+            })
+            .count();
+        (closes, destroys)
     }
 
     #[test]
@@ -1490,7 +1747,7 @@ mod tests {
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
-                PresentationTransitionEffect::CloseDetachedSession { request_id }
+                PresentationTransitionEffect::CloseDetachedSession { request_id, .. }
                     if *request_id == committed_id
             )),
             "退場側の session が閉じられていない: {effects:?}"
@@ -1575,7 +1832,7 @@ mod tests {
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
-                PresentationTransitionEffect::CloseDetachedSession { request_id }
+                PresentationTransitionEffect::CloseDetachedSession { request_id, .. }
                     if *request_id == committed_id
             )),
             "退場側の session が閉じられていない: {effects:?}"
@@ -1591,21 +1848,13 @@ mod tests {
         );
     }
 
-    /// 退場する別ウィンドウへ戻す要求は、**その窓を再利用先にしない**。
+    /// 退場中の host lease を要求した後継へ移譲し、retire 後に host claim を再検証する。
     ///
     /// `Detached(H) -> Fullscreen` の retire を待っている間に `Detached` を要求すると、
-    /// まだ生きている `H` が後継の ready host として渡ってくる (`native_video.rs` の
-    /// `ready_host_hwnd` は現在の detached host をそのまま読む)。retire 完了時に同じ
-    /// batch が `H` を `DestroyHost` する以上、後継の準備先に `H` を選ぶと、破棄した窓を
-    /// 相手に prepare することになる。
-    ///
-    /// **現在このテストは落ちる。** v3.3.0 の再レビューで見つかった R-27 の再現であり、
-    /// 修正はまだ入っていない。ここで期待している `AwaitingHost` が正しい着地かどうかは
-    /// host の所有権を移譲するのか作り直すのかの決着待ちで、detached リワークの凍結
-    /// ルール (CLAUDE.md) に従って構造的修正として合意を取ってから直す。
-    /// 直したら `#[ignore]` を外すこと。backlog §1.0d。
+    /// まだ生きている `H` が要求時の target claim として渡ってくる。retire 完了時に
+    /// 同じ lease なら old session/viewport は successor が所有するため Close/Destroy を出さない。
+    /// request 時点の raw H は durable ではないので捨て、`AwaitingHost` から現在の claim を取る。
     #[test]
-    #[ignore = "R-27 の再現。修正が入ったら ignore を外す (backlog §1.0d)"]
     fn a_successor_does_not_reuse_the_host_the_same_batch_destroys() {
         let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
         let committed_id = request(&mut owner, ViewerPresentation::Fullscreen, 0);
@@ -1623,29 +1872,36 @@ mod tests {
             ViewerPresentation::DetachedWindow,
             OUTGOING_HOST,
         );
-        owner.take_effects();
+        assert_eq!(
+            detached_cleanup_counts(
+                &owner.take_effects(),
+                DetachedSessionLease {
+                    window_id: OUTGOING_WINDOW,
+                },
+            ),
+            (0, 0),
+            "requesting an alias successor must not release the retiring lease early"
+        );
 
         owner.dispatch(PresentationTransitionEvent::NativeRetired {
             request_id: committed_id,
             candidate_generation: GENERATION,
         });
         let effects = owner.take_effects();
-        let destroyed: Vec<u64> = effects
-            .iter()
-            .filter_map(|effect| match effect {
-                PresentationTransitionEffect::DestroyHost { hwnd, .. } => Some(*hwnd),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(destroyed, vec![OUTGOING_HOST]);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::CloseDetachedSession { .. }
+                | PresentationTransitionEffect::DestroyHost { .. }
+        )));
 
         assert!(
             matches!(
                 owner.state(),
                 PresentationTransitionState::Preparing {
                     request,
-                    progress: PreparingProgress::AwaitingHost,
+                    progress: PreparingProgress::AwaitingHost { lease },
                 } if request.id == successor_id
+                    && lease == DetachedSessionLease { window_id: OUTGOING_WINDOW }
             ),
             "破棄した窓を準備先にしている: {:?}",
             owner.state()
@@ -1653,11 +1909,42 @@ mod tests {
         assert!(
             !effects.iter().any(|effect| matches!(
                 effect,
-                PresentationTransitionEffect::PrepareNative { host_hwnd, .. }
-                    if *host_hwnd == OUTGOING_HOST
+                PresentationTransitionEffect::PrepareNative {
+                    host: Some(host),
+                    ..
+                } if host.hwnd == OUTGOING_HOST
             )),
             "破棄した窓へ prepare を出している: {effects:?}"
         );
+
+        let wrong = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 2)
+            .host
+            .unwrap();
+        owner.dispatch(PresentationTransitionEvent::HostReady {
+            request_id: successor_id,
+            claim: wrong,
+        });
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::AwaitingHost { lease },
+                ..
+            } if lease.window_id == OUTGOING_WINDOW
+        ));
+
+        let reacquired = host_lease(OUTGOING_WINDOW, CANDIDATE_HOST, 2).host.unwrap();
+        owner.dispatch(PresentationTransitionEvent::HostReady {
+            request_id: successor_id,
+            claim: reacquired,
+        });
+        owner.drive();
+        assert!(matches!(
+            owner.take_effects().as_slice(),
+            [PresentationTransitionEffect::PrepareNative {
+                host: Some(host),
+                ..
+            }] if *host == reacquired
+        ));
     }
 
     /// commit 後に要求した後継は、退場側ではなく publish 済みの表示を起点にする。
@@ -1682,10 +1969,12 @@ mod tests {
         owner.take_effects();
 
         // publish 済みの表示と同じ target を要求する。
-        request(
+        let published = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 1);
+        explicit_request(
             &mut owner,
             ViewerPresentation::DetachedWindow,
-            CANDIDATE_HOST,
+            Some(published),
+            Some(published),
         );
         owner.take_effects();
         owner.dispatch(PresentationTransitionEvent::NativeRetired {
@@ -1722,7 +2011,7 @@ mod tests {
         drive_to_native_wait(&mut owner);
 
         // 2 回目: ここで初めて abort が飛ぶ。
-        let second_id = request(&mut owner, ViewerPresentation::MainWindow, MAIN_HOST);
+        let _second_id = request(&mut owner, ViewerPresentation::MainWindow, MAIN_HOST);
         let effects = owner.take_effects();
         assert!(
             effects.iter().any(|effect| matches!(
@@ -1754,11 +2043,8 @@ mod tests {
                 owner.state(),
                 PresentationTransitionState::Preparing {
                     request,
-                    progress: PreparingProgress::Aborting {
-                        aborted_request_id,
-                        ..
-                    },
-                } if aborted_request_id == issued_id && request.id == fourth_id
+                    progress: PreparingProgress::Aborting { aborted, .. },
+                } if aborted.id == issued_id && request.id == fourth_id
             ),
             "abort の identity が後継で上書きされた: {:?}",
             owner.state()
@@ -1773,7 +2059,7 @@ mod tests {
                 owner.state(),
                 PresentationTransitionState::Preparing {
                     request,
-                    progress: PreparingProgress::AwaitingHost
+                    progress: PreparingProgress::AwaitingHost { .. }
                         | PreparingProgress::ReadyToPrepare { .. },
                 } if request.id == fourth_id
             ),
@@ -1809,7 +2095,7 @@ mod tests {
                 owner.state(),
                 PresentationTransitionState::Preparing {
                     request,
-                    progress: PreparingProgress::AwaitingHost
+                    progress: PreparingProgress::AwaitingHost { .. }
                         | PreparingProgress::ReadyToPrepare { .. },
                 } if request.id == successor_id
             ),
@@ -1858,6 +2144,558 @@ mod tests {
             owner.state(),
             PresentationTransitionState::Stable { .. }
         ));
+    }
+
+    #[test]
+    fn non_alias_detached_successor_prepares_new_claim_and_retires_only_old_lease() {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let new = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 1);
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+
+        let first_id = explicit_request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, first_id, OUTGOING_HOST);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: first_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+
+        let successor_id = explicit_request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            Some(old),
+            Some(new),
+        );
+        let request_effects = owner.take_effects();
+        assert_eq!(
+            detached_cleanup_counts(&request_effects, old.session),
+            (0, 0)
+        );
+        assert_eq!(
+            detached_cleanup_counts(&request_effects, new.session),
+            (0, 0)
+        );
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: first_id,
+            candidate_generation: GENERATION,
+        });
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                request,
+                progress: PreparingProgress::AwaitingHost { lease },
+            } if request.id == successor_id && lease == new.session
+        ));
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0),
+            "the published old detached host remains live until the new presenter commits"
+        );
+
+        let refreshed_new = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 2)
+            .host
+            .unwrap();
+        owner.dispatch(PresentationTransitionEvent::HostReady {
+            request_id: successor_id,
+            claim: refreshed_new,
+        });
+        owner.drive();
+        let effects = owner.take_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [PresentationTransitionEffect::PrepareNative {
+                host: Some(host),
+                ..
+            }] if *host == refreshed_new
+        ));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::PrepareNative {
+                host: Some(host),
+                ..
+            } if host.lease == old.session
+        )));
+
+        drive_to_committing(&mut owner, successor_id, CANDIDATE_HOST);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: successor_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+        owner.dispatch(PresentationTransitionEvent::NativeRetired {
+            request_id: successor_id,
+            candidate_generation: GENERATION,
+        });
+        let effects = owner.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, old.session), (1, 1));
+        assert_eq!(detached_cleanup_counts(&effects, new.session), (0, 0));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::DestroyHost {
+                lease,
+                hwnd: OUTGOING_HOST,
+                ..
+            } if *lease == old.session
+        )));
+        assert_eq!(
+            owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::DetachedWindow,
+            }
+        );
+    }
+
+    #[test]
+    fn transferred_native_failure_releases_once_while_keep_live_failure_releases_nothing() {
+        let lease = DetachedSessionLease {
+            window_id: OUTGOING_WINDOW,
+        };
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let request_id = begin_transferred_successor(&mut owner);
+        reacquire_transferred_host(&mut owner, request_id);
+
+        owner.dispatch(PresentationTransitionEvent::NativeFailed { request_id });
+        let effects = owner.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, lease), (1, 1));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::DestroyHost {
+                lease: destroyed,
+                hwnd: CANDIDATE_HOST,
+                ..
+            } if *destroyed == lease
+        )));
+        assert_eq!(
+            owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::Fullscreen,
+            }
+        );
+        owner.dispatch(PresentationTransitionEvent::NativeFailed { request_id });
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), lease),
+            (0, 0),
+            "late terminal events must not release a transferred lease twice"
+        );
+
+        let mut keep_live = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let live = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let keep_live_id = explicit_request(
+            &mut keep_live,
+            ViewerPresentation::DetachedWindow,
+            Some(live),
+            Some(live),
+        );
+        drive_to_native_wait(&mut keep_live);
+        keep_live.dispatch(PresentationTransitionEvent::NativeFailed {
+            request_id: keep_live_id,
+        });
+        assert_eq!(
+            detached_cleanup_counts(&keep_live.take_effects(), live.session),
+            (0, 0),
+            "a direct KeepLive failure must preserve the current detached session"
+        );
+    }
+
+    #[test]
+    fn transferred_lease_survives_alias_replacement_then_releases_once_on_non_alias_replacement() {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        begin_transferred_successor(&mut owner);
+
+        explicit_request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0)
+        );
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                request: PresentationRequest {
+                    target_detached: DetachedTargetLease::Transferred(_),
+                    ..
+                },
+                progress: PreparingProgress::AwaitingHost { .. },
+            }
+        ));
+
+        explicit_request(&mut owner, ViewerPresentation::MainWindow, None, None);
+        let effects = owner.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, old.session), (1, 1));
+
+        explicit_request(&mut owner, ViewerPresentation::Fullscreen, None, None);
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn transferred_abort_terminal_events_release_once() {
+        for abort_failed in [false, true] {
+            let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+            let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+            let transferred_id = begin_transferred_successor(&mut owner);
+            reacquire_transferred_host(&mut owner, transferred_id);
+
+            explicit_request(&mut owner, ViewerPresentation::MainWindow, None, None);
+            let effects = owner.take_effects();
+            assert!(matches!(
+                effects.as_slice(),
+                [PresentationTransitionEffect::AbortNative {
+                    request_id,
+                    ..
+                }] if *request_id == transferred_id
+            ));
+            assert_eq!(detached_cleanup_counts(&effects, old.session), (0, 0));
+
+            if abort_failed {
+                owner.dispatch(PresentationTransitionEvent::NativeFailed {
+                    request_id: transferred_id,
+                });
+            } else {
+                owner.dispatch(PresentationTransitionEvent::NativeAborted {
+                    request_id: transferred_id,
+                });
+            }
+            let terminal_effects = owner.take_effects();
+            assert_eq!(
+                detached_cleanup_counts(&terminal_effects, old.session),
+                (1, 1)
+            );
+            assert!(terminal_effects.iter().any(|effect| matches!(
+                effect,
+                PresentationTransitionEffect::DestroyHost {
+                    lease,
+                    hwnd: CANDIDATE_HOST,
+                    ..
+                } if *lease == old.session
+            )));
+
+            owner.dispatch(PresentationTransitionEvent::NativeAborted {
+                request_id: transferred_id,
+            });
+            owner.dispatch(PresentationTransitionEvent::NativeFailed {
+                request_id: transferred_id,
+            });
+            assert_eq!(
+                detached_cleanup_counts(&owner.take_effects(), old.session),
+                (0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_close_deduplicates_transferred_and_alias_successor_ownership() {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let transferred_id = begin_transferred_successor(&mut owner);
+        reacquire_transferred_host(&mut owner, transferred_id);
+        explicit_request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0),
+            "the alias successor must not release transferred ownership before terminal close"
+        );
+
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        let terminal_effects = owner.take_effects();
+        assert_eq!(
+            detached_cleanup_counts(&terminal_effects, old.session),
+            (1, 1),
+            "aborted transferred ownership and its alias successor must be released once"
+        );
+        assert!(terminal_effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::DestroyHost {
+                lease,
+                hwnd: CANDIDATE_HOST,
+                ..
+            } if *lease == old.session
+        )));
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        assert_eq!(
+            detached_cleanup_counts(&owner.take_effects(), old.session),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn stale_host_unavailable_cannot_rewind_a_reacquired_claim() {
+        let initial = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 1);
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let request_id = explicit_request(
+            &mut owner,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(initial),
+        );
+        drive_to_native_wait(&mut owner);
+        let old_claim = initial.host.unwrap();
+        let wrong_claim = DetachedHostClaim {
+            incarnation: old_claim.incarnation + 1,
+            ..old_claim
+        };
+        let before = owner.state();
+        owner.dispatch(PresentationTransitionEvent::HostUnavailable {
+            request_id,
+            claim: wrong_claim,
+        });
+        assert_eq!(owner.state(), before);
+        assert!(owner.take_effects().is_empty());
+
+        owner.dispatch(PresentationTransitionEvent::HostUnavailable {
+            request_id,
+            claim: old_claim,
+        });
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::AwaitingHost { lease },
+                ..
+            } if lease == old_claim.lease
+        ));
+
+        let new_claim = DetachedHostClaim {
+            incarnation: old_claim.incarnation + 1,
+            hwnd: OUTGOING_HOST,
+            ..old_claim
+        };
+        owner.dispatch(PresentationTransitionEvent::HostReady {
+            request_id,
+            claim: new_claim,
+        });
+        owner.drive();
+        owner.take_effects();
+        let before_stale_rejection = owner.state();
+        owner.dispatch(PresentationTransitionEvent::HostUnavailable {
+            request_id,
+            claim: old_claim,
+        });
+        assert_eq!(owner.state(), before_stale_rejection);
+        assert!(owner.take_effects().is_empty());
+        assert!(matches!(
+            owner.state(),
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::AwaitingNative {
+                    host: Some(host),
+                },
+                ..
+            } if host == new_claim
+        ));
+    }
+
+    #[test]
+    fn replacing_waiting_successors_destroys_only_the_discarded_candidate() {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let discarded = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 1);
+
+        let mut retiring = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let retiring_id = explicit_request(
+            &mut retiring,
+            ViewerPresentation::Fullscreen,
+            Some(old),
+            None,
+        );
+        drive_to_native_wait(&mut retiring);
+        drive_to_committing(&mut retiring, retiring_id, 0);
+        retiring.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: retiring_id,
+            candidate_generation: GENERATION,
+        });
+        retiring.take_effects();
+        explicit_request(
+            &mut retiring,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(discarded),
+        );
+        retiring.take_effects();
+        explicit_request(&mut retiring, ViewerPresentation::MainWindow, None, None);
+        let effects = retiring.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, discarded.session), (0, 1));
+        assert_eq!(detached_cleanup_counts(&effects, old.session), (0, 0));
+
+        let mut aborting = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let aborted_id = explicit_request(
+            &mut aborting,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        drive_to_native_wait(&mut aborting);
+        explicit_request(
+            &mut aborting,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(discarded),
+        );
+        aborting.take_effects();
+        explicit_request(&mut aborting, ViewerPresentation::MainWindow, None, None);
+        let effects = aborting.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, discarded.session), (0, 1));
+        assert_eq!(detached_cleanup_counts(&effects, old.session), (0, 0));
+        assert!(matches!(
+            aborting.state(),
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::Aborting { aborted, .. },
+                ..
+            } if aborted.id == aborted_id
+        ));
+
+        let mut protected_retiring =
+            PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let protected_retiring_id = explicit_request(
+            &mut protected_retiring,
+            ViewerPresentation::Fullscreen,
+            Some(old),
+            None,
+        );
+        drive_to_native_wait(&mut protected_retiring);
+        drive_to_committing(&mut protected_retiring, protected_retiring_id, 0);
+        protected_retiring.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: protected_retiring_id,
+            candidate_generation: GENERATION,
+        });
+        protected_retiring.take_effects();
+        explicit_request(
+            &mut protected_retiring,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        protected_retiring.take_effects();
+        explicit_request(
+            &mut protected_retiring,
+            ViewerPresentation::MainWindow,
+            None,
+            None,
+        );
+        assert_eq!(
+            detached_cleanup_counts(&protected_retiring.take_effects(), old.session),
+            (0, 0),
+            "a pending alias must stay protected by the in-flight retiring owner"
+        );
+        protected_retiring.dispatch(PresentationTransitionEvent::TerminalClose);
+        assert_eq!(
+            detached_cleanup_counts(&protected_retiring.take_effects(), old.session),
+            (1, 1)
+        );
+
+        let mut protected_aborting =
+            PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let protected_aborted_id = explicit_request(
+            &mut protected_aborting,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        drive_to_native_wait(&mut protected_aborting);
+        explicit_request(
+            &mut protected_aborting,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(old),
+        );
+        protected_aborting.take_effects();
+        explicit_request(
+            &mut protected_aborting,
+            ViewerPresentation::MainWindow,
+            None,
+            None,
+        );
+        assert_eq!(
+            detached_cleanup_counts(&protected_aborting.take_effects(), old.session),
+            (0, 0),
+            "a pending alias must stay protected by the in-flight aborted owner"
+        );
+        assert!(matches!(
+            protected_aborting.state(),
+            PresentationTransitionState::Preparing {
+                progress: PreparingProgress::Aborting { aborted, .. },
+                ..
+            } if aborted.id == protected_aborted_id
+        ));
+        protected_aborting.dispatch(PresentationTransitionEvent::TerminalClose);
+        assert_eq!(
+            detached_cleanup_counts(&protected_aborting.take_effects(), old.session),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn retire_failure_keeps_published_target_and_releases_outgoing_lease() {
+        let old = host_lease(OUTGOING_WINDOW, OUTGOING_HOST, 1);
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        let request_id =
+            explicit_request(&mut owner, ViewerPresentation::Fullscreen, Some(old), None);
+        drive_to_native_wait(&mut owner);
+        drive_to_committing(&mut owner, request_id, 0);
+        owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id,
+            candidate_generation: GENERATION,
+        });
+        owner.take_effects();
+
+        owner.dispatch(PresentationTransitionEvent::NativeFailed { request_id });
+        let effects = owner.take_effects();
+        assert_eq!(detached_cleanup_counts(&effects, old.session), (1, 1));
+        assert_eq!(
+            owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::Fullscreen,
+            },
+            "retire failure is terminal completion after the target was published"
+        );
+
+        let incoming = host_lease(CANDIDATE_WINDOW, CANDIDATE_HOST, 1);
+        let mut incoming_owner =
+            PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let incoming_id = explicit_request(
+            &mut incoming_owner,
+            ViewerPresentation::DetachedWindow,
+            None,
+            Some(incoming),
+        );
+        drive_to_native_wait(&mut incoming_owner);
+        drive_to_committing(&mut incoming_owner, incoming_id, CANDIDATE_HOST);
+        incoming_owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: incoming_id,
+            candidate_generation: GENERATION,
+        });
+        incoming_owner.take_effects();
+        incoming_owner.dispatch(PresentationTransitionEvent::NativeFailed {
+            request_id: incoming_id,
+        });
+        assert_eq!(
+            detached_cleanup_counts(&incoming_owner.take_effects(), incoming.session),
+            (0, 0),
+            "a committed incoming detached lease is live, not a failed candidate"
+        );
+        assert_eq!(
+            incoming_owner.state(),
+            PresentationTransitionState::Stable {
+                current: ViewerPresentation::DetachedWindow,
+            }
+        );
     }
 
     #[test]

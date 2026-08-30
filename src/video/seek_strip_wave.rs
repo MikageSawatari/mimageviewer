@@ -1110,6 +1110,14 @@ pub(crate) struct SeekStripWaveWorker {
     cancel: Arc<AtomicBool>,
     latest_request_id: Arc<AtomicU64>,
     coarse_center_bits: Arc<AtomicU64>,
+    /// 見えていない間、**背景の全尺解析だけ**を止める。要求への応答は止めない。
+    ///
+    /// この worker は要求が無いときに全尺の粗い波形を作り続ける。サムネイル側の worker は
+    /// 要求駆動なので、要求が来なくなれば自分で寝る。波形側だけがこの背景段を持つので、
+    /// モードを切り替えても不可視のまま再生とサムネイルの I/O・CPU を奪い続けていた
+    /// (R-21)。cancel ではなく一時停止にするのは、長い動画の粗い解析は高価で、
+    /// **戻ってきたときに作り直させないため**。
+    background_paused: Arc<AtomicBool>,
     next_request_id: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -1124,6 +1132,7 @@ impl SeekStripWaveWorker {
             raster: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
+        let background_paused = Arc::new(AtomicBool::new(false));
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let coarse_center_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         let worker_pending = Arc::clone(&pending);
@@ -1131,6 +1140,7 @@ impl SeekStripWaveWorker {
         let worker_cancel = Arc::clone(&cancel);
         let worker_latest = Arc::clone(&latest_request_id);
         let worker_coarse_center_bits = Arc::clone(&coarse_center_bits);
+        let worker_background_paused = Arc::clone(&background_paused);
         let thread_result = std::thread::Builder::new()
             .name("video-seek-strip-wave".into())
             .spawn(move || {
@@ -1151,14 +1161,18 @@ impl SeekStripWaveWorker {
                         );
                         continue;
                     }
-                    if process_next_coarse_chunk(
-                        &path,
-                        &worker_state,
-                        &worker_cancel,
-                        &worker_latest,
-                        &worker_coarse_center_bits,
-                        &mut runtime,
-                    ) {
+                    // 一時停止中は背景の全尺解析だけを飛ばして寝る。到着した要求は
+                    // 上の分岐で先に処理されるので、応答性は変わらない。
+                    if !worker_background_paused.load(Ordering::Acquire)
+                        && process_next_coarse_chunk(
+                            &path,
+                            &worker_state,
+                            &worker_cancel,
+                            &worker_latest,
+                            &worker_coarse_center_bits,
+                            &mut runtime,
+                        )
+                    {
                         continue;
                     }
                     if wake_rx.recv().is_err() {
@@ -1186,6 +1200,7 @@ impl SeekStripWaveWorker {
             cancel,
             latest_request_id,
             coarse_center_bits,
+            background_paused,
             next_request_id: AtomicU64::new(1),
             thread,
         }
@@ -1227,6 +1242,22 @@ impl SeekStripWaveWorker {
             self.coarse_center_bits
                 .store(center_time_secs.to_bits(), Ordering::Release);
         }
+    }
+
+    /// 見えていないモードの背景解析を止める / 再開する。
+    ///
+    /// 止めても既に作った粗い波形は残る。戻したときは続きから進む。
+    pub(crate) fn set_background_paused(&self, paused: bool) {
+        self.background_paused.store(paused, Ordering::Release);
+        if !paused {
+            // 寝ている worker を起こさないと、次の要求が来るまで再開しない。
+            let _ = self.wake_tx.try_send(());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_is_paused(&self) -> bool {
+        self.background_paused.load(Ordering::Acquire)
     }
 
     pub(crate) fn cancel(&self) {

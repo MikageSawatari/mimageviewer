@@ -120,10 +120,11 @@ mod presentation_transition;
 pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
 #[cfg(windows)]
 use presentation_transition::{
-    PreparingProgress, PresentationCandidate, PresentationEffectsOutcome,
+    DetachedHostLease, PresentationCandidate, PresentationEffectsOutcome,
     PresentationTransitionEffect, PresentationTransitionEvent, PresentationTransitionOwner,
-    PresentationTransitionState,
 };
+#[cfg(all(windows, test))]
+use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
@@ -156,8 +157,9 @@ pub(crate) use detached_window_manager::{
     DetachedActivationCloseHitTest, DetachedActivationDispatch, DetachedActivationRequest,
     DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
-    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedWindowHwndDiff,
-    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
+    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedHostClaim,
+    DetachedSessionLease, DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime,
+    DetachedWindowState, IdentifiedRightDragCommand,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -968,6 +970,32 @@ impl App {
         previous
     }
 
+    /// Attach an observed HWND only while its detached-window lease is still reusable.
+    ///
+    /// A viewport callback can terminally retire its own lease before the surrounding
+    /// `show_viewport_*` call returns. The post-show registration step must not recreate that
+    /// removed runtime, otherwise the next open could recycle the terminal identity.
+    #[cfg(windows)]
+    fn detached_window_hwnd_set_for_reusable_lease(
+        &mut self,
+        window_id: u64,
+        hwnd: u64,
+        reason: &'static str,
+    ) -> Result<Option<u64>, ()> {
+        if !self
+            .detached_window_manager
+            .reusable_session_lease(window_id)
+        {
+            self.log_detached_image_window_debug(format!(
+                "hwnd_registration_dropped window_id={window_id} hwnd=0x{hwnd:x} \
+                 reason={reason} runtime_state={:?}",
+                self.detached_window_state(window_id)
+            ));
+            return Err(());
+        }
+        Ok(self.detached_window_hwnd_set(window_id, hwnd))
+    }
+
     fn detached_window_registered_hwnds(&self) -> std::collections::HashSet<u64> {
         self.detached_window_manager.registered_hwnds()
     }
@@ -1028,16 +1056,26 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn begin_detached_window_hwnd_registration(&mut self, window_id: u64, reason: &'static str) {
+    fn begin_detached_window_hwnd_registration(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        // Registration is a lease-owned mutation. A stale show/deferred callback may reach this
+        // boundary after terminal teardown removed its runtime, so do not let the state transition
+        // below recreate that retired identity.
+        if !self
+            .detached_window_manager
+            .reusable_session_lease(window_id)
+        {
+            return false;
+        }
         // HWND の欠落は OS host の生成状態であって、メディア session の意味状態ではない。
         // ParkedLive を Opening に落とすと live poll / 新メディア close routing から外れる。
-        // Closing も host の再登録だけで復活させない。
-        if !matches!(
-            self.detached_window_state(window_id),
-            Some(DetachedWindowState::ParkedLive | DetachedWindowState::Closing)
-        ) {
+        if self.detached_window_state(window_id) != Some(DetachedWindowState::ParkedLive) {
             self.transition_detached_window_state(window_id, DetachedWindowState::Opening, reason);
         }
+        true
     }
 
     #[cfg(windows)]
@@ -1080,7 +1118,16 @@ impl App {
         let claimed = self.detached_window_registered_hwnds();
         match Self::select_detached_unclaimed_hwnd(after, &claimed) {
             DetachedWindowHwndDiff::Created(hwnd) => {
-                self.detached_window_hwnd_set(window_id, hwnd);
+                if self
+                    .detached_window_hwnd_set_for_reusable_lease(
+                        window_id,
+                        hwnd,
+                        "post_show_adopt_unclaimed",
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
                 let state = self.detached_window_state_for_show_label(window_id, label);
                 self.transition_detached_window_state(window_id, state, "hwnd_adopted_unclaimed");
                 self.detached_viewer_host_generation =
@@ -1889,7 +1936,13 @@ impl App {
         window_id: u64,
         hwnd: u64,
     ) -> bool {
-        let previous = self.detached_window_hwnd_set(window_id, hwnd);
+        let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+            window_id,
+            hwnd,
+            "watcher_repair_hwnd",
+        ) else {
+            return false;
+        };
         let state = self.detached_window_state_for_show_label(window_id, "passive");
         self.transition_detached_window_state(window_id, state, "watcher_repair_hwnd");
         self.detached_viewer_host_generation =
@@ -2035,7 +2088,6 @@ impl App {
         if !close_ids.is_empty() {
             self.close_detached_image_windows_by_ids(
                 ctx,
-                &close_ids,
                 &close_ids,
                 "watcher_passive_close",
                 None,
@@ -2243,29 +2295,17 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
-        self.remove_detached_window_runtime_inner(window_id, reason, false)
-    }
-
-    #[cfg(windows)]
-    fn remove_detached_window_runtime_preserving_activation(
-        &mut self,
-        window_id: u64,
-        reason: &'static str,
-    ) -> Option<DetachedWindowRuntime> {
-        self.remove_detached_window_runtime_inner(window_id, reason, true)
+        self.remove_detached_window_runtime_inner(window_id, reason)
     }
 
     fn remove_detached_window_runtime_inner(
         &mut self,
         window_id: u64,
         reason: &'static str,
-        preserve_activation: bool,
     ) -> Option<DetachedWindowRuntime> {
         self.discard_parked_native_video_pending_for_window(window_id, reason);
         self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
-        if !preserve_activation {
-            self.cancel_detached_right_drag_owner(window_id, reason);
-        }
+        self.cancel_detached_right_drag_owner(window_id, reason);
         let runtime = self.detached_window_manager.remove(window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime
@@ -2299,6 +2339,45 @@ impl App {
             }
         }
         runtime
+    }
+
+    /// Retire one terminal detached viewport identity without publishing a synthetic close.
+    ///
+    /// Egui does not distinguish an internally queued `ViewportCommand::Close` from an OS close
+    /// request delivered for the same `ViewportId`. Terminal teardown therefore removes the
+    /// lease from App's desired output and runtime registry. A later open must allocate a fresh
+    /// identity; stale work for `window_id` can then only address the retired lease.
+    #[cfg(windows)]
+    pub(crate) fn retire_terminal_detached_viewport_identity(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) {
+        if self.detached_window_state(window_id).is_some()
+            && self.detached_window_state(window_id) != Some(DetachedWindowState::Closing)
+        {
+            self.transition_detached_window_state(window_id, DetachedWindowState::Closing, reason);
+        }
+        self.clear_detached_window_hwnd_for_window_id(window_id);
+
+        let active_session_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
+        let owns_active_output = self.detached_viewer_window_id == Some(window_id)
+            || active_session_window_id == Some(window_id)
+            || (active_session_window_id.is_none()
+                && self.detached_viewer_window_id.is_none()
+                && self.last_active_detached_window_id == Some(window_id)
+                && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow));
+        if owns_active_output {
+            self.detached_viewer_window_id = None;
+            self.fs_viewport_shown = false;
+            self.fs_viewport_presentation = None;
+            self.fs_viewport_recreate_after_hide = false;
+            self.detached_viewer_recreate_on_next_render = false;
+        }
+
+        self.remove_detached_window_runtime(window_id, reason);
     }
 }
 
@@ -7457,6 +7536,26 @@ pub(crate) struct FavoriteDefaultClearConfirm {
     pub favorite_name: String,
 }
 
+/// 編集内容を正本 (中央 DB) へ書いた結果。
+///
+/// **`Unavailable` を `Committed` と同じに扱わないこと。** 起動時に DB を開けなかった
+/// 状態を `Ok(())` へ潰すと、`edit_store_write_succeeded` が真を返し、正本が受理して
+/// いない編集の sidecar ミラーが書かれる。次回起動の `sidecar::import_to_dbs` は
+/// 「中央が authoritative」なので、中央に古い行があるとその sidecar を捨てる。
+/// 利用者にはエラーもトーストも出ないまま編集が消える (2026-08-29 レビュー R-26)。
+///
+/// 3 値にしているのは、`Result` では「開けていない」と「書けた」が同じ値になり、
+/// 呼び出し側がどちらか区別できないため。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EditStoreOutcome {
+    /// 正本が受理した。sidecar ミラーを書いてよい。
+    Committed,
+    /// 起動時に DB を開けていないので、書き込みを試してすらいない。
+    Unavailable,
+    /// 正本が拒否した。
+    Failed(String),
+}
+
 /// メタ操作 (タグ付与など) を発火させた UI 面。
 ///
 /// detached viewer 時代はメイングリッドとビューア窓が同時に見える + 同時に操作できる
@@ -9545,6 +9644,14 @@ pub struct App {
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+    /// 直近フレームのグリッド列数。行高・ビューポート高と同じ「最後に描いた形」の一部で、
+    /// 終了時にカーソルが上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
+    pub(crate) last_grid_cols: usize,
+    /// 起動時のカーソル復元で、選択行を上から何行目に置くか。
+    ///
+    /// `select_after_load` と同じ寿命 — 次の `apply_scroll_to_selected` が取り出して使い切る。
+    /// 無いときは従来どおり「見える最小限だけ動かす」。
+    pub(crate) scroll_selected_to_rows_above: Option<u32>,
     /// 詳細表示で前フレームに描画した名前列の実効幅（ヘッダ右クリックで「固定幅へ」する際に使う）
     pub(crate) last_details_name_width: f32,
 
@@ -9771,10 +9878,6 @@ pub struct App {
     /// `settings.last_folder` を書くと次回起動が親の本一覧ではなくページ一覧になる。
     #[cfg(windows)]
     detached_viewer_main_history_suppression_depth: u32,
-    /// `open_fullscreen` 等の ctx を持たない経路で passive window を消した場合に、
-    /// 次の描画フレームで該当 viewport へ明示 close を送るためのキュー。
-    #[cfg(windows)]
-    pub(crate) detached_image_window_close_pending: Vec<u64>,
     /// Active な静止画 / 本の viewport を同じ OS window のまま passive renderer へ
     /// 引き渡した際、次の描画で `CursorVisible(true)` を 1 回だけ送るためのキュー。
     /// active 側のカーソル自動非表示が window 単位で残り、passive 窓上でもカーソルが
@@ -13361,6 +13464,8 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            last_grid_cols: 4,
+            scroll_selected_to_rows_above: None,
             last_details_name_width: 140.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             auto_aspect_cache_db,
@@ -13430,8 +13535,6 @@ impl App {
             viewer_contexts: ViewerContextRegistry::new(),
             #[cfg(windows)]
             detached_viewer_main_history_suppression_depth: 0,
-            #[cfg(windows)]
-            detached_image_window_close_pending: Vec::new(),
             #[cfg(windows)]
             detached_image_window_cursor_show_pending: Vec::new(),
             #[cfg(windows)]
@@ -17563,12 +17666,24 @@ impl App {
             "external_folder_change folder={}",
             folder.display()
         ));
+        // **利用者が選択を引き取ったなら、ここで要求を捨てる。** 再読込は `checked` を
+        // 消すので、判定できるのはこの時点だけ。以後に届く出力で利用者の選択を
+        // 上書きしない (R-09 の「届いた分を足す」を安全にする条件)。
+        if let Some(request) = self.post_operation_selection.as_ref() {
+            let cursor = self.selected_real_file_path();
+            let checked = self.checked_real_file_paths();
+            if !request.still_owns_selection(cursor.as_deref(), &checked) {
+                self.cancel_post_operation_selection("user_changed_selection");
+            }
+        }
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
-        // ただし操作の結果へ選択を移す要求が生きている間は、そちらに任せて手を出さない
+        // まだ 1 度も適用していない要求が生きている間は、そちらに任せて手を出さない
         // (貼り付けの完了はこの自動再読込で拾うので、ここで元の選択へ戻すと打ち消し合う)。
+        // 適用済みなら「元の選択」はこちらが置いたものなので、通常どおり保存して戻す。
         let selected_path: Option<PathBuf> = self
             .post_operation_selection
-            .is_none()
+            .as_ref()
+            .is_none_or(|request| request.has_applied())
             .then(|| self.selected)
             .flatten()
             .and_then(|idx| self.items.get(idx))
@@ -26951,7 +27066,6 @@ impl App {
                         DetachedWindowState::Closing,
                         reason,
                     );
-                    self.detached_image_window_close_pending.push(*id);
                     self.clear_detached_window_hwnd_for_window_id(*id);
                 }
                 // passive/parked の直接 retain-drop でも共通 teardown seam を通し、最終
@@ -36172,6 +36286,14 @@ impl App {
         let row = vis_pos / cols;
         let row_top = row as f32 * cell_h;
         let row_bottom = row_top + cell_h;
+        // 起動時のカーソル復元だけは「見えるように最小限動かす」ではなく、**前回と同じ
+        // 行位置に置く**。前回いた場所をそのまま開いたときに、選んでいた項目が画面の
+        // 違う高さに現れると別の場所に見える (利用者報告 2026-08-30)。
+        if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
+            let top_row = row.saturating_sub(rows_above as usize);
+            self.scroll_offset_y = top_row as f32 * cell_h;
+            return;
+        }
         let vp_top = self.scroll_offset_y;
         let vp_bottom = self.scroll_offset_y + self.last_viewport_h;
 
@@ -36518,6 +36640,8 @@ impl App {
                     Ok(()) => ctx.request_repaint(),
                     Err(err) => {
                         crate::logger::log(format!("shell_clipboard: Paste failed: {err}"));
+                        // 貼り付けは起きなかった。控えた差分要求もここで捨てる (R-08)。
+                        self.cancel_post_operation_selection("shell_paste_failed");
                     }
                 }
             }
@@ -37322,7 +37446,28 @@ impl App {
             "session_finish window_id={} reason={reason}",
             session.window_id
         ));
-        self.remove_detached_window_runtime(session.window_id, reason);
+        self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+    }
+
+    /// Close exactly the detached session named by an effect-owned lease.
+    ///
+    /// Presentation effects can outlive the App-global active selection. A delayed close for
+    /// one window must never consume a sibling session that became current in the meantime.
+    #[cfg(windows)]
+    pub(crate) fn close_active_detached_session_exact(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        if self
+            .active_detached_session
+            .is_none_or(|session| session.window_id != lease.window_id)
+        {
+            return false;
+        }
+        self.begin_active_detached_session_close(reason);
+        self.finish_active_detached_session_close(reason);
+        true
     }
 
     /// Active-to-passive is not terminal: the passive renderer keeps the runtime and OS viewport.
@@ -37449,15 +37594,20 @@ impl App {
             // 再利用すると parked 窓と新セッションが同一 window_id・同一 HWND を取り合い、
             // parked live メディア窓に画像が表示されて点滅・操作不能になる
             // (2026-07-09 実機、review-v2.3.0 checklist 中に発生。BA-7)。下の
-            // last_active_detached_window_id 再利用と同じ衝突ガードを直参照側にも適用し、
-            // stale なら捨てて新規 allocate へ落とす。
-            if !self.detached_image_windows.iter().any(|w| w.id == id) {
+            // last_active_detached_window_id 再利用と同じ衝突ガードを直参照側にも適用する。
+            // terminal teardown 済みで runtime lease が無い/Closing の id も stale なので、
+            // 必ず捨てて fresh identity の allocate へ落とす。
+            if !self.detached_image_windows.iter().any(|w| w.id == id)
+                && self.detached_window_manager.reusable_session_lease(id)
+            {
                 self.last_active_detached_window_id = Some(id);
                 return id;
             }
             self.log_detached_image_window_debug(format!(
                 "stale_window_id_dropped reason=ensure_detached_viewer_window_id id={id} \
-                 (passive/parked window with same id exists)"
+                 passive_collision={} reusable_lease={}",
+                self.detached_image_windows.iter().any(|w| w.id == id),
+                self.detached_window_manager.reusable_session_lease(id)
             ));
             self.detached_viewer_window_id = None;
         }
@@ -37468,10 +37618,12 @@ impl App {
         // 変わり、egui が OS ウィンドウを破棄→再生成してしまう (= 次フォルダへ移るたびに
         // ウィンドウ再表示 + 既定サイズ 822x656 の小窓がカスケード)。PDF/ZIP の非同期 enumerate
         // を跨いで window_id が一旦クリアされても、ここで同じ id を復元して安定させる。
-        // 既に passive window として残っている id は衝突するので再利用しない (always-new mode)。
+        // 既に passive window として残っている id、または terminal close 済みで runtime lease
+        // が失われた id は再利用しない。後者は H の遅延 close event を fresh J から分離する。
         if !self.fs_open_intent_from_grid
             && let Some(prev) = self.last_active_detached_window_id
             && !self.detached_image_windows.iter().any(|w| w.id == prev)
+            && self.detached_window_manager.reusable_session_lease(prev)
         {
             self.log_detached_image_window_debug(format!(
                 "reuse_active_window_id reason=ensure_detached_viewer_window_id id={prev} \
@@ -37715,17 +37867,13 @@ impl App {
             return None;
         };
 
-        // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
-        // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
+        // book context の明示 close = detached セッション終了 (§3.7 closing)。desired set から
+        // 外す前に closing を立て、teardown 後に finish して backstop が窓を復活させない。
         self.begin_active_detached_session_close(reason);
         let result = self.close_and_retire_context(
             id,
             reason,
             |app| {
-                if app.fs_viewport_shown {
-                    let fs_id = app.fullscreen_viewport_id();
-                    ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
-                }
                 // この closure を抜けた直後に context は retire される。遷移中に
                 // `close_fullscreen` を呼ぶと `TerminalClose` を出して戻るだけなので、
                 // ここで完遂させないと teardown へ到達しない (R-24)。
@@ -37801,16 +37949,6 @@ impl App {
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
-        let active_context_window_id = self.active_viewer_context_id().and_then(|id| {
-            self.with_viewer_context_ref(id, |context| context.viewer_session_detached_window_id())
-                .flatten()
-        });
-        if let Some(window_id) = active_context_window_id {
-            ctx.send_viewport_cmd_to(
-                Self::detached_image_window_viewport_id(window_id),
-                egui::ViewportCommand::Close,
-            );
-        }
         if self.active_detached_context_is_at_rest() {
             let _ = self.close_current_active_viewer_context(ctx);
         }
@@ -37824,10 +37962,6 @@ impl App {
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
             || self.fs_viewport_shown
         {
-            let viewport_id = active_window_id
-                .map(Self::detached_image_window_viewport_id)
-                .unwrap_or_else(|| self.fullscreen_viewport_id());
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             if let Some(window_id) = active_window_id {
                 self.transition_detached_window_state(
                     window_id,
@@ -37861,10 +37995,6 @@ impl App {
                 "mode_change_close_all_passive",
             );
             self.clear_detached_window_hwnd_for_window_id(*id);
-            ctx.send_viewport_cmd_to(
-                Self::detached_image_window_viewport_id(*id),
-                egui::ViewportCommand::Close,
-            );
         }
         self.teardown_paused_media_bundles_for_window_ids(
             &passive_ids,
@@ -38029,6 +38159,86 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn detached_session_lease(window_id: u64) -> DetachedSessionLease {
+        DetachedSessionLease { window_id }
+    }
+
+    #[cfg(windows)]
+    fn detached_host_lease_for_window_id(&self, window_id: u64) -> DetachedHostLease {
+        let session = Self::detached_session_lease(window_id);
+        DetachedHostLease {
+            session,
+            host: self.detached_host_claim_for_lease(session),
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_detached_host_lease(&self) -> Option<DetachedHostLease> {
+        let window_id = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)?;
+        Some(self.detached_host_lease_for_window_id(window_id))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_host_claim_for_lease(
+        &self,
+        lease: DetachedSessionLease,
+    ) -> Option<DetachedHostClaim> {
+        if self.detached_viewer_window_id != Some(lease.window_id) {
+            return None;
+        }
+        let claim = self
+            .detached_window_manager
+            .host_claim_alive(lease.window_id)?;
+        self.detached_host_claim_has_client_rect(claim)
+            .then_some(claim)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_host_claim_is_current(&self, claim: DetachedHostClaim) -> bool {
+        self.detached_viewer_window_id == Some(claim.lease.window_id)
+            && self.detached_window_manager.host_claim_is_alive(claim)
+            && self.detached_host_claim_has_client_rect(claim)
+    }
+
+    #[cfg(windows)]
+    fn detached_host_claim_has_client_rect(&self, claim: DetachedHostClaim) -> bool {
+        self.detached_client_rect_for_host_claim(claim).is_some()
+    }
+
+    #[cfg(windows)]
+    fn detached_client_rect_for_host_claim(
+        &self,
+        claim: DetachedHostClaim,
+    ) -> Option<windows::Win32::Foundation::RECT> {
+        if !self.detached_window_manager.host_claim_is_alive(claim) {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            return Some(windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 480,
+            });
+        }
+        #[cfg(not(test))]
+        {
+            use windows::Win32::Foundation::{HWND, RECT};
+            use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(HWND(claim.hwnd as *mut _), &mut rect) }.is_err() {
+                return None;
+            }
+            (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn clear_detached_window_hwnd_for_window_id(
         &mut self,
         window_id: u64,
@@ -38114,6 +38324,9 @@ impl App {
         if self.detached_window_hwnd_alive(window_id).is_some() {
             return None;
         }
+        if !self.begin_detached_window_hwnd_registration(window_id, label) {
+            return None;
+        }
         if let Some(dead_hwnd) = self.detached_window_hwnd_clear_if_dead(window_id) {
             self.log_detached_image_window_debug(format!(
                 "detached_hwnd_dead window_id={window_id} hwnd=0x{dead_hwnd:x} \
@@ -38123,7 +38336,6 @@ impl App {
                 self.pending_detached_video_host_resync = true;
             }
         }
-        self.begin_detached_window_hwnd_registration(window_id, label);
         let main_hwnd = self.main_hwnd?;
         let snapshot = crate::dwm_transitions::thread_window_snapshot(
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
@@ -38166,7 +38378,13 @@ impl App {
         );
         match Self::select_detached_created_hwnd(before, &after) {
             DetachedWindowHwndDiff::Created(hwnd) => {
-                let previous = self.detached_window_hwnd_set(window_id, hwnd);
+                let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+                    window_id,
+                    hwnd,
+                    "post_show_created_hwnd",
+                ) else {
+                    return;
+                };
                 let state = self.detached_window_state_for_show_label(window_id, label);
                 self.transition_detached_window_state(window_id, state, "hwnd_registered");
                 self.detached_viewer_host_generation =
@@ -38237,8 +38455,10 @@ impl App {
         if self.detached_window_hwnd_is_alive(previous_hwnd) {
             return;
         }
+        if !self.begin_detached_window_hwnd_registration(window_id, label) {
+            return;
+        }
         self.detached_window_hwnd_clear(window_id);
-        self.begin_detached_window_hwnd_registration(window_id, label);
         self.log_detached_image_window_debug(format!(
             "detached_hwnd_dead_after_show window_id={window_id} hwnd=0x{previous_hwnd:x} \
              label={label} viewport={viewport_id:?}"
@@ -39018,7 +39238,7 @@ impl App {
                 .position(|(window_id, _)| *window_id == id)
             {
                 let (_, reason) = self.parked_live_media_close_after_poll.remove(request_pos);
-                self.close_detached_image_windows_by_ids(ctx, &[id], &[id], reason, None);
+                self.close_detached_image_windows_by_ids(ctx, &[id], reason, None);
             }
         }
     }
@@ -39085,7 +39305,6 @@ impl App {
         ));
         for id in &ids {
             self.transition_detached_window_state(*id, DetachedWindowState::Closing, reason);
-            self.detached_image_window_close_pending.push(*id);
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
         self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
@@ -39219,8 +39438,10 @@ impl App {
         if self.detached_window_hwnd_alive(window_id).is_some() {
             return;
         }
+        if !self.begin_detached_window_hwnd_registration(window_id, "deferred") {
+            return;
+        }
         let previous_hwnd = self.detached_window_hwnd_clear_if_dead(window_id);
-        self.begin_detached_window_hwnd_registration(window_id, "deferred");
         let Some(main_hwnd) = self.main_hwnd else {
             self.log_detached_image_window_debug(format!(
                 "hwnd_deferred_retry frame={} window_id={window_id} viewport={viewport_id:?} \
@@ -39238,9 +39459,14 @@ impl App {
         let claimed = self.detached_window_registered_hwnds();
         match Self::select_detached_unclaimed_hwnd(&after, &claimed) {
             DetachedWindowHwndDiff::Created(hwnd) => {
-                let old = self
-                    .detached_window_hwnd_set(window_id, hwnd)
-                    .or(previous_hwnd);
+                let Ok(previous) = self.detached_window_hwnd_set_for_reusable_lease(
+                    window_id,
+                    hwnd,
+                    "deferred_callback_adopt_hwnd",
+                ) else {
+                    return;
+                };
+                let old = previous.or(previous_hwnd);
                 let state = self.detached_window_state_for_show_label(window_id, "passive");
                 self.transition_detached_window_state(window_id, state, "hwnd_adopted_deferred");
                 self.detached_viewer_host_generation =
@@ -39523,16 +39749,27 @@ impl App {
             self.detached_viewer_host_debug_state()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
-        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-        self.fs_viewport_shown = false;
-        self.fs_viewport_presentation = None;
-        self.fs_viewport_recreate_after_hide = false;
-        self.clear_detached_viewer_host_hwnd();
+        let closing_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id);
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
         // terminal close が明示的に宣言され、session が finish 済みまたは Closing のとき
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
         // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
-        self.finish_active_detached_session_close("active_close_finalize");
+        if self.active_detached_session.is_some() {
+            self.finish_active_detached_session_close("active_close_finalize");
+        } else if let Some(window_id) = closing_window_id {
+            self.retire_terminal_detached_viewport_identity(
+                window_id,
+                "active_close_finalize_legacy",
+            );
+        } else {
+            self.fs_viewport_shown = false;
+            self.fs_viewport_presentation = None;
+            self.fs_viewport_recreate_after_hide = false;
+            self.detached_viewer_recreate_on_next_render = false;
+        }
         self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
             "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
@@ -39642,16 +39879,15 @@ impl App {
                 .active_detached_session
                 .map(|session| session.window_id);
             let closing_window_id = session_window_id.or(self.detached_viewer_window_id);
-            let fs_id = self.fullscreen_viewport_id();
             self.begin_active_detached_session_close("park_close_legacy_detached");
-            if self.fs_viewport_shown {
-                ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
-            }
             self.finish_active_detached_session_close("park_close_legacy_detached");
             if session_window_id.is_none()
                 && let Some(window_id) = closing_window_id
             {
-                self.remove_detached_window_runtime(window_id, "park_close_legacy_detached");
+                self.retire_terminal_detached_viewport_identity(
+                    window_id,
+                    "park_close_legacy_detached",
+                );
             }
             self.close_fullscreen();
             return true;
@@ -39752,12 +39988,14 @@ impl App {
                 app.bookmark_open_pending =
                     bookmark_pending.map(crate::bookmark_browser::PendingBookmarkOpen::Book);
                 let context_serial = reserved.serial();
-                app.reset_active_detached_viewport_runtime_for_new_window(
-                    context_serial,
-                    "start_active_detached_book_context",
-                );
                 let window_id =
                     resume_window_id.unwrap_or_else(|| app.allocate_detached_viewer_window_id());
+                if resume_window_id.is_none() {
+                    app.reset_active_detached_viewport_runtime_for_new_window(
+                        context_serial,
+                        "start_active_detached_book_context",
+                    );
+                }
                 app.reserve_window_binding_for_build(window_id);
                 app.log_detached_image_window_debug(format!(
                     "allocate_window_id reason=start_active_detached_book_context id={window_id} \
@@ -39767,12 +40005,19 @@ impl App {
                 ));
                 app.detached_viewer_window_id = Some(window_id);
                 app.last_active_detached_window_id = Some(window_id);
-                let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
-                app.set_detached_window_runtime_placement(
-                    window_id,
-                    seed,
-                    "start_active_detached_book_context",
-                );
+                if resume_window_id.is_some() {
+                    app.adopt_active_detached_viewport_runtime_from_passive(
+                        "resume_active_detached_book_context",
+                    );
+                } else {
+                    let seed =
+                        placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
+                    app.set_detached_window_runtime_placement(
+                        window_id,
+                        seed,
+                        "start_active_detached_book_context",
+                    );
+                }
                 app.transition_detached_window_state(
                     window_id,
                     DetachedWindowState::Opening,
@@ -40369,8 +40614,8 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
-        // Image フォールバックは親フォルダが読めることを先に確認する。still 窓を閉じた
-        // 後で load に失敗すると窓ごと失われるため、無理なら parked のまま残す。
+        // Image フォールバックは親フォルダが読めることを先に確認する。handoff を始めた
+        // 後で load に失敗すると表示文脈を失うため、無理なら parked のまま残す。
         // (ユーザーのクリック 1 回につき is_dir 1 回の同期 I/O。恒常経路ではない。)
         if let ViewerContextDescriptor::Image { path } = &descriptor {
             if !path.parent().is_some_and(|p| p.is_dir()) {
@@ -40397,15 +40642,6 @@ impl App {
             snapshot.title
         ));
 
-        self.transition_detached_window_state(
-            snapshot.id,
-            DetachedWindowState::Closing,
-            "passive_activate_reopen_descriptor",
-        );
-        ctx.send_viewport_cmd_to(
-            Self::detached_image_window_viewport_id(snapshot.id),
-            egui::ViewportCommand::Close,
-        );
         self.ensure_detached_window_runtime_placement(snapshot.id, "passive_activate_descriptor");
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.log_detached_image_window_debug(format!(
@@ -40420,23 +40656,10 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         }
-        let preserved_activation_intent = self
-            .remove_detached_window_runtime_preserving_activation(
-                snapshot.id,
-                "passive_activate_reopen_descriptor",
-            )
-            .and_then(|runtime| runtime.activation_intent);
-        let resumed =
-            self.resume_active_detached_book_context_from_descriptor(snapshot.id, descriptor, ctx);
-        if let Some(intent) = preserved_activation_intent {
-            let default_linked = self.detached_window_runtime_default_linked();
-            self.detached_window_manager.restore_activation_intent(
-                snapshot.id,
-                intent,
-                default_linked,
-            );
-        }
-        resumed
+        // Descriptor reopen is a pre-terminal renderer handoff. Keep the same runtime lease,
+        // ViewportId, placement, HWND observation, and activation intent while the new context
+        // becomes the active producer for this window.
+        self.resume_active_detached_book_context_from_descriptor(snapshot.id, descriptor, ctx)
     }
 
     #[cfg(windows)]
@@ -40898,23 +41121,20 @@ impl App {
         let pixels_per_point = ctx
             .map(egui::Context::pixels_per_point)
             .unwrap_or(self.detached_viewer_last_pixels_per_point);
-        let (image_rect_norm, image_content_bbox) = self.detached_single_image_snapshot_layout(
-            idx,
-            placement,
-            pixels_per_point,
-            texture_size,
-            rotation,
-            zoom_pan,
-            free_rotation,
-        );
-        let rotated_size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(texture_size.y, texture_size.x)
-            }
-            _ => texture_size,
-        };
-        let logical_scale = (image_rect_norm.width() * placement.w / rotated_size.x.max(1.0))
-            .min(image_rect_norm.height() * placement.h / rotated_size.y.max(1.0));
+        // 貼り先と倍率は layout が対で返す。ここで `min(rect / tex)` を組み直すと、
+        // **既に物理ピクセルへ寄せた矩形**からの逆算になり、軸ごとの floor の分だけ
+        // 倍率が小さくなる。リサンプラの出力が子ウィンドウの貼り先より 1〜2 物理
+        // ピクセル短くなり、egui/wgpu がもう一度バイリニアを掛ける (§1.0e)。
+        let (image_rect_norm, logical_scale, image_content_bbox) = self
+            .detached_single_image_snapshot_layout(
+                idx,
+                placement,
+                pixels_per_point,
+                texture_size,
+                rotation,
+                zoom_pan,
+                free_rotation,
+            );
         let snapshot_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -40932,6 +41152,10 @@ impl App {
         let visible_source_uv_rect =
             crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
+                    // 貼り先ではなく **UV を取るためだけ**の transform。渡す矩形は layout が
+                    // 既に寄せ済みなので、ここで `Texels` を宣言すると二重に寄って 1px 縮む。
+                    // 寄せるのは 1 回だけという規則をこちら側でも守る。
+                    pixel_fit: crate::displayed_image_transform::RectPixelFit::Proportional,
                     page_idx: idx,
                     viewport_rect: snapshot_rect,
                     source_size: texture_size,
@@ -42131,6 +42355,31 @@ impl App {
                 Some((placement, rect, owner_hwnd))
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_target_for_host_claim(
+        &self,
+        presentation: ViewerPresentation,
+        host: Option<DetachedHostClaim>,
+    ) -> Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )> {
+        if presentation != ViewerPresentation::DetachedWindow {
+            return self.native_video_target_for_presentation(presentation);
+        }
+        let claim = host?;
+        if !self.detached_host_claim_is_current(claim) {
+            return None;
+        }
+        let rect = self.detached_client_rect_for_host_claim(claim)?;
+        Some((
+            crate::video::NativeVideoPlacement::DetachedViewerChild,
+            rect,
+            claim.hwnd,
+        ))
     }
 
     #[cfg(windows)]
@@ -46889,6 +47138,24 @@ impl App {
         self.redirect_selected_to_visible();
     }
 
+    /// 選択中の実ファイル / 実フォルダのパス。仮想項目・未選択では `None`。
+    fn selected_real_file_path(&self) -> Option<std::path::PathBuf> {
+        let selected = self.selected?;
+        self.visible_real_file_paths()
+            .into_iter()
+            .find(|(index, _)| *index == selected)
+            .map(|(_, path)| path)
+    }
+
+    /// チェック中の実ファイル / 実フォルダのパス。
+    fn checked_real_file_paths(&self) -> Vec<std::path::PathBuf> {
+        self.visible_real_file_paths()
+            .into_iter()
+            .filter(|(index, _)| self.checked.contains(index))
+            .map(|(_, path)| path)
+            .collect()
+    }
+
     /// 表示中の実ファイル / 実フォルダ項目を items 順で返す。
     ///
     /// 絞り込みで隠れている項目は入らない。`post_operation_selection` はこれだけを見るので、
@@ -46954,6 +47221,20 @@ impl App {
                 std::time::Instant::now(),
             ),
         );
+    }
+
+    /// 積んだ要求を取り下げる。
+    ///
+    /// 差分で拾う要求は「呼ぶ**前**の一覧」が要るので、Shell を呼ぶより先に積むしかない。
+    /// その代わり、呼び出しがその場で失敗したら**必ずここを通す** — 残したままだと、
+    /// 続く 10 秒の間に起きた**無関係なファイル追加**を貼り付け結果として選んでしまう
+    /// (R-08)。成功後の取り下げは適用側 (`apply_post_operation_selection`) が持つ。
+    pub(crate) fn cancel_post_operation_selection(&mut self, reason: &str) {
+        if self.post_operation_selection.take().is_some() {
+            crate::logger::log(format!(
+                "post_operation_selection: cancelled before any result arrived ({reason})"
+            ));
+        }
     }
 
     /// 貼り付けのように **mIV が出力パスを知らない**操作の直前に、今の一覧を控える。
@@ -47608,19 +47889,32 @@ impl App {
     /// レーティング DB は既にこの形 ([`Self::report_rating_write_error`])。編集ストアだけが
     /// 結果を捨てていた。
     #[must_use]
-    fn edit_store_write_succeeded<E: std::fmt::Display>(
+    /// `Option<Result<..>>` を [`EditStoreOutcome`] に畳む。
+    ///
+    /// 呼び出し側は `self.<db>.as_ref().map(|db| db.op(..))` の形で渡す。`None` が
+    /// 「DB を開けていない」、`Some(Err)` が「拒否された」に対応する。
+    fn edit_store_write<E: std::fmt::Display>(attempt: Option<Result<(), E>>) -> EditStoreOutcome {
+        match attempt {
+            None => EditStoreOutcome::Unavailable,
+            Some(Ok(())) => EditStoreOutcome::Committed,
+            Some(Err(error)) => EditStoreOutcome::Failed(error.to_string()),
+        }
+    }
+
+    /// 正本が受理したときだけ真。偽なら sidecar ミラーを書かずに戻ること。
+    fn edit_store_write_succeeded(
         &mut self,
         what: &'static str,
-        result: Result<(), E>,
+        outcome: EditStoreOutcome,
     ) -> bool {
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                crate::logger::log(format!("[edit-store] {what}: write failed: {error}"));
-                self.show_feedback_toast(format!("{what}を保存できませんでした: {error}"));
-                false
-            }
-        }
+        let reason = match outcome {
+            EditStoreOutcome::Committed => return true,
+            EditStoreOutcome::Unavailable => "保存先を開けませんでした".to_string(),
+            EditStoreOutcome::Failed(error) => error,
+        };
+        crate::logger::log(format!("[edit-store] {what}: write failed: {reason}"));
+        self.show_feedback_toast(format!("{what}を保存できませんでした: {reason}"));
+        false
     }
 
     pub(crate) fn report_rating_write_error(&mut self, error: &str) {
@@ -53742,7 +54036,65 @@ impl App {
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
     /// - 最大化 flag は矩形とは別のフィールドへ書く。矩形側は最大化中に更新されないので、
     ///   「最大化で終了したが、解いたら元のサイズに戻る」を両方保てる。
+    /// 終了 / トレイ退避時に、`last_folder` と**対で**保存するカーソル名を決める。
+    ///
+    /// `Some(name)` は「いま選んでいる項目は `last_folder` が指す場所の中身だ」という主張。
+    /// **`None` は積極的な破棄**であって「不明だから前回値を残す」ではない。検索結果や
+    /// 別ウィンドウの文脈で終了したとき、`last_folder` は更新されないまま名前だけ別の場所の
+    /// ものになると、次回起動で無関係な項目にカーソルが乗る。
+    ///
+    /// 2 つの問いに答える。**そもそも場所か** (合成ビューは場所ではない) と、
+    /// **それは次回開き直す場所か**。ドライブ一覧では `effective_folder` が `None` を
+    /// 返すので、sentinel を名指しする 3 つ目の分岐は要らない。
+    ///
+    /// `detached_viewer_suppresses_main_history_persistence` は**足していない**。あれは
+    /// `with_detached_viewer_main_history_suppressed` の中だけ非ゼロになるスコープ
+    /// カウンタで、終了 / トレイ退避はそのスコープの外から来る。ここで呼んでも常に
+    /// false なので、動いているように見えるだけの分岐になる。
+    pub(crate) fn cursor_to_persist(&self) -> Option<(String, u32)> {
+        let folder = self.effective_folder()?;
+        if is_synthetic_view_path(&folder) {
+            return None;
+        }
+        if !crate::known_folders::startup_folder_is_last_folder(
+            &folder,
+            self.settings.last_folder.as_deref(),
+        ) {
+            return None;
+        }
+        let selected = self.selected?;
+        let name = self.items.get(selected)?.name().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, self.selected_rows_below_view_top(selected)))
+    }
+
+    /// 選択行が、画面の一番上に見えている行から何行下にあるか。
+    ///
+    /// スクロール位置 (pt) ではなくこれを保存する。ウィンドウ幅や列数が変わると同じ pt が
+    /// 別の行を指すが、「上から何行目に見えていたか」は次回のレイアウトでも計算し直せる。
+    fn selected_rows_below_view_top(&self, selected: usize) -> u32 {
+        let cols = self.last_grid_cols.max(1);
+        let cell_h = self.last_cell_h.max(1.0);
+        let position = self
+            .current_grid_order()
+            .iter()
+            .position(|&idx| idx == selected)
+            .unwrap_or(selected);
+        let row = position / cols;
+        let top_row = (self.scroll_offset_y / cell_h).round().max(0.0) as usize;
+        row.saturating_sub(top_row).min(u32::MAX as usize) as u32
+    }
+
     pub(crate) fn persist_window_state_and_flush(&mut self) {
+        // カーソル名と行位置は選択のたびではなく、ここで 1 回だけ書く。`Settings::save()` は
+        // ただではないし (backlog §1.0b)、次回起動が要るのは終了時点の 1 つだけ。
+        // **対で書き、対で捨てる。** 片方だけ残ると、名前は前回のもので位置は前々回、
+        // という組み合わせが生まれる。
+        let cursor = self.cursor_to_persist();
+        self.settings.last_cursor_name = cursor.as_ref().map(|(name, _)| name.clone());
+        self.settings.last_cursor_rows_above = cursor.map(|(_, rows)| rows);
         // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
         // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
         // より前に正規化・検証・反映だけを行う（再走査 worker は開始しない）。
@@ -53874,10 +54226,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.mask_db {
-            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.mask_db
+                .as_ref()
+                .map(|db| db.set_raw(&key, compressed, shapes_json, w, h)),
+        );
         // 画面上の編集は残す。durable な mirror だけ、正本が受け取れたときに書く。
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, true);
         self.mask_pages.insert(idx);
@@ -53904,10 +54257,7 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.mask_db {
-            Some(db) => db.delete(&key),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.mask_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
         self.mask_pages.remove(&idx);
         self.bump_erase_mask_generation(idx);
@@ -53972,10 +54322,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.conceal_db {
-            Some(db) => db.set_raw(&key, compressed, shapes_json, w, h),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.conceal_db
+                .as_ref()
+                .map(|db| db.set_raw(&key, compressed, shapes_json, w, h)),
+        );
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, true);
         self.conceal_pages.insert(idx);
         self.bump_conceal_mask_generation(idx);
@@ -54002,10 +54353,7 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.conceal_db {
-            Some(db) => db.delete(&key),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.conceal_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
         self.conceal_pages.remove(&idx);
         self.bump_conceal_mask_generation(idx);
@@ -54036,10 +54384,11 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = match &self.local_adjust_db {
-            Some(db) => db.set_layers(&key, &layers),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(
+            self.local_adjust_db
+                .as_ref()
+                .map(|db| db.set_layers(&key, &layers)),
+        );
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
         if !self.edit_store_write_succeeded("補正レイヤー", written) {
             // 画面には残す。durable な mirror だけ書かない。
@@ -54152,10 +54501,11 @@ impl App {
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
         if let Some(settings) = normalized {
-            let written = match &self.export_crop_db {
-                Some(db) => db.set(&key, settings),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.export_crop_db
+                    .as_ref()
+                    .map(|db| db.set(&key, settings)),
+            );
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
             if !self.edit_store_write_succeeded("切り出し範囲", written) {
@@ -54163,10 +54513,8 @@ impl App {
             }
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, settings));
         } else {
-            let written = match &self.export_crop_db {
-                Some(db) => db.remove(&key),
-                None => Ok(()),
-            };
+            let written =
+                Self::edit_store_write(self.export_crop_db.as_ref().map(|db| db.remove(&key)));
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
             if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
@@ -58544,10 +58892,7 @@ impl App {
         // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
         // 非現在ページ保存もカバー)。
         self.invalidate_compare_prepared_for_idx(idx);
-        let written = match &self.comic_db {
-            Some(db) => db.set(key, objects),
-            None => Ok(()),
-        };
+        let written = Self::edit_store_write(self.comic_db.as_ref().map(|db| db.set(key, objects)));
         if !self.edit_store_write_succeeded("テキスト注釈", written) {
             return;
         }
@@ -60546,7 +60891,7 @@ impl App {
         &mut self,
         target: &PageAdjustmentTarget,
         params: crate::adjustment::AdjustParams,
-    ) -> Result<(), String> {
+    ) -> EditStoreOutcome {
         // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
@@ -60556,12 +60901,13 @@ impl App {
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
             .collect::<Vec<_>>();
         let matches_default = params == self.adjustment_standard_params_for_target(target);
-        let db_result = match &self.adjustment_db {
-            Some(db) if matches_default => db.remove_page_params(&target.page_key),
-            Some(db) => db.set_page_params(&target.page_key, &params),
-            None => Ok(()),
-        }
-        .map_err(|error| error.to_string());
+        let db_result = Self::edit_store_write(self.adjustment_db.as_ref().map(|db| {
+            if matches_default {
+                db.remove_page_params(&target.page_key)
+            } else {
+                db.set_page_params(&target.page_key, &params)
+            }
+        }));
 
         for idx in &indices {
             if matches_default {
@@ -60577,7 +60923,8 @@ impl App {
         );
         // 正本が受け取れなかった書き込みを sidecar へ写さない。写すと次回起動時に
         // 古い正本の行が勝ち、利用者からは補正が消えたように見える (R-26)。
-        if db_result.is_ok() {
+        // DB を開けていない場合も「受け取れなかった」に含める。
+        if db_result == EditStoreOutcome::Committed {
             if matches_default {
                 self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
                     sidecar.remove_adjust(rel)
@@ -60637,7 +60984,7 @@ impl App {
     pub(crate) fn clear_page_params_for_target(
         &mut self,
         target: &PageAdjustmentTarget,
-    ) -> Result<(), String> {
+    ) -> EditStoreOutcome {
         // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
         let old_effective_for_key = self.effective_params_for_target(target);
         let fallback = self.adjustment_standard_params_for_target(target);
@@ -60647,19 +60994,18 @@ impl App {
             .iter()
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
             .collect::<Vec<_>>();
-        let db_result = self
-            .adjustment_db
-            .as_ref()
-            .map(|db| db.remove_page_params(&target.page_key))
-            .unwrap_or(Ok(()))
-            .map_err(|error| error.to_string());
+        let db_result = Self::edit_store_write(
+            self.adjustment_db
+                .as_ref()
+                .map(|db| db.remove_page_params(&target.page_key)),
+        );
 
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
         Self::set_page_key_presence(&mut self.adjusted_page_keys, &target.page_key, false);
         // set 側と同じ理由で、正本が受け取れたときだけ sidecar を写す (R-26)。
-        if db_result.is_ok() {
+        if db_result == EditStoreOutcome::Committed {
             self.with_sidecar_coords_mut(target.sidecar_coords.as_ref(), |sidecar, rel| {
                 sidecar.remove_adjust(rel)
             });
@@ -60805,10 +61151,11 @@ impl App {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
             }
-            let written = match self.adjustment_db.as_mut() {
-                Some(db) => db.remove_page_params_bulk(&keys),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.adjustment_db
+                    .as_mut()
+                    .map(|db| db.remove_page_params_bulk(&keys)),
+            );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
             if self.edit_store_write_succeeded("補正の一括解除", written) {
                 for (folder, rels) in sidecar_coords {
@@ -60821,10 +61168,11 @@ impl App {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
-            let written = match self.adjustment_db.as_mut() {
-                Some(db) => db.set_page_params_bulk(&keys, &params),
-                None => Ok(()),
-            };
+            let written = Self::edit_store_write(
+                self.adjustment_db
+                    .as_mut()
+                    .map(|db| db.set_page_params_bulk(&keys, &params)),
+            );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
             if self.edit_store_write_succeeded("補正の一括適用", written) {
                 for (folder, rels) in sidecar_coords {
@@ -60860,11 +61208,11 @@ impl App {
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
         }
-        let written = if let Some(db) = self.adjustment_db.as_mut() {
-            db.remove_page_params_bulk(&keys)
-        } else {
-            Ok(())
-        };
+        let written = Self::edit_store_write(
+            self.adjustment_db
+                .as_mut()
+                .map(|db| db.remove_page_params_bulk(&keys)),
+        );
         Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
         if self.edit_store_write_succeeded("補正の全解除", written) {
             for (folder, rels) in sidecar_coords {
@@ -61005,18 +61353,20 @@ impl App {
                     .insert(favorite_id, p.clone());
                 // ここには sidecar mirror が無いので発散はしないが、失敗を黙って
                 // 飲むと「この標準にする」が無言で効かない。
-                let written = match &self.adjustment_db {
-                    Some(db) => db.set_favorite_params(favorite_id, p),
-                    None => Ok(()),
-                };
+                let written = Self::edit_store_write(
+                    self.adjustment_db
+                        .as_ref()
+                        .map(|db| db.set_favorite_params(favorite_id, p)),
+                );
                 let _ = self.edit_store_write_succeeded("お気に入りの標準", written);
             }
             None => {
                 self.adjustment_favorite_params.remove(&favorite_id);
-                let written = match &self.adjustment_db {
-                    Some(db) => db.remove_favorite_params(favorite_id),
-                    None => Ok(()),
-                };
+                let written = Self::edit_store_write(
+                    self.adjustment_db
+                        .as_ref()
+                        .map(|db| db.remove_favorite_params(favorite_id)),
+                );
                 let _ = self.edit_store_write_succeeded("お気に入りの標準の解除", written);
             }
         }
@@ -66696,10 +67046,12 @@ impl eframe::App for App {
         // 物理デバイスはここで読む。**配り先は前面の viewer なので、まだ決めない。**
         // AtRest の active context が前面なら、その context を mount した中で配る
         // (root projection で配ると、別ウィンドウを見ているのにメイングリッドが動く。
-        // 2026-08-29 レビュー R-02)。
+        // 2026-08-29 レビュー R-02)。逆に**前面がメインなら root で配る** — そこを
+        // 見ていなかったため、メイン宛と解決した操作が別ウィンドウの bundle を
+        // 書き換えていた (同 R-02 の残件)。
         let gamepad_batch = self.sample_gamepad_input(ctx);
         #[cfg(windows)]
-        let gamepad_goes_to_active_context = self.active_detached_context_is_at_rest();
+        let gamepad_goes_to_active_context = self.gamepad_batch_goes_to_active_context();
         #[cfg(not(windows))]
         let gamepad_goes_to_active_context = false;
         let mut gamepad_nav = None;

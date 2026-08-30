@@ -108,17 +108,10 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
-        "external-tools/list",
-        ExternalTools,
-        "登録した外部ツール",
-        [
-            "外部ツール",
-            "アプリケーションで開く",
-            "open with",
-            "関連付け",
-            "実行ファイル",
-            "引数"
-        ]
+        "startup/restore-cursor",
+        Startup,
+        "前回のカーソル位置を復元する",
+        ["カーソル", "選択", "位置", "cursor", "復元"]
     ),
     entry!(
         "startup/specific-folder",
@@ -137,6 +130,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "位置",
             "maximize",
             "window"
+        ]
+    ),
+    entry!(
+        "external-tools/list",
+        ExternalTools,
+        "登録した外部ツール",
+        [
+            "外部ツール",
+            "アプリケーションで開く",
+            "open with",
+            "関連付け",
+            "実行ファイル",
+            "引数"
         ]
     ),
     entry!(

@@ -398,6 +398,22 @@ pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
     });
 
+    ui.add_space(6.0);
+    anchored(ui, state, "startup/restore-cursor", |ui, state| {
+        ui.indent("startup_restore_cursor", |ui| {
+            ui.checkbox(
+                &mut state.settings.restore_last_cursor,
+                "前回のカーソル位置を復元する",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "前回終了したときにいた場所をそのまま開いた場合だけ、選んでいた項目にカーソルを戻します。項目が無くなっていたときは先頭を選びます。",
+                )
+                .weak(),
+            );
+        });
+    });
+
     ui.add_space(8.0);
     anchored(ui, state, "startup/specific-folder", |ui, state| {
         ui.add_enabled_ui(

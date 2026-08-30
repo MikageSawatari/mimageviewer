@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "3.3.0"
+version = "3.3.1"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -4001,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "3.3.0"
+version = "3.3.1"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -4012,7 +4012,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "3.3.0"
+version = "3.3.1"
 dependencies = [
  "sha2",
  "tempfile",
@@ -4022,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "3.3.0"
+version = "3.3.1"
 dependencies = [
  "argon2",
  "fast_image_resize",

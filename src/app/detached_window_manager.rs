@@ -28,6 +28,28 @@ pub(crate) enum DetachedWindowState {
     Closing,
 }
 
+/// Stable ownership identity of one detached viewport/session.
+///
+/// The OS HWND may be recreated while this lease remains live, so it is deliberately
+/// separate from [`DetachedHostClaim`].
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DetachedSessionLease {
+    pub(crate) window_id: u64,
+}
+
+/// Exact identity of one OS-host incarnation owned by a detached session lease.
+///
+/// `HWND` values can be reused by Windows. The manager-issued incarnation prevents an
+/// old asynchronous prepare effect from becoming valid again after clear/recreate.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedHostClaim {
+    pub(crate) lease: DetachedSessionLease,
+    pub(crate) incarnation: u64,
+    pub(crate) hwnd: u64,
+}
+
 /// Progress of a right-drag command recognized by a passive detached window.
 /// The command remains owned by that window until its viewer bundle is mounted.
 #[cfg(windows)]
@@ -442,6 +464,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
+    pub(crate) host_incarnation: u64,
     pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
@@ -456,6 +479,7 @@ impl DetachedWindowRuntime {
             window_id,
             state: DetachedWindowState::Opening,
             hwnd: 0,
+            host_incarnation: 0,
             placement: None,
             builder_placement_latch: None,
             trim_bboxes: std::collections::HashMap::new(),
@@ -472,6 +496,7 @@ impl DetachedWindowRuntime {
 /// registration, activation-watch queues, and surface ownership live here.
 pub(crate) struct DetachedWindowManager {
     runtimes: HashMap<u64, DetachedWindowRuntime>,
+    next_host_incarnation: u64,
     activation_watcher: DetachedActivationWatcher,
     #[cfg(test)]
     live_hwnds_for_test: HashSet<u64>,
@@ -491,6 +516,7 @@ impl DetachedWindowManager {
     pub(super) fn new() -> Self {
         Self {
             runtimes: HashMap::new(),
+            next_host_incarnation: 0,
             activation_watcher: DetachedActivationWatcher::new(),
             #[cfg(test)]
             live_hwnds_for_test: HashSet::new(),
@@ -591,6 +617,31 @@ impl DetachedWindowManager {
         self.hwnd_is_alive(hwnd).then_some(hwnd)
     }
 
+    pub(super) fn host_claim_alive(&self, window_id: u64) -> Option<DetachedHostClaim> {
+        let runtime = self.runtime(window_id)?;
+        if runtime.state == DetachedWindowState::Closing
+            || runtime.hwnd == 0
+            || runtime.host_incarnation == 0
+            || !self.hwnd_is_alive(runtime.hwnd)
+        {
+            return None;
+        }
+        Some(DetachedHostClaim {
+            lease: DetachedSessionLease { window_id },
+            incarnation: runtime.host_incarnation,
+            hwnd: runtime.hwnd,
+        })
+    }
+
+    pub(super) fn host_claim_is_alive(&self, claim: DetachedHostClaim) -> bool {
+        self.runtime(claim.lease.window_id).is_some_and(|runtime| {
+            runtime.state != DetachedWindowState::Closing
+                && runtime.hwnd == claim.hwnd
+                && runtime.host_incarnation == claim.incarnation
+                && self.hwnd_is_alive(runtime.hwnd)
+        })
+    }
+
     pub(super) fn clear_hwnd(&mut self, window_id: u64) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&window_id)?;
         let hwnd = std::mem::take(&mut runtime.hwnd);
@@ -615,9 +666,19 @@ impl DetachedWindowManager {
         if hwnd == 0 {
             return self.clear_hwnd(window_id);
         }
+        let needs_new_incarnation = self
+            .runtime(window_id)
+            .is_none_or(|runtime| runtime.hwnd != hwnd || runtime.host_incarnation == 0);
+        let new_incarnation = needs_new_incarnation.then(|| {
+            self.next_host_incarnation = self.next_host_incarnation.wrapping_add(1).max(1);
+            self.next_host_incarnation
+        });
         let runtime = self.entry_mut(window_id, default_linked);
         let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
         runtime.hwnd = hwnd;
+        if let Some(incarnation) = new_incarnation {
+            runtime.host_incarnation = incarnation;
+        }
         previous
     }
 
@@ -655,6 +716,16 @@ impl DetachedWindowManager {
 
     pub(super) fn state(&self, window_id: u64) -> Option<DetachedWindowState> {
         self.runtime(window_id).map(|runtime| runtime.state)
+    }
+
+    /// Returns whether `window_id` still names a reusable detached-window lease.
+    ///
+    /// A terminally retired lease has no runtime. `Closing` is terminal too, even
+    /// before its runtime is removed, so neither case may be recycled for a new
+    /// viewport incarnation.
+    pub(super) fn reusable_session_lease(&self, window_id: u64) -> bool {
+        self.runtime(window_id)
+            .is_some_and(|runtime| runtime.state != DetachedWindowState::Closing)
     }
 
     pub(super) fn set_linked(
@@ -782,15 +853,6 @@ impl DetachedWindowManager {
                 false
             }
         }
-    }
-
-    pub(super) fn restore_activation_intent(
-        &mut self,
-        window_id: u64,
-        intent: DetachedActivationIntent,
-        default_linked: bool,
-    ) {
-        self.entry_mut(window_id, default_linked).activation_intent = Some(intent);
     }
 
     pub(super) fn take_pending_right_drag_execution(
@@ -1043,5 +1105,66 @@ mod tests {
             manager.resolve_input_surface(false, Some(10), Some(10), true),
             ActionSurface::Viewer
         );
+    }
+
+    #[test]
+    fn reusable_session_lease_requires_a_live_non_closing_runtime() {
+        const WINDOW_ID: u64 = 7;
+
+        let mut manager = DetachedWindowManager::new();
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Opening, false);
+        assert!(manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Parked, false);
+        assert!(manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Closing, false);
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
+
+        manager.remove(WINDOW_ID);
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
+    }
+
+    #[test]
+    fn host_claim_incarnation_rejects_clear_reuse_and_closing_runtime() {
+        const WINDOW_ID: u64 = 7;
+        const HWND: u64 = 0x7000;
+
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([HWND]);
+        assert_eq!(manager.set_hwnd(WINDOW_ID, HWND, false), None);
+        let first = manager
+            .host_claim_alive(WINDOW_ID)
+            .expect("first live host claim");
+
+        assert_eq!(manager.set_hwnd(WINDOW_ID, HWND, false), Some(HWND));
+        assert_eq!(
+            manager.host_claim_alive(WINDOW_ID),
+            Some(first),
+            "duplicate observation of the same live HWND must keep its incarnation"
+        );
+
+        assert_eq!(manager.clear_hwnd(WINDOW_ID), Some(HWND));
+        assert_eq!(manager.set_hwnd(WINDOW_ID, HWND, false), None);
+        let recreated = manager
+            .host_claim_alive(WINDOW_ID)
+            .expect("recreated live host claim");
+        assert_ne!(recreated.incarnation, first.incarnation);
+        assert!(!manager.host_claim_is_alive(first));
+        assert!(manager.host_claim_is_alive(recreated));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Closing, false);
+        assert_eq!(manager.host_claim_alive(WINDOW_ID), None);
+        assert!(!manager.host_claim_is_alive(recreated));
+
+        manager.remove(WINDOW_ID);
+        assert_eq!(manager.set_hwnd(WINDOW_ID, HWND, false), None);
+        let reused_window_id = manager
+            .host_claim_alive(WINDOW_ID)
+            .expect("host claim after runtime recreation");
+        assert_ne!(reused_window_id.incarnation, recreated.incarnation);
+        assert!(!manager.host_claim_is_alive(recreated));
     }
 }

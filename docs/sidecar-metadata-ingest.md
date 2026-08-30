@@ -18,8 +18,9 @@
 > **本機能と mIV タグ機能の関係 (重要)**
 > 本機能は **読み取り専用のフリーテキスト検索**であり、mIV の「タグ機能」([archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md))
 > とは **別系統で明確に分離**する。
-> - **mIV タグ** … 利用者が付与・編集する `#xxx` 要素。XMP `dc:subject` に書き込まれ、検索 UI の
->   「対象=タグ」プルダウンで専用に絞り込める。追加 / 全消去などの編集対象。
+> - **mIV タグ** … 利用者が付与・編集する `#xxx` 要素。正本は `tags.db` で、**メディア本体や XMP は
+>   書き換えない** ([tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md))。タグビュー (Ctrl+T) /
+>   facet タグフィルタから絞り込む。追加 / 全消去などの編集対象。
 > - **サイドカー** … 外部ツールが出力した JSON/TXT の **値**を、mIV は一切書き換えず読み取って
 >   自由語検索可能にするだけ。タグとしては扱わない (`#` も付けない)。
 >
@@ -397,7 +398,7 @@ if !is_video_sidecar {
    `run_metadata_search` には `use_sidecar` 経路が無いため「サイドカーのみ」が無反応・「すべて」が
    サイドカーを取りこぼす。対策: `run_metadata_search` (worker スレッド) の Pass 2 に
    `use_sidecar = target.includes(Sidecar)` を追加し、**FS 画像のみ** on-demand でサイドカーを読んで
-   hay に含める (既存の EXIF / XMP / dc:subject の on-demand 読みと同じパターン)。
+   hay に含める (既存の EXIF / XMP の on-demand 読みと同じパターン)。
 
 6. **設定フラグは不要 (P2 → 解消)**: 専用の `sidecar_metadata_enabled` 設定を **持たない**と確定したため
    (§9)、Codex が指摘した「設定フラグを ingest 経路へスレッドする / OFF 化で既存 `sidecar_text` を消す」

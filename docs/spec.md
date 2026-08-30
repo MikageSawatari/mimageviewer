@@ -1544,6 +1544,12 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   `settings.db.preupgrade-v<old>` に複製する。スキーマ破壊が自動復旧で
   救えなかった場合の最終ライフライン。同じ前バージョン名の snapshot が既に
   存在するなら上書きしない。
+- **ローテートされないバックアップの保持世代 (3 世代)**: `preupgrade-v*` と隔離した
+  `.corrupted-*` には消える仕組みが無く、版が変わるたび / 隔離が起きるたびに
+  `settings.db` 1 個ぶんが積み上がっていた (実機で 124 ファイル 2,980 MB を観測)。
+  **新しいものが手に入ってから**、新しい順に 3 世代だけ残して削除する。隔離は
+  main / -wal / -shm の 3 ファイルで 1 世代なので、必ずセット単位で消す。
+  更新時刻が読めなかった世代は消さない (上限を一時的に超えるほうを選ぶ)。
 - **診断ログ**: 復旧経路で起きたイベント (SQLite open エラーの primary/extended code /
   quarantine / bak recovery / preupgrade / save 抑止) は
   **`<data_dir>/logs/settings.log` に常に append** される。logger の初期化状態に
@@ -1726,6 +1732,9 @@ Ctrl+C / Ctrl+X / Ctrl+V も同じ Shell verb ヘルパーを使い、コピー 
 | `active_book_name` | String | `名前なし` | 製本メニュー / ツールバー / 追加ショートカットからページを追加する先の本名。製本ルート直下のフォルダ名として使う |
 | `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了した場所、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
+| `restore_last_cursor` | bool | true | 前回終了時に選んでいた項目へカーソルを戻すか。**前回いた場所そのものを開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。既存利用者は `serde(default)` で ON になる |
+| `last_cursor_name` | Option\<String\> | None | 前回終了時に選んでいた項目の名前。`last_folder` と対でしか意味を持たないので、合成ビュー (検索結果など) やドライブ一覧で終了したときは `None` を書いて破棄する。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
+| `last_cursor_rows_above` | Option\<u32\> | None | そのカーソルが画面の一番上の行から何行下にあったか。スクロール位置 (pt) を保存しないのは、ウィンドウ幅や列数が変わると同じ pt が別の行を指すため。復元は現在の列数と行高から計算し直す。`None` は「一番上にいた」ではなく**分からない**で、その場合は従来どおり見える最小限だけ動かす |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。フォルダバー左端の `フォルダ:` ラベルの右クリックメニューからクリアできる |
 | `reading_history_enabled` | bool | true | フルスクリーンで読んだ本を閲覧履歴に記録するか。OFF にしても既存履歴は削除しない |
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
@@ -2370,17 +2379,26 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 Ctrl+F / Ctrl+G の全文検索にも投影しない。旧 XMP `dc:subject` の `#` タグは移行元としてのみ読み、
 ユーザー明示操作で取り込みまたは取り込み後削除できる。
 
-- [x] XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP は本体埋め込み、
-      動画 (MP4 / MKV / MOV / AVI / WMV / MPG / MPEG) は同名 `.xmp` サイドカーに書き込み、
-      アトミック rename)
-- [x] 他ソフト由来タグ (`#` なし) と既存プロパティ (`xtw:*` 等の Extended XMP 含む) を保持
+**現行 (`tags.db` 正本):**
+
+- [x] タグの付与 / 削除 / クリアは `tags.db` のみ更新。メディア本体 / XMP / IPTC は書き換えない
+- [x] 設定 ON 時のみフォルダサイドカー `mimageviewer.dat` へミラー (`tag_sidecar_backup_enabled`、既定 OFF)
 - [x] メニュー「タグ」: ピン留めタグの管理 / タグビュー (Ctrl+T) / タグを付ける/外す / 選択中項目から mIV タグをクリア / 登録タグのワンクリックトグル
 - [x] ツールバーのタグセクション (先頭の設定ボタンからタグ付与/解除ダイアログ、ピン留めタグはトグル式)
 - [x] メタデータパネル (フルスクリーン / native 動画 overlay) にタグセクション。ピン留めタグは常時表示し、現在対象に付いた未ピン留めタグも表示、`＋` からインラインで検索 / 入力して付与可能
-- [x] `dc:subject` 読み取りを ingest に統合 → Ctrl+G/Ctrl+F で横断検索可能
-- [x] Ctrl+G 検索バーにタグピッカー (登録済みタグからクリックで `#タグ名` をクエリに挿入)
-- [x] 書き込み worker + 進捗インジケーター (左下ステータスライン) + 書き込み完了時の検索インデックス即時反映
+- [x] タグの発見はタグビュー (Ctrl+T) + facet タグフィルタに一本化。Ctrl+F / Ctrl+G には投影しない (`SourceKind::Tags` は検索対象から除外済み)
+- [x] 書き込み worker + 進捗インジケーター (左下ステータスライン)
 - [x] `Settings.tags: Vec<TagDef>` (UUID + name) で永続化、`tag_write_warning_acknowledged` で初回警告抑制
+- [x] 旧 XMP タグの移行: ユーザー明示操作で「取り込む」/「取り込んでファイルから削除」。削除時も
+      他ソフト由来タグ (`#` なし) と既存プロパティ (`xtw:*` 等の Extended XMP 含む) は保持する
+
+**v1.0 当時の実装 (現在は上のモデルへ置き換え済み。履歴として残す):**
+
+- ~~XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP は本体埋め込み、
+  動画は同名 `.xmp` サイドカーに書き込み、アトミック rename)~~ → 通常のタグ操作はファイルを書き換えない
+- ~~`dc:subject` 読み取りを ingest に統合 → Ctrl+G/Ctrl+F で横断検索可能~~ → 検索経路は閉じた
+- ~~Ctrl+G 検索バーにタグピッカー (登録済みタグからクリックで `#タグ名` をクエリに挿入)~~ → タグビューへ統合
+- ~~書き込み完了時の検索インデックス即時反映~~ → Tantivy へ投影しないため不要
 
 ### Phase 6 (テキスト注釈 / v1.1.0) ✅ 完了
 

@@ -73,6 +73,15 @@ pub(super) enum VideoSeekStripRuntime {
     Open(Box<VideoSeekStripSession>),
 }
 
+/// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
+///
+/// 表示しているモードが背景の仕事の持ち主、という規則をここ 1 か所に置く。
+/// サムネイル側の worker は要求駆動なので、対になる述語は要らない (要求が止まれば寝る)。
+#[cfg(windows)]
+fn wave_background_paused_for_mode(mode: crate::settings::VideoSeekStripMode) -> bool {
+    mode != crate::settings::VideoSeekStripMode::Waveform
+}
+
 #[cfg(windows)]
 fn requested_video_seek_strip_state(
     action: KeyAction,
@@ -1323,9 +1332,8 @@ impl App {
         if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
             return None;
         }
-        if target_presentation == ViewerPresentation::DetachedWindow {
-            self.ensure_detached_viewer_window_id();
-        }
+        let target_detached_window_id = (target_presentation == ViewerPresentation::DetachedWindow)
+            .then(|| self.ensure_detached_viewer_window_id());
         if target_presentation != ViewerPresentation::Fullscreen && self.show_vst3_manager {
             self.toggle_native_video_vst3_gui();
         }
@@ -1337,24 +1345,24 @@ impl App {
             }
             _ => (0, 0),
         };
-        let current_detached_host_hwnd = (self.viewer_presentation
-            == ViewerPresentation::DetachedWindow)
-            .then(|| self.detached_viewer_host_hwnd_raw())
-            .unwrap_or(0);
-        let ready_host_hwnd = (target_presentation == ViewerPresentation::DetachedWindow
-            && self.detached_viewer_video_host_ready())
-        .then(|| self.detached_viewer_host_hwnd_raw())
-        .unwrap_or(0);
+        let current_detached = (self.viewer_presentation == ViewerPresentation::DetachedWindow)
+            .then(|| self.current_detached_host_lease())
+            .flatten();
+        let target_detached = target_detached_window_id
+            .map(|window_id| self.detached_host_lease_for_window_id(window_id));
         let request_id = self.video_presentation_transition.request_transition(
             target_presentation,
             activate_on_show,
             false,
             outgoing_presenter_hwnd,
-            current_detached_host_hwnd,
-            ready_host_hwnd,
+            current_detached,
+            target_detached,
         );
         let probe_host = if target_presentation == ViewerPresentation::DetachedWindow {
-            ready_host_hwnd.max(current_detached_host_hwnd)
+            target_detached
+                .and_then(|lease| lease.host)
+                .or_else(|| current_detached.and_then(|lease| lease.host))
+                .map_or(0, |claim| claim.hwnd)
         } else {
             0
         };
@@ -1418,19 +1426,12 @@ impl App {
     pub(super) fn poll_video_presentation_transition(&mut self, ctx: &egui::Context) {
         self.video_presentation_transition
             .sync_stable(self.viewer_presentation);
-        match self.video_presentation_transition.state() {
-            super::PresentationTransitionState::Preparing {
-                request,
-                progress: super::PreparingProgress::AwaitingHost,
-            } if self.detached_viewer_video_host_ready() => {
-                self.video_presentation_transition.dispatch(
-                    super::PresentationTransitionEvent::HostReady {
-                        request_id: request.id,
-                        hwnd: self.detached_viewer_host_hwnd_raw(),
-                    },
-                );
-            }
-            _ => {}
+        if let Some(lease) = self.video_presentation_transition.awaited_detached_lease()
+            && let Some(claim) = self.detached_host_claim_for_lease(lease)
+        {
+            let request_id = self.video_presentation_transition.request_id().unwrap();
+            self.video_presentation_transition
+                .dispatch(super::PresentationTransitionEvent::HostReady { request_id, claim });
         }
         self.video_presentation_transition.drive();
         self.execute_video_presentation_transition_effects(ctx);
@@ -1466,7 +1467,7 @@ impl App {
             }
             for effect in effects {
                 match effect {
-                    super::PresentationTransitionEffect::PrepareNative { request, .. } => {
+                    super::PresentationTransitionEffect::PrepareNative { request, host } => {
                         let Some(idx) = self.native_video_presentation_switch_source() else {
                             self.video_presentation_transition.dispatch(
                                 super::PresentationTransitionEvent::NativeFailed {
@@ -1476,13 +1477,22 @@ impl App {
                             continue;
                         };
                         let Some((placement, rect, owner_hwnd)) =
-                            self.native_video_target_for_presentation(request.target)
+                            self.native_video_target_for_host_claim(request.target, host)
                         else {
-                            self.video_presentation_transition.dispatch(
-                                super::PresentationTransitionEvent::NativeFailed {
-                                    request_id: request.id,
-                                },
-                            );
+                            if let Some(claim) = host {
+                                self.video_presentation_transition.dispatch(
+                                    super::PresentationTransitionEvent::HostUnavailable {
+                                        request_id: request.id,
+                                        claim,
+                                    },
+                                );
+                            } else {
+                                self.video_presentation_transition.dispatch(
+                                    super::PresentationTransitionEvent::NativeFailed {
+                                        request_id: request.id,
+                                    },
+                                );
+                            }
                             continue;
                         };
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
@@ -1627,24 +1637,24 @@ impl App {
             super::PresentationTransitionEffect::DestroyHost {
                 request_id,
                 target,
+                lease,
                 hwnd,
             } => {
                 Self::log_presentation_transition_effect(request_id, target, "Destroy", hwnd);
-                if let Some(window_id) = self.detached_viewer_window_id {
-                    ctx.send_viewport_cmd_to(
-                        Self::detached_image_window_viewport_id(window_id),
-                        egui::ViewportCommand::Close,
-                    );
-                    crate::presentation_observer::observe_viewport_command_for_transition(
-                        request_id,
-                        Self::presentation_probe_target(target),
-                        crate::presentation_observer::WindowAction::Destroy,
-                        crate::presentation_observer::WindowRole::Host,
-                        hwnd,
-                        "transition_owner",
-                        "viewport_command=Close",
-                    );
-                }
+                self.retire_terminal_detached_viewport_identity(
+                    lease.window_id,
+                    "video_presentation_transition_destroy_host",
+                );
+                ctx.request_repaint();
+                crate::presentation_observer::observe_viewport_command_for_transition(
+                    request_id,
+                    Self::presentation_probe_target(target),
+                    crate::presentation_observer::WindowAction::Destroy,
+                    crate::presentation_observer::WindowRole::Host,
+                    hwnd,
+                    "transition_owner",
+                    "desired_output=removed",
+                );
             }
             super::PresentationTransitionEffect::ApplyPresentation {
                 request,
@@ -1660,15 +1670,11 @@ impl App {
                     self.show_media_window_main_hint_toast();
                 }
             }
-            super::PresentationTransitionEffect::CloseDetachedSession { .. } => {
-                if self.active_detached_session.is_some() {
-                    self.begin_active_detached_session_close(
-                        "video_presentation_transition_non_detached",
-                    );
-                    self.finish_active_detached_session_close(
-                        "video_presentation_transition_non_detached",
-                    );
-                }
+            super::PresentationTransitionEffect::CloseDetachedSession { lease, .. } => {
+                self.close_active_detached_session_exact(
+                    lease,
+                    "video_presentation_transition_non_detached",
+                );
             }
             super::PresentationTransitionEffect::TerminalSessionClose { .. } => {
                 // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と
@@ -7668,6 +7674,16 @@ impl App {
         if let Some(worker) = new_wave_worker {
             session.wave_worker = Some(worker);
         }
+        // **表示しているモードが、背景で走ってよい仕事の持ち主**。波形 worker は要求が
+        // 無くても全尺の粗い解析を進めるので、切り替えた側で止めないと不可視のまま
+        // 再生とサムネイル生成の I/O・CPU を奪い続ける (R-21)。
+        //
+        // 破棄ではなく一時停止。長い動画の粗い解析は高価なので、戻ってきたときに
+        // 作り直させない。サムネイル側は要求駆動で、要求が止まれば自分で寝るため
+        // 対になる操作は要らない (両方の worker loop を読んで確認した)。
+        if let Some(worker) = session.wave_worker.as_ref() {
+            worker.set_background_paused(wave_background_paused_for_mode(mode));
+        }
         match mode {
             crate::settings::VideoSeekStripMode::Thumbnails => match &mut session.axis {
                 VideoSeekStripAxisState::Resolving { initial_time_secs } => {
@@ -12609,6 +12625,40 @@ mod native_video_key_observation_tests {
             ),
             "[video-audio] enter result source=native_key fs_idx=9 outcome=entered"
         );
+    }
+
+    /// 見えていないモードは背景で全尺を解析しない (R-21)。
+    ///
+    /// 波形 worker は要求が無くても粗い全尺解析を進める。モードを切り替えても止めて
+    /// いなかったので、不可視のまま再生とサムネイル生成の I/O・CPU を奪い続けていた。
+    /// サムネイル側は要求駆動で、要求が止まれば自分で寝る (両方の worker loop を読んで
+    /// 確認した) ので、対になる述語は無い。
+    #[test]
+    fn only_the_visible_waveform_keeps_analysing_in_the_background() {
+        assert!(!wave_background_paused_for_mode(
+            crate::settings::VideoSeekStripMode::Waveform
+        ));
+        assert!(wave_background_paused_for_mode(
+            crate::settings::VideoSeekStripMode::Thumbnails
+        ));
+    }
+
+    /// 一時停止は worker loop が読むのと**同じ場所**へ書く。
+    ///
+    /// 破棄ではなく一時停止なのは、長い動画の粗い解析が高価で、戻ってきたときに作り
+    /// 直させないため。実際に coarse chunk を飛ばす所は実メディアが要るので自動テストは
+    /// 無く、loop の 2 行の gate は読んで確認している。
+    #[test]
+    fn pausing_the_background_analysis_is_visible_where_the_worker_reads_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
+        let worker =
+            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(dir.path().join("none.mp4"));
+        assert!(!worker.background_is_paused(), "作った直後は動いている");
+        worker.set_background_paused(true);
+        assert!(worker.background_is_paused());
+        worker.set_background_paused(false);
+        assert!(!worker.background_is_paused());
     }
 
     #[test]

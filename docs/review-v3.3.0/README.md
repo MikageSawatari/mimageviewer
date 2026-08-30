@@ -9,6 +9,9 @@
 `215464e2`（回帰テスト負荷対応）およびレビュー記録 commit は本レビューの評価対象外とし、
 後段の build / test は「対象コードと同等だが HEAD は異なる」補助検証として記録する。
 
+> **最新判定:** 実際に公開した `v3.3.0` タグ (`0d141615`) に対する P1 再レビューは §9。
+> §1〜§8 は修正前 target の初回レビュー記録として残す。
+
 ## 1. 目的と判定基準
 
 v3.3.0 の変更を機能単位で把握したうえで、次を静的レビューと focused test で確認する。
@@ -490,3 +493,302 @@ false positive と確認し、指摘一覧から除外した。
 native D3D11 / HWND / multi-monitor / DPI / physical touch/gamepad は unit test だけでは完結しない。
 本ターンは read-only review なので通常 profile/portable smoke binary は起動・作成しておらず、上表は
 P1/P2 修正後に automated regression と実機確認の双方で実施する。
+
+## 9. v3.3.0 リリースタグ P1 再レビュー (2026-08-29, Codex)
+
+### 9.1 対象と結論
+
+- 固定対象: `v3.3.0` = `0d141615832598ab40562d94c2ae85163eee7cdb`
+- 方法: タグ専用 detached worktree で静的レビューと focused test を実施。レビュー中の `master`
+  および作業ツリー上の未確定変更は判定に混ぜていない。
+- 対象: 初回 P1 12 件。補足として、関連修正 R-24 と R-17 周辺の同型遷移も確認した。
+- 結論: **「P1 は適切に解消済み」とは判定できない。元 P1 のうち 7 件は元の P1 原因を解消、
+  R-15 の取り下げは妥当、4 件は P1 が残存する。加えて R-17 修正経路に新たな P1 R-27 を確認した。**
+
+従って、リリースタグに残る P1 は **5 件**（R-02 / R-07 / R-14 / R-26 / R-27）。
+R-03 / R-05 / R-06 / R-20 には追跡すべき residual があるが、元 finding の P1 不変条件は回復しており、
+残件は P2/P3 と評価した。
+
+| ID | 再判定 | 要約 |
+| --- | --- | --- |
+| R-01 | ✅ 解消 | abort request identity と後継要求の所有権が分離され、成功・失敗 terminal の双方で後継が解放される |
+| R-02 | ❌ **P1 残存** | AtRest detached を mount した後も batch 内 action が MainWindow surface を選べ、main 向け操作で detached bundle を更新する |
+| R-03 | ⚠️ 元 P1 解消 / residual P2 | ページ間 transient 誤適用は解消。実 gesture 中の page switch は commit/rollback せず handle と snapshot を捨てる |
+| R-04 | ✅ 解消 | split mode から reading direction を一意に導出し、解決・永続化の両方が同じ正本を使う |
+| R-05 | ⚠️ 元 P1 解消 / residual P2 | sequence と再 probe で通常 race は解消。clear 後の crash window には ledger flag 喪失余地が残る |
+| R-06 | ⚠️ 元 P1 解消 / residual P2/P3 | wheel ごとの同期保存は廃止。teardown 時の同期保存と異常終了時の直近値喪失は別残件 |
+| R-07 | ❌ **P1 未対応** | 24MP 単一面の 70.6ms 計測後に意図的延期。複数 mask/layer の全量 serialize・圧縮・DB 保存は UI thread 上に残る |
+| R-14 | ❌ **P1 残存** | enqueue 時の三重 clone は解消したが、writer が snapshot を保持中の次回 UI mutation で `Arc::make_mut` が文書全体を deep clone する |
+| R-15 | 🚫 取り下げ妥当 | reducer の effect は FIFO であり、元 finding の Retire/Abort 逆転は成立しない |
+| R-17 | ✅ 元 finding 解消 / **R-27 発見** | command suffix の欠落は解消。ただし同一 detached host を後継が再利用する連続遷移で別の所有権違反がある |
+| R-20 | ⚠️ 元 P1 解消 / residual P2 | decoded image は 128MiB に bounded。failed cell 数と全 map `snapshot()` の clone cost は未制限 |
+| R-26 | ❌ **P1 残存** | `Some(DB)` の write failure は伝播するが、startup `open().ok()` と `None => Ok(())`、delete failure の publication が authority split を残す |
+| R-24 | ✅ 解消（初回 P2） | bundle retire 前に terminal effects を drain する lifecycle へ修正済み |
+
+### 9.2 残存 P1 の根拠と根本修正境界
+
+#### R-02: gamepad の foreground context と action surface が分裂する
+
+- `src/app.rs:66806-66824` は AtRest detached が active なら gamepad batch 全体をその context へ mount する。
+  しかし `src/app/gamepad_input.rs:575-583,2248-2275` は foreground 判定により batch 内 action を
+  `ActionSurface::MainWindow` と解決できる。
+- その後 grid 操作は mount 中の field を使うため、main を対象に選んだ操作が detached bundle を更新する
+  (`src/app/gamepad_input.rs:6115-6197`)。device sampling と destination ownership が同じ境界で決まっていない。
+- 既存 test (`src/app/tests.rs:63519-63566`) は空 batch かつ foreground HWND 未設定で、実 action の destination
+  と状態変化を検証していない。
+- 根本修正: foreground / last-touched から batch destination を先に一度決定し、Viewer destination のときだけ
+  対象 context を mount する。MainWindow action は root state に dispatch する。main/detached の各 foreground で
+  non-empty D-pad、Y、ring action を検証する。
+
+#### R-07: local adjustment の durable save が UI thread を占有する
+
+- `src/app.rs:54137-54165` から `src/local_adjust_db.rs:102-120` へ、文書全体の JSON 化、mask q8 量子化、
+  deflate、SQLite write を同期実行する。`app.rs:54160` では sidecar 向け layer clone も同じ操作内にある。
+- 70.6ms は 24MP の単一 alpha 面の実測であり、最大 1GiB 文書の複数 layer / primary / add / subtract /
+  subject mask を上限化した値ではない。background migration の repack/VACUUM と競合すれば DB busy timeout
+  も UI 側の待ち時間になる。
+- codec 改善と安全な延期判断は確認できるが、「UI を block しない」という今回の P1 判定基準は満たさない。
+- 根本修正: `(key, immutable document snapshot, generation)` を worker が serialize/commit し、応答 generation が
+  最新のときだけ UI state と sidecar mirror を publish する。失敗・連続保存・終了時 flush も typed lifecycle に含める。
+
+#### R-14: COW が clone の時点を後ろへ移しただけで、UI deep clone は残る
+
+- `Arc` 化により enqueue / pending / worker 間の重複 clone は解消した。
+- 一方 `src/sidecar.rs:196-200` の `Arc::make_mut` は writer が旧 snapshot を保持中なら `BTreeMap` と nested
+  mask vector 全体を複製する。10分 periodic flush、edit tool exit 後の即時再編集、folder switch 後の復帰で到達する
+  (`src/app.rs:59710-59739`, `src/sidecar.rs:202-217`)。
+- 1GiB document budget に対して小規模 fixture の pointer/COW test だけでは UI latency/OOM 不変条件を保証しない。
+- 根本修正: entry / layer / mask 単位の immutable `Arc`、persistent map、または generation 付き delta/journal にし、
+  UI mutation の複製量を変更部分へ限定する。
+
+#### R-26: DB open/write/delete failure で durable authority が分裂する
+
+- startup は各 edit DB を `open().ok()` で保持する (`src/app.rs:13170-13244`)。その後複数 save route が
+  `None => Ok(())` とするため、DB が開けていない状態を durable success と同じに扱う
+  (`src/app.rs:53985-54284,58655-58669,60668-60775,60917-60983,61117-61129`)。
+- 既存中央 row がある状態で open failure → 新 sidecar publish となると、次回 import は中央 row を authoritative
+  として新 sidecar を skip する (`src/sidecar.rs:867-999`)。delete error でも memory/presence を先に更新し、
+  dirty/retry を残さないため再起動で旧編集が復活する経路がある。
+- 既存 test は `Some(read-only DB) -> Err` の mask save 一経路だけで、`None`、delete、各 sibling store、
+  sidecar flush 後の restart/reconciliation を覆わない。
+- 根本修正: DB availability を typed state とし、全 edit store の save/delete が durable commit 成功後だけ publish する。
+  失敗時は dirty generation と retry/error を保持する。sidecar を復旧 authority にするなら双方の revision 比較が必要。
+
+#### R-27（新規）: retiring host と successor host の alias で Detached 再要求が消える
+
+- `Detached(H) -> Fullscreen` の retire 待ち中に `Detached` を再要求すると、生存中の旧 host `H` が後継の
+  `next_host_hwnd` として保存される (`src/app/native_video.rs:1340-1354`,
+  `src/app/presentation_transition.rs:433-452`)。
+- `NativeRetired` 後、reducer は FIFO で `CloseDetachedSession(H)`、`DestroyHost(H)`、同じ `H` を持つ
+  successor `PrepareNative` を生成する (`src/app/presentation_transition.rs:737-812`)。
+- executor は先に session/runtime を除去し、`PrepareNative` の typed `host_hwnd` を使わず current host を再解決する
+  (`src/app/native_video.rs:1457-1487,1627-1671`, `src/app.rs:37387-37434`)。解決は `None` となり
+  `NativeFailed` へ遷移するため、再 Detached 要求が失われる。表示は Fullscreen、window は閉じる一方、
+  settings と toast は Detached ON のままになり得る (`src/app.rs:60161-60203`)。
+- retire は native pump の非同期境界なので連続 F12、keymap、gamepad から到達可能。既存 test
+  (`src/app/presentation_transition.rs:1517-1592`) は outgoing host と successor host を別値に固定し、
+  alias、App executor、resolver、最終設定/表示の収束を検証しない。
+- 根本修正: 同一 `H` を後継 Detached が使うなら session/host ownership を移譲し、`H` の Close/Destroy を発行しない。
+  破棄する設計なら後継を `AwaitingHost` に戻し、新 runtime/viewport 成立後に Prepare する。delay/retry ではなく、
+  reducer と detached session/host ownership 境界を修正する。
+
+### 9.3 P2/P3 residual
+
+- **R-03 (P2):** shape / brush / canvas gesture 中の page switch は、すでに memory を変更しているのに
+  commit も rollback もせず transient handle と before snapshot を clear する
+  (`src/ui_adjustment_panel.rs:10421-10493,10643-10698,13342-13365`)。
+- **R-05 (P2):** sequence check 後から CAS/re-probe 完了までの間に process が終了すると、clear 済み ledger
+  flag を戻せない crash-consistency window がある (`src/content_identity.rs:1503-1525`)。
+- **R-06 (P2/P3):** strip teardown の設定保存は UI thread 上で同期実行される。通常操作の notch ごとの stall は
+  解消したが、cold DB の close hitch と strip open 中の異常終了による直近値喪失は残る。
+- **R-20 (P2):** decoded image bytes は bounded だが、失敗 cell は最小 128 bytes 換算のため最大約100万件を持て、
+  `BTreeMap` overhead を予算に含めない。UI poll の `snapshot()` は map 全体を lock 中に clone する
+  (`src/video/seek_strip_thumbs.rs:604-680,959-968,1468-1488`)。
+
+### 9.4 タグ固定検証
+
+| 検証 | 結果 |
+| --- | --- |
+| target identity / cleanliness | `0d141615832598ab40562d94c2ae85163eee7cdb`、専用 worktree clean、`git diff --check` 成功 |
+| presentation transition | 17 tests passed / 0 failed |
+| P1 focused filters | gamepad、page transient、Remote direction、content identity、settings generation、sidecar COW、seek budget、DB failure、command batching、terminal close の 24 tests passed / 0 failed |
+| format | `cargo fmt -p mimageviewer -- --check` 成功 |
+
+合計 41 test execution は成功した。ただし成功した test は上記の gap を直接覆っていないため、残存 P1 を反証しない。
+特に R-02 は空 batch、R-14 は小規模 COW、R-26 は `Some(read-only DB)` の単一路、R-27 は異なる HWND の
+reducer state までしか検証していない。本節は read-only 再レビューであり、source code は変更していない。
+
+## 10. §9 の裏取り (2026-08-29, ClaudeCode)
+
+§9 は静的レビューで、§9.4 自身が「成功した 41 test は指摘した gap を覆っていない」と書いている。
+そこで 5 件それぞれについて、**実在するか / 何が壊れるか / v3.3.1 に入れるか** を独立に確認した。
+結論: **5 件とも実在する。ただし 2 件は「新しい問題」ではない。**
+
+| ID | 実在 | 確認方法 | 深刻度 | v3.3.1 |
+| --- | --- | --- | --- | --- |
+| R-27 | ✅ | **失敗するテストで再現** | 高 — 複数ウィンドウ操作で表示と設定が食い違う | **入れる** |
+| R-02 | ✅ | コード確認 (実装が**自分のコメントの意図を裏切っている**) | 中〜高 — 誤った窓を操作する。データ破壊は無し | **入れる** |
+| R-26 | ✅ | コード確認 (無言のデータ損失の連鎖を特定) | 高 — 頻度は低いが編集が黙って消える | **入れる** |
+| R-14 | ✅ (残存) | doc comment に既に明記済みの設計上のトレードオフ | 中 — R-07 と同一の構造問題 | R-07 と 1 件として扱う |
+| R-07 | ✅ | 既知 | 中 | **既に v3.3.1 予定** (§1.0) |
+
+### 10.1 R-27 — 再現済み
+
+`src/app/presentation_transition.rs` の
+`a_successor_does_not_reuse_the_host_the_same_batch_destroys` が現状落ちる (`#[ignore]` 中)。
+`Detached(H) -> Fullscreen` の retire 待ちに `Detached` を要求すると、`NativeRetired` の
+**同じ effect batch** が `DestroyHost { hwnd: H }` を出しつつ後継を
+`ReadyToPrepare { host_hwnd: H }` にする。
+
+production で `ready_host == H` になることも確認した。`native_video.rs` の `ready_host_hwnd` は
+`detached_viewer_video_host_ready()` が真なら現在の detached host をそのまま読み、その述語は
+`detached_viewer_client_rect_physical().is_some()` — retire 中の窓はまだ生きているので真になる。
+
+既存テストが見逃していた理由も特定した。`OUTGOING_HOST = 0x202` と `CANDIDATE_HOST = 0x404` を
+**別値に固定**しており、production で実際に起きる「同じ値」の場合を一度も通していない。
+
+### 10.2 R-02 — 判定が 2 つの情報源に割れている
+
+**2026-08-30 追記**: 実機で確認したところ、**利用者環境ではこの症状は再現しなかった**
+(別ウィンドウを開いたままメインを前面にして十字キーを押すと、v3.3.0 でもメイン一覧が
+動いて見えた)。以下で確認したのは「配り先と面の判定が別の情報源を使っており、食い違い
+得る」ことまでで、`active_detached_context_is_at_rest()` が真になる条件は限られる。
+**「誤った窓を操作する」と断定したのは証拠より強かった。** 修正 (`7f064a57`) は 2 つの
+判定を 1 つにするもので構造的には正しいが、深刻度は下方修正する。
+
+配り先の判定と surface の判定が**別々の情報源**を使う。
+
+- 配り先: `app.rs` の `gamepad_goes_to_active_context = self.active_detached_context_is_at_rest()`。
+  この述語は `active_viewer_context_id()` の residence だけを見ており、**前面ウィンドウを見ていない**。
+- surface: `gamepad_input.rs` の `current_input_surface()` →
+  `resolve_input_surface(.., foreground_app_hwnd(), ..)` は**前面を見る**。前面がメインなら
+  `ActionSurface::MainWindow`。
+
+同じ frame の同じ batch で、前者が「detached bundle を mount」、後者が「対象はメイン」と答え得る。
+そして `handle_gamepad_y_tap` のコメントはこう書いてある:
+
+> グリッド面: Y でツリーをトグル。detached viewer が同時表示中でも
+> **foreground / last-touched がメインならこちらを操作する。**
+
+ところが `handle_gamepad_direction_for_grid` が読み書きする `self.selected` /
+`self.scroll_to_selected` / `self.items` は、mount 中は `ViewerContextBundle` が所有する
+detached 側の field である (`viewer_context_registry.rs:704` 以降に `items` / `selected` /
+`scroll_offset_y` / `scroll_to_selected` を確認)。**意図した挙動をコードが実現できていない。**
+
+根本修正の境界は §9.2 のとおり: batch の宛先を前面 / last-touched から**先に一度**決め、
+Viewer 宛のときだけ context を mount する。
+
+### 10.3 R-26 — 無言のデータ損失の連鎖
+
+損失経路を最後まで辿れた。
+
+1. 起動時に各 edit DB を `open().ok()` で保持する (`app.rs:13170` 以降、adjustment /
+   local_adjust / export_crop / mask / conceal / comic の 6 つすべて)。開けなければ `None`。
+2. 保存経路は `None => Ok(())` (13 か所)。`edit_store_write_succeeded` は `Err` のときだけ
+   失敗を報告するので、**開けていない状態は durable 成功と区別されない**。
+3. そのまま `set_page_key_presence(.., true)` が立ち、sidecar ミラーが書かれる。
+4. 次回起動で DB が開けると `sidecar::import_to_dbs` が走るが、その doc は
+   「中央 DB に既にエントリがあるものは **上書きしない** (中央が authoritative)」。
+   → 中央に古い行があると、`None` の間に書いた sidecar は**捨てられる**。
+
+利用者にはエラーもトーストも出ない。到達条件は「以前の行が中央にあり、今回 DB が開けない」で、
+別インスタンスの排他ロック・DB 破損・ディスク満杯などで成立する。頻度は低いが、
+起きたときの結果が編集の消失なので P1 の格付けは妥当。
+
+### 10.4 R-14 は R-07 と同じ構造問題
+
+`SidecarFile::items` の doc comment に既に書いてあるとおり、`Arc::make_mut` は
+**writer が前の snapshot を持っている間だけ 1 回**複製する。v3.3.0 の修正は
+「flush・読み直し・worker 取り出しの 3 か所が毎回 map 全体を deep clone」を
+「重なったときだけ 1 回」にしたもので、常用経路は 3 回 → 0 回になっている。
+
+残るのは「編集文書という大きな値を UI スレッドが所有して複製する」という一点で、
+**これは R-07 (マスクの直列化・圧縮・DB 保存が UI スレッド) と同じ問題**である。
+R-07 の根本修正 (`(key, 不変スナップショット, generation)` を worker が処理し、
+最新 generation の応答だけを publish する) を入れれば、sidecar ミラー側も同じ
+所有権に乗せられる。**2 件を別々に直さず、1 つの作業として扱うほうがよい。**
+
+### 10.5 対応状況 (2026-08-30 時点)
+
+| ID | 状態 |
+| --- | --- |
+| R-27 | **修正済み** — 後継へ lease を移譲し、retire 後に exact claim を取り直す (`44e012a6` / `e84a8daf`、実装 Codex)。再現テストの `#[ignore]` は外した |
+| R-02 | **修正済み** — 配り先と面を `current_input_surface` 1 つから導く (`7f064a57`) |
+| R-26 | **修正済み** — `EditStoreOutcome` で「開けていない」を成功と区別する (`b8cb3ce5`) |
+| R-14 | R-07 の一部として扱う (格下げ) |
+| R-07 | 未着手。§1.0 のとおり v3.3.1 の作業項目 |
+
+**実機確認が残っている**: R-27 は F12 連打まわり、R-02 は別ウィンドウを開いたままメイン一覧を
+gamepad で操作する経路。どちらも unit test では完結しない。
+
+### 10.5b v3.3.1 への割り当て (当初)
+
+- **新規に入れる**: R-27 / R-02 / R-26。R-27 と R-02 は detached の所有権境界に触るので、
+  CLAUDE.md の凍結ルール (症状パッチ禁止・構造的修正は ClaudeCode と Codex の合意 +
+  [detached-rework-plan](detached-rework-plan.md) への記録) に従う。
+- **既に予定済み**: R-07 (+ 図形のキー移動 / 塗りの毎フレーム複製)、§1.0b (対応済み)、§1.0c。
+- **格付け変更の提案**: R-14 は単独 P1 ではなく R-07 の一部として扱う。
+
+### 10.6 R-27 の設計判断 (ClaudeCode と Codex の合意、2026-08-29)
+
+凍結ルール (CLAUDE.md「Detached viewer リワーク中のルール」) に従い、着手前に
+[detached-rework-plan](../detached-rework-plan.md) §2 を読み、Codex に設計判断を当てた。
+
+**ClaudeCode の当初案は誤りだった。** 「破棄予定の host は ready host ではない」ので後継を
+`AwaitingHost` へ戻す (案 B) を推したが、Codex が事実で否定した:
+
+- `DestroyHost` は H に `DestroyWindow` していない。現在の `detached_viewer_window_id` から
+  ViewportId を再解決して `ViewportCommand::Close` を送るだけで、effect の `hwnd` はログにしか
+  使われない。
+- egui-winit 0.33.3 の `ViewportCommand::Close` は同期 destroy ではなく `ViewportEvent::Close`
+  を積むだけ。
+- 案 B には「旧 viewport の close 完了 → 新 window identity の確保 → 新 HWND 登録」という
+  因果経路が無い。同じ ViewportId を render し続けるので、**まだ生きている H を再び
+  `HostReady` にする**か、`ViewportEvent::Close` を利用者の close と解釈して**後継ごと閉じる**
+  かのどちらにもなる。永久待機だけが問題なのではなく、結果が lifecycle ordering 依存になる。
+
+**合意した設計は案 A′ (lease の移譲 + retire 後の再検証)。** native presenter は H 自身では
+なく H 配下の `WS_CHILD` で、retire が壊すのは child と render core / DComp / GPU 資源だけ。
+親 H には SetParent / style / subclass / DComp target のような再利用不能な状態が残らないので、
+**同じ egui parent を後継 presenter の親として再利用できる**。後継の `Switch` も retire と
+同じ native pump FIFO に後から入るので、旧 child の Destroy を追い越さない。
+
+ただし要求時に観測した H をそのまま信用はしない。`NativeRetired` の後に現在の host claim を
+採り直してから Prepare する (`{window_id, host incarnation, hwnd}` で producer → reducer →
+effect → executor を結ぶ)。これは規則 5 の「判断は問うている事柄と同じ時間・所有境界の
+事実で行う」に沿う — 要求時の HWND は非同期 retire 境界の向こうでは事実ではない。
+
+**単純な alias guard (同一 H なら Close/Destroy を省くだけ) では Codex は合意しない**と明示
+された。失敗・再置換・terminal close で session が残るため。
+
+ブリーフは [r27-fix-brief.md](r27-fix-brief.md)。実装は Codex、検収は ClaudeCode。
+完了後に [detached-rework-plan](../detached-rework-plan.md) §11 へ記録する。
+
+### 10.7 内部 Close と利用者 Close の取り違え (ClaudeCode と Codex の合意、2026-08-30)
+
+実機で F12 連打すると再生が止まって別ウィンドウが閉じる。**ログで原因を確定した** —
+自分が送った `ViewportCommand::Close` が、再利用された同じ ViewportId の新しい viewport に
+届き、利用者の × と同じ扱いになっている。詳細は backlog §1.0f (a)。
+
+**ClaudeCode が最初に立てた仮説 (`push_detached_release` が移譲した lease を畳む) は外れ。**
+コードを読んだ根拠はあったが、ログを取れば確かめられる状況で先に仮説を出したのは順序が
+逆だった。実ログは 112ms の因果関係まで示している。
+
+**ClaudeCode が出した 2 案は、どちらも Codex が証拠つきで否定した:**
+
+- **「送った Close を identity 付きで覚え、対応する `close_requested` を 1 回だけ消費する」**
+  → egui 0.33.3 では内部 Close と OS の × / Alt+F4 が**同じ `ViewportEvent::Close`**
+  になり、`close_requested()` は送信元も incarnation も個数も持たない。照合できないので、
+  内部 Close が未配達のまま利用者の × が来ると**その × を誤消費し得る**。
+- **「host incarnation ごとに ViewportId を変える」**
+  → incarnation は HWND 取得後の `set_hwnd` で採番されるのに、ViewportId は HWND を作る
+  `show_viewport_immediate` より前に要る。**循環している。**
+
+**合意した設計 (Codex の第三案)**: **内部 teardown では Close を送らず、viewport を
+desired set から外して破棄する。terminal になった `window_id` / `ViewportId` は再利用せず、
+再入場時に新しい ID を割り当てる。非終端の移譲 (terminal 前の反転・folder navigation・
+active↔passive) は従来どおり同じ ID を維持する** (R-27 の lease 移譲を壊さない)。
+
+利用者の × の保証は**抑制ではなく「内部 Close を生成しない」ことで得る**。live viewport に
+届く Close は利用者 / OS 由来だけになるので、`close_requested()` の処理は無条件のまま
+維持できる。ブリーフは [close-identity-brief.md](close-identity-brief.md)。

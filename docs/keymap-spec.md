@@ -578,7 +578,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
 | <kbd>Esc</kbd> | 編集中の図形操作を解除。解除対象がなければ補正レイヤーモード終了 |
 | <kbd>Enter</kbd> | 多角形マスクの頂点列を確定。Action: `LaConfirmPolygon` |
-| <kbd>Del</kbd> | 選択中の図形マスクを削除 |
+| <kbd>Del</kbd> | 選択中の図形マスクを削除。Action: `LaDeleteShape` |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | 多角形入力中は頂点を戻す。それ以外は補正レイヤー操作を Undo |
 | <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | 補正レイヤー操作を Redo |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | 選択中の図形マスクを 1px / 10px 移動 |

@@ -1459,6 +1459,129 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-30 detached close identity を、内部 teardown と利用者 OS close の発生源ではなく
+session lease の寿命で分離する (v3.3.0 出荷前レビュー close identity。ClaudeCode / Codex
+双方が第三案を構造的修正と合意):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の terminal session close / mode change /
+active・passive context teardown と fresh viewport ID 払い出し、
+[src/app/native_video.rs](../src/app/native_video.rs) の terminal `DestroyHost` effect、
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の detached desired set / event batch、
+[src/app/detached_window_manager.rs](../src/app/detached_window_manager.rs) の session lease
+再利用可否、[src/app/presentation_transition.rs](../src/app/presentation_transition.rs) は変更せず
+同一 lease transfer / terminal effect 契約を監査、[src/app/tests.rs](../src/app/tests.rs) の回帰証明、
+および本節の記録。`src/ui_main.rs` を含む許可範囲外は変更しない。
+
+**不変条件と所有境界**:
+
+- 内部 teardown は detached child へ `ViewportCommand::Close` を送らない。terminal な窓 H は
+  runtime / snapshot / active presentation という **desired set から exact window ID で外す**。
+  egui が `close_requested()` に合流させる同一 event を「内部 close 済み」marker で消費しない。
+  したがって遅れて届いた H の event が、後継 J の利用者 OS close を代理して消費する経路を
+  作らない。
+- terminal に達した `DetachedSessionLease { window_id: H }` は再利用しない。次の open は
+  manager が「H の runtime が存在し、かつ `Closing` ではない」と証明できない限り fresh J を
+  払い出す。viewport callback 内で H を retire した後に同じ `show_viewport_*` の末尾が行う
+  pre-show / deferred / post-show の HWND 登録は state transition より前にこの lease 生存判定を
+  通らなければ破棄するため、削除済み runtime を `Opening` として作り直さない。
+  H の遅延 event は exact ID で H だけに当たり、現在の J を閉じない。
+- descriptor fallback、folder navigation、active↔passive handoff のような **pre-terminal**
+  遷移では同じ ID / runtime / placement / activation intent を引き継ぐ。descriptor fallback は
+  H を一度 `Closing` にして同じ H で作り直すのではなく、既存 lease をそのまま resume する。
+- 現在の J に対する利用者の `close_requested()` は、embedded でない detached viewport なら
+  引き続き無条件で close reducer へ渡す。`detached_image_window_viewport_id` も変更しない。
+
+**producer 監査**: detached child へ programmatic `ViewportCommand::Close` を送っていた全 10
+producer を分類した。terminal 9 件 (active context take、mode change の active / legacy /
+passive 3 経路、active session finalize、legacy park-and-close fallback、native `DestroyHost`、
+複数 passive window close、専用 pending queue の drain) は command 送信をやめて desired set
+から exact owner を除く。nonterminal 1 件 (descriptor fallback) は close / runtime remove 自体を
+やめ、同じ lease を resume する。内部 Close 専用の
+`detached_image_window_close_pending` queue は所有する意味がなくなるため削除する。root application
+quit の `ViewportCommand::Close` と、利用者 OS close の `close_requested()` は対象外で維持する。
+
+**placement の移譲**: 新しい配置経路は作らない。H の runtime removal が位置・inner size・
+maximized を既存 `settings.detached_viewer_window_placement` へ保存し、fresh J の runtime 初期化と
+viewport builder が同じ設定を読む。maximized は既存 visible commit、borderless は既存 App-global
+設定から復元する。この H → settings → J runtime / builder の経路を回帰テストで固定する。
+
+**なぜ症状パッチではないか**: stale close を時刻や「次の一回だけ無視」で推測せず、terminal
+lease の再利用を ownership 境界で禁止し、内部 teardown を egui の利用者 close event から除いた。
+同じ ownership 判定を pre-show / post-show / deferred / watcher の HWND 登録 producer にも適用し、
+terminal callback の末尾から runtime が再生成される lifecycle 競合を閉じる。
+新しい App-level bool / `Option` / pending marker は追加しない (規則 3)。時間窓、settle、retry、
+sleep、geometry / focus heuristic は使わない (規則 5)。fresh H→J、desired output の H 不在 / J
+存在、stale H close の無害性、current J close の有効性、pre-terminal ID 維持、配置・maximized・
+borderless 継承を manager / reducer / App-level test で証明し、既存 detached テストは削除・
+弱体化しない (規則 8)。
+
+**2026-08-30 gamepad の配り先と面を 1 つの判定に揃える (レビュー R-02 の残件。修正の形は
+Codex が [review-v3.3.0 §9.2](review-v3.3.0/README.md) で示した根本修正そのもの):**
+
+**触った範囲**: [src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の
+`current_input_surface` / `gamepad_batch_goes_to_active_context`、
+[src/app.rs](../src/app.rs) の root pass routing 1 行、
+[src/app/tests.rs](../src/app/tests.rs) の回帰証明 2 本。
+
+**不変条件と所有境界**: batch の配り先と、その batch の中で解決される `ActionSurface` は
+**同じ 1 つの関数から導く**。2026-08-29 の R-02 修正は「別ウィンドウが前面ならそちらへ配る」
+側だけを直し、配り先は `active_detached_context_is_at_rest()` (= 前面を見ない) のままだった。
+そのため前面がメインでも batch が別ウィンドウの context へ入り、`MainWindow` と解決された
+グリッド操作が mount 中の bundle の `selected` を書き換えていた。`handle_gamepad_y_tap` の
+コメントは当時から「前面 / last-touched がメインならメインを操作する」と書いてある。
+
+直したのは `current_input_surface` の 4 番目の引数だけ。root projection の `fullscreen_idx`
+には別ウィンドウのビューアが現れないので、`|| active_detached_context_is_at_rest()` を足す。
+第 1 引数は `viewer_session_is_detached_or_switching` が既に同じ事実を含んでいるため触らない
+(**最初は足していたが、変異テストが生き残って冗長だと分かった**)。
+
+**なぜ症状パッチではないか**: 述語に例外を足したのではなく、2 つに割れていた判定を 1 つに
+した。新しい App-level bool / Option は無い (規則 3)。時間窓も retry も無い (規則 5)。既存の
+`a_foreground_detached_viewer_receives_the_gamepad_batch_itself` は無変更で緑のまま (規則 8)。
+配り先を旧規則へ戻す変異と、4 番目の引数を戻す変異の両方を、追加した 2 本が拒否する。
+
+**2026-08-29 R-27 host/session lease 移譲 (v3.3.0 出荷前レビュー R-27。ClaudeCode /
+Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/presentation_transition.rs](../src/app/presentation_transition.rs) の
+reducer / state / effect identity、[src/app/native_video.rs](../src/app/native_video.rs) の
+producer・poll・effect executor、[src/app.rs](../src/app.rs) の lease 指定 claim 取得・検証と
+exact session close、[src/app/detached_window_manager.rs](../src/app/detached_window_manager.rs) の
+per-runtime host incarnation、[src/app/tests.rs](../src/app/tests.rs) と reducer / manager の回帰証明。
+
+**不変条件と所有境界**:
+
+- `DetachedSessionLease { window_id }` は viewport/session の継続所有権、
+  `DetachedHostClaim { lease, incarnation, hwnd }` はその session 内の特定 OS host 世代を表す。
+  同じ live HWND の再観測では incarnation を保ち、clear / HWND 変更 / runtime 再作成では
+  manager-global allocator から新しい incarnation を払い出す。`Closing` または exact claim の
+  いずれかが違う host は prepare できない。
+- commit 済み retire の outgoing lease と successor の target lease が同じなら、lease を
+  `Transferred` として後継へ移し、同じ batch では `CloseDetachedSession` / `DestroyHost` を
+  出さない。要求時の raw HWND/claim は非同期 retire 境界で捨て、必ず
+  `AwaitingHost(transferred lease)` から現在の exact claim を取り直す。
+- producer → reducer → `PrepareNative` → executor は同じ full host claim を運ぶ。executor が
+  claim を再検証できなければ current global host へ解決し直さず、matching
+  `HostUnavailable { request_id, claim }` で `AwaitingHost` へ戻る。遅れて届いた旧 claim の拒否は
+  再取得済み claim を巻き戻さない。
+- `KeepLive` / 未 commit の `Candidate` / retire から受け取った `Transferred` を別 variant にし、
+  failure / replacement / abort / terminal close の解放責任を区別する。Close/Destroy は effect が
+  運ぶ session lease を使い、現在の sibling window/session を再解決しない。同一 batch 内は lease
+  で重複排除し、各 lifecycle で一度だけ解放する。full host claim は prepare の exact identity、
+  session lease は cleanup の単位である。同じ lease の host が再 incarnation していても、その
+  session/viewport を閉じる terminal effect は無効化しない (claim 一致を要求すると leak する)。
+- presentation enum が同じ `Detached` でも lease が違う H→J は no-op ではない。旧 H を outgoing、
+  新 J を candidate として扱い、J の exact claim だけへ prepare した後、native retire 完了で H
+  だけを close/destroy する。
+
+**なぜ症状パッチではないか**: ready 述語へ「retire 中なら unready」という例外を足さず、壊れて
+いた host/session の所有 identity を型と reducer の移譲規則で閉じた。新しい App-level bool /
+Option は足していない (規則 3 — 状態は `PresentationTransitionState` / `PreparingProgress` と
+`DetachedWindowRuntime.host_incarnation` が所有)。時間窓・retry・settle・sleep は無い (規則 5)。
+既存 detached テストは削除・弱体化せず、指定された R-27 再現だけを A′ の新契約へ書き換えて
+`#[ignore]` を外した (規則 8)。既存 Detached→Fullscreen と同一 lease の Detached→Detached
+KeepLive の期待値は変更していない。
+
 **2026-08-29 gamepad の配り先を前面の context にする (レビュー R-02。ClaudeCode / Codex
 双方が構造的修正と合意):**
 
@@ -2254,6 +2377,7 @@ foreground ownership を扱う際の観測として残す。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
+| 2026-08-30 | detached 静止画スナップショットの**貼り先と倍率**を、layout が対で返す 1 つの答えから取る (backlog §1.0e の最後の未達経路)。UV を取るためだけの transform は `Proportional` を宣言して二重の寄せをやめる | [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の `fs_image_draw_rect_for_size` → `fs_image_draw_geometry_for_size` (矩形単体 → `(rect, scale)`) と `detached_single_image_snapshot_layout` の戻り値、[src/app.rs](../src/app.rs) の `build_active_snapshot` から自前 `min()` の削除と UV 用 transform の `pixel_fit`、[src/gpu_lanczos.rs](../src/gpu_lanczos.rs) の回帰テスト。detached 述語、viewport ID / 登録 / recreate、runtime / host ownership、placement、focus routing、window lifecycle は変更なし | ClaudeCode が数値で再現 (子が貼る 1440 物理 px に対しリサンプラ出力 1439、`[1249,2272]` では 1438。DPI 125% / 150% でも同型)。原因は `resolve()` が丸め**前**の情報から決めた `total_scale` を捨て、丸め**後**の矩形から `min()` で逆算していたこと。Codex も source inspection で「情報を一度捨ててから復元しようとしているのが根因」と一致し、双方が構造的修正と合意 (R4 待ちは不要 — R4 は viewport / 描画入口の統合であって paint geometry 契約の前提ではない)。新規 App bool / Option、時間窓、retry は無し。旧実装と同じ再導出を戻すと落ちる回帰テストを追加し、**丸めてから比較しない** (0.44px のずれでも GPU はバイリニアを掛けるため)。Codex が指摘した Z モードの `Texels → Texels` 二重 resolve は別種 (貼り先と倍率が同じ transform 由来なので今回のボケではない) なので、backlog §1.0h として分離 |
 | 2026-08-28 | F11 borderless と対になる restore placement の所有範囲を OS host instance から、同じ viewer content の detached presentation intent へ訂正し、F12 host migration で保持 | `src/app.rs` の borderless/restore write 境界と F12 toggle、`src/app/tests.rs` の通常・always-new media round-trip / builder / F11-off / write-path audit、backlog §1.139。builder、viewport ID / host registry、runtime placement、focus / activation、1.139 instrumentation は変更なし。新しい App state、guard、timeout、retry なし | Codex の修正前 unit 再現で、F12 OFF の `toggle_detached_viewer_mode_disabled` が `true/Some(...)` を `false/None` にし、`f12_to_non_detached` が重ねて clear する probe output を確認した。F12 は host runtime を terminal remove する一方、同じ viewer presentation intent を main に移送して再び detached へ戻す操作なので、host の寿命を intent の寿命にしていた所有境界が原因。真の viewer close、F11 OFF、genuinely new stable window の reset、別 passive window の adopt は intent の終了または owner 交代なので clear を維持した。症状を見て復元する guard ではなく、対の唯一の write path と terminal authority を正し、再生成 builder と F11-off consumer まで unit test で固定する構造的修正として §2 に適合すると Codex と ClaudeCode が合意 (ClaudeCode は F12 clear の復元 2 系統と builder の borderless 無効化の計 3 変異を独立に実行し、いずれも対応するテストが拒否することを確認) |
 | 2026-08-27 | ParkedLive の HUD クリック分類器 `native_video_output_event_is_parked_live_hud_click_activation` から catch-all `_ => true` を撤去し、`NativeVideoOutputEvent` 77 variant すべてを網羅 match で分類した = backlog §1.132 (ClaudeCode / Codex 双方が構造的修正と合意) | [src/app/native_video.rs](../src/app/native_video.rs) の当該述語のみ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、placement / focus、window lifecycle、activation 要求の生成・消費経路は変更なし。App state の追加なし、時間窓・guard・retry・repaint の追加なし | 実機ログ (`MIV_DETACHED_WINDOW_DEBUG=1`) で、描画経路が layout 変化のたびに出す `RequestSeekStripWindow` が「利用者の HUD クリック」と分類され、利用者が活性化した別窓を 13ms で降ろしていたことを確定。原因は個別イベントの登録漏れではなく **「未分類のイベント = 利用者のクリック」という open-world の既定**であり、シークストリップが 10 個足して 3 個しか分類されなかったのはその帰結。網羅 match 化は新 variant の分類をコンパイラに強制し、誤分類の発生境界そのものを閉じるため症状パッチではない。Codex は方針に同意したうえで一次分類案に 5 件の反例を出し (`TouchChromeLearned` は利用者タップ由来 / `CloseSeekStrip` は cause 依存で `HudHidden` は描画由来 / `SetVst3PanelPos` は自動 clamp でも発火 / `SetVst3PanelVisible` は producer 不在 / `TileColumnsDelta` は入力源が 2 つ)、ClaudeCode が全件を emit 元で裏取りして反映した。`CloseSeekStrip` は既存の `SeekStripCloseCause::is_user_dismissal()` を使うだけで payload 変更を伴わない。`TileColumnsDelta` の provenance 分離と、活性化要求の**寿命・順序**問題 (消費側が「まだ望まれている要求か」を問うていない) は §2 規則 7 に従いスコープ外とし、backlog §1.132 に残した |
 | 2026-08-25 | R2e-2d で active_viewer_context_contains_video が registry 化と同時に mounted context まで含む意味へ広がり、detached video open の main-update poll を自己抑止した回帰を修正。active ID が現在 projected ではない場合だけ動画を検出する other_active_viewer_context_contains_video へ改名し、旧述語から継承した十一 caller を全数監査して同じ「別 context」意味へ移行 | src/app.rs の context predicate、main video poll 入口、pending index / tile / mode-switch / park / close / media-navigation ownership、src/app/native_video.rs の source-swap / mounted clear ownership、src/app/startup_ops.rs の bookmark handoff、src/app/tests.rs の main-update poll 到達テスト。viewport ID / registry transaction / runtime / host ownership、geometry / placement / focus、window lifecycle、pending field と既存計装は変更なし | 利用者のログ・source 分析と Codex の十一 caller / mounted・at-rest lifecycle 監査が、旧 holder 述語の意味は「App に投影されていない active context」であり、全 caller が current/mounted を別の条件または現在処理中の owner として扱う点で一致。guard / retry / delay / re-entrancy flag を足さず、projected identity との比較で residence を保つ ownership 修正である。修正前に production main-update 入口から pending poll に未到達する red を確認し、修正後は poll_native_video_open_pending 固有の host_not_ready 記録まで到達する回帰テストで固定したため、症状パッチではなく §2 に適合すると双方合意 |
