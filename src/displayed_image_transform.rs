@@ -666,6 +666,14 @@ impl ResolvedZTransform {
         input.image.fit_mode = FullscreenFitMode::Page;
         input.image.fit_scale_limits = FullscreenFitScaleLimits::default();
         input.image.free_rotation_rad = 0.0;
+        // **Z の矩形は中間枠であって貼り先ではない。** 描く経路はこれを layout として受け取り、
+        // テクスチャに合わせ直してから寄せる。ここでも寄せると「中間で 1 回・最終で 1 回」の
+        // 二重丸めになり、理想フィットより 1 物理ピクセルほど小さくなる (backlog §1.0h)。
+        //
+        // 呼び出し側の指定ではなくここで固定するのは、上の 3 つと同じ理由 — Z の入力として
+        // 意味を持たない値だから。照準枠・factor・full_image_zoom は viewport と content から
+        // 決まるので、この宣言では動かない。
+        input.image.pixel_fit = RectPixelFit::Proportional;
         let display_size = rotated_size(input.image.texture_size, input.image.rotation);
         let bbox = effective_bbox(0.0, input.image.content_bbox)
             .map(|bbox| rotate_bbox_to_display(bbox, input.image.rotation));
@@ -1665,6 +1673,57 @@ mod tests {
             .unwrap();
         close(visible.center().x, target.x);
         close(visible.center().y, target.y);
+    }
+
+    /// Z の矩形は**中間枠**なので、呼び出し側が `Texels` を渡しても寄せない。
+    ///
+    /// 描く経路 (`draw_fs_image`) がこれを layout として受け取り、テクスチャに合わせ直して
+    /// から寄せる。ここでも寄せると「中間で 1 回・最終で 1 回」の二重丸めになり、理想フィット
+    /// より 1 物理ピクセルほど小さくなる (backlog §1.0h、Codex 指摘 2026-08-30)。
+    ///
+    /// 縮小で端数が出る組み合わせを選んである。`Texels` に戻すと幅が 791.63 から 791 へ
+    /// 落ちるので落ちる。
+    #[test]
+    fn the_z_rectangle_is_a_layout_frame_and_is_never_snapped() {
+        let source = egui::vec2(1249.0, 2272.0);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, 1440.0));
+        let resolved = ResolvedZTransform::resolve(ZTransformInput {
+            pan_band: viewport,
+            cursor: viewport.center(),
+            factor: 1.0,
+            // 照準側 (非 active)。矩形が画像全体そのものになるので寄せの有無が直接出る。
+            active: false,
+            image: DisplayedImageTransformInput {
+                // 呼び出し側が寄せろと言っても、Z は中間枠なので従わない。
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: source,
+                texture_size: source,
+                rotation: Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+        })
+        .unwrap();
+
+        let ideal = (viewport.width() / source.x).min(viewport.height() / source.y);
+        let rect = resolved.transform.full_image_rect;
+        assert!(
+            (rect.width() - source.x * ideal).abs() < 1.0e-3,
+            "理想フィットのままであること: {} vs {}",
+            rect.width(),
+            source.x * ideal
+        );
+        assert!(
+            (rect.width() - rect.width().round()).abs() > 0.1,
+            "この組み合わせで端数が出ないなら、寄せの有無を区別できていない ({})",
+            rect.width()
+        );
     }
 
     #[test]

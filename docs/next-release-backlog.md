@@ -65,7 +65,7 @@ detached の分岐は削除し、synthetic 判定は `last_folder` 側も合成�
 返すので、素朴に「起動フォルダが決まったなら前回の続き」と扱うと、消えたフォルダの
 カーソル名を親フォルダへ持ち込むことになる。
 
-### 1.0h Z モードが中間枠と最終矩形で 2 回寄せる — Codex 指摘 (2026-08-30)
+### 1.0h Z モードが中間枠と最終矩形で 2 回寄せる — Codex 指摘 (2026-08-30) — **v3.3.1 で対応済み**
 
 **§1.0e と同種だがボケ方が違う。** Z (分析) モードは
 [ui_fullscreen.rs](../src/ui_fullscreen.rs) で `ResolvedZTransform` を `Texels` で resolve し、
@@ -78,9 +78,16 @@ detached の分岐は削除し、synthetic 判定は `last_folder` 側も合成�
 - 呼び出し元へ返るのは **1 回目**の transform なので、返した geometry と実際に
   描いた geometry が違う (ヒット判定・ナビゲータ・UV がわずかにずれる)
 
-**方向**: 中間 solve は `Proportional`、最終 paint だけ `Texels`、返すのは実際に描画した
-transform。これは `resolve_fs_image_transform` の中間枠に対して v3.3.1 で既に行った判断と
-同じ。active detached からも到達する共通経路なので、§1.0e の修正へ暗黙に混ぜず分けた。
+**対応 (2026-08-30)**: 方向どおり直した。`ResolvedZTransform::resolve` が `pixel_fit` を
+`Proportional` へ**固定する** — 呼び出し側の指定にしなかったのは、`fit_mode` /
+`fit_scale_limits` / `free_rotation_rad` を同じ理由で既に固定しているから (Z の入力として
+意味を持たない値)。照準枠・factor・full_image_zoom は viewport と content から決まるので
+この宣言では動かないことを確認した。
+
+`draw_fs_zoom_mode` は `draw_fs_image` の戻り値を返すようにした。通常表示の枝は元から
+`single_transform = self.draw_fs_image(...)` になっており、Z だけが自分の中間枠を返して
+いた。`single_transform` は当たり判定・ナビゲータ・カーソル写像の基準なので、
+「画面に出ていない矩形」を配っていたことになる。
 
 同じ調査で見つかった、直さなくてよいもの:
 

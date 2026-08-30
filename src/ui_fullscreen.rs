@@ -6816,14 +6816,17 @@ impl App {
             ResolvedDisplayPlacement::Normal { .. } => None,
         };
         let bg_style = self.fs_bg_style(ctx);
-        let transform = resolved.transform;
-        self.draw_fs_image(
+        // **返すのは実際に描いた transform。** `draw_fs_image` は渡した矩形をテクスチャに
+        // 合わせ直してから貼るので、ここで自分の中間枠を返すと、当たり判定・ナビゲータ・
+        // カーソル写像が「画面に出ていない矩形」を基準にする (backlog §1.0h)。
+        // 通常表示の枝 (`single_transform = self.draw_fs_image(...)`) は元からこうなっている。
+        let painted = self.draw_fs_image(
             ui,
             image_rect,
             fs_idx,
             Some(source_size),
             FsPageLayoutSource::CurrentItem,
-            Some(transform),
+            Some(resolved.transform),
             paint_resource.as_ref(),
             state.thumb_tex.as_ref(),
             false,
@@ -6865,7 +6868,7 @@ impl App {
                 egui::StrokeKind::Outside,
             );
         }
-        Some(transform)
+        painted
     }
 
     /// 利用者入力から通常表示の pan を変更する唯一の入口。
