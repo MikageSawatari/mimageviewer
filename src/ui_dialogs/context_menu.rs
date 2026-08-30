@@ -1614,6 +1614,14 @@ impl crate::app::App {
             &self.settings.external_tools,
             crate::external_tool::ExternalToolMenuTarget::from_grid_item(target),
         );
+        let labels: Vec<_> = external_items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        crate::logger::log(format!(
+            "native_context_menu: external_tools count={} labels={labels:?}",
+            external_items.len()
+        ));
         let separate_from_existing = !items.is_empty() && !external_items.is_empty();
         items.extend(external_items.into_iter().enumerate().map(|(index, item)| {
             NativeMivMenuItem {

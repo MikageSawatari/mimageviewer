@@ -230,7 +230,13 @@ pub(crate) struct ExternalLaunchRequest {
 #[derive(Debug)]
 pub(crate) struct ExternalLaunchResult {
     pub tool_name: String,
-    pub result: Result<(), String>,
+    pub result: Result<Option<AssociationHandlerRefresh>, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AssociationHandlerRefresh {
+    previous_id: String,
+    current_id: String,
 }
 
 pub(crate) struct ExternalLaunchPending {
@@ -245,6 +251,15 @@ impl Drop for ExternalLaunchPending {
 }
 
 impl ExternalTool {
+    /// 右クリックメニューに出す文言。
+    ///
+    /// 名前だけだと項目として認識されにくい (利用者が区切り線の下の項目を見落とした,
+    /// 2026-08-30)。既存の「最近使ったアプリ」や「このフォルダをエクスプローラで開く」と
+    /// 同じく、空白を入れずに `で開く` を付ける。表記の所有者はここ 1 か所にする。
+    pub fn menu_label(&self) -> String {
+        format!("{}で開く", self.display_name())
+    }
+
     pub fn display_name(&self) -> String {
         if !self.name.is_empty() {
             return self.name.clone();
@@ -343,13 +358,13 @@ pub(crate) fn external_tool_menu_items(
         .filter_map(|tool| match target {
             ExternalToolMenuTarget::RealFile => Some(ExternalToolMenuItem {
                 tool_id: tool.id,
-                label: tool.display_name(),
+                label: tool.menu_label(),
                 enabled: true,
                 disabled_reason: None,
             }),
             ExternalToolMenuTarget::VirtualPage if tool.for_editing => Some(ExternalToolMenuItem {
                 tool_id: tool.id,
-                label: tool.display_name(),
+                label: tool.menu_label(),
                 enabled: false,
                 disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
             }),
@@ -615,7 +630,9 @@ pub(crate) fn start_launch_worker(
     Ok(ExternalLaunchPending { cancel, rx })
 }
 
-fn launch_request(request: ExternalLaunchRequest) -> Result<(), String> {
+fn launch_request(
+    request: ExternalLaunchRequest,
+) -> Result<Option<AssociationHandlerRefresh>, String> {
     match request.launch {
         ExternalToolLaunch::Executable(executable) => {
             let mut command = Command::new(executable);
@@ -634,15 +651,47 @@ fn launch_request(request: ExternalLaunchRequest) -> Result<(), String> {
             }
             command
                 .spawn()
-                .map(|_| ())
+                .map(|_| None)
                 .map_err(|error| error.to_string())
         }
         ExternalToolLaunch::Association { handler_id } => {
-            crate::open_with::invoke_association_handler(&handler_id, &request.file)
+            crate::open_with::invoke_association_handler(
+                &handler_id,
+                &request.tool_name,
+                &request.file,
+            )
+            .map(|outcome| {
+                outcome
+                    .refreshed_handler_id
+                    .map(|current_id| AssociationHandlerRefresh {
+                        previous_id: handler_id,
+                        current_id,
+                    })
+            })
         }
-        ExternalToolLaunch::OsDefault => {
-            opener::open(request.file).map_err(|error| error.to_string())
+        ExternalToolLaunch::OsDefault => opener::open(request.file)
+            .map(|_| None)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn write_back_association_handler_id(
+    settings: &mut crate::settings::Settings,
+    refresh: &AssociationHandlerRefresh,
+) {
+    let update = |launch: &mut ExternalToolLaunch| {
+        let ExternalToolLaunch::Association { handler_id } = launch else {
+            return;
+        };
+        if *handler_id == refresh.previous_id {
+            handler_id.clone_from(&refresh.current_id);
         }
+    };
+    for recent in &mut settings.recent_open_with_apps {
+        update(&mut recent.launch);
+    }
+    for tool in &mut settings.external_tools {
+        update(&mut tool.launch);
     }
 }
 
@@ -714,7 +763,10 @@ impl crate::app::App {
         for outcome in finished {
             match outcome {
                 Some(result) => match result.result {
-                    Ok(()) => {
+                    Ok(refresh) => {
+                        if let Some(refresh) = refresh {
+                            write_back_association_handler_id(&mut self.settings, &refresh);
+                        }
                         self.show_feedback_toast(format!("{} を起動しました", result.tool_name))
                     }
                     Err(error) => self.show_feedback_toast(external_launch_error_message(
@@ -798,6 +850,39 @@ mod tests {
             handler_id: "Photos.App".to_string(),
         };
         assert_eq!(tool.display_name(), ASSOCIATED_APP_DISPLAY_NAME);
+    }
+
+    #[test]
+    fn handler_refresh_updates_recent_apps_and_registered_tools() {
+        let mut settings = crate::settings::Settings::default();
+        settings.recent_open_with_apps = vec![crate::settings::RecentApp {
+            display_name: "ペイント".to_string(),
+            launch: ExternalToolLaunch::Association {
+                handler_id: "old.Paint".to_string(),
+            },
+        }];
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "old.Paint".to_string(),
+        };
+        settings.external_tools = vec![tool];
+
+        write_back_association_handler_id(
+            &mut settings,
+            &AssociationHandlerRefresh {
+                previous_id: "old.Paint".to_string(),
+                current_id: "current.Paint".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            &settings.recent_open_with_apps[0].launch,
+            ExternalToolLaunch::Association { handler_id } if handler_id == "current.Paint"
+        ));
+        assert!(matches!(
+            &settings.external_tools[0].launch,
+            ExternalToolLaunch::Association { handler_id } if handler_id == "current.Paint"
+        ));
     }
 
     #[test]
@@ -900,11 +985,23 @@ mod tests {
                 .map(|item| (item.tool_id.0, item.label.clone()))
                 .collect::<Vec<_>>(),
             (0..12)
-                .map(|index| (index + 1, format!("tool-{index}")))
+                .map(|index| (index + 1, format!("tool-{index}で開く")))
                 .collect::<Vec<_>>()
         );
         assert!(items.iter().all(|item| item.enabled));
         assert!(items.iter().all(|item| item.disabled_reason.is_none()));
+    }
+
+    #[test]
+    fn menu_label_appends_the_open_verb_without_a_space() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.name = "Photoshop".to_string();
+        assert_eq!(tool.menu_label(), "Photoshopで開く");
+
+        // 名前が空なら exe の file_stem に付く。
+        tool.name = String::new();
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:	ools\Foo Bar.exe"));
+        assert_eq!(tool.menu_label(), "Foo Barで開く");
     }
 
     #[test]
@@ -921,7 +1018,7 @@ mod tests {
             items,
             vec![ExternalToolMenuItem {
                 tool_id: ExternalToolId(2),
-                label: "editor".to_string(),
+                label: "editorで開く".to_string(),
                 enabled: false,
                 disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
             }]
