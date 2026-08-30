@@ -33,15 +33,17 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::external_tool::{
-    ExternalTool, ExternalToolId, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy,
+    ExternalTool, ExternalToolId, ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy,
+    VideoPolicy, classify_legacy_recent_launch,
 };
 use crate::settings::{
-    FavoriteEntry, RecentApp, Settings, TagDef, Vst3ChainPresetSlot, Vst3ChainPresetSlots,
-    Vst3PluginEntry,
+    FavoriteEntry, LegacyOpenWithApp, RecentApp, Settings, TagDef, Vst3ChainPresetSlot,
+    Vst3ChainPresetSlots, Vst3PluginEntry,
 };
 
 const SCHEMA_VERSION: &str = "1";
 const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
+const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_launch_classified";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'show_hidden_files', 'grid_display_order',
@@ -598,6 +600,14 @@ impl SettingsDb {
                 "settings_db: external tool migration failed; retrying on the next load: {e}"
             )),
         }
+        match migrate_recent_open_with_launch(&inner.conn) {
+            Ok(true) => log_diag("settings_db: classified recent open-with launch kinds"),
+            Ok(false) => {}
+            Err(e @ SettingsDbError::Incompatible(_)) => return Err(e),
+            Err(e) => log_diag(&format!(
+                "settings_db: recent open-with launch migration failed; retrying on the next load: {e}"
+            )),
+        }
         // 既定値だけを揃える移行なので、書き込み失敗は設定ロード全体を失敗させない。
         // transaction rollback により旧値のまま + marker 無しとなり、次の load で再試行する。
         match migrate_folder_thumb_sort_default_v2(&inner.conn) {
@@ -855,6 +865,10 @@ impl SettingsDb {
         tx.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
             params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+            params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
         )?;
         // app_version は DB を「開いた版」ではなく、設定内容を最後に正常保存した版を示す。
         // backup rotation はこの save より前に走るため、bak1 側には直前の保存版が残る。
@@ -1502,7 +1516,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS recent_open_with_apps (
             exe_path      TEXT PRIMARY KEY,
             display_name  TEXT NOT NULL,
-            sort_index    INTEGER NOT NULL
+            sort_index    INTEGER NOT NULL,
+            launch_kind   TEXT
          );
          CREATE INDEX IF NOT EXISTS recent_apps_sort
             ON recent_open_with_apps(sort_index);
@@ -1518,7 +1533,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS external_tools (
             id                   INTEGER PRIMARY KEY,
             name                 TEXT NOT NULL,
-            executable           TEXT,
+            launch_kind          TEXT NOT NULL,
+            launch_value         TEXT,
             arguments            TEXT NOT NULL,
             working_directory    TEXT,
             payload              TEXT NOT NULL,
@@ -1534,6 +1550,13 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS external_tools_sort
             ON external_tools(sort_index);",
     )?;
+    if !table_has_column(conn, "recent_open_with_apps", "launch_kind")? {
+        conn.execute(
+            "ALTER TABLE recent_open_with_apps ADD COLUMN launch_kind TEXT",
+            [],
+        )?;
+    }
+    reset_unreleased_external_tools_schema_if_needed(conn)?;
     migrate_tags_table(conn)?;
 
     // schema_version は schema migration 後の現行値へ更新する。新しい版の DB は
@@ -1552,6 +1575,42 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         params![app_version],
     )?;
     Ok(())
+}
+
+/// P0/P1/P1b の `external_tools` は未出荷なので、旧 `executable` schema はその場で
+/// 作り直す。released source の `custom_open_with_apps` と migration marker は残っている
+/// ため、marker を外して通常の一度きり移行を再実行すれば登録元は失われない。
+fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqlite::Result<()> {
+    if table_has_column(conn, "external_tools", "launch_kind")? {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "DROP TABLE external_tools;
+         CREATE TABLE external_tools (
+            id                   INTEGER PRIMARY KEY,
+            name                 TEXT NOT NULL,
+            launch_kind          TEXT NOT NULL,
+            launch_value         TEXT,
+            arguments            TEXT NOT NULL,
+            working_directory    TEXT,
+            payload              TEXT NOT NULL,
+            video                TEXT NOT NULL,
+            spread               TEXT NOT NULL,
+            selection            TEXT NOT NULL,
+            pdf_render_long_edge INTEGER NOT NULL,
+            for_editing          INTEGER NOT NULL,
+            show_in_context_menu INTEGER NOT NULL,
+            keep_temp            INTEGER NOT NULL,
+            sort_index           INTEGER NOT NULL
+         );
+         CREATE INDEX external_tools_sort ON external_tools(sort_index);",
+    )?;
+    tx.execute(
+        "DELETE FROM schema_meta WHERE key = ?1",
+        params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+    )?;
+    tx.commit()
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -2215,23 +2274,62 @@ fn write_recent_apps(
     // legacy の `custom_open_with_apps` は意図的に書き戻さないため injection リスクなし。
     tx.execute(&format!("DELETE FROM {table}"), [])?;
     let mut stmt = tx.prepare(&format!(
-        "INSERT INTO {table} (exe_path, display_name, sort_index) VALUES (?1, ?2, ?3)"
+        "INSERT INTO {table} (exe_path, display_name, sort_index, launch_kind)
+         VALUES (?1, ?2, ?3, ?4)"
     ))?;
     for (idx, app) in apps.iter().enumerate() {
-        stmt.execute(params![app.exe_path, app.display_name, idx as i64])?;
+        let (launch_kind, launch_value) = external_tool_launch_storage(&app.launch);
+        stmt.execute(params![
+            launch_value.unwrap_or_default(),
+            app.display_name,
+            idx as i64,
+            launch_kind
+        ])?;
     }
     Ok(())
 }
 
-fn read_recent_apps(conn: &Connection, table: &str) -> Result<Vec<RecentApp>, SettingsDbError> {
-    let sql = format!("SELECT exe_path, display_name FROM {table} ORDER BY sort_index ASC");
-    let mut stmt = conn.prepare(&sql)?;
+fn read_recent_apps(conn: &Connection) -> Result<Vec<RecentApp>, SettingsDbError> {
+    let mut stmt = conn.prepare(
+        "SELECT exe_path, display_name, launch_kind
+         FROM recent_open_with_apps
+         ORDER BY sort_index ASC",
+    )?;
     let rows = stmt.query_map([], |row| {
         let exe_path: String = row.get(0)?;
         let display_name: String = row.get(1)?;
-        Ok(RecentApp {
-            exe_path,
+        let launch_kind: Option<String> = row.get(2)?;
+        Ok((exe_path, display_name, launch_kind))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (stored_value, display_name, launch_kind) = row?;
+        let launch = match launch_kind {
+            Some(kind) => external_tool_launch_from_storage(&kind, Some(stored_value))?,
+            None => {
+                classify_legacy_recent_launch(&stored_value, Path::new(&stored_value).is_file())
+            }
+        };
+        out.push(RecentApp {
             display_name,
+            launch,
+        });
+    }
+    Ok(out)
+}
+
+fn read_legacy_open_with_apps(
+    conn: &Connection,
+) -> Result<Vec<LegacyOpenWithApp>, SettingsDbError> {
+    let mut stmt = conn.prepare(
+        "SELECT exe_path, display_name
+         FROM custom_open_with_apps
+         ORDER BY sort_index ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LegacyOpenWithApp {
+            exe_path: row.get(0)?,
+            display_name: row.get(1)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2277,6 +2375,46 @@ fn selection_policy_text(value: SelectionPolicy) -> &'static str {
     }
 }
 
+fn external_tool_launch_storage(value: &ExternalToolLaunch) -> (&'static str, Option<String>) {
+    match value {
+        ExternalToolLaunch::Executable(path) => {
+            ("Executable", Some(path.to_string_lossy().into_owned()))
+        }
+        ExternalToolLaunch::Association { handler_id } => ("Association", Some(handler_id.clone())),
+        ExternalToolLaunch::OsDefault => ("OsDefault", None),
+    }
+}
+
+fn external_tool_launch_from_storage(
+    kind: &str,
+    value: Option<String>,
+) -> Result<ExternalToolLaunch, SettingsDbError> {
+    match kind {
+        "Executable" => value
+            .map(PathBuf::from)
+            .map(ExternalToolLaunch::Executable)
+            .ok_or_else(|| {
+                SettingsDbError::Corrupted("Executable launch is missing its path".to_string())
+            }),
+        "Association" => value
+            .map(|handler_id| ExternalToolLaunch::Association { handler_id })
+            .ok_or_else(|| {
+                SettingsDbError::Corrupted(
+                    "Association launch is missing its handler id".to_string(),
+                )
+            }),
+        "OsDefault" if value.as_deref().is_none_or(str::is_empty) => {
+            Ok(ExternalToolLaunch::OsDefault)
+        }
+        "OsDefault" => Err(SettingsDbError::Corrupted(
+            "OsDefault launch unexpectedly has a value".to_string(),
+        )),
+        other => Err(SettingsDbError::Incompatible(format!(
+            "unknown external tool launch kind: {other}"
+        ))),
+    }
+}
+
 fn write_external_tools(
     tx: &rusqlite::Transaction<'_>,
     tools: &[ExternalTool],
@@ -2284,20 +2422,17 @@ fn write_external_tools(
     tx.execute("DELETE FROM external_tools", [])?;
     let mut stmt = tx.prepare(
         "INSERT INTO external_tools (
-            id, name, executable, arguments, working_directory,
+            id, name, launch_kind, launch_value, arguments, working_directory,
             payload, video, spread, selection, pdf_render_long_edge,
             for_editing, show_in_context_menu, keep_temp, sort_index
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     // パスは既存の recent/custom テーブルと同じく TEXT (UTF-8) で持つ。Windows の
     // ファイルダイアログが返すパスは有効な UTF-16 なので、ここで lossy になるのは
     // 手で不正な値を入れた場合だけ。その場合も spawn 時に「起動できません」として
     // 表面化するので、保存全体を失敗させるより局所化する方を採る。
     for (sort_index, tool) in tools.iter().enumerate() {
-        let executable = tool
-            .executable
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
+        let (launch_kind, launch_value) = external_tool_launch_storage(&tool.launch);
         let working_directory = tool
             .working_directory
             .as_ref()
@@ -2305,7 +2440,8 @@ fn write_external_tools(
         stmt.execute(params![
             i64::from(tool.id.0),
             tool.name,
-            executable,
+            launch_kind,
+            launch_value,
             tool.arguments,
             working_directory,
             payload_policy_text(tool.payload),
@@ -2325,7 +2461,8 @@ fn write_external_tools(
 struct ExternalToolRow {
     id: i64,
     name: String,
-    executable: Option<String>,
+    launch_kind: String,
+    launch_value: Option<String>,
     arguments: String,
     working_directory: Option<String>,
     payload: String,
@@ -2347,7 +2484,7 @@ where
 
 fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsDbError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, executable, arguments, working_directory,
+        "SELECT id, name, launch_kind, launch_value, arguments, working_directory,
                 payload, video, spread, selection, pdf_render_long_edge,
                 for_editing, show_in_context_menu, keep_temp
          FROM external_tools
@@ -2357,17 +2494,18 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
         Ok(ExternalToolRow {
             id: row.get(0)?,
             name: row.get(1)?,
-            executable: row.get(2)?,
-            arguments: row.get(3)?,
-            working_directory: row.get(4)?,
-            payload: row.get(5)?,
-            video: row.get(6)?,
-            spread: row.get(7)?,
-            selection: row.get(8)?,
-            pdf_render_long_edge: row.get(9)?,
-            for_editing: row.get(10)?,
-            show_in_context_menu: row.get(11)?,
-            keep_temp: row.get(12)?,
+            launch_kind: row.get(2)?,
+            launch_value: row.get(3)?,
+            arguments: row.get(4)?,
+            working_directory: row.get(5)?,
+            payload: row.get(6)?,
+            video: row.get(7)?,
+            spread: row.get(8)?,
+            selection: row.get(9)?,
+            pdf_render_long_edge: row.get(10)?,
+            for_editing: row.get(11)?,
+            show_in_context_menu: row.get(12)?,
+            keep_temp: row.get(13)?,
         })
     })?;
     let mut tools = Vec::new();
@@ -2385,7 +2523,7 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
         tools.push(ExternalTool {
             id: ExternalToolId(id),
             name: row.name,
-            executable: row.executable.map(PathBuf::from),
+            launch: external_tool_launch_from_storage(&row.launch_kind, row.launch_value)?,
             arguments: row.arguments,
             working_directory: row.working_directory.map(PathBuf::from),
             payload: parse_external_tool_enum(row.payload)?,
@@ -2401,13 +2539,13 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
     Ok(tools)
 }
 
-fn external_tools_from_legacy_apps(apps: &[RecentApp]) -> Vec<ExternalTool> {
+fn external_tools_from_legacy_apps(apps: &[LegacyOpenWithApp]) -> Vec<ExternalTool> {
     apps.iter()
         .enumerate()
         .map(|(index, app)| ExternalTool {
             id: ExternalToolId((index as u32) + 1),
             name: app.display_name.clone(),
-            executable: Some(PathBuf::from(&app.exe_path)),
+            launch: ExternalToolLaunch::Executable(PathBuf::from(&app.exe_path)),
             ..ExternalTool::defaults_for_viewing()
         })
         .collect()
@@ -2437,7 +2575,7 @@ fn migrate_external_tools_from_custom_open_with(
     let external_tool_count: i64 =
         tx.query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))?;
     let migrated = if external_tool_count == 0 {
-        let legacy_apps = read_recent_apps(&tx, "custom_open_with_apps")?;
+        let legacy_apps = read_legacy_open_with_apps(&tx)?;
         let tools = external_tools_from_legacy_apps(&legacy_apps);
         write_external_tools(&tx, &tools)?;
         !tools.is_empty()
@@ -2455,6 +2593,60 @@ fn migrate_external_tools_from_custom_open_with(
     Ok(migrated)
 }
 
+/// Classify released `recent_open_with_apps` rows exactly once.
+///
+/// `launch_kind IS NULL` is the row-level source of truth for legacy data. If the marker is
+/// lost after a successful migration, already classified rows are only validated and the
+/// marker is restored; filesystem changes therefore cannot silently change their launch kind.
+fn migrate_recent_open_with_launch(conn: &Connection) -> Result<bool, SettingsDbError> {
+    let tx = conn.unchecked_transaction()?;
+    let already_migrated = tx
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if already_migrated {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let mut stmt = tx.prepare(
+        "SELECT exe_path
+         FROM recent_open_with_apps
+         WHERE launch_kind IS NULL
+         ORDER BY sort_index ASC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut legacy_values = Vec::new();
+    for row in rows {
+        legacy_values.push(row?);
+    }
+    drop(stmt);
+
+    for stored_value in &legacy_values {
+        let launch = classify_legacy_recent_launch(stored_value, Path::new(stored_value).is_file());
+        let (launch_kind, _) = external_tool_launch_storage(&launch);
+        tx.execute(
+            "UPDATE recent_open_with_apps
+             SET launch_kind = ?1
+             WHERE exe_path = ?2 AND launch_kind IS NULL",
+            params![launch_kind, stored_value],
+        )?;
+    }
+
+    // Unknown future launch kinds must leave the marker absent and surface as Incompatible.
+    let _ = read_recent_apps(&tx)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+        params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(!legacy_values.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // load 側: 全テーブル → Settings
 // ---------------------------------------------------------------------------
@@ -2468,8 +2660,8 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let video_resume_positions = read_video_resume_positions(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
-    let recent_apps = read_recent_apps(conn, "recent_open_with_apps")?;
-    let custom_apps = read_recent_apps(conn, "custom_open_with_apps")?;
+    let recent_apps = read_recent_apps(conn)?;
+    let custom_apps = read_legacy_open_with_apps(conn)?;
     let external_tools = read_external_tools(conn)?;
 
     map.insert("favorites".into(), serde_json::to_value(favorites)?);
@@ -3693,9 +3885,9 @@ impl Drop for DataDirOverrideGuard {
 mod tests {
     use super::*;
     use crate::external_tool::{
-        PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
+        ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
     };
-    use crate::settings::{RecentApp, Settings, SortOrder, TagDef};
+    use crate::settings::{LegacyOpenWithApp, RecentApp, Settings, SortOrder, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -3749,12 +3941,12 @@ mod tests {
         });
         s.recent_open_with_apps = vec![RecentApp {
             display_name: "Editor".to_string(),
-            exe_path: r"C:\bin\edit.exe".to_string(),
+            launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\bin\edit.exe")),
         }];
         s.external_tools = vec![ExternalTool {
             id: ExternalToolId(12),
             name: "Photoshop".to_string(),
-            executable: Some(PathBuf::from(r"C:\bin\ps.exe")),
+            launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\bin\ps.exe")),
             ..ExternalTool::defaults_for_editing()
         }];
         s.detached_viewer_open_images_in_window = true;
@@ -3829,7 +4021,7 @@ mod tests {
             ExternalTool {
                 id: ExternalToolId(41),
                 name: "Editor A".to_string(),
-                executable: Some(PathBuf::from(r"C:\Tools\a.exe")),
+                launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\a.exe")),
                 arguments: "--edit {file}".to_string(),
                 working_directory: Some(PathBuf::from(r"C:\Work A")),
                 payload: PayloadPolicy::Original,
@@ -3844,7 +4036,9 @@ mod tests {
             ExternalTool {
                 id: ExternalToolId(7),
                 name: "Container Tool".to_string(),
-                executable: None,
+                launch: ExternalToolLaunch::Association {
+                    handler_id: "Container.App".to_string(),
+                },
                 arguments: "--container {file}".to_string(),
                 working_directory: None,
                 payload: PayloadPolicy::Container,
@@ -3859,7 +4053,7 @@ mod tests {
             ExternalTool {
                 id: ExternalToolId(90),
                 name: String::new(),
-                executable: Some(PathBuf::from(r"D:\Viewer\view.exe")),
+                launch: ExternalToolLaunch::OsDefault,
                 arguments: "{file} --readonly".to_string(),
                 working_directory: Some(PathBuf::from(r"D:\Viewer")),
                 payload: PayloadPolicy::RealFileOnly,
@@ -3898,6 +4092,20 @@ mod tests {
             .query_row(
                 "SELECT 1 FROM schema_meta WHERE key = ?1",
                 params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    fn recent_launch_migration_marker_present(db: &SettingsDb) -> bool {
+        let inner = db.inner.lock().unwrap();
+        inner
+            .conn
+            .query_row(
+                "SELECT 1 FROM schema_meta WHERE key = ?1",
+                params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
                 |_| Ok(()),
             )
             .optional()
@@ -4094,7 +4302,7 @@ mod tests {
     }
 
     #[test]
-    fn external_tools_roundtrip_preserves_order_and_every_field() {
+    fn external_tool_launch_three_kinds_roundtrip_with_every_field() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut settings = Settings::default();
         settings.external_tools = nondefault_external_tools();
@@ -4103,6 +4311,225 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
 
         assert_eq!(loaded.external_tools, settings.external_tools);
+        assert!(matches!(
+            loaded.external_tools[0].launch,
+            ExternalToolLaunch::Executable(_)
+        ));
+        assert!(matches!(
+            loaded.external_tools[1].launch,
+            ExternalToolLaunch::Association { .. }
+        ));
+        assert_eq!(
+            loaded.external_tools[2].launch,
+            ExternalToolLaunch::OsDefault
+        );
+    }
+
+    #[test]
+    fn init_schema_recreates_the_unreleased_external_tools_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO schema_meta(key, value)
+               VALUES ('external_tools_migrated_from_custom_open_with', '1');
+             CREATE TABLE external_tools (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                executable TEXT,
+                arguments TEXT NOT NULL,
+                working_directory TEXT,
+                payload TEXT NOT NULL,
+                video TEXT NOT NULL,
+                spread TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                pdf_render_long_edge INTEGER NOT NULL,
+                for_editing INTEGER NOT NULL,
+                show_in_context_menu INTEGER NOT NULL,
+                keep_temp INTEGER NOT NULL,
+                sort_index INTEGER NOT NULL
+             );
+             INSERT INTO external_tools
+               VALUES (1, 'Unreleased', 'C:\\old.exe', '{file}', NULL,
+                       'AsDisplayed', 'File', 'Merged', 'Single', 4096, 0, 1, 0, 0);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        assert!(table_has_column(&conn, "external_tools", "launch_kind").unwrap());
+        assert!(table_has_column(&conn, "external_tools", "launch_value").unwrap());
+        assert!(!table_has_column(&conn, "external_tools", "executable").unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let marker = conn
+            .query_row(
+                "SELECT 1 FROM schema_meta WHERE key = ?1",
+                params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap();
+        assert!(marker.is_none());
+    }
+
+    #[test]
+    fn released_recent_table_schema_is_extended_then_classified() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE recent_open_with_apps (
+                exe_path TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                sort_index INTEGER NOT NULL
+             );
+             INSERT INTO recent_open_with_apps(exe_path, display_name, sort_index)
+               VALUES ('フォト', 'フォト', 0);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        assert!(table_has_column(&conn, "recent_open_with_apps", "launch_kind").unwrap());
+        assert!(migrate_recent_open_with_launch(&conn).unwrap());
+
+        let stored_kind: String = conn
+            .query_row(
+                "SELECT launch_kind FROM recent_open_with_apps WHERE exe_path = 'フォト'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "Association");
+        let loaded = read_recent_apps(&conn).unwrap();
+        assert_eq!(
+            loaded[0].launch,
+            ExternalToolLaunch::Association {
+                handler_id: "フォト".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn recent_launch_migration_classifies_existing_non_path_and_missing_path() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("viewer.exe");
+        std::fs::write(&existing, b"test").unwrap();
+        let missing = dir.path().join("missing.exe");
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+                )
+                .unwrap();
+            inner
+                .conn
+                .execute("DELETE FROM recent_open_with_apps", [])
+                .unwrap();
+            for (index, (value, name)) in [
+                (existing.to_string_lossy().into_owned(), "Existing"),
+                ("フォト".to_string(), "Photos"),
+                (missing.to_string_lossy().into_owned(), "Missing"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO recent_open_with_apps
+                            (exe_path, display_name, sort_index, launch_kind)
+                         VALUES (?1, ?2, ?3, NULL)",
+                        params![value, name, index as i64],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(
+            loaded.recent_open_with_apps[0].launch,
+            ExternalToolLaunch::Executable(existing)
+        );
+        assert_eq!(
+            loaded.recent_open_with_apps[1].launch,
+            ExternalToolLaunch::Association {
+                handler_id: "フォト".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.recent_open_with_apps[2].launch,
+            ExternalToolLaunch::Association {
+                handler_id: missing.to_string_lossy().into_owned()
+            }
+        );
+        assert!(recent_launch_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn markerless_classified_recent_rows_are_not_classified_twice() {
+        let dir = TempDir::new().unwrap();
+        let late_file = dir.path().join("late-viewer.exe");
+        let stored_value = late_file.to_string_lossy().into_owned();
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute("DELETE FROM recent_open_with_apps", [])
+                .unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+                )
+                .unwrap();
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO recent_open_with_apps
+                        (exe_path, display_name, sort_index, launch_kind)
+                     VALUES (?1, 'Late', 0, NULL)",
+                    params![stored_value],
+                )
+                .unwrap();
+        }
+        let first = db.load_into_settings().unwrap();
+        assert!(matches!(
+            first.recent_open_with_apps[0].launch,
+            ExternalToolLaunch::Association { .. }
+        ));
+
+        std::fs::write(&late_file, b"now exists").unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+                )
+                .unwrap();
+        }
+
+        let reloaded = db.load_into_settings().unwrap();
+        assert_eq!(reloaded.recent_open_with_apps, first.recent_open_with_apps);
+        assert!(recent_launch_migration_marker_present(&db));
+        let inner = db.inner.lock().unwrap();
+        let stored_kind: String = inner
+            .conn
+            .query_row(
+                "SELECT launch_kind FROM recent_open_with_apps WHERE display_name = 'Late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "Association");
     }
 
     #[test]
@@ -4132,8 +4559,8 @@ mod tests {
         assert_eq!(loaded.external_tools[0].id, ExternalToolId(1));
         assert_eq!(loaded.external_tools[0].name, "First");
         assert_eq!(
-            loaded.external_tools[0].executable,
-            Some(PathBuf::from(r"C:\Tools\first.exe"))
+            loaded.external_tools[0].launch,
+            ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\first.exe"))
         );
         assert_eq!(loaded.external_tools[0].arguments, "{file}");
         assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
@@ -6018,7 +6445,7 @@ mod tests {
             .favorites
             .push(FavoriteEntry::new("Pics".into(), PathBuf::from(r"C:\Pics")));
         original.tags.push(TagDef::new("原神".into()));
-        original.custom_open_with_apps = vec![RecentApp {
+        original.custom_open_with_apps = vec![LegacyOpenWithApp {
             display_name: "Legacy Editor".to_string(),
             exe_path: r"C:\Legacy\editor.exe".to_string(),
         }];

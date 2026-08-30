@@ -2161,13 +2161,13 @@ impl crate::app::App {
             for recent in self.settings.recent_open_with_apps.clone() {
                 let label = format!("{}で開く", recent.display_name);
                 if ui.button(&label).clicked() {
-                    self.start_legacy_open_with(
+                    self.start_open_with(
                         recent.display_name.clone(),
-                        PathBuf::from(&recent.exe_path),
+                        recent.launch.clone(),
                         file_path.clone(),
                     );
                     self.settings
-                        .record_recent_open_with(recent.display_name, recent.exe_path);
+                        .record_recent_open_with(recent.display_name, recent.launch);
                     self.settings.save();
                     *close = true;
                     close_fullscreen = true;
@@ -2227,15 +2227,16 @@ impl crate::app::App {
                 };
                 for handler in &handlers {
                     if ui.button(&handler.display_name).clicked() {
-                        self.start_legacy_open_with(
+                        let launch = crate::external_tool::ExternalToolLaunch::Association {
+                            handler_id: handler.handler_id.clone(),
+                        };
+                        self.start_open_with(
                             handler.display_name.clone(),
-                            PathBuf::from(&handler.exe_path),
+                            launch.clone(),
                             file_path.clone(),
                         );
-                        self.settings.record_recent_open_with(
-                            handler.display_name.clone(),
-                            handler.exe_path.clone(),
-                        );
+                        self.settings
+                            .record_recent_open_with(handler.display_name.clone(), launch);
                         self.settings.save();
                         *close = true;
                         close_fullscreen = true;
@@ -2247,16 +2248,16 @@ impl crate::app::App {
             ui.separator();
             if ui.button("アプリケーションを追加…").clicked() {
                 if let Some(app) = crate::open_with::pick_exe_dialog() {
-                    let executable = PathBuf::from(&app.exe_path);
+                    let executable = app.executable;
                     let already = self
                         .settings
                         .external_tools
                         .iter()
-                        .filter_map(|tool| tool.executable.as_deref())
+                        .filter_map(|tool| tool.launch.executable())
                         .any(|path| {
                             path.as_os_str()
-                                .to_string_lossy()
-                                .eq_ignore_ascii_case(&app.exe_path)
+                                .as_encoded_bytes()
+                                .eq_ignore_ascii_case(executable.as_os_str().as_encoded_bytes())
                         });
                     if !already {
                         let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
@@ -2265,7 +2266,8 @@ impl crate::app::App {
                             .file_stem()
                             .map(|stem| stem.to_string_lossy().into_owned())
                             .unwrap_or(app.display_name);
-                        tool.executable = Some(executable);
+                        tool.launch =
+                            crate::external_tool::ExternalToolLaunch::Executable(executable);
                         tool.show_in_context_menu = true;
                         self.settings.external_tools.push(tool);
                         self.settings.save();

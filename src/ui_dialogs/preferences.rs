@@ -5,7 +5,7 @@
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -562,6 +562,45 @@ impl Drop for ExternalToolHandlersPending {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExternalToolLaunchCandidate {
+    pub display_name: String,
+    pub launch: crate::external_tool::ExternalToolLaunch,
+}
+
+/// リリース済み履歴を候補の先頭に保ち、現在の関連付け列挙結果を重複なく足す。
+///
+/// 履歴の `Executable` / `Association` 分類は一度きりの migration 結果なので、ここで
+/// ファイルシステムを見て再分類しない。
+fn merge_external_tool_launch_candidates(
+    recent: &[crate::settings::RecentApp],
+    handlers: &[crate::open_with::AppHandler],
+) -> Vec<ExternalToolLaunchCandidate> {
+    let mut candidates: Vec<_> = recent
+        .iter()
+        .map(|app| ExternalToolLaunchCandidate {
+            display_name: app.display_name.clone(),
+            launch: app.launch.clone(),
+        })
+        .collect();
+    for handler in handlers {
+        let launch = crate::external_tool::ExternalToolLaunch::Association {
+            handler_id: handler.handler_id.clone(),
+        };
+        if candidates
+            .iter()
+            .any(|candidate| candidate.launch.same_target(&launch))
+        {
+            continue;
+        }
+        candidates.push(ExternalToolLaunchCandidate {
+            display_name: handler.display_name.clone(),
+            launch,
+        });
+    }
+    candidates
+}
+
 pub(super) struct ExternalToolPathCheckResult {
     pub tool_id: crate::external_tool::ExternalToolId,
     pub executable: Option<Result<bool, String>>,
@@ -606,7 +645,7 @@ pub(crate) struct PreferencesState {
     external_tool_executable_input: String,
     external_tool_working_directory_input: String,
     external_tool_add_source: Option<ExternalToolAddSource>,
-    external_tool_handlers: Vec<crate::open_with::AppHandler>,
+    external_tool_candidates: Vec<ExternalToolLaunchCandidate>,
     external_tool_handlers_pending: Option<ExternalToolHandlersPending>,
     external_tool_handlers_for_editing: bool,
     external_tool_path_check_pending: Option<ExternalToolPathCheckPending>,
@@ -840,8 +879,8 @@ impl PreferencesState {
             return;
         };
         self.external_tool_executable_input = tool
-            .executable
-            .as_deref()
+            .launch
+            .executable()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         self.external_tool_working_directory_input = tool
@@ -868,19 +907,23 @@ impl PreferencesState {
         self.external_tool_path_check_due = Some((
             std::time::Instant::now() + delay,
             id,
-            tool.executable.clone(),
-            tool.working_directory.clone(),
+            tool.launch.executable().map(Path::to_path_buf),
+            tool.launch
+                .uses_process_options()
+                .then(|| tool.working_directory.clone())
+                .flatten(),
         ));
-        self.external_tool_executable_status = if tool.executable.is_some() {
+        self.external_tool_executable_status = if tool.launch.uses_process_options() {
             ExternalToolPathStatus::Checking
         } else {
             ExternalToolPathStatus::Unchecked
         };
-        self.external_tool_working_directory_status = if tool.working_directory.is_some() {
-            ExternalToolPathStatus::Checking
-        } else {
-            ExternalToolPathStatus::Unchecked
-        };
+        self.external_tool_working_directory_status =
+            if tool.launch.uses_process_options() && tool.working_directory.is_some() {
+                ExternalToolPathStatus::Checking
+            } else {
+                ExternalToolPathStatus::Unchecked
+            };
     }
 
     pub(super) fn start_external_tool_handler_enumeration(
@@ -888,6 +931,10 @@ impl PreferencesState {
         for_editing: bool,
         ctx: &egui::Context,
     ) {
+        self.external_tool_handlers_pending = None;
+        self.external_tool_candidates =
+            merge_external_tool_launch_candidates(&self.settings.recent_open_with_apps, &[]);
+        self.external_tool_handlers_for_editing = for_editing;
         let extension = self
             .external_tool_target
             .real_file()
@@ -901,9 +948,6 @@ impl PreferencesState {
             return;
         };
 
-        self.external_tool_handlers_pending = None;
-        self.external_tool_handlers.clear();
-        self.external_tool_handlers_for_editing = for_editing;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -1010,8 +1054,11 @@ impl PreferencesState {
         if let Some(result) = handlers_result {
             self.external_tool_handlers_pending = None;
             if let Some(handlers) = result {
-                self.external_tool_handlers = handlers;
-                if self.external_tool_handlers.is_empty() {
+                self.external_tool_candidates = merge_external_tool_launch_candidates(
+                    &self.settings.recent_open_with_apps,
+                    &handlers,
+                );
+                if self.external_tool_candidates.is_empty() {
                     self.external_tool_message =
                         Some("関連付けアプリが見つかりませんでした".to_string());
                 }
@@ -1120,7 +1167,7 @@ impl PreferencesState {
             external_tool_executable_input: String::new(),
             external_tool_working_directory_input: String::new(),
             external_tool_add_source: None,
-            external_tool_handlers: Vec::new(),
+            external_tool_candidates: Vec::new(),
             external_tool_handlers_pending: None,
             external_tool_handlers_for_editing: false,
             external_tool_path_check_pending: None,
@@ -3086,6 +3133,60 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_launch_candidates_keep_their_kind_and_precede_new_handlers() {
+        let recent = vec![
+            crate::settings::RecentApp {
+                display_name: "フォト".to_string(),
+                launch: crate::external_tool::ExternalToolLaunch::Association {
+                    handler_id: "Photos.App".to_string(),
+                },
+            },
+            crate::settings::RecentApp {
+                display_name: "Legacy editor".to_string(),
+                launch: crate::external_tool::ExternalToolLaunch::Executable(PathBuf::from(
+                    r"C:\Tools\viewer.exe",
+                )),
+            },
+        ];
+        let handlers = vec![
+            crate::open_with::AppHandler {
+                display_name: "Photos".to_string(),
+                handler_id: "photos.app".to_string(),
+            },
+            crate::open_with::AppHandler {
+                display_name: "Same legacy target".to_string(),
+                handler_id: r"c:\tools\VIEWER.exe".to_string(),
+            },
+            crate::open_with::AppHandler {
+                display_name: "Paint".to_string(),
+                handler_id: "Paint.App".to_string(),
+            },
+        ];
+
+        let candidates = merge_external_tool_launch_candidates(&recent, &handlers);
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].display_name, "フォト");
+        assert_eq!(candidates[0].launch, recent[0].launch);
+        assert_eq!(candidates[1].display_name, "Legacy editor");
+        assert_eq!(candidates[1].launch, recent[1].launch);
+        assert_eq!(
+            candidates[2],
+            ExternalToolLaunchCandidate {
+                display_name: "Paint".to_string(),
+                launch: crate::external_tool::ExternalToolLaunch::Association {
+                    handler_id: "Paint.App".to_string(),
+                },
+            }
+        );
+        assert_eq!(
+            merge_external_tool_launch_candidates(&recent, &[]).len(),
+            2,
+            "recent entries remain selectable even when Shell enumeration is empty"
+        );
+    }
 
     #[test]
     fn settings_page_add_applies_context_menu_default_at_ten_and_eleven() {

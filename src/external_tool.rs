@@ -28,6 +28,62 @@ const DEFERRED_PLACEHOLDERS: &[&str] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolId(pub u32);
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExternalToolLaunch {
+    Executable(PathBuf),
+    Association { handler_id: String },
+    OsDefault,
+}
+
+impl ExternalToolLaunch {
+    pub fn executable(&self) -> Option<&Path> {
+        match self {
+            Self::Executable(path) => Some(path),
+            Self::Association { .. } | Self::OsDefault => None,
+        }
+    }
+
+    pub fn uses_process_options(&self) -> bool {
+        matches!(self, Self::Executable(_))
+    }
+
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Executable(left), Self::Executable(right)) => left
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(right.as_os_str().as_encoded_bytes()),
+            (Self::Association { handler_id: left }, Self::Association { handler_id: right }) => {
+                left.eq_ignore_ascii_case(right)
+            }
+            (Self::Executable(path), Self::Association { handler_id })
+            | (Self::Association { handler_id }, Self::Executable(path)) => path
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(handler_id.as_bytes()),
+            (Self::OsDefault, Self::OsDefault) => true,
+            _ => false,
+        }
+    }
+}
+
+/// リリース済み `recent_open_with_apps.exe_path` の値を起動種別へ分類する。
+///
+/// ファイルシステム参照は呼び出し側が済ませ、結果だけを渡す。これにより分類規則を
+/// migration と旧 JSON 読み込みで共有しつつ、純関数として検証できる。
+pub(crate) fn classify_legacy_recent_launch(
+    stored_value: &str,
+    is_existing_file: bool,
+) -> ExternalToolLaunch {
+    if is_existing_file {
+        ExternalToolLaunch::Executable(PathBuf::from(stored_value))
+    } else {
+        ExternalToolLaunch::Association {
+            handler_id: stored_value.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PayloadPolicy {
     #[default]
@@ -64,7 +120,7 @@ pub enum SelectionPolicy {
 pub struct ExternalTool {
     pub id: ExternalToolId,
     pub name: String,
-    pub executable: Option<PathBuf>,
+    pub launch: ExternalToolLaunch,
     pub arguments: String,
     pub working_directory: Option<PathBuf>,
     pub payload: PayloadPolicy,
@@ -165,7 +221,7 @@ impl PlaceholderContext {
 #[derive(Debug)]
 pub(crate) struct ExternalLaunchRequest {
     pub tool_name: String,
-    pub executable: Option<PathBuf>,
+    pub launch: ExternalToolLaunch,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub file: PathBuf,
@@ -194,8 +250,8 @@ impl ExternalTool {
             return self.name.clone();
         }
         if let Some(stem) = self
-            .executable
-            .as_deref()
+            .launch
+            .executable()
             .and_then(|path| path.file_stem())
             .filter(|stem| !stem.is_empty())
         {
@@ -204,11 +260,26 @@ impl ExternalTool {
         ASSOCIATED_APP_DISPLAY_NAME.to_string()
     }
 
+    pub fn launch_description(&self) -> String {
+        match &self.launch {
+            ExternalToolLaunch::Executable(path) => path.display().to_string(),
+            ExternalToolLaunch::Association { handler_id } => {
+                let name = if self.name.is_empty() {
+                    handler_id
+                } else {
+                    &self.name
+                };
+                format!("関連付けアプリ ({name})")
+            }
+            ExternalToolLaunch::OsDefault => "OS の関連付け".to_string(),
+        }
+    }
+
     pub fn defaults_for_viewing() -> Self {
         Self {
             id: ExternalToolId(1),
             name: String::new(),
-            executable: None,
+            launch: ExternalToolLaunch::OsDefault,
             arguments: "{file}".to_string(),
             working_directory: None,
             payload: PayloadPolicy::AsDisplayed,
@@ -476,7 +547,7 @@ pub(crate) fn build_launch_request(
     target: &LaunchTarget,
 ) -> Result<ExternalLaunchRequest, String> {
     let file = target.real_file()?.to_path_buf();
-    let arguments = if tool.executable.is_some() {
+    let arguments = if tool.launch.uses_process_options() {
         let tokens = split_argument_template(&tool.arguments);
         expand_arguments(&tokens, &PlaceholderContext::for_file(&file))
     } else {
@@ -484,29 +555,37 @@ pub(crate) fn build_launch_request(
     };
     Ok(ExternalLaunchRequest {
         tool_name: tool.display_name(),
-        executable: tool.executable.clone(),
+        launch: tool.launch.clone(),
         arguments,
-        working_directory: tool.executable.as_ref().and(tool.working_directory.clone()),
+        working_directory: tool
+            .launch
+            .uses_process_options()
+            .then(|| tool.working_directory.clone())
+            .flatten(),
         file,
     })
 }
 
-pub(crate) fn build_legacy_launch_request(
+pub(crate) fn build_open_with_launch_request(
     tool_name: String,
-    executable: PathBuf,
+    launch: ExternalToolLaunch,
     file: PathBuf,
 ) -> ExternalLaunchRequest {
+    let arguments = match &launch {
+        ExternalToolLaunch::Executable(_) => vec![file.as_os_str().to_os_string()],
+        ExternalToolLaunch::Association { .. } | ExternalToolLaunch::OsDefault => Vec::new(),
+    };
     ExternalLaunchRequest {
         tool_name,
-        executable: Some(executable),
-        arguments: vec![file.as_os_str().to_os_string()],
+        launch,
+        arguments,
         working_directory: None,
         file,
     }
 }
 
 pub(crate) fn executable_requires_confirmation(request: &ExternalLaunchRequest) -> bool {
-    request.executable.as_ref().is_some_and(|path| {
+    request.launch.executable().is_some_and(|path| {
         path.as_os_str()
             .as_encoded_bytes()
             .first()
@@ -537,28 +616,38 @@ pub(crate) fn start_launch_worker(
 }
 
 fn launch_request(request: ExternalLaunchRequest) -> Result<(), String> {
-    if let Some(executable) = request.executable {
-        let mut command = Command::new(executable);
-        command
-            .args(request.arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(directory) = request.working_directory {
-            command.current_dir(directory);
+    match request.launch {
+        ExternalToolLaunch::Executable(executable) => {
+            let mut command = Command::new(executable);
+            command
+                .args(request.arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(directory) = request.working_directory {
+                command.current_dir(directory);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            command
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(CREATE_NO_WINDOW);
+        ExternalToolLaunch::Association { handler_id } => {
+            crate::open_with::invoke_association_handler(&handler_id, &request.file)
         }
-        command
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    } else {
-        opener::open(request.file).map_err(|error| error.to_string())
+        ExternalToolLaunch::OsDefault => {
+            opener::open(request.file).map_err(|error| error.to_string())
+        }
     }
+}
+
+fn external_launch_error_message(tool_name: &str, error: &str) -> String {
+    format!("{tool_name}: {error}")
 }
 
 impl crate::app::App {
@@ -581,16 +670,17 @@ impl crate::app::App {
         }
     }
 
-    pub(crate) fn start_legacy_open_with(
+    pub(crate) fn start_open_with(
         &mut self,
         display_name: String,
-        executable: PathBuf,
+        launch: ExternalToolLaunch,
         file: PathBuf,
     ) {
-        match crate::open_with::launch_with_app(display_name.clone(), executable.as_os_str(), &file)
-        {
-            Ok(pending) => self.external_tool_launch_pending.push(pending),
-            Err(error) => self.show_feedback_toast(format!("{display_name}: {error}")),
+        let request = build_open_with_launch_request(display_name.clone(), launch, file);
+        if executable_requires_confirmation(&request) {
+            self.external_tool_launch_confirmation = Some(request);
+        } else {
+            self.start_external_launch_request(request);
         }
     }
 
@@ -627,9 +717,10 @@ impl crate::app::App {
                     Ok(()) => {
                         self.show_feedback_toast(format!("{} を起動しました", result.tool_name))
                     }
-                    Err(error) => {
-                        self.show_feedback_toast(format!("{}: {error}", result.tool_name))
-                    }
+                    Err(error) => self.show_feedback_toast(external_launch_error_message(
+                        &result.tool_name,
+                        &error,
+                    )),
                 },
                 // worker が結果を送らずに落ちた (panic 等)。黙って消すと「押したのに
                 // 何も起きない」になるので、起きたことは伝える。
@@ -648,8 +739,8 @@ impl crate::app::App {
         };
         let tool_name = request.tool_name.clone();
         let executable = request
-            .executable
-            .as_deref()
+            .launch
+            .executable()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         let mut launch = false;
@@ -697,13 +788,15 @@ mod tests {
     fn display_name_uses_name_then_executable_stem_then_association_label() {
         let mut tool = ExternalTool::defaults_for_viewing();
         tool.name = "画像編集".to_string();
-        tool.executable = Some(PathBuf::from(r"C:\Tools\editor.exe"));
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\editor.exe"));
         assert_eq!(tool.display_name(), "画像編集");
 
         tool.name.clear();
         assert_eq!(tool.display_name(), "editor");
 
-        tool.executable = None;
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "Photos.App".to_string(),
+        };
         assert_eq!(tool.display_name(), ASSOCIATED_APP_DISPLAY_NAME);
     }
 
@@ -724,6 +817,7 @@ mod tests {
         assert_eq!(tool.video, VideoPolicy::File);
         assert_eq!(tool.spread, SpreadPolicy::Merged);
         assert_eq!(tool.selection, SelectionPolicy::Single);
+        assert_eq!(tool.launch, ExternalToolLaunch::OsDefault);
         assert!(!tool.for_editing);
         assert!(tool.show_in_context_menu);
         assert!(!tool.keep_temp);
@@ -768,7 +862,7 @@ mod tests {
         ExternalTool {
             id: ExternalToolId(id),
             name: name.to_string(),
-            executable: Some(PathBuf::from(format!(r"C:\Tools\{name}.exe"))),
+            launch: ExternalToolLaunch::Executable(PathBuf::from(format!(r"C:\Tools\{name}.exe"))),
             for_editing,
             show_in_context_menu: shown,
             ..ExternalTool::defaults_for_viewing()
@@ -939,16 +1033,88 @@ mod tests {
     }
 
     #[test]
-    fn build_request_rejects_virtual_targets_and_ignores_association_arguments() {
-        let tool = ExternalTool::defaults_for_viewing();
+    fn build_request_rejects_virtual_targets_and_ignores_shell_launch_arguments() {
+        let mut tool = ExternalTool::defaults_for_viewing();
         assert!(build_launch_request(&tool, &LaunchTarget::UnsupportedVirtual).is_err());
-        let request = build_launch_request(
-            &tool,
-            &LaunchTarget::RealFile(PathBuf::from(r"C:\image.png")),
-        )
-        .unwrap();
-        assert!(request.arguments.is_empty());
-        assert!(request.working_directory.is_none());
+        tool.arguments = "--ignored {file}".to_string();
+        tool.working_directory = Some(PathBuf::from(r"C:\ignored"));
+        let target = LaunchTarget::RealFile(PathBuf::from(r"C:\image.png"));
+
+        for launch in [
+            ExternalToolLaunch::Association {
+                handler_id: "Photos.App".to_string(),
+            },
+            ExternalToolLaunch::OsDefault,
+        ] {
+            tool.launch = launch.clone();
+            let request = build_launch_request(&tool, &target).unwrap();
+            assert_eq!(request.launch, launch);
+            assert!(request.arguments.is_empty());
+            assert!(request.working_directory.is_none());
+        }
+
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        let request = build_launch_request(&tool, &target).unwrap();
+        assert_eq!(
+            request.arguments,
+            [OsString::from("--ignored"), OsString::from(r"C:\image.png")]
+        );
+        assert_eq!(
+            request.working_directory,
+            Some(PathBuf::from(r"C:\ignored"))
+        );
+    }
+
+    #[test]
+    fn legacy_recent_classification_is_pure_for_all_three_reported_shapes() {
+        assert_eq!(
+            classify_legacy_recent_launch(r"C:\Tools\viewer.exe", true),
+            ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"))
+        );
+        assert_eq!(
+            classify_legacy_recent_launch("フォト", false),
+            ExternalToolLaunch::Association {
+                handler_id: "フォト".to_string()
+            }
+        );
+        assert_eq!(
+            classify_legacy_recent_launch(r"C:\Missing\viewer.exe", false),
+            ExternalToolLaunch::Association {
+                handler_id: r"C:\Missing\viewer.exe".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn launch_descriptions_make_non_executable_kinds_explicit() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        assert_eq!(tool.launch_description(), "OS の関連付け");
+        tool.name = "フォト".to_string();
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "Photos.App".to_string(),
+        };
+        assert_eq!(tool.launch_description(), "関連付けアプリ (フォト)");
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        assert_eq!(tool.launch_description(), r"C:\Tools\viewer.exe");
+    }
+
+    #[test]
+    fn external_launch_error_message_includes_the_tool_name() {
+        assert_eq!(
+            external_launch_error_message("フォト", "関連付けアプリが見つかりません"),
+            "フォト: 関連付けアプリが見つかりません"
+        );
+    }
+
+    #[test]
+    fn recent_identity_replaces_a_legacy_executable_with_the_same_handler_id() {
+        let executable = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        let association = ExternalToolLaunch::Association {
+            handler_id: r"c:\tools\VIEWER.exe".to_string(),
+        };
+        assert!(executable.same_target(&association));
+        assert!(association.same_target(&executable));
+        assert!(!executable.same_target(&ExternalToolLaunch::OsDefault));
     }
 
     #[cfg(windows)]

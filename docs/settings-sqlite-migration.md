@@ -319,7 +319,8 @@ CREATE TABLE vst3_chain_slots (
 CREATE TABLE recent_open_with_apps (
     exe_path      TEXT PRIMARY KEY,
     display_name  TEXT NOT NULL,
-    sort_index    INTEGER NOT NULL
+    sort_index    INTEGER NOT NULL,
+    launch_kind   TEXT                 -- Executable / Association / OsDefault
 );
 CREATE INDEX recent_apps_sort ON recent_open_with_apps(sort_index);
 
@@ -334,7 +335,8 @@ CREATE INDEX custom_apps_sort ON custom_open_with_apps(sort_index);
 CREATE TABLE external_tools (
     id                   INTEGER PRIMARY KEY,
     name                 TEXT NOT NULL,
-    executable           TEXT,
+    launch_kind          TEXT NOT NULL, -- Executable / Association / OsDefault
+    launch_value         TEXT,          -- EXE path / handler ID / NULL
     arguments            TEXT NOT NULL,
     working_directory    TEXT,
     payload              TEXT NOT NULL,
@@ -354,6 +356,17 @@ CREATE INDEX external_tools_sort ON external_tools(sort_index);
 `schema_meta.external_tools_migrated_from_custom_open_with = '1'` が無い場合だけ、
 `sort_index` 順に `external_tools` へ変換し、行と marker を同じ transaction で commit する。
 marker が失われても `external_tools` に行があれば追加移行せず、二重登録を防ぐ。
+
+`recent_open_with_apps.exe_path` はリリース済み列名なので、P1c 後も起動値の carrier として残す。
+既存テーブルへ nullable `launch_kind` を追加し、
+`schema_meta.recent_open_with_apps_launch_classified = '1'` が無い場合だけ、未分類
+(`launch_kind IS NULL`) の各行を分類する。実在するファイルなら `Executable`、それ以外は
+`Association` とし、更新と marker を同じ transaction で commit する。marker が失われても
+非 NULL の行は再分類しないため、後から同名パスが作られても起動種別は変わらない。
+
+`external_tools` は P1c 時点で未出荷だったため、旧 `executable` schema からのデータ移行は行わず
+テーブルを新 schema へ作り直す。released source の `custom_open_with_apps` は残っているため、
+既存の一度きり移行を再実行して `Executable` として登録し直す。
 
 ### 4.1 PRAGMA 設定 (open 時)
 

@@ -505,13 +505,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     if ui.selectable_label(selected, tool.display_name()).clicked() {
                         state.select_external_tool(Some(tool.id));
                     }
-                    ui.label(
-                        tool.executable
-                            .as_deref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "OS の関連付け".to_string()),
-                    );
-                    ui.label(if tool.executable.is_some() {
+                    ui.label(tool.launch_description());
+                    ui.label(if tool.launch.uses_process_options() {
                         tool.arguments.as_str()
                     } else {
                         "-"
@@ -611,7 +606,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.end_row();
 
             ui.label("実行ファイル");
-            if tool.executable.is_some() {
+            if tool.launch.uses_process_options() {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
                     &mut state.external_tool_executable_input,
@@ -624,16 +619,18 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     &mut state.external_tool_executable_input,
                 );
                 if output.response.changed() || menu_changed {
-                    tool.executable = Some(PathBuf::from(&state.external_tool_executable_input));
+                    tool.launch = crate::external_tool::ExternalToolLaunch::Executable(
+                        PathBuf::from(&state.external_tool_executable_input),
+                    );
                     state.external_tool_executable_status = ExternalToolPathStatus::Checking;
                 }
             } else {
-                ui.add_enabled(false, egui::Label::new("OS の関連付け"));
+                ui.add_enabled(false, egui::Label::new(tool.launch_description()));
             }
             ui.end_row();
 
             ui.label("引数");
-            ui.add_enabled_ui(tool.executable.is_some(), |ui| {
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
                 crate::ime_focus::add_singleline(ui, &mut tool.arguments, None, |edit| {
                     edit.desired_width(360.0)
                 });
@@ -641,7 +638,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.end_row();
 
             ui.label("作業フォルダー");
-            ui.add_enabled_ui(tool.executable.is_some(), |ui| {
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
                     &mut state.external_tool_working_directory_input,
@@ -750,11 +747,11 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         ui.checkbox(&mut tool.keep_temp, "一時ファイルを残す");
     });
 
-    let executable_changed = tool.executable != state.settings.external_tools[index].executable;
+    let launch_changed = tool.launch != state.settings.external_tools[index].launch;
     let working_directory_changed =
         tool.working_directory != state.settings.external_tools[index].working_directory;
     state.settings.external_tools[index] = tool.clone();
-    if executable_changed || working_directory_changed {
+    if launch_changed || working_directory_changed {
         state.schedule_external_tool_path_check(std::time::Duration::from_millis(300));
     }
 
@@ -765,7 +762,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         &state.external_tool_working_directory_status,
     );
 
-    if tool.executable.is_some() {
+    if tool.launch.uses_process_options() {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
         ui.label("{file}  {dir}  {name}  {stem}  {ext}  {uri}");
@@ -775,13 +772,25 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     match crate::external_tool::build_launch_request(&tool, &state.external_tool_target) {
         Ok(request) => {
             ui.label(egui::RichText::new("現在の対象での引数プレビュー").strong());
-            if request.executable.is_none() {
-                ui.label("OS の関連付けでファイルを開きます");
-            } else if request.arguments.is_empty() {
-                ui.label("(引数なし)");
-            } else {
-                for (position, argument) in request.arguments.iter().enumerate() {
-                    ui.monospace(format!("{}: {}", position + 1, argument.to_string_lossy()));
+            match &request.launch {
+                crate::external_tool::ExternalToolLaunch::Association { .. } => {
+                    ui.label(format!("{}でファイルを開きます", tool.launch_description()));
+                }
+                crate::external_tool::ExternalToolLaunch::OsDefault => {
+                    ui.label("OS の関連付けでファイルを開きます");
+                }
+                crate::external_tool::ExternalToolLaunch::Executable(_) => {
+                    if request.arguments.is_empty() {
+                        ui.label("(引数なし)");
+                    } else {
+                        for (position, argument) in request.arguments.iter().enumerate() {
+                            ui.monospace(format!(
+                                "{}: {}",
+                                position + 1,
+                                argument.to_string_lossy()
+                            ));
+                        }
+                    }
                 }
             }
             if ui.button("現在の実ファイルで起動して確認").clicked() {
@@ -854,7 +863,8 @@ fn draw_external_tool_add_purpose(ctx: &egui::Context, state: &mut PreferencesSt
                         crate::external_tool::ExternalTool::defaults_for_viewing()
                     };
                     tool.name = handler.display_name;
-                    tool.executable = Some(PathBuf::from(handler.exe_path));
+                    tool.launch =
+                        crate::external_tool::ExternalToolLaunch::Executable(handler.executable);
                     state.add_external_tool(tool);
                 }
             }
@@ -875,7 +885,7 @@ fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut Preferences
         });
         return;
     }
-    if state.external_tool_handlers.is_empty() {
+    if state.external_tool_candidates.is_empty() {
         return;
     }
     ui.group(|ui| {
@@ -887,20 +897,20 @@ fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut Preferences
                 crate::external_tool::ExternalTool::defaults_for_viewing()
             };
             state.add_external_tool(tool);
-            state.external_tool_handlers.clear();
+            state.external_tool_candidates.clear();
         }
-        let handlers = state.external_tool_handlers.clone();
-        for handler in handlers {
-            if ui.button(&handler.display_name).clicked() {
+        let candidates = state.external_tool_candidates.clone();
+        for candidate in candidates {
+            if ui.button(&candidate.display_name).clicked() {
                 let mut tool = if state.external_tool_handlers_for_editing {
                     crate::external_tool::ExternalTool::defaults_for_editing()
                 } else {
                     crate::external_tool::ExternalTool::defaults_for_viewing()
                 };
-                tool.name = handler.display_name;
-                tool.executable = Some(PathBuf::from(handler.exe_path));
+                tool.name = candidate.display_name;
+                tool.launch = candidate.launch;
                 state.add_external_tool(tool);
-                state.external_tool_handlers.clear();
+                state.external_tool_candidates.clear();
                 break;
             }
         }

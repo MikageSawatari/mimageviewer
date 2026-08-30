@@ -3155,10 +3155,56 @@ impl FullscreenJumpMode {
 // RecentApp (アプリケーションで開く 履歴)
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RecentApp {
     pub display_name: String,
+    pub launch: crate::external_tool::ExternalToolLaunch,
+}
+
+/// リリース済み `custom_open_with_apps` の読み取り専用キャリア。
+///
+/// このリストは利用者が明示的に選んだ EXE だけなので、現在そのファイルが存在するかに
+/// 関係なく `ExternalToolLaunch::Executable` へ移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LegacyOpenWithApp {
+    pub display_name: String,
     pub exe_path: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RecentAppSerde {
+    Current(RecentApp),
+    Legacy {
+        display_name: String,
+        exe_path: String,
+    },
+}
+
+fn deserialize_recent_open_with_apps<'de, D>(deserializer: D) -> Result<Vec<RecentApp>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = <Vec<RecentAppSerde> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|app| match app {
+            RecentAppSerde::Current(app) => app,
+            RecentAppSerde::Legacy {
+                display_name,
+                exe_path,
+            } => {
+                let is_existing_file = Path::new(&exe_path).is_file();
+                RecentApp {
+                    display_name,
+                    launch: crate::external_tool::classify_legacy_recent_launch(
+                        &exe_path,
+                        is_existing_file,
+                    ),
+                }
+            }
+        })
+        .collect())
 }
 
 // -----------------------------------------------------------------------
@@ -4322,12 +4368,12 @@ pub struct Settings {
     // ── アプリケーションで開く ──────────────────────────────────
     /// 最近使ったアプリケーション（最大3件、最新が先頭）。
     /// 次リリースまでの legacy 候補リストで、外部ツール UI 移行後に削除予定。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_recent_open_with_apps")]
     pub recent_open_with_apps: Vec<RecentApp>,
     /// ユーザーが手動で追加した legacy アプリケーション。
     /// `external_tools` への移行元として読むだけで、以後は書かない。次リリース後に削除予定。
     #[serde(default)]
-    pub custom_open_with_apps: Vec<RecentApp>,
+    pub custom_open_with_apps: Vec<LegacyOpenWithApp>,
     /// 安定 ID 付きの外部ツール登録。表示順は Vec の順序。
     #[serde(default)]
     pub external_tools: Vec<crate::external_tool::ExternalTool>,
@@ -8183,16 +8229,20 @@ impl Settings {
     }
 
     /// 「アプリケーションで開く」で使用したアプリを履歴に記録する。
-    /// 同じ exe_path が既にあれば先頭に移動。最大3件。
-    pub fn record_recent_open_with(&mut self, display_name: String, exe_path: String) {
+    /// 同じ起動先が既にあれば先頭に移動。最大3件。
+    pub fn record_recent_open_with(
+        &mut self,
+        display_name: String,
+        launch: crate::external_tool::ExternalToolLaunch,
+    ) {
         const MAX_RECENT_OPEN_WITH: usize = 3;
         self.recent_open_with_apps
-            .retain(|a| !a.exe_path.eq_ignore_ascii_case(&exe_path));
+            .retain(|app| !app.launch.same_target(&launch));
         self.recent_open_with_apps.insert(
             0,
             RecentApp {
                 display_name,
-                exe_path,
+                launch,
             },
         );
         self.recent_open_with_apps.truncate(MAX_RECENT_OPEN_WITH);
@@ -10498,6 +10548,80 @@ mod tests {
             crate::external_tool::ExternalToolId(23)
         );
         assert_eq!(edited.external_tools[0].name, "Edited Tool");
+    }
+
+    #[test]
+    fn legacy_json_open_with_shapes_deserialize_with_context_specific_rules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let existing = dir.path().join("editor.exe");
+        std::fs::write(&existing, b"test").unwrap();
+        let missing_custom = dir.path().join("missing-custom.exe");
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let map = value.as_object_mut().unwrap();
+        map.insert(
+            "recent_open_with_apps".to_string(),
+            serde_json::json!([
+                {
+                    "display_name": "Editor",
+                    "exe_path": existing.to_string_lossy()
+                },
+                {
+                    "display_name": "フォト",
+                    "exe_path": "フォト"
+                }
+            ]),
+        );
+        map.insert(
+            "custom_open_with_apps".to_string(),
+            serde_json::json!([{
+                "display_name": "Missing custom editor",
+                "exe_path": missing_custom.to_string_lossy()
+            }]),
+        );
+
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            loaded.recent_open_with_apps[0].launch,
+            crate::external_tool::ExternalToolLaunch::Executable(existing)
+        );
+        assert_eq!(
+            loaded.recent_open_with_apps[1].launch,
+            crate::external_tool::ExternalToolLaunch::Association {
+                handler_id: "フォト".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.custom_open_with_apps,
+            vec![LegacyOpenWithApp {
+                display_name: "Missing custom editor".to_string(),
+                exe_path: missing_custom.to_string_lossy().into_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn recording_a_handler_replaces_the_same_legacy_executable_identity() {
+        let mut settings = Settings::default();
+        settings.record_recent_open_with(
+            "Legacy".to_string(),
+            crate::external_tool::ExternalToolLaunch::Executable(PathBuf::from(
+                r"C:\Tools\viewer.exe",
+            )),
+        );
+        settings.record_recent_open_with(
+            "Shell".to_string(),
+            crate::external_tool::ExternalToolLaunch::Association {
+                handler_id: r"c:\tools\VIEWER.exe".to_string(),
+            },
+        );
+
+        assert_eq!(settings.recent_open_with_apps.len(), 1);
+        assert_eq!(settings.recent_open_with_apps[0].display_name, "Shell");
+        assert!(matches!(
+            settings.recent_open_with_apps[0].launch,
+            crate::external_tool::ExternalToolLaunch::Association { .. }
+        ));
     }
 
     #[test]
