@@ -3253,7 +3253,6 @@ pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect)
 #[derive(Default)]
 struct DetachedImageWindowEventBatch {
     close_ids: Vec<u64>,
-    close_command_ids: Vec<u64>,
     activate_ids: Vec<u64>,
     placements: Vec<(u64, crate::settings::DetachedViewerWindowPlacement)>,
     focus_updates: Vec<(u64, bool)>,
@@ -11824,7 +11823,6 @@ impl App {
                 let window_placement =
                     self.ensure_detached_window_runtime_placement(id, "deferred_passive_event");
                 if bar_close_requested {
-                    batch.close_command_ids.push(id);
                     batch.close_ids.push(id);
                 } else if viewport_close_requested {
                     batch.close_ids.push(id);
@@ -12091,13 +12089,10 @@ impl App {
         }
         batch.close_ids.sort_unstable();
         batch.close_ids.dedup();
-        batch.close_command_ids.sort_unstable();
-        batch.close_command_ids.dedup();
         if !batch.close_ids.is_empty() {
             self.close_detached_image_windows_by_ids(
                 ctx,
                 &batch.close_ids,
-                &batch.close_command_ids,
                 "passive_close",
                 Some(&batch.activate_ids),
             );
@@ -12163,7 +12158,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         close_ids: &[u64],
-        close_command_ids: &[u64],
         reason: &'static str,
         activate_ids: Option<&[u64]>,
     ) {
@@ -12173,20 +12167,14 @@ impl App {
         let mut close_ids = close_ids.to_vec();
         close_ids.sort_unstable();
         close_ids.dedup();
-        let mut close_command_ids = close_command_ids.to_vec();
-        close_command_ids.sort_unstable();
-        close_command_ids.dedup();
         let activate_ids = activate_ids.unwrap_or(&[]);
         self.log_detached_image_window_debug(format!(
-            "{reason} ids={:?} command_ids={:?} passive_before={} activate_ids={:?}",
+            "{reason} ids={:?} passive_before={} activate_ids={:?}",
             close_ids,
-            close_command_ids,
             self.detached_image_windows.len(),
             activate_ids
         ));
-        if !close_command_ids.is_empty() {
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-        }
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
         for id in &close_ids {
             self.transition_detached_window_state(
                 *id,
@@ -12199,10 +12187,6 @@ impl App {
                 ));
             }
         }
-        for id in &close_command_ids {
-            let viewport_id = Self::detached_image_window_viewport_id(*id);
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-        }
         self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
@@ -12211,6 +12195,7 @@ impl App {
             self.deferred_detached_image_window_views.remove(id);
         }
         self.focus_main_after_detached_window_close_if_idle(ctx, reason);
+        ctx.request_repaint();
     }
 
     #[cfg(all(windows, test))]
@@ -12280,21 +12265,6 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
-        let pending_close_ids: Vec<u64> =
-            self.detached_image_window_close_pending.drain(..).collect();
-        if !pending_close_ids.is_empty() {
-            self.log_detached_image_window_debug(format!(
-                "pending_close ids={pending_close_ids:?} passive_windows={} active_context={}",
-                self.detached_image_windows.len(),
-                self.active_detached_context_is_at_rest()
-            ));
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-        }
-        for id in pending_close_ids {
-            let viewport_id = Self::detached_image_window_viewport_id(id);
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
-        }
-
         // Active -> Passive handoff は OS window を閉じず同じ ViewportId を引き継ぐ。
         // active 静止画が auto-hide 中だった場合の window 単位 cursor flag を、passive
         // renderer を登録する前に 1 回だけ表示へ戻す。
@@ -12695,7 +12665,6 @@ impl App {
             }
 
             if bar_close_requested {
-                render_batch.close_command_ids.push(window.id);
                 render_batch.close_ids.push(window.id);
             } else if viewport_close_requested {
                 render_batch.close_ids.push(window.id);

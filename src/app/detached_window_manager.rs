@@ -718,6 +718,16 @@ impl DetachedWindowManager {
         self.runtime(window_id).map(|runtime| runtime.state)
     }
 
+    /// Returns whether `window_id` still names a reusable detached-window lease.
+    ///
+    /// A terminally retired lease has no runtime. `Closing` is terminal too, even
+    /// before its runtime is removed, so neither case may be recycled for a new
+    /// viewport incarnation.
+    pub(super) fn reusable_session_lease(&self, window_id: u64) -> bool {
+        self.runtime(window_id)
+            .is_some_and(|runtime| runtime.state != DetachedWindowState::Closing)
+    }
+
     pub(super) fn set_linked(
         &mut self,
         window_id: u64,
@@ -843,15 +853,6 @@ impl DetachedWindowManager {
                 false
             }
         }
-    }
-
-    pub(super) fn restore_activation_intent(
-        &mut self,
-        window_id: u64,
-        intent: DetachedActivationIntent,
-        default_linked: bool,
-    ) {
-        self.entry_mut(window_id, default_linked).activation_intent = Some(intent);
     }
 
     pub(super) fn take_pending_right_drag_execution(
@@ -1104,6 +1105,26 @@ mod tests {
             manager.resolve_input_surface(false, Some(10), Some(10), true),
             ActionSurface::Viewer
         );
+    }
+
+    #[test]
+    fn reusable_session_lease_requires_a_live_non_closing_runtime() {
+        const WINDOW_ID: u64 = 7;
+
+        let mut manager = DetachedWindowManager::new();
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Opening, false);
+        assert!(manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Parked, false);
+        assert!(manager.reusable_session_lease(WINDOW_ID));
+
+        manager.transition_state(WINDOW_ID, DetachedWindowState::Closing, false);
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
+
+        manager.remove(WINDOW_ID);
+        assert!(!manager.reusable_session_lease(WINDOW_ID));
     }
 
     #[test]

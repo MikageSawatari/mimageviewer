@@ -1459,6 +1459,62 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-30 detached close identity を、内部 teardown と利用者 OS close の発生源ではなく
+session lease の寿命で分離する (v3.3.0 出荷前レビュー close identity。ClaudeCode / Codex
+双方が第三案を構造的修正と合意):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の terminal session close / mode change /
+active・passive context teardown と fresh viewport ID 払い出し、
+[src/app/native_video.rs](../src/app/native_video.rs) の terminal `DestroyHost` effect、
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の detached desired set / event batch、
+[src/app/detached_window_manager.rs](../src/app/detached_window_manager.rs) の session lease
+再利用可否、[src/app/presentation_transition.rs](../src/app/presentation_transition.rs) は変更せず
+同一 lease transfer / terminal effect 契約を監査、[src/app/tests.rs](../src/app/tests.rs) の回帰証明、
+および本節の記録。`src/ui_main.rs` を含む許可範囲外は変更しない。
+
+**不変条件と所有境界**:
+
+- 内部 teardown は detached child へ `ViewportCommand::Close` を送らない。terminal な窓 H は
+  runtime / snapshot / active presentation という **desired set から exact window ID で外す**。
+  egui が `close_requested()` に合流させる同一 event を「内部 close 済み」marker で消費しない。
+  したがって遅れて届いた H の event が、後継 J の利用者 OS close を代理して消費する経路を
+  作らない。
+- terminal に達した `DetachedSessionLease { window_id: H }` は再利用しない。次の open は
+  manager が「H の runtime が存在し、かつ `Closing` ではない」と証明できない限り fresh J を
+  払い出す。viewport callback 内で H を retire した後に同じ `show_viewport_*` の末尾が行う
+  pre-show / deferred / post-show の HWND 登録は state transition より前にこの lease 生存判定を
+  通らなければ破棄するため、削除済み runtime を `Opening` として作り直さない。
+  H の遅延 event は exact ID で H だけに当たり、現在の J を閉じない。
+- descriptor fallback、folder navigation、active↔passive handoff のような **pre-terminal**
+  遷移では同じ ID / runtime / placement / activation intent を引き継ぐ。descriptor fallback は
+  H を一度 `Closing` にして同じ H で作り直すのではなく、既存 lease をそのまま resume する。
+- 現在の J に対する利用者の `close_requested()` は、embedded でない detached viewport なら
+  引き続き無条件で close reducer へ渡す。`detached_image_window_viewport_id` も変更しない。
+
+**producer 監査**: detached child へ programmatic `ViewportCommand::Close` を送っていた全 10
+producer を分類した。terminal 9 件 (active context take、mode change の active / legacy /
+passive 3 経路、active session finalize、legacy park-and-close fallback、native `DestroyHost`、
+複数 passive window close、専用 pending queue の drain) は command 送信をやめて desired set
+から exact owner を除く。nonterminal 1 件 (descriptor fallback) は close / runtime remove 自体を
+やめ、同じ lease を resume する。内部 Close 専用の
+`detached_image_window_close_pending` queue は所有する意味がなくなるため削除する。root application
+quit の `ViewportCommand::Close` と、利用者 OS close の `close_requested()` は対象外で維持する。
+
+**placement の移譲**: 新しい配置経路は作らない。H の runtime removal が位置・inner size・
+maximized を既存 `settings.detached_viewer_window_placement` へ保存し、fresh J の runtime 初期化と
+viewport builder が同じ設定を読む。maximized は既存 visible commit、borderless は既存 App-global
+設定から復元する。この H → settings → J runtime / builder の経路を回帰テストで固定する。
+
+**なぜ症状パッチではないか**: stale close を時刻や「次の一回だけ無視」で推測せず、terminal
+lease の再利用を ownership 境界で禁止し、内部 teardown を egui の利用者 close event から除いた。
+同じ ownership 判定を pre-show / post-show / deferred / watcher の HWND 登録 producer にも適用し、
+terminal callback の末尾から runtime が再生成される lifecycle 競合を閉じる。
+新しい App-level bool / `Option` / pending marker は追加しない (規則 3)。時間窓、settle、retry、
+sleep、geometry / focus heuristic は使わない (規則 5)。fresh H→J、desired output の H 不在 / J
+存在、stale H close の無害性、current J close の有効性、pre-terminal ID 維持、配置・maximized・
+borderless 継承を manager / reducer / App-level test で証明し、既存 detached テストは削除・
+弱体化しない (規則 8)。
+
 **2026-08-30 gamepad の配り先と面を 1 つの判定に揃える (レビュー R-02 の残件。修正の形は
 Codex が [review-v3.3.0 §9.2](review-v3.3.0/README.md) で示した根本修正そのもの):**
 

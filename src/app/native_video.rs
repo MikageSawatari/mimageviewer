@@ -1632,17 +1632,11 @@ impl App {
                 hwnd,
             } => {
                 Self::log_presentation_transition_effect(request_id, target, "Destroy", hwnd);
-                if self.detached_window_state(lease.window_id).is_some() {
-                    self.transition_detached_window_state(
-                        lease.window_id,
-                        super::DetachedWindowState::Closing,
-                        "video_presentation_transition_destroy_host",
-                    );
-                }
-                ctx.send_viewport_cmd_to(
-                    Self::detached_image_window_viewport_id(lease.window_id),
-                    egui::ViewportCommand::Close,
+                self.retire_terminal_detached_viewport_identity(
+                    lease.window_id,
+                    "video_presentation_transition_destroy_host",
                 );
+                ctx.request_repaint();
                 crate::presentation_observer::observe_viewport_command_for_transition(
                     request_id,
                     Self::presentation_probe_target(target),
@@ -1650,7 +1644,7 @@ impl App {
                     crate::presentation_observer::WindowRole::Host,
                     hwnd,
                     "transition_owner",
-                    "viewport_command=Close",
+                    "desired_output=removed",
                 );
             }
             super::PresentationTransitionEffect::ApplyPresentation {
