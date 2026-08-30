@@ -2100,13 +2100,9 @@ fn collect_zip_entry_dims(
     }
 }
 
-pub(super) fn page_dims_without_catalog(item: &crate::grid_item::GridItem) -> Option<(u32, u32)> {
-    match item {
-        crate::grid_item::GridItem::Image(path) => file_image_dims(path),
-        _ => None,
-    }
-}
-
+/// 1 枚分のヘッダ読み。並列版 [`file_image_dims_batch`] の中身であり、その等価性テストの
+/// 参照でもある。実ファイル画像だけを扱う — ZIP / PDF は書庫展開と worker 往復が要るので
+/// [`collect_zip_entry_dims`] / [`catalog_free_dims`] が別に持つ。
 fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path)
         .ok()?
@@ -7760,21 +7756,10 @@ mod tests {
             .save(&portrait)
             .expect("write portrait");
 
-        assert_eq!(
-            page_dims_without_catalog(&crate::grid_item::GridItem::Image(landscape)),
-            Some((120, 40))
-        );
-        assert_eq!(
-            page_dims_without_catalog(&crate::grid_item::GridItem::Image(portrait)),
-            Some((40, 120))
-        );
+        assert_eq!(file_image_dims(&landscape), Some((120, 40)));
+        assert_eq!(file_image_dims(&portrait), Some((40, 120)));
         // 存在しないファイルは「不明」。横長として扱わない。
-        assert_eq!(
-            page_dims_without_catalog(&crate::grid_item::GridItem::Image(
-                dir.path().join("missing.png")
-            )),
-            None
-        );
+        assert_eq!(file_image_dims(&dir.path().join("missing.png")), None);
     }
 
     #[test]
@@ -7799,7 +7784,7 @@ mod tests {
 
         let one_at_a_time = paths
             .iter()
-            .map(|path| page_dims_without_catalog(&crate::grid_item::GridItem::Image(path.clone())))
+            .map(|path| file_image_dims(path))
             .collect::<Vec<_>>();
         assert_eq!(file_image_dims_batch(&paths), one_at_a_time);
         assert_eq!(
@@ -7890,24 +7875,26 @@ mod tests {
     }
 
     #[test]
-    /// ZIP / PDF ページはこの経路では補わない (書庫展開と worker 往復が要るため)。
-    /// **意図した範囲であることを固定する。**広げるときはここが落ちる。
-    fn archive_and_pdf_pages_still_depend_on_the_catalog() {
-        assert_eq!(
-            page_dims_without_catalog(&crate::grid_item::GridItem::ZipImage {
+    /// 実ファイルの一括読みは ZIP / PDF ページに手を出さない。
+    ///
+    /// あちらは書庫を 1 回開く / worker 1 往復という別の集め方を持っている
+    /// ([`collect_zip_entry_dims`] と `catalog_free_dims` の PDF 枝)。**意図した範囲で
+    /// あることを固定する。**広げるときはここが落ちる。
+    fn archive_and_pdf_pages_are_collected_by_their_own_pass() {
+        let items = vec![
+            crate::grid_item::GridItem::ZipImage {
                 zip_path: std::path::PathBuf::from("book.zip"),
                 entry_name: "001.jpg".into(),
-            }),
-            None
-        );
-        assert_eq!(
-            page_dims_without_catalog(&crate::grid_item::GridItem::PdfPage {
+            },
+            crate::grid_item::GridItem::PdfPage {
                 pdf_path: std::path::PathBuf::from("book.pdf"),
                 page_num: 0,
                 content_type: None,
-            }),
-            None
-        );
+            },
+        ];
+        let mut dims = std::collections::HashMap::new();
+        collect_file_image_dims(&items, &std::collections::HashMap::new(), &mut dims);
+        assert!(dims.is_empty());
     }
 
     #[test]
