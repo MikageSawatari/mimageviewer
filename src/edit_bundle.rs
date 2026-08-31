@@ -271,21 +271,25 @@ fn transform_local_adjust_layers(
     Ok(transformed)
 }
 
+/// サイズ変換の JSON 往復から原寸バッファを外して持っておく入れ物。
+///
+/// 中身は共有所有のまま持つ。ここで値へ落とすと、外した意味 (大きなバッファを
+/// 動かさない) が消える。
 enum DetachedMaskPayload {
     None,
-    Raster(Vec<f32>),
-    RasterVector(Vec<f32>),
+    Raster(local_adjust_core::MaskAlpha),
+    RasterVector(local_adjust_core::MaskAlpha),
     Subject {
-        alpha: Vec<f32>,
-        source_alpha: Option<Vec<f32>>,
+        alpha: local_adjust_core::MaskAlpha,
+        source_alpha: Option<local_adjust_core::MaskAlpha>,
     },
-    Segmentation(Vec<u32>),
+    Segmentation(local_adjust_core::MaskLabels),
 }
 
 struct DetachedLocalAdjustPayloads {
     mask: DetachedMaskPayload,
-    manual_add_alpha: Option<Vec<f32>>,
-    manual_subtract_alpha: Option<Vec<f32>>,
+    manual_add_alpha: Option<local_adjust_core::MaskAlpha>,
+    manual_subtract_alpha: Option<local_adjust_core::MaskAlpha>,
     cube_lut_table: Option<Vec<[f32; 3]>>,
 }
 
@@ -379,7 +383,7 @@ impl DetachedLocalAdjustPayloads {
 
 fn restore_manual_mask_alpha(
     mask: &mut Option<local_adjust_core::RasterVectorMask>,
-    alpha: Option<Vec<f32>>,
+    alpha: Option<local_adjust_core::MaskAlpha>,
     payload_mismatch: &impl Fn() -> String,
 ) -> Result<(), String> {
     match (mask.as_mut(), alpha) {
@@ -757,8 +761,10 @@ mod tests {
         let subject = local_adjust_core::SubjectMask {
             width: 2,
             height: 2,
-            alpha: vec![0.0, 0.25, 0.75, 1.0],
-            source_alpha: Some(vec![1.0, 0.75, 0.25, 0.0]),
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.25, 0.75, 1.0]),
+            source_alpha: Some(local_adjust_core::MaskAlpha::new(vec![
+                1.0, 0.75, 0.25, 0.0,
+            ])),
             refinement: local_adjust_core::SubjectMaskRefinement {
                 enabled: true,
                 threshold: 0.5,
@@ -783,7 +789,7 @@ mod tests {
         layer.manual_override.add = Some(local_adjust_core::RasterVectorMask {
             width: 2,
             height: 2,
-            alpha: vec![0.0, 1.0, 0.0, 1.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 0.0, 1.0]),
             shapes: vec![local_adjust_core::MaskShape::Line {
                 op: local_adjust_core::ShapeOp::Add,
                 kind: local_adjust_core::LineKind::Diagonal,
@@ -833,7 +839,7 @@ mod tests {
                 LocalMask::Raster(local_adjust_core::RasterMask {
                     width: 2,
                     height: 2,
-                    alpha: vec![0.0, 0.25, 0.75, 1.0],
+                    alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.25, 0.75, 1.0]),
                 }),
                 LocalEffect::None,
             ),
@@ -842,7 +848,7 @@ mod tests {
                 LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
                     width: 2,
                     height: 2,
-                    alpha: vec![0.0, 1.0, 1.0, 0.0],
+                    alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 0.0]),
                     shapes: Vec::new(),
                 }),
                 LocalEffect::None,
@@ -852,7 +858,7 @@ mod tests {
                 LocalMask::Segmentation(local_adjust_core::RegionMask {
                     width: 2,
                     height: 2,
-                    labels: vec![0, 1, 1, 0],
+                    labels: local_adjust_core::MaskLabels::new(vec![0, 1, 1, 0]),
                     selected: vec![false, true],
                 }),
                 LocalEffect::None,

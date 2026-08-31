@@ -1828,7 +1828,7 @@ mod writer_tests {
 
     fn sample_layer() -> local_adjust_core::LocalAdjustmentLayer {
         let mut mask = local_adjust_core::RasterVectorMask::empty(4, 4);
-        mask.alpha[5] = 1.0;
+        mask.alpha_mut()[5] = 1.0;
         local_adjust_core::LocalAdjustmentLayer::new(
             "layer",
             local_adjust_core::LocalMask::RasterVector(mask),
@@ -2061,9 +2061,10 @@ mod writer_tests {
         // 1000x1000 は実データ (3082x4486) より小さいが、旧形式なら 1 枚で
         // 4 MB を超える。packed ならページ数を増やしても効かない。
         let mut mask = local_adjust_core::RasterVectorMask::empty(1000, 1000);
+        let alpha = mask.alpha_mut();
         for y in 100..140 {
             for x in 100..180 {
-                mask.alpha[y * 1000 + x] = 1.0;
+                alpha[y * 1000 + x] = 1.0;
             }
         }
         sidecar.set_local_adjust_layers(

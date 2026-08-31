@@ -287,12 +287,14 @@ where
 pub mod alpha {
     use super::*;
 
-    pub fn serialize<S: Serializer>(alpha: &Vec<f32>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(alpha: &crate::MaskAlpha, s: S) -> Result<S::Ok, S::Error> {
+        // `encode_alpha` takes a slice, so the bytes on disk do not depend on how
+        // the buffer is owned (`the_on_disk_encoding_is_byte_for_byte_stable`).
         s.serialize_str(&encode_alpha(alpha).ok_or_else(encoding_failed)?)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
-        d.deserialize_any(AlphaVisitor)
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<crate::MaskAlpha, D::Error> {
+        d.deserialize_any(AlphaVisitor).map(std::sync::Arc::new)
     }
 }
 
@@ -300,14 +302,19 @@ pub mod alpha {
 pub mod alpha_opt {
     use super::*;
 
-    pub fn serialize<S: Serializer>(alpha: &Option<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        alpha: &Option<crate::MaskAlpha>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         match alpha {
             Some(alpha) => s.serialize_some(&encode_alpha(alpha).ok_or_else(encoding_failed)?),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<crate::MaskAlpha>, D::Error> {
         struct OptVisitor;
 
         impl<'de> Visitor<'de> for OptVisitor {
@@ -331,6 +338,7 @@ pub mod alpha_opt {
         }
 
         d.deserialize_option(OptVisitor)
+            .map(|alpha| alpha.map(std::sync::Arc::new))
     }
 }
 
@@ -341,16 +349,16 @@ pub mod alpha_opt {
 pub mod labels {
     use super::*;
 
-    pub fn serialize<S: Serializer>(labels: &Vec<u32>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(labels: &crate::MaskLabels, s: S) -> Result<S::Ok, S::Error> {
         let mut bytes = Vec::with_capacity(labels.len() * 4);
-        for label in labels {
+        for label in labels.iter() {
             bytes.extend_from_slice(&label.to_le_bytes());
         }
         let packed = encode(TAG_LABEL_U32, labels.len(), &bytes).ok_or_else(encoding_failed)?;
         s.serialize_str(&packed)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<crate::MaskLabels, D::Error> {
         struct LabelVisitor;
 
         impl<'de> Visitor<'de> for LabelVisitor {
@@ -373,7 +381,7 @@ pub mod labels {
             }
         }
 
-        d.deserialize_any(LabelVisitor)
+        d.deserialize_any(LabelVisitor).map(std::sync::Arc::new)
     }
 }
 
@@ -381,9 +389,72 @@ pub mod labels {
 mod tests {
     use super::*;
     use crate::{
-        LocalAdjustmentLayer, LocalEffect, LocalMask, RasterVectorMask, RegionMask, SubjectMask,
-        SubjectMaskRefinement,
+        LocalAdjustmentLayer, LocalEffect, LocalMask, MaskAlpha, MaskLabels, RasterVectorMask,
+        RegionMask, SubjectMask, SubjectMaskRefinement,
     };
+
+    /// レイヤーの複製が**画素まで写さない**こと。
+    ///
+    /// この共有所有はそのためだけに在る。補正パネルの編集器は egui にスカラーを
+    /// 書かせるためにレイヤーの所有値が要り、そこは**毎フレーム**走る。画素を写すと
+    /// 24MP で 1 フレームあたり数百 MB になる (2026-08-31 実測で 1 フレームの 67%)。
+    #[test]
+    fn cloning_a_layer_shares_the_pixels_instead_of_copying_them() {
+        let mut base = RasterVectorMask::empty(64, 64);
+        base.alpha_mut()[0] = 1.0;
+        let mut add = RasterVectorMask::empty(64, 64);
+        add.alpha_mut()[1] = 1.0;
+        let mut layer =
+            LocalAdjustmentLayer::new("shared", LocalMask::RasterVector(base), LocalEffect::None);
+        layer.manual_override.add = Some(add);
+
+        let copy = layer.clone();
+
+        let (LocalMask::RasterVector(from), LocalMask::RasterVector(to)) =
+            (&layer.mask, &copy.mask)
+        else {
+            panic!("expected raster-vector masks");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&from.alpha, &to.alpha),
+            "ベースマスクの画素まで複製している"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &layer.manual_override.add.as_ref().unwrap().alpha,
+                &copy.manual_override.add.as_ref().unwrap().alpha,
+            ),
+            "追加マスクの画素まで複製している"
+        );
+    }
+
+    /// 共有していても、書けば分かれる。
+    ///
+    /// 分かれないと、Undo に取ったはずのスナップショットが後から書き換わる。
+    #[test]
+    fn writing_through_one_handle_leaves_the_other_alone() {
+        let mask = RasterVectorMask::empty(8, 8);
+        let layer =
+            LocalAdjustmentLayer::new("shared", LocalMask::RasterVector(mask), LocalEffect::None);
+        let mut copy = layer.clone();
+
+        let LocalMask::RasterVector(edited) = &mut copy.mask else {
+            panic!("expected a raster-vector mask");
+        };
+        edited.alpha_mut()[0] = 1.0;
+
+        let (LocalMask::RasterVector(original), LocalMask::RasterVector(edited)) =
+            (&layer.mask, &copy.mask)
+        else {
+            panic!("expected raster-vector masks");
+        };
+        assert_eq!(original.alpha[0], 0.0, "書き込みが元の手にも見えている");
+        assert_eq!(edited.alpha[0], 1.0);
+        assert!(
+            !std::sync::Arc::ptr_eq(&original.alpha, &edited.alpha),
+            "書き込んだのに割り当てが分岐していない"
+        );
+    }
 
     /// **出荷済みのディスク形式を 1 バイトも変えない。**
     ///
@@ -397,9 +468,7 @@ mod tests {
     #[test]
     fn the_on_disk_encoding_is_byte_for_byte_stable() {
         let mut raster_vector = RasterVectorMask::empty(4, 2);
-        raster_vector.alpha = vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 1.0]
-            .into_iter()
-            .collect();
+        raster_vector.alpha = MaskAlpha::new(vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 1.0]);
         assert_eq!(
             serde_json::to_string(&raster_vector).unwrap(),
             RASTER_VECTOR_JSON,
@@ -409,14 +478,8 @@ mod tests {
         let subject = SubjectMask {
             width: 4,
             height: 2,
-            alpha: vec![1.0, 0.0, 0.5, 0.25, 0.75, 1.0, 0.0, 0.5]
-                .into_iter()
-                .collect(),
-            source_alpha: Some(
-                vec![0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0]
-                    .into_iter()
-                    .collect(),
-            ),
+            alpha: MaskAlpha::new(vec![1.0, 0.0, 0.5, 0.25, 0.75, 1.0, 0.0, 0.5]),
+            source_alpha: Some(MaskAlpha::new(vec![0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0])),
             refinement: SubjectMaskRefinement::default(),
         };
         assert_eq!(
@@ -426,7 +489,7 @@ mod tests {
         );
 
         let mut region = RegionMask::empty(4, 2);
-        region.labels = vec![0, 1, 1, 2, 2, 0, 3, 3].into_iter().collect();
+        region.labels = MaskLabels::new(vec![0, 1, 1, 2, 2, 0, 3, 3]);
         region.selected = vec![false, true, false, true];
         assert_eq!(
             serde_json::to_string(&region).unwrap(),
@@ -444,10 +507,10 @@ mod tests {
     fn a_soft_edge_survives_the_round_trip_within_one_step_of_255() {
         let mut mask = RasterVectorMask::empty(8, 1);
         // A feathered brush edge: the values a 1-bit encoding would destroy.
-        mask.alpha = vec![0.0, 0.1, 0.25, 0.4, 0.6, 0.75, 0.9, 1.0];
+        mask.alpha = MaskAlpha::new(vec![0.0, 0.1, 0.25, 0.4, 0.6, 0.75, 0.9, 1.0]);
         let json = serde_json::to_string(&mask).unwrap();
         let back: RasterVectorMask = serde_json::from_str(&json).unwrap();
-        for (before, after) in mask.alpha.iter().zip(&back.alpha) {
+        for (before, after) in mask.alpha.iter().zip(back.alpha.iter()) {
             assert!(
                 (before - after).abs() <= 1.0 / 255.0,
                 "{before} -> {after} lost more than one quantization step"
@@ -487,9 +550,10 @@ mod tests {
     fn the_packed_form_is_orders_of_magnitude_smaller_than_the_array() {
         // 1000x1000 with a small painted blob, the shape real mask data takes.
         let mut mask = RasterVectorMask::empty(1000, 1000);
+        let alpha = mask.alpha_mut();
         for y in 400..430 {
             for x in 400..460 {
-                mask.alpha[y * 1000 + x] = 1.0;
+                alpha[y * 1000 + x] = 1.0;
             }
         }
         let packed = serde_json::to_string(&mask).unwrap();
@@ -507,28 +571,34 @@ mod tests {
         let mut subject = SubjectMask {
             width: 2,
             height: 2,
-            alpha: vec![0.0, 0.25, 0.75, 1.0],
+            alpha: MaskAlpha::new(vec![0.0, 0.25, 0.75, 1.0]),
             source_alpha: None,
             refinement: Default::default(),
         };
         let json = serde_json::to_string(&subject).unwrap();
         assert!(!json.contains("source_alpha"), "None must stay skipped");
 
-        subject.source_alpha = Some(vec![1.0, 0.0, 1.0, 0.0]);
+        subject.source_alpha = Some(MaskAlpha::new(vec![1.0, 0.0, 1.0, 0.0]));
         let json = serde_json::to_string(&subject).unwrap();
         let back: SubjectMask = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.source_alpha, Some(vec![1.0, 0.0, 1.0, 0.0]));
+        assert_eq!(
+            back.source_alpha,
+            Some(MaskAlpha::new(vec![1.0, 0.0, 1.0, 0.0]))
+        );
 
         // ...and the released array form of the same field.
         let legacy = r#"{"width":2,"height":2,"alpha":[0,0,0,0],"source_alpha":[1.0,0.0,1.0,0.0]}"#;
         let back: SubjectMask = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back.source_alpha, Some(vec![1.0, 0.0, 1.0, 0.0]));
+        assert_eq!(
+            back.source_alpha,
+            Some(MaskAlpha::new(vec![1.0, 0.0, 1.0, 0.0]))
+        );
     }
 
     #[test]
     fn region_labels_are_identities_so_they_round_trip_exactly() {
         let mut region = RegionMask::empty(4, 2);
-        region.labels = vec![0, 1, 2, 300, 65_536, 4_294_967_295, 7, 0];
+        region.labels = MaskLabels::new(vec![0, 1, 2, 300, 65_536, 4_294_967_295, 7, 0]);
         region.selected = vec![false, true, false];
         let json = serde_json::to_string(&region).unwrap();
         let back: RegionMask = serde_json::from_str(&json).unwrap();
@@ -537,13 +607,13 @@ mod tests {
 
         let legacy = r#"{"width":2,"height":1,"labels":[0,4294967295],"selected":[false,true]}"#;
         let back: RegionMask = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back.labels, vec![0, 4_294_967_295]);
+        assert_eq!(back.labels, MaskLabels::new(vec![0, 4_294_967_295]));
     }
 
     #[test]
     fn a_truncated_payload_is_refused_rather_than_decoded_short() {
         let mut mask = RasterVectorMask::empty(64, 64);
-        mask.alpha[100] = 1.0;
+        mask.alpha_mut()[100] = 1.0;
         let json = serde_json::to_string(&mask).unwrap();
         // Drop four base64 characters off the end of the payload, the shape a
         // half-written file takes.
@@ -571,13 +641,13 @@ mod tests {
         let mut subject = SubjectMask {
             width: 64,
             height: 64,
-            alpha: vec![0.0; 4_096],
-            source_alpha: Some(vec![0.0; 4_096]),
+            alpha: MaskAlpha::new(vec![0.0; 4_096]),
+            source_alpha: Some(MaskAlpha::new(vec![0.0; 4_096])),
             refinement: SubjectMaskRefinement::default(),
         };
-        subject.alpha[7] = 1.0;
+        subject.alpha_mut()[7] = 1.0;
         let mut add = RasterVectorMask::empty(64, 64);
-        add.alpha[9] = 1.0;
+        add.alpha_mut()[9] = 1.0;
         let mut layer =
             LocalAdjustmentLayer::new("budgeted", LocalMask::Subject(subject), LocalEffect::None);
         layer.manual_override.add = Some(add.clone());
@@ -640,7 +710,7 @@ mod tests {
     #[test]
     fn a_small_payload_cannot_claim_a_count_past_the_ceiling() {
         let mut mask = RasterVectorMask::empty(8, 8);
-        mask.alpha[3] = 1.0;
+        mask.alpha_mut()[3] = 1.0;
         let json = serde_json::to_string(&mask).unwrap();
         // The payload stays as it is; only the declared count moves.
         let swapped = json.replace("\"q8z:64:", &format!("\"q8z:{}:", u64::MAX));

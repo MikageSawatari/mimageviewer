@@ -591,7 +591,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
                 width: 200,
                 height: 100,
-                alpha: vec![0.0; 200 * 100],
+                alpha: local_adjust_core::MaskAlpha::new(vec![0.0; 200 * 100]),
                 shapes: vec![local_adjust_core::MaskShape::Line {
                     op: local_adjust_core::ShapeOp::Add,
                     kind: local_adjust_core::LineKind::Diagonal,
@@ -644,7 +644,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
                 width: 48,
                 height: 24,
-                alpha: vec![0.0; 48 * 24],
+                alpha: local_adjust_core::MaskAlpha::new(vec![0.0; 48 * 24]),
                 shapes: vec![local_adjust_core::MaskShape::Line {
                     op: local_adjust_core::ShapeOp::Add,
                     kind: local_adjust_core::LineKind::Horizontal,
@@ -688,7 +688,7 @@ mod local_adjust_segmentation_tests {
         layer.manual_override.subtract = Some(local_adjust_core::RasterVectorMask {
             width: 2,
             height: 1,
-            alpha: vec![1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![1.0, 0.0]),
             shapes: Vec::new(),
         });
         assert_eq!(
@@ -712,7 +712,7 @@ mod local_adjust_segmentation_tests {
         layer.manual_override.subtract = Some(local_adjust_core::RasterVectorMask {
             width: 1,
             height: 1,
-            alpha: vec![1.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![1.0]),
             shapes: Vec::new(),
         });
         assert_eq!(
@@ -736,7 +736,7 @@ mod local_adjust_segmentation_tests {
         let width = 3840;
         let height = 2160;
         let mut subtract = local_adjust_core::RasterVectorMask::empty(width, height);
-        subtract.alpha[width * height - 1] = 1.0;
+        subtract.alpha_mut()[width * height - 1] = 1.0;
         let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
             "full",
             local_adjust_core::LocalMask::Full,
@@ -778,7 +778,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalMask::Segmentation(local_adjust_core::RegionMask {
                 width,
                 height,
-                labels,
+                labels: local_adjust_core::MaskLabels::new(labels),
                 selected: vec![false; 1025],
             }),
             local_adjust_core::LocalEffect::None,
@@ -1129,7 +1129,7 @@ mod local_adjust_segmentation_tests {
         let mask = local_adjust_core::RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![0.20, 0.49, 0.52, 0.90],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.20, 0.49, 0.52, 0.90]),
         };
         let refined = local_adjust_subject_refined_alpha(&mask, 0.5, 0, 0);
         assert_eq!(refined, vec![0.0, 0.0, 1.0, 1.0]);
@@ -1137,7 +1137,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::RasterMask {
                 width: 4,
                 height: 1,
-                alpha: refined,
+                alpha: local_adjust_core::MaskAlpha::new(refined),
             },
         ));
         assert_eq!(stats.foreground_percent, 50.0);
@@ -1149,16 +1149,30 @@ mod local_adjust_segmentation_tests {
         let source = local_adjust_core::RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![0.20, 0.45, 0.55, 0.90],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.20, 0.45, 0.55, 0.90]),
         };
         let mut subject = local_adjust_core::SubjectMask::from_raster(source);
-        subject.alpha =
-            local_adjust_subject_refined_alpha(&subject.source_raster_mask(), 0.60, 0, 0);
-        assert_eq!(subject.alpha, vec![0.0, 0.0, 0.0, 1.0]);
+        subject.alpha = local_adjust_core::MaskAlpha::new(local_adjust_subject_refined_alpha(
+            &subject.source_raster_mask(),
+            0.60,
+            0,
+            0,
+        ));
+        assert_eq!(
+            subject.alpha,
+            local_adjust_core::MaskAlpha::new(vec![0.0, 0.0, 0.0, 1.0])
+        );
 
-        subject.alpha =
-            local_adjust_subject_refined_alpha(&subject.source_raster_mask(), 0.40, 0, 0);
-        assert_eq!(subject.alpha, vec![0.0, 1.0, 1.0, 1.0]);
+        subject.alpha = local_adjust_core::MaskAlpha::new(local_adjust_subject_refined_alpha(
+            &subject.source_raster_mask(),
+            0.40,
+            0,
+            0,
+        ));
+        assert_eq!(
+            subject.alpha,
+            local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 1.0])
+        );
     }
 
     #[test]
@@ -1302,7 +1316,7 @@ mod local_adjust_segmentation_tests {
         let subject = local_adjust_core::RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![1.0, 1.0, 0.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![1.0, 1.0, 0.0, 0.0]),
         };
         let mask = build_local_adjust_region_segmentation(
             &source,
@@ -1882,7 +1896,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalMask::Raster(local_adjust_core::RasterMask {
                 width: 1,
                 height: 1,
-                alpha: vec![1.0],
+                alpha: local_adjust_core::MaskAlpha::new(vec![1.0]),
             }),
         );
     }
@@ -2162,7 +2176,10 @@ mod local_adjust_canvas_edit_contract_tests {
             )
             .unwrap();
             assert_eq!(handle.preparation, LocalAdjustMaskPreparation::Normalized);
-            assert_eq!(handle.mask.alpha, vec![1.0; 6]);
+            assert_eq!(
+                handle.mask.alpha,
+                local_adjust_core::MaskAlpha::new(vec![1.0; 6])
+            );
             assert!(handle.mask.shapes.is_empty());
         }
 
@@ -2421,7 +2438,7 @@ mod local_adjust_canvas_edit_contract_tests {
                 true,
             )
             .expect("create = true なので空スロットが作られる");
-            handle.mask.alpha[0] = 1.0;
+            handle.mask.alpha_mut()[0] = 1.0;
             LocalAdjustCanvasEdit::from_edit(
                 true,
                 handle.preparation,
@@ -2907,7 +2924,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn the_compaction_predicate_agrees_with_the_operation() {
         let empty = local_adjust_core::RasterVectorMask::empty(4, 3);
         let mut painted = local_adjust_core::RasterVectorMask::empty(4, 3);
-        painted.alpha[0] = 1.0;
+        painted.alpha_mut()[0] = 1.0;
 
         for (name, add, subtract) in [
             ("空なし", None, None),
@@ -4749,7 +4766,7 @@ fn local_adjust_subject_mask_stats(
     }
     let mut foreground = 0usize;
     let mut soft = 0usize;
-    for &alpha in &mask.alpha {
+    for &alpha in mask.alpha.iter() {
         let alpha = alpha.clamp(0.0, 1.0);
         if alpha >= 0.5 {
             foreground += 1;
@@ -4807,12 +4824,12 @@ fn apply_local_adjust_subject_refinement(
         feather_px: refinement.feather_px.max(0),
     };
     let source = mask.source_raster_mask();
-    mask.alpha = local_adjust_subject_refined_alpha(
+    mask.alpha = local_adjust_core::MaskAlpha::new(local_adjust_subject_refined_alpha(
         &source,
         refinement.threshold,
         refinement.expand_px,
         refinement.feather_px as usize,
-    );
+    ));
     mask.refinement = refinement;
 }
 
@@ -4997,7 +5014,7 @@ fn run_local_adjust_subject_segmentation(
     Ok(local_adjust_core::RasterMask {
         width: source.size[0],
         height: source.size[1],
-        alpha,
+        alpha: local_adjust_core::MaskAlpha::new(alpha),
     })
 }
 
@@ -5215,7 +5232,7 @@ fn build_local_adjust_region_segmentation(
     Ok(local_adjust_core::RegionMask {
         width,
         height,
-        labels,
+        labels: local_adjust_core::MaskLabels::new(labels),
         selected: vec![false; label as usize + 1],
     })
 }
@@ -8717,11 +8734,11 @@ fn draw_local_mask_editor(
         local_adjust_core::LocalMask::Raster(mask) => {
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("クリア").clicked() {
-                    mask.alpha.fill(0.0);
+                    mask.alpha_mut().fill(0.0);
                     changed = true;
                 }
                 if ui.small_button("塗りつぶし").clicked() {
-                    mask.alpha.fill(1.0);
+                    mask.alpha_mut().fill(1.0);
                     changed = true;
                 }
             });
@@ -8730,7 +8747,7 @@ fn draw_local_mask_editor(
         local_adjust_core::LocalMask::RasterVector(mask) => {
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("ビットマップ消去").clicked() {
-                    mask.alpha.fill(0.0);
+                    mask.alpha_mut().fill(0.0);
                     changed = true;
                 }
                 if ui.small_button("オブジェクト消去").clicked() {
@@ -11049,10 +11066,10 @@ impl App {
                     mask.height,
                     op == LocalAdjustBitmapMaskOp::Expand,
                 );
-                if next == mask.alpha {
+                if next == *mask.alpha {
                     return LocalAdjustCanvasEdit::prepared_only(preparation, active_target);
                 }
-                mask.alpha = next;
+                mask.alpha = local_adjust_core::MaskAlpha::new(next);
                 LocalAdjustCanvasEdit::Applied
             });
         if changed {
@@ -11118,7 +11135,7 @@ impl App {
                     return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 outcome = flood_fill_local_adjust_alpha_mask(
-                    &mut mask.alpha,
+                    mask.alpha_mut(),
                     source.as_ref(),
                     seed_x,
                     seed_y,
@@ -11309,25 +11326,15 @@ impl App {
             |layer| match target {
                 LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
                     local_adjust_core::LocalMask::Raster(mask) => {
+                        let (alpha, width, height) = mask.alpha_and_dims_mut();
                         LocalAdjustCanvasEdit::from_pure_edit(paint_local_adjust_alpha_line(
-                            &mut mask.alpha,
-                            mask.width,
-                            mask.height,
-                            from_norm,
-                            to_norm,
-                            radius,
-                            paint,
+                            alpha, width, height, from_norm, to_norm, radius, paint,
                         ))
                     }
                     local_adjust_core::LocalMask::RasterVector(mask) => {
+                        let (alpha, width, height) = mask.alpha_and_dims_mut();
                         LocalAdjustCanvasEdit::from_pure_edit(paint_local_adjust_alpha_line(
-                            &mut mask.alpha,
-                            mask.width,
-                            mask.height,
-                            from_norm,
-                            to_norm,
-                            radius,
-                            paint,
+                            alpha, width, height, from_norm, to_norm, radius, paint,
                         ))
                     }
                     _ => LocalAdjustCanvasEdit::Untouched,
@@ -11360,15 +11367,10 @@ impl App {
                     let Some(mask) = slot.as_mut() else {
                         return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                     };
+                    let (alpha, width, height) = mask.alpha_and_dims_mut();
                     LocalAdjustCanvasEdit::from_edit(
                         paint_local_adjust_alpha_line(
-                            &mut mask.alpha,
-                            mask.width,
-                            mask.height,
-                            from_norm,
-                            to_norm,
-                            radius,
-                            paint,
+                            alpha, width, height, from_norm, to_norm, radius, paint,
                         ),
                         preparation,
                         target,
@@ -11418,7 +11420,7 @@ impl App {
                 }
                 LocalAdjustCanvasEdit::from_edit(
                     paint_local_adjust_alpha_edge_brush_line(
-                        &mut mask.alpha,
+                        mask.alpha_mut(),
                         source.as_ref(),
                         from_norm,
                         to_norm,
@@ -11460,16 +11462,10 @@ impl App {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
                 let LocalAdjustPreparedMask { mask, preparation } = handle;
+                let (alpha, width, height) = mask.alpha_and_dims_mut();
                 LocalAdjustCanvasEdit::from_edit(
                     paint_local_adjust_alpha_gap_fill_line(
-                        &mut mask.alpha,
-                        mask.width,
-                        mask.height,
-                        from_norm,
-                        to_norm,
-                        radius,
-                        paint,
-                        gap,
+                        alpha, width, height, from_norm, to_norm, radius, paint, gap,
                     ),
                     preparation,
                     target,
@@ -11538,14 +11534,9 @@ impl App {
                     return LocalAdjustCanvasEdit::Untouched;
                 };
                 let LocalAdjustPreparedMask { mask, preparation } = handle;
+                let (alpha, width, height) = mask.alpha_and_dims_mut();
                 LocalAdjustCanvasEdit::from_edit(
-                    fill_local_adjust_alpha_polygon(
-                        &mut mask.alpha,
-                        mask.width,
-                        mask.height,
-                        &points,
-                        paint,
-                    ),
+                    fill_local_adjust_alpha_polygon(alpha, width, height, &points, paint),
                     preparation,
                     target,
                 )

@@ -584,7 +584,7 @@ mod repack_tests {
         // 移行が読む内容を控えたうえで、先にアプリ側の保存を入れる。
         let stale = db.get_layers_json("c:/a.png").unwrap();
         let mut mask = RasterVectorMask::empty(8, 8);
-        mask.alpha[7] = 1.0;
+        mask.alpha_mut()[7] = 1.0;
         let saved = vec![LocalAdjustmentLayer::new(
             "edited",
             LocalMask::RasterVector(mask),

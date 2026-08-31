@@ -2878,7 +2878,7 @@ impl LocalAdjustLabApp {
                 let alpha = if mask.width == w && mask.height == h && mask.alpha.len() == w * h {
                     mask.alpha
                 } else {
-                    vec![0.0; w.saturating_mul(h)]
+                    local_adjust_core::MaskAlpha::new(vec![0.0; w.saturating_mul(h)])
                 };
                 layer.mask = LocalMask::RasterVector(RasterVectorMask {
                     width: w,
@@ -3898,7 +3898,7 @@ impl LocalAdjustLabApp {
         let Some(mask) = self.selected_edit_raster_vector_mask_mut() else {
             return false;
         };
-        let alpha = &mut mask.alpha;
+        let alpha = mask.alpha_mut();
         let min_y = (p.y - radius).floor().max(0.0) as usize;
         let max_y = (p.y + radius).ceil().min(h as f32 - 1.0) as usize;
         let r2 = radius * radius;
@@ -4029,17 +4029,19 @@ impl LocalAdjustLabApp {
 
         let mut changed = false;
         if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
+            // ループの**外**で 1 回だけ複製する。
+            let alpha = mask.alpha_mut();
             for idx in targets {
-                if idx >= mask.alpha.len() {
+                if idx >= alpha.len() {
                     continue;
                 }
-                let before = mask.alpha[idx];
+                let before = alpha[idx];
                 if add {
-                    mask.alpha[idx] = mask.alpha[idx].max(brush_alpha);
+                    alpha[idx] = alpha[idx].max(brush_alpha);
                 } else {
-                    mask.alpha[idx] = 0.0;
+                    alpha[idx] = 0.0;
                 }
-                changed |= (mask.alpha[idx] - before).abs() > f32::EPSILON;
+                changed |= (alpha[idx] - before).abs() > f32::EPSILON;
             }
         }
         changed
@@ -4085,10 +4087,11 @@ impl LocalAdjustLabApp {
             return false;
         }
         let mut changed = false;
+        let alpha = mask.alpha_mut();
         for idx in targets {
-            let before = mask.alpha[idx];
-            mask.alpha[idx] = 1.0;
-            changed |= (mask.alpha[idx] - before).abs() > f32::EPSILON;
+            let before = alpha[idx];
+            alpha[idx] = 1.0;
+            changed |= (alpha[idx] - before).abs() > f32::EPSILON;
         }
         changed
     }
@@ -4148,8 +4151,12 @@ impl LocalAdjustLabApp {
         self.push_undo_snapshot();
         if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
             mask.alpha = match op {
-                BitmapMaskOp::Expand => dilate_alpha(&mask.alpha, w, h),
-                BitmapMaskOp::Shrink => erode_alpha(&mask.alpha, w, h),
+                BitmapMaskOp::Expand => {
+                    local_adjust_core::MaskAlpha::new(dilate_alpha(&mask.alpha, w, h))
+                }
+                BitmapMaskOp::Shrink => {
+                    local_adjust_core::MaskAlpha::new(erode_alpha(&mask.alpha, w, h))
+                }
             };
             self.mark_mask_changed();
         }
@@ -4239,14 +4246,8 @@ impl LocalAdjustLabApp {
         let add = self.paint_mode;
         let brush_alpha = 1.0;
         if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
-            fill_polygon_alpha(
-                &mut mask.alpha,
-                mask.width,
-                mask.height,
-                &points,
-                add,
-                brush_alpha,
-            );
+            let (alpha, width, height) = mask.alpha_and_dims_mut();
+            fill_polygon_alpha(alpha, width, height, &points, add, brush_alpha);
         }
         self.mark_mask_changed();
     }
@@ -6771,7 +6772,7 @@ impl LocalAdjustLabApp {
             refinement.expand_px,
             refinement.feather_px.max(0) as usize,
         );
-        mask.alpha = alpha;
+        mask.alpha = local_adjust_core::MaskAlpha::new(alpha);
         mask.refinement = SubjectMaskRefinement {
             enabled: true,
             threshold: refinement.threshold,
@@ -8835,11 +8836,11 @@ fn draw_mask_controls(
         LocalMask::Raster(mask) => {
             ui.horizontal(|ui| {
                 if ui.button("クリア").clicked() {
-                    mask.alpha.fill(0.0);
+                    mask.alpha_mut().fill(0.0);
                     changed = true;
                 }
                 if ui.button("塗りつぶし").clicked() {
-                    mask.alpha.fill(1.0);
+                    mask.alpha_mut().fill(1.0);
                     changed = true;
                 }
             });
@@ -8855,7 +8856,7 @@ fn draw_mask_controls(
         LocalMask::RasterVector(mask) => {
             ui.horizontal(|ui| {
                 if ui.button("ビットマップ消去").clicked() {
-                    mask.alpha.fill(0.0);
+                    mask.alpha_mut().fill(0.0);
                     changed = true;
                 }
                 if ui.button("オブジェクト消去").clicked() {
@@ -21288,7 +21289,7 @@ fn subject_mask_stats(mask: &SubjectMask) -> SubjectMaskStats {
     }
     let mut foreground = 0usize;
     let mut soft = 0usize;
-    for &alpha in &mask.alpha {
+    for &alpha in mask.alpha.iter() {
         let alpha = alpha.clamp(0.0, 1.0);
         if alpha >= 0.5 {
             foreground += 1;
@@ -21791,7 +21792,7 @@ fn run_u2netp_segmentation(source: &RgbaImageBuf, model_path: &Path) -> Result<R
     Ok(RasterMask {
         width: source.width,
         height: source.height,
-        alpha,
+        alpha: local_adjust_core::MaskAlpha::new(alpha),
     })
 }
 
@@ -21877,7 +21878,7 @@ fn build_region_segmentation(
     Ok(RegionMask {
         width: source.width,
         height: source.height,
-        labels,
+        labels: local_adjust_core::MaskLabels::new(labels),
         selected,
     })
 }
@@ -22226,7 +22227,7 @@ fn raster_vector_from_stored(stored: &StoredRasterVectorMask) -> Result<RasterVe
     Ok(RasterVectorMask {
         width: stored.width,
         height: stored.height,
-        alpha: unpack_alpha_bits(&packed, len),
+        alpha: local_adjust_core::MaskAlpha::new(unpack_alpha_bits(&packed, len)),
         shapes: stored.shapes.clone(),
     })
 }
@@ -22278,15 +22279,15 @@ fn soft_mask_from_stored(stored: &StoredSoftMask) -> Result<SubjectMask, String>
     Ok(SubjectMask {
         width: stored.width,
         height: stored.height,
-        alpha,
-        source_alpha,
+        alpha: local_adjust_core::MaskAlpha::new(alpha),
+        source_alpha: source_alpha.map(local_adjust_core::MaskAlpha::new),
         refinement: stored.refinement,
     })
 }
 
 fn stored_region_mask_from_mask(mask: &RegionMask) -> Result<StoredRegionMask, String> {
     let mut bytes = Vec::with_capacity(mask.labels.len().saturating_mul(4));
-    for &label in &mask.labels {
+    for &label in mask.labels.iter() {
         bytes.extend_from_slice(&label.to_le_bytes());
     }
     Ok(StoredRegionMask {
@@ -22303,10 +22304,12 @@ fn region_mask_from_stored(stored: &StoredRegionMask) -> Result<RegionMask, Stri
     if bytes.len() < len.saturating_mul(4) {
         return Err("region label payload is shorter than expected".to_string());
     }
-    let labels = bytes[..len * 4]
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let labels = local_adjust_core::MaskLabels::new(
+        bytes[..len * 4]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+    );
     Ok(RegionMask {
         width: stored.width,
         height: stored.height,
@@ -24462,14 +24465,14 @@ mod tests {
         let mask = RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![0.20, 0.49, 0.52, 0.90],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.20, 0.49, 0.52, 0.90]),
         };
         let refined = subject_cutout_refined_alpha(&mask, 0.5, 0, 0);
         assert_eq!(refined, vec![0.0, 0.0, 1.0, 1.0]);
         let stats = subject_mask_stats(&SubjectMask::from_raster(RasterMask {
             width: 4,
             height: 1,
-            alpha: refined,
+            alpha: local_adjust_core::MaskAlpha::new(refined),
         }));
         assert_eq!(stats.foreground_percent, 50.0);
         assert_eq!(stats.soft_percent, 0.0);
@@ -24480,7 +24483,7 @@ mod tests {
         let mask = RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 1.0, 1.0, 1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 1.0, 0.0]),
         };
         let refined = subject_cutout_refined_alpha(&mask, 0.5, 0, 1);
         assert!((refined[0] - 0.5).abs() < 0.001);
@@ -24495,7 +24498,7 @@ mod tests {
         let mask = RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 0.0, 1.0, 0.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.0, 1.0, 0.0, 0.0]),
         };
         let expanded = subject_cutout_refined_alpha(&mask, 0.5, 1, 0);
         assert_eq!(expanded, vec![0.0, 1.0, 1.0, 1.0, 0.0]);
@@ -24503,7 +24506,7 @@ mod tests {
         let mask = RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 1.0, 1.0, 1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 1.0, 0.0]),
         };
         let shrunk = subject_cutout_refined_alpha(&mask, 0.5, -1, 0);
         assert_eq!(shrunk, vec![0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -24514,14 +24517,30 @@ mod tests {
         let source = RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![0.20, 0.45, 0.55, 0.90],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.20, 0.45, 0.55, 0.90]),
         };
         let mut subject = SubjectMask::from_raster(source);
-        subject.alpha = subject_cutout_refined_alpha(&subject.source_raster_mask(), 0.60, 0, 0);
-        assert_eq!(subject.alpha, vec![0.0, 0.0, 0.0, 1.0]);
+        subject.alpha = local_adjust_core::MaskAlpha::new(subject_cutout_refined_alpha(
+            &subject.source_raster_mask(),
+            0.60,
+            0,
+            0,
+        ));
+        assert_eq!(
+            subject.alpha,
+            local_adjust_core::MaskAlpha::new(vec![0.0, 0.0, 0.0, 1.0])
+        );
 
-        subject.alpha = subject_cutout_refined_alpha(&subject.source_raster_mask(), 0.40, 0, 0);
-        assert_eq!(subject.alpha, vec![0.0, 1.0, 1.0, 1.0]);
+        subject.alpha = local_adjust_core::MaskAlpha::new(subject_cutout_refined_alpha(
+            &subject.source_raster_mask(),
+            0.40,
+            0,
+            0,
+        ));
+        assert_eq!(
+            subject.alpha,
+            local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 1.0])
+        );
     }
 
     #[test]
@@ -24881,7 +24900,7 @@ mod tests {
         let mask = RasterVectorMask {
             width: 4,
             height: 1,
-            alpha: vec![0.0, 0.49, 0.5, 1.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.49, 0.5, 1.0]),
             shapes: vec![MaskShape::Rect {
                 op: ShapeOp::Add,
                 center: [1.0, 1.0],
@@ -24896,7 +24915,10 @@ mod tests {
 
         assert_eq!(restored.width, 4);
         assert_eq!(restored.height, 1);
-        assert_eq!(restored.alpha, vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            restored.alpha,
+            local_adjust_core::MaskAlpha::new(vec![0.0, 0.0, 1.0, 1.0])
+        );
         assert_eq!(restored.shapes, mask.shapes);
     }
 
@@ -24905,8 +24927,8 @@ mod tests {
         let mask = SubjectMask {
             width: 3,
             height: 1,
-            alpha: vec![0.0, 1.0, 1.0],
-            source_alpha: Some(vec![0.20, 0.55, 0.90]),
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0]),
+            source_alpha: Some(local_adjust_core::MaskAlpha::new(vec![0.20, 0.55, 0.90])),
             refinement: SubjectMaskRefinement {
                 enabled: true,
                 threshold: 0.58,
@@ -24922,7 +24944,10 @@ mod tests {
         assert_eq!(restored.height, 1);
         assert_eq!(restored.alpha, mask.alpha);
         let source = restored.source_alpha.as_ref().unwrap();
-        for (actual, expected) in source.iter().zip(mask.source_alpha.as_ref().unwrap()) {
+        for (actual, expected) in source
+            .iter()
+            .zip(mask.source_alpha.as_ref().unwrap().iter())
+        {
             assert!((actual - expected).abs() <= 1.0 / 255.0);
         }
         assert_eq!(restored.refinement, mask.refinement);
@@ -24948,7 +24973,7 @@ mod tests {
         layer.manual_override.subtract = Some(RasterVectorMask {
             width: 2,
             height: 1,
-            alpha: vec![0.0, 1.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0]),
             shapes: Vec::new(),
         });
         layer.mask_inverted = true;
@@ -25004,7 +25029,7 @@ mod tests {
         layer.manual_override.subtract = Some(RasterVectorMask {
             width: 3,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 0.0]),
             shapes: Vec::new(),
         });
 
@@ -25041,7 +25066,7 @@ mod tests {
         layer.manual_override.subtract = Some(RasterVectorMask {
             width: 3,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 0.0]),
             shapes: Vec::new(),
         });
 
@@ -25081,7 +25106,7 @@ mod tests {
         layer.manual_override.add = Some(RasterVectorMask {
             width: 2,
             height: 1,
-            alpha: vec![1.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![1.0, 0.0]),
             shapes: Vec::new(),
         });
 
@@ -25609,7 +25634,7 @@ mod tests {
         let subject = RasterMask {
             width: 4,
             height: 1,
-            alpha: vec![1.0, 1.0, 0.0, 0.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![1.0, 1.0, 0.0, 0.0]),
         };
         let mask = build_region_segmentation(
             &source,
