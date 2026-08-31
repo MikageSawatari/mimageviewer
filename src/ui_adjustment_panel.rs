@@ -2789,26 +2789,60 @@ mod local_adjust_canvas_edit_contract_tests {
         );
     }
 
-    /// Esc は開いているキー編集も編集前へ戻す。
+    /// Esc はキーでの移動 / 回転を**取り消さず確定する**。
     ///
-    /// 戻さないと、Esc のあとに畳む処理が走って「取り消したはずの編集」を確定する。
+    /// 取り消しにすると、Esc の意味が**利用者に見えない無操作タイマー**次第で変わる
+    /// (1.2 秒以内なら run 全体が戻り、過ぎたら戻らない)。キー編集は 1 回押すごとに
+    /// 完了した操作で、まとめているのは Undo と保存の都合にすぎない。完了した操作を
+    /// 戻すのは Ctrl+Z の役目 (2026-08-31 利用者の実機指摘)。
+    ///
+    /// 進行中のポインタドラッグを Esc が取り消すのは別 (下のテスト)。あちらは
+    /// ボタンを押したまま本当に進行中なので、中断が正しい。
     #[test]
-    fn escape_reverts_an_open_key_run() {
+    fn escape_commits_a_key_run_instead_of_reverting_it() {
         let mut app = seam_app_with_shape();
         let start = seam_shape_center(&app);
-        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.05, 0.0);
-        assert_ne!(seam_shape_center(&app)[0], start[0]);
-
-        assert!(app.cancel_local_adjust_canvas_edit_from_shortcut());
-
-        assert_eq!(seam_shape_center(&app), start, "Esc が編集前へ戻していない");
-        assert!(app.local_adjust_shape_key_edit.is_none());
-
-        // 取り消したものを、後の畳みが復活させない。
         let undo_before = app.meta_undo.undo_len();
-        app.fold_local_adjust_edit_state();
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.05, 0.0);
+        let moved = seam_shape_center(&app);
+        assert_ne!(moved[0], start[0]);
+
+        app.cancel_local_adjust_canvas_edit_from_shortcut();
+
+        assert_eq!(
+            seam_shape_center(&app),
+            moved,
+            "Esc が完了済みのキー操作を巻き戻している"
+        );
+        assert!(
+            app.local_adjust_shape_key_edit.is_none(),
+            "run が開いたまま"
+        );
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_before + 1,
+            "Esc の時点で Undo 1 件として確定していない"
+        );
+
+        // Ctrl+Z なら戻る。
+        app.apply_meta_undo();
         assert_eq!(seam_shape_center(&app), start);
-        assert_eq!(app.meta_undo.undo_len(), undo_before);
+    }
+
+    /// Esc は「見えないセッション」に吸われない。
+    ///
+    /// キー編集を `had_edit` に数えると、選択も何も無い状態の Esc が
+    /// 「編集を取り消した」として消費され、モードを抜けられなくなる。
+    #[test]
+    fn escape_with_nothing_selected_is_not_swallowed_by_a_key_run() {
+        let mut app = seam_app_with_shape();
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.05, 0.0);
+        app.local_adjust_selected_shape = None;
+
+        assert!(
+            !app.cancel_local_adjust_canvas_edit_from_shortcut(),
+            "取り消すものが無いのに Esc が消費されている (モードを抜けられない)"
+        );
     }
 
     /// Esc はキャンバスドラッグ (グラデーション等) も編集前へ戻す。
@@ -3235,10 +3269,15 @@ mod local_adjust_fold_audit {
         );
     }
 
-    /// 確定と取り消しは、保留の種類を同じだけ扱う。
+    /// 確定と取り消しは、保留の種類を同じだけ**扱う** (同じ結末にする、ではない)。
     ///
-    /// 片方が漏らすと、取り消した編集が後の確定で復活する / 確定したはずの編集が
-    /// 残り続ける。種類が増えたときに両方へ足すことを強制する。
+    /// 片方が種類を知らないと、その保留は Esc をすり抜けて後から確定される / 逆に
+    /// 確定をすり抜けて残る。種類が増えたときに両方へ足すことを強制する。
+    ///
+    /// **結末は種類ごとに違ってよい。**ポインタのドラッグは進行中なので Esc で
+    /// 編集前へ戻すが、キーでの移動は 1 回ごとが完了した操作なので Esc でも
+    /// **確定する** (戻すのは Ctrl+Z)。取り消しが `local_adjust_shape_key_edit` を
+    /// 知っていることは、`persist_local_adjust_shape_key_edit` の呼び出しで満たす。
     #[test]
     fn commit_and_cancel_cover_the_same_kinds_of_pending_edit() {
         const KINDS: &[(&str, &str)] = &[
@@ -3276,7 +3315,7 @@ mod local_adjust_fold_audit {
             assert!(commit.contains(persist), "確定が {persist} を呼んでいない");
             assert!(
                 cancel.contains(field),
-                "取り消しが {field} を扱っていない (確定だけが扱う保留がある)"
+                "取り消しが {field} を扱っていない (Esc をすり抜ける保留がある)"
             );
         }
     }
@@ -11558,14 +11597,20 @@ impl App {
         let shape_drag = self.local_adjust_shape_drag.take();
         let brush_stroke = self.local_adjust_mask_brush_stroke.take();
         let canvas_drag = self.local_adjust_canvas_drag.take();
-        let key_edit = self.local_adjust_shape_key_edit.take();
+        // **キーでの移動 / 回転は取り消さず、ここで確定する。**
+        //
+        // ポインタのドラッグ (図形・グラデーションのハンドル・筆) は「ボタンを押した
+        // まま進行中」なので Esc で中断できる。キー編集は違って、1 回押すごとに完了した
+        // 操作であり、まとめているのは Undo と保存の都合にすぎない。取り消しにすると、
+        // **利用者に見えない無操作タイマーの内側か外側かで Esc の意味が変わる**
+        // (内側なら run 全体が戻り、外側なら戻らない)。完了した操作を戻すのは Ctrl+Z。
+        self.persist_local_adjust_shape_key_edit();
         let had_edit = self.local_adjust_selected_shape.take().is_some()
             || shape_drag.is_some()
             || self.local_adjust_mask_shape_drag_start.take().is_some()
             || self.local_adjust_mask_shape_drag_end.take().is_some()
             || brush_stroke.is_some()
             || canvas_drag.is_some()
-            || key_edit.is_some()
             || !self.local_adjust_mask_lasso_points.is_empty();
         if let Some(drag) = shape_drag
             && let Some(before) = self.local_adjust_shape_drag_before_layers.take()
@@ -11576,9 +11621,6 @@ impl App {
             && let Some(before) = self.local_adjust_canvas_drag_before_layers.take()
         {
             self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
-        }
-        if let Some(session) = key_edit {
-            self.set_local_adjust_layers_for_idx_memory_only(session.fs_idx, session.before);
         }
         if let Some(stroke) = brush_stroke {
             if let Some(before) = self.local_adjust_mask_brush_before_layers.take() {
