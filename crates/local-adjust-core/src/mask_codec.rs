@@ -385,6 +385,61 @@ mod tests {
         SubjectMaskRefinement,
     };
 
+    /// **出荷済みのディスク形式を 1 バイトも変えない。**
+    ///
+    /// `local_adjust.db` とサイドカー `mimageviewer.dat` がこの文字列を保存している。
+    /// 変わると、旧版が書いたファイルを新版が読めない (逆も) 状態になり、フォルダを
+    /// 移した利用者の補正が黙って消える。往復テストは「自分が書いたものを自分が
+    /// 読める」ことしか見ないので、**バイト列そのもの**を固定する。
+    ///
+    /// 画素バッファの持ち方を変えるとき (値 → 共有所有など) に、ここが動かないことを
+    /// 確かめること。
+    #[test]
+    fn the_on_disk_encoding_is_byte_for_byte_stable() {
+        let mut raster_vector = RasterVectorMask::empty(4, 2);
+        raster_vector.alpha = vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 1.0]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            serde_json::to_string(&raster_vector).unwrap(),
+            RASTER_VECTOR_JSON,
+            "RasterVectorMask の保存形式が変わった"
+        );
+
+        let subject = SubjectMask {
+            width: 4,
+            height: 2,
+            alpha: vec![1.0, 0.0, 0.5, 0.25, 0.75, 1.0, 0.0, 0.5]
+                .into_iter()
+                .collect(),
+            source_alpha: Some(
+                vec![0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0]
+                    .into_iter()
+                    .collect(),
+            ),
+            refinement: SubjectMaskRefinement::default(),
+        };
+        assert_eq!(
+            serde_json::to_string(&subject).unwrap(),
+            SUBJECT_JSON,
+            "SubjectMask の保存形式が変わった"
+        );
+
+        let mut region = RegionMask::empty(4, 2);
+        region.labels = vec![0, 1, 1, 2, 2, 0, 3, 3].into_iter().collect();
+        region.selected = vec![false, true, false, true];
+        assert_eq!(
+            serde_json::to_string(&region).unwrap(),
+            REGION_JSON,
+            "RegionMask の保存形式が変わった"
+        );
+    }
+
+    const RASTER_VECTOR_JSON: &str =
+        "{\"width\":4,\"height\":2,\"alpha\":\"q8z:8:Y3Bo2P+/geE/AA==\",\"shapes\":[]}";
+    const SUBJECT_JSON: &str = "{\"width\":4,\"height\":2,\"alpha\":\"q8z:8:+8/Q4LD/P0MDAA==\",\"source_alpha\":\"q8z:8:a2hoaGBg+P8fAA==\",\"refinement\":{\"enabled\":false,\"threshold\":0.52,\"expand_px\":0,\"feather_px\":1}}";
+    const REGION_JSON: &str = "{\"width\":4,\"height\":2,\"labels\":\"u32z:8:Y2BgYGCEYiYoBgFmKAYA\",\"selected\":[false,true,false,true]}";
+
     #[test]
     fn a_soft_edge_survives_the_round_trip_within_one_step_of_255() {
         let mut mask = RasterVectorMask::empty(8, 1);
