@@ -400,6 +400,19 @@ fn invoke_association_handler_inner(
     }
 
     let matched = find_association_handler(expected_id, expected_display_name, &candidates)?;
+    // 起動したのにアプリが出ず OS の「アプリを選択」が出る、という報告があった
+    // (2026-08-31)。Invoke は Ok を返すので失敗ログに出ず、どのハンドラを掴んだのか
+    // 外から見えなかった。どれに当てたかと Invoke の結果を残す。
+    crate::logger::log(format!(
+        "open_with: matched handler index={} id={:?} ui_name={:?} writeback={} (expected id={:?} name={:?}) candidates={}",
+        matched.index,
+        candidates[matched.index].handler_id,
+        candidates[matched.index].display_name,
+        matched.needs_writeback,
+        expected_id,
+        expected_display_name,
+        candidates.len(),
+    ));
     let refreshed_handler_id = matched
         .needs_writeback
         .then(|| candidates[matched.index].handler_id.clone());
@@ -411,7 +424,13 @@ fn invoke_association_handler_inner(
         },
     )?;
     ensure_all_association_paths_resolved(failed_paths)?;
-    unsafe { handlers[matched.index].Invoke(&data) }.map_err(|error| {
+    let invoke_result = unsafe { handlers[matched.index].Invoke(&data) };
+    crate::logger::log(format!(
+        "open_with: Invoke result={:?} files={}",
+        invoke_result,
+        file_paths.len()
+    ));
+    invoke_result.map_err(|error| {
         AssociationLaunchError::Shell(format!("関連付けアプリを起動できません: {error}"))
     })?;
     Ok(AssociationInvokeOutcome {
@@ -632,5 +651,22 @@ mod tests {
             find_association_handler(OLD_PAINT, "ペイント", &candidates),
             Err(AssociationLaunchError::HandlerNotFound)
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod handler_dump_tests {
+    /// 実機の関連付けハンドラを目視するための調査用テスト。
+    /// `cargo test -p mimageviewer --lib handler_dump -- --ignored --nocapture` で走らせる。
+    /// 環境依存なので通常のテスト実行からは外す。
+    #[test]
+    #[ignore]
+    fn dump_handlers_for_jpg() {
+        for handler in super::enumerate_handlers(".jpg") {
+            println!(
+                "UIName={:?} | Name={:?}",
+                handler.display_name, handler.handler_id
+            );
+        }
     }
 }

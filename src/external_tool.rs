@@ -1036,6 +1036,10 @@ fn launch_request(
                 .map_err(|error| error.to_string())
         }
         ExternalToolLaunch::Association { handler_id } => {
+            crate::logger::log(format!(
+                "external_tool: launching {tool_name:?} via Association handler_id={handler_id:?} files={}",
+                files.len()
+            ));
             let outcome = if files.len() == 1 {
                 crate::open_with::invoke_association_handler(&handler_id, &tool_name, &files[0])
             } else {
