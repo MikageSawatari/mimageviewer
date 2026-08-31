@@ -63,13 +63,38 @@ CLAUDE.md の要求どおり、**`ini_name()` / `context()` / `trigger()` / `def
 - 右クリックメニュー (フォルダー背景 / コンテナー項目)。**どこに置くのが自然かは
   [context_menu_model.rs](../../src/context_menu_model.rs) の既存構成を見て決め、判断理由を書く。**
 
-### 4. ツールバー
+### 4. ツールバー (**2026-09-01 訂正**。前版のブリーフは正本より狭かった)
 
-- 設定に `show_toolbar_external_tools` を足す (既存の `show_toolbar_*` と同型、
-  [settings.rs](../../src/settings.rs) の `show_toolbar_rating` 等が近い)。
-- ボタンを押すとピッカーを出す。
+正本 §4.9 は「任意ツールをボタンとして置ける (**お気に入り / タグと同じ動的項目パターン**)」。
+実装を見ると、そのパターンは **`ToolbarSectionId` のセクション + `ToolbarSectionDisplay` の
+表示モード**を指す ([settings.rs:1644](../../src/settings.rs:1644))。
+
+| モード | 見え方 |
+| --- | --- |
+| `Buttons` | 登録ツールが**それぞれボタン**として並ぶ |
+| `Collapsible` | 折り畳める |
+| `Dropdown` | 1 つのプルダウンから選ぶ |
+
+つまり「ツールごとの直接起動ボタン」と「単一ピッカー」は**排他ではなく、同じセクションの
+表示モードの違い**。お気に入りと同じ形で両方作る。
+
+- `ToolbarSectionId::ExternalTools` を足す。ラベル / 表示フラグの対応表は
+  [ui_main.rs:3362](../../src/ui_main.rs:3362) と [ui_main.rs:3499](../../src/ui_main.rs:3499) にある。
+- 描画は `TS::Favorites` の腕 ([ui_main.rs:8354](../../src/ui_main.rs:8354)) をそのまま雛形にする
+  (`toolbar_label` → `finish_toolbar_section_lead` → `toolbar_section_fold_toggle` →
+  モード別描画、未登録なら `(未登録)`)。
+- 設定は `show_toolbar_external_tools` / `toolbar_external_tools_display` /
+  `toolbar_external_tools_collapsed` の 3 つ。お気に入りと同じ命名に揃える。
 - ツールバーカスタマイズ ([ui_dialogs/toolbar_settings.rs](../../src/ui_dialogs/toolbar_settings.rs)) にも並べる。
 - **既定は OFF。** 既存のツールバーを黙って変えない。
+- `ToolbarSectionId` / `ToolbarSectionDisplay` はどちらも `#[serde(other)]` の `Unknown` を
+  持つので、variant 追加は旧バイナリで settings を全損させない。**その仕組みを壊さない。**
+
+### 5. メニューバー (**前版のブリーフが落としていた**)
+
+正本 §4.9 の表より: **「ファイル」配下に「外部ツール ▸」**。
+**全ツールを出す** (`show_in_context_menu` の設定に関係なく)。右クリックは「出すと決めた
+ものだけ」だが、メニューバーは全部から選べる場所という役割分担。
 
 ## やらないこと (P3 / P4)
 
