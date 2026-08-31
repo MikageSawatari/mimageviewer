@@ -2375,6 +2375,23 @@ touch Phase 3 Step 3g は相関済み touch canvas gesture へ primary 抑止を
 focus claim、debounce、viewport / detached predicate には変更を入れていない。後続リワークで
 foreground ownership を扱う際の観測として残す。
 
+**未修正の報告 (2026-08-31、BA-7 系):** 補正レイヤーの進行中編集
+(`local_adjust_shape_drag` / `local_adjust_canvas_drag` / `local_adjust_mask_brush_stroke` と
+それぞれの `*_before_layers`、および 2026-08-31 に追加した `local_adjust_shape_key_edit`) は
+**App-global**である一方、対象の文書 `local_adjust_page_layers` は `ViewerContextBundle`
+所有で swap される。detached の描画後にメイン context へ戻ってから確定が走ると、
+確定は「いま mount されている map」を `fs_idx` だけで引き直すため、**detached 側の編集が
+未保存のまま、同じ index のメインページを保存 / 削除し得る**。文書が見つからない場合は
+空として扱うので、削除に化ける経路もある。
+
+これは R-07 (b) の作業 (`368499d9` / `9ccbb934`) が**作った**ものではない。3 つの既存
+ジェスチャが元から App-global で、新しいキー編集セッションが同じ形を踏襲している。
+凍結ルールに従い**症状パッチを入れず報告のみ**とする。直すなら、保留を bundle 所有へ
+移すか、保留が `fs_idx` ではなく context + page key + items generation を持ち、確定時に
+「積んだときと同じ文書か」を検証する形になる。4 つとも同時に動かす必要がある
+(1 つだけ直すと非対称が増える)。指摘元は Codex レビュー、詳細は
+[briefs/local-adjust-ownership-progress.md](briefs/local-adjust-ownership-progress.md)。
+
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
 | 2026-08-30 | detached 静止画スナップショットの**貼り先と倍率**を、layout が対で返す 1 つの答えから取る (backlog §1.0e の最後の未達経路)。UV を取るためだけの transform は `Proportional` を宣言して二重の寄せをやめる | [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の `fs_image_draw_rect_for_size` → `fs_image_draw_geometry_for_size` (矩形単体 → `(rect, scale)`) と `detached_single_image_snapshot_layout` の戻り値、[src/app.rs](../src/app.rs) の `build_active_snapshot` から自前 `min()` の削除と UV 用 transform の `pixel_fit`、[src/gpu_lanczos.rs](../src/gpu_lanczos.rs) の回帰テスト。detached 述語、viewport ID / 登録 / recreate、runtime / host ownership、placement、focus routing、window lifecycle は変更なし | ClaudeCode が数値で再現 (子が貼る 1440 物理 px に対しリサンプラ出力 1439、`[1249,2272]` では 1438。DPI 125% / 150% でも同型)。原因は `resolve()` が丸め**前**の情報から決めた `total_scale` を捨て、丸め**後**の矩形から `min()` で逆算していたこと。Codex も source inspection で「情報を一度捨ててから復元しようとしているのが根因」と一致し、双方が構造的修正と合意 (R4 待ちは不要 — R4 は viewport / 描画入口の統合であって paint geometry 契約の前提ではない)。新規 App bool / Option、時間窓、retry は無し。旧実装と同じ再導出を戻すと落ちる回帰テストを追加し、**丸めてから比較しない** (0.44px のずれでも GPU はバイリニアを掛けるため)。Codex が指摘した Z モードの `Texels → Texels` 二重 resolve は別種 (貼り先と倍率が同じ transform 由来なので今回のボケではない) なので、backlog §1.0h として分離 |
