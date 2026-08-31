@@ -33405,6 +33405,15 @@ impl App {
         Ok(job.source.size)
     }
 
+    /// 範囲コピー用に、**描いた矩形の中で**元画像座標へ写す transform を作る。
+    ///
+    /// `page_rect` には描画に使った (= 見開きの間隔合わせ済みの) 矩形が入る。表示テクスチャの
+    /// 縦横比が元画像と違うことがあるので、元画像の比で letterbox し直す。
+    ///
+    /// **`Proportional` で作る。** `Texels` にすると寄せ直しが入り、間隔合わせで動かした分だけ
+    /// 元へ戻ってしまう。描画側は `x≈252.82`、キャプチャ側は `x=253` のように食い違い、同じ
+    /// 画面位置が別の元画像座標を指す (§1.154、Codex Sol の指摘 3)。ここで欲しいのは
+    /// **描いた位置と同じ写像**であって、貼り先の画素境界ではない。
     fn capture_region_spread_transform_for_source(
         idx: usize,
         page_rect: egui::Rect,
@@ -33414,7 +33423,7 @@ impl App {
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-            pixel_fit: RectPixelFit::Texels,
+            pixel_fit: RectPixelFit::Proportional,
             page_idx: idx,
             viewport_rect: page_rect,
             source_size: tex_size,
@@ -48086,6 +48095,36 @@ mod tests {
                 max_x: 100.0,
                 max_y: 200.0,
             },
+        );
+    }
+
+    /// キャプチャ用 transform は、**描いた矩形の位置をそのまま**引き継ぐ。
+    ///
+    /// 見開きの間隔合わせで動かした分を寄せ直しで戻すと、同じ画面位置が別の元画像座標を
+    /// 指す (§1.154、Codex Sol の指摘 3)。縦横比が同じなら位置は完全に一致するはず。
+    #[test]
+    fn capture_region_spread_target_keeps_the_rect_it_was_drawn_at() {
+        // 間隔合わせで画素境界から外れた位置を模す。
+        let drawn = egui::Rect::from_min_size(egui::pos2(252.82, 40.0), egui::vec2(200.0, 100.0));
+        let transform = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn,
+            [400, 200],
+            crate::rotation_db::Rotation::None,
+            1.0,
+        )
+        .unwrap();
+        assert!(
+            (transform.full_image_rect.left() - drawn.left()).abs() < 1e-3,
+            "描いた位置 {} からずれた: {}",
+            drawn.left(),
+            transform.full_image_rect.left()
+        );
+        assert!(
+            (transform.full_image_rect.width() - drawn.width()).abs() < 1e-3,
+            "描いた幅 {} からずれた: {}",
+            drawn.width(),
+            transform.full_image_rect.width()
         );
     }
 
