@@ -2,6 +2,7 @@
 ///
 /// Windows Shell API (`SHAssocEnumHandlers`) を使用して、
 /// ファイル拡張子に対応するアプリ一覧を取得する。
+use std::path::{Path, PathBuf};
 
 /// アプリケーションハンドラ情報
 #[derive(Clone, Debug)]
@@ -145,6 +146,7 @@ pub fn pick_exe_dialog() -> Option<PickedExecutable> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AssociationLaunchError {
+    NoTargets,
     MissingExtension,
     NonUnicodeExtension,
     HandlerNotFound,
@@ -221,7 +223,7 @@ fn normalize_windows_apps_handler_id(handler_id: &str) -> Option<WindowsAppsHand
     })
 }
 
-fn association_extension(path: &std::path::Path) -> Result<String, AssociationLaunchError> {
+fn association_extension(path: &Path) -> Result<String, AssociationLaunchError> {
     let extension = path
         .extension()
         .ok_or(AssociationLaunchError::MissingExtension)?
@@ -231,6 +233,28 @@ fn association_extension(path: &std::path::Path) -> Result<String, AssociationLa
         return Err(AssociationLaunchError::MissingExtension);
     }
     Ok(format!(".{extension}"))
+}
+
+/// Batch 起動でも、関連付けハンドラの列挙には先頭対象の拡張子だけを使う。
+///
+/// 対象順は外部ツール側で「現在項目を先頭」に解決済みという契約であり、ここで並べ替えない。
+fn association_extension_for_paths(paths: &[PathBuf]) -> Result<String, AssociationLaunchError> {
+    let first = paths.first().ok_or(AssociationLaunchError::NoTargets)?;
+    association_extension(first)
+}
+
+/// `shell_data_object_for_paths` は一部の PIDL 解決に失敗しても、解決できた対象の
+/// `IDataObject` を返せる。関連付け Batch は部分実行せず、1 件でも失敗したら Invoke 前に止める。
+fn ensure_all_association_paths_resolved(
+    failed_paths: usize,
+) -> Result<(), AssociationLaunchError> {
+    if failed_paths == 0 {
+        Ok(())
+    } else {
+        Err(AssociationLaunchError::Shell(format!(
+            "対象ファイルを Shell に渡せません (解決失敗 {failed_paths} 件)"
+        )))
+    }
 }
 
 fn find_association_handler(
@@ -276,6 +300,9 @@ fn find_association_handler(
 
 fn association_launch_error_message(error: &AssociationLaunchError) -> String {
     match error {
+        AssociationLaunchError::NoTargets => {
+            "関連付けアプリへ渡す対象ファイルがありません".to_string()
+        }
         AssociationLaunchError::MissingExtension => {
             "関連付けアプリを探すための拡張子がありません".to_string()
         }
@@ -310,7 +337,7 @@ fn initialize_com_sta() -> Result<ComApartmentGuard, windows::core::Error> {
     Ok(ComApartmentGuard { uninitialize: true })
 }
 
-/// 保存済み handler ID を対象拡張子で引き直し、Shell に単一ファイルを起動させる。
+/// 保存済み handler ID を先頭対象の拡張子で引き直し、Shell に対象全件を一度に渡す。
 ///
 /// Association 固有の COM ポインタと `IAssocHandler::Invoke` はこの関数から外へ出さない。
 /// 呼び出し元は external-tool launch worker なので、列挙・PIDL 解決・Invoke は UI thread
@@ -320,7 +347,7 @@ fn invoke_association_handler_inner(
     extension: &str,
     expected_id: &str,
     expected_display_name: &str,
-    file_path: &std::path::Path,
+    file_paths: &[PathBuf],
 ) -> Result<AssociationInvokeOutcome, AssociationLaunchError> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{ASSOC_FILTER_NONE, SHAssocEnumHandlers};
@@ -376,19 +403,14 @@ fn invoke_association_handler_inner(
     let refreshed_handler_id = matched
         .needs_writeback
         .then(|| candidates[matched.index].handler_id.clone());
-    let (data, failed_paths) =
-        crate::file_drag::shell_data_object_for_paths(&[file_path.to_path_buf()]).map_err(
-            |(failed_paths, error)| {
-                AssociationLaunchError::Shell(format!(
-                    "対象ファイルを Shell に渡せません: {error:?} (解決失敗 {failed_paths} 件)"
-                ))
-            },
-        )?;
-    if failed_paths != 0 {
-        return Err(AssociationLaunchError::Shell(format!(
-            "対象ファイルを Shell に渡せません (解決失敗 {failed_paths} 件)"
-        )));
-    }
+    let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(file_paths).map_err(
+        |(failed_paths, error)| {
+            AssociationLaunchError::Shell(format!(
+                "対象ファイルを Shell に渡せません: {error:?} (解決失敗 {failed_paths} 件)"
+            ))
+        },
+    )?;
+    ensure_all_association_paths_resolved(failed_paths)?;
     unsafe { handlers[matched.index].Invoke(&data) }.map_err(|error| {
         AssociationLaunchError::Shell(format!("関連付けアプリを起動できません: {error}"))
     })?;
@@ -398,24 +420,38 @@ fn invoke_association_handler_inner(
 }
 
 #[cfg(windows)]
-pub(crate) fn invoke_association_handler(
+pub(crate) fn invoke_association_handler_for_paths(
     handler_id: &str,
     display_name: &str,
-    file_path: &std::path::Path,
+    file_paths: &[PathBuf],
 ) -> Result<AssociationInvokeOutcome, String> {
-    let extension = association_extension(file_path)
+    let extension = association_extension_for_paths(file_paths)
         .map_err(|error| association_launch_error_message(&error))?;
-    invoke_association_handler_inner(&extension, handler_id, display_name, file_path)
+    invoke_association_handler_inner(&extension, handler_id, display_name, file_paths)
         .map_err(|error| association_launch_error_message(&error))
 }
 
 #[cfg(not(windows))]
-pub(crate) fn invoke_association_handler(
+pub(crate) fn invoke_association_handler_for_paths(
     _handler_id: &str,
     _display_name: &str,
-    _file_path: &std::path::Path,
+    file_paths: &[PathBuf],
 ) -> Result<AssociationInvokeOutcome, String> {
+    if file_paths.is_empty() {
+        return Err(association_launch_error_message(
+            &AssociationLaunchError::NoTargets,
+        ));
+    }
     Err("関連付けアプリの起動は Windows でのみ利用できます".to_string())
+}
+
+/// 既存の単一ファイル起動経路向け compatibility wrapper。
+pub(crate) fn invoke_association_handler(
+    handler_id: &str,
+    display_name: &str,
+    file_path: &Path,
+) -> Result<AssociationInvokeOutcome, String> {
+    invoke_association_handler_for_paths(handler_id, display_name, &[file_path.to_path_buf()])
 }
 
 #[cfg(test)]
@@ -431,6 +467,53 @@ mod tests {
         assert_eq!(
             association_extension(std::path::Path::new(r"C:\images\page")),
             Err(AssociationLaunchError::MissingExtension)
+        );
+    }
+
+    #[test]
+    fn association_batch_uses_only_the_first_path_for_handler_lookup() {
+        let paths = vec![
+            PathBuf::from(r"C:\images\primary.JPG"),
+            PathBuf::from(r"C:\images\secondary.png"),
+            PathBuf::from(r"C:\images\without-extension"),
+        ];
+
+        assert_eq!(
+            association_extension_for_paths(&paths),
+            Ok(".JPG".to_string())
+        );
+
+        let first_has_no_extension = vec![
+            PathBuf::from(r"C:\images\without-extension"),
+            PathBuf::from(r"C:\images\secondary.png"),
+        ];
+        assert_eq!(
+            association_extension_for_paths(&first_has_no_extension),
+            Err(AssociationLaunchError::MissingExtension),
+            "後続 path の拡張子へ暗黙にフォールバックしない"
+        );
+    }
+
+    #[test]
+    fn association_batch_rejects_an_empty_target_list() {
+        assert_eq!(
+            association_extension_for_paths(&[]),
+            Err(AssociationLaunchError::NoTargets)
+        );
+        assert_eq!(
+            association_launch_error_message(&AssociationLaunchError::NoTargets),
+            "関連付けアプリへ渡す対象ファイルがありません"
+        );
+    }
+
+    #[test]
+    fn association_batch_rejects_any_unresolved_shell_path() {
+        assert_eq!(ensure_all_association_paths_resolved(0), Ok(()));
+        assert_eq!(
+            ensure_all_association_paths_resolved(2),
+            Err(AssociationLaunchError::Shell(
+                "対象ファイルを Shell に渡せません (解決失敗 2 件)".to_string()
+            ))
         );
     }
 

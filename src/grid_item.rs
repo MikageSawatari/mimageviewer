@@ -169,6 +169,16 @@ impl FileOperationRefusal {
     }
 }
 
+/// チェック選択に ZIP / PDF 内ページが混ざったときの共通通知。
+///
+/// チェック可能だが実ファイルとして渡せない項目は現状 `ZipImage` / `PdfPage` だけなので、
+/// ファイル操作と外部ツール起動で同じ理由・解除方法を案内する。
+pub(crate) fn checked_virtual_selection_message(action: &str) -> String {
+    format!(
+        "圧縮ファイル / PDF 内のページが選択に含まれています。ページは{action}できません。ページの選択を外してから実行してください"
+    )
+}
+
 impl GridItem {
     /// 補正プリセット / 消しゴムマスク / タグなど、ページ単位の永続データを持てるアイテムか。
     /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・

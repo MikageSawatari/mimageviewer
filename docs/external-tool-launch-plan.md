@@ -708,7 +708,8 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 | **P1b (実装済み 2026-08-30)** | ネイティブ / フォールバック右クリックへの差し込み、フォールバックの登録先を `external_tools` へ載せ替え、legacy 書き戻しの停止 | S |
 | **P1c (実装済み 2026-08-30、実機確認待ち)** | 関連付けアプリをシェルに起動させる (`ExternalToolLaunch` 3 分岐、`IAssocHandler::Invoke`、`recent_open_with_apps` の分類移行)。実機で踏んだ不具合の修正 | M |
 | **P1d (実装中 2026-08-30)** | 関連付けハンドラの引き当てを Store 更新に耐える形にする (パッケージ識別 / 表示名フォールバックと `handler_id` の書き戻し)。実機で踏んだ不具合の修正 | S |
-| **P2** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、ツールバー / キースロット | M |
+| **P2a (実装済み 2026-08-31)** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、`{files}`、複数起動の確認と成否集約。コンテナーは resolver のみで入口は P2b | M |
+| **P2b** | ツールバー / キースロット / ピッカー UI とコンテナー対象の入口 | S |
 | **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
 | **P4** | `VideoPolicy::CurrentFrame`、**`SpreadPolicy` 3 値まとめて** (`Merged` の合成を含む。§4.5 の 2026-08-31 決定)、`{container}`/`{entry}`/`{page}`/`{time}` | M |
 | **P5** | round-trip の残り (実ファイルの mtime 監視 + 再読み込み) | M |

@@ -9,7 +9,7 @@ use crate::context_menu_model::{
     AssociatedAppMenuEntry, ContextMenuActionState, ContextMenuInput, ContextMenuItemKind,
     ContextMenuSurface, ContextMenuViewFlags, ExternalToolMenuEntry, MenuCommand, MenuNode,
 };
-use crate::grid_item::GridItem;
+use crate::grid_item::{GridItem, checked_virtual_selection_message};
 use crate::native_context_menu::{
     NativeContextMenuRequest, NativeContextMenuResult, ShellMenuPlacement,
 };
@@ -290,12 +290,6 @@ fn classify_checked_file_operation_selection(
     }
 }
 
-fn checked_virtual_selection_message(operation: &str) -> String {
-    format!(
-        "圧縮ファイル / PDF 内のページが選択に含まれています。ページは{operation}できません。ページの選択を外してから実行してください"
-    )
-}
-
 #[derive(Clone)]
 struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
@@ -306,6 +300,7 @@ struct NativeGridContextMenuTarget {
     is_folder_context: bool,
     has_checked: bool,
     checked_count: usize,
+    external_tool_targets: Vec<crate::external_tool::LaunchTarget>,
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
@@ -1162,6 +1157,24 @@ impl crate::app::App {
                 .map(|path| vec![(idx, path.to_path_buf())])
                 .unwrap_or_default()
         };
+        let external_tool_targets = if is_folder_context {
+            vec![crate::external_tool::LaunchTarget::Unsupported]
+        } else {
+            let source = match surface {
+                ContextMenuSurface::Grid => {
+                    crate::external_tool::ExternalTargetSource::GridContext { clicked: Some(idx) }
+                }
+                ContextMenuSurface::Fullscreen => {
+                    crate::external_tool::ExternalTargetSource::Viewer { current: Some(idx) }
+                }
+            };
+            crate::external_tool::resolve_external_targets(
+                &self.items,
+                self.current_grid_order(),
+                &self.checked,
+                source,
+            )
+        };
         NativeGridContextMenuTarget {
             shell_paths,
             real_paths,
@@ -1171,6 +1184,7 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             checked_count: if has_checked { self.checked.len() } else { 0 },
+            external_tool_targets,
             surface,
             explorer_folder,
             folder_command_target,
@@ -1184,7 +1198,9 @@ impl crate::app::App {
     ) -> Vec<MenuNode> {
         let external_items = crate::external_tool::external_tool_menu_items(
             &self.settings.external_tools,
-            crate::external_tool::ExternalToolMenuTarget::from_grid_item(&target.item),
+            crate::external_tool::ExternalToolMenuTarget::from_launch_targets(
+                &target.external_tool_targets,
+            ),
         );
         let labels: Vec<_> = external_items
             .iter()
@@ -1503,9 +1519,7 @@ impl crate::app::App {
                     self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
                     return None;
                 };
-                let launch_target =
-                    crate::external_tool::LaunchTarget::from_grid_item(Some(&target.item));
-                self.queue_external_tool_launch(&tool, &launch_target);
+                self.queue_external_tool_launch_targets(&tool, &target.external_tool_targets);
                 None
             }
             MenuCommand::OpenWithAssociation {
@@ -2466,6 +2480,9 @@ mod delete_confirm_tests {
 
     fn target(item: GridItem, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
         let path = item.drag_source_path().map(Path::to_path_buf);
+        let external_tool_targets = vec![crate::external_tool::LaunchTarget::from_grid_item(Some(
+            &item,
+        ))];
         NativeGridContextMenuTarget {
             shell_paths: path.clone().map(|path| vec![path]),
             real_paths: path.into_iter().collect(),
@@ -2475,6 +2492,7 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
+            external_tool_targets,
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
@@ -2577,6 +2595,93 @@ mod delete_confirm_tests {
     }
 
     #[test]
+    fn external_tool_context_target_uses_checked_display_order_with_clicked_first() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\zero.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\two.jpg")),
+        ];
+        app.visible_indices = vec![2, 0, 1];
+        app.checked.extend([0, 1, 2]);
+
+        let target = app.context_menu_target(
+            1,
+            app.items[1].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+        let paths: Vec<_> = target
+            .external_tool_targets
+            .iter()
+            .map(|target| target.real_file().unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\media\clicked.jpg"),
+                PathBuf::from(r"C:\media\two.jpg"),
+                PathBuf::from(r"C:\media\zero.jpg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_tool_mixed_checked_selection_is_rejected_before_partial_launch() {
+        let mut app = crate::app::setup_app_for_test();
+        let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+        tool.id = crate::external_tool::ExternalToolId(7);
+        tool.name = "test-tool".to_string();
+        app.settings.external_tools = vec![tool];
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\real.jpg")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+                page_num: 2,
+                content_type: None,
+            },
+        ];
+        app.visible_indices = vec![0, 1];
+        app.checked.extend([0, 1]);
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+
+        assert!(app.context_menu_nodes(&target, false).iter().any(|node| {
+            matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
+                    ..
+                }
+            )
+        }));
+        let action = app.dispatch_native_grid_context_command(
+            &egui::Context::default(),
+            MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
+            &target,
+        );
+
+        assert!(action.is_none());
+        assert!(app.external_tool_launch_pending.is_empty());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("test-tool")
+                && text.contains("ページは外部ツールで開くことができません")
+                && text.contains("ページの選択を外してから")
+        }));
+    }
+
+    #[test]
     fn native_menu_appends_all_visible_external_tools_after_one_separator() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.external_tools = (0..12)
@@ -2594,7 +2699,7 @@ mod delete_confirm_tests {
         app.settings.external_tools.insert(4, hidden);
 
         let target = NativeGridContextMenuTarget {
-            // checked の Shell paths と外部ツール対象 item は別 ownership。P1b は item 側。
+            // Shell paths と外部ツール対象集合は別 ownership。P2a は checked 全件を保持する。
             shell_paths: Some(vec![PathBuf::from(r"C:\media\checked-other.jpg")]),
             real_paths: vec![PathBuf::from(r"C:\media\checked-other.jpg")],
             delete_targets: vec![(0, PathBuf::from(r"C:\media\checked-other.jpg"))],
@@ -2603,6 +2708,9 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: true,
             checked_count: 1,
+            external_tool_targets: vec![crate::external_tool::LaunchTarget::RealFile(
+                PathBuf::from(r"C:\media\checked-other.jpg"),
+            )],
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,

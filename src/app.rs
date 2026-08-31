@@ -11630,14 +11630,12 @@ pub struct App {
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
     pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
-    /// 外部ツールの process spawn を UI スレッド外で待つ短命 worker。
-    /// 実行中の外部ツール起動。**Vec で持つ**: 単一 slot にすると 2 つ続けて起動した
-    /// ときに先の結果 (失敗 toast を含む) が捨てられる。UNC 上の EXE では spawn 自体が
-    /// 秒単位で待たされ得るので、この窓は実際に踏める。
+    /// 外部ツールの process spawn を UI スレッド外で行う、操作単位の短命 worker。
+    /// `Each` の複数結果は各 pending 内で集約し、別々の利用者操作はこの Vec で並行保持する。
     pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
-    /// ネットワークパス上の登録 EXE を起動する前の確認要求。
+    /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_launch_confirmation:
-        Option<crate::external_tool::ExternalLaunchRequest>,
+        Option<crate::external_tool::ExternalLaunchConfirmation>,
 
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)

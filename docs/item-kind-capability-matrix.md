@@ -115,12 +115,13 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 
 | 機能・入口 | 実ファイル (`Image` / `Video` / `Audio`) | `Folder` | コンテナファイル (`ZipFile` / `PdfFile`) | `ZipImage` | `PdfPage` | `Stack` | `ZipDir` | 保存先・対象ファイルの変更 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ExternalTool — グリッド | **対応**。`show_in_context_menu` の実ファイル用 tool を enabled 表示し、実 path を渡す (`src/external_tool.rs:136-160`, `src/external_tool.rs:348-374`, `src/external_tool.rs:560-581`)。 | **拒否**。`Unsupported` に分類し、tool を menu に出さない (`src/external_tool.rs:143-159`, `src/external_tool.rs:371-372`)。 | **対応**。ZIP/PDF 自身を `RealFile` として渡す (`src/external_tool.rs:143-152`, `src/external_tool.rs:171-203`)。 | **拒否**。viewing tool は非表示、editing tool だけ disabled +「書き出してから」理由表示。fallback / 一時実体化はない (`src/external_tool.rs:12`, `src/external_tool.rs:153-159`, `src/external_tool.rs:365-370`)。 | **拒否**。`ZipImage` と同じ `VirtualPage` 扱い (`src/external_tool.rs:153-159`, `src/external_tool.rs:365-370`)。 | **拒否**。`VirtualPage` 扱いで viewing tool は非表示、editing tool は理由付き disabled (`src/external_tool.rs:153-159`, `src/external_tool.rs:365-370`)。 | **拒否**。`Unsupported` として全 tool を非表示 (`src/external_tool.rs:156-159`, `src/external_tool.rs:371-372`)。 | tool 定義は `settings.db` の `external_tools` table (`src/settings_db.rs:1530-1548`, `src/settings_db.rs:2391-2456`)。mIV は path を process / association / OS default へ渡すだけで対象 file を変更しない (`src/external_tool.rs:633-675`)。外部 process が行う変更は mIV 管理外。 |
-| ExternalTool — ビューア | **対応**。viewer leaf の実 Image/Video/Audio は同じ launch 経路を使う。ただし spawn 成功前でも viewer close を予約する (`src/ui_dialogs/context_menu.rs:1681-1694`, `src/external_tool.rs:699-717`)。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない (`src/ui_main.rs:13139-13184`, `src/external_tool.rs:156-159`)。 | **拒否**。コンテナ自身でなく子ページが viewer target になるため、親へ fallback しない (`src/external_tool.rs:153-159`, `src/external_tool.rs:178-203`)。 | **拒否**。グリッドと同じく viewing tool 非表示 / editing tool disabled (`src/external_tool.rs:153-159`, `src/external_tool.rs:365-370`)。 | **拒否**。グリッドと同じく viewing tool 非表示 / editing tool disabled (`src/external_tool.rs:153-159`, `src/external_tool.rs:365-370`)。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される (`src/filename_stack_ui.rs:595-660`)。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない (`src/ui_main.rs:13139-13184`, `src/external_tool.rs:156-159`)。 | グリッドと同じ `settings.db` の tool 定義を読む (`src/settings_db.rs:2391-2512`)。mIV は file を書き換えず、外部 process の動作は管理外 (`src/external_tool.rs:633-675`)。 |
+| ExternalTool — グリッド | **対応**。checked があれば checked 全件、無ければ右クリック項目を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す (`resolve_external_targets` / `build_launch_operation`)。 | **拒否**。`Unsupported` に分類し、tool を menu に出さない。 | **対応**。ZIP/PDF 自身を `RealFile` として渡し、実ファイルと同じ選択ポリシーを適用する。 | **拒否 (P3 まで)**。単独では viewing tool を非表示、editing tool を理由付き disabled にする。実ファイルとの混在時は選択全体を起動前に拒否し、部分起動しない。 | **拒否 (P3 まで)**。`ZipImage` と同じ仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。mIV は実 path を process / association / OS default へ渡すだけで対象 file を変更しない。外部 process が行う変更は mIV 管理外。 |
+| ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P2a では 1 件のままで、`SpreadPolicy` は P4 まで適用しない。ただし spawn 成功前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身でなく子ページが viewer target になるため、親へ fallback しない。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ `settings.db` の tool 定義を読む。mIV は file を書き換えず、外部 process の動作は管理外。 |
 
-checked があっても ExternalTool の menu と launch target は右クリックした一件だけから作り、
-checked selection は使わない (`src/ui_dialogs/context_menu.rs:1180-1188`,
-`src/ui_dialogs/context_menu.rs:1495-1509`, `src/external_tool.rs:560-581`)。
+`SelectionPolicy::Single` は上記対象集合の先頭 1 件、`Each` は 1 件ずつ、`Batch` は全件を 1 回で渡す。
+`Executable::Batch` の `{files}` は path ごとに独立した引数へ展開し、`Association::Batch` は全 path を
+1 つの `IDataObject` に載せる。`OsDefault::Batch` は `Each` と同じで、21 件以上の個別起動は
+確認ダイアログを挟む。複数試行の結果は 1 利用者操作として成功 / 失敗件数を集約して通知する。
 
 ## 5. スマートフォルダと検索
 
@@ -196,14 +197,14 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
     classifier は拡張子が厳密に `zip` の場合しか索引しない。そのため同じ `ZipFile` variant
     でも `.cbz` は検索されない (`src/folder_tree.rs:137-141`,
     `src/name_bulk_indexer.rs:339-362`)。
-13. **ExternalTool × virtual page / `Stack`** — 3 種とも `VirtualPage` にまとめられ、閲覧 tool は
-    menu から消え、編集 tool だけ理由付き disabled になる。親 fallback や一時実体化はない
-    (`src/external_tool.rs:143-159`, `src/external_tool.rs:348-373`,
-    `src/external_tool.rs:178-203`)。
-14. **ExternalTool × checked selection × menu 対象全種別** — checked が複数あっても、
-    `RealFile` / `VirtualPage` / `Unsupported` の判定と tool launch は右クリックした一件だけを使う
-    (`src/external_tool.rs:143-159`, `src/ui_dialogs/context_menu.rs:1180-1188`,
-    `src/ui_dialogs/context_menu.rs:1495-1509`, `src/external_tool.rs:560-581`)。
+13. **ExternalTool × virtual page / `Stack` / `ZipDir`** — P3 の実体化までは仮想対象として扱う。
+    単独では閲覧 tool が menu から消え、編集 tool だけ理由付き disabled になる。実項目との混在では
+    tool の入口を残すが、起動境界で選択全体を理由付き拒否する。親 fallback や部分実行はない
+    (`LaunchTarget::Virtual`, `virtual_target_error`)。
+14. **ExternalTool × checked selection × menu 対象全種別 (P2a で解消)** — menu 構築時に checked
+    全件を `current_grid_order()` 順で snapshot し、右クリック項目が checked 内なら先頭へ移す。
+    menu 表示後に checked が変わっても dispatch は同じ snapshot を使い、`SelectionPolicy` を適用する
+    (`resolve_external_targets`, `NativeGridContextMenuTarget::external_tool_targets`)。
 15. **mIV 削除 / Windows Shell 削除 × 実 path** — 同じ native context menu に両方が併存し得るが、
     Windows 側 command は mIV の metadata hard-purge 経路を通らない。Windows が削除項目を
     出すか自体は環境依存で **要調査** (`src/native_context_menu.rs:415-451`,
