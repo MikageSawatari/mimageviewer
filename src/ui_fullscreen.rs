@@ -14321,6 +14321,14 @@ impl App {
         let mut fs_hud_ms = 0.0_f64;
         let mut fs_panels_ms = 0.0_f64;
         let mut fs_hover_bar_ms = 0.0_f64;
+        // 編集ツールのキャンバス (消しゴム / 隠蔽 / テキスト / 補正レイヤー / crop)。
+        // ここは `central_unaccounted_ms` の中身で、24MP のブラシ操作中はフレームの
+        // 半分近くを占めていた (2026-08-31 実測)。塗りと重ね描きを分けて計る。
+        let mut fs_edit_canvas_ms = 0.0_f64;
+        let mut fs_la_canvas_input_ms = 0.0_f64;
+        let mut fs_la_canvas_overlay_ms = 0.0_f64;
+        // hover bar より後ろのオーバーレイ / ダイアログ群。
+        let mut fs_tail_ms = 0.0_f64;
         let mut fs_central_ms = 0.0_f64;
         let mut fs_vst_manager_ms = 0.0_f64;
         let mut fs_closure_ms = 0.0_f64;
@@ -15111,6 +15119,7 @@ impl App {
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
+                        let edit_canvas_t0 = std::time::Instant::now();
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
                         // `is_spread_double` はキー入力ハンドラより前 (フレーム冒頭) で
                         // 計算されるので、見開き中に [E] を押した最初のフレームだけは
@@ -15166,8 +15175,14 @@ impl App {
                             && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
+                                let la_input_t0 = std::time::Instant::now();
                                 self.handle_local_adjust_canvas_input(ctx, full_rect, transform);
+                                fs_la_canvas_input_ms =
+                                    la_input_t0.elapsed().as_secs_f64() * 1000.0;
+                                let la_overlay_t0 = std::time::Instant::now();
                                 self.draw_local_adjust_canvas_overlay(ui, transform);
+                                fs_la_canvas_overlay_ms =
+                                    la_overlay_t0.elapsed().as_secs_f64() * 1000.0;
                             }
                         } else if self.local_adjust_mode {
                             ctx.request_repaint();
@@ -15212,6 +15227,8 @@ impl App {
                         } else if self.export_crop_mode {
                             ctx.request_repaint();
                         }
+
+                        fs_edit_canvas_ms = edit_canvas_t0.elapsed().as_secs_f64() * 1000.0;
 
                         let overlay_t0 = std::time::Instant::now();
                         self.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
@@ -15862,6 +15879,8 @@ impl App {
                             }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
+
+                        let tail_t0 = std::time::Instant::now();
                         if let Some(rotation) = rotation_choice {
                             self.set_image_rotation(fs_idx, rotation);
                         }
@@ -15990,6 +16009,7 @@ impl App {
                             self.persist_current_reading_flow();
                             ctx.request_repaint();
                         }
+                        fs_tail_ms = tail_t0.elapsed().as_secs_f64() * 1000.0;
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -16183,10 +16203,12 @@ impl App {
             let fs_closure_unaccounted_ms = (fs_closure_ms - fs_closure_tracked_ms).max(0.0);
             let fs_central_tracked_ms = fs_input_ms
                 + fs_media_ms
+                + fs_edit_canvas_ms
                 + fs_overlay_ms
                 + fs_hud_ms
                 + fs_panels_ms
-                + fs_hover_bar_ms;
+                + fs_hover_bar_ms
+                + fs_tail_ms;
             let fs_central_unaccounted_ms = (fs_central_ms - fs_central_tracked_ms).max(0.0);
             let (video_playing, video_pending_frames, video_state, video_seq) =
                 match self.fs_cache.get(&fs_idx) {
@@ -16273,6 +16295,16 @@ impl App {
                     ("hud_ms", serde_json::Value::from(fs_hud_ms)),
                     ("panels_ms", serde_json::Value::from(fs_panels_ms)),
                     ("hover_bar_ms", serde_json::Value::from(fs_hover_bar_ms)),
+                    ("edit_canvas_ms", serde_json::Value::from(fs_edit_canvas_ms)),
+                    (
+                        "la_canvas_input_ms",
+                        serde_json::Value::from(fs_la_canvas_input_ms),
+                    ),
+                    (
+                        "la_canvas_overlay_ms",
+                        serde_json::Value::from(fs_la_canvas_overlay_ms),
+                    ),
+                    ("tail_ms", serde_json::Value::from(fs_tail_ms)),
                     ("vst_manager_ms", serde_json::Value::from(fs_vst_manager_ms)),
                     ("is_video", serde_json::Value::from(fs_state_is_video)),
                     ("gpu_video", serde_json::Value::from(fs_state_gpu_video)),
