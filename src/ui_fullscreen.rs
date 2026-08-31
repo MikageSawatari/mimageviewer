@@ -4241,6 +4241,19 @@ fn align_spread_pages_for_gap(
     center_x: f32,
     pixels_per_point: f32,
 ) -> (egui::Vec2, egui::Vec2) {
+    // **寄せていない矩形を動かさない。** 端数のある拡大では `RectPixelFit::Texels` は
+    // 何も寄せないので、`layout_spread_page_rects` が小数のまま空けた間隔がそのまま正しい。
+    // そこへ整数量の移動を足すと、正しかった間隔を壊す (1 度目の修正がこれをやっていて、
+    // 高 DPI では間隔が 0.5px ずれたりページが重なったりしていた)。
+    if matches!(
+        crate::displayed_image_transform::rect_snap_mode(left.total_scale, pixels_per_point),
+        crate::displayed_image_transform::RectSnapMode::None
+    ) || matches!(
+        crate::displayed_image_transform::rect_snap_mode(right.total_scale, pixels_per_point),
+        crate::displayed_image_transform::RectSnapMode::None
+    ) {
+        return (egui::Vec2::ZERO, egui::Vec2::ZERO);
+    }
     let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -36471,105 +36484,118 @@ mod tests {
     /// 見開きの間隔は、**最終的に描く矩形**で設定どおりになる (§1.154)。
     ///
     /// 中間の `layout_spread_page_rects` だけ調べても足りない。そこは小数のまま正しく
-    /// 空けるが、その後 `RectPixelFit::Texels` の寄せが左右を独立に丸めるので、1px 設定が
-    /// 2px になる。**測るのは最終 transform の `paint_rect`。**
+    /// 空けるが、その後 `RectPixelFit::Texels` の寄せが左右を独立に丸めると保たれない。
+    /// **測るのは最終 transform の `paint_rect`。**
     ///
-    /// 1249x2272 は縮小後の片ページ幅に端数が出る組み合わせ (791.62px)。1120x1600 のように
-    /// 整数になる組み合わせでは元から 1px だったので、「設定どおりの場合もある」という
-    /// 発症条件をそのまま並べる。
+    /// 幅を広く振るのは、1 度目の修正が**寄せていない矩形まで動かして**壊していたため
+    /// (端数のある拡大では寄せは何もしない。そこへ整数量を足すと、正しかった間隔が
+    /// 0.5px ずれたりページが重なったりする)。3 サイズでは踏めなかった。
     #[test]
-    fn a_downscaled_spread_keeps_the_configured_gap_in_the_rect_it_paints() {
-        for (page_w, page_h) in [(1249.0_f32, 2272.0_f32), (1120.0, 1600.0), (4248.0, 6048.0)] {
-            for gap in [0.0_f32, 1.0, 2.0, 3.0] {
-                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
-                    let viewport =
-                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
-                    let page = egui::vec2(page_w, page_h);
-                    // 高さフィットで左右に並べる。
-                    let total_scale =
-                        (viewport.height() / page.y).min((viewport.width() - gap) / (page.x * 2.0));
-                    let geometry = SpreadLayoutGeometry {
-                        left: SpreadPageLayoutSize {
-                            size: page,
-                            scale_factor: 1.0,
-                        },
-                        right: SpreadPageLayoutSize {
-                            size: page,
-                            scale_factor: 1.0,
-                        },
-                        fit_size: page,
-                        content_center_offset: egui::Vec2::ZERO,
-                    };
-                    let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    let rects = layout_spread_page_rects(
-                        viewport.center(),
-                        geometry,
-                        total_scale,
-                        gap,
-                        pixels_per_point,
-                        unit,
-                        unit,
-                        false,
-                    );
-
-                    let resolve = |rect: egui::Rect| {
-                        resolve_fs_transform_in_layout_rect(
-                            DisplayedImageTransformInput {
-                                pixel_fit: RectPixelFit::Texels,
-                                page_idx: 0,
-                                viewport_rect: viewport,
-                                source_size: page,
-                                texture_size: page,
-                                rotation: crate::rotation_db::Rotation::None,
-                                free_rotation_rad: 0.0,
-                                content_bbox: None,
-                                fit_mode: FullscreenFitMode::Page,
-                                fit_scale_limits: FullscreenFitScaleLimits {
-                                    pixels_per_point,
-                                    ..FullscreenFitScaleLimits::default()
-                                },
-                                pixels_per_point,
-                                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                            },
-                            rect,
-                        )
-                        .expect("spread page transform")
-                    };
-                    let left = resolve(rects.left_rect);
-                    let right = resolve(rects.right_rect);
-
-                    let gap_px = (gap.max(0.0) * pixels_per_point).round();
-                    let (left_offset, right_offset) = align_spread_pages_for_gap(
-                        &left,
-                        &right,
-                        gap_px,
-                        viewport.center().x,
-                        pixels_per_point,
-                    );
-                    let left = left.translated_by(left_offset);
-                    let right = right.translated_by(right_offset);
-
-                    let painted_gap_px =
-                        (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
-                    assert!(
-                        (painted_gap_px - gap_px).abs() < 1e-3,
-                        "{page_w}x{page_h} gap={gap} ppp={pixels_per_point}:                          描いた間隔 {painted_gap_px}px、設定 {gap_px}px"
-                    );
-
-                    // §1.0e を戻さないこと: 貼り先はどちらも物理ピクセル境界に乗ったまま。
-                    for (label, rect) in [
-                        ("left", left.full_image_rect),
-                        ("right", right.full_image_rect),
-                    ] {
-                        let min_px = rect.min.x * pixels_per_point;
-                        assert!(
-                            (min_px - min_px.round()).abs() < 1e-3,
-                            "{label} の原点が物理ピクセルから外れた: {min_px}"
+    fn a_spread_keeps_the_configured_gap_in_the_rect_it_paints() {
+        let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let mut failures = Vec::new();
+        for page_w in (900..1400).step_by(7) {
+            for (left_h, right_h) in [(1600.0_f32, 1600.0_f32), (2272.0, 2272.0), (6048.0, 6040.0)]
+            {
+                for gap in [0.0_f32, 1.0, 2.0, 3.0] {
+                    for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+                        let page_w = page_w as f32;
+                        let viewport = egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(2560.0, 1440.0),
                         );
+                        let left_page = egui::vec2(page_w, left_h);
+                        let right_page = egui::vec2(page_w, right_h);
+                        let geometry =
+                            spread_layout_geometry(left_page, right_page, unit, unit, true);
+                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                            / geometry.fit_size.x)
+                            .min(viewport.height() / geometry.fit_size.y);
+                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                        let rects = layout_spread_page_rects(
+                            center,
+                            geometry,
+                            fit_scale,
+                            spread_gap,
+                            pixels_per_point,
+                            unit,
+                            unit,
+                            false,
+                        );
+                        let resolve = |rect: egui::Rect, page: egui::Vec2| {
+                            resolve_fs_transform_in_layout_rect(
+                                DisplayedImageTransformInput {
+                                    pixel_fit: RectPixelFit::Texels,
+                                    page_idx: 0,
+                                    viewport_rect: viewport,
+                                    source_size: page,
+                                    texture_size: page,
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: None,
+                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                        pixels_per_point,
+                                        ..FullscreenFitScaleLimits::default()
+                                    },
+                                    pixels_per_point,
+                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                },
+                                rect,
+                            )
+                            .expect("spread page transform")
+                        };
+                        let left = resolve(rects.left_rect, left_page);
+                        let right = resolve(rects.right_rect, right_page);
+                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                        let (left_offset, right_offset) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(left_offset);
+                        let right = right.translated_by(right_offset);
+
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        let case =
+                            format!("{page_w}x{left_h}/{right_h} gap={gap} ppp={pixels_per_point}");
+                        if (painted - gap_px).abs() >= 1e-3 {
+                            failures.push(format!("{case}: 間隔 {painted}px (設定 {gap_px}px)"));
+                        }
+                        // §1.0e を戻さないこと。寄せた側は物理ピクセル境界に乗ったまま。
+                        for (side, transform) in [("left", &left), ("right", &right)] {
+                            if matches!(
+                                crate::displayed_image_transform::rect_snap_mode(
+                                    transform.total_scale,
+                                    pixels_per_point
+                                ),
+                                crate::displayed_image_transform::RectSnapMode::None
+                            ) {
+                                continue;
+                            }
+                            let min_px = transform.full_image_rect.min.x * pixels_per_point;
+                            if (min_px - min_px.round()).abs() >= 1e-3 {
+                                failures.push(format!("{case}: {side} の原点が {min_px}"));
+                            }
+                        }
                     }
                 }
             }
         }
+        assert!(
+            failures.is_empty(),
+            "{} 件失敗:
+{}",
+            failures.len(),
+            failures.iter().take(12).cloned().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
     }
 
     #[test]
