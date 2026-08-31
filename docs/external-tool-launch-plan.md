@@ -705,7 +705,7 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 | **P1d (実装中 2026-08-30)** | 関連付けハンドラの引き当てを Store 更新に耐える形にする (パッケージ識別 / 表示名フォールバックと `handler_id` の書き戻し)。実機で踏んだ不具合の修正 | S |
 | **P2** | 対象解決の共通化 (`checked` 優先 / コンテナー対象)、`SelectionPolicy`、ツールバー / キースロット | M |
 | **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
-| **P4** | `VideoPolicy::CurrentFrame`、`SpreadPolicy::Merged` の合成、`{container}`/`{entry}`/`{page}`/`{time}` | M |
+| **P4** | `VideoPolicy::CurrentFrame`、**`SpreadPolicy` 3 値まとめて** (`Merged` の合成を含む。§4.5 の 2026-08-31 決定)、`{container}`/`{entry}`/`{page}`/`{time}` | M |
 | **P5** | round-trip の残り (実ファイルの mtime 監視 + 再読み込み) | M |
 
 利用者判断により P0〜P4 は一括で出す。P5 は分けてよい。
