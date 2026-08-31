@@ -232,6 +232,7 @@ impl App {
     pub(crate) fn handle_sns_split_keys(
         &mut self,
         ctx: &egui::Context,
+        fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
         let action = crate::ui_fullscreen::FsKeyAction {
             close: false,
@@ -251,10 +252,35 @@ impl App {
             return action;
         }
         if self.keymap.consume_action(ctx, KeyAction::SnsSplitExecute) {
-            // P2 はモード終了まで。実際の分割書き出しは P3 で接続する。
-            self.reset_sns_split_mode();
+            self.execute_sns_split_export(ctx, fs_idx);
         }
         action
+    }
+
+    fn execute_sns_split_export(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let Some(layout) = self.sns_split else {
+            return false;
+        };
+        let Some(source_size) = self.fs_page_coordinate_source_size(fs_idx) else {
+            // キー入力に対して何も起きないと、利用者は原因を知る手段が無い。
+            // open_export_dialog 側の失敗経路と同じく理由を出す。
+            self.show_feedback_toast("ページの寸法をまだ取得できていません".to_string());
+            return false;
+        };
+        let image_size = [
+            source_size.x.round().max(1.0) as usize,
+            source_size.y.round().max(1.0) as usize,
+        ];
+        if !layout.fits(image_size) {
+            // パネルにも警告は出ているが、キーを押して無反応にはしない。
+            self.show_feedback_toast(
+                "画像が小さすぎるため、選択した枚数を配置できません".to_string(),
+            );
+            return false;
+        }
+
+        let frames = layout.frames();
+        self.open_export_dialog_for_sns_split(ctx, fs_idx, frames, image_size)
     }
 
     pub(crate) fn draw_sns_split_panel(
@@ -570,5 +596,156 @@ mod tests {
         assert!(summary.warning.is_some());
         assert!(summary.warning.unwrap().contains("書き出しには進めません"));
         assert_eq!(summary.dimensions, "1 x 1 x 4 枚");
+    }
+
+    #[test]
+    fn execute_shortcut_keeps_mode_and_skips_dialog_when_frames_do_not_fit() {
+        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_frame();
+
+        let image_size = [3, 3];
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
+        assert!(!layout.fits(image_size));
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.fs_early_dims.insert(0, image_size);
+        app.sns_split = Some(layout);
+
+        let ctx = egui::Context::default();
+        let modifiers = egui::Modifiers::CTRL;
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        app.keyboard_owner_for_pass(&ctx);
+        let _ = app.handle_sns_split_keys(&ctx, 0);
+        assert!(
+            !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
+            "SNS 分割の Ctrl+E は handler が消費する"
+        );
+        let _ = ctx.end_pass();
+
+        assert_eq!(app.sns_split, Some(layout));
+        assert!(app.export_dialog.is_none());
+    }
+
+    #[test]
+    fn execute_keeps_mode_when_export_snapshot_is_not_ready() {
+        let image_size = [80, 120];
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 3, image_size);
+        assert!(layout.fits(image_size));
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("not-loaded.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        app.fs_early_dims.insert(0, image_size);
+        app.sns_split = Some(layout);
+
+        let opened = app.execute_sns_split_export(&egui::Context::default(), 0);
+
+        assert!(!opened);
+        assert_eq!(app.sns_split, Some(layout));
+        assert!(app.export_dialog.is_none());
+    }
+
+    #[test]
+    fn execute_shortcut_opens_numbered_single_page_export_from_spread() {
+        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_frame();
+
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let image_size = [80, 120];
+        let left_path = app.tmp.path().join("sns-left.png");
+        let right_path = app.tmp.path().join("sns-right.png");
+        app.items = vec![
+            crate::grid_item::GridItem::Image(left_path),
+            crate::grid_item::GridItem::Image(right_path),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.thumbnails = vec![
+            crate::grid_item::ThumbnailState::Pending,
+            crate::grid_item::ThumbnailState::Pending,
+        ];
+        for (idx, color) in [(0, egui::Color32::RED), (1, egui::Color32::BLUE)] {
+            let image = egui::ColorImage::filled(image_size, color);
+            let texture = ctx.load_texture(
+                format!("sns_split_export_{idx}"),
+                image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                crate::fs_animation::FsCacheEntry::Static {
+                    tex: texture,
+                    pixels: std::sync::Arc::new(image),
+                    source_dims: Some(image_size),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.settings.sns_split_target = Some(SnsTarget::X.stable_key().to_string());
+        app.settings.sns_split_count = 3;
+        let original_selection = [false, true, false, true, false];
+        app.settings.export_batch_selection = original_selection;
+
+        assert!(app.enter_sns_split_mode(0));
+        let expected_frames = app.sns_split.expect("SNS 分割が開始していない").frames();
+        assert_eq!(expected_frames.len(), 3);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert!(app.sns_split_spread_ctx.is_some());
+
+        let modifiers = egui::Modifiers::CTRL;
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        app.keyboard_owner_for_pass(&ctx);
+        let _ = app.handle_sns_split_keys(&ctx, 0);
+        assert!(
+            !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
+            "SNS 分割の Ctrl+E は handler が消費する"
+        );
+        let _ = ctx.end_pass();
+
+        assert!(app.sns_split.is_none());
+        assert!(app.sns_split_spread_ctx.is_none());
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert_eq!(state.scale, crate::export_dialog::ExportScale::Full);
+        assert_eq!(state.sns_split_frames, expected_frames);
+        assert_eq!(state.selection, original_selection);
+        match state.pixels {
+            crate::export_dialog::ExportPixels::Single(page) => {
+                assert_eq!(page.base_pixels.size, image_size);
+                assert_eq!(page.base_pixels.pixels[0], egui::Color32::RED);
+            }
+            crate::export_dialog::ExportPixels::Spread { .. } => {
+                panic!("SNS 分割は編集対象の単ページだけを snapshot する")
+            }
+        }
     }
 }

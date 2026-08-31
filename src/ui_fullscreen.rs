@@ -3372,6 +3372,92 @@ struct ExportDialogTarget {
     pixels: crate::export_dialog::ExportPixels,
 }
 
+fn scale_sns_split_frames_to_export_pixels(
+    frames: &[crate::export_crop::CropRect],
+    source_size: [usize; 2],
+    target_size: [usize; 2],
+) -> Result<Vec<crate::export_crop::CropRect>, String> {
+    let Some(first_frame) = frames.first().copied() else {
+        return Ok(Vec::new());
+    };
+    let source_width = source_size[0].max(1) as f64;
+    let source_height = source_size[1].max(1) as f64;
+    let target_width = target_size[0].max(1);
+    let target_height = target_size[1].max(1);
+    let scale_x = target_width as f64 / source_width;
+    let scale_y = target_height as f64 / source_height;
+
+    // frames() が保証する同一寸法・同一間隔を一度だけ整数化する。各枠の端や
+    // 原点を個別に丸めると、非整数倍率では端数の位相だけで 1px 差が生じる。
+    let frame_count = frames.len();
+    if target_width < frame_count {
+        return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
+    }
+    let mut frame_width =
+        ((f64::from(first_frame.width()) * scale_x).round() as usize).clamp(1, target_width);
+    let frame_height =
+        ((f64::from(first_frame.height()) * scale_y).round() as usize).clamp(1, target_height);
+    let step = if let Some(second_frame) = frames.get(1) {
+        let source_gap = (second_frame.min_x - first_frame.max_x).max(0.0);
+        let desired_gap = (f64::from(source_gap) * scale_x).round() as usize;
+        let max_non_overlapping_width = target_width / frame_count;
+        frame_width = frame_width.min(max_non_overlapping_width);
+        let width_budget = frame_width.saturating_mul(frame_count);
+        let max_gap = (target_width - width_budget) / (frame_count - 1);
+        frame_width.saturating_add(desired_gap.min(max_gap))
+    } else {
+        0
+    };
+    let frames_width = frame_width.saturating_add((frame_count - 1).saturating_mul(step));
+    let first_min_x = (f64::from(first_frame.min_x) * scale_x)
+        .round()
+        .clamp(0.0, target_width.saturating_sub(frames_width) as f64)
+        as usize;
+    let first_min_y = (f64::from(first_frame.min_y) * scale_y)
+        .round()
+        .clamp(0.0, (target_height - frame_height) as f64) as usize;
+
+    Ok(frames
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let min_x = first_min_x.saturating_add(index.saturating_mul(step));
+            crate::export_crop::CropRect {
+                min_x: min_x as f32,
+                min_y: first_min_y as f32,
+                max_x: min_x.saturating_add(frame_width) as f32,
+                max_y: first_min_y.saturating_add(frame_height) as f32,
+            }
+        })
+        .collect())
+}
+
+fn export_batch_selection_update(
+    sns_split: bool,
+    original_selection: [bool; 5],
+    selection: [bool; 5],
+    has_conceal_mask: bool,
+    preset_slots: &crate::conceal::ConcealPresetSlots,
+) -> Option<[bool; 5]> {
+    if sns_split {
+        return None;
+    }
+
+    let mut next_selection = original_selection;
+    for i in 0..selection.len() {
+        if selection[i] {
+            next_selection[i] = true;
+        }
+    }
+    for i in 0..selection.len() {
+        let env_disabled = i > 0 && (!has_conceal_mask || preset_slots[i - 1].is_none());
+        if !selection[i] && !env_disabled {
+            next_selection[i] = false;
+        }
+    }
+    Some(next_selection)
+}
+
 #[cfg(windows)]
 struct NativeFocusClaim {
     foreground_hwnd: usize,
@@ -19418,7 +19504,7 @@ impl App {
             return self.handle_export_crop_keys(ctx, fs_idx);
         }
         if self.sns_split.is_some() {
-            return self.handle_sns_split_keys(ctx);
+            return self.handle_sns_split_keys(ctx, fs_idx);
         }
 
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
@@ -34479,23 +34565,71 @@ impl App {
     }
 
     pub(crate) fn open_export_dialog_for_current(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let _ = self.open_export_dialog(ctx, fs_idx, None);
+    }
+
+    pub(crate) fn open_export_dialog_for_sns_split(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        frames: Vec<crate::export_crop::CropRect>,
+        source_size: [usize; 2],
+    ) -> bool {
+        self.open_export_dialog(ctx, fs_idx, Some((frames, source_size)))
+    }
+
+    fn open_export_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        sns_split: Option<(Vec<crate::export_crop::CropRect>, [usize; 2])>,
+    ) -> bool {
+        let sns_split_export = sns_split.is_some();
         if self.export_pending.is_some() {
             self.show_feedback_toast("エクスポート中です".to_string());
-            return;
+            return false;
         }
-        if self.is_overlay_edit_mode_active()
+        // SNS 自身は snapshot の準備が成功するまで active のままにする。編集モードは
+        // 相互排他なので、SNS 経路ではこの 1 モードだけを例外にできる。
+        if (self.is_overlay_edit_mode_active() && !(sns_split_export && self.sns_split.is_some()))
             || self.adjustment_mode.is_open()
             || self.analysis_mode
         {
             self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
-            return;
+            return false;
         }
-        let target = match self.prepare_export_dialog_target(ctx, fs_idx) {
+        let target = match if sns_split_export {
+            // 分割枠を作った 1 ページだけを snapshot する。通常 Ctrl+E の
+            // 見開き合成経路は変更しない。
+            self.prepare_single_export_dialog_target(ctx, fs_idx)
+        } else {
+            self.prepare_export_dialog_target(ctx, fs_idx)
+        } {
             Ok(target) => target,
             Err(err) => {
                 self.show_feedback_toast(err);
-                return;
+                return false;
             }
+        };
+        let sns_split_frames = match (sns_split, &target.pixels) {
+            (Some((frames, source_size)), crate::export_dialog::ExportPixels::Single(page)) => {
+                match scale_sns_split_frames_to_export_pixels(
+                    &frames,
+                    source_size,
+                    page.base_pixels.size,
+                ) {
+                    Ok(frames) => frames,
+                    Err(err) => {
+                        self.show_feedback_toast(err);
+                        return false;
+                    }
+                }
+            }
+            (Some(_), crate::export_dialog::ExportPixels::Spread { .. }) => {
+                self.show_feedback_toast("SNS 分割の単ページを準備できませんでした".to_string());
+                return false;
+            }
+            (None, _) => Vec::new(),
         };
 
         let output_dir = self
@@ -34507,16 +34641,23 @@ impl App {
         let original_selection = self.settings.export_batch_selection;
         let mut selection = original_selection;
         let has_conceal_mask = target.pixels.has_conceal_mask();
-        for i in 1..selection.len() {
-            if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
-                selection[i] = false;
+        if !sns_split_export {
+            for i in 1..selection.len() {
+                if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
+                    selection[i] = false;
+                }
             }
-        }
-        if !selection.iter().any(|&v| v) {
-            selection[0] = true;
+            if !selection.iter().any(|&v| v) {
+                selection[0] = true;
+            }
         }
         let original_include_metadata = self.settings.export_embed_metadata;
 
+        // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
+        // snapshot と枠変換が揃った時だけ SNS モードを確定終了する。
+        if sns_split_export {
+            self.reset_sns_split_mode();
+        }
         self.export_dialog = Some(crate::export_dialog::ExportDialogState {
             source: target.source,
             source_label: target.source_label,
@@ -34525,13 +34666,18 @@ impl App {
                 &target.original_format,
                 self.settings.export_fallback_format,
             ),
-            scale: self.settings.export_default_scale,
+            scale: if sns_split_export {
+                crate::export_dialog::ExportScale::Full
+            } else {
+                self.settings.export_default_scale
+            },
             basename: crate::capture::basename_from_text(&format!("{}_edited", target.basename)),
             output_dir_text: output_dir.display().to_string(),
             source_dir: target.source_dir,
             include_metadata: original_include_metadata,
             selection,
             has_conceal_mask,
+            sns_split_frames,
             pixels: target.pixels,
             original_selection,
             original_include_metadata,
@@ -34539,6 +34685,7 @@ impl App {
             error: None,
         });
         ctx.request_repaint();
+        true
     }
 
     fn prepare_export_dialog_target(
@@ -34694,12 +34841,19 @@ impl App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let preset_slots = self.settings.conceal_presets.clone();
         let has_conceal_mask = state.has_conceal_mask;
-        for i in 1..state.selection.len() {
-            if !has_conceal_mask || preset_slots[i - 1].is_none() {
-                state.selection[i] = false;
+        let sns_split_export = !state.sns_split_frames.is_empty();
+        if !sns_split_export {
+            for i in 1..state.selection.len() {
+                if !has_conceal_mask || preset_slots[i - 1].is_none() {
+                    state.selection[i] = false;
+                }
             }
         }
-        let selected_count = state.selection.iter().filter(|&&v| v).count();
+        let selected_count = if sns_split_export {
+            state.sns_split_frames.len()
+        } else {
+            state.selection.iter().filter(|&&v| v).count()
+        };
         let basename_ok = !crate::capture::basename_from_text(&state.basename)
             .trim()
             .is_empty();
@@ -34721,6 +34875,9 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.label(&state.source_label);
+                if sns_split_export {
+                    ui.label(format!("{selected_count} 枚に分割して書き出します"));
+                }
                 ui.add_space(6.0);
                 ui.label("ファイル名");
                 let mut basename_output =
@@ -34811,7 +34968,7 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
-                let base_size = state.pixels.render_size();
+                let base_size = state.render_size();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for scale in crate::export_dialog::ExportScale::FIXED {
@@ -34854,27 +35011,59 @@ impl App {
 
                 ui.separator();
                 ui.label("出力するバリエーション");
-                ui.checkbox(&mut state.selection[0], "現在の設定 (_0)");
-                for (slot_idx, slot) in preset_slots.iter().enumerate() {
-                    let enabled = has_conceal_mask && slot.is_some();
-                    let label = match slot {
-                        Some(preset) if !preset.name.trim().is_empty() => {
-                            format!(
-                                "プリセット{}: {} (_{})",
-                                slot_idx + 1,
-                                preset.name,
-                                slot_idx + 1
-                            )
-                        }
-                        Some(_) => format!("プリセット{} (_{})", slot_idx + 1, slot_idx + 1),
-                        None => format!("プリセット{}: 空", slot_idx + 1),
-                    };
-                    ui.add_enabled_ui(enabled, |ui| {
-                        ui.checkbox(&mut state.selection[slot_idx + 1], label);
-                    });
-                }
-                if !has_conceal_mask {
-                    ui.small("プリセット出力は隠蔽マスクがある画像で有効です");
+                if sns_split_export {
+                    let reason = "SNS 分割では現在の設定のみ書き出します";
+                    let mut current_selected = true;
+                    ui.add_enabled(
+                        false,
+                        egui::Checkbox::new(&mut current_selected, "現在の設定 (_0)"),
+                    )
+                    .on_disabled_hover_text(reason);
+                    for (slot_idx, slot) in preset_slots.iter().enumerate() {
+                        let label = match slot {
+                            Some(preset) if !preset.name.trim().is_empty() => {
+                                format!(
+                                    "プリセット{}: {} (_{})",
+                                    slot_idx + 1,
+                                    preset.name,
+                                    slot_idx + 1
+                                )
+                            }
+                            Some(_) => {
+                                format!("プリセット{} (_{})", slot_idx + 1, slot_idx + 1)
+                            }
+                            None => format!("プリセット{}: 空", slot_idx + 1),
+                        };
+                        let mut selected = false;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut selected, label))
+                            .on_disabled_hover_text(reason);
+                    }
+                    ui.small(reason);
+                } else {
+                    ui.checkbox(&mut state.selection[0], "現在の設定 (_0)");
+                    for (slot_idx, slot) in preset_slots.iter().enumerate() {
+                        let enabled = has_conceal_mask && slot.is_some();
+                        let label = match slot {
+                            Some(preset) if !preset.name.trim().is_empty() => {
+                                format!(
+                                    "プリセット{}: {} (_{})",
+                                    slot_idx + 1,
+                                    preset.name,
+                                    slot_idx + 1
+                                )
+                            }
+                            Some(_) => {
+                                format!("プリセット{} (_{})", slot_idx + 1, slot_idx + 1)
+                            }
+                            None => format!("プリセット{}: 空", slot_idx + 1),
+                        };
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.checkbox(&mut state.selection[slot_idx + 1], label);
+                        });
+                    }
+                    if !has_conceal_mask {
+                        ui.small("プリセット出力は隠蔽マスクがある画像で有効です");
+                    }
                 }
 
                 if let Some(err) = &state.error {
@@ -35126,32 +35315,21 @@ impl App {
         // が export される (Codex review CONFIRMED)。
         let pixels = state.pixels.clone();
         let has_conceal_mask = pixels.has_conceal_mask();
-        let mut planned: Vec<(String, u8, Option<crate::conceal::ConcealPreset>)> = Vec::new();
-        if state.selection[0] {
-            let preset = has_conceal_mask.then(|| self.current_conceal_preset_from_settings());
-            planned.push(("現在の設定".to_string(), 0, preset));
-        }
-        for slot_idx in 0..4 {
-            if state.selection[slot_idx + 1] {
-                if !has_conceal_mask {
-                    continue;
-                }
-                let Some(preset) = self.settings.conceal_presets[slot_idx].clone() else {
-                    continue;
-                };
-                let label = if preset.name.trim().is_empty() {
-                    format!("プリセット{}", slot_idx + 1)
-                } else {
-                    format!("プリセット{}: {}", slot_idx + 1, preset.name)
-                };
-                planned.push((label, (slot_idx + 1) as u8, Some(preset)));
-            }
-        }
-        if planned.is_empty() {
+        let sns_split_export = !state.sns_split_frames.is_empty();
+        let current_conceal_preset = (!sns_split_export && has_conceal_mask)
+            .then(|| self.current_conceal_preset_from_settings());
+        let entries = crate::export_dialog::plan_export_entries(
+            &state.sns_split_frames,
+            &state.selection,
+            has_conceal_mask,
+            current_conceal_preset,
+            &self.settings.conceal_presets,
+        )?;
+        if entries.is_empty() {
             return Err("出力するバリエーションを選んでください".to_string());
         }
 
-        let suffixes: Vec<u8> = planned.iter().map(|(_, suffix, _)| *suffix).collect();
+        let suffixes: Vec<u8> = entries.iter().map(|entry| entry.suffix).collect();
         let resolved_basename = crate::export_dialog::resolve_session_basename(
             &output_dir,
             &basename,
@@ -35159,35 +35337,19 @@ impl App {
             &suffixes,
         )?;
 
-        let mut entries = Vec::with_capacity(planned.len());
-        for (label, suffix, preset) in planned {
-            entries.push(crate::export_dialog::ExportEntry {
-                label,
-                suffix,
-                conceal_preset: preset,
-            });
-        }
-
         // 永続化する selection は **ユーザーが実際にダイアログで触った値** を残す。
-        // 環境要因 (has_conceal_mask=false / preset slot 空) で planned から落ちた
+        // 環境要因 (has_conceal_mask=false / preset slot 空) で entries から落ちた
         // エントリは「ユーザーが unchecked にした」と区別したいので、original_selection
         // を底辺にして「現在も checked」な slot だけ反映する (Codex review CONFIRMED)。
-        let mut next_selection = state.original_selection;
-        // user が今のセッションで checked にした slot は反映する
-        for i in 0..state.selection.len() {
-            if state.selection[i] {
-                next_selection[i] = true;
-            }
-        }
-        // user が明示的に unchecked にした slot を反映 (= state.selection が false で
-        // かつ環境要因で disable されていなかった slot のみ)。
-        for i in 0..state.selection.len() {
-            let env_disabled =
-                i > 0 && (!has_conceal_mask || self.settings.conceal_presets[i - 1].is_none());
-            if !state.selection[i] && !env_disabled {
-                next_selection[i] = false;
-            }
-        }
+        // SNS 分割では controls の有効状態も entries も selection と独立しているため、
+        // 永続値を一切更新しない。
+        let selection_update = export_batch_selection_update(
+            sns_split_export,
+            state.original_selection,
+            state.selection,
+            has_conceal_mask,
+            &self.settings.conceal_presets,
+        );
         // metadata は元値ベースで、ユーザーが意図的に切り替えた場合のみ反映する。
         // format 切替の force-flip を考慮し、metadata_possible=true のときの値だけを
         // 信頼する。
@@ -35200,8 +35362,14 @@ impl App {
         };
         self.settings.export_embed_metadata = persisted_metadata;
         self.settings.export_last_directory = Some(output_dir.clone());
-        self.settings.export_batch_selection = next_selection;
-        self.settings.export_default_scale = state.scale;
+        if let Some(next_selection) = selection_update {
+            self.settings.export_batch_selection = next_selection;
+        }
+        // SNS はモード固有の既定値として毎回 Full で開く。その強制初期値を通常
+        // エクスポートの既定倍率へ逆流させない。
+        if !sns_split_export {
+            self.settings.export_default_scale = state.scale;
+        }
         if matches!(
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other(_)
@@ -36682,6 +36850,145 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn sns_split_frames_scale_from_source_coordinates_to_export_pixels() {
+        let frame = crate::export_crop::CropRect {
+            min_x: 10.0,
+            min_y: 5.0,
+            max_x: 30.0,
+            max_y: 25.0,
+        };
+
+        let scaled =
+            scale_sns_split_frames_to_export_pixels(&[frame], [100, 50], [400, 100]).unwrap();
+
+        assert_eq!(
+            scaled,
+            vec![crate::export_crop::CropRect {
+                min_x: 40.0,
+                min_y: 10.0,
+                max_x: 120.0,
+                max_y: 50.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn sns_split_frames_keep_equal_sizes_and_gaps_at_fractional_scale() {
+        let frames = [
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 30.0,
+                max_y: 30.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 31.0,
+                min_y: 0.0,
+                max_x: 61.0,
+                max_y: 30.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 62.0,
+                min_y: 0.0,
+                max_x: 92.0,
+                max_y: 30.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 93.0,
+                min_y: 0.0,
+                max_x: 123.0,
+                max_y: 30.0,
+            },
+        ];
+
+        let scaled =
+            scale_sns_split_frames_to_export_pixels(&frames, [130, 60], [173, 77]).unwrap();
+        let bounds = scaled
+            .iter()
+            .map(|frame| {
+                let (min_x, _, width, height) = frame.pixel_bounds(173, 77);
+                (min_x, width, height)
+            })
+            .collect::<Vec<_>>();
+        let steps = bounds
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].0)
+            .collect::<Vec<_>>();
+        let gaps = bounds
+            .windows(2)
+            .map(|pair| pair[1].0 - (pair[0].0 + pair[0].1))
+            .collect::<Vec<_>>();
+
+        assert!(
+            bounds
+                .iter()
+                .all(|(_, width, height)| (*width, *height) == (40, 39))
+        );
+        assert_eq!(steps, vec![41, 41, 41]);
+        assert_eq!(gaps, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn sns_split_instagram_frames_remain_contiguous_at_fractional_scale() {
+        let frames = [
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 5.0,
+                max_y: 5.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 5.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 5.0,
+            },
+        ];
+
+        let scaled = scale_sns_split_frames_to_export_pixels(&frames, [10, 5], [11, 6]).unwrap();
+        let first = scaled[0].pixel_bounds(11, 6);
+        let second = scaled[1].pixel_bounds(11, 6);
+
+        assert_eq!((first.2, first.3), (5, 6));
+        assert_eq!((second.2, second.3), (5, 6));
+        assert_eq!(first.0 + first.2, second.0);
+    }
+
+    #[test]
+    fn sns_split_frames_reject_a_snapshot_too_narrow_for_distinct_entries() {
+        let frames = [
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 1.0,
+                max_y: 1.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 2.0,
+                max_y: 1.0,
+            },
+        ];
+
+        let err = scale_sns_split_frames_to_export_pixels(&frames, [2, 1000], [1, 500])
+            .expect_err("1px 幅へ 2 枠は配置できない");
+
+        assert!(err.contains("解像度が小さすぎ"));
+    }
+
+    #[test]
+    fn sns_split_does_not_publish_a_batch_selection_update() {
+        let original = [false, true, false, true, false];
+        let transient = [true, false, false, false, false];
+        let slots = crate::conceal::default_conceal_presets();
+
+        let update = export_batch_selection_update(true, original, transient, false, &slots);
+
+        assert_eq!(update, None);
+    }
 
     /// 見開きの間隔は、**最終的に描く矩形**で設定どおりになる (§1.154)。
     ///

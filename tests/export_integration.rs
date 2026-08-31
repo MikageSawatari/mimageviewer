@@ -30,6 +30,7 @@ fn entry(label: &str, suffix: u8) -> ExportEntry {
         label: label.to_string(),
         suffix,
         conceal_preset: None,
+        crop: None,
     }
 }
 
