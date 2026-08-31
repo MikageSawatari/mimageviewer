@@ -2553,6 +2553,98 @@ mod local_adjust_canvas_edit_contract_tests {
     // 1 つなので、複製ではなく共有所有 (`Arc`) で配り、書き手だけが
     // `Arc::make_mut` で実複製を払う。以下はその契約を固定する。
 
+    /// 圧縮の要否判定と圧縮そのものが食い違わないこと。
+    ///
+    /// 判定が甘いと、落とすものが無いのに原寸マスクを 1 枚複製する。判定が辛いと、
+    /// 圧縮すべき文書を複製せずに書き換えてしまい、他の持ち主 (Undo / サイドカー) の
+    /// 見ている姿が後から変わる。
+    #[test]
+    fn the_compaction_predicate_agrees_with_the_operation() {
+        let empty = local_adjust_core::RasterVectorMask::empty(4, 3);
+        let mut painted = local_adjust_core::RasterVectorMask::empty(4, 3);
+        painted.alpha[0] = 1.0;
+
+        for (name, add, subtract) in [
+            ("空なし", None, None),
+            ("add が空", Some(empty.clone()), None),
+            ("subtract が空", None, Some(empty.clone())),
+            ("両方空", Some(empty.clone()), Some(empty.clone())),
+            ("add に中身", Some(painted.clone()), None),
+            ("片方だけ空", Some(painted.clone()), Some(empty.clone())),
+        ] {
+            let mut layer =
+                layer_with_mask(local_adjust_core::LocalMask::RasterVector(empty.clone()));
+            layer.manual_override.add = add;
+            layer.manual_override.subtract = subtract;
+
+            let predicted = local_adjust_manual_override_is_compactable(&layer);
+            let before = layer.clone();
+            compact_local_adjust_manual_override(&mut layer);
+            assert_eq!(
+                predicted,
+                before != layer,
+                "{name}: 判定と実際の圧縮が食い違う"
+            );
+        }
+    }
+
+    fn layer_with_empty_override() -> local_adjust_core::LocalAdjustmentLayer {
+        let mut layer = layer_with_mask(local_adjust_core::LocalMask::RasterVector(
+            local_adjust_core::RasterVectorMask::empty(4, 3),
+        ));
+        layer.manual_override.add = Some(local_adjust_core::RasterVectorMask::empty(4, 3));
+        layer
+    }
+
+    /// 落とすものが無い確定 (= 普通のストローク) は文書を複製しない。
+    ///
+    /// マップが常に 1 つ握っているので、判定せずに `Arc::make_mut` を呼ぶと
+    /// **必ず**実複製になる。24MP なら確定のたびに 96MB。
+    #[test]
+    fn a_release_with_nothing_to_compact_keeps_the_same_document() {
+        let mut app = seam_test_app();
+        let before_ptr = Arc::as_ptr(&app.local_adjust_page_layers[&0]);
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
+            local_adjust_core::LocalMask::Full,
+        )]));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+
+        app.persist_local_adjust_mask_brush_stroke();
+
+        assert!(seam_took_the_save_path(&app));
+        assert!(
+            std::ptr::eq(before_ptr, Arc::as_ptr(&app.local_adjust_page_layers[&0])),
+            "圧縮するものが無いなら、確定は文書をそのまま保存する"
+        );
+    }
+
+    /// 逆に、落とすものがあれば複製して圧縮する。
+    #[test]
+    fn a_release_with_something_to_compact_drops_the_empty_slot() {
+        let mut app = seam_test_app();
+        app.local_adjust_page_layers
+            .insert(0, Arc::new(vec![layer_with_empty_override()]));
+        let before_ptr = Arc::as_ptr(&app.local_adjust_page_layers[&0]);
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
+            local_adjust_core::LocalMask::Full,
+        )]));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+
+        app.persist_local_adjust_mask_brush_stroke();
+
+        assert!(
+            !std::ptr::eq(before_ptr, Arc::as_ptr(&app.local_adjust_page_layers[&0])),
+            "圧縮したなら複製している (共有したまま書き換えていない)"
+        );
+        assert!(
+            app.local_adjust_page_layers[&0][0]
+                .manual_override
+                .add
+                .is_none(),
+            "空のオーバーライドは落ちる"
+        );
+    }
+
     /// 前の姿を誰も握っていなければ、キャンバス編集は同じ割り当てを書き換える。
     ///
     /// ここが複製に戻ると、24MP で毎フレーム 96MB を作り直すことになる
@@ -2641,6 +2733,42 @@ fn local_adjust_target_raster_vector_mask_ref(
         LocalAdjustMaskEditTarget::OverrideSubtract => layer.manual_override.subtract.as_ref(),
         LocalAdjustMaskEditTarget::None => None,
     }
+}
+
+/// 共有所有の文書のうち 1 レイヤーを圧縮する。**落とすものがあるときだけ複製する。**
+///
+/// 判定せずに `Arc::make_mut` を呼ぶと、落とすものが無い通常のケース (= 図形も筆も
+/// 中身を残して終わったとき) でも原寸マスクを 1 枚複製することになる。文書はマップが
+/// 常に 1 つ握っているので、`make_mut` は必ず実複製になる点に注意。
+fn compact_local_adjust_manual_override_in(
+    layers: &mut local_adjust_core::LocalAdjustmentLayers,
+    layer_idx: usize,
+) {
+    if !layers
+        .get(layer_idx)
+        .is_some_and(local_adjust_manual_override_is_compactable)
+    {
+        return;
+    }
+    if let Some(layer) = Arc::make_mut(layers).get_mut(layer_idx) {
+        compact_local_adjust_manual_override(layer);
+    }
+}
+
+/// [`compact_local_adjust_manual_override`] が実際に何かを落とすか。
+///
+/// 両者が食い違うと「圧縮したのに複製していない」= 文書が黙って共有されたまま
+/// 書き換わる、または「複製したのに落とすものが無い」= 無駄な複製になる。
+/// 一致することは `compaction_predicate_agrees_with_the_operation` が検査する。
+fn local_adjust_manual_override_is_compactable(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+) -> bool {
+    [&layer.manual_override.add, &layer.manual_override.subtract]
+        .into_iter()
+        .any(|slot| {
+            slot.as_ref()
+                .is_some_and(|mask| !local_adjust_raster_vector_has_content(mask))
+        })
 }
 
 fn compact_local_adjust_manual_override(layer: &mut local_adjust_core::LocalAdjustmentLayer) {
@@ -11156,9 +11284,7 @@ impl App {
         let Some(mut layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
             return;
         };
-        if let Some(layer) = Arc::make_mut(&mut layers).get_mut(drag.layer_idx) {
-            compact_local_adjust_manual_override(layer);
-        }
+        compact_local_adjust_manual_override_in(&mut layers, drag.layer_idx);
         let before = self
             .local_adjust_shape_drag_before_layers
             .take()
@@ -11195,9 +11321,7 @@ impl App {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
         };
-        if let Some(layer) = Arc::make_mut(&mut layers).get_mut(stroke.layer_idx) {
-            compact_local_adjust_manual_override(layer);
-        }
+        compact_local_adjust_manual_override_in(&mut layers, stroke.layer_idx);
         self.local_adjust_selected_layers
             .insert(stroke.fs_idx, stroke.layer_idx);
         let before = self

@@ -986,4 +986,36 @@ mod tests {
             Some(old_adjust)
         );
     }
+
+    /// 貼り付け束の補正レイヤーは共有所有 (`Arc`) で持つが、`local_adjust.db` へ入る
+    /// JSON は素の配列のまま。ここが包まれると、貼り付けた補正を次の起動で読めない。
+    #[test]
+    fn a_shared_local_adjust_document_still_prepares_as_a_plain_array() {
+        let layers =
+            local_adjust_core::LocalAdjustmentLayers::new(vec![LocalAdjustmentLayer::new(
+                "pasted",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )]);
+        let bundle = PageEditBundle {
+            source_size: [2, 2],
+            local_adjust_layers: Some(local_adjust_core::LocalAdjustmentLayers::clone(&layers)),
+            ..Default::default()
+        };
+
+        let json = bundle
+            .prepare()
+            .unwrap()
+            .local_adjust_json
+            .expect("非空の文書は JSON になる");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.is_array(),
+            "補正レイヤーは配列として書かれること: {json}"
+        );
+
+        // `local_adjust.db` の唯一の復元入口で読み戻せる (= 往復する)。
+        let restored = crate::local_adjust_db::parse_layers_json(&json).unwrap();
+        assert_eq!(restored.as_slice(), layers.as_slice());
+    }
 }
