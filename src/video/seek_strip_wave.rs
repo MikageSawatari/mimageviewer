@@ -1260,6 +1260,21 @@ impl SeekStripWaveWorker {
         self.background_paused.load(Ordering::Acquire)
     }
 
+    /// テスト専用の同一性。**持ち越したワーカーがそのまま戻ったか**を確かめるためだけに
+    /// 使う。これが無いと、テストは「再利用した」と「新しく作った」を区別できない。
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.cancel) as usize
+    }
+
+    /// テスト専用。`cancel` は**不可逆**で、立てた時点でこの worker のスレッドは終わる。
+    /// 持ち越すつもりで cancel すると、次のセッションが死んだ worker を拾って全尺解析が
+    /// 二度と進まない。同一性だけでは見分けが付かないので、生きているかを別に見る。
+    #[cfg(test)]
+    pub(crate) fn is_cancelled_for_test(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
         self.latest_request_id.fetch_add(1, Ordering::AcqRel);

@@ -802,7 +802,25 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 `Settings.video_seek_strip_state` (`none / thumbnails / waveform`) ひとつで、開閉 bool と mode を
 分けない。`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
 明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
-サムネイル軸、2 種類の worker を 1 session として所有する。サムネイルモードの
+サムネイル軸、2 種類の worker を 1 session として所有する。
+
+**セッションを畳む境界と、記憶している選択は別物である** (§1.146、2026-08-31)。
+`Settings.video_seek_strip_state` を消すのは `SeekStripCloseCause::is_user_dismissal`
+(`Toggle` / `DownwardDrag` / `Escape`) と、もう一方の面を明示的に開いた `TileModeOpened`
+だけ。**HUD が自動で隠れただけの `HudHidden` と、素材都合の `Unavailable` は消さない。**
+以前は固定していない限りこの 2 つでも消しており、シークバーが自動で隠れて出し直すたびに
+ストリップが「なし」に戻っていた。素材の無い動画 1 本が、そのあとの動画すべてから選択を
+奪ってもいた。
+
+波形の粗トラック (全尺解析) はセッションより長く生きる。`SeekStripWaveWorker` は
+`SeekStripCloseCause::keeps_viewing_the_same_video` が真の境界では `cancel` せず、
+App の `video_seek_strip_wave_holdover` へ動画パスと一緒に預ける。次のセッションは
+`take_or_spawn_seek_strip_wave_worker` でパスを照合して拾い、**新しく spawn したものと
+見分けが付かない状態** (背景段は再開済み) で受け取る。預けている間は背景の全尺解析だけを
+止める。手放すのは動画が変わる / フルスクリーンを出るときで、`sync_native_video_seek_strip`
+が毎フレーム現在のパスと照合して取りこぼしを拾う。保持は 1 本ぶん
+(`MAX_COARSE_WAVEFORM_BYTES` = 64 MiB が上限、通常の 1〜2 時間なら 250〜500 KB)。
+`cancel` は不可逆でスレッドが終わるため、預ける経路では絶対に呼ばない。サムネイルモードの
 `SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
 抽出を UI thread の外で行う。要求は可視窓と進行方向 1 画面分の latest-wins で、取得済み画像は
 窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、

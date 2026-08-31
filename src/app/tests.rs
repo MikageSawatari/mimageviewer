@@ -64293,6 +64293,49 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
     }
 }
 
+/// フルスクリーンを出るときは、セッションが開いていなくても持ち越しを手放す。
+///
+/// フルスクリーン退出は**無条件に** `close_video_seek_strip` を呼ぶ。ストリップを閉じた
+/// まま退出した経路にはセッションが無いので、早期 return より前に手放さないと、動画を
+/// 見ていないあいだワーカーが残る。HUD が隠れただけなら、逆に手放してはいけない
+/// (§1.146 の直す対象そのもの)。
+#[test]
+#[cfg(windows)]
+fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
+    for (cause, still_held) in [
+        (
+            crate::video::seek_strip::SeekStripCloseCause::HudHidden,
+            true,
+        ),
+        (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
+        (
+            crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
+            false,
+        ),
+        (
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            false,
+        ),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 開けないパスでよい。ここで見たいのは持ち越しの所在であって解析結果ではない。
+        let path = dir.path().join("clip.mp4");
+        app.video_seek_strip_wave_holdover = Some(native_video::HeldSeekStripWaveWorker {
+            path: path.clone(),
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path),
+        });
+
+        app.close_video_seek_strip(cause);
+
+        assert_eq!(
+            app.video_seek_strip_wave_holdover.is_some(),
+            still_held,
+            "{cause:?} のあとの持ち越し"
+        );
+    }
+}
+
 /// 別ウィンドウで開いているものが動画なら、十字キーは動画の面へ行く。
 ///
 /// 利用者報告 (§1.0f(b)): 別ウィンドウで動画を開いていると十字キーでシークできない。

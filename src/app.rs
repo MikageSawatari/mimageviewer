@@ -10904,6 +10904,17 @@ pub struct App {
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
     video_seek_strip_runtime: native_video::VideoSeekStripRuntime,
+    /// 直前のストリップセッションが使っていた波形ワーカー。**同じ動画のあいだだけ持つ。**
+    ///
+    /// HUD が自動で隠れるたびに捨てていたので、出し直すたびに全尺の粗い解析をやり直して
+    /// いた (30 分の表示範囲で 2〜3 秒、§1.146)。閉じた原因が「同じ動画を見続けている」
+    /// ものなら、セッションを畳むときにここへ預け、次のセッションが拾う。
+    ///
+    /// 資源を握りっぱなしにしないためセッションごと捨てていた判断を、ここで覆している。
+    /// 保持は 1 本ぶん (`MAX_COARSE_WAVEFORM_BYTES` = 64 MiB が上限、通常の 1〜2 時間なら
+    /// 250〜500 KB) で、背景の解析段は預けるときに止める。
+    #[cfg(windows)]
+    video_seek_strip_wave_holdover: Option<native_video::HeldSeekStripWaveWorker>,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_pending: bool,
     #[cfg(windows)]
@@ -13935,6 +13946,8 @@ impl App {
             video_tile_state: None,
             #[cfg(windows)]
             video_seek_strip_runtime: native_video::VideoSeekStripRuntime::Closed,
+            #[cfg(windows)]
+            video_seek_strip_wave_holdover: None,
             #[cfg(windows)]
             video_tile_reopen_pending: false,
             #[cfg(windows)]

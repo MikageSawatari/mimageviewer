@@ -843,15 +843,31 @@ impl SeekStripCloseCause {
     /// While the strip is pinned, a close the user did not ask for must not clear it either:
     /// a video with no usable material, or a trip through the tile grid, would otherwise cancel
     /// the pin for every video after it.
+    ///
+    /// `HudHidden` と `Unavailable` は 2026-08-31 にこちら側へ移した (§1.146)。**固定して
+    /// いない状態で `HudHidden` が選択を消していた**ので、シークバーが自動で隠れて出し直す
+    /// たびにストリップが「なし」に戻っていた。利用者はストリップを閉じていない。
+    /// `Unavailable` も同じで、素材の都合で開けなかった 1 本が、そのあとの動画すべてから
+    /// 選択を奪っていた (固定中にそれを禁じている上のコメントと同じ理由が、固定して
+    /// いなくても成り立つ)。
+    ///
+    /// `TileModeOpened` はここに残す。タイル一覧は利用者が**もう一方の面を明示的に開いた**
+    /// ものであり、戻ったときの復帰は別の仕組み (`video_tile_reopen_pending`) が持っている。
+    /// 一緒に変えると、そちらの復帰と二重になる。
     pub(crate) const fn clears_persisted_state(self, strip_locked: bool) -> bool {
         if self.is_user_dismissal() {
             return true;
         }
-        !strip_locked
-            && matches!(
-                self,
-                Self::HudHidden | Self::TileModeOpened | Self::Unavailable
-            )
+        !strip_locked && matches!(self, Self::TileModeOpened)
+    }
+
+    /// この境界のあとも、同じ動画を見続けているか。
+    ///
+    /// 見続けているなら、解析済みの粗い波形を捨てる理由が無い。捨てると、HUD を出し直す
+    /// たびに全尺の再解析が走り、30 分の表示範囲で 2〜3 秒待たされる (§1.146)。
+    /// 動画が変わる / フルスクリーンを出る境界だけがワーカーを手放す。
+    pub(crate) const fn keeps_viewing_the_same_video(self) -> bool {
+        !matches!(self, Self::VideoChanged | Self::FullscreenExit)
     }
 }
 
@@ -1960,25 +1976,89 @@ mod tests {
         );
     }
 
+    /// 宣言されている close cause 全部。増やしたらここへ足す。
+    const ALL_CLOSE_CAUSES: [SeekStripCloseCause; 8] = [
+        SeekStripCloseCause::Toggle,
+        SeekStripCloseCause::DownwardDrag,
+        SeekStripCloseCause::Escape,
+        SeekStripCloseCause::HudHidden,
+        SeekStripCloseCause::VideoChanged,
+        SeekStripCloseCause::FullscreenExit,
+        SeekStripCloseCause::TileModeOpened,
+        SeekStripCloseCause::Unavailable,
+    ];
+
     #[test]
     fn every_declared_close_cause_closes_an_open_strip() {
-        let causes = [
-            SeekStripCloseCause::Toggle,
-            SeekStripCloseCause::DownwardDrag,
-            SeekStripCloseCause::Escape,
-            SeekStripCloseCause::HudHidden,
-            SeekStripCloseCause::VideoChanged,
-            SeekStripCloseCause::FullscreenExit,
-            SeekStripCloseCause::TileModeOpened,
-            SeekStripCloseCause::Unavailable,
-        ];
-        for cause in causes {
+        for cause in ALL_CLOSE_CAUSES {
             assert_eq!(
                 decide_seek_strip_surface(
                     SeekStripSurface::Strip,
                     SeekStripSurfaceIntent::CloseStrip(cause),
                 ),
                 SeekStripSurface::Neither
+            );
+        }
+    }
+
+    /// 選択を消すのは利用者が閉じたときだけ。**HUD が勝手に隠れたのは閉じたことではない。**
+    ///
+    /// 期待値は `match` で書く。網羅が要るので、close cause を増やしたら**ここで
+    /// 決めないとコンパイルが通らない**。
+    #[test]
+    fn only_the_user_retracts_the_remembered_strip_choice() {
+        /// `(固定していない, 固定している)`。
+        const fn expected(cause: SeekStripCloseCause) -> (bool, bool) {
+            match cause {
+                // 利用者が閉じた。固定していても外す (`close_video_seek_strip` が固定も解く)。
+                SeekStripCloseCause::Toggle
+                | SeekStripCloseCause::DownwardDrag
+                | SeekStripCloseCause::Escape => (true, true),
+                // もう一方の面を明示的に開いた。復帰は tile 側の仕組みが持つ。
+                SeekStripCloseCause::TileModeOpened => (true, false),
+                // 利用者は何も閉じていない。選択は残す (§1.146)。
+                SeekStripCloseCause::HudHidden
+                | SeekStripCloseCause::Unavailable
+                | SeekStripCloseCause::VideoChanged
+                | SeekStripCloseCause::FullscreenExit => (false, false),
+            }
+        }
+
+        for cause in ALL_CLOSE_CAUSES {
+            let (unpinned, pinned) = expected(cause);
+            assert_eq!(
+                cause.clears_persisted_state(false),
+                unpinned,
+                "固定していないときの {cause:?}"
+            );
+            assert_eq!(
+                cause.clears_persisted_state(true),
+                pinned,
+                "固定しているときの {cause:?}"
+            );
+        }
+    }
+
+    /// 同じ動画を見続けている境界では、解析済みの粗い波形を手放さない。
+    #[test]
+    fn only_leaving_the_video_gives_up_the_analysis() {
+        const fn expected(cause: SeekStripCloseCause) -> bool {
+            match cause {
+                SeekStripCloseCause::VideoChanged | SeekStripCloseCause::FullscreenExit => false,
+                SeekStripCloseCause::Toggle
+                | SeekStripCloseCause::DownwardDrag
+                | SeekStripCloseCause::Escape
+                | SeekStripCloseCause::HudHidden
+                | SeekStripCloseCause::TileModeOpened
+                | SeekStripCloseCause::Unavailable => true,
+            }
+        }
+
+        for cause in ALL_CLOSE_CAUSES {
+            assert_eq!(
+                cause.keeps_viewing_the_same_video(),
+                expected(cause),
+                "{cause:?}"
             );
         }
     }

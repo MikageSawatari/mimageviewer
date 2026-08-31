@@ -57,6 +57,45 @@ pub(super) struct VideoSeekStripSession {
     range_edited_at_save_generation: Option<u64>,
 }
 
+#[cfg(all(test, windows))]
+impl VideoSeekStripSession {
+    /// 持ち越しの検証に要る 2 つ (動画と波形ワーカー) だけを持つセッション。
+    /// 残りは「まだ何もしていない」に相当する値で埋める。
+    pub(super) fn for_wave_holdover_test(
+        video_path: std::path::PathBuf,
+        worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
+    ) -> Self {
+        Self {
+            owner_fs_idx: 0,
+            video_path,
+            duration_secs: 600.0,
+            center: crate::video::seek_strip::SeekStripCenter::Waveform {
+                center_time_secs: 0.0,
+            },
+            axis: VideoSeekStripAxisState::Resolving {
+                initial_time_secs: 0.0,
+            },
+            thumbnail_worker: None,
+            wave_worker: Some(worker),
+            completed_analysis: None,
+            visible_count: 9,
+            last_requested_center: None,
+            last_sent_thumbnail_request_id: None,
+            wave_raster_size: None,
+            last_wave_request: None,
+            pending_wave_span: None,
+            waveform_span_secs: 30.0,
+            wave_holdover: None,
+            min_interval_secs: 1.0,
+            drag_state: VideoSeekStripDragState::Idle,
+            last_follow_recenter_at: None,
+            visible_pending_since: None,
+            visible_pending_reported: false,
+            range_edited_at_save_generation: None,
+        }
+    }
+}
+
 #[cfg(windows)]
 #[derive(Default)]
 enum VideoSeekStripDragState {
@@ -71,6 +110,41 @@ pub(super) enum VideoSeekStripRuntime {
     #[default]
     Closed,
     Open(Box<VideoSeekStripSession>),
+}
+
+/// セッションをまたいで持ち越す波形ワーカーと、その持ち主の動画。
+///
+/// 持ち主を一緒に持つのは、**持ち越して良いかを最後に決めるのが動画の同一性**だから。
+/// close cause は「同じ動画を見続けているか」しか答えられないので、拾う側で必ず照合する。
+#[cfg(windows)]
+pub(crate) struct HeldSeekStripWaveWorker {
+    pub(super) path: std::path::PathBuf,
+    pub(super) worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
+}
+
+/// このセッション用の波形ワーカーを用意する。持ち越しが同じ動画のものなら、それを使う。
+///
+/// **新しく spawn したものと見分けが付かない状態で返す。** 呼び出し側は背景段の停止・再開を
+/// 必ずしも触らないので、預けるときに止めた背景段はここで戻す。戻し忘れると、拾った側だけ
+/// 全尺解析が進まないまま「速いはずの 2 回目」が永遠に埋まらない。
+///
+/// 別の動画のものは、この `take` で落ちて `Drop` が worker を止める。
+#[cfg(windows)]
+fn take_or_spawn_seek_strip_wave_worker(
+    holdover: &mut Option<HeldSeekStripWaveWorker>,
+    path: &std::path::Path,
+) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
+    if let Some(held) = holdover.take() {
+        if crate::path_key::eq_keep_drive(&held.path, path) {
+            held.worker.set_background_paused(false);
+            crate::logger::log(format!(
+                "[video-seek-strip] reused the held wave worker: {}",
+                path.display()
+            ));
+            return held.worker;
+        }
+    }
+    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf())
 }
 
 /// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
@@ -7413,6 +7487,11 @@ impl App {
         &mut self,
         cause: crate::video::seek_strip::SeekStripCloseCause,
     ) -> bool {
+        if !cause.keeps_viewing_the_same_video() {
+            // セッションが開いていなくてもここへ来る (フルスクリーン退出は無条件に呼ぶ)。
+            // 下の早期 return より前に手放さないと、動画を見ていないあいだ残ってしまう。
+            self.video_seek_strip_wave_holdover = None;
+        }
         let desired_surface = crate::video::seek_strip::decide_seek_strip_surface(
             crate::video::seek_strip::SeekStripSurface::Strip,
             crate::video::seek_strip::SeekStripSurfaceIntent::CloseStrip(cause),
@@ -7422,7 +7501,7 @@ impl App {
             crate::video::seek_strip::SeekStripSurface::Neither
         );
         let previous = std::mem::take(&mut self.video_seek_strip_runtime);
-        let VideoSeekStripRuntime::Open(session) = previous else {
+        let VideoSeekStripRuntime::Open(mut session) = previous else {
             return false;
         };
         // ホイールで動かしたレンジはここで 1 回だけ書く
@@ -7435,8 +7514,18 @@ impl App {
         if let Some(worker) = session.thumbnail_worker.as_ref() {
             worker.cancel();
         }
-        if let Some(worker) = session.wave_worker.as_ref() {
-            worker.cancel();
+        if let Some(worker) = session.wave_worker.take() {
+            if cause.keeps_viewing_the_same_video() {
+                // **cancel は呼ばない。** cancel は不可逆で、スレッドがそこで終わる。
+                // 見えていないあいだ背景の全尺解析だけ止め、解析済みの粗い波形は残す。
+                worker.set_background_paused(true);
+                self.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+                    path: session.video_path.clone(),
+                    worker,
+                });
+            } else {
+                worker.cancel();
+            }
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&session.owner_fs_idx) {
             // fast source-swap 後は path が新動画へ変わっていても、同じ output owner から
@@ -7653,8 +7742,14 @@ impl App {
                 fallback_interval_secs,
             )
         });
-        let new_wave_worker = need_wave_worker
-            .then(|| crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone()));
+        let new_wave_worker = if need_wave_worker {
+            Some(take_or_spawn_seek_strip_wave_worker(
+                &mut self.video_seek_strip_wave_holdover,
+                &path,
+            ))
+        } else {
+            None
+        };
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
             let meta = self.image_metas.get(fs_idx).copied().flatten();
             self.completed_music_analysis_for_seek_strip(&path, meta)
@@ -8111,6 +8206,15 @@ impl App {
             }
             _ => None,
         });
+        // 見ている動画が変わった / 動画を見ていない。close だけに任せると、ストリップを
+        // 閉じたまま次の動画へ移った経路で持ち越しが残る。
+        if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
+            && !current_path
+                .as_ref()
+                .is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
+        {
+            self.video_seek_strip_wave_holdover = None;
+        }
         if self.video_tile_mode_active {
             self.close_video_seek_strip(
                 crate::video::seek_strip::SeekStripCloseCause::TileModeOpened,
@@ -8189,11 +8293,10 @@ impl App {
                                 crate::video::seek_strip::SeekStripCenter::Waveform { .. }
                             ) && session.wave_worker.is_none()
                             {
-                                session.wave_worker = Some(
-                                    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
-                                        session.video_path.clone(),
-                                    ),
-                                );
+                                session.wave_worker = Some(take_or_spawn_seek_strip_wave_worker(
+                                    &mut self.video_seek_strip_wave_holdover,
+                                    &session.video_path,
+                                ));
                             }
                             Self::request_video_seek_strip_window(session);
                         }
@@ -12641,6 +12744,108 @@ mod native_video_key_observation_tests {
         assert!(wave_background_paused_for_mode(
             crate::settings::VideoSeekStripMode::Thumbnails
         ));
+    }
+
+    /// 開いているセッションを畳むとき、同じ動画なら波形ワーカーを預ける。
+    ///
+    /// **`cancel` を呼んではいけない。** cancel は不可逆でスレッドがそこで終わるので、
+    /// 預けたつもりの死んだワーカーを次のセッションが拾い、全尺解析が二度と進まなくなる。
+    /// 同一性で「そのまま預かった」ことまで確かめる。
+    #[test]
+    fn folding_a_session_hands_the_wave_worker_over_instead_of_killing_it() {
+        for (cause, handed_over) in [
+            (
+                crate::video::seek_strip::SeekStripCloseCause::HudHidden,
+                true,
+            ),
+            (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
+            (
+                crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
+                false,
+            ),
+            (
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+                false,
+            ),
+        ] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("clip.mp4");
+            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone());
+            let identity = worker.identity_for_test();
+            app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(
+                VideoSeekStripSession::for_wave_holdover_test(path, worker),
+            ));
+
+            app.stop_video_seek_strip_session(cause);
+
+            let held = app.video_seek_strip_wave_holdover.as_ref();
+            assert_eq!(held.is_some(), handed_over, "{cause:?} のあとの持ち越し");
+            if let Some(held) = held {
+                assert_eq!(
+                    held.worker.identity_for_test(),
+                    identity,
+                    "{cause:?} で別のワーカーを預けている"
+                );
+                assert!(
+                    held.worker.background_is_paused(),
+                    "{cause:?} で預けたのに背景の全尺解析が止まっていない"
+                );
+                assert!(
+                    !held.worker.is_cancelled_for_test(),
+                    "{cause:?} で預けた worker を止めている (拾っても解析が進まない)"
+                );
+            }
+        }
+    }
+
+    /// 持ち越したワーカーは、同じ動画のときだけ**そのまま**戻る。
+    ///
+    /// 戻ってくるのが同じワーカーであること自体が要件なので、同一性で確かめる。
+    /// 別の動画なら新しく作り、預かっていた方は落として止める。
+    ///
+    /// 拾った側で背景段が止まったままだと、「速いはずの 2 回目」が永遠に埋まらない。
+    /// 預けるときに止めるので、拾うときに戻すのは対で必要。
+    #[test]
+    fn the_held_wave_worker_comes_back_only_for_the_same_video() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = dir.path().join("one.mp4");
+        let other = dir.path().join("other.mp4");
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let held_identity = worker.identity_for_test();
+        // 預けるときと同じ状態にしてから拾わせる。
+        worker.set_background_paused(true);
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            path: one.clone(),
+            worker,
+        });
+
+        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one);
+        assert_eq!(
+            reused.identity_for_test(),
+            held_identity,
+            "同じ動画なのに作り直している"
+        );
+        assert!(
+            !reused.background_is_paused(),
+            "拾った側で背景の全尺解析が止まったままになっている"
+        );
+        assert!(holdover.is_none(), "持ち越しは 1 本ぶんだけ");
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let stale_identity = worker.identity_for_test();
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            path: one.clone(),
+            worker,
+        });
+        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other);
+        assert_ne!(
+            fresh.identity_for_test(),
+            stale_identity,
+            "別の動画に前のワーカーを使い回している"
+        );
+        assert!(holdover.is_none(), "別の動画のものを抱えたままになっている");
     }
 
     /// 一時停止は worker loop が読むのと**同じ場所**へ書く。
