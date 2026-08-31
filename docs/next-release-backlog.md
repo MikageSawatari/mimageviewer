@@ -3334,9 +3334,17 @@ pipeline / 遷移中から選ぶので別物になり、寸法も丸めも違う
   2,000 件を下回ると走査自体が失敗するようにした (狭めたのが 5 回の見落としの原因)。
   トリムの寄せを外す変異で 4,248 件落ちる。
 
-**残り**: 提案 2 の連結読み最終 transform (live / frozen) は、production 配線テストを
-連結読み経路へも広げる形になる。detached の frozen 2 種は同型だが、clip の所有が別なので
-そちらの契約変更と一緒に扱う。
+- **提案 2 (連結読みの最終 transform、live)**:
+  `the_drawn_continuous_spread_puts_the_configured_gap_between_the_pages`。
+  `draw_fs_continuous_reading` を実際に走らせて測る (unit は `visible_indices` から組むので
+  そこも設定する)。**5 回目の見落としをそのまま変異にできる** — 合わせが自分でテクスチャを
+  選び直す形へ戻すと「gap=1: 描いた間隔 2px (設定 1px)」で落ちる。合わせ自体を無効にしても同じ。
+
+**残り**: frozen 経路 2 種 (`detached_spread_frozen_pages_for_snapshot` /
+`detached_continuous_frozen_pages_for_snapshot`)。どちらもページごとに独立して
+`from_resolved_rect` を呼んでおり同型だが、**clip / UV の所有が配置と別**なので、
+同じ helper を当てるだけでは直らない (a851515c の Codex 不同意を参照)。関数の契約変更として
+別に扱う。現状を固定するテストは**足さない** — 直っていない挙動を仕様にしてしまうため。
 
 **教訓**: 狭いテストで 3 度続けて取りこぼし、4 度目は Sol に見つけてもらった。抜けていた
 次元は順に、ページ幅 → **表示設定** (トリム) → **表示中の解像度** → **リサンプラ分岐と
