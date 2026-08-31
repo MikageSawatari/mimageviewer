@@ -33273,6 +33273,44 @@ mod pipeline_cache_refactor_tests {
         texture_id
     }
 
+    /// 見開きの**相方**もアニメの全フレーム昇格の対象になる。
+    ///
+    /// 昇格は `fullscreen_idx` の 1 枚だけを見ていたので、見開きの相方は第 1 フレームのまま
+    /// 止まっていた (`advance_animation` は左右とも呼ばれるが、進めるフレームが無い)。
+    /// 一覧から開いた直後は片方だけ動き、行き来すると動き出す — 相方は自分が
+    /// `fullscreen_idx` になったときに初めて昇格し、以後キャッシュに残るため。
+    #[test]
+    fn a_spread_partner_animation_is_promoted_too() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, r"C:\missing\left.gif");
+        let right = push_image(&mut app, r"C:\missing\right.gif");
+        // 見開きの相方解決は表示順 (`visible_indices`) から組む。
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.page_is_displayed_now(left),
+            "現在ページが表示中と判定されない"
+        );
+        assert!(
+            app.page_is_displayed_now(right),
+            "見開きの相方が表示中と判定されない (昇格対象から外れる)"
+        );
+
+        // 単ページ表示に戻せば相方はもう表示中ではない。
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        assert!(app.page_is_displayed_now(left));
+        assert!(
+            !app.page_is_displayed_now(right),
+            "単ページなのに隣まで表示中と判定している"
+        );
+    }
+
     #[test]
     fn fullscreen_load_spawns_current_with_full_frames_and_prefetch_with_first_frame_only() {
         let mut app = setup_app();

@@ -51400,8 +51400,18 @@ impl App {
             }
             self.fs_early_dims.remove(&idx);
         }
+        // 昇格の upload は、表示中のページのぶんだけ残す。**見開きでは相方も表示中**なので
+        // 落とさない (落とすと相方のアニメが第 1 フレームのまま止まる)。
+        let displayed_partner = match self.resolve_spread_pair(current_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                Some(if left == current_idx { right } else { left })
+            }
+            _ => None,
+        };
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || entry.idx == current_idx
+                || Some(entry.idx) == displayed_partner
         });
 
         self.start_animation_promotion_if_needed(current_idx);
@@ -57180,8 +57190,28 @@ impl App {
         }
     }
 
+    /// いま画面に出ているページか。**見開きでは相方も出ている。**
+    ///
+    /// アニメの全フレーム昇格は「表示中の 1 枚」だけを対象にしていたので、見開きの相方は
+    /// 第 1 フレームのまま止まっていた (`advance_animation` は左右とも呼ばれるが、進める
+    /// フレームが存在しない)。一覧から開いた直後に片方だけ動く、行き来すると動き出す、
+    /// という報告はこれで説明が付く — 相方は自分が `fullscreen_idx` になったときに初めて
+    /// 昇格し、以後キャッシュに残る。
+    fn page_is_displayed_now(&mut self, idx: usize) -> bool {
+        if self.fullscreen_idx == Some(idx) {
+            return true;
+        }
+        let Some(current) = self.fullscreen_idx else {
+            return false;
+        };
+        matches!(
+            self.resolve_spread_pair(current),
+            crate::ui_fullscreen::SpreadPair::Double { left, right } if left == idx || right == idx
+        )
+    }
+
     fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
-        if self.fullscreen_idx != Some(idx)
+        if !self.page_is_displayed_now(idx)
             || self
                 .fs_cache
                 .get(&idx)
