@@ -70575,8 +70575,10 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
     target_secs.clamp(0.0, upper)
 }
 
+// テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
+// `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Crate-wide `App` test fixture.
 ///

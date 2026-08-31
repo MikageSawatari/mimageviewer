@@ -36718,6 +36718,89 @@ mod tests {
         );
     }
 
+    /// **production の描画経路**を通した見開きの間隔 (§1.154、Codex Sol のテスト提案 3)。
+    ///
+    /// helper を直接呼ぶテストは「描画がどのテクスチャで矩形を解いたか」を見られない。
+    /// 実際、連結読みでは合わせが別のテクスチャで解かれていて、helper のテストは全部
+    /// 通ったまま実機で直っていなかった。ここは `draw_fs_spread` を実際に走らせ、
+    /// **描画が積んだ最終 transform** で測る。
+    #[test]
+    fn the_drawn_spread_puts_the_configured_gap_between_the_pages() {
+        for gap in [0_u32, 1, 2, 3] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            let left_path = std::path::PathBuf::from(r"C:\pics\spread-left.png");
+            let right_path = std::path::PathBuf::from(r"C:\pics\spread-right.png");
+            app.items = vec![
+                GridItem::Image(left_path.clone()),
+                GridItem::Image(right_path.clone()),
+            ];
+            app.settings.spread_page_gap_px = gap;
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.fullscreen_idx = Some(0);
+            // 縮小表示になる寸法。片ページの幅に端数が出る組み合わせを使う。
+            // egui の既定 Context は最大テクスチャ辺 2048。縮小表示で片ページ幅に
+            // 端数が出る組み合わせにする。
+            for (idx, size) in [(0usize, [1249_usize, 2000_usize]), (1, [1245, 1990])] {
+                let image = egui::ColorImage::new(
+                    [size[0], size[1]],
+                    vec![egui::Color32::WHITE; size[0] * size[1]],
+                );
+                let tex = ctx.load_texture(
+                    format!("spread_test_{idx}"),
+                    image.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    crate::fs_animation::FsCacheEntry::Static {
+                        tex,
+                        pixels: std::sync::Arc::new(image),
+                        source_dims: Some(size),
+                        load_seq: 0,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+            }
+
+            let image_rect =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_fs_spread(
+                        ui,
+                        ctx,
+                        image_rect,
+                        0,
+                        1,
+                        false,
+                        FsPageTurnDecision::normal(),
+                        None,
+                    );
+                });
+            });
+
+            let pixels_per_point = ctx.pixels_per_point();
+            let left = app
+                .fullscreen_page_layout
+                .page_by_idx(0)
+                .expect("左ページが積まれていない");
+            let right = app
+                .fullscreen_page_layout
+                .page_by_idx(1)
+                .expect("右ページが積まれていない");
+            let painted = (right.transform.paint_rect.min.x - left.transform.paint_rect.max.x)
+                * pixels_per_point;
+            let want = (quantize_points_to_physical_pixels(gap as f32, pixels_per_point)
+                * pixels_per_point)
+                .round();
+            assert!(
+                (painted - want).abs() < 1e-3,
+                "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
+            );
+        }
+    }
+
     /// 連結読みで間隔を合わせる相手は、**同じ unit の 2 ページだけ**。
     ///
     /// unit は縦に積まれるので、並びだけで隣を相方と決めると「次の unit の 1 ページ目」を
