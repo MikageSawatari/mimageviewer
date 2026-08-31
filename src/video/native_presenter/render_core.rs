@@ -364,19 +364,42 @@ fn draw_native_seek_strip_lock_button(
     }
 }
 
+/// ポインタの下の領域が、ホイールを自分で処理するか。
+///
+/// **この 1 つの規則を 2 か所に書かない。** 「前後アイテムへ送らない」条件と「360 の視野角へ
+/// 回さない」条件は同じものである。360 側だけこの規則を素通りしていたため、シークストリップ
+/// (波形 / サムネイル列) の上でホイールを回しても時間範囲を変えられなかった (§1.147)。
+///
+/// ここに並ぶ領域はどれも overlay の egui 側にホイールの受け手がいる: ストリップは
+/// `consume_seek_strip_wheel`、端パネルとモーダルはそれぞれの `ScrollArea`。
+fn pointer_region_owns_wheel(
+    over_seek_strip: bool,
+    over_scroll_panel: bool,
+    modal_dialog_visible: bool,
+) -> bool {
+    over_seek_strip || over_scroll_panel || modal_dialog_visible
+}
+
+/// 360 の視野角へホイールを回してよいか。
+///
+/// 360 中は「画面のどこで回しても視野角」という扱いだが、**自分でホイールを使う領域の上では
+/// 奪わない**。奪うと、その領域は raw イベントすら受け取れない (下の呼び出し側は 360 のとき
+/// `egui::Event::MouseWheel` を積まない)。
+fn panorama_takes_the_wheel(panorama_active: bool, region_owns_wheel: bool) -> bool {
+    panorama_active && !region_owns_wheel
+}
+
 fn immediate_native_wheel_command(
     delta: i16,
     ctrl: bool,
     tile_overlay_visible: bool,
-    over_seek_strip: bool,
-    over_scroll_panel: bool,
-    modal_dialog_visible: bool,
+    region_owns_wheel: bool,
 ) -> Option<NativeOverlayCommand> {
     if ctrl && tile_overlay_visible {
         Some(NativeOverlayCommand::TileColumnsDelta {
             delta: if delta > 0 { -1 } else { 1 },
         })
-    } else if !ctrl && !over_seek_strip && !over_scroll_panel && !modal_dialog_visible {
+    } else if !ctrl && !region_owns_wheel {
         Some(NativeOverlayCommand::NavigateItem {
             delta: if delta < 0 { 1 } else { -1 },
             via_wheel: true,
@@ -7429,7 +7452,15 @@ impl NativeEguiOverlay {
                         self.height as f32 / pixels_per_point,
                     )
                     .contains(pos);
-                let panorama_wheel = self.panorama_pose.is_some() && !self.audio_only;
+                let region_owns_wheel = pointer_region_owns_wheel(
+                    over_seek_strip,
+                    over_scroll_panel,
+                    modal_dialog_visible,
+                );
+                let panorama_wheel = panorama_takes_the_wheel(
+                    self.panorama_pose.is_some() && !self.audio_only,
+                    region_owns_wheel,
+                );
                 if panorama_wheel {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::PanoramaWheel {
@@ -7439,9 +7470,7 @@ impl NativeEguiOverlay {
                     wheel.delta,
                     wheel.ctrl,
                     self.tile_overlay.is_some(),
-                    over_seek_strip,
-                    over_scroll_panel,
-                    modal_dialog_visible,
+                    region_owns_wheel,
                 ) {
                     self.pending_overlay_commands.push(command);
                 }
@@ -12433,7 +12462,8 @@ mod tests {
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
-        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        native_video_fullscreen_shortcut_key, panorama_takes_the_wheel, pointer_region_owns_wheel,
+        sample_cpu_rgba_pixel, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
@@ -12689,6 +12719,42 @@ mod tests {
     }
 
     #[test]
+    /// 360 中でも、ホイールを自分で使う領域の上では奪わない (§1.147)。
+    ///
+    /// 360 が取ると raw イベントすら積まれないので (呼び出し側は 360 のとき
+    /// `egui::Event::MouseWheel` を積まない)、ストリップは時間範囲を変えられない。
+    /// **前後アイテム送りにも化けないこと**まで見る。片方だけ直すと、今度はストリップの
+    /// 上でホイールを回すと動画が切り替わる。
+    #[test]
+    fn the_region_under_the_pointer_decides_the_wheel_even_while_360_is_on() {
+        for (over_seek_strip, over_scroll_panel, modal) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let owns = pointer_region_owns_wheel(over_seek_strip, over_scroll_panel, modal);
+            assert!(owns, "{over_seek_strip} {over_scroll_panel} {modal}");
+            assert!(
+                !panorama_takes_the_wheel(true, owns),
+                "360 が領域からホイールを奪っている"
+            );
+            assert!(
+                immediate_native_wheel_command(120, false, false, owns).is_none(),
+                "領域の上なのに前後アイテム送りへ化けている"
+            );
+        }
+
+        // 何も無い所では従来どおり。360 が入っていれば視野角、無ければ前後アイテム。
+        let owns = pointer_region_owns_wheel(false, false, false);
+        assert!(!owns);
+        assert!(panorama_takes_the_wheel(true, owns));
+        assert!(!panorama_takes_the_wheel(false, owns));
+        assert!(matches!(
+            immediate_native_wheel_command(120, false, false, owns),
+            Some(crate::video::native_presenter::NativeOverlayCommand::NavigateItem { .. })
+        ));
+    }
+
     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_rect = super::native_seek_strip_rect(overlay_size.x, overlay_size.y);
@@ -12723,7 +12789,7 @@ mod tests {
             let mut commands = Vec::new();
             let mut wheel_remaining = true;
             assert!(
-                immediate_native_wheel_command(120, false, false, true, false, false).is_none(),
+                immediate_native_wheel_command(120, false, false, true).is_none(),
                 "wheel over the strip must not enqueue navigation before egui handles it"
             );
             let _ = ctx.run(
