@@ -4241,19 +4241,15 @@ fn align_spread_pages_for_gap(
     center_x: f32,
     pixels_per_point: f32,
 ) -> (egui::Vec2, egui::Vec2) {
-    // **寄せていない矩形を動かさない。** 端数のある拡大では `RectPixelFit::Texels` は
-    // 何も寄せないので、`layout_spread_page_rects` が小数のまま空けた間隔がそのまま正しい。
-    // そこへ整数量の移動を足すと、正しかった間隔を壊す (1 度目の修正がこれをやっていて、
-    // 高 DPI では間隔が 0.5px ずれたりページが重なったりしていた)。
-    if matches!(
-        crate::displayed_image_transform::rect_snap_mode(left.total_scale, pixels_per_point),
-        crate::displayed_image_transform::RectSnapMode::None
-    ) || matches!(
-        crate::displayed_image_transform::rect_snap_mode(right.total_scale, pixels_per_point),
-        crate::displayed_image_transform::RectSnapMode::None
-    ) {
-        return (egui::Vec2::ZERO, egui::Vec2::ZERO);
-    }
+    // **倍率や `RectSnapMode` で分岐しない。** 見える 2 辺を直接置くので、寄せ済みかどうかに
+    // 依らず答えは同じになる。ここに条件を足すと、貼るテクスチャが差し替わった瞬間
+    // (サムネイル → 元解像度 → AI アップスケール) だけ合わせが効かなくなり、**中央の線が
+    // 一瞬太さを変える**。実際、最初は「寄せていないなら動かさない」条件を置いていて、
+    // 1/8 解像度の中間テクスチャで 0.89px ずれていた (利用者報告)。
+    //
+    // 中間テクスチャの縦横比は整数丸めで元と僅かに違う。`fs_texture_content_rect` がその比で
+    // 縮めるため、貼り先はレイアウト矩形より少し狭くなる。だから「レイアウトが空けた間隔が
+    // そのまま正しい」も成り立たない。
     let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -36593,6 +36589,107 @@ mod tests {
 "
             )
         );
+    }
+
+    /// 貼るテクスチャが差し替わっても、間隔は変わらない (§1.154、利用者報告)。
+    ///
+    /// 1 ページの表示は サムネイル → 元解像度 → AI アップスケール後 と差し替わる。倍率は
+    /// そのたびに変わり、**`RectSnapMode` も変わり得る** (サムネイルは拡大表示なので
+    /// 「何も寄せない」側に落ちる)。間隔の合わせがその都度効いたり効かなかったりすると、
+    /// 利用者には**中央の線が一瞬太さを変える**ように見える。
+    ///
+    /// 間隔は貼るものの解像度と無関係でなければならない。
+    #[test]
+    fn the_spread_gap_does_not_change_when_the_texture_is_swapped() {
+        let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for trim in [None, Some((0.02_f32, 0.03_f32, 0.98_f32, 0.97_f32))] {
+            for gap in [0.0_f32, 1.0, 2.0] {
+                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                    let viewport =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+                    let left_page = egui::vec2(4161.0, 6053.0);
+                    let right_page = egui::vec2(4155.0, 6038.0);
+                    let bbox = trim.map(|(a, b, c, d)| {
+                        egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
+                    });
+                    let left_bbox = bbox.unwrap_or(unit);
+                    let right_bbox = bbox.unwrap_or(unit);
+                    let geometry =
+                        spread_layout_geometry(left_page, right_page, left_bbox, right_bbox, true);
+                    let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                    let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                        / geometry.fit_size.x)
+                        .min(viewport.height() / geometry.fit_size.y);
+                    let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                    let rects = layout_spread_page_rects(
+                        center,
+                        geometry,
+                        fit_scale,
+                        spread_gap,
+                        pixels_per_point,
+                        left_bbox,
+                        right_bbox,
+                        bbox.is_some(),
+                    );
+                    let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+
+                    // サムネイル (縮小済みで拡大表示になる) / 元解像度 / AI 4 倍。
+                    for texture_factor in [
+                        1.0_f32 / 16.0,
+                        1.0 / 8.0,
+                        1.0 / 4.0,
+                        1.0 / 3.0,
+                        1.0 / 2.0,
+                        1.0,
+                        2.0,
+                        3.0,
+                        4.0,
+                    ] {
+                        let resolve = |rect: egui::Rect, page: egui::Vec2| {
+                            resolve_fs_transform_in_layout_rect(
+                                DisplayedImageTransformInput {
+                                    pixel_fit: RectPixelFit::Texels,
+                                    page_idx: 0,
+                                    viewport_rect: viewport,
+                                    source_size: page,
+                                    texture_size: (page * texture_factor).round(),
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: bbox,
+                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                        pixels_per_point,
+                                        ..FullscreenFitScaleLimits::default()
+                                    },
+                                    pixels_per_point,
+                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                },
+                                rect,
+                            )
+                            .expect("spread page transform")
+                        };
+                        let left = resolve(rects.left_rect, left_page);
+                        let right = resolve(rects.right_rect, right_page);
+                        let (left_offset, right_offset) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(left_offset);
+                        let right = right.translated_by(right_offset);
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        assert!(
+                            (painted - gap_px).abs() < 1e-3,
+                            "テクスチャ {texture_factor} 倍 trim={} gap={gap} ppp={pixels_per_point}:                              間隔 {painted}px (設定 {gap_px}px)",
+                            bbox.is_some()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 自動トリム中の間隔は、**利用者に見える端**で設定どおりになる (§1.154)。
