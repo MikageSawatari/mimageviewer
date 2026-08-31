@@ -1,4 +1,4 @@
-# R-07 + R-14 の進捗と設計判断
+﻿# R-07 + R-14 の進捗と設計判断
 
 [local-adjust-ownership-brief.md](local-adjust-ownership-brief.md) の作業記録。
 **ブリーフが「何を直すか」、これが「どこまで直したか / どう直すと決めたか」**。
@@ -29,24 +29,92 @@
   `None` だったときだけ取り消し可能として扱う。この分岐は既存仕様であり、今回は
   揃えていない。
 
-## 次 — 段 (d-1) 文書の所有権を `Arc` へ
+## 済み — 段 (d-1) 文書の所有権を `Arc` へ
 
-`local_adjust_page_layers: HashMap<usize, Vec<LocalAdjustmentLayer>>` を
-`HashMap<usize, Arc<Vec<LocalAdjustmentLayer>>>` にし、
-`SidecarEntry::local_adjust_layers` も `Option<Arc<Vec<..>>>` にする。
-これで R-14 の残り 2 複製 (サイドカー用の 2 枚目と `items_mut` の 3 枚目) が消える。
+| コミット | 内容 |
+| --- | --- |
+| `a6367fb1` | 文書を `local_adjust_core::LocalAdjustmentLayers` (= `Arc<Vec<LocalAdjustmentLayer>>`) で配り、書き手だけが `Arc::make_mut` で複製を払う形へ |
+| `c093f0d7` | Codex レビュー指摘 (P2 / P3) の修正 |
 
-**調査済みの前提** (着手時に再調査しなくてよい):
+`cargo test -p mimageviewer --lib` は 6763 passed / 0 failed。新規テスト 4 件
+(所有権 3 + サイドカー形式 1)。**4 件とも変異させた実装で落ちることを確認済み**
+(強制複製 / `Arc::get_mut` / before を編集後に取る / 直列化名の変更)。
 
-- 参照は 141 箇所あるが、`Arc<Vec<T>>` は `Vec<T>` へ Deref するので読み取りはそのまま
-  通る。**実際に直す必要がある変異箇所は 3 つだけ** (`src/app.rs` の `remove` /
-  `insert`、`src/ui_adjustment_panel.rs` のテスト `insert`)。残りは `.cloned()` の
-  戻り型が変わる箇所で、コンパイラが全部指す。
-- `serde` は `features = ["rc"]` 済み ([Cargo.toml](../../Cargo.toml))。`Arc<Vec<T>>` を
-  そのままサイドカー JSON へ載せられる。
-- 書き換えは seam の `Arc::make_mut`。writer / worker が前の snapshot を持っている間
-  だけ 1 回複製する。**`SidecarFile::items` (`df245720`) と同じ形**なので、設計の前例が
-  既にある。
+### 消えた複製
+
+着手前の見積もりは「サイドカー用の 2 枚目と `items_mut` の 3 枚目」だったが、
+実際に見つかったのはもっと多い。**一番大きいのは見落としていた**:
+
+- `apply_local_adjust_panel_actions` が **1 フレームに 2 枚**深い複製を作っていた
+  (`.cloned()` と `before_layers = layers.clone()`)。しかも要求の有無を見る**前**なので、
+  補正パネルを開いているだけで毎フレーム 2 枚。
+- `LocalMaterializeLayers::Memory` — 描画 worker へ渡すたびに 1 枚。
+- `set_local_adjust_layers_for_idx` のサイドカーミラー用に 1 枚。
+- `set_local_adjust_layers_for_idx_with_undo` の `after` 再取得で 1 枚。
+- `*_before_layers` 3 フィールド (図形ドラッグ / キャンバスドラッグ / ブラシ) が
+  各操作の開始時に 1 枚。
+
+### 判断の記録
+
+- **型エイリアスを `local_adjust_core` に置いた。** `undo_stack` / `sidecar` /
+  `edit_bundle` / `books` が全部この型を持つので、所有権の方針を型が定義されている場所に
+  1 度だけ書く。
+- **Undo の `before` は編集より前に取る**という要件がここで初めて**壊れうる**ものになった。
+  複製していた頃は「後で取っても複製だから別物」だったが、共有所有では live と同じ割り当てを
+  指すので、後で取ると `Arc::make_mut` で分岐した後の姿を掴み、before == after で
+  Undo が捨てられる。seam にコメントを置き、テストで固定した。
+- **Undo スタックも `Arc` にした。** ここを `Vec` のまま残すと `capture_local_adjustment_undo`
+  で `(*arc).clone()` が要り、消したはずの複製が戻る。スコープ拡大ではなく、
+  変更が意味を持つための必要条件。
+- **必要になったときだけ複製する形へ 2 箇所直した**。`materialize_local_adjust` は
+  寸法が合っているなら複製しない (以前は無条件に複製してから寸法を見ていた)。
+  `local_adjust_layers_until` は prefix が有効なときだけ `to_vec` する。
+- **サイドカーの形式は変わらない** (`serde` の `rc` feature が `Arc<T>` を `T` として
+  直列化する)。出荷済みのディスク形式なので、配列であることをテストで固定した。
+  フォルダ移動時の復元がここを読む。
+
+### Codex レビューで直したこと (`c093f0d7`)
+
+- **[P2] 確定のたびに必ず複製していた。** 両 persist 経路が「live の `Arc` を複製 →
+  無条件に `Arc::make_mut`」の形だった。マップが常に 1 つ握っているので、**refcount は
+  必ず 1 より大きく、`make_mut` は必ず実複製になる**。落とすものが無い通常の
+  ストロークでも 96MB。この段の目的の大半をここで失っていた。
+  「落とすものがあるときだけ複製する」を単一の owner
+  (`compact_local_adjust_manual_override_in`) に集約し、判定と実際の圧縮が一致することを
+  テストで固定した (両方向に食い違うと害があるため)。
+- **[P3] ポインタ同一性のテストが無かった。** 上の退行を検出できる形
+  (複製しない確定 / 複製する確定) と、未検査だった `PageEditBundle::prepare` の
+  直列化経路 (貼り付け → `local_adjust.db` JSON) を追加。
+
+Codex は **意味的な別名化・スナップショット順序の欠陥は無し**、サイドカーと
+`local_adjust.db` の形式は読み書き両方向で不変、と確認している。
+
+## 未修正で見つかったもの — 補正パネルの編集器が毎フレーム 1 レイヤーを複製する
+
+**[Codex P1、段 (b) で扱う]** `draw_selected_local_adjust_layer_editor`
+([src/ui_adjustment_panel.rs](../../src/ui_adjustment_panel.rs) `3566` 付近) の
+`let mut edited = layer.clone();` が、補正パネルを開いている間**毎フレーム**走る
+(`draw_local_adjust_panel` の入口ガードは `local_adjust_mode` + フルスクリーンだけ)。
+`LocalAdjustmentLayer` の複製は `RasterVectorMask::alpha` を再帰的に複製するので、
+24MP なら 1 枚 96MB。`manual_override` の add / subtract も持てば最大 3 枚。
+
+**これは段 (c) で直したのと同じ形の契約**である。「文書を複製 → UI に貸す →
+変わっていたら publish」で、複製が正しさ (何が変わったかの判定) を支えている。
+
+調査済み: **編集器はマスクの画素を書かない。** 書くのは
+`mask_inverted` / `opacity` / `mask_before_effect` / `mask_after_effect` /
+`mask_expand_px` / `mask_feather_px` の scalar、`mask` の**パラメータ**
+(グラデーション幾何・許容幅・target RGB)、`shapes` (ベクタ、太さスライダを動かしたときだけ)、
+`effect` の 4 種類だけ。原寸の `alpha` 配列は読むだけ。つまり**複製の大部分は純粋な無駄**。
+
+直し方の候補を検討した結果:
+
+- `Arc<LocalAdjustmentLayer>` にしても効かない。egui のウィジェットは毎フレーム
+  `&mut f32` を要求するので、`Arc::make_mut` が毎フレーム走る。
+- 画素配列だけ抜いて貸し、戻すときに差し戻す形は、抜き忘れが静かに壊れる。
+- **正解は「編集中のレイヤー」を App の state owner に持たせること** — 選択が変わった
+  ときに 1 度作り、変更を publish する。これは**段 (b) が作ろうとしている
+  「保留中の編集の単一 state owner」と同じもの**なので、段 (b) に畳む。
 
 ## 次の次 — 段 (d-2) 保存の worker 化 (R-26 を開け直さない)
 
