@@ -566,6 +566,8 @@ impl Drop for ExternalToolHandlersPending {
 pub(super) struct ExternalToolLaunchCandidate {
     pub display_name: String,
     pub launch: crate::external_tool::ExternalToolLaunch,
+    /// Windows が「おすすめ」に分類しているか。見出しを入れる位置を決めるだけ。
+    pub is_recommended: bool,
 }
 
 fn external_tool_launch_candidates(
@@ -590,6 +592,7 @@ fn external_tool_launch_candidates(
         candidates.push(ExternalToolLaunchCandidate {
             display_name: handler.display_name.clone(),
             launch,
+            is_recommended: handler.is_recommended,
         });
     }
     candidates
@@ -3172,6 +3175,7 @@ mod tests {
                 launch: crate::external_tool::ExternalToolLaunch::Association {
                     handler_id: "Paint.App".to_string(),
                 },
+                is_recommended: false,
             }
         );
         assert!(external_tool_launch_candidates(&[]).is_empty());

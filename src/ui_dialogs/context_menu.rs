@@ -1277,6 +1277,7 @@ impl crate::app::App {
             .map(|handler| AssociatedAppMenuEntry {
                 display_name: handler.display_name,
                 handler_id: handler.handler_id,
+                is_recommended: handler.is_recommended,
             })
             .collect()
     }

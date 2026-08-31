@@ -170,6 +170,9 @@ pub struct ExternalToolMenuEntry {
 pub struct AssociatedAppMenuEntry {
     pub display_name: String,
     pub handler_id: String,
+    /// Windows が「おすすめ」に分類しているか。区切り線を入れる位置を決めるだけで、
+    /// 候補を絞る条件には使わない。
+    pub is_recommended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +236,16 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     if !input.kind.supports_open_with() {
         return None;
     }
+    // Windows の「プログラムから開く」と同じく、おすすめとその他を区切って見せる。
+    // 一覧は絞らない (絞ると OS に出るアプリが mIV に出ないことになる) が、
+    // 区切りが無いと利用者にはどこまでがおすすめか分からない (2026-09-01 指摘)。
     let mut children = Vec::new();
+    let mut previous_recommended: Option<bool> = None;
     for app in &input.associated_apps {
+        if previous_recommended == Some(true) && !app.is_recommended {
+            children.push(MenuNode::Separator);
+        }
+        previous_recommended = Some(app.is_recommended);
         children.push(item(
             MenuCommand::OpenWithAssociation {
                 display_name: app.display_name.clone(),

@@ -90,7 +90,11 @@ fn enumerate_handlers_inner(
             if let (Some(display_name), Some(handler_id)) = (display_name, handler_id) {
                 let key = handler_id.to_lowercase();
                 if seen_ids.insert(key) {
-                    let is_recommended = unsafe { handler.IsRecommended() }.is_ok();
+                    // `IsRecommended` は `Result` ではなく `HRESULT` を直接返す。
+                    // おすすめでないときは **S_FALSE** で、これは失敗ではないので
+                    // `is_ok()` では両者を区別できない。S_OK と厳密に比較する。
+                    let is_recommended =
+                        unsafe { handler.IsRecommended() } == windows::Win32::Foundation::S_OK;
                     result.push(AppHandler {
                         display_name,
                         handler_id,
@@ -999,11 +1003,11 @@ mod handler_dump_tests {
     #[test]
     #[ignore]
     fn dump_handlers_for_jpg() {
-        println!("--- picker view (RECOMMENDED + dedupe) ---");
+        println!("--- picker view (canonical enumeration) ---");
         for handler in super::enumerate_handlers(".jpg") {
             println!(
-                "UIName={:?} | Name={:?}",
-                handler.display_name, handler.handler_id
+                "recommended={} UIName={:?} | Name={:?}",
+                handler.is_recommended, handler.display_name, handler.handler_id
             );
         }
         println!("--- identity QI (AUMID / ProgID) ---");

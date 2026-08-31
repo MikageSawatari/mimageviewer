@@ -957,8 +957,23 @@ fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut Preferences
             state.add_external_tool(tool);
             state.external_tool_candidates.clear();
         }
+        // Windows の「プログラムから開く」と同じく、おすすめとその他を見出しで分ける。
+        // 一覧そのものは絞らない (2026-09-01 利用者指摘)。
         let candidates = state.external_tool_candidates.clone();
+        let mut previous_recommended: Option<bool> = None;
         for candidate in candidates {
+            if previous_recommended != Some(candidate.is_recommended) {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(if candidate.is_recommended {
+                        "おすすめのアプリ"
+                    } else {
+                        "その他のアプリ"
+                    })
+                    .weak(),
+                );
+            }
+            previous_recommended = Some(candidate.is_recommended);
             if ui.button(&candidate.display_name).clicked() {
                 let mut tool = if state.external_tool_handlers_for_editing {
                     crate::external_tool::ExternalTool::defaults_for_editing()
