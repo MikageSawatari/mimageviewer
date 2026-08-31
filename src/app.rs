@@ -7580,21 +7580,6 @@ pub(crate) struct FavoriteDefaultClearConfirm {
 ///
 /// 3 値にしているのは、`Result` では「開けていない」と「書けた」が同じ値になり、
 /// 呼び出し側がどちらか区別できないため。
-/// 積んだ保存 1 件について、完了時に必要になるものだけを控えた記録。
-///
-/// **サイドカー座標を控えるのが要点。**完了が返る頃には一覧の idx が別のページを
-/// 指し得るので、そのとき解決し直すと無関係なページへミラーする。`idx` も持つが、
-/// これは idx 依存の後続処理を「まだ同じページを指しているか」で gate するためだけに
-/// 使う。
-pub(crate) struct LocalAdjustWritePending {
-    /// この key について最後に積んだ generation。古い完了を捨てるのに使う。
-    pub generation: u64,
-    /// 積んだ時点の一覧 idx。
-    pub idx: usize,
-    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
-    pub sidecar: Option<(std::path::PathBuf, String)>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditStoreOutcome {
     /// 正本が受理した。sidecar ミラーを書いてよい。
@@ -7603,6 +7588,23 @@ pub(crate) enum EditStoreOutcome {
     Unavailable,
     /// 正本が拒否した。
     Failed(String),
+}
+
+/// 積んだ補正レイヤー保存 1 件について、完了時に必要になるものだけを控えた記録。
+///
+/// **サイドカー座標を控えるのが要点。**完了が返る頃には一覧の idx が別のページを
+/// 指し得るので、そのとき解決し直すと無関係なページへミラーする。`idx` も持つが、
+/// これは idx 依存の後続処理を「まだ同じページを指しているか」で gate するためだけに使う。
+///
+/// key ごとに**最後に積んだ 1 件**だけを持つ。同じ key の古い完了もこの座標でミラーして
+/// よい (key が同じなら指すページも同じ)。
+pub(crate) struct LocalAdjustWritePending {
+    /// この key について最後に積んだ generation。記録を畳む時期を決めるのに使う。
+    pub generation: u64,
+    /// 積んだ時点の一覧 idx。
+    pub idx: usize,
+    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
+    pub sidecar: Option<(std::path::PathBuf, String)>,
 }
 
 /// メタ操作 (タグ付与など) を発火させた UI 面。
@@ -28369,9 +28371,18 @@ impl App {
             .edit_preview_cache
             .as_ref()
             .is_some_and(|cache| cache.has_pending_commands());
+        // 補正レイヤーの保存も `local_adjust.db` を直接書く。積んだままリネーム移行を
+        // 始めると、移した後に古い key の保存が着地して行を復活させる。未回収の完了も
+        // 数える (完了を適用するとサイドカーへミラーが書かれるため)。
+        let local_adjust_busy = self
+            .local_adjust_write_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_unfinished_work())
+            || !self.local_adjust_write_pending.is_empty();
         tag_busy
             || rating_busy
             || edit_preview_busy
+            || local_adjust_busy
             || !self.book_bookmark_pending_requests.is_empty()
     }
 
@@ -54597,11 +54608,25 @@ impl App {
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         self.ensure_local_adjust_write_handle();
-        let Some(handle) = self.local_adjust_write_handle.as_ref() else {
-            return;
-        };
         let layer_count = layers.len();
-        let generation = handle.submit(key.clone(), layers);
+        let submitted = match self.local_adjust_write_handle.as_ref() {
+            Some(handle) => handle.submit(key.clone(), layers),
+            None => Err(EditStoreOutcome::Failed(
+                "保存ワーカーを起動できません".to_string(),
+            )),
+        };
+        let generation = match submitted {
+            Ok(generation) => generation,
+            Err(outcome) => {
+                // worker が受け取らなかった = 正本には何も書かれない。黙って積んだ
+                // ことにすると、画面には編集が残ったまま保存されない状態が続く。
+                // 他の失敗と同じ扱い (ミラーを書かず、利用者へ伝える) にする。
+                debug_assert!(!matches!(outcome, EditStoreOutcome::Committed));
+                let _ = self.edit_store_write_succeeded("補正レイヤー", outcome);
+                self.local_adjust_write_pending.remove(&key);
+                return;
+            }
+        };
         crate::perf::event(
             "local_adjust",
             "save_enqueue",
@@ -54682,44 +54707,42 @@ impl App {
     /// - `Unavailable` / `Failed` — トーストだけ。**ミラーは書かない。**書くと、次回起動の
     ///   import が「中央が authoritative」として新しい sidecar を捨て、利用者からは編集が
     ///   消えたように見える。
-    /// - `Superseded` — 成功でも失敗でもない。何もしない。
+    ///
+    /// **古い generation の完了も同じように処理する。**worker は key ごとに順に書くので、
+    /// 完了は必ず古い順に届く。受理された古い完了を「新しい要求が控えているから」と
+    /// 捨てると、その新しい要求が失敗したときに**正本には古い内容があるのに sidecar には
+    /// 何も無い**状態で止まる (2026-08-31 Codex P2)。
     pub(crate) fn apply_local_adjust_write_completion(
         &mut self,
         completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
     ) {
-        use crate::local_adjust_write_worker::LocalAdjustWriteCompletion as Completion;
-
-        // 追い越された結果は無視する。新しい要求が同じ行を上書きし、自分のミラーを
-        // 連れてくるので、古い内容を写すと一瞬 sidecar だけが巻き戻る。
-        let key = completion.key().to_string();
-        if self
-            .local_adjust_write_pending
-            .get(&key)
-            .is_none_or(|pending| pending.generation != completion.generation())
-        {
-            return;
-        }
-        let pending = self
-            .local_adjust_write_pending
-            .remove(&key)
-            .expect("just looked it up");
-
-        let Completion::Settled {
-            layers, outcome, ..
-        } = completion
-        else {
+        let crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+            key,
+            generation,
+            layers,
+            outcome,
+        } = completion;
+        let Some(pending) = self.local_adjust_write_pending.get(&key) else {
             return;
         };
+        let sidecar = pending.sidecar.clone();
+        let idx = pending.idx;
+        // 記録を畳むのは最新の完了だけ。古い完了で畳むと、後から届く最新の完了が
+        // ミラー先を失う。
+        if pending.generation == generation {
+            self.local_adjust_write_pending.remove(&key);
+        }
+
         if !self.edit_store_write_succeeded("補正レイヤー", outcome) {
             // 画面には残す。durable な mirror だけ書かない。
             return;
         }
         if layers.is_empty() {
-            self.with_sidecar_coords_mut(pending.sidecar.as_ref(), |sc, rel| {
+            self.with_sidecar_coords_mut(sidecar.as_ref(), |sc, rel| {
                 sc.remove_local_adjust_layers(rel)
             });
         } else {
-            self.with_sidecar_coords_mut(pending.sidecar.as_ref(), move |sc, rel| {
+            self.with_sidecar_coords_mut(sidecar.as_ref(), move |sc, rel| {
                 sc.set_local_adjust_layers(rel, layers)
             });
         }
@@ -54728,9 +54751,9 @@ impl App {
         );
         // idx は完了までに別のページを指し得る。同じ key を指したままのときだけ
         // idx 依存の後続処理を走らせる。
-        if self.page_path_key(pending.idx).as_deref() == Some(key.as_str()) {
+        if self.page_path_key(idx).as_deref() == Some(key.as_str()) {
             self.record_content_identity_for_idx(
-                pending.idx,
+                idx,
                 crate::content_identity::ContentIdentityTrigger::Edit,
             );
         }
@@ -67774,6 +67797,11 @@ impl eframe::App for App {
         self.poll_tag_maintenance_results();
         self.poll_rating_write_results();
         self.poll_local_adjust_write_results();
+        if !self.local_adjust_write_pending.is_empty() {
+            // 結果は毎フレームの poll で拾う。最後の保存の直後に egui が眠ると、
+            // 失敗トーストとサイドカーミラーが次の入力まで出ない。
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         self.poll_video_upscale_queue(ctx);
 
         let main_viewer_blocked = self.viewer_session_blocks_main_window();

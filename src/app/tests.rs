@@ -15420,6 +15420,16 @@ mod favorite_adjustment_defaults_tests {
         (app, folder)
     }
 
+    /// 唯一積まれている保存の (key, generation)。
+    fn only_pending_local_adjust_write(app: &App) -> (String, u64) {
+        assert_eq!(app.local_adjust_write_pending.len(), 1);
+        app.local_adjust_write_pending
+            .iter()
+            .map(|(key, pending)| (key.clone(), pending.generation))
+            .next()
+            .unwrap()
+    }
+
     fn mirrored_local_adjust(
         app: &App,
         folder: &Path,
@@ -15470,19 +15480,14 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_write_mirrors_exactly_the_document_that_was_written() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("enqueued"));
-        let (key, pending) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, generation) = only_pending_local_adjust_write(&app);
         // 完了までの間にもう一度編集された状況を作る。写るのは worker が書いた方。
         app.set_local_adjust_layers_for_idx_memory_only(0, local_adjust_doc("later"));
 
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
-                generation: pending,
+                generation,
                 layers: local_adjust_doc("written"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -15509,15 +15514,10 @@ mod favorite_adjustment_defaults_tests {
     fn a_write_with_no_store_open_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, generation) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
                 layers: local_adjust_doc("edited"),
@@ -15545,15 +15545,10 @@ mod favorite_adjustment_defaults_tests {
     fn a_refused_write_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, generation) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
                 layers: local_adjust_doc("edited"),
@@ -15573,47 +15568,55 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.local_adjust_pages.contains(&0));
     }
 
-    /// 追い越された結果は成功でも失敗でもない。**何もしない。**
+    /// 積めなかった保存は**その場で失敗として扱う**。
     ///
-    /// トーストを出すと「保存できませんでした」が誤って出るし、ミラーを書くと
-    /// 新しい編集を古い内容で上書きする。
+    /// worker が止まっていると、積んだつもりの保存は正本に何も書かない。黙って
+    /// 受け付けると、画面には編集が残ったまま保存されていない状態が続く。
     #[test]
-    fn a_superseded_write_neither_mirrors_nor_reports() {
+    fn a_save_the_worker_could_not_take_is_reported_and_not_mirrored() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
+        // worker を先に用意し、抜けた状態にしてから保存する。
+        app.ensure_local_adjust_write_handle();
+        app.local_adjust_write_handle
+            .as_ref()
+            .unwrap()
+            .mark_worker_stopped_for_test();
+
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
 
-        app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Superseded {
-                key,
-                generation,
-            },
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "積めていない保存をサイドカーへ写している"
         );
-
-        assert!(mirrored_local_adjust(&app, &folder).is_none());
-        assert_eq!(toast_text(&app), "", "追い越しは利用者に見せるものではない");
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存できなかったことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(
+            app.local_adjust_write_pending.is_empty(),
+            "着地しない保存の記録が残り続けている"
+        );
+        assert!(
+            app.local_adjust_pages.contains(&0),
+            "保存できなかっただけで、編集が画面から消えている"
+        );
     }
 
-    /// 新しい保存が積まれた後に古い完了が返っても、ミラーは巻き戻らない。
+    /// 新しい保存が控えていても、**受理された古い完了は publish する**。
+    ///
+    /// worker は key ごとに順に書くので完了は古い順に届く。ここで古い完了を捨てると、
+    /// 次の完了が失敗したときに「正本には古い内容があるのに sidecar には何も無い」
+    /// 状態で止まる (2026-08-31 Codex P2)。下の合成遷移テストがその筋を通しで見る。
     #[test]
-    fn a_completion_that_a_newer_save_overtook_is_ignored() {
+    fn an_older_committed_completion_still_publishes_while_a_newer_save_is_pending() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("first"));
-        let (key, stale_generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, stale_generation) = only_pending_local_adjust_write(&app);
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("second"));
 
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation: stale_generation,
                 layers: local_adjust_doc("first"),
@@ -15621,14 +15624,61 @@ mod favorite_adjustment_defaults_tests {
             },
         );
 
-        assert!(
-            mirrored_local_adjust(&app, &folder).is_none(),
-            "古い完了で新しい編集を上書きしている"
+        assert_eq!(
+            mirrored_local_adjust(&app, &folder)
+                .expect("受理された内容はサイドカーへ写る")
+                .as_slice(),
+            local_adjust_doc("first").as_slice(),
+            "正本が受理した内容がサイドカーに無い"
         );
         assert!(
             app.local_adjust_write_pending.contains_key(&key),
-            "新しい保存の記録まで消している (自分の完了を照合できなくなる)"
+            "新しい保存の記録まで畳んでいる (その完了がミラー先を失う)"
         );
+    }
+
+    /// **合成遷移**: 古い保存が受理され、新しい保存が失敗する。
+    ///
+    /// この順序でサイドカーが空のまま残ると、正本 (古い内容あり) と食い違ったまま
+    /// 次の保存まで直らない。フォルダを移すとその古い内容も復元できない。
+    #[test]
+    fn a_committed_save_stays_mirrored_when_the_next_save_fails() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("committed"));
+        let (key, committed_generation) = only_pending_local_adjust_write(&app);
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("doomed"));
+        let (_, doomed_generation) = only_pending_local_adjust_write(&app);
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key: key.clone(),
+                generation: committed_generation,
+                layers: local_adjust_doc("committed"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation: doomed_generation,
+                layers: local_adjust_doc("doomed"),
+                outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
+            },
+        );
+
+        assert_eq!(
+            mirrored_local_adjust(&app, &folder)
+                .expect("受理された内容が残っていない")
+                .as_slice(),
+            local_adjust_doc("committed").as_slice(),
+            "失敗した保存が、受理済みのミラーを消している / 上書きしている"
+        );
+        assert!(
+            toast_text(&app).contains("disk full"),
+            "失敗が利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(app.local_adjust_write_pending.is_empty());
     }
 
     /// 空の文書を受理したら、サイドカーからも消す。
@@ -15636,14 +15686,9 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_empty_document_removes_the_sidecar_entry() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, generation) = only_pending_local_adjust_write(&app);
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation,
                 layers: local_adjust_doc("edited"),
@@ -15655,7 +15700,7 @@ mod favorite_adjustment_defaults_tests {
         app.set_local_adjust_layers_for_idx(0, local_adjust_core::LocalAdjustmentLayers::default());
         let generation = app.local_adjust_write_pending[&key].generation;
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
                 layers: local_adjust_core::LocalAdjustmentLayers::default(),
@@ -15677,12 +15722,7 @@ mod favorite_adjustment_defaults_tests {
     fn the_mirror_target_is_the_one_fixed_when_the_save_was_enqueued() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = app
-            .local_adjust_write_pending
-            .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
-            .next()
-            .unwrap();
+        let (key, generation) = only_pending_local_adjust_write(&app);
 
         // 一覧が入れ替わり、idx 0 は別フォルダの別ページを指すようになった。
         let other = app.tmp.path().join("other");
@@ -15692,7 +15732,7 @@ mod favorite_adjustment_defaults_tests {
         app.items = vec![GridItem::Image(other_image)];
 
         app.apply_local_adjust_write_completion(
-            crate::local_adjust_write_worker::LocalAdjustWriteCompletion::Settled {
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
                 layers: local_adjust_doc("written"),
@@ -45850,6 +45890,35 @@ mod still_window_mode_key_tests {
         );
 
         app.book_bookmark_pending_requests.clear();
+        assert!(!app.rename_migration_writers_busy());
+    }
+
+    /// リネーム移行は補正レイヤーの保存も待つ。
+    ///
+    /// 保存は worker 経由、key の付け替えは UI スレッドが直接 `local_adjust.db` を
+    /// 書き換える。待たずに始めると、移した後に古い key の保存が着地して行を復活させる。
+    /// **未回収の完了も「まだ終わっていない」に数える** — 完了を適用するとサイドカーへ
+    /// ミラーが書かれるため (2026-08-31 Codex P1)。
+    #[test]
+    fn rename_migration_waits_for_the_local_adjust_write_worker() {
+        let mut app = setup_app();
+        assert!(!app.rename_migration_writers_busy());
+
+        // 積んだが完了を回収していない状態。
+        app.local_adjust_write_pending.insert(
+            "c:/pics/page.png".to_string(),
+            crate::app::LocalAdjustWritePending {
+                generation: 1,
+                idx: 0,
+                sidecar: None,
+            },
+        );
+        assert!(
+            app.rename_migration_writers_busy(),
+            "付け替えが、着地していない補正レイヤーの保存を追い越している"
+        );
+
+        app.local_adjust_write_pending.clear();
         assert!(!app.rename_migration_writers_busy());
     }
 

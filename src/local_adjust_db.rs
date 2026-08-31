@@ -50,6 +50,19 @@ impl LocalAdjustDb {
         Ok(Self { conn })
     }
 
+    /// 保存 worker 用に開く。
+    ///
+    /// UI 側の接続と**同じ DB を別接続で**開くので、待ち時間を明示する。rusqlite の
+    /// 既定 (5 秒) に任せると、競合で 5 秒止まっているのか壊れているのか区別できない。
+    /// 補正レイヤーの保存は「遅れて成功する」より「早く失敗して利用者に伝える」方が
+    /// 良い (画面の編集は残り、やり直せる)。
+    pub(crate) fn open_for_writer(path: &Path) -> Result<Self, rusqlite::Error> {
+        let db = Self::open_at(path)?;
+        db.conn
+            .busy_timeout(std::time::Duration::from_millis(3_000))?;
+        Ok(db)
+    }
+
     /// 起動時に schema 初期化済みの DB を一覧準備 worker から読み取り専用で開く。
     pub fn open_readonly(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = rusqlite::Connection::open_with_flags(

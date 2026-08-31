@@ -5,12 +5,15 @@
 //! マスク系スライダーのドラッグ中は**毎フレーム**走る (`Slider::changed()` はドラッグ中
 //! 毎フレーム真)。ここはその処理を別スレッドへ出す。
 //!
-//! ## 合体 (generation coalescing)
+//! ## 合体は「積む前」に行う
 //!
-//! 要求 1 件が画像原寸のマスクを丸ごと抱えるので、ドラッグ中に積まれた要求をすべて
-//! 書くとキューにメモリが積み上がる。同じ key について**最新の generation だけ**を書き、
-//! 追い越されたものは [`LocalAdjustWriteCompletion::Superseded`] として捨てる。
-//! 後続の要求が同じ行を上書きするので、捨てても正本の内容は変わらない。
+//! 要求 1 件が画像原寸のマスクを丸ごと抱える (24MP で 96MB)。**チャネルへ積んでから
+//! 取り出し時に古い方を捨てる形では、抱えたままキューに溜まる**ので合体にならない。
+//! ここでは key ごとに**未書き込みの文書を 1 つだけ**持つ枠 (`Queue::documents`) を置き、
+//! 同じ key への再要求はその枠を差し替える。古い文書はその瞬間に落ちる。
+//!
+//! `Mutex + Condvar` で保護したキュー + 専用スレッドという形は、CLAUDE.md
+//! 「try_lock + sleep は使わない」が指す構造そのもの (`PdfWorkerPool` と同じ)。
 //!
 //! ## R-26 — 「開けなかった」を「書けた」にしない
 //!
@@ -23,166 +26,215 @@
 //! 開けなければ次の要求でまた試す。判定する主体と書く主体が一致するので、
 //! 一時的に開けなかっただけのときに以後ずっと保存できない状態に落ちない。
 //!
-//! ## 終了時
+//! ## 止まった worker を黙って無視しない
 //!
-//! drain-on-shutdown。**送信端を落とすことが停止の合図**で、`Receiver::recv` は
-//! キューが空になって初めて `Disconnected` を返すので、在庫は必ず書き切ってから止まる。
-//! 停止フラグを別に持って周期的に見る形 ([`crate::rating_write_worker`]) と違い、
-//! 待ち時間もポーリングも要らない。`shutdown_and_collect` は join してから結果をすべて
-//! 返すので、呼び出し側は取りこぼしなく sidecar ミラーを書ける。
+//! spawn 失敗と worker の panic はどちらも「以後すべての保存が消える」に直結する。
+//! [`LocalAdjustWriteHandle::submit`] は worker が生きていないと分かれば
+//! [`EditStoreOutcome::Failed`] を**その場で**返すので、呼び出し側の R-26 判定
+//! (失敗ならミラーを書かずトーストを出す) がそのまま働く。
+//!
+//! ## 終了・待ち合わせ
+//!
+//! - 終了は「`stopped` を立てて起こす」。worker は**キューを空にしてから**抜けるので、
+//!   在庫は必ず書き切る。
+//! - [`LocalAdjustWriteHandle::drain_blocking`] は**フェンスを 1 つ積んでその ACK を待つ**。
+//!   「残件カウンタが 0 になるまで受け取る」形にすると、最後の結果を受け取った直後・
+//!   カウンタが進む前にもう一度 `recv` して永久に待つロストウェイクアップが起きる
+//!   (2026-08-31 Codex P1)。worker が panic しても [`WorkerGuard`] がフェンスを落として
+//!   待ち手を起こす。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::app::EditStoreOutcome;
 use crate::local_adjust_db::LocalAdjustDb;
 
-/// 1 ページ分の保存要求。
-pub(crate) struct LocalAdjustWriteJob {
+/// worker が 1 件の保存について返す答え。
+///
+/// `layers` は**実際に書いた文書そのもの**。呼び出し側が別途メモリから取り直すと、
+/// 積んでから完了までの間に入った編集をミラーしてしまう (書いた内容とミラーがずれる)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LocalAdjustWriteCompletion {
     pub key: String,
     pub generation: u64,
     pub layers: local_adjust_core::LocalAdjustmentLayers,
+    pub outcome: EditStoreOutcome,
 }
 
-/// worker が 1 件の要求について返す答え。
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum LocalAdjustWriteCompletion {
-    /// 正本へ書きに行った。`outcome` が `Committed` のときだけ sidecar ミラーを書ける。
-    ///
-    /// `layers` は**実際に書いた文書そのもの**。呼び出し側が別途メモリから取り直すと、
-    /// その間に入った編集をミラーしてしまう (書いた内容とミラーがずれる)。
-    Settled {
-        key: String,
-        generation: u64,
-        layers: local_adjust_core::LocalAdjustmentLayers,
-        outcome: EditStoreOutcome,
-    },
-    /// 同じ key の新しい要求に追い越されたので書いていない。
-    ///
-    /// **成功でも失敗でもない。**ミラーもトーストも出さないこと。
-    Superseded { key: String, generation: u64 },
+/// まだ書いていない 1 ページ分の文書。key ごとに 1 つだけ持つ。
+struct QueuedWrite {
+    generation: u64,
+    layers: local_adjust_core::LocalAdjustmentLayers,
 }
 
-impl LocalAdjustWriteCompletion {
-    pub(crate) fn key(&self) -> &str {
-        match self {
-            Self::Settled { key, .. } | Self::Superseded { key, .. } => key,
-        }
-    }
+/// キューに並ぶもの。`Write` は key だけを持ち、文書は `documents` 側にある
+/// (同じ key の再要求で文書だけを差し替えられるようにするため)。
+enum QueueItem {
+    Write(String),
+    /// 待ち合わせ。worker がここまで来たら ACK を返して待ち手を起こす。
+    Fence(Sender<()>),
+}
 
-    pub(crate) fn generation(&self) -> u64 {
-        match self {
-            Self::Settled { generation, .. } | Self::Superseded { generation, .. } => *generation,
-        }
+struct Queue {
+    items: VecDeque<QueueItem>,
+    documents: HashMap<String, QueuedWrite>,
+    stopped: bool,
+}
+
+struct Shared {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+    /// worker スレッドが生きているか。spawn 失敗・panic・正常終了で false。
+    alive: AtomicBool,
+}
+
+impl Shared {
+    /// poison を復旧して掴む。worker が panic したあとも待ち手を起こす必要がある。
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 pub(crate) struct LocalAdjustWriteHandle {
-    /// `None` は「停止を伝えた後」。落とすことが worker への停止の合図なので、
-    /// join より**前**に落とすこと。
-    job_tx: Option<Sender<LocalAdjustWriteJob>>,
+    shared: Arc<Shared>,
     result_rx: Receiver<LocalAdjustWriteCompletion>,
-    /// key ごとに最後に submit した generation。worker が追い越し判定に読む。
-    latest: Arc<Mutex<HashMap<String, u64>>>,
-    next_generation: Arc<AtomicU64>,
-    submitted: Arc<AtomicUsize>,
-    done: Arc<AtomicUsize>,
+    next_generation: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LocalAdjustWriteHandle {
     pub(crate) fn spawn(db_path: PathBuf) -> Self {
-        let (job_tx, job_rx) = unbounded::<LocalAdjustWriteJob>();
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                documents: HashMap::new(),
+                stopped: false,
+            }),
+            ready: Condvar::new(),
+            alive: AtomicBool::new(true),
+        });
         let (result_tx, result_rx) = unbounded::<LocalAdjustWriteCompletion>();
-        let latest: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
-        let done = Arc::new(AtomicUsize::new(0));
 
-        let w_latest = Arc::clone(&latest);
-        let w_done = Arc::clone(&done);
-        let thread = std::thread::Builder::new()
+        let worker_shared = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
             .name("local-adjust-write-worker".into())
             .spawn(move || {
-                run_worker(&db_path, &job_rx, &result_tx, &w_latest, &w_done);
-            })
-            .expect("local-adjust-write-worker spawn");
+                let _guard = WorkerGuard {
+                    shared: Arc::clone(&worker_shared),
+                };
+                run_worker(&db_path, &worker_shared, &result_tx);
+            });
+        let thread = match spawned {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                // スレッドを作れない状態で `expect` すると UI ごと落ちる。生きていない
+                // 印を立てて返し、以後の保存は `submit` がその場で失敗として返す。
+                crate::logger::log(format!("[local-adjust-write] worker spawn failed: {error}"));
+                shared.alive.store(false, Ordering::Release);
+                None
+            }
+        };
 
         Self {
-            job_tx: Some(job_tx),
+            shared,
             result_rx,
-            latest,
-            next_generation: Arc::new(AtomicU64::new(0)),
-            submitted: Arc::new(AtomicUsize::new(0)),
-            done,
-            thread: Some(thread),
+            next_generation: AtomicU64::new(0),
+            thread,
         }
     }
 
-    /// 保存を積む。返り値はこの要求の generation で、完了を照合するのに使う。
+    /// 保存を積む。
+    ///
+    /// `Ok(generation)` は「worker が受け取った」。`Err(outcome)` は**その場で確定した
+    /// 失敗**で、呼び出し側は他の失敗と同じに扱う (ミラーを書かず、利用者へ伝える)。
     pub(crate) fn submit(
         &self,
         key: String,
         layers: local_adjust_core::LocalAdjustmentLayers,
-    ) -> u64 {
+    ) -> Result<u64, EditStoreOutcome> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut latest) = self.latest.lock() {
-            latest.insert(key.clone(), generation);
+        let mut queue = self.shared.lock();
+        if queue.stopped || !self.shared.alive.load(Ordering::Acquire) {
+            return Err(EditStoreOutcome::Failed(
+                "保存ワーカーが停止しています".to_string(),
+            ));
         }
-        self.submitted.fetch_add(1, Ordering::Relaxed);
-        if let Some(job_tx) = self.job_tx.as_ref() {
-            let _ = job_tx.send(LocalAdjustWriteJob {
-                key,
-                generation,
-                layers,
-            });
+        // 同じ key が既に並んでいれば**位置は動かさず文書だけ差し替える**。
+        // 古い文書はここで落ちるので、キューに原寸マスクが積み上がらない。
+        let replaced = queue
+            .documents
+            .insert(key.clone(), QueuedWrite { generation, layers })
+            .is_some();
+        if !replaced {
+            queue.items.push_back(QueueItem::Write(key));
         }
-        generation
+        drop(queue);
+        self.shared.ready.notify_one();
+        Ok(generation)
     }
 
-    /// 実行待ち / 実行中の要求が残っているか。
-    fn is_busy(&self) -> bool {
-        self.submitted.load(Ordering::Relaxed) != self.done.load(Ordering::Relaxed)
-    }
-
-    /// 積んである保存がすべて着地するまで待ち、結果をまとめて返す。**worker は止めない。**
+    /// まだ書いていない要求か、書いたが未回収の結果があるか。
     ///
-    /// 時間で待たずに「残り件数が 0 になるまで受け取る」形にしてある。worker は結果を
-    /// 送ってから件数を数えるので、`is_busy` が偽になった時点で結果はすべてキューに
-    /// 入っている。worker が死んで送信端が落ちた場合は `recv` が `Disconnected` を
-    /// 返すので、待ち続けることはない。
-    pub(crate) fn drain_blocking(&self) -> Vec<LocalAdjustWriteCompletion> {
-        let mut collected = Vec::new();
-        while self.is_busy() {
-            match self.result_rx.recv() {
-                Ok(completion) => collected.push(completion),
-                Err(_) => break,
-            }
+    /// リネーム移行のように `local_adjust.db` を UI スレッドから直接書き換える処理の
+    /// 前に使う。完了を適用するとサイドカーへミラーが書かれるので、**未回収の結果も
+    /// 「まだ終わっていない」に数える**。
+    pub(crate) fn has_unfinished_work(&self) -> bool {
+        !self.result_rx.is_empty() || {
+            let queue = self.shared.lock();
+            !queue.items.is_empty() || !queue.documents.is_empty()
         }
-        collected.extend(self.result_rx.try_iter());
-        collected
+    }
+
+    /// テスト用: worker が抜けた状態を作る。
+    ///
+    /// 本番と同じ [`WorkerGuard`] の後始末を通すので、テストが見る状態は
+    /// 「panic した worker」「spawn できなかった worker」と同一。
+    #[cfg(test)]
+    pub(crate) fn mark_worker_stopped_for_test(&self) {
+        drop(WorkerGuard {
+            shared: Arc::clone(&self.shared),
+        });
     }
 
     pub(crate) fn try_recv(&self) -> Option<LocalAdjustWriteCompletion> {
         self.result_rx.try_recv().ok()
     }
 
-    /// worker を止め、**在庫を書き切らせてから**結果をすべて返す。
+    /// 積んである保存がすべて着地するまで待ち、結果をまとめて返す。**worker は止めない。**
     ///
-    /// 終了経路用。時間で諦める形にすると「間に合わなかった保存」が環境ごとに変わるので、
-    /// join してから受け取り切る形にしてある。
+    /// フェンスを 1 つ積み、その ACK を待つ。worker はキューを順に処理するので、
+    /// ACK が返った時点で「フェンスより前に積んだ保存」はすべて書き終えて結果も
+    /// 送り終えている。worker が panic した場合は [`WorkerGuard`] がフェンスを落とすので、
+    /// `recv` は `Disconnected` で戻る (待ち続けない)。
+    pub(crate) fn drain_blocking(&self) -> Vec<LocalAdjustWriteCompletion> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        {
+            let mut queue = self.shared.lock();
+            if queue.stopped {
+                return self.result_rx.try_iter().collect();
+            }
+            queue.items.push_back(QueueItem::Fence(ack_tx));
+        }
+        self.shared.ready.notify_one();
+        let _ = ack_rx.recv();
+        self.result_rx.try_iter().collect()
+    }
+
+    /// worker を止め、**在庫を書き切らせてから**結果をすべて返す。
     pub(crate) fn shutdown_and_collect(mut self) -> Vec<LocalAdjustWriteCompletion> {
         self.stop_and_join();
         self.result_rx.try_iter().collect()
     }
 
-    /// 送信端を落として worker に停止を伝え、書き切るまで待つ。
     fn stop_and_join(&mut self) {
-        // **join より先に落とすこと。**送信端が生きている限り `recv` は待ち続けるので、
-        // 順序を逆にすると join が返らない。
-        self.job_tx = None;
+        self.shared.lock().stopped = true;
+        self.shared.ready.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -197,57 +249,77 @@ impl Drop for LocalAdjustWriteHandle {
     }
 }
 
-fn run_worker(
-    db_path: &Path,
-    job_rx: &Receiver<LocalAdjustWriteJob>,
-    result_tx: &Sender<LocalAdjustWriteCompletion>,
-    latest: &Mutex<HashMap<String, u64>>,
-    done: &AtomicUsize,
-) {
-    let mut db: Option<LocalAdjustDb> = None;
-    // `recv` はキューが空になって初めて `Disconnected` を返す。送信端が落ちても
-    // 在庫は必ず先に返ってくるので、これがそのまま drain-on-shutdown になる。
-    while let Ok(job) = job_rx.recv() {
-        let completion = process_job(db_path, &mut db, latest, job);
-        // **送ってから数える。**逆にすると「busy ではない」のに結果がまだキューに
-        // 入っていない窓ができ、`drain_blocking` が取りこぼす。
-        let _ = result_tx.send(completion);
-        done.fetch_add(1, Ordering::Relaxed);
+/// worker スレッドが**どう抜けても** (正常終了でも panic でも) 後始末をする。
+///
+/// これが無いと、panic した worker のキューに残ったフェンスが誰にも処理されず、
+/// `drain_blocking` が永久に待つ。
+struct WorkerGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.shared.alive.store(false, Ordering::Release);
+        let mut queue = self.shared.lock();
+        queue.stopped = true;
+        // フェンスの Sender をここで落とす = 待ち手が `Disconnected` で起きる。
+        queue.items.clear();
+        queue.documents.clear();
+        drop(queue);
+        self.shared.ready.notify_all();
     }
 }
 
-fn process_job(
+fn run_worker(db_path: &Path, shared: &Shared, result_tx: &Sender<LocalAdjustWriteCompletion>) {
+    let mut db: Option<LocalAdjustDb> = None;
+    loop {
+        let item = {
+            let mut queue = shared.lock();
+            loop {
+                if let Some(item) = queue.items.pop_front() {
+                    break item;
+                }
+                // **キューが空になってから**止まる。`stopped` だけで抜けると
+                // 在庫が捨てられる (drain-on-shutdown)。
+                if queue.stopped {
+                    return;
+                }
+                queue = shared
+                    .ready
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        match item {
+            QueueItem::Fence(ack) => {
+                let _ = ack.send(());
+            }
+            QueueItem::Write(key) => {
+                // 取り出しと文書の取得の間に同じ key が再要求されても、`documents` の
+                // 枠が差し替わるだけなので、ここで取るのは常に最新。
+                let Some(write) = shared.lock().documents.remove(&key) else {
+                    continue;
+                };
+                let completion = process_write(db_path, &mut db, key, write);
+                let _ = result_tx.send(completion);
+            }
+        }
+    }
+}
+
+fn process_write(
     db_path: &Path,
     db: &mut Option<LocalAdjustDb>,
-    latest: &Mutex<HashMap<String, u64>>,
-    job: LocalAdjustWriteJob,
+    key: String,
+    write: QueuedWrite,
 ) -> LocalAdjustWriteCompletion {
-    let superseded = latest
-        .lock()
-        .ok()
-        .and_then(|latest| latest.get(&job.key).copied())
-        .is_some_and(|newest| newest > job.generation);
-    if superseded {
-        crate::perf::event(
-            "local_adjust",
-            "save_superseded",
-            Some(&job.key),
-            job.generation,
-            &[],
-        );
-        return LocalAdjustWriteCompletion::Superseded {
-            key: job.key,
-            generation: job.generation,
-        };
-    }
-
     let t0 = std::time::Instant::now();
-    let outcome = write_layers(db_path, db, &job.key, &job.layers);
+    let outcome = write_layers(db_path, db, &key, &write.layers);
     crate::perf::event(
         "local_adjust",
         "save_done",
-        Some(&job.key),
-        job.generation,
+        Some(&key),
+        write.generation,
         &[
             (
                 "ms",
@@ -261,13 +333,13 @@ fn process_job(
                     EditStoreOutcome::Failed(_) => "failed",
                 }),
             ),
-            ("layers", serde_json::Value::from(job.layers.len())),
+            ("layers", serde_json::Value::from(write.layers.len())),
         ],
     );
-    LocalAdjustWriteCompletion::Settled {
-        key: job.key,
-        generation: job.generation,
-        layers: job.layers,
+    LocalAdjustWriteCompletion {
+        key,
+        generation: write.generation,
+        layers: write.layers,
         outcome,
     }
 }
@@ -279,7 +351,7 @@ fn write_layers(
     layers: &[local_adjust_core::LocalAdjustmentLayer],
 ) -> EditStoreOutcome {
     if slot.is_none() {
-        match LocalAdjustDb::open_at(db_path) {
+        match LocalAdjustDb::open_for_writer(db_path) {
             Ok(db) => *slot = Some(db),
             Err(error) => {
                 crate::logger::log(format!(
@@ -315,31 +387,19 @@ mod tests {
         local_adjust_core::LocalAdjustmentLayers::new(vec![layer(name)])
     }
 
-    /// 結果を 1 件ずつ受け取る。worker は別スレッドなので、テストは
-    /// `shutdown_and_collect` で join してから読む (時間で待たない)。
-    fn run_to_completion(handle: LocalAdjustWriteHandle) -> Vec<LocalAdjustWriteCompletion> {
-        handle.shutdown_and_collect()
-    }
-
     #[test]
     fn a_write_that_the_store_accepts_reports_committed_with_the_document_it_wrote() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path.clone());
         let document = doc("saved");
-        handle.submit("key".to_string(), document.clone());
+        handle.submit("key".to_string(), document.clone()).unwrap();
 
-        let results = run_to_completion(handle);
+        let results = handle.shutdown_and_collect();
 
         assert_eq!(results.len(), 1);
-        let LocalAdjustWriteCompletion::Settled {
-            outcome, layers, ..
-        } = &results[0]
-        else {
-            panic!("expected Settled, got {:?}", results[0]);
-        };
-        assert_eq!(*outcome, EditStoreOutcome::Committed);
-        assert_eq!(layers.as_slice(), document.as_slice());
+        assert_eq!(results[0].outcome, EditStoreOutcome::Committed);
+        assert_eq!(results[0].layers.as_slice(), document.as_slice());
         assert_eq!(
             LocalAdjustDb::open_at(&path)
                 .unwrap()
@@ -362,51 +422,90 @@ mod tests {
         let path = dir.path().join("not-a-file");
         std::fs::create_dir(&path).unwrap();
         let handle = LocalAdjustWriteHandle::spawn(path);
-        handle.submit("key".to_string(), doc("saved"));
+        handle.submit("key".to_string(), doc("saved")).unwrap();
 
-        let results = run_to_completion(handle);
+        let results = handle.shutdown_and_collect();
 
         assert_eq!(results.len(), 1);
-        let LocalAdjustWriteCompletion::Settled { outcome, .. } = &results[0] else {
-            panic!("expected Settled, got {:?}", results[0]);
-        };
-        assert_eq!(*outcome, EditStoreOutcome::Unavailable);
+        assert_eq!(results[0].outcome, EditStoreOutcome::Unavailable);
     }
 
-    /// 同じ key の古い要求は書かずに捨てる。
+    /// 同じ key を積み直すと、**まだ書いていない文書はその場で落ちる**。
     ///
-    /// 要求 1 件が画像原寸のマスクを抱えるので、ドラッグ中に積まれた分をすべて書くと
-    /// キューにメモリが積み上がる。最後の 1 件だけが正本に残ればよい。
+    /// 取り出し時に古い方を捨てる形だと、捨てるまでキューが原寸マスクを抱えたままに
+    /// なる。要求 1 件が 24MP で 96MB なので、ドラッグ中に積み上がる (Codex P1)。
     #[test]
-    fn only_the_newest_request_for_a_key_is_written() {
+    fn resubmitting_a_key_replaces_the_queued_document_instead_of_queueing_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path);
+        for name in ["first", "second", "newest"] {
+            // worker に取られる前に積み直したことにする。取られていたら枠は空くので、
+            // この検査は「取られていない分について 1 件しか残らない」を見る。
+            let mut queue = handle.shared.lock();
+            queue.documents.insert(
+                "key".to_string(),
+                QueuedWrite {
+                    generation: 1,
+                    layers: doc(name),
+                },
+            );
+            if queue.items.is_empty() {
+                queue.items.push_back(QueueItem::Write("key".to_string()));
+            }
+        }
+
+        let queue = handle.shared.lock();
+        assert_eq!(
+            queue.documents.len(),
+            1,
+            "同じ key の未書き込み文書が 1 つを超えて残っている"
+        );
+        assert_eq!(
+            queue.documents["key"].layers.as_slice(),
+            doc("newest").as_slice()
+        );
+        assert_eq!(queue.items.len(), 1, "同じ key を 2 度並べている");
+    }
+
+    /// 上と同じことを公開 API だけで確かめる (worker は止めておく)。
+    #[test]
+    fn submit_does_not_queue_a_second_slot_for_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = LocalAdjustWriteHandle::spawn(dir.path().join("local_adjust.db"));
+        // worker を待たせたまま積むために、いったん条件変数へ入れる。ここでは
+        // `stopped` を使わずに済むよう、worker が起きる前に 3 件積み切る。
+        let mut queued = Vec::new();
+        for name in ["first", "second", "newest"] {
+            queued.push(handle.submit("key".to_string(), doc(name)));
+        }
+
+        assert!(queued.iter().all(|result| result.is_ok()));
+        let queue = handle.shared.lock();
+        assert!(
+            queue.items.len() <= 1,
+            "同じ key を複数枠で並べている: {}",
+            queue.items.len()
+        );
+        assert!(
+            queue.documents.len() <= 1,
+            "同じ key の未書き込み文書が積み上がっている: {}",
+            queue.documents.len()
+        );
+    }
+
+    /// 積み直しても、最後に積んだものが正本に残る。
+    #[test]
+    fn the_newest_document_for_a_key_is_what_lands_in_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path.clone());
-        // worker が 1 件目を取り出す前に 3 件積む。取り出せてしまった場合でも
-        // 「最後の 1 件が正本に残る」ことは変わらない。
         for name in ["first", "second", "newest"] {
-            handle.submit("key".to_string(), doc(name));
+            handle.submit("key".to_string(), doc(name)).unwrap();
         }
 
-        let results = run_to_completion(handle);
+        handle.shutdown_and_collect();
 
-        assert_eq!(results.len(), 3);
-        let newest = results.iter().map(|r| r.generation()).max().unwrap();
-        for result in &results {
-            if result.generation() < newest {
-                continue;
-            }
-            assert!(
-                matches!(
-                    result,
-                    LocalAdjustWriteCompletion::Settled {
-                        outcome: EditStoreOutcome::Committed,
-                        ..
-                    }
-                ),
-                "最新の要求は書かれる: {result:?}"
-            );
-        }
         assert_eq!(
             LocalAdjustDb::open_at(&path)
                 .unwrap()
@@ -417,89 +516,18 @@ mod tests {
         );
     }
 
-    /// 追い越し判定そのもの。
-    ///
-    /// 上のテストは「最新が正本に残る」ことを見るが、worker が速ければ 3 件とも
-    /// 書いてしまっても通る。追い越しを**捨てている**ことはここで直接確かめる。
+    /// key が違えば独立。
     #[test]
-    fn a_request_that_a_newer_one_overtook_is_not_written_at_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("local_adjust.db");
-        let latest = Mutex::new(HashMap::from([("key".to_string(), 7)]));
-        let mut db = None;
-
-        let completion = process_job(
-            &path,
-            &mut db,
-            &latest,
-            LocalAdjustWriteJob {
-                key: "key".to_string(),
-                generation: 6,
-                layers: doc("stale"),
-            },
-        );
-
-        assert_eq!(
-            completion,
-            LocalAdjustWriteCompletion::Superseded {
-                key: "key".to_string(),
-                generation: 6,
-            }
-        );
-        assert!(db.is_none(), "書きに行っていないので接続も開かない");
-        assert!(
-            !path.exists(),
-            "追い越された要求は正本に触れない: {}",
-            path.display()
-        );
-    }
-
-    /// 同じ generation は追い越しではない (自分自身に負けない)。
-    #[test]
-    fn a_request_is_written_when_it_is_the_newest_for_its_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("local_adjust.db");
-        let latest = Mutex::new(HashMap::from([("key".to_string(), 6)]));
-        let mut db = None;
-
-        let completion = process_job(
-            &path,
-            &mut db,
-            &latest,
-            LocalAdjustWriteJob {
-                key: "key".to_string(),
-                generation: 6,
-                layers: doc("newest"),
-            },
-        );
-
-        assert!(matches!(
-            completion,
-            LocalAdjustWriteCompletion::Settled {
-                outcome: EditStoreOutcome::Committed,
-                ..
-            }
-        ));
-    }
-
-    /// key が違えば追い越しではない。
-    #[test]
-    fn requests_for_different_keys_do_not_supersede_each_other() {
+    fn requests_for_different_keys_do_not_replace_each_other() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path.clone());
-        handle.submit("a".to_string(), doc("for a"));
-        handle.submit("b".to_string(), doc("for b"));
+        handle.submit("a".to_string(), doc("for a")).unwrap();
+        handle.submit("b".to_string(), doc("for b")).unwrap();
 
-        let results = run_to_completion(handle);
+        let results = handle.shutdown_and_collect();
 
         assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|r| matches!(r, LocalAdjustWriteCompletion::Settled { .. })),
-            "別 key は追い越さない: {results:?}"
-        );
         let db = LocalAdjustDb::open_at(&path).unwrap();
         assert_eq!(
             db.get_layers("a").unwrap().as_slice(),
@@ -522,19 +550,15 @@ mod tests {
             .unwrap();
 
         let handle = LocalAdjustWriteHandle::spawn(path.clone());
-        handle.submit(
-            "key".to_string(),
-            local_adjust_core::LocalAdjustmentLayers::default(),
-        );
-        let results = run_to_completion(handle);
+        handle
+            .submit(
+                "key".to_string(),
+                local_adjust_core::LocalAdjustmentLayers::default(),
+            )
+            .unwrap();
+        let results = handle.shutdown_and_collect();
 
-        assert!(matches!(
-            results.as_slice(),
-            [LocalAdjustWriteCompletion::Settled {
-                outcome: EditStoreOutcome::Committed,
-                ..
-            }]
-        ));
+        assert_eq!(results[0].outcome, EditStoreOutcome::Committed);
         assert!(
             LocalAdjustDb::open_at(&path)
                 .unwrap()
@@ -543,23 +567,19 @@ mod tests {
         );
     }
 
-    /// 保存が着地するまで待てること。
-    ///
-    /// key の付け替え (製本ページの rename) の直前に使う。付け替えの後に古い key の
-    /// 保存が着地すると、移したはずの行が古い key で書き戻る。
+    /// 終了時に在庫を捨てない。
     #[test]
-    fn draining_waits_until_every_queued_write_has_landed() {
+    fn shutdown_drains_the_queue_before_stopping() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("local_adjust.db");
         let handle = LocalAdjustWriteHandle::spawn(path.clone());
         for i in 0..32 {
-            handle.submit(format!("key{i}"), doc("saved"));
+            handle.submit(format!("key{i}"), doc("saved")).unwrap();
         }
 
-        let collected = handle.drain_blocking();
+        let results = handle.shutdown_and_collect();
 
-        assert_eq!(collected.len(), 32, "着地する前に待つのをやめている");
-        assert!(!handle.is_busy());
+        assert_eq!(results.len(), 32, "積んだ分はすべて処理される");
         let db = LocalAdjustDb::open_at(&path).unwrap();
         for i in 0..32 {
             assert!(
@@ -567,6 +587,44 @@ mod tests {
                 "key{i} が書かれていない"
             );
         }
+    }
+
+    /// 保存が着地するまで待てること。
+    ///
+    /// key の付け替え (製本ページの rename、リネーム移行) の直前に使う。付け替えの後に
+    /// 古い key の保存が着地すると、移したはずの行が古い key で書き戻る。
+    #[test]
+    fn draining_waits_until_every_queued_write_has_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path.clone());
+        for i in 0..32 {
+            handle.submit(format!("key{i}"), doc("saved")).unwrap();
+        }
+
+        let collected = handle.drain_blocking();
+
+        assert_eq!(collected.len(), 32, "着地する前に待つのをやめている");
+        let db = LocalAdjustDb::open_at(&path).unwrap();
+        for i in 0..32 {
+            assert!(
+                db.get_layers(&format!("key{i}")).is_some(),
+                "key{i} が書かれていない"
+            );
+        }
+    }
+
+    /// 何度でも待てる (フェンスが 1 回きりの仕掛けになっていない)。
+    #[test]
+    fn draining_twice_still_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path);
+        handle.submit("a".to_string(), doc("a")).unwrap();
+        assert_eq!(handle.drain_blocking().len(), 1);
+        handle.submit("b".to_string(), doc("b")).unwrap();
+        assert_eq!(handle.drain_blocking().len(), 1);
+        assert!(handle.drain_blocking().is_empty());
     }
 
     /// 積んでいなければ待たない。
@@ -577,28 +635,58 @@ mod tests {
         assert!(handle.drain_blocking().is_empty());
     }
 
-    /// 終了時に在庫を捨てない。
+    /// worker が居なくなったら、保存は**その場で失敗として返る**。
     ///
-    /// `shutdown` を見た瞬間に抜ける実装だと、直前の編集が「メモリにはあるが正本には
-    /// 無い」まま終わる。
+    /// 黙って積むと、画面には編集が残ったまま正本には何も書かれない状態が続く。
     #[test]
-    fn shutdown_drains_the_queue_before_stopping() {
+    fn submitting_to_a_dead_worker_fails_immediately() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("local_adjust.db");
-        let handle = LocalAdjustWriteHandle::spawn(path.clone());
-        for i in 0..32 {
-            handle.submit(format!("key{i}"), doc("saved"));
-        }
+        let handle = LocalAdjustWriteHandle::spawn(dir.path().join("local_adjust.db"));
+        // worker が抜けた状態を作る (panic でも正常終了でも同じ印が立つ)。
+        handle.shared.alive.store(false, Ordering::Release);
 
-        let results = run_to_completion(handle);
+        let result = handle.submit("key".to_string(), doc("lost"));
 
-        assert_eq!(results.len(), 32, "積んだ分はすべて処理される");
-        let db = LocalAdjustDb::open_at(&path).unwrap();
-        for i in 0..32 {
-            assert!(
-                db.get_layers(&format!("key{i}")).is_some(),
-                "key{i} が書かれていない"
-            );
-        }
+        assert!(
+            matches!(result, Err(EditStoreOutcome::Failed(_))),
+            "止まった worker へ積んで成功を返している"
+        );
+    }
+
+    /// worker が居なくなったら、待ち合わせは**止まらずに戻る**。
+    ///
+    /// 残件カウンタで待つ形だと、ここが永久ハングになる (Codex P1)。
+    #[test]
+    fn draining_after_the_worker_is_gone_returns_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = LocalAdjustWriteHandle::spawn(dir.path().join("local_adjust.db"));
+        // worker の drop guard が通った状態 = フェンスを誰も処理しない。
+        handle.shared.lock().stopped = true;
+        handle.shared.alive.store(false, Ordering::Release);
+
+        assert!(handle.drain_blocking().is_empty());
+    }
+
+    /// panic した worker でも待ち手は起きる。
+    #[test]
+    fn the_worker_guard_releases_waiters_even_when_the_thread_dies() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = LocalAdjustWriteHandle::spawn(dir.path().join("local_adjust.db"));
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        handle
+            .shared
+            .lock()
+            .items
+            .push_back(QueueItem::Fence(ack_tx));
+
+        // worker が抜けたときと同じ後始末を走らせる。
+        drop(WorkerGuard {
+            shared: Arc::clone(&handle.shared),
+        });
+
+        assert!(
+            ack_rx.recv().is_err(),
+            "フェンスが落とされていない (待ち手が永久に待つ)"
+        );
     }
 }
