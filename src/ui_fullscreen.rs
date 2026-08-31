@@ -27577,7 +27577,9 @@ impl App {
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                // 連結読みは 1 ページずつ積むので、左右の間隔合わせは要らない。
+                // TODO(§1.154): 連結読みも見開きモードでは 1 unit に左右 2 ページを並べる
+                // (`build_spread_display_units_for_nav` -> `continuous_reading_page_rects`)。
+                // ここを 0 にしているので元の 2px 問題がそのまま残っている。
                 egui::Vec2::ZERO,
             ) {
                 self.trace_fs_continuous_page_draw(

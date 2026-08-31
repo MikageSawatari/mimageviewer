@@ -1,0 +1,74 @@
+## 判定
+
+**現行 `2db0aa75` は最終承認できません。** 通常の paged 見開きについて「見える gap を設定値にする」処理自体は機能していますが、重大な問題が2件、中程度が1件残っています。
+
+### 1. 重大: トリム時の移動量が §1.0e のサンプリング位相を壊します
+
+`align_spread_pages_for_gap` と `translated_by` は「物理ピクセル整数倍の移動」を契約にしていますが、実装は整数境界から現在の `paint_rect` 辺を引いています。トリム境界は任意の f32 比率なので、移動量は一般に端数物理 px です。
+
+- 契約: [src/ui_fullscreen.rs:4232](C:/home/mimageviewer/src/ui_fullscreen.rs:4232)、[src/displayed_image_transform.rs:267](C:/home/mimageviewer/src/displayed_image_transform.rs:267)
+- 実装: [src/ui_fullscreen.rs:4273](C:/home/mimageviewer/src/ui_fullscreen.rs:4273)
+- `paint_rect` の生成: [src/displayed_image_transform.rs:224](C:/home/mimageviewer/src/displayed_image_transform.rs:224)
+
+現テストの 4161×6053、`bbox.max.x=0.98`、ppp=1 の例でも、寄せ済みの full rect 原点が約 `253.0 → 252.82px` へ移動します。縮小時は full-image の整数サイズ Lanczos 出力を作り、移動後の full rect へ Linear sampler で貼るため、§1.0e が避けた二度目の線形補間が復活します。
+
+- 縮小時の原点・サイズ snap: [src/displayed_image_transform.rs:213](C:/home/mimageviewer/src/displayed_image_transform.rs:213)、[src/displayed_image_transform.rs:877](C:/home/mimageviewer/src/displayed_image_transform.rs:877)
+- full-image Lanczos 出力: [src/gpu_lanczos.rs:1125](C:/home/mimageviewer/src/gpu_lanczos.rs:1125)
+- 最終貼り付け: [src/ui_fullscreen.rs:30249](C:/home/mimageviewer/src/ui_fullscreen.rs:30249)、[src/displayed_image_transform.rs:398](C:/home/mimageviewer/src/displayed_image_transform.rs:398)
+- Linear sampler: [src/gpu_lanczos.rs:536](C:/home/mimageviewer/src/gpu_lanczos.rs:536)
+
+整数倍拡大＋トリムについては、visible-region upscale なら full rect 原点だけで即不正とはいえません。必要なのは「region 出力の物理サイズ・原点」と「region の貼り先」が一致することです。しかし現行は内側辺しか固定せず、region の物理 extent を検証していません。full-texture/direct 経路では端数移動により明確に位相が外れます。
+
+したがって、**「見える内側2辺を整数境界へ置く」だけでは不変条件として不十分**です。gap、出力テクスチャの位相、UV/clip を同じ配置所有者で決める必要があります。`RectSnapMode::None` 条件を戻すのも、テクスチャ差し替え時の瞬間変化を再発させるので解決になりません。
+
+### 2. 重大: 連結読み内の2ページ見開きに元の不具合が残っています
+
+連結読みは見開きモードで2ページ unit を作り、unit 内で左右に並べています。
+
+- 2ページ unit の生成: [src/ui_fullscreen.rs:26562](C:/home/mimageviewer/src/ui_fullscreen.rs:26562)
+- gap を含む横配置: [src/ui_fullscreen.rs:4133](C:/home/mimageviewer/src/ui_fullscreen.rs:4133)
+
+しかし描画時は各ページを独立に最終 snap し、`translate` は常にゼロです。
+
+- 独立描画: [src/ui_fullscreen.rs:27565](C:/home/mimageviewer/src/ui_fullscreen.rs:27565)
+- 独立 snap: [src/ui_fullscreen.rs:30190](C:/home/mimageviewer/src/ui_fullscreen.rs:30190)
+
+1249×2272×2、2560×1440、gap=1、ppp=1 では、最終的に左 `x=488, width=791`、右 `x=1281` となり、同じ2px gapを再現します。
+
+既存テストは snap 前の `continuous_reading_page_rects` しか検査していません。[src/ui_fullscreen.rs:49067](C:/home/mimageviewer/src/ui_fullscreen.rs:49067)
+
+detached continuous frozen もページごとに独立 resolve しており同型です。[src/ui_fullscreen.rs:10736](C:/home/mimageviewer/src/ui_fullscreen.rs:10736)、[src/ui_fullscreen.rs:10764](C:/home/mimageviewer/src/ui_fullscreen.rs:10764)
+
+したがって、backlog の「連結読みは左右に並べない」という記録は誤りです。[docs/next-release-backlog.md:5205](C:/home/mimageviewer/docs/next-release-backlog.md:5205) 正規仕様にも「unit 内は通常見開きと同じ gap」と明記されています。[docs/display-pipeline.md:1511](C:/home/mimageviewer/docs/display-pipeline.md:1511)
+
+### 3. 中: 範囲キャプチャが合わせ済み transform を再 snap しています
+
+ページ選択は移動後の `FullscreenPageLayout` で行いますが、その後 Spread だけ `full_image_rect` から `RectPixelFit::Texels` で transform を再構築します。
+
+- 最終 transform での hit-test: [src/ui_fullscreen.rs:33348](C:/home/mimageviewer/src/ui_fullscreen.rs:33348)
+- 再 resolve: [src/ui_fullscreen.rs:33314](C:/home/mimageviewer/src/ui_fullscreen.rs:33314)、[src/ui_fullscreen.rs:33366](C:/home/mimageviewer/src/ui_fullscreen.rs:33366)
+
+上記の実寸 fixture では、描画側 `x≈252.82` がキャプチャ側で `x=253` に戻り、同じ画面位置が約0.72 source pxずれます。source/texture aspect が同じでも再現するため、letterbox 補正では正当化できません。
+
+移動後の `page.transform` をそのまま使い、必要なら `source_size` だけ置換するのが現在の ownership と整合します。既存テストは整数原点しか扱わないため検出しません。[src/ui_fullscreen.rs:47944](C:/home/mimageviewer/src/ui_fullscreen.rs:47944)
+
+## その他の確認結果
+
+- `translated_by` の `hit_rect` 再構築は正しいです。構築時と同じ式を移動後の `paint_rect`／中心へ適用しています。[src/displayed_image_transform.rs:233](C:/home/mimageviewer/src/displayed_image_transform.rs:233)、[src/displayed_image_transform.rs:269](C:/home/mimageviewer/src/displayed_image_transform.rs:269)
+- transform の2回解決は性能上問題ありません。重い GPU リサンプルは描画側で1回だけです。[src/ui_fullscreen.rs:29889](C:/home/mimageviewer/src/ui_fullscreen.rs:29889)、[src/ui_fullscreen.rs:30254](C:/home/mimageviewer/src/ui_fullscreen.rs:30254) 永続キャッシュは不要です。最適化するなら同一フレームの prepass 結果を描画へ渡す形が安全です。
+- 通常 paged、active detached、2ページ holdover は共通 `draw_fs_spread` を通っており、追加の独立経路は見つかりませんでした。寸法未確定 fallback の移動量ゼロも妥当です。
+- a851515c の paged frozen 見送り判断は妥当です。transform と clip が別所有なので、同じ helper を当てるだけでは直りません。[src/ui_fullscreen.rs:10975](C:/home/mimageviewer/src/ui_fullscreen.rs:10975)、[src/ui_fullscreen.rs:11050](C:/home/mimageviewer/src/ui_fullscreen.rs:11050)
+- ただし記録中のテスト説明は不正確です。[docs/next-release-backlog.md:5299](C:/home/mimageviewer/docs/next-release-backlog.md:5299) の trim テストは「左右が厳密な `[0,.5]`／`[.5,1]`」ではなく、full rect の重なりと clip の非重なりを要求しています。[src/app/tests.rs:48516](C:/home/mimageviewer/src/app/tests.rs:48516) 見送り結論自体には影響しません。
+
+## テストで追加すべきもの
+
+現在の3テストは helper を直接呼び、production wiring、rotation、Original、非ゼロ viewport 原点を通していません。[src/ui_fullscreen.rs:36487](C:/home/mimageviewer/src/ui_fullscreen.rs:36487)、[src/ui_fullscreen.rs:36603](C:/home/mimageviewer/src/ui_fullscreen.rs:36603)、[src/ui_fullscreen.rs:36705](C:/home/mimageviewer/src/ui_fullscreen.rs:36705)
+
+優先順は次です。
+
+1. trim × downscale/direct/visible-upscale で、gapだけでなく出力テクセルと貼り先の原点・extentを検証
+2. 連結読み2ページ unit の最終 transform、live＋frozen
+3. production の spread → `FullscreenPageLayout` → 範囲キャプチャ座標
+4. 左右別 texture factor、片側だけの trim、rotation、Original/no-upscale、非ゼロ viewport 原点
+
+過去3回の外れ方は記録どおりです。今回残った「4つ目の次元」は、幅・DPI・テクスチャ解像度ではなく、**リサンプラ分岐と所有経路**です。すなわち full-image／visible-region、paged／continuous／frozen、paint／capture の交差がまだ不変条件に含まれていません。
