@@ -5209,11 +5209,22 @@ survey §8 に列挙。特に **変換アーカイブ内ページの identity �
   **合わせを外す変異で落ちる**ことを確認 (gap 0 が 1px になる)。原点が物理ピクセル境界に
   乗ったままであること (= §1.0e を戻していないこと) も同じテストで見る。
 
-**残り: `detached_spread_frozen_pages_for_snapshot` が同じ二段丸めを持つ。** 左右の transform を
-独立に解決して `paint_geometry()` を焼いているので、同じ形で 1px ずれる。修正内容は通常見開きと
-同一だが、detached 経路なので CLAUDE.md の凍結ルール (ClaudeCode と Codex の双方が
-「症状パッチではなく構造的修正である」ことに合意 + [detached-rework-plan](detached-rework-plan.md)
-への記録) を通してから入れる。
+**残り: `detached_spread_frozen_pages_for_snapshot` が同じ二段丸めを持つ。** ただし
+**同じ helper をそのまま当てるのは誤り**だった (2026-08-31、Codex が不同意。凍結ルールの
+合意手続きで判明)。
+
+frozen 経路は transform を `content_bbox: None` で組み、可視範囲を別途 `left_clip_rect` /
+`right_clip_rect` として持つ。つまりこの経路の `paint_rect` は**見える端ではなくフルページ矩形**で、
+`align_spread_pages_for_gap` が測る所が通常見開きと違う。しかも移動するのは transform だけで
+clip は旧 `rects` 由来のまま残るので、最終的な可視間隔を helper と旧 layout の 2 者が決めることに
+なる — 直そうとした二段構造がそのまま残る。
+
+既存テスト `detached_spread_snapshot_preserves_trim_uv_and_background`
+([app/tests.rs](../src/app/tests.rs)) が、トリム時に左右のフル矩形が `[0,0.5]` / `[0.5,1]` と
+接することを要求しており、gap 0 でフル矩形同士を合わせる今回の当て方と正面から矛盾する。
+
+**正しい直し方は、clip / UV の導出を配置と同じ所有者へ寄せること**で、この関数の契約変更になる。
+通常見開きの修正とは別項目として起こす。凍結ルールの合意は**得られていない** (= 未実施)。
   原寸用の既存 `spread_layout_quantizes_odd_gap_and_snaps_page_origins` は今回の縮小回帰を
   検出できないため、置き換えず縮小ケースを追加する。
 
