@@ -65043,7 +65043,7 @@ mod sns_split_p2_transition_tests {
         app.settings.sns_split_target = Some("instagram".to_owned());
         app.settings.sns_split_count = 4;
 
-        assert!(app.enter_sns_split_mode(idx));
+        assert!(app.enter_sns_split_mode(idx).is_ok());
 
         let layout = app
             .sns_split
@@ -65076,7 +65076,7 @@ mod sns_split_p2_transition_tests {
         app.fullscreen_idx = Some(0);
         app.spread_mode = crate::settings::SpreadMode::Single;
 
-        assert!(app.enter_sns_split_mode(0));
+        assert!(app.enter_sns_split_mode(0).is_ok());
         assert_eq!(
             app.sns_split,
             Some(crate::sns_split::SnsSplitLayout::centered_max(
@@ -65084,6 +65084,122 @@ mod sns_split_p2_transition_tests {
                 2,
                 source_dims,
             ))
+        );
+    }
+
+    #[test]
+    fn sns_split_entry_rejects_every_saved_rotation_and_free_rotation() {
+        use crate::rotation_db::Rotation;
+        use crate::ui_sns_split::SnsSplitEntryError;
+
+        for rotation in [Rotation::Cw90, Rotation::Cw180, Rotation::Cw270] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let idx = install_loaded_page(&mut app, &ctx, SNS_TEST_IMAGE_SIZE);
+            app.fullscreen_idx = Some(idx);
+            app.spread_mode = crate::settings::SpreadMode::Single;
+            app.rotation_cache.insert(idx, rotation);
+
+            assert_eq!(
+                app.enter_sns_split_mode(idx),
+                Err(SnsSplitEntryError::Rotated),
+                "saved rotation {rotation:?} must block entry"
+            );
+            assert_sns_split_transient_state_cleared(&app);
+            assert_eq!(app.fullscreen_idx, Some(idx));
+        }
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = install_loaded_page(&mut app, &ctx, SNS_TEST_IMAGE_SIZE);
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.rotation_cache.insert(idx, Rotation::None);
+        app.fs_free_rotation = -0.25;
+
+        assert_eq!(
+            app.enter_sns_split_mode(idx),
+            Err(SnsSplitEntryError::Rotated)
+        );
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.fullscreen_idx, Some(idx));
+    }
+
+    #[test]
+    fn sns_split_key_entry_shows_rotation_reason_and_does_not_enter() {
+        use crate::rotation_db::Rotation;
+        use crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = install_loaded_page(&mut app, &ctx, SNS_TEST_IMAGE_SIZE);
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.rotation_cache.insert(idx, Rotation::Cw90);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSnsSplitMode = F13\n");
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::F13,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.keyboard_owner_for_pass(&ctx);
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = ctx.end_pass();
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+        );
+    }
+
+    #[test]
+    fn saved_rotation_change_exits_active_sns_split_and_restores_spread() {
+        use crate::rotation_db::Rotation;
+        use crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON;
+
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+        app.rotation_cache.insert(1, Rotation::None);
+
+        app.rotate_image_cw(1);
+
+        assert_eq!(app.rotation_cache.get(&1), Some(&Rotation::Cw90));
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+        );
+    }
+
+    #[test]
+    fn free_rotation_change_is_reconciled_by_active_sns_split_handler() {
+        use crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON;
+
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+        app.rotation_cache
+            .insert(1, crate::rotation_db::Rotation::None);
+        app.fs_free_rotation = 0.25;
+
+        let _ = app.handle_sns_split_keys(&egui::Context::default(), 1);
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
         );
     }
 

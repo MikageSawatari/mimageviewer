@@ -7,6 +7,41 @@ use crate::sns_split::{MAX_COUNT, MIN_COUNT, SnsSplitLayout, SnsTarget};
 const PANEL_W: f32 = 240.0;
 const PANEL_MARGIN: f32 = 14.0;
 const PANEL_TOP: f32 = 72.0;
+const PREVIEW_H: f32 = 84.0;
+
+pub(crate) const SNS_SPLIT_ROTATION_DISABLED_REASON: &str =
+    "回転しているページでは使えません。回転をリセットしてから実行してください";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnsSplitEntryError {
+    Rotated,
+    ImageLoading,
+}
+
+impl SnsSplitEntryError {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Rotated => SNS_SPLIT_ROTATION_DISABLED_REASON,
+            Self::ImageLoading => "[SNS 分割] 画像読み込み待ち",
+        }
+    }
+}
+
+pub(crate) fn sns_split_rotation_disabled_reason(
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+) -> Option<&'static str> {
+    (!rotation.is_none() || free_rotation_rad != 0.0).then_some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+}
+
+pub(crate) fn sns_split_disabled_reason(
+    edit_tool_disabled_reason: Option<&'static str>,
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+) -> Option<&'static str> {
+    edit_tool_disabled_reason
+        .or_else(|| sns_split_rotation_disabled_reason(rotation, free_rotation_rad))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SnsSplitPanelSummary {
@@ -25,6 +60,116 @@ impl SnsSplitPanelSummary {
             warning: (!layout.fits(image_size)).then_some(
                 "画像が小さすぎるため、選択した枚数を配置できません。書き出しには進めません。",
             ),
+        }
+    }
+}
+
+fn sns_split_preview_rects(
+    bounds: egui::Rect,
+    frames: &[CropRect],
+    seam_ratio: f32,
+) -> Vec<egui::Rect> {
+    let Some(frame) = frames.first().copied() else {
+        return Vec::new();
+    };
+    let count = frames.len() as f32;
+    let frame_aspect = {
+        let aspect = frame.width() / frame.height();
+        if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        }
+    };
+    let seam_ratio = if seam_ratio.is_finite() {
+        seam_ratio.max(0.0)
+    } else {
+        0.0
+    };
+    let divisor = count + (count - 1.0) * seam_ratio;
+    let frame_width =
+        (bounds.width().max(0.0) / divisor).min(bounds.height().max(0.0) * frame_aspect);
+    let frame_height = frame_width / frame_aspect;
+    let step = frame_width * (1.0 + seam_ratio);
+    let total_width = frame_width + step * (count - 1.0);
+    let origin = egui::pos2(
+        bounds.center().x - total_width * 0.5,
+        bounds.center().y - frame_height * 0.5,
+    );
+
+    (0..frames.len())
+        .map(|index| {
+            egui::Rect::from_min_size(
+                origin + egui::vec2(step * index as f32, 0.0),
+                egui::vec2(frame_width, frame_height),
+            )
+        })
+        .collect()
+}
+
+fn sns_split_frame_uvs(frames: &[CropRect], image_size: [usize; 2]) -> Vec<egui::Rect> {
+    let width = image_size[0].max(1) as f32;
+    let height = image_size[1].max(1) as f32;
+    let normalized = |value: f32, extent: f32| {
+        if value.is_finite() {
+            (value / extent).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+
+    frames
+        .iter()
+        .map(|frame| {
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    normalized(frame.min_x, width),
+                    normalized(frame.min_y, height),
+                ),
+                egui::pos2(
+                    normalized(frame.max_x, width),
+                    normalized(frame.max_y, height),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn draw_sns_split_preview(
+    ui: &mut egui::Ui,
+    layout: SnsSplitLayout,
+    image_size: [usize; 2],
+    texture: Option<&egui::TextureHandle>,
+) {
+    let frames = layout.frames();
+    let (bounds, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(1.0), PREVIEW_H),
+        egui::Sense::hover(),
+    );
+    let paint_rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+    let uv_rects = sns_split_frame_uvs(&frames, image_size);
+    let painter = ui.painter_at(bounds);
+    painter.rect_filled(
+        bounds,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+    );
+
+    for (paint_rect, uv_rect) in paint_rects.into_iter().zip(uv_rects) {
+        if let Some(texture) = texture {
+            painter.image(texture.id(), paint_rect, uv_rect, egui::Color32::WHITE);
+        } else {
+            painter.rect_filled(
+                paint_rect,
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(100, 110, 120, 90),
+            );
+            painter.rect_stroke(
+                paint_rect,
+                1.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(135)),
+                egui::StrokeKind::Inside,
+            );
         }
     }
 }
@@ -192,13 +337,25 @@ impl App {
         egui::Rect::from_min_size(pos, egui::vec2(PANEL_W, height))
     }
 
-    pub(crate) fn enter_sns_split_mode(&mut self, fs_idx: usize) -> bool {
+    fn sns_split_rotation_error(&mut self, fs_idx: usize) -> Option<SnsSplitEntryError> {
+        let rotation = self.get_rotation(fs_idx);
+        sns_split_rotation_disabled_reason(rotation, self.fs_free_rotation)
+            .map(|_| SnsSplitEntryError::Rotated)
+    }
+
+    pub(crate) fn enter_sns_split_mode(&mut self, fs_idx: usize) -> Result<(), SnsSplitEntryError> {
         if self.sns_split.is_some() {
-            return true;
+            if let Some(error) = self.sns_split_rotation_error(fs_idx) {
+                return Err(error);
+            }
+            return Ok(());
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if let Some(error) = self.sns_split_rotation_error(target_idx) {
+            return Err(error);
+        }
         let Some(source_size) = self.fs_page_coordinate_source_size(target_idx) else {
-            return false;
+            return Err(SnsSplitEntryError::ImageLoading);
         };
         let image_size = [
             source_size.x.round().max(1.0) as usize,
@@ -219,7 +376,7 @@ impl App {
         }
         self.sns_split = Some(layout);
         self.sns_split_drag = None;
-        true
+        Ok(())
     }
 
     pub(crate) fn reset_sns_split_mode(&mut self) {
@@ -243,6 +400,11 @@ impl App {
             mouse_nav: None,
             jump_to: None,
         };
+        if let Some(error) = self.sns_split_rotation_error(fs_idx) {
+            self.reset_sns_split_mode();
+            self.show_feedback_toast(error.message().to_string());
+            return action;
+        }
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return action;
@@ -261,6 +423,11 @@ impl App {
         let Some(layout) = self.sns_split else {
             return false;
         };
+        if let Some(error) = self.sns_split_rotation_error(fs_idx) {
+            self.reset_sns_split_mode();
+            self.show_feedback_toast(error.message().to_string());
+            return false;
+        }
         let Some(source_size) = self.fs_page_coordinate_source_size(fs_idx) else {
             // キー入力に対して何も起きないと、利用者は原因を知る手段が無い。
             // open_export_dialog 側の失敗経路と同じく理由を出す。
@@ -288,6 +455,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         image_size: Option<[usize; 2]>,
+        preview_texture: Option<&egui::TextureHandle>,
     ) {
         if self.sns_split.is_none() {
             return;
@@ -351,11 +519,43 @@ impl App {
                         });
                         ui.separator();
 
-                        let Some(image_size) = image_size else {
-                            ui.add_enabled(false, egui::Button::new("画像読み込み待ち"));
-                            return;
-                        };
-                        self.draw_sns_split_controls(ui, image_size);
+                        // 短い viewport ではプレビュー追加後の本文が収まらないため、
+                        // ヘッダーを残して本文だけをスクロールさせる。
+                        let body_height =
+                            (panel_rect.bottom() - ui.cursor().top() - 12.0).max(100.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(PANEL_W, body_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.set_min_width(PANEL_W);
+                                ui.set_max_width(PANEL_W);
+                                ui.set_min_height(body_height);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("sns_split_panel_body")
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        let Some(image_size) = image_size else {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new("画像読み込み待ち"),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.label("投稿後の見え方");
+                                            ui.add_space(3.0);
+                                            if let Some(layout) = self.sns_split {
+                                                draw_sns_split_preview(ui, layout, [1, 1], None);
+                                            }
+                                            return;
+                                        };
+                                        self.draw_sns_split_controls(
+                                            ui,
+                                            image_size,
+                                            preview_texture,
+                                        );
+                                    });
+                            },
+                        );
                     });
             });
 
@@ -364,7 +564,12 @@ impl App {
         }
     }
 
-    fn draw_sns_split_controls(&mut self, ui: &mut egui::Ui, image_size: [usize; 2]) {
+    fn draw_sns_split_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_size: [usize; 2],
+        preview_texture: Option<&egui::TextureHandle>,
+    ) {
         let Some(mut layout) = self.sns_split else {
             return;
         };
@@ -401,6 +606,11 @@ impl App {
             self.settings.save();
             self.sns_split = Some(layout);
         }
+
+        ui.add_space(8.0);
+        ui.label("投稿後の見え方");
+        ui.add_space(3.0);
+        draw_sns_split_preview(ui, layout, image_size, preview_texture);
 
         ui.add_space(8.0);
         let summary = SnsSplitPanelSummary::from_layout(layout, image_size);
@@ -575,6 +785,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotation_disabled_reason_covers_every_saved_and_free_rotation() {
+        use crate::rotation_db::Rotation;
+
+        assert_eq!(
+            sns_split_rotation_disabled_reason(Rotation::None, 0.0),
+            None
+        );
+        for rotation in [Rotation::Cw90, Rotation::Cw180, Rotation::Cw270] {
+            assert_eq!(
+                sns_split_rotation_disabled_reason(rotation, 0.0),
+                Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+            );
+        }
+        for free_rotation_rad in [0.25, -0.25, f32::MIN_POSITIVE] {
+            assert_eq!(
+                sns_split_rotation_disabled_reason(Rotation::None, free_rotation_rad),
+                Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+            );
+        }
+    }
+
+    #[test]
+    fn sns_split_disabled_reason_preserves_existing_edit_tool_priority() {
+        use crate::rotation_db::Rotation;
+
+        assert_eq!(
+            sns_split_disabled_reason(Some("detached"), Rotation::Cw90, 0.0),
+            Some("detached")
+        );
+        assert_eq!(
+            sns_split_disabled_reason(None, Rotation::Cw180, 0.0),
+            Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+        );
+    }
+
+    #[test]
+    fn preview_rects_match_count_size_seam_and_bounds() {
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, [2400, 1800]);
+        let frames = layout.frames();
+        let bounds =
+            egui::Rect::from_min_size(egui::pos2(11.0, 17.0), egui::vec2(216.0, PREVIEW_H));
+        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+
+        assert_eq!(rects.len(), frames.len());
+        for rect in &rects[1..] {
+            assert!((rect.width() - rects[0].width()).abs() < 0.001);
+            assert!((rect.height() - rects[0].height()).abs() < 0.001);
+        }
+        for pair in rects.windows(2) {
+            let gap = pair[1].left() - pair[0].right();
+            assert!((gap / pair[0].width() - SnsTarget::X.seam_ratio()).abs() < 0.0001);
+        }
+        assert!(rects[0].left() >= bounds.left() - 0.001);
+        assert!(rects.last().unwrap().right() <= bounds.right() + 0.001);
+        assert!(rects[0].top() >= bounds.top() - 0.001);
+        assert!(rects[0].bottom() <= bounds.bottom() + 0.001);
+    }
+
+    #[test]
+    fn instagram_preview_rects_have_zero_gap() {
+        let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, [2400, 1800]);
+        let frames = layout.frames();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(216.0, PREVIEW_H));
+        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+
+        assert_eq!(rects.len(), 3);
+        for pair in rects.windows(2) {
+            assert!((pair[1].left() - pair[0].right()).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn preview_uvs_convert_source_frames_to_unit_rects() {
+        let frames = [
+            CropRect {
+                min_x: 100.0,
+                min_y: 50.0,
+                max_x: 400.0,
+                max_y: 450.0,
+            },
+            CropRect {
+                min_x: 400.0,
+                min_y: -10.0,
+                max_x: 1100.0,
+                max_y: 510.0,
+            },
+        ];
+
+        let uvs = sns_split_frame_uvs(&frames, [1000, 500]);
+
+        assert_eq!(
+            uvs[0],
+            egui::Rect::from_min_max(egui::pos2(0.1, 0.1), egui::pos2(0.4, 0.9))
+        );
+        assert_eq!(
+            uvs[1],
+            egui::Rect::from_min_max(egui::pos2(0.4, 0.0), egui::pos2(1.0, 1.0))
+        );
+    }
+
+    #[test]
     fn target_and_count_controls_follow_geometry_contract() {
         let image_size = [8000, 6000];
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 2, image_size)
@@ -659,6 +970,27 @@ mod tests {
     }
 
     #[test]
+    fn export_preflight_exits_mode_if_rotation_changed_after_entry() {
+        let image_size = [80, 120];
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 3, image_size);
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.sns_split = Some(layout);
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::Cw180);
+
+        let opened = app.execute_sns_split_export(&egui::Context::default(), 0);
+
+        assert!(!opened);
+        assert!(app.sns_split.is_none());
+        assert!(app.export_dialog.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(SNS_SPLIT_ROTATION_DISABLED_REASON)
+        );
+    }
+
+    #[test]
     fn execute_shortcut_opens_numbered_single_page_export_from_spread() {
         let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
@@ -705,7 +1037,7 @@ mod tests {
         let original_selection = [false, true, false, true, false];
         app.settings.export_batch_selection = original_selection;
 
-        assert!(app.enter_sns_split_mode(0));
+        assert!(app.enter_sns_split_mode(0).is_ok());
         let expected_frames = app.sns_split.expect("SNS 分割が開始していない").frames();
         assert_eq!(expected_frames.len(), 3);
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);

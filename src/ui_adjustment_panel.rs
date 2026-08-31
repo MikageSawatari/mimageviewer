@@ -13948,6 +13948,18 @@ impl App {
                 continuous_reading,
             );
             let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
+            let sns_split_rotation = if can_overlay_edit {
+                let (sns_split_target_idx, _) = self.plan_page_edit_pivot(fs_root_idx);
+                self.get_rotation(sns_split_target_idx)
+            } else {
+                crate::rotation_db::Rotation::None
+            };
+            let sns_split_disabled_reason = crate::ui_sns_split::sns_split_disabled_reason(
+                edit_tool_disabled_reason,
+                sns_split_rotation,
+                self.fs_free_rotation,
+            );
+            let can_start_sns_split = can_overlay_edit && sns_split_disabled_reason.is_none();
             let export_disabled_reason = image_export_disabled_reason(continuous_reading);
             let can_export = can_overlay_edit && export_disabled_reason.is_none();
             // 右側 7 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り /
@@ -14089,13 +14101,13 @@ impl App {
                 &mut child,
                 sns_split_rect,
                 "adjust_panel_sns_split_btn",
-                can_start_edit_tool,
+                can_start_sns_split,
                 false,
                 "SNS 分割",
-                edit_tool_disabled_reason,
+                sns_split_disabled_reason,
                 crate::ui_fullscreen::draw_icons::draw_sns_split_icon,
             );
-            if can_start_edit_tool && sns_split_resp.clicked() {
+            if can_start_sns_split && sns_split_resp.clicked() {
                 activate_sns_split = true;
             }
             // クリック処理は描画後にディスパッチ (借用衝突回避)。
@@ -14148,15 +14160,17 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_sns_split {
-                if self.enter_sns_split_mode(fs_root_idx) {
-                    crate::ime_focus::record_side_panel_close(
-                        child.ctx(),
-                        "ui_adjustment_panel::draw_adjustment_panel:enter_sns_split",
-                    );
-                    self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-                    return;
+                match self.enter_sns_split_mode(fs_root_idx) {
+                    Ok(()) => {
+                        crate::ime_focus::record_side_panel_close(
+                            child.ctx(),
+                            "ui_adjustment_panel::draw_adjustment_panel:enter_sns_split",
+                        );
+                        self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                        return;
+                    }
+                    Err(error) => self.show_feedback_toast(error.message().to_string()),
                 }
-                self.show_feedback_toast("[SNS 分割] 画像読み込み待ち".to_string());
             }
             if activate_export {
                 crate::ime_focus::record_side_panel_close(

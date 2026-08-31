@@ -15706,9 +15706,21 @@ impl App {
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                         {
-                            let image_size =
-                                state.image_dims.map(|(w, h)| [w as usize, h as usize]);
-                            self.draw_sns_split_panel(ctx, full_rect, image_size);
+                            let image_size = source_size.map(|size| {
+                                [
+                                    size.x.round().max(1.0) as usize,
+                                    size.y.round().max(1.0) as usize,
+                                ]
+                            });
+                            // このフレームで実際に描いた display unit の source texture を
+                            // 借りるだけにする。プレビュー専用の decode / upload は行わない。
+                            let preview_texture = single_transform
+                                .as_ref()
+                                .filter(|transform| transform.page_idx == fs_idx)
+                                .and_then(|_| {
+                                    navigator_texture_sources.texture_for_page(fs_idx, None)
+                                });
+                            self.draw_sns_split_panel(ctx, full_rect, image_size, preview_texture);
                         } else if self.export_crop_mode
                             && !compare_wipe_active
                             && !panorama_mode_active_now
@@ -21146,8 +21158,8 @@ impl App {
                 FsContinuousReadingUnavailableFeature::SnsSplit,
             ) && self.fullscreen_edit_mode_entry_allowed(fs_idx)
             {
-                if !self.enter_sns_split_mode(fs_idx) {
-                    self.show_feedback_toast("[SNS 分割] 画像読み込み待ち".to_string());
+                if let Err(error) = self.enter_sns_split_mode(fs_idx) {
+                    self.show_feedback_toast(error.message().to_string());
                 }
             }
         }

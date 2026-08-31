@@ -47670,6 +47670,8 @@ impl App {
         let Some(key) = self.rotation_key_for_idx(idx) else {
             return;
         };
+        let exit_sns_split =
+            self.sns_split.is_some() && self.fullscreen_idx == Some(idx) && !rot.is_none();
         self.rotation_cache.insert(idx, rot);
         if let Some(ref db) = self.rotation_db {
             let _ = db.set_key(&key, rot);
@@ -47682,6 +47684,12 @@ impl App {
             idx,
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
+        if exit_sns_split {
+            self.reset_sns_split_mode();
+            self.show_feedback_toast(
+                crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON.to_string(),
+            );
+        }
     }
 
     // ── レーティング ───────────────────────────────────────────────
