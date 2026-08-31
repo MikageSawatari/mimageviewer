@@ -116,50 +116,61 @@ Codex は **意味的な別名化・スナップショット順序の欠陥は�
   ときに 1 度作り、変更を publish する。これは**段 (b) が作ろうとしている
   「保留中の編集の単一 state owner」と同じもの**なので、段 (b) に畳む。
 
-## 次の次 — 段 (d-2) 保存の worker 化 (R-26 を開け直さない)
+## 済み — 段 (d-2) 保存の worker 化 (R-26 を開け直さない)
 
-**調査済みの前提**:
+| コミット | 内容 |
+| --- | --- |
+| `976aef4a` | 保存を [src/local_adjust_write_worker.rs](../../src/local_adjust_write_worker.rs) へ出し、`EditStoreOutcome` の境界を完了側へ移した |
 
-- **雛形がある**: [src/rating_write_worker.rs](../../src/rating_write_worker.rs) が
-  `spawn` / `submit` / `try_recv_result` と、**Drop で「shutdown かつキュー空」まで
-  drain してから join する**構造を持つ。ブリーフが懸念していた「非同期化すると終了時に
-  書き損なう」はこの既存パターンで塞がる。
-- **DB の複数接続は既に作法**: `LocalAdjustDb::open_readonly` を smart folder /
-  subfolder expansion / metadata import が既にワーカー側で使っている。保存ワーカーが
-  自分の書き込み接続を持つのは延長線上。`busy_timeout` は明示的に設定する
-  (既定値の記憶は当てにしない)。
-- **保存経路の入口は狭い**: `set_local_adjust_layers_for_idx` 系の呼び出しは 14 箇所、
-  ほとんどが `_with_undo` 経由 (`ui_adjustment_panel.rs` / `undo_ops.rs`)。
+`cargo test -p mimageviewer --lib` は 6785 passed / 0 failed。新規テスト 19 件
+(worker 10 + 状態遷移 9)。ブリーフ §4 の指示どおり**失敗経路を含む状態遷移テストを
+先に書いてから**実装し、**6 つの変異がそれぞれ意図したテストだけを落とす**ことを確認した。
 
-### R-26 の境界をどう保つか
+### 着手前の見積もりとの差
 
-現状の同期版は、**presence は成否に関わらず立て、サイドカーのミラーだけを成功時に書く**
-(`schedule_current_smart_folder_metadata_refresh` と `record_content_identity_for_idx` も
-失敗時は early return で飛ぶ)。守るべきはここ。
+- **保存はストローク単位ではなく毎フレームだった。** `Slider::changed()` はドラッグ中
+  毎フレーム真なので、マスク系スライダーを動かしている間ずっと 70.6ms の直列化 +
+  SQLite が走っていた。ブリーフの「70.6ms/stroke」は実際にはフレーム単位。
+  → **合体は最適化ではなく必須**になった。要求 1 件が原寸マスクを抱えるので、
+  合体しないとドラッグ中にキューへ 96MB/frame が積み上がる。
+- **終了時の drain に停止フラグは要らなかった。** 送信端を落とすことを停止の合図に
+  すると、`Receiver::recv` はキューが空になって初めて `Disconnected` を返すので、
+  在庫は必ず書き切ってから止まる。`rating_write_worker` の
+  「フラグ + 200ms ポーリング」より待ちもポーリングも無い。
+- **見落としていた順序ハザードが 1 つあった。** 製本ページの key 付け替え
+  (`copy_book_page_edit_key` / `move_book_page_edit_key`) は worker を経由しない。
+  同期保存だった頃は構造的に起きなかった「付け替えの後に古い key の保存が着地して
+  行を書き戻す」順序が、非同期化で成立する。両バッチの先頭で
+  `wait_for_local_adjust_writes` を呼んで塞いだ。
 
-非同期版:
+### R-26 の境界をどこへ移したか
 
-1. UI: key を採り、preview cache を無効化し、presence を立て、**メモリを即更新**し、
-   `(key, sidecar 座標, Arc snapshot, generation)` を worker へ積む。
-2. worker: キーごとに**最新 generation だけ**を処理する (古いものは捨てる。
-   後続 snapshot が上書きするので結果は不要。各要求が原寸マスクを抱えるので、
-   合体しないとメモリが積み上がる)。書けたら `EditStoreOutcome` を返す。
-3. UI の poll: 世代が最新のものだけを見る。`Committed` のときだけ、**そのとき書いた
-   snapshot そのもの**をサイドカーへ写す。失敗なら従来どおりトーストのみでミラーを
-   書かない。
+判断は 1 か所 (`App::apply_local_adjust_write_completion`) に集約した。
 
-この形は現状より**強い**。「書いた内容」と「写した内容」が同一であることが型で保証され、
-`Unavailable` も「起動時に開けなかった」ではなく「**書き手が開けなかった**」の意味になり、
-判定する主体と書く主体が一致する。
+| 結果 | ミラー | トースト | 画面 |
+| --- | --- | --- | --- |
+| `Committed` | **worker が実際に書いた文書**を写す | なし | そのまま |
+| `Unavailable` / `Failed` | **書かない** | 出す | そのまま (やり直せる) |
+| `Superseded` | 書かない | **出さない** | そのまま |
 
-**idx の陳腐化に注意**: 応答が返る頃には一覧の idx がずれ得る。サイドカー座標は
-enqueue 時に固定する (`with_sidecar_coords_mut` が既にこの用途)。idx を使う後続処理
-(`record_content_identity_for_idx`) は、完了時に `page_path_key(idx)` が同じ key を
-返すことを確認してから走らせる。
+- **ミラーする文書は完了が運んでくる。**メモリから取り直すと、積んでから完了までの間に
+  入った編集を「保存済み」として写す (書いた内容とミラーがずれる)。
+- **`Superseded` は成功でも失敗でもない。**トーストを出すと誤報、ミラーを書くと
+  新しい編集を古い内容で上書きする。
+- **サイドカー座標は積む時点で固定する。**完了が返る頃には一覧の idx が別のページを
+  指し得るので、そのとき解決し直すと無関係なページへ書く。idx 依存の後続処理
+  (`record_content_identity_for_idx`) は `page_path_key(idx)` が同じ key を返すときだけ。
 
-**計装**: この経路には現在 perf イベントが 1 つも無い。worker 化と同時に UI 側の
-enqueue と worker 側の所要時間へ `perf::event` を入れる (CLAUDE.md「追加した同期処理の
-区間には perf::event を必ず差し込む」)。ブリーフ §10 の「perf log で確認」はこれが前提。
+同期版より**強い**点: `Unavailable` の意味が「起動時に開けなかった」から
+「**書き手が開けなかった**」に変わり、判定する主体と書く主体が一致する。一時的に
+開けなかっただけのときに以後ずっと保存できない状態にも落ちない。
+
+### 計装
+
+この経路には perf イベントが 1 つも無かったので、同時に入れた:
+`local_adjust/save_enqueue` (UI 側)、`local_adjust/save_done` (worker 側、所要時間 +
+`outcome` + レイヤー数)、`local_adjust/save_superseded`。
+ブリーフ §10 の「perf log で確認」はこれで測れる。
 
 ## 最後 — 段 (b) キー移動 / 回転の確定タイミング
 
