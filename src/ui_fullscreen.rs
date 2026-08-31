@@ -33427,31 +33427,46 @@ impl App {
     /// 元へ戻ってしまう。描画側は `x≈252.82`、キャプチャ側は `x=253` のように食い違い、同じ
     /// 画面位置が別の元画像座標を指す (§1.154、Codex Sol の指摘 3)。ここで欲しいのは
     /// **描いた位置と同じ写像**であって、貼り先の画素境界ではない。
+    #[allow(clippy::too_many_arguments)]
     fn capture_region_spread_transform_for_source(
         idx: usize,
         page_rect: egui::Rect,
         source_size: [usize; 2],
         rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
-        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-            pixel_fit: RectPixelFit::Proportional,
-            page_idx: idx,
-            viewport_rect: page_rect,
-            source_size: tex_size,
-            texture_size: tex_size,
-            rotation,
-            free_rotation_rad: 0.0,
-            content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
-            fit_scale_limits: FullscreenFitScaleLimits {
+        // 描いた矩形の中へ元画像の縦横比で letterbox するだけ。**`resolve` は使わない** —
+        // あれはトリム後の内容を viewport いっぱいに合わせ直すので、渡した矩形とは別の倍率に
+        // なる。ここで欲しいのは「描いた矩形の中の、元画像座標への写像」。
+        let image_rect =
+            fit_display_size_in_rect(page_rect, rotated_display_size(tex_size, rotation));
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Proportional,
+                page_idx: idx,
+                viewport_rect: page_rect,
+                source_size: tex_size,
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                // **表示トリムを落とさない。** 落とすと `paint_rect` が画像全体になり、
+                // `hit_rect` が見えている範囲を越えて隣のページへ張り出す。そのまま
+                // `screen_to_source` へ渡すと、可視領域の外は**トリムで切ったこちら側の画素**を
+                // 指すので、選択も取れる画も見えているものと合わない (§1.156)。
+                // 単一ページ経路は描画時の transform をそのまま使うのでこの症状が無かった。
+                content_bbox,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
                 pixels_per_point,
-                ..FullscreenFitScaleLimits::default()
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
             },
-            pixels_per_point,
-            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-        })
+            image_rect,
+        )
     }
 
     fn capture_region_target_at(
@@ -33486,6 +33501,7 @@ impl App {
                     page.transform.full_image_rect,
                     source_size,
                     self.get_rotation(idx),
+                    page.transform.content_bbox,
                     ctx.pixels_per_point(),
                 )
                 .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
@@ -48111,6 +48127,49 @@ mod tests {
         );
     }
 
+    /// 見開きの範囲コピーは、**見えている範囲を越えて選べない** (§1.156)。
+    ///
+    /// 表示トリムを落とすと `paint_rect` が画像全体になり、`hit_rect` が隣のページへ張り出す。
+    /// そこを選ぶと、取れる画は隣のページではなく**トリムで切ったこちら側**になる。
+    #[test]
+    fn capture_region_spread_target_cannot_reach_past_the_trim() {
+        let drawn = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(400.0, 200.0));
+        // 右 20% を切ったトリム。
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.8, 1.0));
+        let transform = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn,
+            [400, 200],
+            crate::rotation_db::Rotation::None,
+            Some(bbox),
+            1.0,
+        )
+        .unwrap();
+
+        assert!(
+            transform.hit_rect.right() <= drawn.left() + drawn.width() * 0.8 + 1e-3,
+            "見えていない右 20% まで選べてしまう: hit_rect={:?}",
+            transform.hit_rect
+        );
+
+        // 画面右端まで引いても、取れるのは見えている範囲まで。
+        let target = CaptureRegionTarget {
+            idx: 0,
+            source_size: [400, 200],
+            transform,
+        };
+        let crop = crate::app::App::capture_region_crop_from_screen(
+            target,
+            egui::Rect::from_min_max(egui::pos2(100.0, 40.0), egui::pos2(600.0, 240.0)),
+        )
+        .expect("crop");
+        assert!(
+            crop.max_x <= 320.0 + 1e-3,
+            "トリムで切った領域まで取れている: max_x={}",
+            crop.max_x
+        );
+    }
+
     /// キャプチャ用 transform は、**描いた矩形の位置をそのまま**引き継ぐ。
     ///
     /// 見開きの間隔合わせで動かした分を寄せ直しで戻すと、同じ画面位置が別の元画像座標を
@@ -48124,6 +48183,7 @@ mod tests {
             drawn,
             [400, 200],
             crate::rotation_db::Rotation::None,
+            None,
             1.0,
         )
         .unwrap();
@@ -48149,6 +48209,7 @@ mod tests {
             page_rect,
             [200, 100],
             crate::rotation_db::Rotation::None,
+            None,
             1.0,
         )
         .unwrap();
