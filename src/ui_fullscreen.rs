@@ -4260,31 +4260,28 @@ fn align_spread_pages_for_gap(
         1.0
     };
     let to_px = |value: f32| value * ppp;
-    // フル画像矩形の左端から、見える左端までの距離。平行移動で変わらない。
-    let left_lead_px = to_px(left.paint_rect.min.x - left.full_image_rect.min.x);
-    let right_lead_px = to_px(right.paint_rect.min.x - right.full_image_rect.min.x);
     let left_visible_px = to_px(left.paint_rect.width());
     let right_visible_px = to_px(right.paint_rect.width());
-    if !(left_lead_px.is_finite()
-        && right_lead_px.is_finite()
-        && left_visible_px.is_finite()
-        && right_visible_px.is_finite())
-    {
+    if !(left_visible_px.is_finite() && right_visible_px.is_finite()) {
         return (egui::Vec2::ZERO, egui::Vec2::ZERO);
     }
 
+    // **合わせるのは内側の 2 辺。** ここが利用者に見える間隔の境界であり、自動トリム中は
+    // フル画像矩形の端ではない (トリムは `paint_rect` を全体矩形の小数分の 1 にする)。
+    //
+    // トリム中に全体矩形を整数へ寄せても意味が無い。ラスタライズされるのは `paint_rect` の
+    // 頂点で、全体矩形は使われないからである。寄せる相手を間違えると間隔は端数のまま残り、
+    // **ページごとに違う太さに見える** (実測ページで -0.48px 〜 +1.70px。利用者報告)。
     let total_visible_px = left_visible_px + gap_px + right_visible_px;
     let visible_start_px = to_px(center_x) - total_visible_px * 0.5;
-    let left_target_px = (visible_start_px - left_lead_px).round();
-    // 差分をまとめて丸めるので、見える内側端の距離は必ず量子化済み `gap_px` になる
-    // (トリムが無ければ lead=0・幅は整数なので、丸めても誤差が出ない)。
-    let right_target_px =
-        left_target_px + (left_lead_px + left_visible_px + gap_px - right_lead_px).round();
+    // 左ページの右端 = 間隔の左側の境界。ここを物理ピクセル境界へ置く。
+    // トリムが無ければ可視幅は整数なので、左ページの左端も従来どおり整数に乗る。
+    let boundary_px = (visible_start_px + left_visible_px).round();
 
     let offset = |target_px: f32, current: f32| egui::vec2((target_px - to_px(current)) / ppp, 0.0);
     (
-        offset(left_target_px, left.full_image_rect.min.x),
-        offset(right_target_px, right.full_image_rect.min.x),
+        offset(boundary_px, left.paint_rect.max.x),
+        offset(boundary_px + gap_px, right.paint_rect.min.x),
     )
 }
 
@@ -36592,6 +36589,143 @@ mod tests {
 {}",
             failures.len(),
             failures.iter().take(12).cloned().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
+    }
+
+    /// 自動トリム中の間隔は、**利用者に見える端**で設定どおりになる (§1.154)。
+    ///
+    /// トリムは `paint_rect` を全体矩形の小数分の 1 にする。ラスタライズされるのは
+    /// `paint_rect` の頂点なので、全体矩形の側を物理ピクセルへ寄せても間隔は端数のまま
+    /// 残り、**ページごとに違う太さに見える**。実測で -0.48px 〜 +1.70px (利用者報告)。
+    ///
+    /// ページ寸法は報告のあった実ファイルのもの。26 ページ全部が別寸法 (4155-4162 x
+    /// 6038-6053) で、スキャン本ではこれが普通。寸法が違えば丸めも変わるので、
+    /// 同じ本の中でページによって太さが変わる。
+    #[test]
+    fn a_trimmed_spread_keeps_the_gap_at_the_edges_the_viewer_sees() {
+        let mut failures = Vec::new();
+        let mut total = 0;
+        let pairs = [
+            ((4161.0_f32, 6053.0_f32), (4155.0_f32, 6038.0_f32)),
+            ((4162.0, 6048.0), (4161.0, 6041.0)),
+            ((4157.0, 6043.0), (4161.0, 6053.0)),
+        ];
+        let trims = [
+            (None, None),
+            (
+                Some((0.02_f32, 0.03_f32, 0.98_f32, 0.97_f32)),
+                Some((0.015, 0.025, 0.985, 0.975)),
+            ),
+            (Some((0.0, 0.0, 1.0, 1.0)), Some((0.0, 0.0, 1.0, 1.0))),
+        ];
+        for (lp, rp) in pairs {
+            for (lt, rt) in trims {
+                for gap in [0.0_f32, 1.0, 2.0] {
+                    for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                        total += 1;
+                        let viewport = egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(2560.0, 1440.0),
+                        );
+                        let unit =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        let mk = |t: Option<(f32, f32, f32, f32)>| {
+                            t.map(|(a, b, c, d)| {
+                                egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
+                            })
+                        };
+                        let lb = mk(lt);
+                        let rb = mk(rt);
+                        let left_page = egui::vec2(lp.0, lp.1);
+                        let right_page = egui::vec2(rp.0, rp.1);
+                        let left_bbox = lb.unwrap_or(unit);
+                        let right_bbox = rb.unwrap_or(unit);
+                        let content_active = lb.is_some() || rb.is_some();
+                        let geometry = spread_layout_geometry(
+                            left_page, right_page, left_bbox, right_bbox, true,
+                        );
+                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                            / geometry.fit_size.x)
+                            .min(viewport.height() / geometry.fit_size.y);
+                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                        let rects = layout_spread_page_rects(
+                            center,
+                            geometry,
+                            fit_scale,
+                            spread_gap,
+                            pixels_per_point,
+                            left_bbox,
+                            right_bbox,
+                            content_active,
+                        );
+                        let resolve =
+                            |rect: egui::Rect, page: egui::Vec2, bbox: Option<egui::Rect>| {
+                                resolve_fs_transform_in_layout_rect(
+                                    DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
+                                        page_idx: 0,
+                                        viewport_rect: viewport,
+                                        source_size: page,
+                                        texture_size: page,
+                                        rotation: crate::rotation_db::Rotation::None,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox: bbox,
+                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_scale_limits: FullscreenFitScaleLimits {
+                                            pixels_per_point,
+                                            ..FullscreenFitScaleLimits::default()
+                                        },
+                                        pixels_per_point,
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: None,
+                                        },
+                                    },
+                                    rect,
+                                )
+                                .expect("t")
+                            };
+                        let left = resolve(rects.left_rect, left_page, lb);
+                        let right = resolve(rects.right_rect, right_page, rb);
+                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                        let (lo, ro) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(lo);
+                        let right = right.translated_by(ro);
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        let mode = format!(
+                            "{:?}",
+                            crate::displayed_image_transform::rect_snap_mode(
+                                left.total_scale,
+                                pixels_per_point
+                            )
+                        );
+                        if (painted - gap_px).abs() >= 1e-3 {
+                            failures.push(format!(
+                                "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}: painted={painted} want={gap_px}",
+                                lp.0, lp.1, rp.0, rp.1, lb.is_some()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}/{} 件失敗:
+{}",
+            failures.len(),
+            total,
+            failures.iter().take(14).cloned().collect::<Vec<_>>().join(
                 "
 "
             )
