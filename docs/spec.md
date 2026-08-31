@@ -2179,7 +2179,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 ### Ctrl+E エクスポート
 
 - フルスクリーン静止画 (`Image` / `ZipImage` / `PdfPage`) で `Ctrl+E` を押すと、現在の表示結果をファイルに書き出す。見開き表示中は左右ページを現在の配置のまま 1 枚の見開き画像として書き出す。動画や区切りアイテムでは無効。
-- `Ctrl+E` のほか、**画像補正パネルのヘッダー右側に並ぶ処理順アイコン列** (`消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート`) のエクスポートアイコン (`draw_export_icon`) からも開ける。補正パネルはホバー表示のオーバーレイなので、クリック時は `adjustment_mode` を `false` にして閉じてから `open_export_dialog_for_current` に合流する (= ビューモードへ戻して合成結果を書き出す)。`open_export_dialog_for_current` は補正 / 消しゴム / 隠蔽 / 分析モード中は弾く (`is_overlay_edit_mode_active() || adjustment_mode || analysis_mode`) ため、`Ctrl+E` 直接押下はこれらのモード中は無効。アイコン経路は補正パネルを閉じることでこのガードを通過する。
+- `Ctrl+E` のほか、**画像補正パネルのヘッダー右側に並ぶ処理順アイコン列** (`消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト注釈 / エクスポート / SNS 分割`) のエクスポートアイコン (`draw_export_icon`) からも開ける。補正パネルはホバー表示のオーバーレイなので、クリック時は `adjustment_mode` を `false` にして閉じてから `open_export_dialog_for_current` に合流する (= ビューモードへ戻して合成結果を書き出す)。`open_export_dialog_for_current` は補正 / 消しゴム / 隠蔽 / 分析モード中は弾く (`is_overlay_edit_mode_active() || adjustment_mode || analysis_mode`) ため、`Ctrl+E` 直接押下はこれらのモード中は無効。アイコン経路は補正パネルを閉じることでこのガードを通過する。
 - 保存先は前回保存先 (`Settings::export_last_directory`) が存在すればそれを既定表示し、なければ元の場所を使う。ダイアログの「元の場所」ボタンで、通常画像は画像ファイルの親フォルダ、ZIP 内画像は ZIP ファイルの親フォルダ、PDF ページは PDF ファイルの親フォルダ、見開き合成は左ページ側の元フォルダへ戻せる。
 - 出力名は既定で `<元名>_edited`。バッチ出力では `_0` (現在の設定) / `_1`〜`_4` (隠蔽プリセット) を付ける。同じ名前が存在する場合はセッション単位で `_0001` などを挟み、上書きしない。
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
@@ -2188,6 +2188,17 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
 - 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
+
+### SNS 分割書き出し
+
+- フルスクリーン静止画で、画像補正パネル右端の `draw_sns_split_icon` から入る一度きりのモード。`KeyAction::FsSnsSplitMode` にも割り当てられるが標準キーは持たない。モード中は `KeyContext::SnsSplit` で `Ctrl+E` (`SnsSplitExecute`) がエクスポートへ進み、`Esc` が破棄する。
+- 1 枚の表示結果を横一列の 2〜4 枚へ切り分ける。投稿先は X (枠 3:4 / 継ぎ目に枠幅の 1.7%) と Instagram (枠 4:5 / 継ぎ目なし) の 2 択で、隙間の数値設定は持たない。1.7% は 2026-09-01 の実測 (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%) から、PC ブラウザと iOS アプリの誤差がともに 0.4 CSS px 以内に収まる値として選んだ。根拠は [sns-split-export-plan.md](sns-split-export-plan.md) §2.1。
+- 状態は `Option<SnsSplitLayout>` のみで、ページにも DB にも保存しない。`Settings::sns_split_target` / `Settings::sns_split_count` だけが投稿先と枚数を次回へ引き継ぐ。既存の切り取り (`CropSettings` / `export_crop.db`) には一切書かない。
+- グループ矩形は枠数と投稿先から比率が一意に決まる 1 枚の矩形で、8 ハンドル + 本体ドラッグで操作する。枠と継ぎ目は `frames()` が整数ピクセルで導出し、全枠の幅・高さ・間隔が厳密に一致する。描画・プレビュー・書き出しはすべて `frames()` を正とする。
+- 書き出しは `ExportEntry.crop` に枠を載せ、既存の 1 スナップショット → N ファイル経路へ流す。出力名は `_1`〜`_4` で、これが投稿順になる。隠蔽プリセットの一括出力は併用できず、理由を表示して無効にする (永続化された `export_batch_selection` は書き換えない)。既定の出力サイズは等倍。
+- 枠は元画像座標で並ぶのに対し書き出しは crop の後に回転を適用するため、**回転しているページでは使えない**。90 / 180 / 270 と自由回転のいずれでもボタンを無効にし、キー・モード中の回転変更・書き出し直前の 4 経路で同じ理由を表示する。
+- 画像が小さすぎて枠が並ばない場合は `fits()` が false を返し、パネルに警告を出して書き出しへ進まない。
+
 
 ---
 
