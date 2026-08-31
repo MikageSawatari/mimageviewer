@@ -266,6 +266,28 @@ fn native_external_tool_closes_fullscreen(surface: ContextMenuSurface, tool_exis
     surface == ContextMenuSurface::Fullscreen && tool_exists
 }
 
+/// このコマンドを実行する前にフルスクリーンを抜けるか。
+///
+/// **メインウィンドウ側にしか出ない物を開くコマンドはここへ足す。** フルスクリーンの
+/// まま開くと画面の裏に隠れ、利用者からは「何も起きない」に見える (2026-09-01 に
+/// 外部ツールの設定で実際に起きた)。判断を呼び出し側の match に散らさない。
+fn native_menu_command_closes_fullscreen(
+    command: &MenuCommand,
+    surface: ContextMenuSurface,
+    tool_exists: bool,
+) -> bool {
+    match command {
+        MenuCommand::ExternalTool(_) => {
+            native_external_tool_closes_fullscreen(surface, tool_exists)
+        }
+        // 外部アプリが前面に出るので、フルスクリーンのままにしない。
+        MenuCommand::OpenWithAssociation { .. } => surface == ContextMenuSurface::Fullscreen,
+        // 環境設定はメインウィンドウ側に出る。
+        MenuCommand::OpenExternalToolSettings => surface == ContextMenuSurface::Fullscreen,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckedFileOperationSelection {
     Empty,
@@ -1077,19 +1099,16 @@ impl crate::app::App {
                 }
             }
             NativeContextMenuResult::MivCommand(command) => {
-                let close_fullscreen = match command {
-                    MenuCommand::ExternalTool(id) => native_external_tool_closes_fullscreen(
-                        target.surface,
-                        self.settings
-                            .external_tools
-                            .iter()
-                            .any(|tool| tool.id == id),
-                    ),
-                    MenuCommand::OpenWithAssociation { .. } => {
-                        target.surface == ContextMenuSurface::Fullscreen
-                    }
+                let tool_exists = match &command {
+                    MenuCommand::ExternalTool(id) => self
+                        .settings
+                        .external_tools
+                        .iter()
+                        .any(|tool| tool.id == *id),
                     _ => false,
                 };
+                let close_fullscreen =
+                    native_menu_command_closes_fullscreen(&command, target.surface, tool_exists);
                 let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
                 NativeGridContextMenuOutcome::Consumed {
                     nav,
@@ -2772,6 +2791,28 @@ mod delete_confirm_tests {
         assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
             text.contains("外部ツールが見つかりません") && text.contains("404")
         }));
+    }
+
+    /// 環境設定はメインウィンドウ側にしか出ないので、フルスクリーンから開くときは
+    /// 先に抜ける。抜けないと画面の裏で開き、利用者からは無反応に見える。
+    #[test]
+    fn opening_settings_from_fullscreen_leaves_fullscreen_first() {
+        assert!(native_menu_command_closes_fullscreen(
+            &MenuCommand::OpenExternalToolSettings,
+            ContextMenuSurface::Fullscreen,
+            false
+        ));
+        assert!(!native_menu_command_closes_fullscreen(
+            &MenuCommand::OpenExternalToolSettings,
+            ContextMenuSurface::Grid,
+            false
+        ));
+        // 一覧に留まってよいコマンドまで巻き込まない。
+        assert!(!native_menu_command_closes_fullscreen(
+            &MenuCommand::CopyPath,
+            ContextMenuSurface::Fullscreen,
+            false
+        ));
     }
 
     #[test]
