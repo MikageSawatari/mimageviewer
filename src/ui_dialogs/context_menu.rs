@@ -5,9 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::app::is_synthetic_view_path;
+use crate::context_menu_model::{
+    AssociatedAppMenuEntry, ContextMenuActionState, ContextMenuInput, ContextMenuItemKind,
+    ContextMenuSurface, ContextMenuViewFlags, ExternalToolMenuEntry, MenuCommand, MenuNode,
+};
 use crate::grid_item::GridItem;
 use crate::native_context_menu::{
-    NativeContextMenuRequest, NativeContextMenuResult, NativeMivCommand, NativeMivMenuItem,
+    NativeContextMenuRequest, NativeContextMenuResult, ShellMenuPlacement,
 };
 
 #[cfg(windows)]
@@ -251,25 +255,60 @@ fn apply_delete_confirm_action(
 
 #[derive(Debug)]
 enum NativeGridContextMenuOutcome {
-    Consumed(Option<ContextMenuAction>),
+    Consumed {
+        nav: Option<ContextMenuAction>,
+        close_fullscreen: bool,
+    },
     Fallback,
 }
 
+fn native_external_tool_closes_fullscreen(surface: ContextMenuSurface, tool_exists: bool) -> bool {
+    surface == ContextMenuSurface::Fullscreen && tool_exists
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextMenuSurface {
-    Grid,
-    Fullscreen,
+enum CheckedFileOperationSelection {
+    Empty,
+    RealOnly,
+    VirtualOnly,
+    Mixed,
+}
+
+/// チェック選択全体と、ある実ファイル操作が扱える対象数の関係を分類する。
+///
+/// 呼び出し側は `supported_count` に操作別の resolver 結果を渡す。これにより
+/// 削除・パスコピーが仮想項目を黙って除外する分岐を共有せず、同じ拒否規則を使える。
+fn classify_checked_file_operation_selection(
+    checked_count: usize,
+    supported_count: usize,
+) -> CheckedFileOperationSelection {
+    match (checked_count, supported_count) {
+        (0, _) => CheckedFileOperationSelection::Empty,
+        (_, 0) => CheckedFileOperationSelection::VirtualOnly,
+        (checked, supported) if checked == supported => CheckedFileOperationSelection::RealOnly,
+        _ => CheckedFileOperationSelection::Mixed,
+    }
+}
+
+fn checked_virtual_selection_message(operation: &str) -> String {
+    format!(
+        "圧縮ファイル / PDF 内のページが選択に含まれています。ページは{operation}できません。ページの選択を外してから実行してください"
+    )
 }
 
 #[derive(Clone)]
 struct NativeGridContextMenuTarget {
-    paths: Vec<PathBuf>,
+    shell_paths: Option<Vec<PathBuf>>,
+    real_paths: Vec<PathBuf>,
+    delete_targets: Vec<(usize, PathBuf)>,
     item: GridItem,
     item_index: Option<usize>,
     is_folder_context: bool,
     has_checked: bool,
+    checked_count: usize,
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
+    folder_command_target: Option<PathBuf>,
 }
 
 impl NativeGridContextMenuTarget {
@@ -281,11 +320,65 @@ impl NativeGridContextMenuTarget {
 fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) -> &'static str {
     if target.is_folder_context {
         "background"
-    } else if target.has_checked {
+    } else if target.has_checked && target.shell_paths.is_some() {
         "checked_paths"
+    } else if target.has_checked {
+        "checked_virtual_or_mixed"
+    } else if target.shell_paths.is_none() {
+        "virtual_item"
     } else {
         "item_path"
     }
+}
+
+fn menu_leaf_count(nodes: &[MenuNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| match node {
+            MenuNode::Item { .. } => 1,
+            MenuNode::Submenu { children, .. } => menu_leaf_count(children),
+            MenuNode::Separator => 0,
+        })
+        .sum()
+}
+
+fn render_egui_menu_nodes(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Option<MenuCommand> {
+    let mut selected = None;
+    for node in nodes {
+        match node {
+            MenuNode::Separator => {
+                ui.separator();
+            }
+            MenuNode::Item {
+                command,
+                label,
+                enabled,
+                disabled_reason,
+            } => {
+                let response = ui.add_enabled(*enabled, egui::Button::new(label));
+                let response = if let Some(reason) = disabled_reason {
+                    response.on_disabled_hover_text(reason)
+                } else {
+                    response
+                };
+                if response.clicked() {
+                    selected = Some(command.clone());
+                    break;
+                }
+            }
+            MenuNode::Submenu { label, children } => {
+                egui::CollapsingHeader::new(label).show(ui, |ui| {
+                    if selected.is_none() {
+                        selected = render_egui_menu_nodes(ui, children);
+                    }
+                });
+                if selected.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    selected
 }
 
 const DELETE_FOLDER_OMITTED_FILES_WARNING: &str =
@@ -379,10 +472,32 @@ fn copy_path_text(ctx: &egui::Context, path: &Path) {
     ctx.copy_text(native_path_text(path));
 }
 
-fn legacy_xmp_context_path(item: &GridItem) -> Option<PathBuf> {
+fn context_item_path_text(item: &GridItem) -> String {
     match item {
-        GridItem::Image(p) | GridItem::Video(p) => Some(p.clone()),
-        _ => None,
+        GridItem::Folder(path)
+        | GridItem::Image(path)
+        | GridItem::Video(path)
+        | GridItem::Audio(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path)
+        | GridItem::ConvertibleArchive { path, .. }
+        | GridItem::SearchContainer { path, .. }
+        | GridItem::Stack {
+            representative: path,
+            ..
+        } => native_path_text(path),
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        }
+        | GridItem::ZipDir {
+            zip_path,
+            dir_prefix: entry_name,
+            ..
+        } => format!("{}:{}", native_path_text(zip_path), entry_name),
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => format!("{}:Page {}", native_path_text(pdf_path), page_num + 1),
     }
 }
 
@@ -671,7 +786,6 @@ impl crate::app::App {
         };
 
         let has_checked = !is_folder_context && !self.checked.is_empty();
-        let checked_count = self.checked.len();
         if self.items_are_bookmark_view && !is_folder_context {
             return self.show_bookmark_grid_context_menu(ctx, idx);
         }
@@ -719,7 +833,7 @@ impl crate::app::App {
                 folder_command_target.clone(),
                 ContextMenuSurface::Grid,
             ) {
-                NativeGridContextMenuOutcome::Consumed(nav) => {
+                NativeGridContextMenuOutcome::Consumed { nav, .. } => {
                     self.context_menu_idx = None;
                     self.cached_handlers = None;
                     ctx.request_repaint();
@@ -728,7 +842,17 @@ impl crate::app::App {
                 NativeGridContextMenuOutcome::Fallback => {}
             }
         }
-
+        let target = self.context_menu_target(
+            idx,
+            item,
+            is_folder_context,
+            has_checked,
+            folder_command_target,
+            ContextMenuSurface::Grid,
+            explorer_folder,
+        );
+        let nodes = self.context_menu_nodes(&target, in_search);
+        let mut selected_command = None;
         let mut open = true;
         egui::Window::new("context_menu")
             .id(egui::Id::new("grid_ctx_menu"))
@@ -740,386 +864,8 @@ impl crate::app::App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(200.0);
+                selected_command = render_egui_menu_nodes(ui, &nodes);
 
-                if has_checked {
-                    // ── 選択モード: チェック済みアイテムに対する操作 ──
-                    ui.label(
-                        egui::RichText::new(format!("{checked_count} 件選択中"))
-                            .strong()
-                            .size(13.0),
-                    );
-                    ui.separator();
-
-                    // パスをコピー (disabled)
-                    ui.add_enabled(false, egui::Button::new("パスをコピー"));
-
-                    // 回転
-                    ui.horizontal(|ui| {
-                        if ui.button("左に回転 (L)").clicked() {
-                            for &i in &self.checked.clone() {
-                                self.rotate_image_ccw(i);
-                            }
-                            close = true;
-                        }
-                        if ui.button("右に回転 (R)").clicked() {
-                            for &i in &self.checked.clone() {
-                                self.rotate_image_cw(i);
-                            }
-                            close = true;
-                        }
-                    });
-
-                    let legacy_xmp_paths = self
-                        .checked
-                        .iter()
-                        .filter_map(|idx| self.items.get(*idx))
-                        .filter_map(legacy_xmp_context_path)
-                        .collect::<Vec<_>>();
-                    self.draw_legacy_xmp_context_entries(ui, legacy_xmp_paths, &mut close);
-
-                    ui.separator();
-
-                    // 削除 (ゴミ箱)
-                    if ui
-                        .button(format!("削除 (ゴミ箱) [{checked_count}件]"))
-                        .clicked()
-                    {
-                        let targets: Vec<(usize, PathBuf)> = self.collect_checked_indexed_paths();
-                        self.request_delete_confirm(targets);
-                        close = true;
-                    }
-
-                    ui.separator();
-                    if ui.button("選択解除 (Ctrl+D)").clicked() {
-                        self.checked.clear();
-                        close = true;
-                    }
-                } else {
-                    // ── 通常モード: 単一アイテムに対する操作 ──
-                    match &item {
-                        GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
-                            if ui.button("パスをコピー").clicked() {
-                                copy_path_text(ctx, p);
-                                close = true;
-                            }
-                            if ui.button("ファイル名をコピー").clicked() {
-                                let name = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ctx.copy_text(name);
-                                close = true;
-                            }
-                            if matches!(item, GridItem::Image(_)) {
-                                if ui.button("画像をクリップボードにコピー").clicked()
-                                {
-                                    let rotation = self.get_rotation(idx);
-                                    copy_image_to_clipboard(p, rotation);
-                                    close = true;
-                                }
-                            }
-                            if in_search && ui.button("フォルダに移動").clicked() {
-                                nav =
-                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            // ── アプリケーションで開く ──
-                            ui.separator();
-                            let _ = self.render_open_with_menu(ui, p, &mut close);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui.button("左に回転 (L)").clicked() {
-                                    self.rotate_image_ccw(idx);
-                                    close = true;
-                                }
-                                if ui.button("右に回転 (R)").clicked() {
-                                    self.rotate_image_cw(idx);
-                                    close = true;
-                                }
-                            });
-                            self.draw_legacy_xmp_context_entries(ui, vec![p.clone()], &mut close);
-                            ui.separator();
-                            if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.request_delete_confirm(vec![(idx, p.clone())]);
-                                close = true;
-                            }
-                        }
-                        GridItem::Folder(p) => {
-                            let copy_label = if is_folder_context {
-                                "このフォルダのパスをコピー"
-                            } else {
-                                "パスをコピー"
-                            };
-                            if ui.button(copy_label).clicked() {
-                                copy_path_text(ctx, p);
-                                close = true;
-                            }
-                            // フォルダのコピー / カット (クリップボード経由) は v1.1.0 で一旦
-                            // 無効化 (データ破壊リスクのため将来へ延期)。ここには出さない。
-                            if in_search
-                                && !is_folder_context
-                                && ui.button("フォルダに移動").clicked()
-                            {
-                                nav = Some(ContextMenuAction::JumpFromSearch(native_nav_path(p)));
-                                close = true;
-                            }
-                            if self.items_are_reading_history_view
-                                && !is_folder_context
-                                && ui.button("この本のフォルダに移動").clicked()
-                            {
-                                self.select_after_load = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|s| s.to_string());
-                                nav =
-                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            ui.separator();
-                            if is_folder_context {
-                                if ui
-                                    .add_enabled(
-                                        folder_command_target.is_some(),
-                                        egui::Button::new("新しいフォルダ…"),
-                                    )
-                                    .clicked()
-                                {
-                                    if let Some(folder) = folder_command_target.clone() {
-                                        self.request_new_folder_dialog(folder);
-                                    }
-                                    close = true;
-                                }
-                            } else {
-                                if ui.button("削除 (ゴミ箱)").clicked() {
-                                    self.request_delete_confirm(vec![(idx, p.clone())]);
-                                    close = true;
-                                }
-                            }
-                        }
-                        GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                            if ui.button("パスをコピー").clicked() {
-                                copy_path_text(ctx, p);
-                                close = true;
-                            }
-                            if ui.button("ファイル名をコピー").clicked() {
-                                let name = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ctx.copy_text(name);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui.button("ページを開く").clicked() {
-                                nav = Some(ContextMenuAction::OpenGridContainer {
-                                    idx,
-                                    mode: crate::app::GridContainerOpenMode::PageFullscreen,
-                                });
-                                close = true;
-                            }
-                            if ui.button("一覧を開く").clicked() {
-                                nav = Some(ContextMenuAction::OpenGridContainer {
-                                    idx,
-                                    mode: crate::app::GridContainerOpenMode::PageList,
-                                });
-                                close = true;
-                            }
-                            if in_search && ui.button("フォルダに移動").clicked() {
-                                nav =
-                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            if self.items_are_reading_history_view
-                                && ui.button("この本のフォルダに移動").clicked()
-                            {
-                                self.select_after_load = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|s| s.to_string());
-                                nav =
-                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            // ── アプリケーションで開く (ZipFile/PdfFile) ──
-                            ui.separator();
-                            let _ = self.render_open_with_menu(ui, p, &mut close);
-                            ui.separator();
-                            if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.request_delete_confirm(vec![(idx, p.clone())]);
-                                close = true;
-                            }
-                        }
-                        GridItem::ZipImage {
-                            zip_path,
-                            entry_name,
-                        } => {
-                            let display = format!("{}:{}", native_path_text(zip_path), entry_name);
-                            if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(display);
-                                close = true;
-                            }
-                            let basename = crate::zip_loader::entry_basename(entry_name);
-                            if ui.button("ファイル名をコピー").clicked() {
-                                ctx.copy_text(basename.to_string());
-                                close = true;
-                            }
-                            if ui.button("画像をクリップボードにコピー").clicked() {
-                                let rotation = self.get_rotation(idx);
-                                copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
-                                close = true;
-                            }
-                        }
-                        GridItem::ZipDir {
-                            zip_path,
-                            dir_prefix,
-                            ..
-                        } => {
-                            // ネスト ZIP の子コンテナ: 仮想パスのコピーのみ (実ファイル操作は不可)。
-                            let display = format!("{}:{}", native_path_text(zip_path), dir_prefix);
-                            if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(display);
-                                close = true;
-                            }
-                        }
-                        GridItem::SearchContainer { path, .. } => {
-                            // Ctrl+G 結果コンテナ: フォルダ扱いで最小限の操作を出す
-                            if ui.button("パスをコピー").clicked() {
-                                copy_path_text(ctx, path);
-                                close = true;
-                            }
-                            if in_search && ui.button("フォルダに移動").clicked() {
-                                nav =
-                                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)));
-                                close = true;
-                            }
-                        }
-                        GridItem::Stack { representative, .. } => {
-                            // ファイル名スタック集約セル: 仮想コンテナなので最小限。展開 (読書) は
-                            // 左ダブルクリック / Enter で行う。ここは代表画像のパスコピーのみ。
-                            if ui.button("代表画像のパスをコピー").clicked() {
-                                copy_path_text(ctx, representative);
-                                close = true;
-                            }
-                        }
-                        GridItem::PdfPage {
-                            pdf_path, page_num, ..
-                        } => {
-                            let display =
-                                format!("{}:Page {}", native_path_text(pdf_path), page_num + 1);
-                            if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(display);
-                                close = true;
-                            }
-                            if ui.button("ページ名をコピー").clicked() {
-                                ctx.copy_text(format!("Page {}", page_num + 1));
-                                close = true;
-                            }
-                        }
-                        GridItem::ConvertibleArchive { path, .. } => {
-                            if ui.button("パスをコピー").clicked() {
-                                copy_path_text(ctx, path);
-                                close = true;
-                            }
-                            if ui.button("ファイル名をコピー").clicked() {
-                                let name = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                ctx.copy_text(name);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui.button("ページを開く").clicked() {
-                                nav = Some(ContextMenuAction::OpenGridContainer {
-                                    idx,
-                                    mode: crate::app::GridContainerOpenMode::PageFullscreen,
-                                });
-                                close = true;
-                            }
-                            if ui.button("一覧を開く").clicked() {
-                                nav = Some(ContextMenuAction::OpenGridContainer {
-                                    idx,
-                                    mode: crate::app::GridContainerOpenMode::PageList,
-                                });
-                                close = true;
-                            }
-                            if in_search && ui.button("フォルダに移動").clicked() {
-                                nav = parent_folder_for_nav(path)
-                                    .map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            if self.items_are_reading_history_view
-                                && ui.button("この本のフォルダに移動").clicked()
-                            {
-                                self.select_after_load = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|s| s.to_string());
-                                nav = parent_folder_for_nav(path)
-                                    .map(ContextMenuAction::JumpFromSearch);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.request_delete_confirm(vec![(idx, path.clone())]);
-                                close = true;
-                            }
-                        }
-                    }
-
-                    if matches!(
-                        item,
-                        GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
-                    ) {
-                        ui.separator();
-                        if ui.button("編集内容をコピー").clicked() {
-                            self.copy_page_edit_bundle(idx);
-                            close = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                self.has_page_edit_bundle_clipboard(),
-                                egui::Button::new("編集内容を貼り付け"),
-                            )
-                            .clicked()
-                        {
-                            self.request_paste_page_edit_bundle(idx);
-                            close = true;
-                        }
-                    }
-
-                    // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
-                    // 空フォルダの右クリックで合成された `GridItem::Folder(current_folder)`
-                    // は rel="" で pin できないので呼ばない (Codex Phase D P3 指摘: 単独の
-                    // separator が残るのを防ぐため呼び出し自体を skip)。
-                    // pin 不能 / アグリゲートビュー / drill-down 等の条件分岐とそれに伴う
-                    // separator 描画は helper 側に集約 (Codex Phase D 再指摘)。
-                    if !is_folder_context && !self.items_are_reading_history_view {
-                        if self.render_folder_pin_menu_entry(ui, &item) {
-                            close = true;
-                        }
-                    }
-                    if self.items_are_reading_history_view && !is_folder_context {
-                        ui.separator();
-                        if ui.button("履歴から削除").clicked() {
-                            self.remove_reading_history_entry_for_idx(idx);
-                            close = true;
-                        }
-                    }
-                }
-
-                if let Some(folder) = explorer_folder.as_ref() {
-                    ui.separator();
-                    if ui.button("このフォルダをエクスプローラで開く").clicked() {
-                        open_directory_in_explorer(folder);
-                        close = true;
-                    }
-                }
-
-                // メニュー外クリックで閉じる
                 if ui.input(|i| i.pointer.any_click()) && !ui.ui_contains_pointer() {
                     close = true;
                 }
@@ -1127,7 +873,10 @@ impl crate::app::App {
                     close = true;
                 }
             });
-
+        if let Some(command) = selected_command {
+            nav = self.dispatch_native_grid_context_command(ctx, command, &target);
+            close = true;
+        }
         if close || !open {
             self.context_menu_idx = None;
             self.cached_handlers = None;
@@ -1241,9 +990,6 @@ impl crate::app::App {
         folder_command_target: Option<PathBuf>,
         surface: ContextMenuSurface,
     ) -> NativeGridContextMenuOutcome {
-        if !self.settings.use_native_shell_context_menu {
-            return NativeGridContextMenuOutcome::Fallback;
-        }
         let Some(hwnd) = self.main_hwnd else {
             return NativeGridContextMenuOutcome::Fallback;
         };
@@ -1254,7 +1000,7 @@ impl crate::app::App {
             has_checked,
             folder_command_target.as_deref(),
         );
-        let Some(target) = self.native_grid_context_menu_target(
+        let target = self.context_menu_target(
             idx,
             item,
             is_folder_context,
@@ -1262,10 +1008,10 @@ impl crate::app::App {
             folder_command_target,
             surface,
             explorer_folder,
-        ) else {
-            return NativeGridContextMenuOutcome::Fallback;
-        };
-        let miv_items = self.native_grid_context_menu_items(&target, in_search);
+        );
+        let shell_paths = target.shell_paths.clone().unwrap_or_default();
+        let miv_items = self.context_menu_nodes(&target, in_search);
+        let miv_count = menu_leaf_count(&miv_items);
         let target_kind = native_grid_context_menu_target_kind(&target);
         let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() {
@@ -1278,9 +1024,9 @@ impl crate::app::App {
                     ("ms", serde_json::Value::from(prepare_ms)),
                     (
                         "path_count",
-                        serde_json::Value::from(target.paths.len() as u64),
+                        serde_json::Value::from(shell_paths.len() as u64),
                     ),
-                    ("miv_count", serde_json::Value::from(miv_items.len() as u64)),
+                    ("miv_count", serde_json::Value::from(miv_count as u64)),
                     (
                         "folder_context",
                         serde_json::Value::from(target.is_folder_context),
@@ -1292,11 +1038,14 @@ impl crate::app::App {
         if prepare_ms >= 80.0 {
             crate::logger::log(format!(
                 "native_context_menu: slow app_prepare {prepare_ms:.1}ms target={target_kind} paths={} miv_items={}",
-                target.paths.len(),
-                miv_items.len()
+                shell_paths.len(),
+                miv_count
             ));
         }
-        let background_folder = target.is_folder_context.then(|| target.paths[0].clone());
+        let background_folder = target
+            .is_folder_context
+            .then(|| target.folder_command_target.clone())
+            .flatten();
         let request = NativeContextMenuRequest {
             hwnd,
             screen_pos: (pos.x.round() as i32, pos.y.round() as i32),
@@ -1304,9 +1053,14 @@ impl crate::app::App {
             paths: if target.is_folder_context {
                 Vec::new()
             } else {
-                target.paths.clone()
+                shell_paths
             },
             miv_items,
+            shell_menu_placement: if self.settings.show_windows_context_menu_inline {
+                ShellMenuPlacement::Inline
+            } else {
+                ShellMenuPlacement::Submenu
+            },
         };
         let native_result = crate::native_context_menu::show_native_context_menu(request);
         Self::resync_egui_modifiers_from_os(ctx);
@@ -1322,11 +1076,30 @@ impl crate::app::App {
         }
         match native_result {
             NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
-                NativeGridContextMenuOutcome::Consumed(None)
+                NativeGridContextMenuOutcome::Consumed {
+                    nav: None,
+                    close_fullscreen: false,
+                }
             }
             NativeContextMenuResult::MivCommand(command) => {
+                let close_fullscreen = match command {
+                    MenuCommand::ExternalTool(id) => native_external_tool_closes_fullscreen(
+                        target.surface,
+                        self.settings
+                            .external_tools
+                            .iter()
+                            .any(|tool| tool.id == id),
+                    ),
+                    MenuCommand::OpenWithAssociation { .. } => {
+                        target.surface == ContextMenuSurface::Fullscreen
+                    }
+                    _ => false,
+                };
                 let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
-                NativeGridContextMenuOutcome::Consumed(nav)
+                NativeGridContextMenuOutcome::Consumed {
+                    nav,
+                    close_fullscreen,
+                }
             }
             NativeContextMenuResult::Fallback { reason } => {
                 crate::logger::log(format!(
@@ -1337,7 +1110,7 @@ impl crate::app::App {
         }
     }
 
-    fn native_grid_context_menu_target(
+    fn context_menu_target(
         &self,
         idx: usize,
         item: GridItem,
@@ -1346,261 +1119,224 @@ impl crate::app::App {
         folder_command_target: Option<PathBuf>,
         surface: ContextMenuSurface,
         explorer_folder: Option<PathBuf>,
-    ) -> Option<NativeGridContextMenuTarget> {
-        let paths = if is_folder_context {
-            vec![folder_command_target?]
+    ) -> NativeGridContextMenuTarget {
+        let checked_targets = has_checked
+            .then(|| self.collect_checked_indexed_paths())
+            .unwrap_or_default();
+        let real_paths: Vec<PathBuf> = if is_folder_context {
+            folder_command_target.iter().cloned().collect()
         } else if has_checked {
-            if self.checked.iter().any(|&idx| {
-                self.items
-                    .get(idx)
-                    .and_then(GridItem::file_operation_path)
-                    .is_none()
-            }) {
-                return None;
-            }
             self.collect_checked_paths()
         } else {
-            vec![item.drag_source_path()?.to_path_buf()]
+            item.drag_source_path()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect()
         };
-        if paths.is_empty() {
-            return None;
-        }
-        Some(NativeGridContextMenuTarget {
-            paths,
+        let shell_paths = if is_folder_context {
+            folder_command_target
+                .as_ref()
+                .map(|folder| vec![folder.clone()])
+        } else if has_checked {
+            if self.checked.is_empty()
+                || self.checked.iter().any(|&idx| {
+                    self.items
+                        .get(idx)
+                        .and_then(GridItem::file_operation_path)
+                        .is_none()
+                })
+            {
+                None
+            } else {
+                Some(real_paths.clone())
+            }
+        } else {
+            item.drag_source_path().map(|path| vec![path.to_path_buf()])
+        };
+        let delete_targets = if has_checked {
+            checked_targets
+        } else if is_folder_context {
+            Vec::new()
+        } else {
+            item.drag_source_path()
+                .map(|path| vec![(idx, path.to_path_buf())])
+                .unwrap_or_default()
+        };
+        NativeGridContextMenuTarget {
+            shell_paths,
+            real_paths,
+            delete_targets,
             item,
             item_index: (!is_folder_context).then_some(idx),
             is_folder_context,
             has_checked,
+            checked_count: if has_checked { self.checked.len() } else { 0 },
             surface,
             explorer_folder,
-        })
+            folder_command_target,
+        }
     }
 
-    fn native_grid_context_menu_items(
-        &self,
+    fn context_menu_nodes(
+        &mut self,
         target: &NativeGridContextMenuTarget,
         in_search: bool,
-    ) -> Vec<NativeMivMenuItem> {
-        let mut items = Vec::new();
-        let fullscreen_video = target.is_fullscreen_video();
-        if target.has_checked {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::CopyPath,
-                label: "選択項目のパスをコピー".to_string(),
-                enabled: true,
-            });
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::RotateLeft,
-                label: "左に回転 (L)".to_string(),
-                enabled: true,
-            });
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::RotateRight,
-                label: "右に回転 (R)".to_string(),
-                enabled: true,
-            });
-            if target.explorer_folder.is_some() {
-                items.push(NativeMivMenuItem {
-                    command: NativeMivCommand::OpenFolderInExplorer,
-                    label: "このフォルダをエクスプローラで開く".to_string(),
-                    enabled: true,
-                });
-            }
-            return items;
-        }
-
-        if target.is_folder_context
-            && target.paths.first().is_some_and(|path| {
-                self.current_favorite_target()
-                    .as_ref()
-                    .is_some_and(|folder| crate::folder_tree::path_eq(folder, path))
+    ) -> Vec<MenuNode> {
+        let external_items = crate::external_tool::external_tool_menu_items(
+            &self.settings.external_tools,
+            crate::external_tool::ExternalToolMenuTarget::from_grid_item(&target.item),
+        );
+        let labels: Vec<_> = external_items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        crate::logger::log(format!(
+            "native_context_menu: external_tools count={} labels={labels:?}",
+            external_items.len()
+        ));
+        let external_tools = external_items
+            .into_iter()
+            .map(|entry| ExternalToolMenuEntry {
+                tool_id: entry.tool_id,
+                label: entry.label,
+                enabled: entry.enabled,
+                disabled_reason: entry.disabled_reason.map(str::to_string),
             })
-        {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::NewFolder,
-                label: "新しいフォルダ...".to_string(),
-                enabled: true,
-            });
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::Paste,
-                label: "貼り付け".to_string(),
-                enabled: true,
-            });
-        }
-
-        if !target.is_folder_context && target.paths.len() == 1 {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::Rename,
-                label: "名前の変更...".to_string(),
-                enabled: true,
-            });
-        }
-
-        let copy_path_label = if target.is_folder_context {
-            "このフォルダのパスをコピー"
-        } else {
-            "パスをコピー"
+            .collect();
+        let associated_apps = self.context_menu_associated_apps(&target.item);
+        let view = ContextMenuViewFlags {
+            in_search,
+            search: self.items_are_global_search_view
+                || self.global_search.drill.is_some()
+                || self.favsearch.on_results_grid()
+                || !self.favsearch.nav_stack.is_empty(),
+            tag: self.items_are_tag_view || !self.tag_view.nav_stack.is_empty(),
+            rating: self.items_are_rating_view,
+            reading_history: self.items_are_reading_history_view,
         };
-        items.push(NativeMivMenuItem {
-            command: NativeMivCommand::CopyPath,
-            label: copy_path_label.to_string(),
-            enabled: true,
-        });
-        if !target.is_folder_context
-            && target
-                .paths
-                .first()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| !name.is_empty())
-        {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::CopyFileName,
-                label: "ファイル名をコピー".to_string(),
-                enabled: true,
-            });
-        }
-        if matches!(target.item, GridItem::Image(_)) {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::CopyImageToClipboard,
-                label: "画像をクリップボードにコピー".to_string(),
-                enabled: true,
-            });
-        }
-        if matches!(
-            target.item,
-            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
-        ) {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::CopyEditBundle,
-                label: "編集内容をコピー".to_string(),
-                enabled: true,
-            });
-            if self.has_page_edit_bundle_clipboard() {
-                items.push(NativeMivMenuItem {
-                    command: NativeMivCommand::PasteEditBundle,
-                    label: "編集内容を貼り付け".to_string(),
-                    enabled: true,
-                });
-            }
-        }
-        if !target.is_folder_context
-            && !target.has_checked
-            && matches!(
-                target.item,
-                GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. }
-            )
-        {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::OpenContainerAsPage,
-                label: "ページを開く".to_string(),
-                enabled: true,
-            });
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::OpenContainerAsList,
-                label: "一覧を開く".to_string(),
-                enabled: true,
-            });
-        }
-        if in_search && !target.is_folder_context {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::JumpToFolder,
-                label: "フォルダに移動".to_string(),
-                enabled: true,
-            });
-        }
-        if matches!(target.item, GridItem::Image(_))
-            || matches!(target.item, GridItem::Video(_)) && !fullscreen_video
-        {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::RotateLeft,
-                label: "左に回転 (L)".to_string(),
-                enabled: true,
-            });
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::RotateRight,
-                label: "右に回転 (R)".to_string(),
-                enabled: true,
-            });
-        }
-        if fullscreen_video {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::SetCurrentVideoFrameThumbnail,
-                label: "📌 現在のフレームを動画サムネに設定".to_string(),
-                enabled: true,
-            });
-        } else if let Some((label, enabled)) = self.native_folder_pin_context_state(target) {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::ToggleRepresentativeThumb,
-                label,
-                enabled,
-            });
-        }
-        if target.explorer_folder.is_some() {
-            items.push(NativeMivMenuItem {
-                command: NativeMivCommand::OpenFolderInExplorer,
-                label: "このフォルダをエクスプローラで開く".to_string(),
-                enabled: true,
-            });
-        }
-        items
+        let input = ContextMenuInput {
+            kind: ContextMenuItemKind::from_grid_item(&target.item),
+            surface: target.surface,
+            is_folder_context: target.is_folder_context,
+            has_checked: target.has_checked,
+            checked_count: target.checked_count,
+            can_use_folder_commands: target.folder_command_target.is_some(),
+            can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
+            has_explorer_folder: target.explorer_folder.is_some(),
+            view,
+            pin: self.context_menu_pin_state(target, view),
+            external_tools,
+            associated_apps,
+        };
+        crate::context_menu_model::build_context_menu(&input)
     }
 
-    fn native_folder_pin_context_state(
+    fn context_menu_associated_apps(&mut self, item: &GridItem) -> Vec<AssociatedAppMenuEntry> {
+        let launch_target = crate::external_tool::LaunchTarget::from_grid_item(Some(item));
+        let Some(extension) = launch_target
+            .real_file()
+            .ok()
+            .and_then(Path::extension)
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!(".{}", extension.to_lowercase()))
+        else {
+            return Vec::new();
+        };
+        let handlers = match &self.cached_handlers {
+            Some((cached_extension, handlers)) if cached_extension == &extension => {
+                handlers.clone()
+            }
+            _ => {
+                let handlers = crate::open_with::enumerate_handlers(&extension);
+                self.cached_handlers = Some((extension, handlers.clone()));
+                handlers
+            }
+        };
+        handlers
+            .into_iter()
+            .map(|handler| AssociatedAppMenuEntry {
+                display_name: handler.display_name,
+                handler_id: handler.handler_id,
+            })
+            .collect()
+    }
+
+    fn context_menu_pin_state(
         &self,
         target: &NativeGridContextMenuTarget,
-    ) -> Option<(String, bool)> {
+        view: ContextMenuViewFlags,
+    ) -> Option<ContextMenuActionState> {
         if target.is_folder_context
-            || target.item_index.is_none()
-            || self.items_are_global_search_view
-            || self.items_are_tag_view
-            || self.items_are_reading_history_view
-            || self.items_are_rating_view
+            || target.has_checked
+            || view.search
+            || view.tag
+            || view.rating
+            || view.reading_history
             || self.archive_source_override.is_some() && self.zip_nav.is_none()
         {
             return None;
         }
+        let idx = target.item_index?;
         let container = self.current_folder.as_ref()?;
         if is_synthetic_view_path(container) {
             return None;
         }
-        let source = crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?;
         if let GridItem::ConvertibleArchive { path, .. } = &target.item
             && !self
                 .converted_archive_cache_paths
                 .get(&crate::path_key::normalize_keep_drive(path))
                 .is_some_and(crate::app::ConvertedArchiveSourceState::is_available)
         {
-            return Some(("📌 代表サムネ固定: 変換後に設定可能".to_string(), false));
+            return Some(ContextMenuActionState {
+                label: "📌 代表サムネに固定".to_string(),
+                enabled: false,
+                disabled_reason: Some(
+                    "変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)".to_string(),
+                ),
+            });
         }
-        let existing = self.folder_thumb_pin_for(container);
-        let label = if existing == Some(&source) {
+        let (pin_container, source) = if self.zip_nav.is_some() {
+            (
+                self.pin_container_key()?,
+                self.folder_pin_selected_source(idx)?,
+            )
+        } else {
+            (
+                container.clone(),
+                crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?,
+            )
+        };
+        let label = if self.folder_thumb_pin_for(&pin_container) == Some(&source) {
             "📌 代表サムネ固定を解除"
         } else {
             "📌 代表サムネに固定"
         };
-        Some((label.to_string(), true))
+        Some(ContextMenuActionState {
+            label: label.to_string(),
+            enabled: true,
+            disabled_reason: None,
+        })
     }
 
     fn dispatch_native_grid_context_command(
         &mut self,
         ctx: &egui::Context,
-        command: NativeMivCommand,
+        command: MenuCommand,
         target: &NativeGridContextMenuTarget,
     ) -> Option<ContextMenuAction> {
         match command {
-            NativeMivCommand::NewFolder => {
+            MenuCommand::NewFolder => {
                 if target.is_folder_context
-                    && let Some(folder) = target.paths.first().cloned()
+                    && let Some(folder) = target.folder_command_target.clone()
                 {
                     self.request_new_folder_dialog(folder);
                 }
                 None
             }
-            NativeMivCommand::Paste => {
+            MenuCommand::Paste => {
                 if target.is_folder_context
                     && let (Some(hwnd), Some(folder)) =
-                        (self.main_hwnd, target.paths.first().cloned())
+                        (self.main_hwnd, target.folder_command_target.clone())
                 {
                     // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
                     // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
@@ -1619,69 +1355,87 @@ impl crate::app::App {
                 }
                 None
             }
-            NativeMivCommand::Rename => {
+            MenuCommand::Rename => {
                 if !target.is_folder_context
-                    && target.paths.len() == 1
-                    && let Some(path) = target.paths.first().cloned()
+                    && let Some(path) = target.item.drag_source_path().map(Path::to_path_buf)
                 {
                     self.request_rename_dialog(path);
                 }
                 None
             }
-            NativeMivCommand::CopyPath => {
-                let text = target
-                    .paths
-                    .iter()
-                    .map(|p| native_path_text(p))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            MenuCommand::CopyPath | MenuCommand::CopyRepresentativePath => {
+                if target.has_checked
+                    && classify_checked_file_operation_selection(
+                        target.checked_count,
+                        target.real_paths.len(),
+                    ) != CheckedFileOperationSelection::RealOnly
+                {
+                    self.show_feedback_toast(checked_virtual_selection_message(
+                        "ファイルのパスとしてコピー",
+                    ));
+                    return None;
+                }
+                let text = if target.has_checked {
+                    target
+                        .real_paths
+                        .iter()
+                        .map(|path| native_path_text(path))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    context_item_path_text(&target.item)
+                };
                 ctx.copy_text(text);
                 None
             }
-            NativeMivCommand::CopyFileName => {
-                let name = target
-                    .paths
-                    .first()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                ctx.copy_text(name);
+            MenuCommand::CopyFileName | MenuCommand::CopyPageName => {
+                ctx.copy_text(target.item.name().to_string());
                 None
             }
-            NativeMivCommand::CopyImageToClipboard => {
-                if let GridItem::Image(path) = &target.item {
-                    let rotation = target
-                        .item_index
-                        .map(|idx| self.get_rotation(idx))
-                        .unwrap_or(crate::rotation_db::Rotation::None);
-                    copy_image_to_clipboard(path, rotation);
+            MenuCommand::CopyImageToClipboard => {
+                if let Some(idx) = target.item_index {
+                    let rotation = self.get_rotation(idx);
+                    match &target.item {
+                        GridItem::Image(path) => copy_image_to_clipboard(path, rotation),
+                        GridItem::ZipImage {
+                            zip_path,
+                            entry_name,
+                        } => copy_zip_image_to_clipboard(zip_path, entry_name, rotation),
+                        _ => {}
+                    }
                 }
                 None
             }
-            NativeMivCommand::CopyEditBundle => {
+            MenuCommand::CopyEditBundle => {
                 if let Some(idx) = target.item_index {
                     self.copy_page_edit_bundle(idx);
                 }
                 None
             }
-            NativeMivCommand::PasteEditBundle => {
+            MenuCommand::PasteEditBundle => {
                 if let Some(idx) = target.item_index {
                     self.request_paste_page_edit_bundle(idx);
                 }
                 None
             }
-            NativeMivCommand::JumpToFolder => match &target.item {
+            MenuCommand::JumpToFolder => match &target.item {
                 GridItem::Folder(path) => {
                     Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
                 }
-                _ => target
-                    .paths
-                    .first()
-                    .and_then(|path| parent_folder_for_nav(path))
-                    .map(ContextMenuAction::JumpFromSearch),
+                GridItem::SearchContainer { path, .. } => {
+                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
+                }
+                _ => target.item.drag_source_path().and_then(|path| {
+                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
+                }),
             },
-            NativeMivCommand::OpenContainerAsPage => {
+            MenuCommand::JumpToBookFolder => {
+                self.select_after_load = Some(target.item.name().to_string());
+                target.item.container_path().and_then(|path| {
+                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
+                })
+            }
+            MenuCommand::OpenContainerAsPage => {
                 target
                     .item_index
                     .map(|idx| ContextMenuAction::OpenGridContainer {
@@ -1689,7 +1443,7 @@ impl crate::app::App {
                         mode: crate::app::GridContainerOpenMode::PageFullscreen,
                     })
             }
-            NativeMivCommand::OpenContainerAsList => {
+            MenuCommand::OpenContainerAsList => {
                 target
                     .item_index
                     .map(|idx| ContextMenuAction::OpenGridContainer {
@@ -1697,7 +1451,7 @@ impl crate::app::App {
                         mode: crate::app::GridContainerOpenMode::PageList,
                     })
             }
-            NativeMivCommand::RotateLeft => {
+            MenuCommand::RotateLeft => {
                 if target.has_checked {
                     for idx in self.checked.clone() {
                         self.rotate_image_ccw(idx);
@@ -1707,7 +1461,7 @@ impl crate::app::App {
                 }
                 None
             }
-            NativeMivCommand::RotateRight => {
+            MenuCommand::RotateRight => {
                 if target.has_checked {
                     for idx in self.checked.clone() {
                         self.rotate_image_cw(idx);
@@ -1717,13 +1471,13 @@ impl crate::app::App {
                 }
                 None
             }
-            NativeMivCommand::ToggleRepresentativeThumb => {
+            MenuCommand::ToggleRepresentativeThumb => {
                 if let Some(idx) = target.item_index {
                     self.toggle_folder_pin_for_idx(idx);
                 }
                 None
             }
-            NativeMivCommand::SetCurrentVideoFrameThumbnail => {
+            MenuCommand::SetCurrentVideoFrameThumbnail => {
                 #[cfg(windows)]
                 if target.is_fullscreen_video()
                     && let Some(idx) = target.item_index
@@ -1732,9 +1486,71 @@ impl crate::app::App {
                 }
                 None
             }
-            NativeMivCommand::OpenFolderInExplorer => {
+            MenuCommand::OpenFolderInExplorer => {
                 if let Some(folder) = target.explorer_folder.as_deref() {
                     open_directory_in_explorer(folder);
+                }
+                None
+            }
+            MenuCommand::ExternalTool(id) => {
+                let Some(tool) = self
+                    .settings
+                    .external_tools
+                    .iter()
+                    .find(|tool| tool.id == id)
+                    .cloned()
+                else {
+                    self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
+                    return None;
+                };
+                let launch_target =
+                    crate::external_tool::LaunchTarget::from_grid_item(Some(&target.item));
+                self.queue_external_tool_launch(&tool, &launch_target);
+                None
+            }
+            MenuCommand::OpenWithAssociation {
+                display_name,
+                handler_id,
+            } => {
+                let launch_target =
+                    crate::external_tool::LaunchTarget::from_grid_item(Some(&target.item));
+                if let Ok(file) = launch_target.real_file() {
+                    self.start_open_with(
+                        display_name,
+                        crate::external_tool::ExternalToolLaunch::Association { handler_id },
+                        file.to_path_buf(),
+                    );
+                }
+                None
+            }
+            MenuCommand::OpenExternalToolSettings => {
+                self.open_preferences_page(
+                    crate::ui_dialogs::preferences::PreferencesPage::ExternalTools,
+                );
+                None
+            }
+            MenuCommand::MoveToRecycleBin => {
+                if target.has_checked
+                    && classify_checked_file_operation_selection(
+                        target.checked_count,
+                        target.delete_targets.len(),
+                    ) != CheckedFileOperationSelection::RealOnly
+                {
+                    self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                    return None;
+                }
+                if !target.delete_targets.is_empty() {
+                    self.request_delete_confirm(target.delete_targets.clone());
+                }
+                None
+            }
+            MenuCommand::Deselect => {
+                self.checked.clear();
+                None
+            }
+            MenuCommand::RemoveReadingHistory => {
+                if let Some(idx) = target.item_index {
+                    self.remove_reading_history_entry_for_idx(idx);
                 }
                 None
             }
@@ -1821,15 +1637,27 @@ impl crate::app::App {
             None,
             ContextMenuSurface::Fullscreen,
         ) {
-            NativeGridContextMenuOutcome::Consumed(_) => {
+            NativeGridContextMenuOutcome::Consumed {
+                close_fullscreen, ..
+            } => {
                 self.fs_context_menu_idx = None;
                 self.cached_handlers = None;
                 ctx.request_repaint();
-                return false;
+                return close_fullscreen;
             }
             NativeGridContextMenuOutcome::Fallback => {}
         }
-
+        let target = self.context_menu_target(
+            idx,
+            item,
+            false,
+            false,
+            None,
+            ContextMenuSurface::Fullscreen,
+            explorer_folder,
+        );
+        let nodes = self.context_menu_nodes(&target, false);
+        let mut selected_command = None;
         let mut open = true;
         egui::Window::new("fs_context_menu")
             .id(egui::Id::new("fs_ctx_menu"))
@@ -1841,145 +1669,8 @@ impl crate::app::App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(200.0);
+                selected_command = render_egui_menu_nodes(ui, &nodes);
 
-                match &item {
-                    GridItem::Image(p) | GridItem::Video(p) | GridItem::Audio(p) => {
-                        if ui.button("パスをコピー").clicked() {
-                            copy_path_text(ctx, p);
-                            close = true;
-                        }
-                        if ui.button("ファイル名をコピー").clicked() {
-                            let name = p
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            ctx.copy_text(name);
-                            close = true;
-                        }
-                        if matches!(item, GridItem::Image(_)) {
-                            if ui.button("画像をクリップボードにコピー").clicked() {
-                                let rotation = self.get_rotation(idx);
-                                copy_image_to_clipboard(p, rotation);
-                                close = true;
-                            }
-                        }
-                        // ── アプリケーションで開く ──
-                        ui.separator();
-                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
-                        self.draw_legacy_xmp_context_entries(ui, vec![p.clone()], &mut close);
-                    }
-                    GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                        if ui.button("パスをコピー").clicked() {
-                            copy_path_text(ctx, p);
-                            close = true;
-                        }
-                        // ── アプリケーションで開く ──
-                        ui.separator();
-                        close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
-                    }
-                    GridItem::ZipImage {
-                        zip_path,
-                        entry_name,
-                    } => {
-                        let display = format!("{}:{}", native_path_text(zip_path), entry_name);
-                        if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(display);
-                            close = true;
-                        }
-                        let basename = crate::zip_loader::entry_basename(entry_name);
-                        if ui.button("ファイル名をコピー").clicked() {
-                            ctx.copy_text(basename.to_string());
-                            close = true;
-                        }
-                        if ui.button("画像をクリップボードにコピー").clicked() {
-                            let rotation = self.get_rotation(idx);
-                            copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
-                            close = true;
-                        }
-                    }
-                    GridItem::PdfPage {
-                        pdf_path, page_num, ..
-                    } => {
-                        let display =
-                            format!("{}:Page {}", native_path_text(pdf_path), page_num + 1);
-                        if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(display);
-                            close = true;
-                        }
-                        if ui.button("ページ名をコピー").clicked() {
-                            ctx.copy_text(format!("Page {}", page_num + 1));
-                            close = true;
-                        }
-                    }
-                    // ZipDir / Stack はフルスクリーン対象外 (仮想ナビコンテナ) なので FS では
-                    // 最小限 (そもそも FS の items にはメンバーの実 Image しか入らない)。
-                    GridItem::Folder(_) | GridItem::ZipDir { .. } | GridItem::Stack { .. } => {
-                        close = true;
-                    }
-                    GridItem::ConvertibleArchive { path, .. } => {
-                        if ui.button("パスをコピー").clicked() {
-                            copy_path_text(ctx, path);
-                            close = true;
-                        }
-                    }
-                    GridItem::SearchContainer { path, .. } => {
-                        // Ctrl+G 結果ビューのコンテナ (v0.8.0): コピー系のみ最低限
-                        if ui.button("パスをコピー").clicked() {
-                            copy_path_text(ctx, path);
-                            close = true;
-                        }
-                    }
-                }
-
-                if matches!(
-                    item,
-                    GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
-                ) {
-                    ui.separator();
-                    if ui.button("編集内容をコピー").clicked() {
-                        self.copy_page_edit_bundle(idx);
-                        close = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.has_page_edit_bundle_clipboard(),
-                            egui::Button::new("編集内容を貼り付け"),
-                        )
-                        .clicked()
-                    {
-                        self.request_paste_page_edit_bundle(idx);
-                        close = true;
-                    }
-                }
-
-                if matches!(item, GridItem::Video(_)) {
-                    ui.separator();
-                    if ui.button("📌 現在のフレームを動画サムネに設定").clicked()
-                    {
-                        #[cfg(windows)]
-                        self.pin_current_native_video_frame_for_input(ctx, idx);
-                        close = true;
-                    }
-                } else {
-                    // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
-                    // 条件分岐とそれに伴う separator 描画は helper 側に集約。
-                    if self.render_folder_pin_menu_entry(ui, &item) {
-                        close = true;
-                    }
-                }
-
-                if let Some(folder) = explorer_folder.as_ref() {
-                    ui.separator();
-                    if ui.button("このフォルダをエクスプローラで開く").clicked() {
-                        open_directory_in_explorer(folder);
-                        close = true;
-                    }
-                }
-
-                // メニュー外クリックで閉じる
-                // 右クリック長押しからの遷移時、右ボタンのリリースで
-                // secondary_clicked() が発火するため、左クリックのみで判定する
                 if ui.input(|i| i.pointer.primary_clicked()) && !ui.ui_contains_pointer() {
                     close = true;
                 }
@@ -1987,160 +1678,38 @@ impl crate::app::App {
                     close = true;
                 }
             });
-
+        if let Some(command) = selected_command {
+            close_fullscreen = match &command {
+                MenuCommand::ExternalTool(id) => native_external_tool_closes_fullscreen(
+                    target.surface,
+                    self.settings
+                        .external_tools
+                        .iter()
+                        .any(|tool| tool.id == *id),
+                ),
+                MenuCommand::OpenWithAssociation { .. } => true,
+                _ => false,
+            };
+            let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+            close = true;
+        }
         if close || !open {
             self.fs_context_menu_idx = None;
             self.cached_handlers = None;
         }
         close_fullscreen
     }
-
-    fn draw_legacy_xmp_context_entries(
-        &mut self,
-        ui: &mut egui::Ui,
-        mut paths: Vec<PathBuf>,
-        close: &mut bool,
-    ) {
-        paths.retain(|path| {
-            crate::xmp_writer::is_writable_format(path)
-                || crate::xmp_writer::is_video_for_sidecar(path)
-        });
-        paths.sort();
-        paths.dedup();
-        if paths.is_empty() {
-            return;
-        }
-        let count = paths.len();
-        ui.separator();
-        if ui
-            .button(format!("旧XMPタグを取り込む ({count})"))
-            .on_hover_text("ファイル内に残っている旧mIVの #タグをアプリ内タグへ取り込みます。")
-            .clicked()
-        {
-            self.request_legacy_xmp_import_for_paths(
-                paths.clone(),
-                crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportOnly,
-            );
-            *close = true;
-        }
-        if ui
-            .button(format!("旧XMPタグを取り込んでファイルから削除 ({count})"))
-            .on_hover_text("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
-            .clicked()
-        {
-            self.request_legacy_xmp_import_for_paths(
-                paths,
-                crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportAndRemove,
-            );
-            *close = true;
-        }
-    }
-
-    /// 「アプリケーションで開く」サブメニューを描画する。
-    /// Image / ZipFile / PdfFile で共通のロジック。
-    /// アプリが起動された場合は true を返す。
-    fn render_open_with_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        file_path: &std::path::Path,
-        close: &mut bool,
-    ) -> bool {
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e.to_lowercase()))
-            .unwrap_or_default();
-        let file_path_owned = file_path.to_path_buf();
-        let mut app_launched = false;
-
-        // 直近使用アプリ（最大3件）
-        for recent in self.settings.recent_open_with_apps.clone() {
-            let label = format!("{}で開く", recent.display_name);
-            if ui.button(&label).clicked() {
-                crate::open_with::launch_with_app(&recent.exe_path, &file_path_owned);
-                self.settings
-                    .record_recent_open_with(recent.display_name, recent.exe_path);
-                self.settings.save();
-                *close = true;
-                app_launched = true;
-            }
-        }
-
-        // アプリ一覧（折りたたみ展開）
-        egui::CollapsingHeader::new("アプリケーションで開く…").show(ui, |ui| {
-            // カスタムアプリ
-            let custom_apps = self.settings.custom_open_with_apps.clone();
-            if !custom_apps.is_empty() {
-                for app in &custom_apps {
-                    if ui.button(&app.display_name).clicked() {
-                        crate::open_with::launch_with_app(&app.exe_path, &file_path_owned);
-                        self.settings.record_recent_open_with(
-                            app.display_name.clone(),
-                            app.exe_path.clone(),
-                        );
-                        self.settings.save();
-                        *close = true;
-                        app_launched = true;
-                    }
-                }
-                ui.separator();
-            }
-
-            // システム関連付けアプリ（キャッシュ）
-            let handlers = match &self.cached_handlers {
-                Some((cached_ext, h)) if cached_ext == &ext => h.clone(),
-                _ => {
-                    let h = crate::open_with::enumerate_handlers(&ext);
-                    self.cached_handlers = Some((ext.clone(), h.clone()));
-                    h
-                }
-            };
-            for handler in &handlers {
-                if ui.button(&handler.display_name).clicked() {
-                    crate::open_with::launch_with_app(&handler.exe_path, &file_path_owned);
-                    self.settings.record_recent_open_with(
-                        handler.display_name.clone(),
-                        handler.exe_path.clone(),
-                    );
-                    self.settings.save();
-                    *close = true;
-                    app_launched = true;
-                }
-            }
-
-            // アプリ追加ボタン
-            ui.separator();
-            if ui.button("アプリケーションを追加…").clicked() {
-                if let Some(app) = crate::open_with::pick_exe_dialog() {
-                    let already = self
-                        .settings
-                        .custom_open_with_apps
-                        .iter()
-                        .any(|a| a.exe_path.eq_ignore_ascii_case(&app.exe_path));
-                    if !already {
-                        self.settings
-                            .custom_open_with_apps
-                            .push(crate::settings::RecentApp {
-                                display_name: app.display_name,
-                                exe_path: app.exe_path,
-                            });
-                        self.settings.save();
-                    }
-                }
-            }
-        });
-        app_launched
-    }
-
-    /// チェック済みアイテムのパスを収集する。
+    /// チェック済みアイテムの Shell ファイル操作対象を収集する。
     pub(crate) fn collect_checked_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for &idx in &self.checked {
-            if let Some(path) = self.items.get(idx).and_then(GridItem::file_operation_path) {
-                paths.push(path.to_path_buf());
-            }
-        }
-        paths
+        self.checked
+            .iter()
+            .filter_map(|&idx| {
+                self.items
+                    .get(idx)
+                    .and_then(GridItem::file_operation_path)
+                    .map(Path::to_path_buf)
+            })
+            .collect()
     }
 
     /// チェック済みアイテムの削除対象 (idx, path) を収集する (降順ソート)。
@@ -2328,15 +1897,24 @@ impl crate::app::App {
         if !self.checked.is_empty() {
             // チェック済みがある → まとめて削除
             let targets = self.collect_checked_indexed_paths();
+            if classify_checked_file_operation_selection(self.checked.len(), targets.len())
+                != CheckedFileOperationSelection::RealOnly
+            {
+                self.show_feedback_toast(checked_virtual_selection_message("削除"));
+                return;
+            }
             self.request_delete_confirm(targets);
         } else if let Some(idx) = self.selected {
-            // 単一選択
-            let Some(path) = self
-                .items
-                .get(idx)
-                .and_then(GridItem::drag_source_path)
-                .map(|p| p.to_path_buf())
-            else {
+            // 単一選択。実パスが無いときは黙って戻らず理由を出す。右クリックでは
+            // そもそも削除項目を出さないので、`Delete` キーだけが無反応だった
+            // (docs/item-kind-capability-matrix.md §6-5)。
+            let Some(item) = self.items.get(idx) else {
+                return;
+            };
+            let Some(path) = item.drag_source_path().map(|p| p.to_path_buf()) else {
+                if let Some(reason) = item.file_operation_refusal() {
+                    self.show_feedback_toast(reason.message("削除"));
+                }
                 return;
             };
             self.request_delete_confirm(vec![(idx, path)]);
@@ -2870,85 +2448,283 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 mod delete_confirm_tests {
     use super::*;
 
-    fn menu_commands(
-        app: &crate::app::App,
-        item: GridItem,
-        surface: ContextMenuSurface,
-    ) -> Vec<NativeMivCommand> {
-        let path = item
-            .drag_source_path()
-            .expect("test item should expose a file-operation path")
-            .to_path_buf();
-        let target = NativeGridContextMenuTarget {
-            paths: vec![path],
+    /// 拒否文は「なぜ実行されなかったか」と対処を伝えるので、読み切れる表示時間が要る。
+    /// 表示時間は文字数から決まる (`feedback_toast_duration`) ので、文言を伸ばしたときに
+    /// 上限で頭打ちになって読めなくなることがないよう、実際の文言でここを固定する。
+    #[test]
+    fn virtual_selection_refusal_toast_is_long_enough_to_read() {
+        let message = checked_virtual_selection_message("削除");
+        let chars = message.chars().count();
+        assert!(chars >= 50, "文言が想定より短い: {chars} 文字");
+        let secs = crate::ui_fullscreen::feedback_toast_duration(&message);
+        // 日本語の読字速度 (毎秒 8 文字程度) で読み切れること。
+        assert!(
+            secs >= 5.0,
+            "拒否文 {chars} 文字に対して表示時間が短い: {secs} 秒"
+        );
+    }
+
+    fn target(item: GridItem, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
+        let path = item.drag_source_path().map(Path::to_path_buf);
+        NativeGridContextMenuTarget {
+            shell_paths: path.clone().map(|path| vec![path]),
+            real_paths: path.into_iter().collect(),
+            delete_targets: Vec::new(),
             item,
             item_index: Some(0),
             is_folder_context: false,
             has_checked: false,
+            checked_count: 0,
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
+            folder_command_target: None,
+        }
+    }
+
+    fn menu_commands(
+        app: &mut crate::app::App,
+        item: GridItem,
+        surface: ContextMenuSurface,
+    ) -> Vec<MenuCommand> {
+        fn visit(nodes: &[MenuNode], commands: &mut Vec<MenuCommand>) {
+            for node in nodes {
+                match node {
+                    MenuNode::Item { command, .. } => commands.push(command.clone()),
+                    MenuNode::Submenu { children, .. } => visit(children, commands),
+                    MenuNode::Separator => {}
+                }
+            }
+        }
+        let target = target(item, surface);
+        let mut commands = Vec::new();
+        visit(&app.context_menu_nodes(&target, false), &mut commands);
+        commands
+    }
+
+    #[test]
+    fn checked_file_operation_selection_classifies_real_virtual_and_mixed() {
+        assert_eq!(
+            classify_checked_file_operation_selection(0, 0),
+            CheckedFileOperationSelection::Empty
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 3),
+            CheckedFileOperationSelection::RealOnly
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 0),
+            CheckedFileOperationSelection::VirtualOnly
+        );
+        assert_eq!(
+            classify_checked_file_operation_selection(3, 2),
+            CheckedFileOperationSelection::Mixed
+        );
+    }
+
+    #[test]
+    fn mixed_selection_menu_commands_toast_without_copying_or_deleting() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let mut target = target(
+            GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        target.has_checked = true;
+        target.checked_count = 2;
+        target.real_paths = vec![PathBuf::from(r"C:\media\real.jpg")];
+        target.delete_targets = vec![(0, PathBuf::from(r"C:\media\real.jpg"))];
+
+        let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ファイルのパスとしてコピーできません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+
+        app.fs_feedback_toast = None;
+        let _ =
+            app.dispatch_native_grid_context_command(&ctx, MenuCommand::MoveToRecycleBin, &target);
+        assert!(!app.show_delete_confirm);
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ページは削除できません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+    }
+
+    #[test]
+    fn virtual_item_keeps_a_native_miv_only_target() {
+        let mut app = crate::app::setup_app_for_test();
+        let item = GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+            page_num: 2,
+            content_type: None,
         };
-        app.native_grid_context_menu_items(&target, false)
-            .into_iter()
-            .map(|item| item.command)
-            .collect()
+        let target = app.context_menu_target(
+            0,
+            item,
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+
+        assert!(target.shell_paths.is_none());
+        assert_eq!(
+            native_grid_context_menu_target_kind(&target),
+            "virtual_item"
+        );
+        assert!(!app.context_menu_nodes(&target, false).is_empty());
+    }
+
+    #[test]
+    fn native_menu_appends_all_visible_external_tools_after_one_separator() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = (0..12)
+            .map(|index| {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.id = crate::external_tool::ExternalToolId(index + 1);
+                tool.name = format!("tool-{index}");
+                tool
+            })
+            .collect();
+        let mut hidden = crate::external_tool::ExternalTool::defaults_for_viewing();
+        hidden.id = crate::external_tool::ExternalToolId(99);
+        hidden.name = "hidden".to_string();
+        hidden.show_in_context_menu = false;
+        app.settings.external_tools.insert(4, hidden);
+
+        let target = NativeGridContextMenuTarget {
+            // checked の Shell paths と外部ツール対象 item は別 ownership。P1b は item 側。
+            shell_paths: Some(vec![PathBuf::from(r"C:\media\checked-other.jpg")]),
+            real_paths: vec![PathBuf::from(r"C:\media\checked-other.jpg")],
+            delete_targets: vec![(0, PathBuf::from(r"C:\media\checked-other.jpg"))],
+            item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            item_index: Some(0),
+            is_folder_context: false,
+            has_checked: true,
+            checked_count: 1,
+            surface: ContextMenuSurface::Grid,
+            explorer_folder: Some(PathBuf::from(r"C:\media")),
+            folder_command_target: None,
+        };
+
+        let items = app.context_menu_nodes(&target, false);
+        let external: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                MenuNode::Item {
+                    command: MenuCommand::ExternalTool(id),
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(external.len(), 12, "表示時に 10 件で打ち切らない");
+        assert_eq!(
+            external.iter().map(|id| id.0).collect::<Vec<_>>(),
+            (1..=12).collect::<Vec<_>>()
+        );
+        let first_external = items.iter().position(|node| {
+            matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::ExternalTool(_),
+                    ..
+                }
+            )
+        });
+        assert!(first_external.is_some_and(|index| index > 0));
+        assert!(matches!(
+            items[first_external.unwrap() - 1],
+            MenuNode::Separator
+        ));
+    }
+
+    #[test]
+    fn missing_external_tool_id_is_reported_instead_of_ignored() {
+        let mut app = crate::app::setup_app_for_test();
+        let target = target(
+            GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+
+        let action = app.dispatch_native_grid_context_command(
+            &egui::Context::default(),
+            MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(404)),
+            &target,
+        );
+
+        assert!(action.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("外部ツールが見つかりません") && text.contains("404")
+        }));
+    }
+
+    #[test]
+    fn native_external_tool_closes_only_fullscreen_surface_after_lookup() {
+        assert!(native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Fullscreen,
+            true
+        ));
+        assert!(!native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Grid,
+            true
+        ));
+        assert!(!native_external_tool_closes_fullscreen(
+            ContextMenuSurface::Fullscreen,
+            false
+        ));
     }
 
     #[test]
     fn fullscreen_video_menu_uses_frame_thumbnail_action_without_image_only_actions() {
-        let app = crate::app::setup_app_for_test();
+        let mut app = crate::app::setup_app_for_test();
         let commands = menu_commands(
-            &app,
+            &mut app,
             GridItem::Video(PathBuf::from("movie.mp4")),
             ContextMenuSurface::Fullscreen,
         );
 
         for required in [
-            NativeMivCommand::Rename,
-            NativeMivCommand::CopyPath,
-            NativeMivCommand::CopyFileName,
-            NativeMivCommand::SetCurrentVideoFrameThumbnail,
+            MenuCommand::Rename,
+            MenuCommand::CopyPath,
+            MenuCommand::CopyFileName,
+            MenuCommand::SetCurrentVideoFrameThumbnail,
         ] {
             assert!(commands.contains(&required), "missing {required:?}");
         }
         for invalid in [
-            NativeMivCommand::RotateLeft,
-            NativeMivCommand::RotateRight,
-            NativeMivCommand::ToggleRepresentativeThumb,
+            MenuCommand::RotateLeft,
+            MenuCommand::RotateRight,
+            MenuCommand::ToggleRepresentativeThumb,
         ] {
             assert!(!commands.contains(&invalid), "unexpected {invalid:?}");
         }
-        assert_eq!(
-            commands.last(),
-            Some(&NativeMivCommand::OpenFolderInExplorer),
-            "Explorer action must remain the last mIV item"
-        );
+        assert!(commands.contains(&MenuCommand::OpenFolderInExplorer));
     }
 
     #[test]
     fn context_menu_surface_keeps_grid_video_and_fullscreen_image_rotation_actions() {
-        let app = crate::app::setup_app_for_test();
+        let mut app = crate::app::setup_app_for_test();
         let grid_video = menu_commands(
-            &app,
+            &mut app,
             GridItem::Video(PathBuf::from("movie.mp4")),
             ContextMenuSurface::Grid,
         );
-        assert!(grid_video.contains(&NativeMivCommand::RotateLeft));
-        assert!(grid_video.contains(&NativeMivCommand::RotateRight));
-        assert!(!grid_video.contains(&NativeMivCommand::SetCurrentVideoFrameThumbnail));
+        assert!(grid_video.contains(&MenuCommand::RotateLeft));
+        assert!(grid_video.contains(&MenuCommand::RotateRight));
+        assert!(!grid_video.contains(&MenuCommand::SetCurrentVideoFrameThumbnail));
 
         let fullscreen_image = menu_commands(
-            &app,
+            &mut app,
             GridItem::Image(PathBuf::from("image.png")),
             ContextMenuSurface::Fullscreen,
         );
-        assert!(fullscreen_image.contains(&NativeMivCommand::RotateLeft));
-        assert!(fullscreen_image.contains(&NativeMivCommand::RotateRight));
-        assert!(!fullscreen_image.contains(&NativeMivCommand::SetCurrentVideoFrameThumbnail));
-        assert_eq!(
-            fullscreen_image.last(),
-            Some(&NativeMivCommand::OpenFolderInExplorer)
-        );
+        assert!(fullscreen_image.contains(&MenuCommand::RotateLeft));
+        assert!(fullscreen_image.contains(&MenuCommand::RotateRight));
+        assert!(!fullscreen_image.contains(&MenuCommand::SetCurrentVideoFrameThumbnail));
+        assert!(fullscreen_image.contains(&MenuCommand::OpenFolderInExplorer));
     }
 
     #[test]

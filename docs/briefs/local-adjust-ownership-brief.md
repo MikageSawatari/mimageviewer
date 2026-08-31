@@ -4,6 +4,33 @@
 master 側の主セッションは細かいバグ修正、`external-tool-launch` worktree は外部プログラム起動を
 並行して進めている。ファイルの重なりは §7 を見ること。
 
+## 0. まず作業場所を確認する — master では作業しない
+
+**この作業は専用の worktree で行う。** `C:/home/mimageviewer` (master) には別セッションが
+同時に居るので、そこで `src/` を編集すると index と HEAD を取り合うことになる
+(実際に 2026-08-30、bare commit が別セッションの編集を巻き込む事故が起きている)。
+
+`git rev-parse --show-toplevel` が `C:/home/mimageviewer` を返したら、**まだ作業を始めず**、
+利用者へ worktree の作成を依頼すること。作成コマンドは以下 (利用者が PowerShell で実行する):
+
+```powershell
+git worktree add ..\mimageviewer-localadjust -b local-adjust-ownership
+robocopy .\vendor ..\mimageviewer-localadjust\vendor /E /XD target vst3sdk /NFL /NDL /NJH /NJS /NP
+```
+
+`src/` を触る = 本体パッケージをビルドするので `vendor/` が要る (`build.rs` が必須ファイルを
+検査する)。**junction や symlink で共有しない** — worktree 撤収時の再帰削除で main 側の
+`vendor/` を消す事故が複数回起きている。robocopy は `target` を除いてビルド成果物 4.2 GB を
+落とし、`vst3sdk` は C++ ブリッジを再ビルドしない限り不要。コピーは 800 MB 程度。
+robocopy はコピーがあると終了コード 1 を返すが、**これは成功**である。
+
+すでに master 側で編集を始めてしまっていた場合は、**その変更を消さずに** worktree へ移す。
+`git checkout --` や `git restore` で master 側を巻き戻すのは最後にすること (未コミットの
+変更は git では復元できない)。
+
+worktree の撤収は必ず `.\scripts\safe-worktree-remove.ps1 <path>` を通す。
+
+
 ## 1. 何を直すのか
 
 補正レイヤー (ローカル調整) の編集で、**大きな編集文書を UI スレッドが所有して、複製して、

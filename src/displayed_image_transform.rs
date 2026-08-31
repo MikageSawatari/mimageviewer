@@ -255,6 +255,32 @@ impl DisplayedImageTransform {
         })
     }
 
+    /// 貼り先を **平行移動だけ** する。倍率・UV・寸法は動かさない。
+    ///
+    /// 見開きは左右のページを独立に物理ピクセルへ寄せるので、レイアウトが空けた間隔が
+    /// 最終矩形では保たれない (§1.154: 1px 設定が縮小時に 2px になる)。寄せた後の整数幅が
+    /// 分かってから、1 つの所有者が両方を置き直すためにこれを使う。
+    ///
+    /// **`from_resolved_rect` へ通し直さないこと。** あの関数は寄せ済みの矩形から倍率を
+    /// 導き直すので冪等ではなく、通すたびに 1px 縮む (§1.0e で確認済み)。
+    ///
+    /// `offset` は**物理ピクセルの整数倍**を渡す。半端な移動は、§1.0e で揃えた
+    /// 「整数サイズのテクスチャを整数位置へ貼る」を崩す。
+    pub(crate) fn translated_by(self, offset: egui::Vec2) -> Self {
+        let full_image_rect = self.full_image_rect.translate(offset);
+        let paint_rect = self.paint_rect.translate(offset);
+        // hit_rect は clip 済みなので平行移動では作り直せない。構築時と同じ式で組み直す。
+        let hit_rect =
+            rotated_rect_aabb(paint_rect, full_image_rect.center(), self.free_rotation_rad)
+                .intersect(self.viewport_rect);
+        Self {
+            full_image_rect,
+            paint_rect,
+            hit_rect,
+            ..self
+        }
+    }
+
     /// 貼り先の矩形と、そこへ貼るテクスチャを作るときの倍率。
     ///
     /// **2 つで 1 つの答え。** リサンプラは倍率から整数サイズのテクスチャを作り、
@@ -820,33 +846,60 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
 /// 通常は [`DisplayedImageTransform`] 側 (`RectPixelFit`) が呼ぶ。手で矩形を組んで
 /// リサンプラ出力を貼る場所 (detached の keepalive backstop など) は transform を
 /// 持たないので、そこだけがこの関数を直接呼ぶ。
+/// [`snap_rect_to_physical_pixels`] がその倍率で何をするか。
+///
+/// **分岐をここ 1 か所だけに置く。** 「寄せた後だから整数に揃っているはず」と前提する側が
+/// 別に同じ 3 分岐を書くと、揃っていない矩形を揃っている前提で動かして壊す
+/// (§1.154 の 1 度目の修正が実際にそれで、端数のある拡大の見開きで間隔を崩した)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RectSnapMode {
+    /// 何もしない。端数のある拡大。出力サイズは画像全体ではなく可視領域から決まるので、
+    /// 全体矩形を寄せても一致しない。**矩形は小数のまま。**
+    None,
+    /// 原点だけ寄せる。整数倍拡大はサイズが元から整数。
+    Origin,
+    /// 原点とサイズの両方を寄せる。縮小。リサンプラの整数出力と貼り先を一致させる。
+    OriginAndSize,
+}
+
+pub(crate) fn rect_snap_mode(logical_scale: f32, pixels_per_point: f32) -> RectSnapMode {
+    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
+        return RectSnapMode::Origin;
+    }
+    let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
+    if physical_scale.is_finite() && physical_scale > 0.0 && physical_scale < 1.0 {
+        RectSnapMode::OriginAndSize
+    } else {
+        RectSnapMode::None
+    }
+}
+
 pub(crate) fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
     display_size: egui::Vec2,
     logical_scale: f32,
     pixels_per_point: f32,
 ) -> egui::Rect {
-    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
-        let snapped_min = egui::pos2(
-            quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
-            quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
-        );
-        return egui::Rect::from_min_size(snapped_min, rect.size());
-    }
-    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
-    let physical_scale = logical_scale * pixels_per_point;
-    if !physical_scale.is_finite() || physical_scale <= 0.0 || physical_scale >= 1.0 {
+    let mode = rect_snap_mode(logical_scale, pixels_per_point);
+    if matches!(mode, RectSnapMode::None) {
         return rect;
     }
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
     let snapped_min = egui::pos2(
         quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
         quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
     );
-    let snapped_size = egui::vec2(
-        physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
-        physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
-    );
-    egui::Rect::from_min_size(snapped_min, snapped_size)
+    let size = match mode {
+        RectSnapMode::Origin | RectSnapMode::None => rect.size(),
+        RectSnapMode::OriginAndSize => {
+            let physical_scale = logical_scale * pixels_per_point;
+            egui::vec2(
+                physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
+                physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
+            )
+        }
+    };
+    egui::Rect::from_min_size(snapped_min, size)
 }
 
 fn size_is_valid(size: egui::Vec2) -> bool {

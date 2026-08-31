@@ -5349,14 +5349,33 @@ fn content_identity_physical_listing_predicate_excludes_mixed_and_archive_surfac
         entry_name: "page.png".to_string(),
     }];
     assert!(!app.is_physical_folder_listing(), "ZIP 内一覧は対象外");
+    // PDF を開くと current_folder は PDF 自身になる (両方の PdfPage 構築経路が
+    // `start_loading_items(pdf_path, ..)` を呼ぶ)。marker も PDF に揃えて、他の guard を
+    // すべて通した状態で「PDF ページ一覧だから対象外」だけが効くことを確かめる。
+    let pdf = folder.join("book.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: pdf.clone(),
+        counts: Default::default(),
+    });
     app.items = vec![GridItem::PdfPage {
-        pdf_path: folder.join("book.pdf"),
+        pdf_path: pdf.clone(),
         page_num: 0,
         content_type: None,
     }];
     assert!(!app.is_physical_folder_listing(), "PDF 内一覧も対象外");
 
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: folder.clone(),
+        counts: Default::default(),
+    });
     app.items = vec![GridItem::Image(folder.join("page.png"))];
+    assert!(
+        app.is_physical_folder_listing(),
+        "通常フォルダへ戻れば再び物理一覧"
+    );
+
     app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
         folder: app.tmp.path().join("other"),
         counts: Default::default(),
@@ -27070,8 +27089,9 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn grid_container_kind_checks_use_homogeneous_leading_item() {
+    fn grid_container_kind_checks_follow_what_is_open() {
         let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from("c:/book.pdf"));
         app.items = vec![
             GridItem::PdfPage {
                 pdf_path: PathBuf::from("c:/book.pdf"),
@@ -27087,6 +27107,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
 
+        app.current_folder = Some(PathBuf::from("c:/book.zip"));
         app.items = vec![GridItem::ZipImage {
             zip_path: PathBuf::from("c:/book.zip"),
             entry_name: "chapter/page.jpg".into(),
@@ -27094,9 +27115,33 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.grid_is_pdf_pages());
         assert!(app.grid_is_zip_entries());
 
+        app.current_folder = Some(PathBuf::from("c:/p"));
         app.items = vec![GridItem::Image(PathBuf::from("c:/p/a.jpg"))];
         assert!(!app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
+    }
+
+    /// ★ 横断一覧は実ファイルと PDF ページを同じ一覧に並べる。ここで Ctrl+F の可否を
+    /// 先頭 item で決めると、並び順の偶然で一覧全体の絞り込みが落ちる
+    /// (docs/item-kind-capability-matrix.md §6-11)。開いているのは合成パスであって
+    /// PDF ではないので、先頭がページでも Ctrl+F は生きていること。
+    #[test]
+    fn mixed_rating_list_keeps_ctrl_f_even_when_a_pdf_page_leads() {
+        let mut app = setup_app();
+        app.current_folder = Some(crate::app::rating_view_synthetic_path());
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("c:/book.pdf"),
+                page_num: 3,
+                content_type: None,
+            },
+            GridItem::Image(PathBuf::from("c:/p/a.jpg")),
+        ];
+        assert!(!app.grid_is_pdf_pages());
+
+        // 逆順でも同じ答えになること (= 並び順に依存しない)。
+        app.items.reverse();
+        assert!(!app.grid_is_pdf_pages());
     }
 
     #[test]
@@ -56896,6 +56941,43 @@ mod file_operation_selection_tests {
     }
 
     #[test]
+    fn delete_key_rejects_mixed_real_and_virtual_selection() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        let pdf_page = push_item(
+            &mut app,
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        );
+        app.checked = HashSet::from([image, pdf_page]);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        app.handle_delete_key(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(!app.show_delete_confirm);
+        assert!(app.delete_targets.is_empty());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("ページは削除できません")
+                && toast.0.contains("ページの選択を外してから")
+        }));
+    }
+
+    #[test]
     fn shell_clipboard_paths_include_real_folders_and_reject_virtual_pages() {
         let mut app = setup_app();
 
@@ -56920,7 +57002,9 @@ mod file_operation_selection_tests {
         app.checked.insert(zip_page);
         assert_eq!(
             app.collect_shell_clipboard_paths(),
-            Err(ShellClipboardSelectionError::UncopyableItem),
+            Err(ShellClipboardSelectionError::UncopyableItem(Some(
+                crate::grid_item::FileOperationRefusal::VirtualPage
+            ))),
             "mixed real + virtual checked selections must not silently copy only the real subset",
         );
 
@@ -56937,7 +57021,9 @@ mod file_operation_selection_tests {
         app.selected = Some(zip_page);
         assert_eq!(
             app.collect_shell_clipboard_paths(),
-            Err(ShellClipboardSelectionError::UncopyableItem),
+            Err(ShellClipboardSelectionError::UncopyableItem(Some(
+                crate::grid_item::FileOperationRefusal::VirtualPage
+            ))),
             "a selected virtual item should produce the same visible rejection path",
         );
     }
@@ -64607,6 +64693,93 @@ fn the_gamepad_destination_and_the_action_surface_agree() {
             app.current_input_surface_for_test(),
             surface,
             "面の解決が直近の面と食い違っている: {surface:?}"
+        );
+    }
+}
+
+/// フルスクリーンを出るときは、セッションが開いていなくても持ち越しを手放す。
+///
+/// フルスクリーン退出は**無条件に** `close_video_seek_strip` を呼ぶ。ストリップを閉じた
+/// まま退出した経路にはセッションが無いので、早期 return より前に手放さないと、動画を
+/// 見ていないあいだワーカーが残る。HUD が隠れただけなら、逆に手放してはいけない
+/// (§1.146 の直す対象そのもの)。
+#[test]
+#[cfg(windows)]
+fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
+    for (cause, still_held) in [
+        (
+            crate::video::seek_strip::SeekStripCloseCause::HudHidden,
+            true,
+        ),
+        (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
+        (
+            crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
+            false,
+        ),
+        (
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            false,
+        ),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 開けないパスでよい。ここで見たいのは持ち越しの所在であって解析結果ではない。
+        let path = dir.path().join("clip.mp4");
+        app.video_seek_strip_wave_holdover = Some(native_video::HeldSeekStripWaveWorker {
+            path: path.clone(),
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path),
+        });
+
+        app.close_video_seek_strip(cause);
+
+        assert_eq!(
+            app.video_seek_strip_wave_holdover.is_some(),
+            still_held,
+            "{cause:?} のあとの持ち越し"
+        );
+    }
+}
+
+/// 別ウィンドウで開いているものが動画なら、十字キーは動画の面へ行く。
+///
+/// 利用者報告 (§1.0f(b)): 別ウィンドウで動画を開いていると十字キーでシークできない。
+/// **静止画では効く**ので、配り先そのものは届いている。対比をそのままテストにする。
+///
+/// 配り先は mount 済みの context で決まる (`dispatch_gamepad_batch` の doc) ので、
+/// root projection ではなく `with_active_viewer_context` の中で問う。
+#[test]
+#[cfg(windows)]
+fn what_the_detached_window_holds_decides_which_dpad_branch_runs() {
+    for (label, item, expected) in [
+        (
+            "動画",
+            GridItem::Video(PathBuf::from("C:/videos/clip.mp4")),
+            crate::app::gamepad_input::DpadRoute::Video(0),
+        ),
+        (
+            "静止画",
+            GridItem::Image(PathBuf::from("C:/photos/page.jpg")),
+            crate::app::gamepad_input::DpadRoute::Still(0),
+        ),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let window_id = 81;
+        app.build_window_context_for_test(window_id, |bundle| {
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.items = vec![item];
+            bundle.fullscreen_idx = Some(0);
+        });
+        app.detached_viewer_window_id = Some(window_id);
+        // 前面が別ウィンドウ = 直近に配った面がビューア。前面 HWND はテストから触れない。
+        app.detached_window_manager
+            .note_input_surface(crate::app::ActionSurface::Viewer);
+
+        let route = app.with_active_viewer_context(|app| app.dpad_route_for_test());
+
+        assert_eq!(
+            route,
+            Some(expected),
+            "別ウィンドウが{label}を持っているときの配り先が違う"
         );
     }
 }

@@ -4222,6 +4222,65 @@ fn fs_texture_content_rect(
 /// The layout rectangle is therefore only a containing frame. Re-resolve the final
 /// image rectangle from the actual texture at this ownership boundary so no caller
 /// can publish a non-uniform pixel scale when those aspects differ transiently.
+/// 見開きの左右を、寄せ終わった後に**一体で**置き直すための平行移動量。
+///
+/// `layout_spread_page_rects` は小数のまま設定どおりの間隔を空けるが、その後 `RectPixelFit`
+/// の寄せが左右を**独立に**物理ピクセルへ丸めるので、間隔が保たれない (§1.154。1249x2272 を
+/// 2560x1440 へ高さフィットすると片ページ 791.62px となり、左 `x=488 幅 791` / 右 `x=1281` で
+/// 実測 2px)。縮小後の幅が整数になる組み合わせでは 1px のままなので、発症が画像で変わる。
+///
+/// 返す量は**物理ピクセルの整数倍**。半端に動かすと、§1.0e で揃えた「整数サイズの
+/// テクスチャを整数位置へ貼る」が崩れて縮小がボケる。
+///
+/// 間隔は**実際に見えている内側端**で測る。表示トリム中はフル画像矩形の端ではなく
+/// `paint_rect` の端が見える境界なので、そちらを合わせる。
+fn align_spread_pages_for_gap(
+    left: &DisplayedImageTransform,
+    right: &DisplayedImageTransform,
+    gap_px: f32,
+    center_x: f32,
+    pixels_per_point: f32,
+) -> (egui::Vec2, egui::Vec2) {
+    // **倍率や `RectSnapMode` で分岐しない。** 見える 2 辺を直接置くので、寄せ済みかどうかに
+    // 依らず答えは同じになる。ここに条件を足すと、貼るテクスチャが差し替わった瞬間
+    // (サムネイル → 元解像度 → AI アップスケール) だけ合わせが効かなくなり、**中央の線が
+    // 一瞬太さを変える**。実際、最初は「寄せていないなら動かさない」条件を置いていて、
+    // 1/8 解像度の中間テクスチャで 0.89px ずれていた (利用者報告)。
+    //
+    // 中間テクスチャの縦横比は整数丸めで元と僅かに違う。`fs_texture_content_rect` がその比で
+    // 縮めるため、貼り先はレイアウト矩形より少し狭くなる。だから「レイアウトが空けた間隔が
+    // そのまま正しい」も成り立たない。
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let to_px = |value: f32| value * ppp;
+    let left_visible_px = to_px(left.paint_rect.width());
+    let right_visible_px = to_px(right.paint_rect.width());
+    if !(left_visible_px.is_finite() && right_visible_px.is_finite()) {
+        return (egui::Vec2::ZERO, egui::Vec2::ZERO);
+    }
+
+    // **合わせるのは内側の 2 辺。** ここが利用者に見える間隔の境界であり、自動トリム中は
+    // フル画像矩形の端ではない (トリムは `paint_rect` を全体矩形の小数分の 1 にする)。
+    //
+    // トリム中に全体矩形を整数へ寄せても意味が無い。ラスタライズされるのは `paint_rect` の
+    // 頂点で、全体矩形は使われないからである。寄せる相手を間違えると間隔は端数のまま残り、
+    // **ページごとに違う太さに見える** (実測ページで -0.48px 〜 +1.70px。利用者報告)。
+    let total_visible_px = left_visible_px + gap_px + right_visible_px;
+    let visible_start_px = to_px(center_x) - total_visible_px * 0.5;
+    // 左ページの右端 = 間隔の左側の境界。ここを物理ピクセル境界へ置く。
+    // トリムが無ければ可視幅は整数なので、左ページの左端も従来どおり整数に乗る。
+    let boundary_px = (visible_start_px + left_visible_px).round();
+
+    let offset = |target_px: f32, current: f32| egui::vec2((target_px - to_px(current)) / ppp, 0.0);
+    (
+        offset(boundary_px, left.paint_rect.max.x),
+        offset(boundary_px + gap_px, right.paint_rect.min.x),
+    )
+}
+
 fn resolve_fs_transform_in_layout_rect(
     input: DisplayedImageTransformInput,
     page_rect: egui::Rect,
@@ -4524,8 +4583,56 @@ fn format_duration_mm_ss(secs: f64) -> String {
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
-/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
 pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+const FEEDBACK_TOAST_BASE_CHARS: usize = 20;
+/// 1 文字あたりの加算秒。**日本語の読字速度は毎秒 8 文字程度**なので、その逆数を取る。
+/// 0.06 (= 毎秒 17 文字) では読み切る前に消えた (2026-08-30、混在選択の拒否文で実測報告)。
+const FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR: f32 = 0.12;
+/// 上限。長すぎるトーストは邪魔になるが、拒否理由と対処を書いた長文案内にも
+/// 5 秒以上を確保する。既存の長文ヒント (`NO_IMAGE_FOLDER_HINT_DURATION` = 4.0) より長い。
+const FEEDBACK_TOAST_MAX_DURATION: f32 = 5.5;
+
+/// 短文は従来の 1.2 秒を維持し、20 文字を超えた分だけ表示時間を延ばす。
+/// 日本語を 1 文字として扱うため、byte 長ではなく Unicode scalar value 数で計算する。
+pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
+    let extra_chars = text
+        .chars()
+        .count()
+        .saturating_sub(FEEDBACK_TOAST_BASE_CHARS);
+    (FEEDBACK_TOAST_DURATION + extra_chars as f32 * FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR)
+        .min(FEEDBACK_TOAST_MAX_DURATION)
+}
+
+fn feedback_toast_layer_id(drawing_surface: crate::app::ActionSurface) -> egui::LayerId {
+    let id = match drawing_surface {
+        crate::app::ActionSurface::MainWindow => "feedback_toast_main_window",
+        crate::app::ActionSurface::Viewer => "feedback_toast_viewer",
+    };
+    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(id))
+}
+
+fn feedback_toast_rect(
+    full_rect: egui::Rect,
+    toast_size: egui::Vec2,
+    avoid_rect: Option<egui::Rect>,
+) -> egui::Rect {
+    let mut toast_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            full_rect.max.x - toast_size.x - 20.0,
+            full_rect.min.y + 60.0,
+        ),
+        toast_size,
+    );
+    if let Some(avoid_rect) = avoid_rect
+        && toast_rect.intersects(avoid_rect)
+    {
+        toast_rect = toast_rect.translate(egui::vec2(
+            0.0,
+            avoid_rect.bottom() + 8.0 - toast_rect.top(),
+        ));
+    }
+    toast_rect
+}
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -27501,6 +27608,8 @@ impl App {
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                // 連結読みは 1 ページずつ積むので、左右の間隔合わせは要らない。
+                egui::Vec2::ZERO,
             ) {
                 self.trace_fs_continuous_page_draw(
                     page.idx,
@@ -29805,9 +29914,71 @@ impl App {
                 content_active,
             );
 
+            // 左右を独立に物理ピクセルへ寄せると、レイアウトが空けた間隔が最終矩形では
+            // 保たれない (§1.154)。寄せ終わった矩形を先に求め、1 か所で両方を置き直す。
+            // 片側だけ寄せ直さないのは、それだと組が中心からずれるため。
+            let spread_offsets = {
+                let mut resolve = |rect,
+                                   idx,
+                                   source_size,
+                                   layout_source,
+                                   rot,
+                                   display_tex,
+                                   allow_thumbnail,
+                                   content_bbox| {
+                    let handle =
+                        self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail)?;
+                    self.resolve_fs_spread_page_transform(
+                        &handle,
+                        image_rect,
+                        rect,
+                        idx,
+                        source_size,
+                        layout_source,
+                        rot,
+                        content_bbox,
+                        pixels_per_point,
+                        resolved_placement,
+                    )
+                };
+                let left = resolve(
+                    spread_rects.left_rect,
+                    left_idx,
+                    left_coordinate_size,
+                    left_page_layout_source,
+                    left_rot,
+                    left_display_tex.as_ref(),
+                    left_allow_thumbnail,
+                    content_left,
+                );
+                let right = resolve(
+                    spread_rects.right_rect,
+                    right_idx,
+                    right_coordinate_size,
+                    right_page_layout_source,
+                    right_rot,
+                    right_display_tex.as_ref(),
+                    right_allow_thumbnail,
+                    content_right,
+                );
+                match (left, right) {
+                    (Some(left), Some(right)) => align_spread_pages_for_gap(
+                        &left,
+                        &right,
+                        (effective_gap.max(0.0) * pixels_per_point).round(),
+                        center.x,
+                        pixels_per_point,
+                    ),
+                    // 片方でも最終矩形が出せないなら合わせない (もう片方だけ動かすと
+                    // 組が中心からずれる)。
+                    _ => (egui::Vec2::ZERO, egui::Vec2::ZERO),
+                }
+            };
+
             self.fullscreen_page_layout
                 .begin(FullscreenPageLayoutKind::Spread);
             for (
+                page_offset,
                 rect,
                 idx,
                 source_size,
@@ -29819,6 +29990,7 @@ impl App {
                 content_bbox,
             ) in [
                 (
+                    spread_offsets.0,
                     spread_rects.left_rect,
                     left_idx,
                     left_coordinate_size,
@@ -29830,6 +30002,7 @@ impl App {
                     content_left,
                 ),
                 (
+                    spread_offsets.1,
                     spread_rects.right_rect,
                     right_idx,
                     right_coordinate_size,
@@ -29856,6 +30029,7 @@ impl App {
                     content_bbox,
                     pixels_per_point,
                     resolved_placement,
+                    page_offset,
                 ) {
                     self.fullscreen_page_layout.push(transform);
                 }
@@ -29938,6 +30112,9 @@ impl App {
                     content_bbox,
                     pixels_per_point,
                     ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
+                    // いること) が成り立たないので、ここでは合わせない。
+                    egui::Vec2::ZERO,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -29985,6 +30162,86 @@ impl App {
     /// `display_tex` は `resolve_fs_processed_texture` で解決済みの加工済みテクスチャ。
     /// ここではページ単位の thumbnail フォールバックだけを担当する。
     #[allow(clippy::too_many_arguments)]
+    /// 見開き 1 ページに実際に貼るリソース。サムネイル代替までを含めて **1 か所で**決める。
+    ///
+    /// 配置合わせ (`align_spread_pages_for_gap`) は描画より前に左右の最終矩形を知る必要が
+    /// あり、そのために同じ解決をもう一度通る。ここを 2 か所に綴ると、合わせた矩形と
+    /// 描いた矩形が別のテクスチャ由来になり得る。
+    fn fs_spread_page_paint_resource(
+        &mut self,
+        idx: usize,
+        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        allow_thumbnail: bool,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        display_tex.cloned().or_else(|| {
+            allow_thumbnail
+                .then(|| {
+                    self.fs_thumbnail_texture_for_display(idx)
+                        .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
+                })
+                .flatten()
+        })
+    }
+
+    /// 見開き 1 ページの最終 transform。**描画と配置合わせが同じ答えを見るための入口。**
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_fs_spread_page_transform(
+        &mut self,
+        handle: &crate::gpu_lanczos::FullscreenPaintResource,
+        viewport_rect: egui::Rect,
+        rect: egui::Rect,
+        idx: usize,
+        source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
+        rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
+        pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
+    ) -> Option<DisplayedImageTransform> {
+        let tex_size = handle.size_vec2();
+        let layout_size = match layout_source {
+            FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
+            FsPageLayoutSource::CurrentItem => {
+                let preserve_texture_aspect =
+                    self.is_passthrough_rendition_texture(handle.source_texture());
+                let use_layout = preserve_texture_aspect
+                    || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
+                use_layout
+                    .then(|| self.fs_page_layout_source_size(idx))
+                    .flatten()
+                    .unwrap_or(tex_size)
+            }
+        };
+        let display_size = match rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+                egui::vec2(layout_size.y, layout_size.x)
+            }
+            _ => layout_size,
+        };
+        let page_rect = fit_display_size_in_rect(rect, display_size);
+        resolve_fs_transform_in_layout_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: idx,
+                viewport_rect,
+                source_size: source_size.unwrap_or(tex_size),
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                content_bbox,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
+                pixels_per_point,
+                placement,
+            },
+            page_rect,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         &mut self,
         painter: &egui::Painter,
@@ -30001,57 +30258,26 @@ impl App {
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
         placement: ResolvedDisplayPlacement,
+        // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
+        translate: egui::Vec2,
     ) -> Option<DisplayedImageTransform> {
-        let thumb_tex = if allow_thumbnail {
-            self.fs_thumbnail_texture_for_display(idx)
-                .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
-        } else {
-            None
-        };
-        let display_tex = display_tex.or(thumb_tex.as_ref());
-
-        if let Some(handle) = display_tex {
-            let tex_size = handle.size_vec2();
-            let layout_size = match layout_source {
-                FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
-                FsPageLayoutSource::CurrentItem => {
-                    let preserve_texture_aspect =
-                        self.is_passthrough_rendition_texture(handle.source_texture());
-                    let use_layout = preserve_texture_aspect
-                        || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-                    use_layout
-                        .then(|| self.fs_page_layout_source_size(idx))
-                        .flatten()
-                        .unwrap_or(tex_size)
-                }
-            };
-            let display_size = match rotation {
-                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                    egui::vec2(layout_size.y, layout_size.x)
-                }
-                _ => layout_size,
-            };
-            let page_rect = fit_display_size_in_rect(rect, display_size);
-            let transform = resolve_fs_transform_in_layout_rect(
-                DisplayedImageTransformInput {
-                    pixel_fit: RectPixelFit::Texels,
-                    page_idx: idx,
+        let handle = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
+        if let Some(handle) = handle {
+            let handle = &handle;
+            let transform = self
+                .resolve_fs_spread_page_transform(
+                    handle,
                     viewport_rect,
-                    source_size: source_size.unwrap_or(tex_size),
-                    texture_size: tex_size,
+                    rect,
+                    idx,
+                    source_size,
+                    layout_source,
                     rotation,
-                    free_rotation_rad: 0.0,
                     content_bbox,
-                    fit_mode: FullscreenFitMode::Page,
-                    fit_scale_limits: FullscreenFitScaleLimits {
-                        pixels_per_point,
-                        ..FullscreenFitScaleLimits::default()
-                    },
                     pixels_per_point,
                     placement,
-                },
-                page_rect,
-            )?;
+                )?
+                .translated_by(translate);
             // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
                 paint_transparent_bg(painter, transform.paint_rect, bg_style);
@@ -32256,28 +32482,42 @@ impl App {
         };
         let alpha_u8 = (alpha * 220.0) as u8;
 
+        // Foreground のチェック件数パネルより上で描画し、クリック判定も同じ層へ置く。
+        let toast_layer_id = feedback_toast_layer_id(drawing_surface);
+        let toast_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(toast_layer_id)
+                .max_rect(full_rect),
+        );
         let font = egui::FontId::proportional(18.0);
-        let galley = ui
-            .painter()
-            .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let galley =
+            toast_ui
+                .painter()
+                .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
         let text_size = galley.size();
         let padding = egui::vec2(16.0, 10.0);
         let toast_size = text_size + padding * 2.0;
 
-        let toast_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                full_rect.max.x - toast_size.x - 20.0,
-                full_rect.min.y + 60.0,
-            ),
-            toast_size,
-        );
+        // 一覧では実測したチェック件数パネルの下へ逃がし、「選択解除」を覆わない。
+        // フルスクリーン、ダイアログ中などパネルが出ない場面は従来位置を維持する。
+        let checked_overlay_rect = (drawing_surface == crate::app::ActionSurface::MainWindow
+            && !self.checked.is_empty()
+            && !self.viewer_session_blocks_main_window()
+            && !self.any_dialog_open())
+        .then(|| {
+            ctx.memory(|memory| {
+                memory.area_rect(egui::Id::new(crate::ui_main::CHECKED_SELECTION_OVERLAY_ID))
+            })
+        })
+        .flatten();
+        let toast_rect = feedback_toast_rect(full_rect, toast_size, checked_overlay_rect);
 
-        ui.painter().rect_filled(
+        toast_ui.painter().rect_filled(
             toast_rect,
             8.0,
             egui::Color32::from_rgba_unmultiplied(30, 30, 30, alpha_u8),
         );
-        ui.painter().text(
+        toast_ui.painter().text(
             toast_rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
@@ -32286,7 +32526,7 @@ impl App {
         );
 
         if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
-            let resp = ui
+            let resp = toast_ui
                 .interact(
                     toast_rect,
                     egui::Id::new("feedback_toast_reveal_capture"),
@@ -36265,6 +36505,417 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    /// 見開きの間隔は、**最終的に描く矩形**で設定どおりになる (§1.154)。
+    ///
+    /// 中間の `layout_spread_page_rects` だけ調べても足りない。そこは小数のまま正しく
+    /// 空けるが、その後 `RectPixelFit::Texels` の寄せが左右を独立に丸めると保たれない。
+    /// **測るのは最終 transform の `paint_rect`。**
+    ///
+    /// 幅を広く振るのは、1 度目の修正が**寄せていない矩形まで動かして**壊していたため
+    /// (端数のある拡大では寄せは何もしない。そこへ整数量を足すと、正しかった間隔が
+    /// 0.5px ずれたりページが重なったりする)。3 サイズでは踏めなかった。
+    #[test]
+    fn a_spread_keeps_the_configured_gap_in_the_rect_it_paints() {
+        let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let mut failures = Vec::new();
+        for page_w in (900..1400).step_by(7) {
+            for (left_h, right_h) in [(1600.0_f32, 1600.0_f32), (2272.0, 2272.0), (6048.0, 6040.0)]
+            {
+                for gap in [0.0_f32, 1.0, 2.0, 3.0] {
+                    for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+                        let page_w = page_w as f32;
+                        let viewport = egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(2560.0, 1440.0),
+                        );
+                        let left_page = egui::vec2(page_w, left_h);
+                        let right_page = egui::vec2(page_w, right_h);
+                        let geometry =
+                            spread_layout_geometry(left_page, right_page, unit, unit, true);
+                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                            / geometry.fit_size.x)
+                            .min(viewport.height() / geometry.fit_size.y);
+                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                        let rects = layout_spread_page_rects(
+                            center,
+                            geometry,
+                            fit_scale,
+                            spread_gap,
+                            pixels_per_point,
+                            unit,
+                            unit,
+                            false,
+                        );
+                        let resolve = |rect: egui::Rect, page: egui::Vec2| {
+                            resolve_fs_transform_in_layout_rect(
+                                DisplayedImageTransformInput {
+                                    pixel_fit: RectPixelFit::Texels,
+                                    page_idx: 0,
+                                    viewport_rect: viewport,
+                                    source_size: page,
+                                    texture_size: page,
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: None,
+                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                        pixels_per_point,
+                                        ..FullscreenFitScaleLimits::default()
+                                    },
+                                    pixels_per_point,
+                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                },
+                                rect,
+                            )
+                            .expect("spread page transform")
+                        };
+                        let left = resolve(rects.left_rect, left_page);
+                        let right = resolve(rects.right_rect, right_page);
+                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                        let (left_offset, right_offset) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(left_offset);
+                        let right = right.translated_by(right_offset);
+
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        let case =
+                            format!("{page_w}x{left_h}/{right_h} gap={gap} ppp={pixels_per_point}");
+                        if (painted - gap_px).abs() >= 1e-3 {
+                            failures.push(format!("{case}: 間隔 {painted}px (設定 {gap_px}px)"));
+                        }
+                        // §1.0e を戻さないこと。寄せた側は物理ピクセル境界に乗ったまま。
+                        for (side, transform) in [("left", &left), ("right", &right)] {
+                            if matches!(
+                                crate::displayed_image_transform::rect_snap_mode(
+                                    transform.total_scale,
+                                    pixels_per_point
+                                ),
+                                crate::displayed_image_transform::RectSnapMode::None
+                            ) {
+                                continue;
+                            }
+                            let min_px = transform.full_image_rect.min.x * pixels_per_point;
+                            if (min_px - min_px.round()).abs() >= 1e-3 {
+                                failures.push(format!("{case}: {side} の原点が {min_px}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} 件失敗:
+{}",
+            failures.len(),
+            failures.iter().take(12).cloned().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
+    }
+
+    /// 貼るテクスチャが差し替わっても、間隔は変わらない (§1.154、利用者報告)。
+    ///
+    /// 1 ページの表示は サムネイル → 元解像度 → AI アップスケール後 と差し替わる。倍率は
+    /// そのたびに変わり、**`RectSnapMode` も変わり得る** (サムネイルは拡大表示なので
+    /// 「何も寄せない」側に落ちる)。間隔の合わせがその都度効いたり効かなかったりすると、
+    /// 利用者には**中央の線が一瞬太さを変える**ように見える。
+    ///
+    /// 間隔は貼るものの解像度と無関係でなければならない。
+    #[test]
+    fn the_spread_gap_does_not_change_when_the_texture_is_swapped() {
+        let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for trim in [None, Some((0.02_f32, 0.03_f32, 0.98_f32, 0.97_f32))] {
+            for gap in [0.0_f32, 1.0, 2.0] {
+                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                    let viewport =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+                    let left_page = egui::vec2(4161.0, 6053.0);
+                    let right_page = egui::vec2(4155.0, 6038.0);
+                    let bbox = trim.map(|(a, b, c, d)| {
+                        egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
+                    });
+                    let left_bbox = bbox.unwrap_or(unit);
+                    let right_bbox = bbox.unwrap_or(unit);
+                    let geometry =
+                        spread_layout_geometry(left_page, right_page, left_bbox, right_bbox, true);
+                    let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                    let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                        / geometry.fit_size.x)
+                        .min(viewport.height() / geometry.fit_size.y);
+                    let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                    let rects = layout_spread_page_rects(
+                        center,
+                        geometry,
+                        fit_scale,
+                        spread_gap,
+                        pixels_per_point,
+                        left_bbox,
+                        right_bbox,
+                        bbox.is_some(),
+                    );
+                    let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+
+                    // サムネイル (縮小済みで拡大表示になる) / 元解像度 / AI 4 倍。
+                    for texture_factor in [
+                        1.0_f32 / 16.0,
+                        1.0 / 8.0,
+                        1.0 / 4.0,
+                        1.0 / 3.0,
+                        1.0 / 2.0,
+                        1.0,
+                        2.0,
+                        3.0,
+                        4.0,
+                    ] {
+                        let resolve = |rect: egui::Rect, page: egui::Vec2| {
+                            resolve_fs_transform_in_layout_rect(
+                                DisplayedImageTransformInput {
+                                    pixel_fit: RectPixelFit::Texels,
+                                    page_idx: 0,
+                                    viewport_rect: viewport,
+                                    source_size: page,
+                                    texture_size: (page * texture_factor).round(),
+                                    rotation: crate::rotation_db::Rotation::None,
+                                    free_rotation_rad: 0.0,
+                                    content_bbox: bbox,
+                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                        pixels_per_point,
+                                        ..FullscreenFitScaleLimits::default()
+                                    },
+                                    pixels_per_point,
+                                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                },
+                                rect,
+                            )
+                            .expect("spread page transform")
+                        };
+                        let left = resolve(rects.left_rect, left_page);
+                        let right = resolve(rects.right_rect, right_page);
+                        let (left_offset, right_offset) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(left_offset);
+                        let right = right.translated_by(right_offset);
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        assert!(
+                            (painted - gap_px).abs() < 1e-3,
+                            "テクスチャ {texture_factor} 倍 trim={} gap={gap} ppp={pixels_per_point}:                              間隔 {painted}px (設定 {gap_px}px)",
+                            bbox.is_some()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 自動トリム中の間隔は、**利用者に見える端**で設定どおりになる (§1.154)。
+    ///
+    /// トリムは `paint_rect` を全体矩形の小数分の 1 にする。ラスタライズされるのは
+    /// `paint_rect` の頂点なので、全体矩形の側を物理ピクセルへ寄せても間隔は端数のまま
+    /// 残り、**ページごとに違う太さに見える**。実測で -0.48px 〜 +1.70px (利用者報告)。
+    ///
+    /// ページ寸法は報告のあった実ファイルのもの。26 ページ全部が別寸法 (4155-4162 x
+    /// 6038-6053) で、スキャン本ではこれが普通。寸法が違えば丸めも変わるので、
+    /// 同じ本の中でページによって太さが変わる。
+    #[test]
+    fn a_trimmed_spread_keeps_the_gap_at_the_edges_the_viewer_sees() {
+        let mut failures = Vec::new();
+        let mut total = 0;
+        let pairs = [
+            ((4161.0_f32, 6053.0_f32), (4155.0_f32, 6038.0_f32)),
+            ((4162.0, 6048.0), (4161.0, 6041.0)),
+            ((4157.0, 6043.0), (4161.0, 6053.0)),
+        ];
+        let trims = [
+            (None, None),
+            (
+                Some((0.02_f32, 0.03_f32, 0.98_f32, 0.97_f32)),
+                Some((0.015, 0.025, 0.985, 0.975)),
+            ),
+            (Some((0.0, 0.0, 1.0, 1.0)), Some((0.0, 0.0, 1.0, 1.0))),
+        ];
+        for (lp, rp) in pairs {
+            for (lt, rt) in trims {
+                for gap in [0.0_f32, 1.0, 2.0] {
+                    for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                        total += 1;
+                        let viewport = egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(2560.0, 1440.0),
+                        );
+                        let unit =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        let mk = |t: Option<(f32, f32, f32, f32)>| {
+                            t.map(|(a, b, c, d)| {
+                                egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
+                            })
+                        };
+                        let lb = mk(lt);
+                        let rb = mk(rt);
+                        let left_page = egui::vec2(lp.0, lp.1);
+                        let right_page = egui::vec2(rp.0, rp.1);
+                        let left_bbox = lb.unwrap_or(unit);
+                        let right_bbox = rb.unwrap_or(unit);
+                        let content_active = lb.is_some() || rb.is_some();
+                        let geometry = spread_layout_geometry(
+                            left_page, right_page, left_bbox, right_bbox, true,
+                        );
+                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
+                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                            / geometry.fit_size.x)
+                            .min(viewport.height() / geometry.fit_size.y);
+                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
+                        let rects = layout_spread_page_rects(
+                            center,
+                            geometry,
+                            fit_scale,
+                            spread_gap,
+                            pixels_per_point,
+                            left_bbox,
+                            right_bbox,
+                            content_active,
+                        );
+                        let resolve =
+                            |rect: egui::Rect, page: egui::Vec2, bbox: Option<egui::Rect>| {
+                                resolve_fs_transform_in_layout_rect(
+                                    DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
+                                        page_idx: 0,
+                                        viewport_rect: viewport,
+                                        source_size: page,
+                                        texture_size: page,
+                                        rotation: crate::rotation_db::Rotation::None,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox: bbox,
+                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_scale_limits: FullscreenFitScaleLimits {
+                                            pixels_per_point,
+                                            ..FullscreenFitScaleLimits::default()
+                                        },
+                                        pixels_per_point,
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: None,
+                                        },
+                                    },
+                                    rect,
+                                )
+                                .expect("t")
+                            };
+                        let left = resolve(rects.left_rect, left_page, lb);
+                        let right = resolve(rects.right_rect, right_page, rb);
+                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                        let (lo, ro) = align_spread_pages_for_gap(
+                            &left,
+                            &right,
+                            gap_px,
+                            center.x,
+                            pixels_per_point,
+                        );
+                        let left = left.translated_by(lo);
+                        let right = right.translated_by(ro);
+                        let painted =
+                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                        let mode = format!(
+                            "{:?}",
+                            crate::displayed_image_transform::rect_snap_mode(
+                                left.total_scale,
+                                pixels_per_point
+                            )
+                        );
+                        if (painted - gap_px).abs() >= 1e-3 {
+                            failures.push(format!(
+                                "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}: painted={painted} want={gap_px}",
+                                lp.0, lp.1, rp.0, rp.1, lb.is_some()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}/{} 件失敗:
+{}",
+            failures.len(),
+            total,
+            failures.iter().take(14).cloned().collect::<Vec<_>>().join(
+                "
+"
+            )
+        );
+    }
+
+    #[test]
+    fn feedback_toast_short_text_keeps_default_duration() {
+        assert_eq!(
+            feedback_toast_duration("短い確認メッセージ"),
+            FEEDBACK_TOAST_DURATION
+        );
+    }
+
+    #[test]
+    fn feedback_toast_long_japanese_text_extends_by_character_count() {
+        let text = "あ".repeat(FEEDBACK_TOAST_BASE_CHARS + 1);
+        let expected = FEEDBACK_TOAST_DURATION + FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR;
+        assert!((feedback_toast_duration(&text) - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn feedback_toast_duration_is_capped() {
+        assert_eq!(
+            feedback_toast_duration(&"長".repeat(10_000)),
+            FEEDBACK_TOAST_MAX_DURATION
+        );
+    }
+
+    #[test]
+    fn feedback_toast_layer_is_above_checked_selection_overlay() {
+        assert_eq!(
+            feedback_toast_layer_id(crate::app::ActionSurface::MainWindow).order,
+            egui::Order::Tooltip
+        );
+        assert!(egui::Order::Tooltip > egui::Order::Foreground);
+    }
+
+    #[test]
+    fn feedback_toast_moves_below_overlapping_checked_selection_overlay() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let overlay_rect =
+            egui::Rect::from_min_size(egui::pos2(690.0, 20.0), egui::vec2(100.0, 120.0));
+
+        let toast_rect =
+            feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), Some(overlay_rect));
+
+        assert!(!toast_rect.intersects(overlay_rect));
+        assert_eq!(toast_rect.top(), overlay_rect.bottom() + 8.0);
+        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
+    }
+
+    #[test]
+    fn feedback_toast_keeps_default_position_without_checked_selection_overlay() {
+        let full_rect = egui::Rect::from_min_size(egui::pos2(10.0, 30.0), egui::vec2(800.0, 600.0));
+
+        let toast_rect = feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), None);
+
+        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
+        assert_eq!(toast_rect.top(), full_rect.top() + 60.0);
+    }
 
     #[test]
     fn edit_brush_wheel_owner_covers_all_radius_bearing_brushes() {
