@@ -407,11 +407,208 @@ fn executable_handler_path(handler_id: &str) -> Option<PathBuf> {
     (is_exe && path.is_file()).then(|| path.to_path_buf())
 }
 
+/// 各 `IAssocHandler` を `IObjectWithAppUserModelID` / `IObjectWithProgID` へ QI して
+/// 素性を出す調査用。`GetName()` が friendly name しか返さない packaged app でも、
+/// ここから AUMID と正確な ProgID を取れるかを実機で確かめるために置く。
+#[cfg(all(test, windows))]
+pub(crate) fn dump_handler_identities(extension: &str) {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        ASSOC_FILTER_NONE, IObjectWithAppUserModelID, IObjectWithProgID, SHAssocEnumHandlers,
+    };
+    use windows::core::{Interface, PCWSTR};
+
+    let Ok(_com) = initialize_com_sta() else {
+        return;
+    };
+    let wide: Vec<u16> = extension.encode_utf16().chain(std::iter::once(0)).collect();
+    let Ok(enum_handlers) =
+        (unsafe { SHAssocEnumHandlers(PCWSTR(wide.as_ptr()), ASSOC_FILTER_NONE) })
+    else {
+        return;
+    };
+    let read = |value: windows::core::PWSTR| {
+        let text = unsafe { value.to_string() }.ok();
+        unsafe { CoTaskMemFree(Some(value.0 as *const _)) };
+        text
+    };
+    loop {
+        let mut next = [None];
+        let mut fetched = 0u32;
+        if unsafe { enum_handlers.Next(&mut next, Some(&mut fetched)) }.is_err() || fetched == 0 {
+            break;
+        }
+        let Some(handler) = next[0].take() else {
+            continue;
+        };
+        let name = unsafe { handler.GetName() }.ok().and_then(read);
+        let ui_name = unsafe { handler.GetUIName() }.ok().and_then(read);
+        let aumid = handler
+            .cast::<IObjectWithAppUserModelID>()
+            .ok()
+            .and_then(|object| unsafe { object.GetAppID() }.ok())
+            .and_then(read);
+        let prog_id = handler
+            .cast::<IObjectWithProgID>()
+            .ok()
+            .and_then(|object| unsafe { object.GetProgID() }.ok())
+            .and_then(read);
+        println!("ui={ui_name:?} name={name:?} aumid={aumid:?} progid={prog_id:?}");
+    }
+}
+
+/// パッケージ (Store) アプリを AppUserModelID で起動する。
+///
+/// `IAssocHandler::Invoke` は packaged app に対して S_OK を返しながら実際には起動せず、
+/// shell が「アプリを選択」を出す (2026-08-31 実機、ペイントとフォトの両方)。
+/// ハンドラ照合・データオブジェクト・`CreateInvoker`・STA 延命のいずれも原因ではなかった。
+///
+/// packaged app には専用の起動口がある。ハンドラ自身を `IObjectWithAppUserModelID` へ
+/// QI すれば AUMID が取れるので、`IApplicationActivationManager::ActivateForFile` へ
+/// `IShellItemArray` ごと渡す。実機の .jpg では packaged app 5 件すべてで AUMID が取れ、
+/// 従来 exe のアプリでは 1 件も取れなかったので、これはそのまま両者の判別にもなる。
+#[cfg(windows)]
+fn activate_packaged_handler(
+    handler: &windows::Win32::UI::Shell::IAssocHandler,
+    file_paths: &[PathBuf],
+) -> Option<bool> {
+    use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Shell::{
+        ApplicationActivationManager, IApplicationActivationManager, IObjectWithAppUserModelID,
+    };
+    use windows::core::{Interface, PCWSTR};
+
+    let app_id = handler
+        .cast::<IObjectWithAppUserModelID>()
+        .ok()
+        .and_then(|object| unsafe { object.GetAppID() }.ok())
+        .and_then(|value| {
+            let text = unsafe { value.to_string() }.ok();
+            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(value.0 as *const _)) };
+            text
+        })
+        .filter(|app_id| !app_id.is_empty())?;
+
+    crate::logger::log(format!("open_with: packaged handler aumid={app_id:?}"));
+
+    let manager: IApplicationActivationManager =
+        match unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER) }
+        {
+            Ok(manager) => manager,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "open_with: CoCreateInstance(ApplicationActivationManager) failed: {error}"
+                ));
+                return Some(false);
+            }
+        };
+
+    let (items, failed_paths) = match crate::file_drag::shell_item_array_for_paths(file_paths) {
+        Ok(result) => result,
+        Err((failed_paths, error)) => {
+            crate::logger::log(format!(
+                "open_with: shell item array failed: {error:?} (解決失敗 {failed_paths} 件)"
+            ));
+            return Some(false);
+        }
+    };
+    if ensure_all_association_paths_resolved(failed_paths).is_err() {
+        return Some(false);
+    }
+
+    let app_id_wide: Vec<u16> = app_id.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        manager.ActivateForFile(
+            PCWSTR(app_id_wide.as_ptr()),
+            &items,
+            PCWSTR(verb_wide.as_ptr()),
+        )
+    };
+    crate::logger::log(format!(
+        "open_with: ActivateForFile result={:?} files={}",
+        result.as_ref().map(|_| ()),
+        file_paths.len()
+    ));
+    Some(result.is_ok())
+}
+
+/// 正確な ProgID を指定して `ShellExecuteExW` で開く。
+///
+/// AUMID 経由 (`ActivateForFile`) が contract 未対応 (0x80270254) を返す packaged app
+/// 向けの次善手。ハンドラを `IObjectWithProgID` へ QI すると `AppX...` 形式の正確な
+/// ProgID が取れるので、その登録済み `DelegateExecute` / broker を shell に処理させる。
+/// `GetName()` の表示名 (`"フォト"`) からは引けないので、QI で取ることが要点。
+///
+/// worker thread から呼ぶので `SEE_MASK_NOASYNC` は必須。1 ファイルずつしか渡せない。
+#[cfg(windows)]
+fn shell_execute_with_progid(
+    handler: &windows::Win32::UI::Shell::IAssocHandler,
+    file_paths: &[PathBuf],
+    owner_hwnd: Option<isize>,
+) -> Option<bool> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{
+        IObjectWithProgID, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{Interface, PCWSTR};
+
+    let prog_id = handler
+        .cast::<IObjectWithProgID>()
+        .ok()
+        .and_then(|object| unsafe { object.GetProgID() }.ok())
+        .and_then(|value| {
+            let text = unsafe { value.to_string() }.ok();
+            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(value.0 as *const _)) };
+            text
+        })
+        .filter(|prog_id| !prog_id.is_empty())?;
+
+    crate::logger::log(format!(
+        "open_with: trying ShellExecuteEx progid={prog_id:?} files={}",
+        file_paths.len()
+    ));
+
+    let prog_id_wide: Vec<u16> = prog_id.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut launched_any = false;
+    for path in file_paths {
+        let file_wide: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_CLASSNAME | SEE_MASK_NOASYNC,
+            hwnd: HWND(owner_hwnd.unwrap_or(0) as *mut core::ffi::c_void),
+            lpVerb: PCWSTR(verb_wide.as_ptr()),
+            lpFile: PCWSTR(file_wide.as_ptr()),
+            lpClass: PCWSTR(prog_id_wide.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let result = unsafe { ShellExecuteExW(&mut info) };
+        crate::logger::log(format!(
+            "open_with: ShellExecuteEx progid result={:?} file={:?}",
+            result.as_ref().map(|_| ()),
+            path
+        ));
+        if result.is_ok() {
+            launched_any = true;
+        }
+    }
+    Some(launched_any)
+}
+
 fn invoke_association_handler_inner(
     extension: &str,
     expected_id: &str,
     expected_display_name: &str,
     file_paths: &[PathBuf],
+    owner_hwnd: Option<isize>,
 ) -> Result<AssociationInvokeOutcome, AssociationLaunchError> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{ASSOC_FILTER_NONE, SHAssocEnumHandlers};
@@ -488,15 +685,28 @@ fn invoke_association_handler_inner(
         },
     )?;
     ensure_all_association_paths_resolved(failed_paths)?;
-    // Store 版アプリはこの先の `IAssocHandler::Invoke` で起動しない。ハンドラの照合も
-    // データオブジェクトも正しく、Invoke は S_OK を返すのに、shell が OS の
-    // 「アプリを選択」を出す (2026-08-31 実機。ペイントとフォトの両方で確認)。
-    // `CreateInvoker` + `SupportsSelection` も、STA を 2 秒保ってメッセージを回すのも
-    // 結果は同じだった。
+    // 起動経路は 4 段。**どの段も、失敗したら次を試す**。試した経路と結果はログに残し、
+    // 全部駄目だったときだけ利用者へ理由を返す。
     //
-    // ハンドラ名が実在する .exe なら、shell を通さず直接起動する。ハンドラ名は毎回
-    // 列挙し直すので、Store アプリの更新でパスの版番号が変わっても追随する
-    // (= `Executable` として保存してしまうのとは違う)。
+    // 順番は実測で決めた (2026-09-01、実機ログ)。
+    // - ProgID + ShellExecuteEx はペイント / フォトの両方を 75〜95ms で起動できた
+    // - AUMID + ActivateForFile は同じ 2 つとも 0x80270254 (contract 未対応) で、
+    //   しかも失敗までに 1.0〜1.6 秒かかった。先に置くと毎回その分待たされる
+    // - ProgID 経路は shell に登録済みの verb / DelegateExecute を処理させるので、
+    //   exe を直接 spawn するより素性が良い (必要な引数や DDE を飛ばさない)
+
+    // 1. 正確な ProgID があれば shell に処理させる。`GetName()` の表示名 ("フォト") では
+    //    引けないので、ハンドラを `IObjectWithProgID` へ QI して取る。
+    if shell_execute_with_progid(&handlers[matched.index], file_paths, owner_hwnd)
+        .is_some_and(|ok| ok)
+    {
+        return Ok(AssociationInvokeOutcome {
+            refreshed_handler_id,
+        });
+    }
+
+    // 2. ハンドラ名が実在する .exe なら直接起動する。ハンドラ名は毎回列挙し直すので、
+    //    Store アプリの更新でパスの版番号が変わっても追随する (`Executable` 保存とは違う)。
     if let Some(executable) = executable_handler_path(&candidates[matched.index].handler_id) {
         crate::logger::log(format!(
             "open_with: launching handler executable directly path={executable:?} files={}",
@@ -516,6 +726,17 @@ fn invoke_association_handler_inner(
         });
     }
 
+    // 3. packaged app 専用の起動口。実機の 2 つでは効かなかったが、file activation
+    //    contract を要求する UWP handler にはこちらが正道 (docs)。ここまで落ちるのは
+    //    ProgID も exe path も無い packaged app だけなので、待ち時間は普段は発生しない。
+    if activate_packaged_handler(&handlers[matched.index], file_paths).is_some_and(|ok| ok) {
+        return Ok(AssociationInvokeOutcome {
+            refreshed_handler_id,
+        });
+    }
+
+    // 4. 従来の経路。packaged app では S_OK を返しながら起動しないことが分かっている
+    //    (2026-08-31 実機) が、従来アプリではこれで足りる。
     let invoke_result = unsafe { handlers[matched.index].Invoke(&data) };
     crate::logger::log(format!(
         "open_with: Invoke result={:?} files={}",
@@ -535,10 +756,11 @@ pub(crate) fn invoke_association_handler_for_paths(
     handler_id: &str,
     display_name: &str,
     file_paths: &[PathBuf],
+    owner_hwnd: Option<isize>,
 ) -> Result<AssociationInvokeOutcome, String> {
     let extension = association_extension_for_paths(file_paths)
         .map_err(|error| association_launch_error_message(&error))?;
-    invoke_association_handler_inner(&extension, handler_id, display_name, file_paths)
+    invoke_association_handler_inner(&extension, handler_id, display_name, file_paths, owner_hwnd)
         .map_err(|error| association_launch_error_message(&error))
 }
 
@@ -547,6 +769,7 @@ pub(crate) fn invoke_association_handler_for_paths(
     _handler_id: &str,
     _display_name: &str,
     file_paths: &[PathBuf],
+    _owner_hwnd: Option<isize>,
 ) -> Result<AssociationInvokeOutcome, String> {
     if file_paths.is_empty() {
         return Err(association_launch_error_message(
@@ -561,8 +784,14 @@ pub(crate) fn invoke_association_handler(
     handler_id: &str,
     display_name: &str,
     file_path: &Path,
+    owner_hwnd: Option<isize>,
 ) -> Result<AssociationInvokeOutcome, String> {
-    invoke_association_handler_for_paths(handler_id, display_name, &[file_path.to_path_buf()])
+    invoke_association_handler_for_paths(
+        handler_id,
+        display_name,
+        &[file_path.to_path_buf()],
+        owner_hwnd,
+    )
 }
 
 #[cfg(test)]
@@ -761,6 +990,8 @@ mod handler_dump_tests {
                 handler.display_name, handler.handler_id
             );
         }
+        println!("--- identity QI (AUMID / ProgID) ---");
+        super::dump_handler_identities(".jpg");
         println!("--- invoke view (NONE, raw order) ---");
         for (index, handler) in super::enumerate_handlers_unfiltered(".jpg")
             .into_iter()

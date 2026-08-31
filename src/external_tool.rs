@@ -953,6 +953,7 @@ fn launch_confirmation(
 
 pub(crate) fn start_launch_worker(
     operation: ExternalLaunchOperation,
+    owner_hwnd: Option<isize>,
 ) -> Result<ExternalLaunchPending, String> {
     let tool_name = operation.tool_name.clone();
     let expected_attempts = operation.requests.len();
@@ -975,7 +976,7 @@ pub(crate) fn start_launch_worker(
                 } else {
                     format!("{target_count} 件")
                 };
-                let result = launch_request(request);
+                let result = launch_request(request, owner_hwnd);
                 if cancel_worker.load(Ordering::Relaxed)
                     || tx
                         .send(ExternalLaunchAttemptResult {
@@ -1006,6 +1007,7 @@ pub(crate) fn start_launch_worker(
 
 fn launch_request(
     request: ExternalLaunchRequest,
+    owner_hwnd: Option<isize>,
 ) -> Result<Option<AssociationHandlerRefresh>, String> {
     let ExternalLaunchRequest {
         tool_name,
@@ -1041,12 +1043,18 @@ fn launch_request(
                 files.len()
             ));
             let outcome = if files.len() == 1 {
-                crate::open_with::invoke_association_handler(&handler_id, &tool_name, &files[0])
+                crate::open_with::invoke_association_handler(
+                    &handler_id,
+                    &tool_name,
+                    &files[0],
+                    owner_hwnd,
+                )
             } else {
                 crate::open_with::invoke_association_handler_for_paths(
                     &handler_id,
                     &tool_name,
                     &files,
+                    owner_hwnd,
                 )
             };
             outcome.map(|outcome| {
@@ -1179,7 +1187,7 @@ impl crate::app::App {
     fn start_external_launch_operation(&mut self, operation: ExternalLaunchOperation) {
         let tool_name = operation.tool_name.clone();
         let target_count = operation.target_count;
-        match start_launch_worker(operation) {
+        match start_launch_worker(operation, self.main_hwnd) {
             Ok(pending) => self.external_tool_launch_pending.push(pending),
             Err(error) if target_count == 1 => {
                 self.show_feedback_toast(format!("{tool_name}: {error}"))
