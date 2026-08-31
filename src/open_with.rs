@@ -343,6 +343,70 @@ fn initialize_com_sta() -> Result<ComApartmentGuard, windows::core::Error> {
 /// 呼び出し元は external-tool launch worker なので、列挙・PIDL 解決・Invoke は UI thread
 /// では実行されない。
 #[cfg(windows)]
+/// `invoke_association_handler_inner` と同じ条件 (`ASSOC_FILTER_NONE`、重複除去なし) で
+/// 列挙して中身だけ返す調査用。起動側とピッカー側で列挙条件が違っていた件の確認に使う。
+#[cfg(all(test, windows))]
+pub(crate) fn enumerate_handlers_unfiltered(extension: &str) -> Vec<AppHandler> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{ASSOC_FILTER_NONE, SHAssocEnumHandlers};
+    use windows::core::PCWSTR;
+
+    let Ok(_com) = initialize_com_sta() else {
+        return Vec::new();
+    };
+    let wide: Vec<u16> = extension.encode_utf16().chain(std::iter::once(0)).collect();
+    let Ok(enum_handlers) =
+        (unsafe { SHAssocEnumHandlers(PCWSTR(wide.as_ptr()), ASSOC_FILTER_NONE) })
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    loop {
+        let mut next = [None];
+        let mut fetched = 0u32;
+        if unsafe { enum_handlers.Next(&mut next, Some(&mut fetched)) }.is_err() || fetched == 0 {
+            break;
+        }
+        let Some(handler) = next[0].take() else {
+            continue;
+        };
+        let handler_id = unsafe { handler.GetName() }.ok().and_then(|value| {
+            let text = unsafe { value.to_string() }.ok();
+            unsafe { CoTaskMemFree(Some(value.0 as *const _)) };
+            text
+        });
+        let display_name = unsafe { handler.GetUIName() }
+            .ok()
+            .and_then(|value| {
+                let text = unsafe { value.to_string() }.ok();
+                unsafe { CoTaskMemFree(Some(value.0 as *const _)) };
+                text
+            })
+            .unwrap_or_default();
+        if let Some(handler_id) = handler_id {
+            out.push(AppHandler {
+                display_name,
+                handler_id,
+            });
+        }
+    }
+    out
+}
+
+/// ハンドラ名が「そのまま起動できる実行ファイル」なら、そのパスを返す。
+///
+/// `IAssocHandler::GetName()` は、従来アプリでも Store アプリでも実 exe path を返すことが
+/// ある一方 (`...\PaintApp\mspaint.exe`)、ProgID 相当の文字列だけのこともある
+/// (`"フォト"` / `"TsubameViewer"`)。前者は shell を通さず直接起動できる。
+fn executable_handler_path(handler_id: &str) -> Option<PathBuf> {
+    let path = Path::new(handler_id);
+    let is_exe = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    (is_exe && path.is_file()).then(|| path.to_path_buf())
+}
+
 fn invoke_association_handler_inner(
     extension: &str,
     expected_id: &str,
@@ -424,6 +488,34 @@ fn invoke_association_handler_inner(
         },
     )?;
     ensure_all_association_paths_resolved(failed_paths)?;
+    // Store 版アプリはこの先の `IAssocHandler::Invoke` で起動しない。ハンドラの照合も
+    // データオブジェクトも正しく、Invoke は S_OK を返すのに、shell が OS の
+    // 「アプリを選択」を出す (2026-08-31 実機。ペイントとフォトの両方で確認)。
+    // `CreateInvoker` + `SupportsSelection` も、STA を 2 秒保ってメッセージを回すのも
+    // 結果は同じだった。
+    //
+    // ハンドラ名が実在する .exe なら、shell を通さず直接起動する。ハンドラ名は毎回
+    // 列挙し直すので、Store アプリの更新でパスの版番号が変わっても追随する
+    // (= `Executable` として保存してしまうのとは違う)。
+    if let Some(executable) = executable_handler_path(&candidates[matched.index].handler_id) {
+        crate::logger::log(format!(
+            "open_with: launching handler executable directly path={executable:?} files={}",
+            file_paths.len()
+        ));
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(file_paths)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().map_err(|error| {
+            AssociationLaunchError::Shell(format!("関連付けアプリを起動できません: {error}"))
+        })?;
+        return Ok(AssociationInvokeOutcome {
+            refreshed_handler_id,
+        });
+    }
+
     let invoke_result = unsafe { handlers[matched.index].Invoke(&data) };
     crate::logger::log(format!(
         "open_with: Invoke result={:?} files={}",
@@ -662,9 +754,20 @@ mod handler_dump_tests {
     #[test]
     #[ignore]
     fn dump_handlers_for_jpg() {
+        println!("--- picker view (RECOMMENDED + dedupe) ---");
         for handler in super::enumerate_handlers(".jpg") {
             println!(
                 "UIName={:?} | Name={:?}",
+                handler.display_name, handler.handler_id
+            );
+        }
+        println!("--- invoke view (NONE, raw order) ---");
+        for (index, handler) in super::enumerate_handlers_unfiltered(".jpg")
+            .into_iter()
+            .enumerate()
+        {
+            println!(
+                "[{index}] UIName={:?} | Name={:?}",
                 handler.display_name, handler.handler_id
             );
         }
