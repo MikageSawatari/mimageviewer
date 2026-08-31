@@ -27493,18 +27493,21 @@ impl App {
                     && !self.vertical_reading_processed_texture_cached(page.idx)
             });
 
-        // 見開き構成の unit は左右 2 ページを横に並べる (`continuous_reading_page_rects` が
-        // `spread_page_gap_px` を挟む)。通常見開きと**同じ二段丸め**があるので、同じ関数で
-        // 置き直す。ここを飛ばすと、連結読みだけ設定 1px が 2px に見える (§1.154、Codex Sol)。
-        let spread_offsets = self.continuous_spread_gap_offsets(&pages, image_rect, ctx);
-
         let mut any_raw_work_pending = false;
         let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
         let mut painted_sources = FsNavigatorTextureSources::default();
-        for page in pages {
+
+        // **貼るテクスチャは描画より前に 1 回だけ決める。**
+        //
+        // 見開き unit の間隔合わせ (§1.154) は、描画と同じ矩形を先に知る必要がある。テクスチャが
+        // 違えば寸法も丸めも違うので、ここを 2 か所に綴ると「合わせた矩形」と「描いた矩形」が
+        // 別のテクスチャ由来になる。最初の実装が実際にそれで、連結読みだけ直っていなかった。
+        //
+        // アニメーションの駒送りはテクスチャを変えるので、選ぶ前に済ませる。
+        let mut page_textures: Vec<Option<FullscreenPaintResource>> =
+            Vec::with_capacity(pages.len());
+        for page in &pages {
             self.advance_animation(ctx, page.idx);
-            let rotation = self.get_rotation(page.idx);
-            let location = self.location_display_for_loading(page.idx);
             let pass_through_target_page = pass_through_target_pages
                 .as_ref()
                 .is_some_and(|target_pages| target_pages.contains(&page.idx));
@@ -27565,6 +27568,26 @@ impl App {
                         })
                     })
             };
+            let allow_thumbnail = !pass_through_target_page
+                && (original_preview_active
+                    || !self.colorize_display_requires_final_effect(page.idx));
+            page_textures.push(display_tex.or_else(|| {
+                allow_thumbnail
+                    .then(|| {
+                        self.fs_thumbnail_texture_for_display(page.idx)
+                            .map(FullscreenPaintResource::direct)
+                    })
+                    .flatten()
+            }));
+        }
+
+        // 間隔合わせは、上で決めたテクスチャで矩形を解決する。
+        let spread_offsets =
+            self.continuous_spread_gap_offsets(&pages, &page_textures, image_rect, ctx);
+
+        for (position, page) in pages.iter().enumerate() {
+            let rotation = self.get_rotation(page.idx);
+            let location = self.location_display_for_loading(page.idx);
             if matches!(self.fs_cache.get(&page.idx), Some(FsCacheEntry::Failed)) {
                 painter.text(
                     page.rect.center(),
@@ -27584,17 +27607,7 @@ impl App {
             {
                 any_raw_work_pending = true;
             }
-            let allow_thumbnail = !pass_through_target_page
-                && (original_preview_active
-                    || !self.colorize_display_requires_final_effect(page.idx));
-            let draw_tex = display_tex.or_else(|| {
-                allow_thumbnail
-                    .then(|| {
-                        self.fs_thumbnail_texture_for_display(page.idx)
-                            .map(FullscreenPaintResource::direct)
-                    })
-                    .flatten()
-            });
+            let draw_tex = page_textures[position].take();
             let source_size = self
                 .source_dims_for_idx(page.idx)
                 .map(|(w, h)| egui::vec2(w, h));
@@ -30255,6 +30268,7 @@ impl App {
     fn continuous_spread_gap_offsets(
         &mut self,
         pages: &[VerticalReadingPage],
+        page_textures: &[Option<FullscreenPaintResource>],
         image_rect: egui::Rect,
         ctx: &egui::Context,
     ) -> std::collections::HashMap<usize, egui::Vec2> {
@@ -30268,38 +30282,37 @@ impl App {
             .round();
         let mut offsets = std::collections::HashMap::new();
         for [start, second] in continuous_spread_pair_positions(pages) {
-            {
-                let (left_idx, right_idx) = (pages[start].idx, pages[second].idx);
-                let resolved: Vec<Option<DisplayedImageTransform>> =
-                    [&pages[start], &pages[second]]
-                        .into_iter()
-                        .map(|page| {
-                            let handle =
-                                self.fs_spread_page_paint_resource(page.idx, None, true)?;
-                            let rotation = self.get_rotation(page.idx);
-                            let source_size = self
-                                .source_dims_for_idx(page.idx)
-                                .map(|(w, h)| egui::vec2(w, h));
-                            self.resolve_fs_spread_page_transform(
-                                &handle,
-                                image_rect,
-                                page.rect,
-                                page.idx,
-                                source_size,
-                                FsPageLayoutSource::CurrentItem,
-                                rotation,
-                                page.content_bbox,
-                                pixels_per_point,
-                                ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                            )
-                        })
-                        .collect();
-                if let [Some(left), Some(right)] = resolved.as_slice() {
-                    let (left_offset, right_offset) =
-                        align_spread_pages_for_gap(left, right, gap_px, pixels_per_point);
-                    offsets.insert(left_idx, left_offset);
-                    offsets.insert(right_idx, right_offset);
-                }
+            let (left_idx, right_idx) = (pages[start].idx, pages[second].idx);
+            let resolved: Vec<Option<DisplayedImageTransform>> = [start, second]
+                .into_iter()
+                .map(|position| {
+                    // **描画と同じテクスチャで解く。** 別に選び直すと、合わせた矩形と描いた
+                    // 矩形が別のテクスチャ由来になり、出した移動量が描画側に合わない。
+                    let handle = page_textures.get(position)?.clone()?;
+                    let page = &pages[position];
+                    let rotation = self.get_rotation(page.idx);
+                    let source_size = self
+                        .source_dims_for_idx(page.idx)
+                        .map(|(w, h)| egui::vec2(w, h));
+                    self.resolve_fs_spread_page_transform(
+                        &handle,
+                        image_rect,
+                        page.rect,
+                        page.idx,
+                        source_size,
+                        FsPageLayoutSource::CurrentItem,
+                        rotation,
+                        page.content_bbox,
+                        pixels_per_point,
+                        ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    )
+                })
+                .collect();
+            if let [Some(left), Some(right)] = resolved.as_slice() {
+                let (left_offset, right_offset) =
+                    align_spread_pages_for_gap(left, right, gap_px, pixels_per_point);
+                offsets.insert(left_idx, left_offset);
+                offsets.insert(right_idx, right_offset);
             }
         }
         offsets
