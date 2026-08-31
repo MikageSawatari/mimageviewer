@@ -1041,11 +1041,20 @@ impl PreferencesState {
             });
         if let Some(result) = handlers_result {
             self.external_tool_handlers_pending = None;
-            if let Some(handlers) = result {
-                self.external_tool_candidates = external_tool_launch_candidates(&handlers);
-                if self.external_tool_candidates.is_empty() {
+            match result {
+                Some(handlers) => {
+                    self.external_tool_candidates = external_tool_launch_candidates(&handlers);
+                    if self.external_tool_candidates.is_empty() {
+                        self.external_tool_message =
+                            Some("関連付けアプリが見つかりませんでした".to_string());
+                    }
+                }
+                // worker が結果を送らずに終わった経路。以前はここで黙って pending を
+                // 捨てていたので、利用者からは「押しても何も起きない」に見えた
+                // (2026-08-31 利用者報告)。
+                None => {
                     self.external_tool_message =
-                        Some("関連付けアプリが見つかりませんでした".to_string());
+                        Some("関連付けアプリを調べられませんでした".to_string());
                 }
             }
         }

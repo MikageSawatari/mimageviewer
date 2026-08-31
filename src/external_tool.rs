@@ -433,6 +433,20 @@ impl ExternalTool {
         ASSOCIATED_APP_DISPLAY_NAME.to_string()
     }
 
+    /// 一覧の行に出す短い要約。`launch_description` はフルパスを返すので、
+    /// 一覧に置くと横幅がダイアログを突き抜ける (2026-08-31 利用者報告)。
+    /// 一覧は「どれを選ぶか」が分かればよく、フルパスと引数は下の詳細に出ている。
+    pub fn launch_summary(&self) -> String {
+        match &self.launch {
+            ExternalToolLaunch::Executable(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            ExternalToolLaunch::Association { .. } => "関連付けアプリ".to_string(),
+            ExternalToolLaunch::OsDefault => "OS の関連付け".to_string(),
+        }
+    }
+
     pub fn launch_description(&self) -> String {
         match &self.launch {
             ExternalToolLaunch::Executable(path) => path.display().to_string(),

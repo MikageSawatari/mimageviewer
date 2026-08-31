@@ -507,26 +507,23 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         );
         ui.add_space(6.0);
 
+        // 一覧はフルパスと引数を出さない。出すと横幅がダイアログを突き抜け、
+        // 広げないと右端が読めなくなる (2026-08-31 利用者報告)。どちらも下の
+        // 「選択したツールの設定」に出ているので、ここは選ぶための最小限にする。
         egui::Grid::new("external_tools_table")
-            .num_columns(3)
+            .num_columns(2)
             .striped(true)
-            .min_col_width(90.0)
+            .min_col_width(120.0)
             .show(ui, |ui| {
                 ui.strong("名前");
-                ui.strong("実行ファイル");
-                ui.strong("引数");
+                ui.strong("起動方法");
                 ui.end_row();
                 for tool in state.settings.external_tools.clone() {
                     let selected = state.external_tool_selected == Some(tool.id);
                     if ui.selectable_label(selected, tool.display_name()).clicked() {
                         state.select_external_tool(Some(tool.id));
                     }
-                    ui.label(tool.launch_description());
-                    ui.label(if tool.launch.uses_process_options() {
-                        tool.arguments.as_str()
-                    } else {
-                        "-"
-                    });
+                    ui.add(egui::Label::new(tool.launch_summary()).truncate());
                     ui.end_row();
                 }
             });
@@ -536,7 +533,24 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             if ui.button("実行ファイルを選んで追加").clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Executable);
             }
-            if ui.button("関連付けアプリから追加").clicked() {
+            // 関連付けの列挙には「拡張子のある実ファイル」が要る。押した後に種別を
+            // 選ばせてから失敗させると、利用者からは何も起きないのと同じに見える
+            // (2026-08-31 利用者報告)。押す前に無効化して理由を出す。
+            let can_enumerate_association = state
+                .external_tool_target
+                .real_file()
+                .ok()
+                .and_then(|path| path.extension())
+                .is_some();
+            let association_button = ui.add_enabled(
+                can_enumerate_association,
+                egui::Button::new("関連付けアプリから追加"),
+            );
+            if !can_enumerate_association {
+                association_button.on_hover_text(
+                    "関連付けを調べるには、拡張子のある実ファイルを選んでから環境設定を開いてください",
+                );
+            } else if association_button.clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Associated);
             }
             let selected_index = state.external_tool_selected.and_then(|id| {
@@ -589,6 +603,12 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     });
 
     draw_external_tool_add_purpose(ui.ctx(), state);
+    // 列挙の結果と失敗理由は、それを起こしたボタンの隣に出す。以前は選択中ツールの
+    // 詳細のいちばん下 (= ダイアログを広げないと見えない位置) に薄い文字で出ていた
+    // ため、押しても何も起きないように見えた (2026-08-31 利用者報告)。
+    if let Some(message) = &state.external_tool_message {
+        ui.label(egui::RichText::new(message).color(ui.visuals().warn_fg_color));
+    }
     draw_external_tool_handler_choices(ui, state);
 
     ui.add_space(12.0);
@@ -818,10 +838,6 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.label(egui::RichText::new(error).weak());
             ui.add_enabled(false, egui::Button::new("現在の実ファイルで起動して確認"));
         }
-    }
-
-    if let Some(message) = &state.external_tool_message {
-        ui.label(egui::RichText::new(message).weak());
     }
 }
 
