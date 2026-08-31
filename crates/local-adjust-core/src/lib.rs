@@ -108,6 +108,14 @@ impl<'a> RgbaImageRef<'a> {
     }
 }
 
+/// One page's worth of local adjustment layers, held by shared ownership.
+///
+/// Every layer can carry a source-resolution `Vec<f32>` mask (96 MB for a 24 MP image).
+/// Saving, undo history and the sidecar mirror all need "the document as it was", but only
+/// one place ever writes it, so the document is handed out as an `Arc` and the writer alone
+/// pays for a copy through `Arc::make_mut`. This is the same shape as `SidecarFile::items`.
+pub type LocalAdjustmentLayers = std::sync::Arc<Vec<LocalAdjustmentLayer>>;
+
 /// A non-destructive local adjustment layer.
 ///
 /// Serialization contract: fields that represent lengths in source-image pixels must end in

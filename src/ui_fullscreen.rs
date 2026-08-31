@@ -5820,7 +5820,7 @@ impl App {
             let total_layers = self
                 .local_adjust_page_layers
                 .get(&idx)
-                .map(Vec::len)
+                .map(|layers| layers.len())
                 .unwrap_or(0);
             let focus_viewport = if self.fullscreen_embedded_still_active() {
                 ctx.viewport_id()
@@ -33759,6 +33759,7 @@ impl App {
                 self.local_adjust_db
                     .as_ref()
                     .and_then(|db| db.get_layers(key))
+                    .map(local_adjust_core::LocalAdjustmentLayers::new)
             }
             .filter(|layers| !layers.is_empty())
             .ok_or_else(|| "補正レイヤーを読み取れません".to_string())?

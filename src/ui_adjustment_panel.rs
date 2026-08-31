@@ -2293,9 +2293,11 @@ mod local_adjust_canvas_edit_contract_tests {
         ))];
         app.local_adjust_page_layers.insert(
             0,
-            vec![layer_with_mask(local_adjust_core::LocalMask::RasterVector(
-                local_adjust_core::RasterVectorMask::empty(4, 3),
-            ))],
+            Arc::new(vec![layer_with_mask(
+                local_adjust_core::LocalMask::RasterVector(
+                    local_adjust_core::RasterVectorMask::empty(4, 3),
+                ),
+            )]),
         );
         app
     }
@@ -2495,8 +2497,9 @@ mod local_adjust_canvas_edit_contract_tests {
     fn a_brush_stroke_that_painted_nothing_is_not_saved_or_undoable() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
-        app.local_adjust_mask_brush_before_layers =
-            Some(vec![layer_with_mask(local_adjust_core::LocalMask::Full)]);
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
+            local_adjust_core::LocalMask::Full,
+        )]));
         app.local_adjust_mask_brush_stroke = Some(brush_stroke(false));
 
         app.persist_local_adjust_mask_brush_stroke();
@@ -2513,8 +2516,9 @@ mod local_adjust_canvas_edit_contract_tests {
     fn a_brush_stroke_that_painted_is_saved_and_undoable() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
-        app.local_adjust_mask_brush_before_layers =
-            Some(vec![layer_with_mask(local_adjust_core::LocalMask::Full)]);
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
+            local_adjust_core::LocalMask::Full,
+        )]));
         app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
 
         app.persist_local_adjust_mask_brush_stroke();
@@ -2540,6 +2544,87 @@ mod local_adjust_canvas_edit_contract_tests {
             "ドラッグ中の 1 フレームは保存しない"
         );
         assert_eq!(app.meta_undo.undo_len(), undo_before);
+    }
+
+    // ── 文書の所有権 (R-14) ────────────────────────────────────────────────
+    //
+    // 補正レイヤー文書は 1 レイヤーごとに画像原寸のマスクを抱える (24MP で 96MB)。
+    // 保存・Undo・サイドカーはどれも「そのときの姿」を必要とするが、書き手は常に
+    // 1 つなので、複製ではなく共有所有 (`Arc`) で配り、書き手だけが
+    // `Arc::make_mut` で実複製を払う。以下はその契約を固定する。
+
+    /// 前の姿を誰も握っていなければ、キャンバス編集は同じ割り当てを書き換える。
+    ///
+    /// ここが複製に戻ると、24MP で毎フレーム 96MB を作り直すことになる
+    /// (この段の作業そのものが無効になる)。
+    #[test]
+    fn a_canvas_edit_writes_in_place_when_no_snapshot_is_outstanding() {
+        let mut app = seam_test_app();
+        let before = Arc::as_ptr(&app.local_adjust_page_layers[&0]);
+
+        let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, false, |layer| {
+            layer.name = "edited".to_string();
+            LocalAdjustCanvasEdit::Applied
+        });
+
+        assert!(applied);
+        assert!(
+            std::ptr::eq(before, Arc::as_ptr(&app.local_adjust_page_layers[&0])),
+            "誰も握っていない文書は、その場で書き換わる (複製しない)"
+        );
+    }
+
+    /// 前の姿を握っている手がいれば、その手が見ている文書は書き換わらない。
+    ///
+    /// Undo の before、保存 worker へ積んだ snapshot、サイドカーのミラーが
+    /// これに当たる。ここが崩れると「取ったはずのスナップショット」が後から
+    /// 変わり、before と after が同じになって Undo が消える。
+    #[test]
+    fn a_canvas_edit_leaves_an_outstanding_snapshot_untouched() {
+        let mut app = seam_test_app();
+        let snapshot =
+            local_adjust_core::LocalAdjustmentLayers::clone(&app.local_adjust_page_layers[&0]);
+
+        app.mutate_local_adjust_layer_from_canvas(0, 0, false, |layer| {
+            layer.name = "edited".to_string();
+            LocalAdjustCanvasEdit::Applied
+        });
+
+        assert_eq!(seam_layer_name(&app), "edited");
+        assert_eq!(
+            snapshot[0].name, "",
+            "先に取った姿は編集前のまま残る (copy-on-write)"
+        );
+        assert!(
+            !Arc::ptr_eq(&snapshot, &app.local_adjust_page_layers[&0]),
+            "書き換えで割り当てが分岐している"
+        );
+    }
+
+    /// 保存経路の Undo は、**編集前**の姿を持っていなければならない。
+    ///
+    /// 共有所有にした結果、before は編集直前まで live 文書と同じ割り当てを指す。
+    /// seam が編集の**後**に before を取ると、両者が同じ姿になって Undo が
+    /// 「変更なし」として捨てられる。
+    #[test]
+    fn the_undo_entry_holds_the_document_as_it_was_before_the_edit() {
+        let mut app = seam_test_app();
+        let undo_before = app.meta_undo.undo_len();
+
+        app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
+            layer.name = "edited".to_string();
+            LocalAdjustCanvasEdit::Applied
+        });
+
+        assert_eq!(seam_layer_name(&app), "edited");
+        assert_eq!(app.meta_undo.undo_len(), undo_before + 1);
+
+        app.apply_meta_undo();
+        assert_eq!(
+            seam_layer_name(&app),
+            "",
+            "Undo で編集前の姿へ戻る (before が編集後の姿になっていない)"
+        );
     }
 }
 
@@ -10152,6 +10237,9 @@ impl App {
         // Undo 用の複製は保存する回だけ作る。ドラッグ中は毎フレームここを通り、
         // レイヤー文書には**画像原寸**のラスターマスク (`Vec<f32>`) が入っているので、
         // 使わない複製が 1 枚 24MP で 27.7ms / 96 MB になる (2026-08-29 実測)。
+        // Undo 用の「編集前の姿」。参照カウントの複製なので原寸マスクは写らない。
+        // **編集より前に取ること**が要件で、後に取ると下の `Arc::make_mut` で分岐した
+        // 後の姿を掴み、before と after が同じになって Undo が捨てられる。
         let before_layers = persist.then(|| {
             self.local_adjust_page_layers
                 .get(&fs_idx)
@@ -10159,10 +10247,12 @@ impl App {
                 .unwrap_or_default()
         });
         let outcome = {
+            // 文書は共有所有。Undo 履歴や worker が前の姿を握っている間だけ、ここで
+            // 1 回だけ実複製を払う (`Arc::make_mut`)。握られていなければ複製は起きない。
             let Some(layer) = self
                 .local_adjust_page_layers
                 .get_mut(&fs_idx)
-                .and_then(|layers| layers.get_mut(layer_idx))
+                .and_then(|layers| Arc::make_mut(layers).get_mut(layer_idx))
             else {
                 return false;
             };
@@ -11066,7 +11156,7 @@ impl App {
         let Some(mut layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
             return;
         };
-        if let Some(layer) = layers.get_mut(drag.layer_idx) {
+        if let Some(layer) = Arc::make_mut(&mut layers).get_mut(drag.layer_idx) {
             compact_local_adjust_manual_override(layer);
         }
         let before = self
@@ -11105,7 +11195,7 @@ impl App {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
         };
-        if let Some(layer) = layers.get_mut(stroke.layer_idx) {
+        if let Some(layer) = Arc::make_mut(&mut layers).get_mut(stroke.layer_idx) {
             compact_local_adjust_manual_override(layer);
         }
         self.local_adjust_selected_layers
@@ -12545,7 +12635,9 @@ impl App {
             .get(&fs_idx)
             .cloned()
             .unwrap_or_default();
-        let before_layers = layers.clone();
+        // 同じ割り当てを指す参照カウントの複製。実際に書き換えるときだけ
+        // `Arc::make_mut` が 1 回複製を払い、そこで before と after が分岐する。
+        let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
         let mut changed = false;
         let mut selected_after: Option<usize> = None;
         let mut undo_summary: Option<String> = None;
@@ -12553,7 +12645,7 @@ impl App {
 
         let image_dims = local_adjust_image_dims(self, fs_idx);
         if let Some(mask_kind) = add_layer_mask {
-            layers.push(layer_with_local_mask(
+            Arc::make_mut(&mut layers).push(layer_with_local_mask(
                 mask_kind.label(),
                 mask_kind,
                 image_dims,
@@ -12567,7 +12659,7 @@ impl App {
             self.show_feedback_toast(format!("補正レイヤーを追加しました: {}", mask_kind.label()));
         }
         if let Some((layer_idx, kind)) = set_layer_effect
-            && let Some(layer) = layers.get_mut(layer_idx)
+            && let Some(layer) = Arc::make_mut(&mut layers).get_mut(layer_idx)
         {
             layer.effect = kind.default_effect();
             layer.name = kind.label().to_string();
@@ -12584,7 +12676,7 @@ impl App {
             self.show_feedback_toast(format!("加工内容を変更: {}", kind.label()));
         }
         if let Some((layer_idx, mask_kind, keep_manual_override)) = change_layer_mask
-            && let Some(layer) = layers.get_mut(layer_idx)
+            && let Some(layer) = Arc::make_mut(&mut layers).get_mut(layer_idx)
         {
             replace_local_adjust_layer_base_mask(
                 layer,
@@ -12606,7 +12698,7 @@ impl App {
             self.show_feedback_toast(format!("マスク種類を変更: {}", mask_kind.label()));
         }
         if let Some((layer_idx, enabled)) = set_enabled {
-            if let Some(layer) = layers.get_mut(layer_idx) {
+            if let Some(layer) = Arc::make_mut(&mut layers).get_mut(layer_idx) {
                 layer.enabled = enabled;
                 changed = true;
                 undo_summary.get_or_insert_with(|| "補正レイヤー切替".to_string());
@@ -12620,7 +12712,7 @@ impl App {
         if let Some((layer_idx, layer)) = update_layer
             && layer_idx < layers.len()
         {
-            layers[layer_idx] = layer;
+            Arc::make_mut(&mut layers)[layer_idx] = layer;
             selected_after = Some(layer_idx);
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー編集".to_string());
@@ -12630,6 +12722,7 @@ impl App {
             && to < layers.len()
             && from != to
         {
+            let layers = Arc::make_mut(&mut layers);
             let layer = layers.remove(from);
             layers.insert(to, layer);
             selected_after = Some(to);
@@ -12641,7 +12734,7 @@ impl App {
             && let Some(layer) = layers.get(layer_idx).cloned()
         {
             let insert_at = layer_idx + 1;
-            layers.insert(insert_at, layer);
+            Arc::make_mut(&mut layers).insert(insert_at, layer);
             selected_after = Some(insert_at);
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー複製".to_string());
@@ -12656,7 +12749,7 @@ impl App {
         }
         if let Some(layer_idx) = effect_requests.paste_effect {
             if let Some(effect) = self.local_adjust_effect_clipboard.clone() {
-                if let Some(layer) = layers.get_mut(layer_idx) {
+                if let Some(layer) = Arc::make_mut(&mut layers).get_mut(layer_idx) {
                     let kind = EffectKind::from_effect(&effect);
                     paste_layer_effect(layer, effect);
                     selected_after = Some(layer_idx);
@@ -12672,7 +12765,7 @@ impl App {
             }
         }
         if let Some(layer_idx) = effect_requests.reset_effect
-            && let Some(layer) = layers.get_mut(layer_idx)
+            && let Some(layer) = Arc::make_mut(&mut layers).get_mut(layer_idx)
         {
             let kind = EffectKind::from_effect(&layer.effect);
             if reset_layer_effect_params(layer) {
@@ -12688,14 +12781,14 @@ impl App {
         if let Some(layer_idx) = delete_layer
             && layer_idx < layers.len()
         {
-            layers.remove(layer_idx);
+            Arc::make_mut(&mut layers).remove(layer_idx);
             selected_after = Some(layer_idx.min(layers.len().saturating_sub(1)));
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー削除".to_string());
             self.show_feedback_toast("補正レイヤーを削除".to_string());
         }
         if clear_layers {
-            layers.clear();
+            Arc::make_mut(&mut layers).clear();
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー全削除".to_string());
             self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
@@ -12864,7 +12957,7 @@ impl App {
                     .get(&pending.fs_idx)
                     .cloned()
                     .unwrap_or_default();
-                let before_layers = layers.clone();
+                let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
                 }) {
@@ -12875,7 +12968,8 @@ impl App {
                 }
                 let name = params.name.clone();
                 let size = params.size;
-                layers[pending.layer_idx].effect = local_adjust_core::LocalEffect::CubeLut(params);
+                Arc::make_mut(&mut layers)[pending.layer_idx].effect =
+                    local_adjust_core::LocalEffect::CubeLut(params);
                 self.local_adjust_selected_layers
                     .insert(pending.fs_idx, pending.layer_idx);
                 self.set_local_adjust_layers_for_idx_with_undo(
@@ -13146,8 +13240,8 @@ impl App {
                     .get(&pending.fs_idx)
                     .cloned()
                     .unwrap_or_default();
-                let before_layers = layers.clone();
-                let Some(layer) = layers.get_mut(pending.layer_idx) else {
+                let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
+                let Some(layer) = Arc::make_mut(&mut layers).get_mut(pending.layer_idx) else {
                     self.show_feedback_toast(
                         "マスク生成結果を破棄しました。対象レイヤーがありません".to_string(),
                     );

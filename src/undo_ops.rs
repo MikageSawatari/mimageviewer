@@ -460,8 +460,8 @@ impl App {
     pub(crate) fn capture_local_adjustment_undo(
         &mut self,
         idx: usize,
-        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
-        after: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        after: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
         self.push_local_adjustment_undo_entry(
@@ -473,8 +473,8 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_with_undo(
         &mut self,
         idx: usize,
-        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        layers: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
         self.set_local_adjust_layers_for_idx(idx, layers);

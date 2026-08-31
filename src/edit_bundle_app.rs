@@ -435,7 +435,7 @@ fn load_page_edit_bundle(
     key: &str,
     source_size: [usize; 2],
     adjust_override: Option<crate::adjustment::AdjustParams>,
-    local_adjust_override: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    local_adjust_override: Option<local_adjust_core::LocalAdjustmentLayers>,
     crop_override: Option<crate::export_crop::CropSettings>,
     comic_override: Option<Vec<comic_core::AnnotationObject>>,
 ) -> Result<PageEditBundle, String> {
@@ -478,7 +478,11 @@ fn load_page_edit_bundle(
             .get_full(key, source_size[0], source_size[1])
             .map(|(pixels, shapes)| snapshot_mask(pixels, shapes)),
         local_adjust_layers: local_adjust_override
-            .or_else(|| local_adjust_db.get_layers(key))
+            .or_else(|| {
+                local_adjust_db
+                    .get_layers(key)
+                    .map(local_adjust_core::LocalAdjustmentLayers::new)
+            })
             .filter(|layers| !layers.is_empty()),
         export_crop,
         comic: comic_override

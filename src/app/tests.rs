@@ -16242,7 +16242,7 @@ mod favorite_adjustment_defaults_tests {
         app.set_local_adjust_layers_for_idx_with_undo(
             idx,
             before,
-            vec![layer],
+            Arc::new(vec![layer]),
             "test local adjust".to_string(),
         );
         assert_eq!(app.local_adjust_page_layers.get(&idx).unwrap().len(), 1);
@@ -27356,9 +27356,9 @@ mod favorite_adjustment_defaults_tests {
         app.local_adjust_selected_shape = Some(0);
         app.local_adjust_mask_shape_drag_start = Some([0.1, 0.1]);
         app.local_adjust_mask_shape_drag_end = Some([0.3, 0.3]);
-        app.local_adjust_shape_drag_before_layers = Some(Vec::new());
-        app.local_adjust_canvas_drag_before_layers = Some(Vec::new());
-        app.local_adjust_mask_brush_before_layers = Some(Vec::new());
+        app.local_adjust_shape_drag_before_layers = Some(Arc::new(Vec::new()));
+        app.local_adjust_canvas_drag_before_layers = Some(Arc::new(Vec::new()));
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(Vec::new()));
         app.local_adjust_selective_color_pick_active = true;
 
         app.switch_local_adjust_target_in_spread(1);
@@ -27902,16 +27902,17 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!((a, b, c), (0, 1, 2));
 
         app.local_adjust_page_layers
-            .insert(a, vec![layer("A0"), layer("A1")]);
+            .insert(a, Arc::new(vec![layer("A0"), layer("A1")]));
         app.local_adjust_pages.insert(a);
         app.local_adjust_selected_layers.insert(a, 1);
 
-        app.local_adjust_page_layers.insert(b, vec![layer("B0")]);
+        app.local_adjust_page_layers
+            .insert(b, Arc::new(vec![layer("B0")]));
         app.local_adjust_pages.insert(b);
         app.local_adjust_selected_layers.insert(b, 0);
 
         app.local_adjust_page_layers
-            .insert(c, vec![layer("C0"), layer("C1"), layer("C2")]);
+            .insert(c, Arc::new(vec![layer("C0"), layer("C1"), layer("C2")]));
         app.local_adjust_pages.insert(c);
         app.local_adjust_selected_layers.insert(c, 2);
 
@@ -27951,11 +27952,11 @@ mod favorite_adjustment_defaults_tests {
         // b は 1 layer だが選択 idx を意図的に過大 (5) にしておく。
         app.local_adjust_page_layers.insert(
             b,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "B0",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(b);
         app.local_adjust_selected_layers.insert(b, 5);
@@ -28015,11 +28016,11 @@ mod favorite_adjustment_defaults_tests {
 
         app.local_adjust_page_layers.insert(
             a,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "stale",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(a);
         app.local_adjust_selected_layers.insert(a, 0);
@@ -28035,7 +28036,12 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.local_adjust_selected_layers.is_empty());
 
         assert!(app.load_local_adjust_layers_for_book_snapshot_sync(b));
-        assert_eq!(app.local_adjust_page_layers.get(&b), Some(&layers));
+        assert_eq!(
+            app.local_adjust_page_layers
+                .get(&b)
+                .map(|stored| stored.as_slice()),
+            Some(layers.as_slice())
+        );
     }
 
     /// Codex P1: snapshot 有効化で items を subset へ差し替えたら、idx-keyed なページ編集
@@ -28185,11 +28191,11 @@ mod favorite_adjustment_defaults_tests {
             .insert(0, params_with_brightness(5.0));
         app.local_adjust_page_layers.insert(
             0,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "L",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(0);
         app.local_adjust_selected_layers.insert(0, 3);
@@ -28963,7 +28969,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/layer-bypass.jpg");
         app.local_adjust_page_layers.insert(
             idx,
-            vec![
+            Arc::new(vec![
                 local_adjust_core::LocalAdjustmentLayer::new(
                     "A",
                     local_adjust_core::LocalMask::Full,
@@ -28979,7 +28985,7 @@ mod pipeline_cache_refactor_tests {
                     local_adjust_core::LocalMask::Full,
                     local_adjust_core::LocalEffect::None,
                 ),
-            ],
+            ]),
         );
 
         let preview_layers = app
@@ -30086,7 +30092,7 @@ mod pipeline_cache_refactor_tests {
         assert!(crate::colorize::is_near_monochrome(&edited, 12));
 
         install_raw_static_source(&mut app, &ctx, idx, "gate_local_desaturate_raw", raw);
-        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![layer]);
+        app.set_local_adjust_layers_for_idx_memory_only(idx, Arc::new(vec![layer]));
         install_colorize_summary_edit_result(&mut app, idx, edited);
         app.fullscreen_idx = Some(idx);
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -30180,14 +30186,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.set_local_adjust_layers_for_idx_memory_only(
             idx,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "pending-local-adjust",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
                     saturation: -100.0,
                     ..Default::default()
                 }),
-            )],
+            )]),
         );
         app.fullscreen_idx = Some(idx);
 
@@ -31357,7 +31363,10 @@ mod pipeline_cache_refactor_tests {
         let (edit_key, final_key) =
             insert_edit_and_final_cache(&mut app, &ctx, idx, "brush_defer_final");
 
-        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(
+            idx,
+            Arc::new(vec![brush_layer()]),
+        );
         let pending = app
             .local_adjust_brush_deferred_render
             .expect("brush render should be deferred");
@@ -31394,11 +31403,14 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/pipeline-brush-release.jpg");
 
-        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(
+            idx,
+            Arc::new(vec![brush_layer()]),
+        );
         let pending = app
             .local_adjust_brush_deferred_render
             .expect("brush render should be deferred");
-        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only(idx, Arc::new(vec![brush_layer()]));
 
         assert_eq!(app.local_adjust_generation.get(&idx), Some(&1));
         assert!(app.local_adjust_brush_deferred_render.is_none());
@@ -31525,7 +31537,8 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-lab-parity.jpg");
         let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
-        app.local_adjust_page_layers.insert(idx, layers.clone());
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(layers.clone()));
 
         // 各 layer_idx について、mIV と lab で同じ (name, enabled) 並びになる
         for layer_idx in 0..layers.len() {
@@ -31570,7 +31583,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-boundaries.jpg");
         let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
-        app.local_adjust_page_layers.insert(idx, layers);
+        app.local_adjust_page_layers.insert(idx, Arc::new(layers));
 
         // layer_count = 0 → None
         assert!(
@@ -31613,7 +31626,7 @@ mod pipeline_cache_refactor_tests {
 
         // ケース 1: 唯一のレイヤーを bypass → 残り 0
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("only")]);
+            .insert(idx, Arc::new(vec![full_layer("only")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 0)
                 .is_none(),
@@ -31624,7 +31637,7 @@ mod pipeline_cache_refactor_tests {
         let mut a = full_layer("A");
         a.enabled = false;
         app.local_adjust_page_layers
-            .insert(idx, vec![a, full_layer("B")]);
+            .insert(idx, Arc::new(vec![a, full_layer("B")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
                 .is_none(),
@@ -31635,7 +31648,7 @@ mod pipeline_cache_refactor_tests {
         let mut zero_op = full_layer("zero");
         zero_op.opacity = 0.0;
         app.local_adjust_page_layers
-            .insert(idx, vec![zero_op, full_layer("real")]);
+            .insert(idx, Arc::new(vec![zero_op, full_layer("real")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
                 .is_none(),
@@ -31644,7 +31657,7 @@ mod pipeline_cache_refactor_tests {
 
         // ケース 4: 範囲外 idx → None
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("a"), full_layer("b")]);
+            .insert(idx, Arc::new(vec![full_layer("a"), full_layer("b")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 99)
                 .is_none(),
@@ -31759,7 +31772,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/cancel-bypass.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
@@ -31795,7 +31808,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/cancel-keep-this.jpg");
         let other_idx = push_image(&mut app, "C:/pics/cancel-keep-other.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
@@ -31838,7 +31851,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-cache.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         // cache に同 key を仕込む
         let ctx = egui::Context::default();
@@ -31875,7 +31888,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-same-key.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let result_key = app.current_local_adjust_key(idx);
         let layer_idx = 1usize;
@@ -31905,7 +31918,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/bypass-guard-no-layers.jpg");
         // 単一 layer のみ → bypass すると残り 0 → None
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("only")]);
+            .insert(idx, Arc::new(vec![full_layer("only")]));
 
         // 別 key の pending を立てておく → guard で抜けたかの判定材料
         let mut other_key = app.current_local_adjust_key(idx);
@@ -31935,7 +31948,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-no-source.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         // mask_pages に入れる → current_local_adjust_source_pixels が None
         app.mask_pages.insert(idx);
 
@@ -31975,7 +31988,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-cache.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let ctx = egui::Context::default();
         let key = app.current_local_adjust_prefix_preview_key(idx, 1);
@@ -32009,7 +32022,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-same-key.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let result_key = app.current_local_adjust_key(idx);
         let layer_count = 1usize;
@@ -32037,7 +32050,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-boundaries.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let mut other_key = app.current_local_adjust_key(idx);
         other_key.idx = idx + 100;
@@ -32178,7 +32191,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-no-source.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         app.mask_pages.insert(idx);
 
         let mut other_key = app.current_local_adjust_key(idx);
@@ -35046,7 +35059,7 @@ mod pipeline_cache_refactor_tests {
         let mut disabled = full_layer("d");
         disabled.enabled = false;
         app.local_adjust_page_layers
-            .insert(idx, vec![disabled.clone()]);
+            .insert(idx, Arc::new(vec![disabled.clone()]));
         assert!(
             !app.has_active_local_adjust_layers(idx),
             "all-disabled => not active"
@@ -35055,7 +35068,8 @@ mod pipeline_cache_refactor_tests {
         // opacity=0 のみ
         let mut zero = full_layer("z");
         zero.opacity = 0.0;
-        app.local_adjust_page_layers.insert(idx, vec![zero.clone()]);
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(vec![zero.clone()]));
         assert!(
             !app.has_active_local_adjust_layers(idx),
             "opacity=0 only => not active"
@@ -35063,7 +35077,7 @@ mod pipeline_cache_refactor_tests {
 
         // 1 つでも enabled && opacity>0 があれば active
         app.local_adjust_page_layers
-            .insert(idx, vec![disabled, zero, full_layer("real")]);
+            .insert(idx, Arc::new(vec![disabled, zero, full_layer("real")]));
         assert!(
             app.has_active_local_adjust_layers(idx),
             "any enabled & opaque layer => active"
@@ -35127,7 +35141,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/poll-stale.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let old_result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, _bypass_cancel, bypass_tx) =
@@ -35376,7 +35390,7 @@ mod pipeline_display_edit_split_tests {
             egui::Color32::from_rgb(1, 2, 3),
         );
         app.local_adjust_page_layers
-            .insert(idx, vec![active_tone_layer()]);
+            .insert(idx, Arc::new(vec![active_tone_layer()]));
 
         assert!(
             app.current_conceal_source_pixels(idx).is_none(),
@@ -35449,7 +35463,7 @@ mod edit_materialize_worker_tests {
                 ready: Some(EditMaterializeResult::Ready {
                     request,
                     payload: EditMaterializePayload::LocalReady {
-                        layers: vec![active_layer()],
+                        layers: Arc::new(vec![active_layer()]),
                         image,
                     },
                 }),
@@ -35537,7 +35551,7 @@ mod edit_materialize_worker_tests {
             },
         );
         app.local_adjust_page_layers
-            .insert(idx, vec![active_layer()]);
+            .insert(idx, Arc::new(vec![active_layer()]));
         app.local_adjust_pages.insert(idx);
         let request = local_request(&app, idx);
         let (tx, rx) = mpsc::channel();

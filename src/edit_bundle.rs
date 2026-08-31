@@ -29,7 +29,7 @@ pub struct PageEditBundle {
     pub adjust: Option<AdjustParams>,
     pub mask: Option<EditMaskSnapshot>,
     pub conceal: Option<EditMaskSnapshot>,
-    pub local_adjust_layers: Option<Vec<LocalAdjustmentLayer>>,
+    pub local_adjust_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
     pub export_crop: Option<CropSettings>,
     pub comic: Option<Vec<AnnotationObject>>,
 }
@@ -77,7 +77,7 @@ pub struct PreparedPageEditBundle {
     pub adjust_json: Option<String>,
     pub mask: Option<PreparedEditMask>,
     pub conceal: Option<PreparedEditMask>,
-    pub local_adjust_layers: Option<Vec<LocalAdjustmentLayer>>,
+    pub local_adjust_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
     pub local_adjust_json: Option<String>,
     pub export_crop: Option<CropSettings>,
     pub comic: Option<Vec<AnnotationObject>>,
@@ -174,7 +174,8 @@ impl PageEditBundle {
             .local_adjust_layers
             .as_ref()
             .map(|layers| transform_local_adjust_layers(layers, target_size, length_scale))
-            .transpose()?;
+            .transpose()?
+            .map(local_adjust_core::LocalAdjustmentLayers::new);
 
         let export_crop = self.export_crop.map(|crop| {
             crop.with_legacy_source_size(self.source_size)
@@ -974,7 +975,7 @@ mod tests {
         let bundle = PageEditBundle {
             source_size: [2, 2],
             adjust: Some(replacement),
-            local_adjust_layers: Some(Vec::new()),
+            local_adjust_layers: Some(local_adjust_core::LocalAdjustmentLayers::default()),
             ..Default::default()
         };
         assert!(bundle.prepare().unwrap().apply_atomic(&paths, key).is_err());

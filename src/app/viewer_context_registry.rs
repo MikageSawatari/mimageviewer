@@ -968,7 +968,7 @@ pub(in crate::app) struct ViewerContextBundle {
     passthrough_rendition_cache: PassthroughRenditionCache,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
-        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        std::collections::HashMap<usize, local_adjust_core::LocalAdjustmentLayers>,
     local_adjust_pages: std::collections::HashSet<usize>,
     local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     local_adjust_generation: std::collections::HashMap<usize, u64>,

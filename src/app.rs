@@ -3376,11 +3376,11 @@ pub(crate) struct EditMaterializeRequest {
 
 pub(crate) enum EditMaterializePayload {
     LocalReady {
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
         image: egui::ColorImage,
     },
     LocalInactive {
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     },
     ConcealDisplayReady {
         image: egui::ColorImage,
@@ -3660,7 +3660,7 @@ pub(crate) struct ExportCropCreateDrag {
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
-    layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    layers: local_adjust_core::LocalAdjustmentLayers,
     cancel: Arc<AtomicBool>,
 ) -> LocalAdjustRenderResult {
     if cancel.load(Ordering::Relaxed) {
@@ -3695,7 +3695,7 @@ fn run_local_adjust_render(
 }
 
 enum LocalMaterializeLayers {
-    Memory(Vec<local_adjust_core::LocalAdjustmentLayer>),
+    Memory(local_adjust_core::LocalAdjustmentLayers),
     Database { path: PathBuf, page_key: String },
 }
 
@@ -3773,7 +3773,9 @@ fn run_local_materialize(
             let Some(json) = json else {
                 return EditMaterializeResult::Ready {
                     request,
-                    payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                    payload: EditMaterializePayload::LocalInactive {
+                        layers: local_adjust_core::LocalAdjustmentLayers::default(),
+                    },
                 };
             };
             if cancel.load(Ordering::Relaxed) {
@@ -3789,14 +3791,16 @@ fn run_local_materialize(
                 decode_t0,
             );
             match parsed {
-                Ok(layers) => layers,
+                Ok(layers) => local_adjust_core::LocalAdjustmentLayers::new(layers),
                 Err(err) => {
                     crate::logger::log(format!(
                         "local_adjust: invalid layers_json key={page_key} error={err}"
                     ));
                     return EditMaterializeResult::Ready {
                         request,
-                        payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                        payload: EditMaterializePayload::LocalInactive {
+                            layers: local_adjust_core::LocalAdjustmentLayers::default(),
+                        },
                     };
                 }
             }
@@ -11716,7 +11720,7 @@ pub struct App {
     /// フルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。表示合成は後段の
     /// `local_adjust_cache` / worker が担当する。
     pub(crate) local_adjust_page_layers:
-        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        std::collections::HashMap<usize, local_adjust_core::LocalAdjustmentLayers>,
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
     /// `local_adjust.db` の `page_path` exact lookup だけで復元し、サムネイルには
     /// 補正レイヤー結果自体を反映しない。
@@ -11822,13 +11826,13 @@ pub struct App {
     pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
     /// 図形ドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
     pub(crate) local_adjust_shape_drag_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
     /// キャンバスドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
     pub(crate) local_adjust_canvas_drag_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
     /// 手描きブラシ開始前の補正レイヤー配列。Undo をストローク単位にまとめる。
     pub(crate) local_adjust_mask_brush_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
     /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
     pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
@@ -26601,7 +26605,10 @@ impl App {
         };
 
         let loaded = !layers.is_empty();
-        self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+        self.set_local_adjust_layers_for_idx_memory_only_inner(
+            idx,
+            local_adjust_core::LocalAdjustmentLayers::new(layers),
+        );
         loaded
     }
 
@@ -54518,7 +54525,7 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         let key = match self.page_path_key(idx) {
             Some(key) => key,
@@ -54539,7 +54546,8 @@ impl App {
         if layers.is_empty() {
             self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
         } else {
-            let sidecar_layers = layers.clone();
+            // 文書は共有所有なので、ミラーへ渡すのは参照カウントの複製だけ。
+            let sidecar_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
             self.with_sidecar_mut(idx, move |sc, rel| {
                 sc.set_local_adjust_layers(rel, sidecar_layers)
             });
@@ -54559,7 +54567,7 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_memory_only(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.bump_local_adjust_generation(idx);
@@ -54568,7 +54576,7 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.defer_local_adjust_brush_render(idx);
@@ -54577,7 +54585,7 @@ impl App {
     fn set_local_adjust_layers_for_idx_memory_only_inner(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
@@ -55133,10 +55141,10 @@ impl App {
         &self,
         idx: usize,
         layer_idx: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let mut layers = self.local_adjust_layers_for_render(idx)?;
-        let layer = layers.get_mut(layer_idx)?;
-        layer.enabled = false;
+        // バイパス済みの文書は元と別物なので、ここだけは実複製を払う。
+        Arc::make_mut(&mut layers).get_mut(layer_idx)?.enabled = false;
         layers
             .iter()
             .any(|layer| layer.enabled && layer.opacity > 0.0)
@@ -55147,23 +55155,23 @@ impl App {
         &self,
         idx: usize,
         layer_count: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let layers = self.local_adjust_page_layers.get(&idx)?;
         let count = layer_count.min(layers.len());
         if count == 0 || count >= layers.len() {
             return None;
         }
-        let preview_layers = layers[..count].to_vec();
+        let preview_layers = &layers[..count];
         preview_layers
             .iter()
             .any(|layer| layer.enabled && layer.opacity > 0.0)
-            .then_some(preview_layers)
+            .then(|| local_adjust_core::LocalAdjustmentLayers::new(preview_layers.to_vec()))
     }
 
     fn local_adjust_layers_for_render(
         &self,
         idx: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let layers = self.local_adjust_page_layers.get(&idx)?;
         layers
             .iter()

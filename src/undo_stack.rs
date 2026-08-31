@@ -78,8 +78,8 @@ pub struct AdjustmentChange {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalAdjustmentChange {
     pub idx: usize,
-    pub before: Vec<local_adjust_core::LocalAdjustmentLayer>,
-    pub after: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    pub before: local_adjust_core::LocalAdjustmentLayers,
+    pub after: local_adjust_core::LocalAdjustmentLayers,
 }
 
 /// レーティング 1 件の変更記録。`path_key` は `adjustment_db::normalize_path` 正規化済み。

@@ -291,7 +291,7 @@ pub struct BakedEditSnapshot {
     pub rotation: crate::rotation_db::Rotation,
     pub conceal: Option<BookConcealSnapshot>,
     pub erase: Option<BookEraseSnapshot>,
-    pub local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    pub local_adjust: Option<local_adjust_core::LocalAdjustmentLayers>,
     pub comic: Option<BookComicSnapshot>,
     pub comic_source_dims: Option<[usize; 2]>,
     pub export_crop: Option<crate::export_crop::CropSettings>,
@@ -1099,8 +1099,8 @@ fn compose_book_page(
 
     if let Some(layers) = &edits.local_adjust {
         let [width, height] = image.size;
-        let mut layers = layers.clone();
-        for layer in &mut layers {
+        let mut layers = local_adjust_core::LocalAdjustmentLayers::clone(layers);
+        for layer in std::sync::Arc::make_mut(&mut layers) {
             layer.resize_masks_to(width, height);
         }
         let rgba = crate::capture::color_image_to_rgba(&image);
@@ -2022,11 +2022,13 @@ mod tests {
             vec![egui::Color32::from_rgb(10, 20, 30), egui::Color32::WHITE],
         );
         let mut edits = empty_baked_edits();
-        edits.local_adjust = Some(vec![local_adjust_core::LocalAdjustmentLayer::new(
-            "invert",
-            local_adjust_core::LocalMask::Full,
-            local_adjust_core::LocalEffect::Invert(local_adjust_core::InvertParams::default()),
-        )]);
+        edits.local_adjust = Some(Arc::new(vec![
+            local_adjust_core::LocalAdjustmentLayer::new(
+                "invert",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::Invert(local_adjust_core::InvertParams::default()),
+            ),
+        ]));
         edits.params.brightness = 10.0;
         edits.rotation = crate::rotation_db::Rotation::Cw90;
         edits.export_crop = Some(crate::export_crop::CropSettings::authored(
