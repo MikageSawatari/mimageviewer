@@ -7590,6 +7590,31 @@ pub(crate) enum EditStoreOutcome {
     Failed(String),
 }
 
+/// キーボードで図形マスクを動かしている間の保留。
+///
+/// キーリピート 1 回ごとに保存すると、リピートの数だけ Undo が積まれ、保存も毎回
+/// 積まれる。編集はメモリへ即反映して見た目を追随させ、**保存と Undo はセッションの
+/// 終わりに 1 回だけ**行う。
+///
+/// セッションが閉じるのは 3 つ:
+/// - 一定時間キー編集が来なかったとき ([`App::LOCAL_ADJUST_SHAPE_KEY_IDLE`])
+/// - 別のページ / 別の図形を編集し始めたとき
+/// - 編集状態を畳むとき ([`App::commit_local_adjust_pending_edits`])
+///
+/// **畳むときに捨ててはいけない。**ドラッグ中のブラシと違い、キー編集は 1 回ごとが
+/// 完了した編集で、捨てると利用者の操作がそのまま消える。
+pub(crate) struct LocalAdjustShapeKeyEdit {
+    pub fs_idx: usize,
+    /// 対象の図形。別の図形へ移ったらセッションを閉じる。
+    pub shape_idx: usize,
+    /// セッション開始前の文書。Undo を 1 件にまとめる。
+    pub before: local_adjust_core::LocalAdjustmentLayers,
+    /// Undo に出す操作名。移動と回転が混ざったら丸める。
+    pub summary: &'static str,
+    /// 最後にキー編集が来た時刻。無操作でセッションを閉じる判定に使う。
+    pub last_edit_at: std::time::Instant,
+}
+
 /// 積んだ補正レイヤー保存 1 件について、完了時に必要になるものだけを控えた記録。
 ///
 /// **サイドカー座標を控えるのが要点。**完了が返る頃には一覧の idx が別のページを
@@ -11850,6 +11875,8 @@ pub struct App {
     /// 手描きブラシ開始前の補正レイヤー配列。Undo をストローク単位にまとめる。
     pub(crate) local_adjust_mask_brush_before_layers:
         Option<local_adjust_core::LocalAdjustmentLayers>,
+    /// キーボードでの図形移動 / 回転の保留。Undo と保存をセッション単位にまとめる。
+    pub(crate) local_adjust_shape_key_edit: Option<LocalAdjustShapeKeyEdit>,
     /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
     pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
@@ -14295,6 +14322,7 @@ impl App {
             local_adjust_shape_drag_before_layers: None,
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
+            local_adjust_shape_key_edit: None,
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
@@ -23824,6 +23852,8 @@ impl App {
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
+        // **文書を捨てる前に確定する。**メモリにしか無い編集はここで消える。
+        self.fold_local_adjust_edit_state();
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
@@ -23846,17 +23876,6 @@ impl App {
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
         self.local_adjust_effect_position_handles_visible = true;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
@@ -37988,17 +38007,7 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
+        self.fold_local_adjust_edit_state();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
         self.cancel_all_local_adjust_pending();
@@ -52252,17 +52261,7 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
+        self.fold_local_adjust_edit_state();
         self.local_adjust_segmentation_pending = None;
         self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
@@ -54339,6 +54338,8 @@ impl App {
         }
         self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
+        // **まず確定する。**保留のままの編集は、メモリにしか無いのでここで消える。
+        self.commit_local_adjust_pending_edits();
         // 保存 worker の在庫を書き切らせ、そのミラーを sidecar へ入れてから flush する。
         // 終了経路では worker を止めて join する (在庫は drain してから止まる)。トレイ
         // 退避では worker も読み手も生き続けるので、届いている分だけ回収する。
@@ -63723,16 +63724,7 @@ impl App {
         self.export_crop_create_drag = None;
         self.export_crop_spread_ctx = None;
         self.fs_loupe_locked = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
+        self.fold_local_adjust_edit_state();
         self.local_adjust_segmentation_pending = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
@@ -67801,6 +67793,10 @@ impl eframe::App for App {
             // 結果は毎フレームの poll で拾う。最後の保存の直後に egui が眠ると、
             // 失敗トーストとサイドカーミラーが次の入力まで出ない。
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.settle_local_adjust_shape_key_edit() {
+            // セッションが開いている間はフレームを回す。眠ると無操作判定が来ない。
+            ctx.request_repaint_after(Self::LOCAL_ADJUST_SHAPE_KEY_IDLE);
         }
         self.poll_video_upscale_queue(ctx);
 

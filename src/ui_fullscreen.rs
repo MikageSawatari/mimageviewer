@@ -4886,6 +4886,7 @@ impl App {
             self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
+            self.fold_local_adjust_edit_state();
             self.local_adjust_repair_point_pick_active = None;
             self.local_adjust_add_layer_dialog_open = false;
             self.local_adjust_change_mask_dialog_open = false;
@@ -19231,6 +19232,7 @@ impl App {
                 } else {
                     self.cache_current_edit_preview_if_ready();
                     self.local_adjust_mode = false;
+                    self.fold_local_adjust_edit_state();
                     self.local_adjust_repair_point_pick_active = None;
                     self.local_adjust_add_layer_dialog_open = false;
                     self.local_adjust_change_mask_dialog_open = false;
@@ -26296,10 +26298,7 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_selected_shape = None;
+        self.fold_local_adjust_edit_state();
     }
 
     /// 見開きモード (`SpreadMode`) を適用する。キーボードのショートカット 1〜5 と
