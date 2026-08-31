@@ -3898,6 +3898,10 @@ struct VerticalReadingPage {
     idx: usize,
     rect: egui::Rect,
     content_bbox: Option<egui::Rect>,
+    /// このページが属する表示ユニット。**見開き構成では 1 unit に左右 2 ページが入る**ので、
+    /// 通常見開きと同じ間隔合わせ (§1.154) をここで区別する必要がある。ページの並びだけでは
+    /// 「隣は同じ unit の相方か、次の unit の 1 ページ目か」が分からない。
+    unit_id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -4222,6 +4226,27 @@ fn fs_texture_content_rect(
 /// The layout rectangle is therefore only a containing frame. Re-resolve the final
 /// image rectangle from the actual texture at this ownership boundary so no caller
 /// can publish a non-uniform pixel scale when those aspects differ transiently.
+/// 連結読みのページ列から、**左右に並ぶ 2 ページの組**を取り出す。
+///
+/// unit は連続して積まれるので、同じ `unit_id` が続く範囲が 1 つの unit。ちょうど 2 ページの
+/// unit だけが見開きで、1 ページの unit (表紙 / 横長 / 端数) は間隔を持たない。
+/// **並びだけで隣を相方と決めない** — 次の unit の 1 ページ目と区別が付かない。
+fn continuous_spread_pair_positions(pages: &[VerticalReadingPage]) -> Vec<[usize; 2]> {
+    let mut pairs = Vec::new();
+    let mut start = 0usize;
+    while start < pages.len() {
+        let mut end = start + 1;
+        while end < pages.len() && pages[end].unit_id == pages[start].unit_id {
+            end += 1;
+        }
+        if end - start == 2 {
+            pairs.push([start, start + 1]);
+        }
+        start = end;
+    }
+    pairs
+}
+
 /// 見開きの左右を、寄せ終わった後に**一体で**置き直すための平行移動量。
 ///
 /// `layout_spread_page_rects` は小数のまま設定どおりの間隔を空けるが、その後 `RectPixelFit`
@@ -4238,7 +4263,6 @@ fn align_spread_pages_for_gap(
     left: &DisplayedImageTransform,
     right: &DisplayedImageTransform,
     gap_px: f32,
-    center_x: f32,
     pixels_per_point: f32,
 ) -> (egui::Vec2, egui::Vec2) {
     // **倍率や `RectSnapMode` で分岐しない。** 見える 2 辺を直接置くので、寄せ済みかどうかに
@@ -4268,8 +4292,11 @@ fn align_spread_pages_for_gap(
     // トリム中に全体矩形を整数へ寄せても意味が無い。ラスタライズされるのは `paint_rect` の
     // 頂点で、全体矩形は使われないからである。寄せる相手を間違えると間隔は端数のまま残り、
     // **ページごとに違う太さに見える** (実測ページで -0.48px 〜 +1.70px。利用者報告)。
+    // 組の中心は**渡された 2 つから決める**。呼び出し側 (通常見開き / 連結読みの unit) が
+    // それぞれ別の中心を綴ると、同じ関数が窓ごとに違う答えを出す。
+    let center_px = (to_px(left.paint_rect.min.x) + to_px(right.paint_rect.max.x)) * 0.5;
     let total_visible_px = left_visible_px + gap_px + right_visible_px;
-    let visible_start_px = to_px(center_x) - total_visible_px * 0.5;
+    let visible_start_px = center_px - total_visible_px * 0.5;
     // 左ページの右端 = 間隔の左側の境界。ここを物理ピクセル境界へ置く。
     // トリムが無ければ可視幅は整数なので、左ページの左端も従来どおり整数に乗る。
     let boundary_px = (visible_start_px + left_visible_px).round();
@@ -26959,6 +26986,7 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            let unit_id = u32::try_from(list_pos).unwrap_or(u32::MAX);
             for (idx, rect, content_bbox) in
                 continuous_reading_page_rects(unit_rect, size, pixels_per_point)
             {
@@ -26966,6 +26994,7 @@ impl App {
                     idx,
                     rect,
                     content_bbox,
+                    unit_id,
                 });
             }
         }
@@ -27017,6 +27046,7 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            let unit_id = u32::try_from(pages.len()).unwrap_or(u32::MAX);
             for (idx, rect, content_bbox) in
                 continuous_reading_page_rects(unit_rect, &size, pixels_per_point)
             {
@@ -27024,6 +27054,7 @@ impl App {
                     idx,
                     rect,
                     content_bbox,
+                    unit_id,
                 });
             }
         }
@@ -27462,6 +27493,11 @@ impl App {
                     && !self.vertical_reading_processed_texture_cached(page.idx)
             });
 
+        // 見開き構成の unit は左右 2 ページを横に並べる (`continuous_reading_page_rects` が
+        // `spread_page_gap_px` を挟む)。通常見開きと**同じ二段丸め**があるので、同じ関数で
+        // 置き直す。ここを飛ばすと、連結読みだけ設定 1px が 2px に見える (§1.154、Codex Sol)。
+        let spread_offsets = self.continuous_spread_gap_offsets(&pages, image_rect, ctx);
+
         let mut any_raw_work_pending = false;
         let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
         let mut painted_sources = FsNavigatorTextureSources::default();
@@ -27577,10 +27613,10 @@ impl App {
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                // TODO(§1.154): 連結読みも見開きモードでは 1 unit に左右 2 ページを並べる
-                // (`build_spread_display_units_for_nav` -> `continuous_reading_page_rects`)。
-                // ここを 0 にしているので元の 2px 問題がそのまま残っている。
-                egui::Vec2::ZERO,
+                spread_offsets
+                    .get(&page.idx)
+                    .copied()
+                    .unwrap_or(egui::Vec2::ZERO),
             ) {
                 self.trace_fs_continuous_page_draw(
                     page.idx,
@@ -29937,7 +29973,6 @@ impl App {
                         &left,
                         &right,
                         (effective_gap.max(0.0) * pixels_per_point).round(),
-                        center.x,
                         pixels_per_point,
                     ),
                     // 片方でも最終矩形が出せないなら合わせない (もう片方だけ動かすと
@@ -30213,6 +30248,63 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 連結読みの見開き unit について、左右の間隔を設定どおりにするための平行移動量。
+    ///
+    /// 通常見開きと**同じ関数**で決める。unit ごとに独立していて、1 ページの unit
+    /// (表紙 / 横長 / 端数) には何もしない。
+    fn continuous_spread_gap_offsets(
+        &mut self,
+        pages: &[VerticalReadingPage],
+        image_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) -> std::collections::HashMap<usize, egui::Vec2> {
+        let pixels_per_point = ctx.pixels_per_point();
+        let gap_px = (quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        )
+        .max(0.0)
+            * pixels_per_point)
+            .round();
+        let mut offsets = std::collections::HashMap::new();
+        for [start, second] in continuous_spread_pair_positions(pages) {
+            {
+                let (left_idx, right_idx) = (pages[start].idx, pages[second].idx);
+                let resolved: Vec<Option<DisplayedImageTransform>> =
+                    [&pages[start], &pages[second]]
+                        .into_iter()
+                        .map(|page| {
+                            let handle =
+                                self.fs_spread_page_paint_resource(page.idx, None, true)?;
+                            let rotation = self.get_rotation(page.idx);
+                            let source_size = self
+                                .source_dims_for_idx(page.idx)
+                                .map(|(w, h)| egui::vec2(w, h));
+                            self.resolve_fs_spread_page_transform(
+                                &handle,
+                                image_rect,
+                                page.rect,
+                                page.idx,
+                                source_size,
+                                FsPageLayoutSource::CurrentItem,
+                                rotation,
+                                page.content_bbox,
+                                pixels_per_point,
+                                ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                            )
+                        })
+                        .collect();
+                if let [Some(left), Some(right)] = resolved.as_slice() {
+                    let (left_offset, right_offset) =
+                        align_spread_pages_for_gap(left, right, gap_px, pixels_per_point);
+                    offsets.insert(left_idx, left_offset);
+                    offsets.insert(right_idx, right_offset);
+                }
+            }
+        }
+        offsets
+    }
+
     fn draw_fs_spread_page(
         &mut self,
         painter: &egui::Painter,
@@ -36544,13 +36636,8 @@ mod tests {
                         let left = resolve(rects.left_rect, left_page);
                         let right = resolve(rects.right_rect, right_page);
                         let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
-                        let (left_offset, right_offset) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
+                        let (left_offset, right_offset) =
+                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
                         let left = left.translated_by(left_offset);
                         let right = right.translated_by(right_offset);
 
@@ -36591,6 +36678,42 @@ mod tests {
 "
             )
         );
+    }
+
+    /// 連結読みで間隔を合わせる相手は、**同じ unit の 2 ページだけ**。
+    ///
+    /// unit は縦に積まれるので、並びだけで隣を相方と決めると「次の unit の 1 ページ目」を
+    /// 掴む。1 ページの unit (表紙 / 横長 / 端数) は間隔を持たないので対象外。
+    #[test]
+    fn only_two_page_units_are_a_continuous_spread_pair() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0));
+        let page = |idx: usize, unit_id: u32| VerticalReadingPage {
+            idx,
+            rect,
+            content_bbox: None,
+            unit_id,
+        };
+        // 表紙 1 枚 -> 見開き -> 見開き -> 端数 1 枚。
+        let pages = vec![
+            page(0, 0),
+            page(1, 1),
+            page(2, 1),
+            page(3, 2),
+            page(4, 2),
+            page(5, 3),
+        ];
+        assert_eq!(
+            continuous_spread_pair_positions(&pages),
+            vec![[1, 2], [3, 4]]
+        );
+
+        // 3 ページの unit は見開きではない (現状は作られないが、掴んだら間隔が壊れる)。
+        let odd = vec![page(0, 7), page(1, 7), page(2, 7)];
+        assert!(continuous_spread_pair_positions(&odd).is_empty());
+
+        // 単ページばかりでも、隣同士を組にしない。
+        let singles = vec![page(0, 0), page(1, 1), page(2, 2)];
+        assert!(continuous_spread_pair_positions(&singles).is_empty());
     }
 
     /// 貼るテクスチャが差し替わっても、間隔は変わらない (§1.154、利用者報告)。
@@ -36672,13 +36795,8 @@ mod tests {
                         };
                         let left = resolve(rects.left_rect, left_page);
                         let right = resolve(rects.right_rect, right_page);
-                        let (left_offset, right_offset) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
+                        let (left_offset, right_offset) =
+                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
                         let left = left.translated_by(left_offset);
                         let right = right.translated_by(right_offset);
                         let painted =
@@ -36790,15 +36908,10 @@ mod tests {
                         let left = resolve(rects.left_rect, left_page, lb);
                         let right = resolve(rects.right_rect, right_page, rb);
                         let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
-                        let (lo, ro) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
-                        let left = left.translated_by(lo);
-                        let right = right.translated_by(ro);
+                        let (left_offset, right_offset) =
+                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
+                        let left = left.translated_by(left_offset);
+                        let right = right.translated_by(right_offset);
                         let painted =
                             (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
                         let mode = format!(
@@ -36808,11 +36921,45 @@ mod tests {
                                 pixels_per_point
                             )
                         );
+                        let case = format!(
+                            "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}",
+                            lp.0,
+                            lp.1,
+                            rp.0,
+                            rp.1,
+                            lb.is_some()
+                        );
                         if (painted - gap_px).abs() >= 1e-3 {
-                            failures.push(format!(
-                                "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}: painted={painted} want={gap_px}",
-                                lp.0, lp.1, rp.0, rp.1, lb.is_some()
-                            ));
+                            failures.push(format!("{case}: painted={painted} want={gap_px}"));
+                        }
+                        // **§1.0e**: trim があっても貼り先は物理ピクセル境界に乗ったまま。
+                        // 端数で動かすとテクセルが画素中心から外れ、Lanczos の結果へ
+                        // 二度目の線形補間が掛かる (Codex Sol の指摘 1)。
+                        for (side, transform, offset) in [
+                            ("left", &left, left_offset),
+                            ("right", &right, right_offset),
+                        ] {
+                            if matches!(
+                                crate::displayed_image_transform::rect_snap_mode(
+                                    transform.total_scale,
+                                    pixels_per_point
+                                ),
+                                crate::displayed_image_transform::RectSnapMode::None
+                            ) {
+                                continue;
+                            }
+                            let offset_px = offset.x * pixels_per_point;
+                            if (offset_px - offset_px.round()).abs() >= 1e-3 {
+                                failures.push(format!(
+                                    "{case}: {side} の移動量が {offset_px}px (整数でない)"
+                                ));
+                            }
+                            let min_px = transform.full_image_rect.min.x * pixels_per_point;
+                            if (min_px - min_px.round()).abs() >= 1e-3 {
+                                failures.push(format!(
+                                    "{case}: {side} の原点が {min_px} (画素境界から外れた)"
+                                ));
+                            }
                         }
                     }
                 }
@@ -48781,11 +48928,13 @@ mod tests {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 0,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 1,
             },
         ];
 
@@ -48808,11 +48957,13 @@ mod tests {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 0,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 1,
             },
         ];
 
