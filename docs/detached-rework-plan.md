@@ -1459,6 +1459,29 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-01 SNS 分割 P2 の transient editor lifecycle を既存の foreground cleanup owner
+へ追加する (ClaudeCode の P2 ブリーフが同型の構造的追加を指定し、Codex が §2 に照らして
+ownership 境界を確認):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の
+reconcile_page_edit_spread_pivots と reset_detached_pause_foreground_modes、
+[src/app/tests.rs](../src/app/tests.rs) の lifecycle 回帰証明。viewer context bundle の型、
+mount / stash、viewport、HWND、presentation transition の経路は変更しない。
+
+**不変条件と所有境界**: SNS 分割の layout / drag / spread pivot は、ページに保存しない
+一度きりの foreground editor state である。したがって inactive / parked context の bundle
+には載せず、detached pause が foreground を手放す前に、既存の crop / text と同じ cleanup
+owner で破棄する。通常のモード退場だけが saved spread を復元し、pause / fullscreen close /
+panorama / non-paged 遷移は pivot を先に破棄して遷移先の idx / Single 表示を巻き戻さない。
+mode marker が別の lifecycle で先に落ちた場合は、全ページ編集ツール共通の reconcile が
+stale pivot を一度だけ回収する。
+
+**なぜ症状パッチではないか**: detached 固有の判定、bool、pending state、時間窓、retry、
+focus / geometry heuristic は追加しない。新モードの transient state を既存の foreground
+editor ownership 表へ 1 行追加し、bundle に保存しない契約を明示しただけである。
+pause 後の parked bundle に state が残らないことと、通常退場だけが spread を復元することを
+状態遷移テストで固定する。
+
 **2026-08-30 detached close identity を、内部 teardown と利用者 OS close の発生源ではなく
 session lease の寿命で分離する (v3.3.0 出荷前レビュー close identity。ClaudeCode / Codex
 双方が第三案を構造的修正と合意):**

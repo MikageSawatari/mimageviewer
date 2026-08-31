@@ -42,8 +42,8 @@ use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
 use crate::keymap::{
-    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
-    KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
+    Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyContext,
+    KeyName, KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
 };
 #[cfg(windows)]
 use crate::keymap::{
@@ -4796,6 +4796,8 @@ pub(crate) enum FsBoundaryHint {
 pub(crate) const CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON: &str =
     "ページ単位表示でのみ使用できます";
 
+const SNS_SPLIT_ACTIVE_SCOPES: &[CommandScope] = &[KeyContext::Global, KeyContext::SnsSplit];
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsContinuousReadingUnavailableFeature {
     ImageAnalysis,
@@ -4806,13 +4808,14 @@ pub(crate) enum FsContinuousReadingUnavailableFeature {
     LocalAdjust,
     Conceal,
     Text,
+    SnsSplit,
     Export,
     CaptureRegion,
 }
 
 impl FsContinuousReadingUnavailableFeature {
     #[cfg(test)]
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::ImageAnalysis,
         Self::Zoom,
         Self::Panorama,
@@ -4821,6 +4824,7 @@ impl FsContinuousReadingUnavailableFeature {
         Self::LocalAdjust,
         Self::Conceal,
         Self::Text,
+        Self::SnsSplit,
         Self::Export,
         Self::CaptureRegion,
     ];
@@ -4835,6 +4839,7 @@ impl FsContinuousReadingUnavailableFeature {
             Self::LocalAdjust => "[補正レイヤー] ページ単位表示でのみ使用できます",
             Self::Conceal => "[隠蔽加工] ページ単位表示でのみ使用できます",
             Self::Text => "[テキスト注釈] ページ単位表示でのみ使用できます",
+            Self::SnsSplit => "[SNS 分割] ページ単位表示でのみ使用できます",
             Self::Export => "[エクスポート] ページ単位表示でのみ使用できます",
             Self::CaptureRegion => "[範囲コピー] ページ単位表示でのみ使用できます",
         }
@@ -10127,6 +10132,7 @@ impl App {
             || self.text_mode
             || self.local_adjust_mode
             || self.export_crop_mode
+            || self.sns_split.is_some()
     }
 
     /// 分割中のページ送り。ステップ列の中を 1 つ動かす。
@@ -14825,7 +14831,9 @@ impl App {
                         // ── キー入力 ──
                         // 音声 (映像なし動画) は動画スコープの Video* アクション (L / B / 音量 /
                         // 前後ファイル) を共有するので、ショートカット一覧も動画スコープを使う。
-                        let active_scopes = if matches!(
+                        let active_scopes = if self.sns_split.is_some() {
+                            SNS_SPLIT_ACTIVE_SCOPES
+                        } else if matches!(
                             self.items.get(fs_idx),
                             Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
                         ) {
@@ -15308,6 +15316,28 @@ impl App {
 
                         if let Some((w, h)) = state.image_dims {
                             let image_size = [w as usize, h as usize];
+                            if self.sns_split.is_some()
+                                && !is_spread_double
+                                && !state.original_preview_active
+                                && let Some(transform) = single_transform.as_ref()
+                            {
+                                let pointer_allowed = !self.any_dialog_open()
+                                    && !ctx.input(|i| {
+                                        i.pointer.hover_pos().is_some_and(|p| {
+                                            self.sns_split_panel_rect(full_rect).contains(p)
+                                        })
+                                    });
+                                self.draw_sns_split_overlay(
+                                    ui,
+                                    transform,
+                                    image_size,
+                                    pointer_allowed,
+                                );
+                                ctx.request_repaint();
+                            } else if self.sns_split.is_some() {
+                                ctx.request_repaint();
+                            }
+
                             let has_crop = self.export_crop_for_idx(fs_idx, image_size).is_some();
                             // crop はパイプライン最後段。crop の枠 / 暗転は「切り取りツール」
                             // または「素の通常表示」でのみ出す。各ツールは自分の手前までの
@@ -15316,6 +15346,7 @@ impl App {
                             let in_earlier_tool = self.erase_mode
                                 || self.local_adjust_mode
                                 || self.conceal_mode
+                                || self.sns_split.is_some()
                                 || self.adjustment_mode.is_open()
                                 || self.analysis_mode;
                             if !is_spread_double
@@ -15342,7 +15373,7 @@ impl App {
                             } else if self.export_crop_mode {
                                 ctx.request_repaint();
                             }
-                        } else if self.export_crop_mode {
+                        } else if self.export_crop_mode || self.sns_split.is_some() {
                             ctx.request_repaint();
                         }
 
@@ -15585,6 +15616,13 @@ impl App {
                             && !panorama_mode_active_now
                         {
                             self.draw_local_adjust_panel(ctx, full_rect);
+                        } else if self.sns_split.is_some()
+                            && !compare_wipe_active
+                            && !panorama_mode_active_now
+                        {
+                            let image_size =
+                                state.image_dims.map(|(w, h)| [w as usize, h as usize]);
+                            self.draw_sns_split_panel(ctx, full_rect, image_size);
                         } else if self.export_crop_mode
                             && !compare_wipe_active
                             && !panorama_mode_active_now
@@ -17633,7 +17671,7 @@ impl App {
     /// Pixel coordinate dimensions used by annotations, hit testing, and Original
     /// scale. PDF `source_*` values have the same pixel contract as other sources;
     /// the independent page-box aspect lives in `layout_*`.
-    fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+    pub(crate) fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
         self.source_dims_for_idx(idx)
             .map(|(w, h)| egui::vec2(w, h))
             .or_else(|| {
@@ -18705,7 +18743,9 @@ impl App {
             return true;
         }
         // 音声 (映像なし動画) は動画スコープの Video* アクションを共有するので動画スコープで probe。
-        let active_scopes = if matches!(
+        let active_scopes = if self.sns_split.is_some() {
+            SNS_SPLIT_ACTIVE_SCOPES
+        } else if matches!(
             self.items.get(fs_idx),
             Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
         ) {
@@ -19376,6 +19416,9 @@ impl App {
 
         if self.export_crop_mode {
             return self.handle_export_crop_keys(ctx, fs_idx);
+        }
+        if self.sns_split.is_some() {
+            return self.handle_sns_split_keys(ctx);
         }
 
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
@@ -20119,6 +20162,10 @@ impl App {
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
+        let key_sns_split = !is_video_fs
+            && !fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && self.keymap.consume_action(ctx, KeyAction::FsSnsSplitMode);
         let key_compare_x = !is_video_fs
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
@@ -20991,6 +21038,31 @@ impl App {
                 FsContinuousReadingUnavailableFeature::Text,
             ) {
                 self.enter_text_mode(fs_idx);
+            }
+        }
+
+        if key_sns_split
+            && !self.analysis_mode
+            && !self.adjustment_mode.is_open()
+            && !self.erase_mode
+            && !self.conceal_mode
+            && !self.text_mode
+            && !self.local_adjust_mode
+            && !is_video_fs
+            && !self.fs_entry_is_animated(fs_idx)
+        {
+            if image_edit_unavailable {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedEditUnavailable, false);
+            } else if !self.show_continuous_reading_shortcut_noop(
+                ctx,
+                fs_idx,
+                true,
+                FsContinuousReadingUnavailableFeature::SnsSplit,
+            ) && self.fullscreen_edit_mode_entry_allowed(fs_idx)
+            {
+                if !self.enter_sns_split_mode(fs_idx) {
+                    self.show_feedback_toast("[SNS 分割] 画像読み込み待ち".to_string());
+                }
             }
         }
 
@@ -23106,6 +23178,8 @@ impl App {
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
                         let in_export_crop_panel = self.export_crop_mode
                             && self.export_crop_panel_rect(full_rect).contains(p);
+                        let in_sns_split_panel = self.sns_split.is_some()
+                            && self.sns_split_panel_rect(full_rect).contains(p);
                         let in_view_trim_panel =
                             self.view_trim_mode && self.view_trim_panel_rect(full_rect).contains(p);
                         // テキスト注釈モードの左 (一覧) / 右 (詳細) パネル。一覧 ScrollArea を
@@ -23122,6 +23196,7 @@ impl App {
                             || in_local_adjust_panel
                             || in_conceal_panel
                             || in_export_crop_panel
+                            || in_sns_split_panel
                             || in_view_trim_panel
                             || in_text_panel
                             || cursor_in_seek_panel
@@ -26423,6 +26498,8 @@ impl App {
             self.export_crop_spread_ctx = None;
             self.reset_export_crop_mode();
         }
+        self.sns_split_spread_ctx = None;
+        self.reset_sns_split_mode();
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;

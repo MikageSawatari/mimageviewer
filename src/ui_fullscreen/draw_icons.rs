@@ -778,6 +778,20 @@ pub(crate) fn draw_crop_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     );
 }
 
+/// SNS カルーセル分割。隙間を空けた 3 枚の縦長フレームで表す。
+pub(crate) fn draw_sns_split_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let stroke = egui::Stroke::new(1.6, egui::Color32::WHITE);
+    let frame_half_w = r * 0.22;
+    let frame_half_h = r * 0.78;
+    for offset in [-r * 0.66, 0.0, r * 0.66] {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(c.x + offset - frame_half_w, c.y - frame_half_h),
+            egui::pos2(c.x + offset + frame_half_w, c.y + frame_half_h),
+        );
+        painter.rect_stroke(rect, 0.8, stroke, egui::StrokeKind::Middle);
+    }
+}
+
 /// テキスト注釈 (comic) アイコン。吹き出し + 本文線 + しっぽで注釈ツールを表す。
 pub(crate) fn draw_text_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;

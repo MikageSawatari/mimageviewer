@@ -13950,10 +13950,12 @@ impl App {
             let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
             let export_disabled_reason = image_export_disabled_reason(continuous_reading);
             let can_export = can_overlay_edit && export_disabled_reason.is_none();
-            // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
+            // 右側 7 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り /
+            // テキスト / エクスポート / SNS 分割。
             // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
             let btn_y = header_rect.min.y + 34.0;
-            let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
+            let sns_split_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
+            let export_btn_x = sns_split_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
             let text_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
             let crop_btn_x = text_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
             let conceal_btn_x = crop_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
@@ -13983,12 +13985,17 @@ impl App {
                 egui::pos2(export_btn_x, btn_y),
                 egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
             );
+            let sns_split_rect = egui::Rect::from_min_size(
+                egui::pos2(sns_split_btn_x, btn_y),
+                egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+            );
             let mut activate_erase = false;
             let mut activate_local_adjust = false;
             let mut activate_conceal = false;
             let mut activate_crop = false;
             let mut activate_text = false;
             let mut activate_export = false;
+            let mut activate_sns_split = false;
 
             let erase_resp = draw_header_icon_button(
                 &mut child,
@@ -14077,6 +14084,20 @@ impl App {
             if can_export && export_resp.clicked() {
                 activate_export = true;
             }
+
+            let sns_split_resp = draw_header_icon_button(
+                &mut child,
+                sns_split_rect,
+                "adjust_panel_sns_split_btn",
+                can_start_edit_tool,
+                false,
+                "SNS 分割",
+                edit_tool_disabled_reason,
+                crate::ui_fullscreen::draw_icons::draw_sns_split_icon,
+            );
+            if can_start_edit_tool && sns_split_resp.clicked() {
+                activate_sns_split = true;
+            }
             // クリック処理は描画後にディスパッチ (借用衝突回避)。
             // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
             // adjustment_mode を Closed にしておく (enter_*_mode 内の open-state guard
@@ -14125,6 +14146,17 @@ impl App {
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
                 self.enter_text_mode(fs_root_idx);
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+            }
+            if activate_sns_split {
+                if self.enter_sns_split_mode(fs_root_idx) {
+                    crate::ime_focus::record_side_panel_close(
+                        child.ctx(),
+                        "ui_adjustment_panel::draw_adjustment_panel:enter_sns_split",
+                    );
+                    self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                    return;
+                }
+                self.show_feedback_toast("[SNS 分割] 画像読み込み待ち".to_string());
             }
             if activate_export {
                 crate::ime_focus::record_side_panel_close(

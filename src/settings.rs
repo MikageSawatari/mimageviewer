@@ -4114,6 +4114,14 @@ pub struct Settings {
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
 
+    // ── SNS 分割 ──────────────────────────────────────────────
+    /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
+    #[serde(default = "default_sns_split_target")]
+    pub sns_split_target: Option<String>,
+    /// 直前に選んだ分割枚数 (2..=4)。ページ固有の配置は保存しない。
+    #[serde(default = "default_sns_split_count")]
+    pub sns_split_count: u8,
+
     // ── フルスクリーン表示モード ────────────────────────────
     /// デフォルトのページ構成
     #[serde(default)]
@@ -5742,6 +5750,14 @@ pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
 
+fn default_sns_split_target() -> Option<String> {
+    Some(crate::sns_split::SnsTarget::X.stable_key().to_owned())
+}
+
+fn default_sns_split_count() -> u8 {
+    crate::sns_split::MIN_COUNT
+}
+
 fn sanitize_details_column_order(order: &mut Vec<DetailsColumnId>) {
     if order.is_empty() {
         return;
@@ -6156,6 +6172,8 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            sns_split_target: default_sns_split_target(),
+            sns_split_count: default_sns_split_count(),
         }
     }
 }
@@ -7548,6 +7566,13 @@ impl Settings {
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
+        let sns_split_target = crate::sns_split::SnsTarget::from_stable_key(
+            self.sns_split_target.as_deref().unwrap_or_default(),
+        );
+        self.sns_split_target = Some(sns_split_target.stable_key().to_owned());
+        self.sns_split_count = self
+            .sns_split_count
+            .clamp(crate::sns_split::MIN_COUNT, crate::sns_split::MAX_COUNT);
         self.grid_display_order.normalize();
         self.subfolder_expansion_filter_kinds.retain(|kind| {
             matches!(
@@ -8012,6 +8037,10 @@ impl Settings {
         // 環境設定側の古い snapshot で巻き戻らないよう live 値を引き継ぐ。
         self.keymap = src.keymap.clone();
         self.ring_shortcuts = src.ring_shortcuts.clone();
+        // SNS 分割パネルでライブ更新する直前値。環境設定側の古い snapshot で
+        // 投稿先と枚数を巻き戻さない。
+        self.sns_split_target = src.sns_split_target.take();
+        self.sns_split_count = src.sns_split_count;
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
@@ -8275,6 +8304,62 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sns_split_settings_default_to_x_and_two_frames() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(defaults.sns_split_count, 2);
+
+        let missing_fields: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing_fields.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(missing_fields.sns_split_count, 2);
+    }
+
+    #[test]
+    fn sns_split_settings_round_trip_stable_target_and_count() {
+        let mut saved = Settings::default();
+        saved.sns_split_target = Some(
+            crate::sns_split::SnsTarget::Instagram
+                .stable_key()
+                .to_owned(),
+        );
+        saved.sns_split_count = 4;
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(restored.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(restored.sns_split_count, 4);
+    }
+
+    #[test]
+    fn sns_split_settings_sanitize_unknown_target_and_out_of_range_count() {
+        let mut below_minimum: Settings =
+            serde_json::from_str(r#"{"sns_split_target":"future-service","sns_split_count":0}"#)
+                .unwrap();
+        below_minimum.sanitize();
+        assert_eq!(below_minimum.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(below_minimum.sns_split_count, crate::sns_split::MIN_COUNT);
+
+        below_minimum.sns_split_target = Some("instagram".to_owned());
+        below_minimum.sns_split_count = u8::MAX;
+        below_minimum.sanitize();
+        assert_eq!(below_minimum.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(below_minimum.sns_split_count, crate::sns_split::MAX_COUNT);
+    }
+
+    #[test]
+    fn preferences_ok_preserves_live_sns_split_selection() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        live.sns_split_target = Some("instagram".to_owned());
+        live.sns_split_count = 4;
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(edited.sns_split_count, 4);
+    }
 
     /// **モードと読み順は互いの逆向きでなければならない。**
     ///

@@ -64,7 +64,7 @@ fn conceal_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f
 impl App {
     /// 「フルスクリーン上の主要 UI (メタデータパネル / 上部ホバーバー / カーソル自動隠し /
     /// マウスホイールでのページ送り 等) を抑制すべき編集モード」が現在 active か判定する
-    /// (= 消しゴム / 補正レイヤー / 隠蔽加工 / 最後段 crop)。Phase 4 で追加。
+    /// (= 消しゴム / 補正レイヤー / 隠蔽加工 / 最後段 crop / SNS 分割)。Phase 4 で追加。
     ///
     /// 既存コード (ui_fullscreen.rs) に散らばっている `!self.erase_mode` 判定の多くは
     /// 「左側の編集パネル中の UI を邪魔するな」という同じ意図なので、本ヘルパーで統一する。
@@ -75,6 +75,7 @@ impl App {
             || self.local_adjust_mode
             || self.conceal_mode
             || self.export_crop_mode
+            || self.sns_split.is_some()
             || self.text_mode
     }
 

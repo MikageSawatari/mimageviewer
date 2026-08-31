@@ -209,6 +209,7 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
+mod ui_sns_split;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]

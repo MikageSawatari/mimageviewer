@@ -3649,6 +3649,12 @@ pub(crate) struct ExportCropDrag {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct SnsSplitDrag {
+    pub(crate) handle: crate::export_crop::CropHandle,
+    pub(crate) base: crate::sns_split::SnsSplitLayout,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ExportCropCreateDrag {
     pub(crate) start: [f32; 2],
 }
@@ -7371,6 +7377,7 @@ fn build_passthrough_rendition_pixels(
 /// 入力も無いモード**になる。消しゴム / 隠蔽 / 注釈 / 切り取りはこの退避を持っていたが、
 /// 補正レイヤー (Ctrl+G) だけ持っておらず、見開きから入ると操作が一切効かなかった
 /// (2026-08-26 の利用者報告)。
+/// SNS 分割も同じ typed pivot owner を使い、ツール固有の復元手順は持たない。
 ///
 /// 手順は [`App::plan_page_edit_pivot`] / [`App::enter_page_edit_single_view`] /
 /// [`App::leave_page_edit_single_view`] が持つ。**ツールごとに書き写さない。**
@@ -7424,6 +7431,7 @@ impl App {
             (!self.conceal_mode, &mut self.conceal_spread_ctx),
             (!self.text_mode, &mut self.text_spread_ctx),
             (!self.export_crop_mode, &mut self.export_crop_spread_ctx),
+            (self.sns_split.is_none(), &mut self.sns_split_spread_ctx),
             (!self.local_adjust_mode, &mut self.local_adjust_spread_ctx),
         ]
         .into_iter()
@@ -7443,6 +7451,7 @@ impl App {
             .or(self.conceal_spread_ctx)
             .or(self.text_spread_ctx)
             .or(self.export_crop_spread_ctx)
+            .or(self.sns_split_spread_ctx)
             .or(self.local_adjust_spread_ctx)
             .map(|pivot| pivot.pair)
     }
@@ -11693,6 +11702,13 @@ pub struct App {
     pub(crate) local_adjust_mode: bool,
     /// エクスポート / 最後段 crop パネルの独立左パネル表示フラグ。
     pub(crate) export_crop_mode: bool,
+    /// SNS カルーセル向け分割レイアウト。Some がモード中を表す唯一の sentinel。
+    /// ページには保存せず、モードを抜けたら破棄する。
+    pub(crate) sns_split: Option<crate::sns_split::SnsSplitLayout>,
+    /// SNS 分割グループのリサイズ / 移動ドラッグ。
+    pub(crate) sns_split_drag: Option<SnsSplitDrag>,
+    /// 見開きから SNS 分割モードに入ったときの spread 状態スナップショット。
+    pub(crate) sns_split_spread_ctx: Option<PageEditSpreadPivot>,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
     /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
     pub(crate) adjust_spread_target: AdjustSpreadTarget,
@@ -11748,7 +11764,7 @@ pub struct App {
     /// 見開きから切り取りモードに入ったときの spread 状態スナップショット
     /// (消しゴム / 隠蔽加工と同じく Single へ pivot し、退場時に復元する)。
     pub(crate) export_crop_spread_ctx: Option<PageEditSpreadPivot>,
-    /// 補正レイヤーを見開きから開いたときの退避。**5 つの編集ツールで唯一これが無く**、
+    /// 補正レイヤーを見開きから開いたときの退避。**当時の 5 つの編集ツールで唯一これが無く**、
     /// 見開きのまま入ると canvas 用 transform が作られずマスク編集が一切効かなかった
     /// (2026-08-26 の利用者報告)。
     pub(crate) local_adjust_spread_ctx: Option<PageEditSpreadPivot>,
@@ -14220,6 +14236,9 @@ impl App {
             adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
             local_adjust_mode: false,
             export_crop_mode: false,
+            sns_split: None,
+            sns_split_drag: None,
+            sns_split_spread_ctx: None,
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjust_scope_selection: AdjustScopeSelection::Standard,
             adjust_scope_selection_idx: None,
@@ -23815,6 +23834,9 @@ impl App {
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
         self.export_crop_spread_ctx = None;
+        self.sns_split = None;
+        self.sns_split_drag = None;
+        self.sns_split_spread_ctx = None;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
         self.export_crop_page_settings.clear();
@@ -26328,6 +26350,9 @@ impl App {
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
         self.export_crop_spread_ctx = None;
+        self.sns_split = None;
+        self.sns_split_drag = None;
+        self.sns_split_spread_ctx = None;
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
@@ -37882,6 +37907,8 @@ impl App {
             self.export_crop_spread_ctx = None;
             self.reset_export_crop_mode();
         }
+        self.sns_split_spread_ctx = None;
+        self.reset_sns_split_mode();
     }
 
     #[cfg(windows)]
@@ -52119,6 +52146,10 @@ impl App {
         // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
         self.export_crop_spread_ctx = None;
         self.reset_export_crop_mode();
+        // SNS 分割も一度きりの foreground editor。close では旧ページを復元せず、
+        // layout / drag と一緒に pivot を破棄する。
+        self.sns_split_spread_ctx = None;
+        self.reset_sns_split_mode();
         self.persist_pending_view_trim_state();
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
@@ -63439,6 +63470,9 @@ impl App {
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
         self.export_crop_spread_ctx = None;
+        self.sns_split = None;
+        self.sns_split_drag = None;
+        self.sns_split_spread_ctx = None;
         self.fs_loupe_locked = false;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;

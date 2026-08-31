@@ -133,6 +133,7 @@ const FS_VIDEO_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
 const ERASE_HELP_SCOPES: &[CommandScope] = &[CommandScope::Erase];
 const CONCEAL_HELP_SCOPES: &[CommandScope] = &[CommandScope::Conceal];
 const CROP_HELP_SCOPES: &[CommandScope] = &[CommandScope::Crop];
+const SNS_SPLIT_HELP_SCOPES: &[CommandScope] = &[CommandScope::SnsSplit];
 const LOCAL_ADJUST_HELP_SCOPES: &[CommandScope] = &[CommandScope::LocalAdjust];
 const TEXT_HELP_SCOPES: &[CommandScope] = &[CommandScope::Text];
 
@@ -190,6 +191,25 @@ const CROP_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
     FixedShortcutRow {
         keys: "ドラッグ",
         description: "切り取り範囲を作成、移動、またはリサイズする",
+    },
+    FixedShortcutRow {
+        keys: "マウスホイール / Ctrl+ホイール",
+        description: "画像上ではズームする。パネル上ではスクロールまたはズームする",
+    },
+];
+
+const SNS_SPLIT_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
+    FixedShortcutRow {
+        keys: "?",
+        description: "このショートカット一覧を表示する",
+    },
+    FixedShortcutRow {
+        keys: "Esc",
+        description: "SNS 分割モードを終了する",
+    },
+    FixedShortcutRow {
+        keys: "ドラッグ",
+        description: "分割枠グループを移動またはリサイズする",
     },
     FixedShortcutRow {
         keys: "マウスホイール / Ctrl+ホイール",
@@ -280,6 +300,7 @@ enum ShortcutHelpContext {
     Erase,
     Conceal,
     Crop,
+    SnsSplit,
     LocalAdjust,
     Text,
 }
@@ -293,6 +314,7 @@ impl ShortcutHelpContext {
             Self::Erase => "消しゴムモード",
             Self::Conceal => "隠蔽加工モード",
             Self::Crop => "切り取りモード",
+            Self::SnsSplit => "SNS 分割モード",
             Self::LocalAdjust => "補正レイヤー",
             Self::Text => "テキスト注釈モード",
         }
@@ -306,6 +328,7 @@ impl ShortcutHelpContext {
             Self::Erase => ERASE_HELP_SCOPES,
             Self::Conceal => CONCEAL_HELP_SCOPES,
             Self::Crop => CROP_HELP_SCOPES,
+            Self::SnsSplit => SNS_SPLIT_HELP_SCOPES,
             Self::LocalAdjust => LOCAL_ADJUST_HELP_SCOPES,
             Self::Text => TEXT_HELP_SCOPES,
         }
@@ -319,6 +342,7 @@ impl ShortcutHelpContext {
             Self::Erase => ERASE_FIXED_SHORTCUT_ROWS,
             Self::Conceal => CONCEAL_FIXED_SHORTCUT_ROWS,
             Self::Crop => CROP_FIXED_SHORTCUT_ROWS,
+            Self::SnsSplit => SNS_SPLIT_FIXED_SHORTCUT_ROWS,
             Self::LocalAdjust => LOCAL_ADJUST_FIXED_SHORTCUT_ROWS,
             Self::Text => TEXT_FIXED_SHORTCUT_ROWS,
         }
@@ -333,6 +357,7 @@ impl ShortcutHelpContext {
             | Self::Erase
             | Self::Conceal
             | Self::Crop
+            | Self::SnsSplit
             | Self::LocalAdjust => &[],
         }
     }
@@ -351,6 +376,7 @@ impl ShortcutHelpContext {
             | Self::Erase
             | Self::Conceal
             | Self::Crop
+            | Self::SnsSplit
             | Self::LocalAdjust
             | Self::Text => &[],
         }
@@ -368,7 +394,12 @@ impl ShortcutHelpContext {
                     || row.spec.action.is_location_navigation_action()
             }
             Self::FsVideo => video_help_includes_row(row),
-            Self::Erase | Self::Conceal | Self::Crop | Self::LocalAdjust | Self::Text => true,
+            Self::Erase
+            | Self::Conceal
+            | Self::Crop
+            | Self::SnsSplit
+            | Self::LocalAdjust
+            | Self::Text => true,
         }
     }
 }
@@ -469,6 +500,9 @@ impl App {
         }
         if self.export_crop_mode {
             return ShortcutHelpContext::Crop;
+        }
+        if self.sns_split.is_some() {
+            return ShortcutHelpContext::SnsSplit;
         }
         if let Some(fs_idx) = self.fullscreen_idx
             && matches!(

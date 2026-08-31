@@ -15,6 +15,7 @@ pub enum KeyContext {
     Erase,
     Conceal,
     Crop,
+    SnsSplit,
     Text,
     LocalAdjust,
 }
@@ -31,6 +32,7 @@ impl KeyContext {
             KeyContext::Erase => "Erase",
             KeyContext::Conceal => "Conceal",
             KeyContext::Crop => "Crop",
+            KeyContext::SnsSplit => "SnsSplit",
             KeyContext::Text => "Text",
             KeyContext::LocalAdjust => "LocalAdjust",
         }
@@ -47,6 +49,7 @@ impl KeyContext {
             KeyContext::Erase => "消しゴムモード",
             KeyContext::Conceal => "隠蔽加工モード",
             KeyContext::Crop => "切り取りモード",
+            KeyContext::SnsSplit => "SNS 分割モード",
             KeyContext::Text => "テキスト注釈モード",
             KeyContext::LocalAdjust => "補正レイヤー",
         }
@@ -64,6 +67,7 @@ impl KeyContext {
             KeyContext::Erase,
             KeyContext::Conceal,
             KeyContext::Crop,
+            KeyContext::SnsSplit,
             KeyContext::Text,
             KeyContext::LocalAdjust,
         ]
@@ -1589,6 +1593,7 @@ pub enum KeyAction {
     FsLocalAdjustMode,
     FsConcealMode,
     FsTextMode,
+    FsSnsSplitMode,
     FsBookBookmark,
     FsBgCycle,
     FsPin,
@@ -1777,6 +1782,7 @@ pub enum KeyAction {
     ConcealSpacePan,
     CropSpacePan,
     CropExecute,
+    SnsSplitExecute,
     TextConfirm,
     TextRedo,
     TextUndo,
@@ -2061,6 +2067,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsLocalAdjustMode,
     KeyAction::FsConcealMode,
     KeyAction::FsTextMode,
+    KeyAction::FsSnsSplitMode,
     KeyAction::FsBookBookmark,
     KeyAction::FsBgCycle,
     KeyAction::FsPin,
@@ -2247,6 +2254,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealSpacePan,
     KeyAction::CropSpacePan,
     KeyAction::CropExecute,
+    KeyAction::SnsSplitExecute,
     KeyAction::TextConfirm,
     KeyAction::TextRedo,
     KeyAction::TextUndo,
@@ -3595,6 +3603,7 @@ impl KeyAction {
             FsLocalAdjustMode => "FsLocalAdjustMode",
             FsConcealMode => "FsConcealMode",
             FsTextMode => "FsTextMode",
+            FsSnsSplitMode => "FsSnsSplitMode",
             FsBookBookmark => "FsBookBookmark",
             FsBgCycle => "FsBgCycle",
             FsPin => "FsPin",
@@ -3781,6 +3790,7 @@ impl KeyAction {
             ConcealSpacePan => "ConcealSpacePan",
             CropSpacePan => "CropSpacePan",
             CropExecute => "CropExecute",
+            SnsSplitExecute => "SnsSplitExecute",
             TextConfirm => "TextConfirm",
             TextRedo => "TextRedo",
             TextUndo => "TextUndo",
@@ -4163,6 +4173,7 @@ impl KeyAction {
             FsLocalAdjustMode => "補正レイヤーモードを開始する",
             FsConcealMode => "隠蔽加工モードを開始または終了する",
             FsTextMode => "テキスト注釈モードを開始または終了する",
+            FsSnsSplitMode => "SNS 分割モードを開始する",
             FsBookBookmark => "現在の本のページにブックマークを追加する",
             FsBgCycle => "透過背景色を切り替える",
             FsPin => "現在の項目を代表サムネイルに固定または解除する",
@@ -4355,6 +4366,7 @@ impl KeyAction {
             ConcealSpacePan => "押している間だけ画像をパン操作する",
             CropSpacePan => "押している間だけ画像をパン操作する",
             CropExecute => "切り取りを実行する",
+            SnsSplitExecute => "SNS 分割を実行する",
             TextConfirm => "テキスト注釈モードを確定または終了する",
             TextRedo => "テキスト注釈編集をやり直す",
             TextUndo => "テキスト注釈編集を元に戻す",
@@ -4599,6 +4611,7 @@ impl KeyAction {
             | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
+            | FsSnsSplitMode
             | FsBookBookmark
             | FsBgCycle
             | FsPin
@@ -4771,6 +4784,7 @@ impl KeyAction {
             | ConcealToolEllipse
             | ConcealSpacePan => KeyContext::Conceal,
             CropExecute | CropSpacePan => KeyContext::Crop,
+            SnsSplitExecute => KeyContext::SnsSplit,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush | LaToolBucket
             | LaToolEdgeBrush | LaToolGapFill | LaToolLasso | LaToolPolygon | LaToolSelect
@@ -5013,6 +5027,7 @@ impl KeyAction {
             | FsLocalAdjustMode
             | FsConcealMode
             | FsTextMode
+            | FsSnsSplitMode
             | FsBookBookmark
             | FsBgCycle
             | FsPin
@@ -5196,6 +5211,7 @@ impl KeyAction {
             | ConcealToolRect
             | ConcealToolEllipse
             | CropExecute
+            | SnsSplitExecute
             | TextConfirm
             | TextRedo
             | TextUndo
@@ -5467,6 +5483,7 @@ impl KeyAction {
             FsLocalAdjustMode => ChordList::one(Chord::ctrl(G)),
             FsConcealMode => ChordList::one(Chord::ctrl(M)),
             FsTextMode => ChordList::one(Chord::ctrl(T)),
+            FsSnsSplitMode => ChordList::EMPTY,
             FsBookBookmark => ChordList::one(Chord::key(B)),
             FsBgCycle => ChordList::one(Chord::shift(B)),
             FsPin => ChordList::one(Chord::key(P)),
@@ -5656,6 +5673,7 @@ impl KeyAction {
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
+            SnsSplitExecute => ChordList::one(Chord::ctrl(E)),
             TextConfirm => ChordList::one(Chord::ctrl(T)),
             TextRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             TextUndo => ChordList::one(Chord::ctrl(Z)),
@@ -5865,6 +5883,7 @@ const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
     &[KeyContext::Erase],
     &[KeyContext::Conceal],
     &[KeyContext::Crop],
+    &[KeyContext::SnsSplit],
     &[KeyContext::Text],
     &[KeyContext::LocalAdjust],
 ];
@@ -5882,6 +5901,7 @@ fn is_overlay_edit_scope(scope: CommandScope) -> bool {
         KeyContext::Erase
             | KeyContext::Conceal
             | KeyContext::Crop
+            | KeyContext::SnsSplit
             | KeyContext::Text
             | KeyContext::LocalAdjust
     )
@@ -7250,6 +7270,7 @@ impl Keymap {
             KeyContext::Erase,
             KeyContext::Conceal,
             KeyContext::Crop,
+            KeyContext::SnsSplit,
             KeyContext::Text,
             KeyContext::LocalAdjust,
         ];
@@ -10355,6 +10376,21 @@ mod tests {
                 || conflict.action == KeyAction::VideoCompareToggle
                 || conflict.other_action == Some(KeyAction::VideoCompareToggle)
         }));
+    }
+
+    #[test]
+    fn sns_split_actions_have_their_declared_contexts_and_defaults() {
+        assert_eq!(KeyAction::FsSnsSplitMode.context(), KeyContext::FsImage);
+        assert_eq!(KeyAction::FsSnsSplitMode.trigger(), KeyTrigger::Press);
+        assert!(KeyAction::FsSnsSplitMode.default_chords().is_empty());
+
+        assert_eq!(KeyAction::SnsSplitExecute.context(), KeyContext::SnsSplit);
+        assert_eq!(KeyAction::SnsSplitExecute.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            KeyAction::SnsSplitExecute.default_chords().iter().next(),
+            Some(Chord::ctrl(KeyName::E))
+        );
+        assert_eq!(KeyContext::parse("SnsSplit"), Some(KeyContext::SnsSplit));
     }
 
     #[test]

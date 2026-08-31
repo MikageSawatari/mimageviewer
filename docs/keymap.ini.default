@@ -319,6 +319,7 @@
 # FsLocalAdjustMode = Ctrl+G ; 補正レイヤーモードを開始する
 # FsConcealMode = Ctrl+M ; 隠蔽加工モードを開始または終了する
 # FsTextMode = Ctrl+T ; テキスト注釈モードを開始または終了する
+# FsSnsSplitMode = none ; SNS 分割モードを開始する
 # FsBookBookmark = B ; 現在の本のページにブックマークを追加する
 # FsBgCycle = Shift+B ; 透過背景色を切り替える
 # FsPin = P ; 現在の項目を代表サムネイルに固定または解除する
@@ -560,6 +561,9 @@
 [Crop] ; 切り取りモード
 # CropSpacePan = Space ; 押している間だけ画像をパン操作する
 # CropExecute = Ctrl+E ; 切り取りを実行する
+
+[SnsSplit] ; SNS 分割モード
+# SnsSplitExecute = Ctrl+E ; SNS 分割を実行する
 
 [Text] ; テキスト注釈モード
 # TextConfirm = Ctrl+T ; テキスト注釈モードを確定または終了する

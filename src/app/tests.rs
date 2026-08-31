@@ -18478,8 +18478,9 @@ mod favorite_adjustment_defaults_tests {
         // 表示していない別ページには左右を持ち込まない。
         assert_eq!(app.fs_page_content_bbox(7, Rotation::None, trim), trim);
 
-        // **編集ツールへ入ったら分割を掛けない。**マスク・注釈・切り取り枠・補正レイヤーは
-        // 分割前の画像へ記録されるので、半分だけ見ながら全体に効く編集をさせない
+        // **編集ツールへ入ったら分割を掛けない。**マスク・注釈・切り取り枠・
+        // SNS 分割枠・補正レイヤーは分割前の画像へ記録されるので、半分だけを
+        // 見ながら全体に効く編集をさせない
         // (2026-08-26 の実機報告: 半ページのまま編集ツールへ入っていた)。
         for enter in [
             |app: &mut crate::app::App| app.erase_mode = true,
@@ -18487,6 +18488,13 @@ mod favorite_adjustment_defaults_tests {
             |app: &mut crate::app::App| app.text_mode = true,
             |app: &mut crate::app::App| app.local_adjust_mode = true,
             |app: &mut crate::app::App| app.export_crop_mode = true,
+            |app: &mut crate::app::App| {
+                app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                    crate::sns_split::SnsTarget::X,
+                    2,
+                    [2400, 1600],
+                ));
+            },
         ] {
             enter(&mut app);
             assert_eq!(
@@ -18501,6 +18509,7 @@ mod favorite_adjustment_defaults_tests {
             app.text_mode = false;
             app.local_adjust_mode = false;
             app.export_crop_mode = false;
+            app.sns_split = None;
             assert_eq!(
                 app.fs_page_content_bbox(4, Rotation::None, trim),
                 Some(PageSlice::Left.uv_rect())
@@ -18516,7 +18525,7 @@ mod favorite_adjustment_defaults_tests {
         app.analysis_mode = false;
     }
 
-    /// **5 つの編集ツールが同じ手順で単ページへ倒れ、抜けたら見開きへ戻る。**
+    /// **6 つの編集ツールが同じ手順で単ページへ倒れ、抜けたら見開きへ戻る。**
     ///
     /// 補正レイヤー (Ctrl+G) だけこの手順を持たず、見開きから入るとマスク編集も左右の
     /// 切り替えも一切効かないモードになっていた (2026-08-26 の利用者報告)。canvas 用の
@@ -18579,7 +18588,7 @@ mod favorite_adjustment_defaults_tests {
         app.reconcile_page_edit_spread_pivots();
         assert_eq!(app.spread_mode, SpreadMode::Ltr);
 
-        // 5 つのツールすべてが同じ扱いを受ける。1 つでも見落とすと倒れたままになる。
+        // 6 つのツールすべてが同じ扱いを受ける。1 つでも見落とすと倒れたままになる。
         for (index, put) in [
             (
                 0usize,
@@ -18589,7 +18598,8 @@ mod favorite_adjustment_defaults_tests {
             (1, |app, p| app.conceal_spread_ctx = Some(p)),
             (2, |app, p| app.text_spread_ctx = Some(p)),
             (3, |app, p| app.export_crop_spread_ctx = Some(p)),
-            (4, |app, p| app.local_adjust_spread_ctx = Some(p)),
+            (4, |app, p| app.sns_split_spread_ctx = Some(p)),
+            (5, |app, p| app.local_adjust_spread_ctx = Some(p)),
         ] {
             app.enter_page_edit_single_view(target_idx);
             put(&mut app, pivot);
@@ -48849,6 +48859,20 @@ mod still_window_mode_key_tests {
             app.erase_mode = true;
             app.erase_mask = Some(vec![true, false]);
             app.erase_mask_size = [2, 1];
+            let sns_layout = crate::sns_split::SnsSplitLayout::centered_max(
+                crate::sns_split::SnsTarget::X,
+                2,
+                [2400, 1600],
+            );
+            app.sns_split = Some(sns_layout);
+            app.sns_split_drag = Some(SnsSplitDrag {
+                handle: crate::export_crop::CropHandle::SouthEast,
+                base: sns_layout,
+            });
+            app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
+                saved_mode: crate::settings::SpreadMode::Ltr,
+                pair: (idx, idx),
+            });
             insert_static_fs_entry(app, &ctx, idx, "pause_foreground_modes");
         });
 
@@ -48863,6 +48887,9 @@ mod still_window_mode_key_tests {
         assert!(!app.metadata_panel_hover_active);
         assert!(!app.fs_loupe_locked);
         assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
+        assert!(app.sns_split.is_none());
+        assert!(app.sns_split_drag.is_none());
+        assert!(app.sns_split_spread_ctx.is_none());
         let paused_id = app.detached_image_windows[0].id;
         app.with_window_viewer_context(paused_id, |paused| {
             assert!(
@@ -48871,6 +48898,12 @@ mod still_window_mode_key_tests {
             );
             assert!(!paused.pano_toast_shown_for_current_fs);
             assert!(!paused.analysis_mode);
+            assert!(
+                paused.sns_split.is_none()
+                    && paused.sns_split_drag.is_none()
+                    && paused.sns_split_spread_ctx.is_none(),
+                "SNS split is foreground-only and must not be stashed in a paused viewer bundle"
+            );
             assert_eq!(
                 paused.fs_zoom, 2.5,
                 "leaving analysis mode should preserve the analysis zoom as the normal display zoom"
@@ -64926,4 +64959,249 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
         assert_eq!(sibling.detached_viewer_window_id, Some(99));
     })
     .unwrap();
+}
+
+#[cfg(test)]
+mod sns_split_p2_transition_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    const SNS_TEST_IMAGE_SIZE: [usize; 2] = [2400, 1600];
+
+    fn install_two_page_context(app: &mut App) {
+        app.items = vec![
+            GridItem::Image(PathBuf::from("C:/sns/page-a.jpg")),
+            GridItem::Image(PathBuf::from("C:/sns/page-b.jpg")),
+        ];
+        app.image_metas = vec![None, None];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.visible_indices = vec![0, 1];
+    }
+
+    fn install_loaded_page(app: &mut App, ctx: &egui::Context, source_dims: [usize; 2]) -> usize {
+        let idx = app.items.len();
+        app.items
+            .push(GridItem::Image(PathBuf::from("C:/sns/loaded.jpg")));
+        app.image_metas.push(None);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices.push(idx);
+        let pixels = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+        let tex = ctx.load_texture(
+            "sns_split_entry_source",
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some(source_dims),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        idx
+    }
+
+    fn seed_sns_split_transient_state(app: &mut App, current_idx: usize) {
+        let layout = crate::sns_split::SnsSplitLayout::centered_max(
+            crate::sns_split::SnsTarget::X,
+            2,
+            SNS_TEST_IMAGE_SIZE,
+        );
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.fullscreen_idx = Some(current_idx);
+        app.sns_split = Some(layout);
+        app.sns_split_drag = Some(SnsSplitDrag {
+            handle: crate::export_crop::CropHandle::SouthEast,
+            base: layout,
+        });
+        app.sns_split_spread_ctx = Some(PageEditSpreadPivot {
+            saved_mode: crate::settings::SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+    }
+
+    fn assert_sns_split_transient_state_cleared(app: &App) {
+        assert!(app.sns_split.is_none(), "layout sentinel must be cleared");
+        assert!(app.sns_split_drag.is_none(), "drag state must be cleared");
+        assert!(
+            app.sns_split_spread_ctx.is_none(),
+            "spread pivot must be cleared"
+        );
+    }
+
+    #[test]
+    fn sns_split_entry_uses_saved_target_count_and_source_dimensions_then_reset_exits() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let source_dims = [3200, 2000];
+        let idx = install_loaded_page(&mut app, &ctx, source_dims);
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.sns_split_target = Some("instagram".to_owned());
+        app.settings.sns_split_count = 4;
+
+        assert!(app.enter_sns_split_mode(idx));
+
+        let layout = app
+            .sns_split
+            .expect("entry must set the sole mode sentinel");
+        assert_eq!(layout.target, crate::sns_split::SnsTarget::Instagram);
+        assert_eq!(layout.count, 4);
+        assert_eq!(layout.frames().len(), 4);
+        assert_eq!(
+            layout,
+            crate::sns_split::SnsSplitLayout::centered_max(
+                crate::sns_split::SnsTarget::Instagram,
+                4,
+                source_dims,
+            ),
+            "entry geometry must use canonical source dimensions, not the 2x2 GPU test texture"
+        );
+
+        app.reset_sns_split_mode();
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.fullscreen_idx, Some(idx));
+    }
+
+    #[test]
+    fn sns_split_entry_accepts_canonical_early_dimensions_before_static_cache_arrives() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        let source_dims = [4200, 2800];
+        app.fs_early_dims.insert(0, source_dims);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+
+        assert!(app.enter_sns_split_mode(0));
+        assert_eq!(
+            app.sns_split,
+            Some(crate::sns_split::SnsSplitLayout::centered_max(
+                crate::sns_split::SnsTarget::X,
+                2,
+                source_dims,
+            ))
+        );
+    }
+
+    #[test]
+    fn sns_split_reconcile_waits_while_active_and_restores_after_sentinel_drops() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(20.0, 10.0);
+
+        app.reconcile_page_edit_spread_pivots();
+
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.sns_split_spread_ctx.is_some());
+
+        app.sns_split = None;
+        app.sns_split_drag = None;
+        app.reconcile_page_edit_spread_pivots();
+
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.fs_zoom, 1.0);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        assert_sns_split_transient_state_cleared(&app);
+    }
+
+    #[test]
+    fn sns_split_reset_restores_saved_spread_state() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(20.0, 10.0);
+
+        app.reset_sns_split_mode();
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.fs_zoom, 1.0);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn sns_split_start_loading_items_clears_transient_mode_state() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+        let folder = app.tmp.path().join("sns-split-new-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        app.start_loading_items(
+            folder.clone(),
+            vec![GridItem::Image(folder.join("new-page.jpg"))],
+            vec![None],
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_sns_split_transient_state_cleared(&app);
+    }
+
+    #[test]
+    fn sns_split_invalidate_idx_state_clears_transient_state_without_restoring_pivot() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+
+        app.invalidate_idx_state_and_queues();
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+
+    #[test]
+    fn sns_split_close_fullscreen_clears_state_without_resurrecting_index() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+
+        app.close_fullscreen();
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "close must not let reset restore the pivot's old page"
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+    }
+
+    #[test]
+    fn sns_split_panorama_entry_discards_state_without_restoring_pivot() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+
+        app.toggle_panorama_mode(1);
+
+        assert!(app.panorama_state.is_some());
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+
+    #[test]
+    fn sns_split_disable_non_paged_modes_discards_state_without_restoring_pivot() {
+        let mut app = setup_app();
+        install_two_page_context(&mut app);
+        seed_sns_split_transient_state(&mut app, 1);
+
+        app.disable_non_paged_fullscreen_modes(1);
+
+        assert_sns_split_transient_state_cleared(&app);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
 }
