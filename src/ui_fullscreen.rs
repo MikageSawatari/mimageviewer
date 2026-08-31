@@ -36875,134 +36875,193 @@ mod tests {
                 Some((0.015, 0.025, 0.985, 0.975)),
             ),
             (Some((0.0, 0.0, 1.0, 1.0)), Some((0.0, 0.0, 1.0, 1.0))),
+            // 片側だけトリム。自動トリムは左右で結果が違うので、これが普通の状態
+            // (Codex Sol のテスト提案 4)。
+            (Some((0.0, 0.04, 0.97, 0.96)), None),
+            (None, Some((0.03, 0.0, 1.0, 0.95))),
         ];
+        // 左右で違う解像度のテクスチャ。片側だけ AI アップスケールが先に届く、
+        // 片側だけサムネイルのまま、といった状態が実際に起きる。
+        let texture_factors = [(1.0_f32, 1.0_f32), (1.0, 4.0), (1.0 / 8.0, 1.0)];
+        // 回転は bbox を表示空間へ写してから寄せるので、寄せ・UV・逆写像がまとめて効く。
+        // viewport の原点が 0 でない場合も混ぜる (Codex Sol のテスト提案 4)。
+        let rotations = [
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::Cw180,
+        ];
+        let viewport_origins = [egui::pos2(0.0, 0.0), egui::pos2(37.0, 19.0)];
         for (lp, rp) in pairs {
             for (lt, rt) in trims {
-                for gap in [0.0_f32, 1.0, 2.0] {
-                    for pixels_per_point in [1.0_f32, 1.25, 1.5] {
-                        total += 1;
-                        let viewport = egui::Rect::from_min_size(
-                            egui::pos2(0.0, 0.0),
-                            egui::vec2(2560.0, 1440.0),
-                        );
-                        let unit =
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                        let mk = |t: Option<(f32, f32, f32, f32)>| {
-                            t.map(|(a, b, c, d)| {
-                                egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
-                            })
-                        };
-                        let lb = mk(lt);
-                        let rb = mk(rt);
-                        let left_page = egui::vec2(lp.0, lp.1);
-                        let right_page = egui::vec2(rp.0, rp.1);
-                        let left_bbox = lb.unwrap_or(unit);
-                        let right_bbox = rb.unwrap_or(unit);
-                        let content_active = lb.is_some() || rb.is_some();
-                        let geometry = spread_layout_geometry(
-                            left_page, right_page, left_bbox, right_bbox, true,
-                        );
-                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
-                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
-                            / geometry.fit_size.x)
-                            .min(viewport.height() / geometry.fit_size.y);
-                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
-                        let rects = layout_spread_page_rects(
-                            center,
-                            geometry,
-                            fit_scale,
-                            spread_gap,
-                            pixels_per_point,
-                            left_bbox,
-                            right_bbox,
-                            content_active,
-                        );
-                        let resolve =
-                            |rect: egui::Rect, page: egui::Vec2, bbox: Option<egui::Rect>| {
-                                resolve_fs_transform_in_layout_rect(
-                                    DisplayedImageTransformInput {
-                                        pixel_fit: RectPixelFit::Texels,
-                                        page_idx: 0,
-                                        viewport_rect: viewport,
-                                        source_size: page,
-                                        texture_size: page,
-                                        rotation: crate::rotation_db::Rotation::None,
-                                        free_rotation_rad: 0.0,
-                                        content_bbox: bbox,
-                                        fit_mode: FullscreenFitMode::Page,
-                                        fit_scale_limits: FullscreenFitScaleLimits {
-                                            pixels_per_point,
-                                            ..FullscreenFitScaleLimits::default()
-                                        },
+                for (left_factor, right_factor) in texture_factors {
+                    for rotation in rotations {
+                        for viewport_origin in viewport_origins {
+                            for gap in [0.0_f32, 1.0, 2.0] {
+                                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                                    total += 1;
+                                    let viewport = egui::Rect::from_min_size(
+                                        viewport_origin,
+                                        egui::vec2(2560.0, 1440.0),
+                                    );
+                                    let unit = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    );
+                                    let mk = |t: Option<(f32, f32, f32, f32)>| {
+                                        t.map(|(a, b, c, d)| {
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(a, b),
+                                                egui::pos2(c, d),
+                                            )
+                                        })
+                                    };
+                                    let lb = mk(lt);
+                                    let rb = mk(rt);
+                                    let left_page = egui::vec2(lp.0, lp.1);
+                                    let right_page = egui::vec2(rp.0, rp.1);
+                                    // レイアウトは回転後の表示寸法で組む (production と同じ)。
+                                    let left_display = rotated_display_size(left_page, rotation);
+                                    let right_display = rotated_display_size(right_page, rotation);
+                                    let left_bbox = lb.unwrap_or(unit);
+                                    let right_bbox = rb.unwrap_or(unit);
+                                    let content_active = lb.is_some() || rb.is_some();
+                                    let geometry = spread_layout_geometry(
+                                        left_display,
+                                        right_display,
+                                        left_bbox,
+                                        right_bbox,
+                                        true,
+                                    );
+                                    let spread_gap =
+                                        quantize_points_to_physical_pixels(gap, pixels_per_point);
+                                    let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                                        / geometry.fit_size.x)
+                                        .min(viewport.height() / geometry.fit_size.y);
+                                    let center = viewport.center()
+                                        - geometry.content_center_offset * fit_scale;
+                                    let rects = layout_spread_page_rects(
+                                        center,
+                                        geometry,
+                                        fit_scale,
+                                        spread_gap,
                                         pixels_per_point,
-                                        placement: ResolvedDisplayPlacement::Normal {
-                                            zoom_pan: None,
-                                        },
-                                    },
-                                    rect,
-                                )
-                                .expect("t")
-                            };
-                        let left = resolve(rects.left_rect, left_page, lb);
-                        let right = resolve(rects.right_rect, right_page, rb);
-                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
-                        let (left_offset, right_offset) =
-                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
-                        let left = left.translated_by(left_offset);
-                        let right = right.translated_by(right_offset);
-                        let painted =
-                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
-                        let mode = format!(
-                            "{:?}",
-                            crate::displayed_image_transform::rect_snap_mode(
-                                left.total_scale,
-                                pixels_per_point
-                            )
-                        );
-                        let case = format!(
-                            "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}",
-                            lp.0,
-                            lp.1,
-                            rp.0,
-                            rp.1,
-                            lb.is_some()
-                        );
-                        if (painted - gap_px).abs() >= 1e-3 {
-                            failures.push(format!("{case}: painted={painted} want={gap_px}"));
-                        }
-                        // **§1.0e**: trim があっても貼り先は物理ピクセル境界に乗ったまま。
-                        // 端数で動かすとテクセルが画素中心から外れ、Lanczos の結果へ
-                        // 二度目の線形補間が掛かる (Codex Sol の指摘 1)。
-                        for (side, transform, offset) in [
-                            ("left", &left, left_offset),
-                            ("right", &right, right_offset),
-                        ] {
-                            if matches!(
-                                crate::displayed_image_transform::rect_snap_mode(
-                                    transform.total_scale,
-                                    pixels_per_point
-                                ),
-                                crate::displayed_image_transform::RectSnapMode::None
-                            ) {
-                                continue;
-                            }
-                            let offset_px = offset.x * pixels_per_point;
-                            if (offset_px - offset_px.round()).abs() >= 1e-3 {
-                                failures.push(format!(
-                                    "{case}: {side} の移動量が {offset_px}px (整数でない)"
-                                ));
-                            }
-                            let min_px = transform.full_image_rect.min.x * pixels_per_point;
-                            if (min_px - min_px.round()).abs() >= 1e-3 {
-                                failures.push(format!(
-                                    "{case}: {side} の原点が {min_px} (画素境界から外れた)"
-                                ));
+                                        left_bbox,
+                                        right_bbox,
+                                        content_active,
+                                    );
+                                    let resolve =
+                                        |rect: egui::Rect,
+                                         page: egui::Vec2,
+                                         bbox: Option<egui::Rect>,
+                                         factor: f32| {
+                                            resolve_fs_transform_in_layout_rect(
+                                                DisplayedImageTransformInput {
+                                                    pixel_fit: RectPixelFit::Texels,
+                                                    page_idx: 0,
+                                                    viewport_rect: viewport,
+                                                    source_size: page,
+                                                    texture_size: (page * factor).round(),
+                                                    rotation,
+                                                    free_rotation_rad: 0.0,
+                                                    content_bbox: bbox,
+                                                    fit_mode: FullscreenFitMode::Page,
+                                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                                        pixels_per_point,
+                                                        ..FullscreenFitScaleLimits::default()
+                                                    },
+                                                    pixels_per_point,
+                                                    placement: ResolvedDisplayPlacement::Normal {
+                                                        zoom_pan: None,
+                                                    },
+                                                },
+                                                rect,
+                                            )
+                                            .expect("t")
+                                        };
+                                    let left = resolve(rects.left_rect, left_page, lb, left_factor);
+                                    let right =
+                                        resolve(rects.right_rect, right_page, rb, right_factor);
+                                    let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                                    let (left_offset, right_offset) = align_spread_pages_for_gap(
+                                        &left,
+                                        &right,
+                                        gap_px,
+                                        pixels_per_point,
+                                    );
+                                    let left = left.translated_by(left_offset);
+                                    let right = right.translated_by(right_offset);
+                                    let painted = (right.paint_rect.min.x - left.paint_rect.max.x)
+                                        * pixels_per_point;
+                                    let mode = format!(
+                                        "{:?}",
+                                        crate::displayed_image_transform::rect_snap_mode(
+                                            left.total_scale,
+                                            pixels_per_point
+                                        )
+                                    );
+                                    let case = format!(
+                                        "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}",
+                                        lp.0,
+                                        lp.1,
+                                        rp.0,
+                                        rp.1,
+                                        lb.is_some()
+                                    );
+                                    if (painted - gap_px).abs() >= 1e-3 {
+                                        failures.push(format!(
+                                            "{case}: painted={painted} want={gap_px}"
+                                        ));
+                                    }
+                                    // **§1.0e**: trim があっても貼り先は物理ピクセル境界に乗ったまま。
+                                    // 端数で動かすとテクセルが画素中心から外れ、Lanczos の結果へ
+                                    // 二度目の線形補間が掛かる (Codex Sol の指摘 1)。
+                                    for (side, transform, offset) in [
+                                        ("left", &left, left_offset),
+                                        ("right", &right, right_offset),
+                                    ] {
+                                        if matches!(
+                                            crate::displayed_image_transform::rect_snap_mode(
+                                                transform.total_scale,
+                                                pixels_per_point
+                                            ),
+                                            crate::displayed_image_transform::RectSnapMode::None
+                                        ) {
+                                            continue;
+                                        }
+                                        let offset_px = offset.x * pixels_per_point;
+                                        if (offset_px - offset_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                        "{case}: {side} の移動量が {offset_px}px (整数でない)"
+                                    ));
+                                        }
+                                        let min_px =
+                                            transform.full_image_rect.min.x * pixels_per_point;
+                                        if (min_px - min_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                                "{case}: {side} の原点が {min_px} (画素境界から外れた)"
+                                            ));
+                                        }
+                                        // **貼り先は出力テクセルの整数個ぶん。** リサンプラは
+                                        // 整数サイズのテクスチャを作るので、貼り先が半端だと
+                                        // egui/wgpu がもう一度補間する (§1.0e)。trim があっても、
+                                        // 寄せた bbox のおかげで可視幅は整数テクセルになる
+                                        // (Codex Sol のテスト提案 1)。
+                                        let extent_px =
+                                            transform.paint_rect.width() * pixels_per_point;
+                                        if (extent_px - extent_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                                "{case}: {side} の貼り先幅 {extent_px}px がテクセル整数個でない"
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        assert!(total >= 2000, "走査が狭すぎる: {total} 件");
         assert!(
             failures.is_empty(),
             "{}/{} 件失敗:
