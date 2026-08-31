@@ -501,7 +501,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         ui.label(egui::RichText::new("登録した外部ツール").strong());
         ui.label(
             egui::RichText::new(
-                "この段階では、現在選択している実ファイル 1 件で登録内容を確認できます。",
+                "登録と設定はこの画面だけで完結します。下の「現在の実ファイルで起動して確認」
+だけは、環境設定を開いた時点で選んでいた実ファイル 1 件を使います。",
             )
             .weak(),
         );
@@ -529,29 +530,35 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
 
         ui.add_space(6.0);
+        // 関連付けの列挙は拡張子ごとなので、その拡張子をここで選ぶ。以前は
+        // メインウィンドウで選択中のファイルから採っていたが、環境設定で出来ることが
+        // 裏の一覧の選択で変わるのは他のどのページとも違い、分かりづらい
+        // (2026-08-31 利用者報告)。環境設定の中だけで完結させる。
+        ui.horizontal_wrapped(|ui| {
+            ui.label("拡張子");
+            egui::ComboBox::from_id_salt("external_tool_association_ext")
+                .selected_text(format!(".{}", state.external_tool_association_ext))
+                .show_ui(ui, |ui| {
+                    for (group, extensions) in association_extension_groups() {
+                        ui.label(egui::RichText::new(group).weak());
+                        for extension in extensions {
+                            ui.selectable_value(
+                                &mut state.external_tool_association_ext,
+                                (*extension).to_string(),
+                                format!(".{extension}"),
+                            );
+                        }
+                    }
+                });
+            if ui.button("この拡張子の関連付けアプリから追加").clicked() {
+                state.external_tool_add_source = Some(ExternalToolAddSource::Associated);
+            }
+        });
+
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button("実行ファイルを選んで追加").clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Executable);
-            }
-            // 関連付けの列挙には「拡張子のある実ファイル」が要る。押した後に種別を
-            // 選ばせてから失敗させると、利用者からは何も起きないのと同じに見える
-            // (2026-08-31 利用者報告)。押す前に無効化して理由を出す。
-            let can_enumerate_association = state
-                .external_tool_target
-                .real_file()
-                .ok()
-                .and_then(|path| path.extension())
-                .is_some();
-            let association_button = ui.add_enabled(
-                can_enumerate_association,
-                egui::Button::new("関連付けアプリから追加"),
-            );
-            if !can_enumerate_association {
-                association_button.on_hover_text(
-                    "関連付けを調べるには、拡張子のある実ファイルを選んでから環境設定を開いてください",
-                );
-            } else if association_button.clicked() {
-                state.external_tool_add_source = Some(ExternalToolAddSource::Associated);
             }
             let selected_index = state.external_tool_selected.and_then(|id| {
                 state
@@ -907,6 +914,25 @@ fn draw_external_tool_add_purpose(ctx: &egui::Context, state: &mut PreferencesSt
     } else if cancel {
         state.external_tool_add_source = None;
     }
+}
+
+/// 関連付けアプリを調べる対象として選べる拡張子。**一覧は増やさず、mIV が実際に
+/// 開ける拡張子の正本 (`folder_tree` の定数) をそのまま並べ替えて出す。**
+pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'static str]); 4] {
+    [
+        ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
+        ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
+        ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
+        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+    ]
+}
+
+/// 環境設定を開いた時点の選択から初期値を採るときに使う。一覧に無い拡張子
+/// (Susie プラグイン任せの形式など) は候補に出せないので既定へ落とす。
+pub(super) fn association_extension_is_known(extension: &str) -> bool {
+    association_extension_groups()
+        .iter()
+        .any(|(_, extensions)| extensions.contains(&extension))
 }
 
 fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut PreferencesState) {

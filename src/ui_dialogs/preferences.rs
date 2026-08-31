@@ -629,6 +629,12 @@ pub(crate) struct PreferencesState {
     // ── 外部ツールページ ────────────────────────────────────────
     /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
     external_tool_target: crate::external_tool::LaunchTarget,
+    /// 関連付けアプリを列挙する対象の拡張子 (小文字、先頭 `.` なし)。
+    ///
+    /// 以前はメインウィンドウで選択中のファイルから採っていたが、環境設定で
+    /// 出来ることが裏の一覧の選択で変わるのは他のどのページとも違う挙動で、
+    /// 分かりづらいという指摘を受けた (2026-08-31)。環境設定の中だけで選ぶ。
+    external_tool_association_ext: String,
     external_tool_selected: Option<crate::external_tool::ExternalToolId>,
     external_tool_editor_loaded_for: Option<crate::external_tool::ExternalToolId>,
     external_tool_executable_input: String,
@@ -923,18 +929,7 @@ impl PreferencesState {
         self.external_tool_handlers_pending = None;
         self.external_tool_candidates.clear();
         self.external_tool_handlers_for_editing = for_editing;
-        let extension = self
-            .external_tool_target
-            .real_file()
-            .ok()
-            .and_then(|path| path.extension())
-            .and_then(|extension| extension.to_str())
-            .map(|extension| format!(".{}", extension.to_ascii_lowercase()));
-        let Some(extension) = extension else {
-            self.external_tool_message =
-                Some("関連付けを調べるには、拡張子のある実ファイルを選択してください".to_string());
-            return;
-        };
+        let extension = format!(".{}", self.external_tool_association_ext);
 
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -1094,6 +1089,17 @@ impl PreferencesState {
         book_resume_entry_count: usize,
         reading_history_entry_count: usize,
     ) -> Self {
+        // 開いた時点の選択があればその拡張子から始める (よくある出発点なので)。
+        // 無くても既定で動くことが要件で、選択の有無で機能が消えてはいけない。
+        let external_tool_association_ext = external_tool_target
+            .real_file()
+            .ok()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .filter(|extension| pages::association_extension_is_known(extension))
+            .unwrap_or_else(|| "jpg".to_string());
+
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
             Parallelism::Auto => s.parallelism.thread_count(),
@@ -1156,6 +1162,7 @@ impl PreferencesState {
             highlight: None,
             expanded,
             external_tool_target,
+            external_tool_association_ext,
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
             external_tool_editor_loaded_for: None,
             external_tool_executable_input: String::new(),
