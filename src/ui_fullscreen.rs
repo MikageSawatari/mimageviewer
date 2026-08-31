@@ -4222,6 +4222,59 @@ fn fs_texture_content_rect(
 /// The layout rectangle is therefore only a containing frame. Re-resolve the final
 /// image rectangle from the actual texture at this ownership boundary so no caller
 /// can publish a non-uniform pixel scale when those aspects differ transiently.
+/// 見開きの左右を、寄せ終わった後に**一体で**置き直すための平行移動量。
+///
+/// `layout_spread_page_rects` は小数のまま設定どおりの間隔を空けるが、その後 `RectPixelFit`
+/// の寄せが左右を**独立に**物理ピクセルへ丸めるので、間隔が保たれない (§1.154。1249x2272 を
+/// 2560x1440 へ高さフィットすると片ページ 791.62px となり、左 `x=488 幅 791` / 右 `x=1281` で
+/// 実測 2px)。縮小後の幅が整数になる組み合わせでは 1px のままなので、発症が画像で変わる。
+///
+/// 返す量は**物理ピクセルの整数倍**。半端に動かすと、§1.0e で揃えた「整数サイズの
+/// テクスチャを整数位置へ貼る」が崩れて縮小がボケる。
+///
+/// 間隔は**実際に見えている内側端**で測る。表示トリム中はフル画像矩形の端ではなく
+/// `paint_rect` の端が見える境界なので、そちらを合わせる。
+fn align_spread_pages_for_gap(
+    left: &DisplayedImageTransform,
+    right: &DisplayedImageTransform,
+    gap_px: f32,
+    center_x: f32,
+    pixels_per_point: f32,
+) -> (egui::Vec2, egui::Vec2) {
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let to_px = |value: f32| value * ppp;
+    // フル画像矩形の左端から、見える左端までの距離。平行移動で変わらない。
+    let left_lead_px = to_px(left.paint_rect.min.x - left.full_image_rect.min.x);
+    let right_lead_px = to_px(right.paint_rect.min.x - right.full_image_rect.min.x);
+    let left_visible_px = to_px(left.paint_rect.width());
+    let right_visible_px = to_px(right.paint_rect.width());
+    if !(left_lead_px.is_finite()
+        && right_lead_px.is_finite()
+        && left_visible_px.is_finite()
+        && right_visible_px.is_finite())
+    {
+        return (egui::Vec2::ZERO, egui::Vec2::ZERO);
+    }
+
+    let total_visible_px = left_visible_px + gap_px + right_visible_px;
+    let visible_start_px = to_px(center_x) - total_visible_px * 0.5;
+    let left_target_px = (visible_start_px - left_lead_px).round();
+    // 差分をまとめて丸めるので、見える内側端の距離は必ず量子化済み `gap_px` になる
+    // (トリムが無ければ lead=0・幅は整数なので、丸めても誤差が出ない)。
+    let right_target_px =
+        left_target_px + (left_lead_px + left_visible_px + gap_px - right_lead_px).round();
+
+    let offset = |target_px: f32, current: f32| egui::vec2((target_px - to_px(current)) / ppp, 0.0);
+    (
+        offset(left_target_px, left.full_image_rect.min.x),
+        offset(right_target_px, right.full_image_rect.min.x),
+    )
+}
+
 fn resolve_fs_transform_in_layout_rect(
     input: DisplayedImageTransformInput,
     page_rect: egui::Rect,
@@ -27518,6 +27571,8 @@ impl App {
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                // 連結読みは 1 ページずつ積むので、左右の間隔合わせは要らない。
+                egui::Vec2::ZERO,
             ) {
                 self.trace_fs_continuous_page_draw(
                     page.idx,
@@ -29822,9 +29877,71 @@ impl App {
                 content_active,
             );
 
+            // 左右を独立に物理ピクセルへ寄せると、レイアウトが空けた間隔が最終矩形では
+            // 保たれない (§1.154)。寄せ終わった矩形を先に求め、1 か所で両方を置き直す。
+            // 片側だけ寄せ直さないのは、それだと組が中心からずれるため。
+            let spread_offsets = {
+                let mut resolve = |rect,
+                                   idx,
+                                   source_size,
+                                   layout_source,
+                                   rot,
+                                   display_tex,
+                                   allow_thumbnail,
+                                   content_bbox| {
+                    let handle =
+                        self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail)?;
+                    self.resolve_fs_spread_page_transform(
+                        &handle,
+                        image_rect,
+                        rect,
+                        idx,
+                        source_size,
+                        layout_source,
+                        rot,
+                        content_bbox,
+                        pixels_per_point,
+                        resolved_placement,
+                    )
+                };
+                let left = resolve(
+                    spread_rects.left_rect,
+                    left_idx,
+                    left_coordinate_size,
+                    left_page_layout_source,
+                    left_rot,
+                    left_display_tex.as_ref(),
+                    left_allow_thumbnail,
+                    content_left,
+                );
+                let right = resolve(
+                    spread_rects.right_rect,
+                    right_idx,
+                    right_coordinate_size,
+                    right_page_layout_source,
+                    right_rot,
+                    right_display_tex.as_ref(),
+                    right_allow_thumbnail,
+                    content_right,
+                );
+                match (left, right) {
+                    (Some(left), Some(right)) => align_spread_pages_for_gap(
+                        &left,
+                        &right,
+                        (effective_gap.max(0.0) * pixels_per_point).round(),
+                        center.x,
+                        pixels_per_point,
+                    ),
+                    // 片方でも最終矩形が出せないなら合わせない (もう片方だけ動かすと
+                    // 組が中心からずれる)。
+                    _ => (egui::Vec2::ZERO, egui::Vec2::ZERO),
+                }
+            };
+
             self.fullscreen_page_layout
                 .begin(FullscreenPageLayoutKind::Spread);
             for (
+                page_offset,
                 rect,
                 idx,
                 source_size,
@@ -29836,6 +29953,7 @@ impl App {
                 content_bbox,
             ) in [
                 (
+                    spread_offsets.0,
                     spread_rects.left_rect,
                     left_idx,
                     left_coordinate_size,
@@ -29847,6 +29965,7 @@ impl App {
                     content_left,
                 ),
                 (
+                    spread_offsets.1,
                     spread_rects.right_rect,
                     right_idx,
                     right_coordinate_size,
@@ -29873,6 +29992,7 @@ impl App {
                     content_bbox,
                     pixels_per_point,
                     resolved_placement,
+                    page_offset,
                 ) {
                     self.fullscreen_page_layout.push(transform);
                 }
@@ -29955,6 +30075,9 @@ impl App {
                     content_bbox,
                     pixels_per_point,
                     ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
+                    // いること) が成り立たないので、ここでは合わせない。
+                    egui::Vec2::ZERO,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -30002,6 +30125,86 @@ impl App {
     /// `display_tex` は `resolve_fs_processed_texture` で解決済みの加工済みテクスチャ。
     /// ここではページ単位の thumbnail フォールバックだけを担当する。
     #[allow(clippy::too_many_arguments)]
+    /// 見開き 1 ページに実際に貼るリソース。サムネイル代替までを含めて **1 か所で**決める。
+    ///
+    /// 配置合わせ (`align_spread_pages_for_gap`) は描画より前に左右の最終矩形を知る必要が
+    /// あり、そのために同じ解決をもう一度通る。ここを 2 か所に綴ると、合わせた矩形と
+    /// 描いた矩形が別のテクスチャ由来になり得る。
+    fn fs_spread_page_paint_resource(
+        &mut self,
+        idx: usize,
+        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        allow_thumbnail: bool,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        display_tex.cloned().or_else(|| {
+            allow_thumbnail
+                .then(|| {
+                    self.fs_thumbnail_texture_for_display(idx)
+                        .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
+                })
+                .flatten()
+        })
+    }
+
+    /// 見開き 1 ページの最終 transform。**描画と配置合わせが同じ答えを見るための入口。**
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_fs_spread_page_transform(
+        &mut self,
+        handle: &crate::gpu_lanczos::FullscreenPaintResource,
+        viewport_rect: egui::Rect,
+        rect: egui::Rect,
+        idx: usize,
+        source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
+        rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
+        pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
+    ) -> Option<DisplayedImageTransform> {
+        let tex_size = handle.size_vec2();
+        let layout_size = match layout_source {
+            FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
+            FsPageLayoutSource::CurrentItem => {
+                let preserve_texture_aspect =
+                    self.is_passthrough_rendition_texture(handle.source_texture());
+                let use_layout = preserve_texture_aspect
+                    || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
+                use_layout
+                    .then(|| self.fs_page_layout_source_size(idx))
+                    .flatten()
+                    .unwrap_or(tex_size)
+            }
+        };
+        let display_size = match rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+                egui::vec2(layout_size.y, layout_size.x)
+            }
+            _ => layout_size,
+        };
+        let page_rect = fit_display_size_in_rect(rect, display_size);
+        resolve_fs_transform_in_layout_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: idx,
+                viewport_rect,
+                source_size: source_size.unwrap_or(tex_size),
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                content_bbox,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
+                pixels_per_point,
+                placement,
+            },
+            page_rect,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         &mut self,
         painter: &egui::Painter,
@@ -30018,57 +30221,26 @@ impl App {
         content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
         placement: ResolvedDisplayPlacement,
+        // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
+        translate: egui::Vec2,
     ) -> Option<DisplayedImageTransform> {
-        let thumb_tex = if allow_thumbnail {
-            self.fs_thumbnail_texture_for_display(idx)
-                .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
-        } else {
-            None
-        };
-        let display_tex = display_tex.or(thumb_tex.as_ref());
-
-        if let Some(handle) = display_tex {
-            let tex_size = handle.size_vec2();
-            let layout_size = match layout_source {
-                FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
-                FsPageLayoutSource::CurrentItem => {
-                    let preserve_texture_aspect =
-                        self.is_passthrough_rendition_texture(handle.source_texture());
-                    let use_layout = preserve_texture_aspect
-                        || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-                    use_layout
-                        .then(|| self.fs_page_layout_source_size(idx))
-                        .flatten()
-                        .unwrap_or(tex_size)
-                }
-            };
-            let display_size = match rotation {
-                crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                    egui::vec2(layout_size.y, layout_size.x)
-                }
-                _ => layout_size,
-            };
-            let page_rect = fit_display_size_in_rect(rect, display_size);
-            let transform = resolve_fs_transform_in_layout_rect(
-                DisplayedImageTransformInput {
-                    pixel_fit: RectPixelFit::Texels,
-                    page_idx: idx,
+        let handle = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
+        if let Some(handle) = handle {
+            let handle = &handle;
+            let transform = self
+                .resolve_fs_spread_page_transform(
+                    handle,
                     viewport_rect,
-                    source_size: source_size.unwrap_or(tex_size),
-                    texture_size: tex_size,
+                    rect,
+                    idx,
+                    source_size,
+                    layout_source,
                     rotation,
-                    free_rotation_rad: 0.0,
                     content_bbox,
-                    fit_mode: FullscreenFitMode::Page,
-                    fit_scale_limits: FullscreenFitScaleLimits {
-                        pixels_per_point,
-                        ..FullscreenFitScaleLimits::default()
-                    },
                     pixels_per_point,
                     placement,
-                },
-                page_rect,
-            )?;
+                )?
+                .translated_by(translate);
             // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
                 paint_transparent_bg(painter, transform.paint_rect, bg_style);
@@ -36295,6 +36467,110 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    /// 見開きの間隔は、**最終的に描く矩形**で設定どおりになる (§1.154)。
+    ///
+    /// 中間の `layout_spread_page_rects` だけ調べても足りない。そこは小数のまま正しく
+    /// 空けるが、その後 `RectPixelFit::Texels` の寄せが左右を独立に丸めるので、1px 設定が
+    /// 2px になる。**測るのは最終 transform の `paint_rect`。**
+    ///
+    /// 1249x2272 は縮小後の片ページ幅に端数が出る組み合わせ (791.62px)。1120x1600 のように
+    /// 整数になる組み合わせでは元から 1px だったので、「設定どおりの場合もある」という
+    /// 発症条件をそのまま並べる。
+    #[test]
+    fn a_downscaled_spread_keeps_the_configured_gap_in_the_rect_it_paints() {
+        for (page_w, page_h) in [(1249.0_f32, 2272.0_f32), (1120.0, 1600.0), (4248.0, 6048.0)] {
+            for gap in [0.0_f32, 1.0, 2.0, 3.0] {
+                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                    let viewport =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+                    let page = egui::vec2(page_w, page_h);
+                    // 高さフィットで左右に並べる。
+                    let total_scale =
+                        (viewport.height() / page.y).min((viewport.width() - gap) / (page.x * 2.0));
+                    let geometry = SpreadLayoutGeometry {
+                        left: SpreadPageLayoutSize {
+                            size: page,
+                            scale_factor: 1.0,
+                        },
+                        right: SpreadPageLayoutSize {
+                            size: page,
+                            scale_factor: 1.0,
+                        },
+                        fit_size: page,
+                        content_center_offset: egui::Vec2::ZERO,
+                    };
+                    let unit = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    let rects = layout_spread_page_rects(
+                        viewport.center(),
+                        geometry,
+                        total_scale,
+                        gap,
+                        pixels_per_point,
+                        unit,
+                        unit,
+                        false,
+                    );
+
+                    let resolve = |rect: egui::Rect| {
+                        resolve_fs_transform_in_layout_rect(
+                            DisplayedImageTransformInput {
+                                pixel_fit: RectPixelFit::Texels,
+                                page_idx: 0,
+                                viewport_rect: viewport,
+                                source_size: page,
+                                texture_size: page,
+                                rotation: crate::rotation_db::Rotation::None,
+                                free_rotation_rad: 0.0,
+                                content_bbox: None,
+                                fit_mode: FullscreenFitMode::Page,
+                                fit_scale_limits: FullscreenFitScaleLimits {
+                                    pixels_per_point,
+                                    ..FullscreenFitScaleLimits::default()
+                                },
+                                pixels_per_point,
+                                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                            },
+                            rect,
+                        )
+                        .expect("spread page transform")
+                    };
+                    let left = resolve(rects.left_rect);
+                    let right = resolve(rects.right_rect);
+
+                    let gap_px = (gap.max(0.0) * pixels_per_point).round();
+                    let (left_offset, right_offset) = align_spread_pages_for_gap(
+                        &left,
+                        &right,
+                        gap_px,
+                        viewport.center().x,
+                        pixels_per_point,
+                    );
+                    let left = left.translated_by(left_offset);
+                    let right = right.translated_by(right_offset);
+
+                    let painted_gap_px =
+                        (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
+                    assert!(
+                        (painted_gap_px - gap_px).abs() < 1e-3,
+                        "{page_w}x{page_h} gap={gap} ppp={pixels_per_point}:                          描いた間隔 {painted_gap_px}px、設定 {gap_px}px"
+                    );
+
+                    // §1.0e を戻さないこと: 貼り先はどちらも物理ピクセル境界に乗ったまま。
+                    for (label, rect) in [
+                        ("left", left.full_image_rect),
+                        ("right", right.full_image_rect),
+                    ] {
+                        let min_px = rect.min.x * pixels_per_point;
+                        assert!(
+                            (min_px - min_px.round()).abs() < 1e-3,
+                            "{label} の原点が物理ピクセルから外れた: {min_px}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn feedback_toast_short_text_keeps_default_duration() {

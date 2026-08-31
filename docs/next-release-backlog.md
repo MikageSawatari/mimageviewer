@@ -5190,6 +5190,30 @@ survey §8 に列挙。特に **変換アーカイブ内ページの identity �
 - 1249x2272 / 4248x6048 など縮小後の幅に実端数が出るページを、2560x1440、gap 0/1/2/3、
   DPI 100/125/150% で確認し、物理 gap が設定値と一致すること。
 - 左右同寸 / 異寸、回転あり、表示トリムあり、原寸 (`拡大しない`) も含める。
+
+#### 実装 (2026-08-31) — 通常見開きは対応済み、detached frozen は保留
+
+- `DisplayedImageTransform::translated_by` を足した。**平行移動だけ**で、倍率も UV も動かさない。
+  `from_resolved_rect` へ通し直さないのが要点 — あれは寄せ済みの矩形から倍率を導き直すので
+  冪等でなく、通すたびに 1px 縮む (§1.0e の調査で確認済み)。
+- `align_spread_pages_for_gap` が、左右の寄せ終わった矩形から**物理ピクセル整数の**移動量を
+  1 か所で決める。間隔は `paint_rect` の内側端で測るので、表示トリム中も見える境界で合う。
+  差分をまとめて丸めるため、トリムが無ければ間隔は必ず設定値ちょうどになる。
+- `draw_fs_spread_page` から解決部を `resolve_fs_spread_page_transform` として切り出し、
+  **描画と配置合わせが同じ 1 つの答えを見る**ようにした。押し込む transform も移動後のものなので、
+  hit-test / ナビゲータ / ルーペは自動的に同じ位置を見る。
+- 連結読みのページ列と、寸法未確定のフォールバック分岐は移動量 0。前者は左右に並べないため、
+  後者は「最終幅が分かっている」という前提が立たないため。
+- 回帰テストは `layout_spread_page_rects` → 最終 transform → 合わせ、まで通して
+  `paint_rect` の間隔で測る。1249x2272 / 1120x1600 / 4248x6048 × gap 0-3 × ppp 1.0/1.25/1.5。
+  **合わせを外す変異で落ちる**ことを確認 (gap 0 が 1px になる)。原点が物理ピクセル境界に
+  乗ったままであること (= §1.0e を戻していないこと) も同じテストで見る。
+
+**残り: `detached_spread_frozen_pages_for_snapshot` が同じ二段丸めを持つ。** 左右の transform を
+独立に解決して `paint_geometry()` を焼いているので、同じ形で 1px ずれる。修正内容は通常見開きと
+同一だが、detached 経路なので CLAUDE.md の凍結ルール (ClaudeCode と Codex の双方が
+「症状パッチではなく構造的修正である」ことに合意 + [detached-rework-plan](detached-rework-plan.md)
+への記録) を通してから入れる。
   原寸用の既存 `spread_layout_quantizes_odd_gap_and_snaps_page_origins` は今回の縮小回帰を
   検出できないため、置き換えず縮小ケースを追加する。
 

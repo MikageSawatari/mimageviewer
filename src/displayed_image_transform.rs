@@ -255,6 +255,32 @@ impl DisplayedImageTransform {
         })
     }
 
+    /// 貼り先を **平行移動だけ** する。倍率・UV・寸法は動かさない。
+    ///
+    /// 見開きは左右のページを独立に物理ピクセルへ寄せるので、レイアウトが空けた間隔が
+    /// 最終矩形では保たれない (§1.154: 1px 設定が縮小時に 2px になる)。寄せた後の整数幅が
+    /// 分かってから、1 つの所有者が両方を置き直すためにこれを使う。
+    ///
+    /// **`from_resolved_rect` へ通し直さないこと。** あの関数は寄せ済みの矩形から倍率を
+    /// 導き直すので冪等ではなく、通すたびに 1px 縮む (§1.0e で確認済み)。
+    ///
+    /// `offset` は**物理ピクセルの整数倍**を渡す。半端な移動は、§1.0e で揃えた
+    /// 「整数サイズのテクスチャを整数位置へ貼る」を崩す。
+    pub(crate) fn translated_by(self, offset: egui::Vec2) -> Self {
+        let full_image_rect = self.full_image_rect.translate(offset);
+        let paint_rect = self.paint_rect.translate(offset);
+        // hit_rect は clip 済みなので平行移動では作り直せない。構築時と同じ式で組み直す。
+        let hit_rect =
+            rotated_rect_aabb(paint_rect, full_image_rect.center(), self.free_rotation_rad)
+                .intersect(self.viewport_rect);
+        Self {
+            full_image_rect,
+            paint_rect,
+            hit_rect,
+            ..self
+        }
+    }
+
     /// 貼り先の矩形と、そこへ貼るテクスチャを作るときの倍率。
     ///
     /// **2 つで 1 つの答え。** リサンプラは倍率から整数サイズのテクスチャを作り、
