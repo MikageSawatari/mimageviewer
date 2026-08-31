@@ -123,6 +123,7 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_write_worker;
 pub mod logger;
 mod manual_mask_tools;
 pub mod margin_fit;

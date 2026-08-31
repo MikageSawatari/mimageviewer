@@ -7580,6 +7580,21 @@ pub(crate) struct FavoriteDefaultClearConfirm {
 ///
 /// 3 値にしているのは、`Result` では「開けていない」と「書けた」が同じ値になり、
 /// 呼び出し側がどちらか区別できないため。
+/// 積んだ保存 1 件について、完了時に必要になるものだけを控えた記録。
+///
+/// **サイドカー座標を控えるのが要点。**完了が返る頃には一覧の idx が別のページを
+/// 指し得るので、そのとき解決し直すと無関係なページへミラーする。`idx` も持つが、
+/// これは idx 依存の後続処理を「まだ同じページを指しているか」で gate するためだけに
+/// 使う。
+pub(crate) struct LocalAdjustWritePending {
+    /// この key について最後に積んだ generation。古い完了を捨てるのに使う。
+    pub generation: u64,
+    /// 積んだ時点の一覧 idx。
+    pub idx: usize,
+    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
+    pub sidecar: Option<(std::path::PathBuf, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditStoreOutcome {
     /// 正本が受理した。sidecar ミラーを書いてよい。
@@ -11955,6 +11970,13 @@ pub struct App {
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
     /// 補正レイヤー DB ハンドル
     pub(crate) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
+    /// 補正レイヤー保存の worker。最初の保存で遅延起動する。
+    pub(crate) local_adjust_write_handle:
+        Option<crate::local_adjust_write_worker::LocalAdjustWriteHandle>,
+    /// 積んだ保存の未完了分 (page key → 記録)。同じ key を積み直すと上書きするので、
+    /// 常に「最後に積んだ 1 件」だけが残る。
+    pub(crate) local_adjust_write_pending:
+        std::collections::HashMap<String, LocalAdjustWritePending>,
     /// 最後段 crop DB ハンドル
     pub(crate) export_crop_db: Option<crate::export_crop::CropDb>,
     /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
@@ -14314,6 +14336,8 @@ impl App {
             adjustment_dragging: false,
             adjustment_db,
             local_adjust_db,
+            local_adjust_write_handle: None,
+            local_adjust_write_pending: std::collections::HashMap::new(),
             export_crop_db,
             slot_save_dialog: None,
             favorite_default_clear_confirm: None,
@@ -30943,6 +30967,8 @@ impl App {
         if mappings.is_empty() {
             return;
         }
+        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
+        self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
         for (from, to) in mappings {
             self.copy_book_page_edit_key(&from, &to, &mut errors);
@@ -30992,6 +31018,8 @@ impl App {
             })
             .collect::<Vec<_>>();
 
+        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
+        self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
         for (from, temp, _) in &temp_mappings {
             self.move_book_page_edit_key(from, temp, &mut errors);
@@ -54300,6 +54328,14 @@ impl App {
         }
         self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
+        // 保存 worker の在庫を書き切らせ、そのミラーを sidecar へ入れてから flush する。
+        // 終了経路では worker を止めて join する (在庫は drain してから止まる)。トレイ
+        // 退避では worker も読み手も生き続けるので、届いている分だけ回収する。
+        if scope.waits_for_sidecar_writer() {
+            self.finish_local_adjust_writes();
+        } else {
+            self.poll_local_adjust_write_results();
+        }
         self.flush_all_sidecars();
         if scope.waits_for_sidecar_writer() {
             // 終了経路だけ待つ。ここから先プロセスが止まるので、積んだだけの書き込みは
@@ -54520,8 +54556,16 @@ impl App {
 
     // ── local_adjust_cache / conceal_cache の世代管理 + invalidate ヘルパー ──
 
-    /// 指定 idx の補正レイヤー配列を DB と in-memory state に反映する。
-    /// 空配列は「補正レイヤーなし」として DB からも削除する。
+    /// 指定 idx の補正レイヤー配列を in-memory state に反映し、正本への保存を
+    /// **worker へ積む**。空配列は「補正レイヤーなし」として DB からも削除する。
+    ///
+    /// 直列化 (q8 量子化 → deflate → base64) と SQLite 書き込みは 24MP で 70.6ms かかり、
+    /// マスク系スライダーのドラッグ中は毎フレーム走っていた。ここでは積むだけで戻る。
+    ///
+    /// **成否が後から返ることが R-26 との接点。**同期版は「正本が受理したときだけ
+    /// sidecar ミラーを書く」順序でこの境界を守っていた。非同期でも順序は同じで、
+    /// ミラーを書くのは [`Self::apply_local_adjust_write_completion`] が `Committed` を
+    /// 受け取ったときだけ。ここでは**メモリと presence だけ**を進める。
     pub(crate) fn set_local_adjust_layers_for_idx(
         &mut self,
         idx: usize,
@@ -54532,34 +54576,164 @@ impl App {
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = Self::edit_store_write(
-            self.local_adjust_db
-                .as_ref()
-                .map(|db| db.set_layers(&key, &layers)),
-        );
+        // presence は「画面に出ている状態」を表す。保存の成否ではないので、同期版と
+        // 同じく結果を待たずに立てる (失敗しても編集は画面に残す)。
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
-        if !self.edit_store_write_succeeded("補正レイヤー", written) {
+        self.set_local_adjust_layers_for_idx_memory_only(
+            idx,
+            local_adjust_core::LocalAdjustmentLayers::clone(&layers),
+        );
+        self.submit_local_adjust_write(idx, key, layers);
+    }
+
+    /// 保存要求を worker へ積み、完了時にミラー先を復元するための座標を控える。
+    ///
+    /// **サイドカー座標は積む時点で固定する。**完了が返る頃には一覧の idx が別のページを
+    /// 指し得るので、そのとき解決し直すと無関係なページへミラーする。
+    fn submit_local_adjust_write(
+        &mut self,
+        idx: usize,
+        key: String,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+    ) {
+        self.ensure_local_adjust_write_handle();
+        let Some(handle) = self.local_adjust_write_handle.as_ref() else {
+            return;
+        };
+        let layer_count = layers.len();
+        let generation = handle.submit(key.clone(), layers);
+        crate::perf::event(
+            "local_adjust",
+            "save_enqueue",
+            Some(&key),
+            generation,
+            &[("layers", serde_json::Value::from(layer_count))],
+        );
+        let sidecar = if self.idx_is_compiled_book_page(idx) {
+            None
+        } else {
+            self.sidecar_coords(idx)
+        };
+        self.local_adjust_write_pending.insert(
+            key,
+            LocalAdjustWritePending {
+                generation,
+                idx,
+                sidecar,
+            },
+        );
+    }
+
+    pub(crate) fn ensure_local_adjust_write_handle(&mut self) {
+        if self.local_adjust_write_handle.is_none() {
+            self.local_adjust_write_handle = Some(
+                crate::local_adjust_write_worker::LocalAdjustWriteHandle::spawn(
+                    crate::local_adjust_db::LocalAdjustDb::db_path(),
+                ),
+            );
+        }
+    }
+
+    /// worker から返った保存結果を回収する。`App::update` から毎フレーム呼ぶ。
+    pub(crate) fn poll_local_adjust_write_results(&mut self) {
+        let mut completions = Vec::new();
+        if let Some(handle) = self.local_adjust_write_handle.as_ref() {
+            while let Some(completion) = handle.try_recv() {
+                completions.push(completion);
+            }
+        }
+        for completion in completions {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 終了時: worker を止めて在庫を書き切らせ、その結果をミラーへ反映する。
+    ///
+    /// 時間で諦める形にすると「間に合わなかった保存」が環境ごとに変わるので、
+    /// join してから受け取り切る。正本は worker が書き切っているので、ここを飛ばしても
+    /// 編集自体は消えない。飛ばすと sidecar (フォルダ移動時の復元源) だけが古くなる。
+    pub(crate) fn finish_local_adjust_writes(&mut self) {
+        let Some(handle) = self.local_adjust_write_handle.take() else {
+            return;
+        };
+        for completion in handle.shutdown_and_collect() {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 積んである保存が着地するまで待ち、結果を反映する。
+    ///
+    /// **page key を付け替える直前に呼ぶ。**付け替えは worker を経由しないので、
+    /// 待たずに走らせると「rename が行を移した後で、古い key の保存が着地して書き戻す」
+    /// 順序が起き得る。同期保存だった頃はこの順序が構造的に起きなかった。
+    pub(crate) fn wait_for_local_adjust_writes(&mut self) {
+        let Some(handle) = self.local_adjust_write_handle.as_ref() else {
+            return;
+        };
+        for completion in handle.drain_blocking() {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 保存結果 1 件を UI 状態へ反映する。**R-26 の境界はここ。**
+    ///
+    /// - `Committed` — 正本が受理した。**worker が実際に書いた文書**を sidecar へ写す。
+    ///   メモリから取り直すと、その間に入った編集を「保存済み」として写してしまう。
+    /// - `Unavailable` / `Failed` — トーストだけ。**ミラーは書かない。**書くと、次回起動の
+    ///   import が「中央が authoritative」として新しい sidecar を捨て、利用者からは編集が
+    ///   消えたように見える。
+    /// - `Superseded` — 成功でも失敗でもない。何もしない。
+    pub(crate) fn apply_local_adjust_write_completion(
+        &mut self,
+        completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+    ) {
+        use crate::local_adjust_write_worker::LocalAdjustWriteCompletion as Completion;
+
+        // 追い越された結果は無視する。新しい要求が同じ行を上書きし、自分のミラーを
+        // 連れてくるので、古い内容を写すと一瞬 sidecar だけが巻き戻る。
+        let key = completion.key().to_string();
+        if self
+            .local_adjust_write_pending
+            .get(&key)
+            .is_none_or(|pending| pending.generation != completion.generation())
+        {
+            return;
+        }
+        let pending = self
+            .local_adjust_write_pending
+            .remove(&key)
+            .expect("just looked it up");
+
+        let Completion::Settled {
+            layers, outcome, ..
+        } = completion
+        else {
+            return;
+        };
+        if !self.edit_store_write_succeeded("補正レイヤー", outcome) {
             // 画面には残す。durable な mirror だけ書かない。
-            self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
             return;
         }
         if layers.is_empty() {
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
+            self.with_sidecar_coords_mut(pending.sidecar.as_ref(), |sc, rel| {
+                sc.remove_local_adjust_layers(rel)
+            });
         } else {
-            // 文書は共有所有なので、ミラーへ渡すのは参照カウントの複製だけ。
-            let sidecar_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
-            self.with_sidecar_mut(idx, move |sc, rel| {
-                sc.set_local_adjust_layers(rel, sidecar_layers)
+            self.with_sidecar_coords_mut(pending.sidecar.as_ref(), move |sc, rel| {
+                sc.set_local_adjust_layers(rel, layers)
             });
         }
-        self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        self.record_content_identity_for_idx(
-            idx,
-            crate::content_identity::ContentIdentityTrigger::Edit,
-        );
+        // idx は完了までに別のページを指し得る。同じ key を指したままのときだけ
+        // idx 依存の後続処理を走らせる。
+        if self.page_path_key(pending.idx).as_deref() == Some(key.as_str()) {
+            self.record_content_identity_for_idx(
+                pending.idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
     }
 
     /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
@@ -67599,6 +67773,7 @@ impl eframe::App for App {
         self.poll_tag_write_results();
         self.poll_tag_maintenance_results();
         self.poll_rating_write_results();
+        self.poll_local_adjust_write_results();
         self.poll_video_upscale_queue(ctx);
 
         let main_viewer_blocked = self.viewer_session_blocks_main_window();
