@@ -186,6 +186,7 @@ pub mod shell_file_ops;
 pub mod sidecar;
 pub mod single_instance;
 pub mod snapshot;
+mod sns_split;
 pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
