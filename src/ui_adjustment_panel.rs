@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use eframe::egui;
+use rayon::prelude::*;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
@@ -729,6 +730,63 @@ mod local_adjust_segmentation_tests {
             ),
             colors.edit(LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA)
         );
+    }
+
+    /// 並列にしたプレビューが、直列に歩いた結果と**1 テクセルも違わない**こと。
+    ///
+    /// 塗っている間はマスクが実際に変わるのでキャッシュでは減らせず、代わりに
+    /// テクセル単位で並列化した。1 テクセルの色は他に依存しない純粋な計算なので
+    /// 並列にできるが、それを言葉で言うだけでは不十分なので突き合わせる。
+    /// 添字の割り出し (`index % tex_w` / `index / tex_w`) を間違えると像が転置する。
+    #[test]
+    fn the_parallel_preview_matches_a_serial_walk_of_the_same_texels() {
+        let (width, height) = (37, 23);
+        // 縦横が違う値で、かつテクスチャ側とも違う比にする (転置や取り違えが
+        // 見えるように)。
+        let [tex_w, tex_h] = [11, 7];
+        let mut base = local_adjust_core::RasterVectorMask::empty(width, height);
+        for i in (0..width * height).step_by(3) {
+            base.alpha_mut()[i] = 1.0;
+        }
+        let mut add = local_adjust_core::RasterVectorMask::empty(width, height);
+        for i in (0..width * height).step_by(7) {
+            add.alpha_mut()[i] = 1.0;
+        }
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "parallel",
+            local_adjust_core::LocalMask::RasterVector(base),
+            local_adjust_core::LocalEffect::None,
+        );
+        layer.manual_override.add = Some(add);
+        let colors = LocalAdjustMaskColorPreset::PinkCyan.colors();
+        let target = Some(LocalAdjustMaskEditTarget::OverrideAdd);
+
+        let image = build_local_adjust_mask_preview_image(
+            &layer,
+            None,
+            (width, height),
+            [tex_w, tex_h],
+            0.0,
+            colors,
+            target,
+        );
+
+        assert_eq!(image.size, [tex_w, tex_h]);
+        for gy in 0..tex_h {
+            for gx in 0..tex_w {
+                let x = (((gx as f32 + 0.5) * width as f32 / tex_w as f32) as usize).min(width - 1);
+                let y =
+                    (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize).min(height - 1);
+                let expected = local_adjust_mask_preview_color(
+                    &layer, None, width, height, x, y, 0.0, colors, target,
+                );
+                assert_eq!(
+                    image.pixels[gy * tex_w + gx],
+                    expected,
+                    "texel ({gx}, {gy}) が直列の結果と違う"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8227,15 +8285,21 @@ fn build_local_adjust_mask_preview_image(
     let [tex_w, tex_h] = [preview_size[0].max(1), preview_size[1].max(1)];
     let source = source.filter(|source| source.size == [width, height]);
     let full_subtract_has_content = local_adjust_full_subtract_mask_has_content(layer);
-    let mut pixels = Vec::with_capacity(tex_w.saturating_mul(tex_h));
 
-    for gy in 0..tex_h {
-        for gx in 0..tex_w {
+    // 塗っている間はマスクが実際に変わるので、この作り直しはキャッシュでは減らせない。
+    // ただし 1 テクセルの色は他のテクセルに依存しない純粋な計算なので、並列にできる。
+    // 画面いっぱいで 200 万テクセル近くあり、UI スレッドで直列に回すとフレームの
+    // ほとんどを占める (2026-09-01 実測で 25ms のフレームのうち 22ms)。
+    let pixels: Vec<egui::Color32> = (0..tex_w.saturating_mul(tex_h))
+        .into_par_iter()
+        .map(|index| {
+            let gx = index % tex_w;
+            let gy = index / tex_w;
             let x = (((gx as f32 + 0.5) * width as f32 / tex_w as f32) as usize)
                 .min(width.saturating_sub(1));
             let y = (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize)
                 .min(height.saturating_sub(1));
-            pixels.push(local_adjust_mask_preview_color_cached(
+            local_adjust_mask_preview_color_cached(
                 layer,
                 source,
                 width,
@@ -8246,9 +8310,9 @@ fn build_local_adjust_mask_preview_image(
                 colors,
                 edit_target,
                 full_subtract_has_content,
-            ));
-        }
-    }
+            )
+        })
+        .collect();
 
     egui::ColorImage::new([tex_w, tex_h], pixels)
 }
