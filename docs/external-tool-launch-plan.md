@@ -416,7 +416,12 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 特に **Ctrl+B の製本追加は「現在ページを実体化して外へ出す」という点で本機能とほぼ同じ**で、
 これが連結読みで動く以上、外部ツールだけ止めると逆に不統一になる。
 
-したがって**連結読みでも起動できるようにする**。ページの選び方は Ctrl+S / Ctrl+E と同じ
+したがって**連結読みでも起動できるようにする**。
+
+> **⚠ 以下の段落は P4 の姿** (`SpreadPolicy` を入れた後)。**P2 では見開き中でも現在ページ 1 件**を
+> 渡す (§4.5 の 2026-08-31 決定)。
+
+ページの選び方は Ctrl+S / Ctrl+E と同じ
 [`resolve_visible_spread_pair()`](../src/ui_fullscreen.rs:18268) を共有し、判断を二重に持たない。
 連結読みでは `FullscreenPageLayout` の種別が `Continuous` になり `spread_pair()` が `None` を返すため
 ([displayed_image_transform.rs:529](../src/displayed_image_transform.rs:529))、
@@ -448,7 +453,7 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 - 焼き込みコスト (デコード + 再エンコード) を、実際に加工されている項目にだけ払う。
 - 画像編集ソフトへ渡したとき、**元ファイルを直接編集できる** (§4.8 の round-trip が成立する)。
 
-見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる。
+見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる (**P4 から**。P2 では現在ページ 1 件)。
 合成には対応する元ファイルが存在しないため、この場合は常に焼き込みになる。
 
 `VideoPolicy` — **動画は別軸にする。**「見えているもの」が動画そのものかフレームかが曖昧で、
