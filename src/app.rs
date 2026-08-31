@@ -7605,6 +7605,11 @@ pub(crate) enum EditStoreOutcome {
 /// 完了した編集で、捨てると利用者の操作がそのまま消える。
 pub(crate) struct LocalAdjustShapeKeyEdit {
     pub fs_idx: usize,
+    /// 対象のレイヤー。同じ数値の図形 index は別レイヤーにも在るので、これが無いと
+    /// 無関係なレイヤーの編集が 1 つのセッションに混ざる。
+    pub layer_idx: usize,
+    /// 対象のマスク (Base / 追加 / 削除)。図形 index は各マスクで独立している。
+    pub target: LocalAdjustMaskEditTarget,
     /// 対象の図形。別の図形へ移ったらセッションを閉じる。
     pub shape_idx: usize,
     /// セッション開始前の文書。Undo を 1 件にまとめる。
@@ -51873,6 +51878,11 @@ impl App {
             let now = close_t0.elapsed().as_secs_f64() * 1000.0;
             stages.push((name, now - previous));
         };
+        // **いちばん先に確定する。**この関数は下で edit preview を snapshot し、
+        // フルスクリーン中の Undo スタックを捨てる。後で畳むと、確定前の画素が
+        // サムネイルとして焼かれ、捨てたはずのスタックへ Undo が 1 件戻る
+        // (2026-08-31 Codex P2)。
+        self.fold_local_adjust_edit_state();
         #[cfg(windows)]
         self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::FullscreenExit);
         close_stage("seek_strip", &mut close_stages);
@@ -52261,7 +52271,6 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.fold_local_adjust_edit_state();
         self.local_adjust_segmentation_pending = None;
         self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
@@ -66622,6 +66631,20 @@ impl eframe::App for App {
         } else if had_deferred_local_adjust_brush {
             ctx.request_repaint();
         }
+        // 補正レイヤーの保存結果とキー編集セッションは、**グリッド描画より前**で回す。
+        // in-window フルスクリーンは下の `embedded_fs_active` gate で無条件に return
+        // するので、そこより後ろに置くと編集中は一度も走らない (2026-08-31 Codex P1)。
+        // 補正の編集はまさにフルスクリーン中に行われる。
+        self.poll_local_adjust_write_results();
+        if !self.local_adjust_write_pending.is_empty() {
+            // 最後の保存の直後に egui が眠ると、失敗トーストとサイドカーミラーが
+            // 次の入力まで出ない。
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.settle_local_adjust_shape_key_edit() {
+            // セッションが開いている間はフレームを回す。眠ると無操作判定が来ない。
+            ctx.request_repaint_after(Self::LOCAL_ADJUST_SHAPE_KEY_IDLE);
+        }
 
         #[cfg(windows)]
         self.apply_pending_main_font_update(ctx);
@@ -67788,16 +67811,6 @@ impl eframe::App for App {
         self.poll_tag_write_results();
         self.poll_tag_maintenance_results();
         self.poll_rating_write_results();
-        self.poll_local_adjust_write_results();
-        if !self.local_adjust_write_pending.is_empty() {
-            // 結果は毎フレームの poll で拾う。最後の保存の直後に egui が眠ると、
-            // 失敗トーストとサイドカーミラーが次の入力まで出ない。
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        if self.settle_local_adjust_shape_key_edit() {
-            // セッションが開いている間はフレームを回す。眠ると無操作判定が来ない。
-            ctx.request_repaint_after(Self::LOCAL_ADJUST_SHAPE_KEY_IDLE);
-        }
         self.poll_video_upscale_queue(ctx);
 
         let main_viewer_blocked = self.viewer_session_blocks_main_window();

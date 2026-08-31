@@ -2733,6 +2733,137 @@ mod local_adjust_canvas_edit_contract_tests {
         );
     }
 
+    /// 別の変更が Undo に載る前に、開いているセッションを閉じる。
+    ///
+    /// 閉じないと、後から確定するセッションの before が別操作より前まで遡り、
+    /// **Undo 1 回でその別操作まで巻き戻る** (2026-08-31 Codex P1)。
+    #[test]
+    fn another_change_closes_an_open_key_run_before_taking_the_undo_slot() {
+        let mut app = seam_app_with_shape();
+        let undo_before = app.meta_undo.undo_len();
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0);
+        assert!(app.local_adjust_shape_key_edit.is_some());
+
+        // 図形削除は自分で Undo を積む別操作。
+        assert!(app.delete_selected_local_adjust_shape_from_shortcut(0));
+
+        assert!(
+            app.local_adjust_shape_key_edit.is_none(),
+            "別操作の Undo が積まれたのにセッションが開いたまま"
+        );
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_before + 2,
+            "移動と削除がそれぞれ 1 件ずつ積まれていない"
+        );
+    }
+
+    /// 図形 index は**レイヤーとマスクごとに独立**しているので、番号が同じでも
+    /// 別レイヤーへ移ったらセッションを閉じる。
+    ///
+    /// 閉じないと、無関係な 2 つのレイヤーの操作が 1 つの Undo にまとまる
+    /// (2026-08-31 Codex P2)。
+    #[test]
+    fn moving_to_the_same_shape_index_in_another_layer_closes_the_run() {
+        let mut app = seam_app_with_shape();
+        // 同じ形の 2 枚目のレイヤーを足す。図形 index はどちらも 0。
+        let second = app.local_adjust_page_layers[&0][0].clone();
+        Arc::make_mut(app.local_adjust_page_layers.get_mut(&0).unwrap()).push(second);
+        let undo_before = app.meta_undo.undo_len();
+
+        app.local_adjust_selected_layers.insert(0, 0);
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0);
+        app.local_adjust_selected_layers.insert(0, 1);
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0);
+
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_before + 1,
+            "別レイヤーへ移ったのに run が続いている (1 つの Undo に混ざる)"
+        );
+        assert_eq!(
+            app.local_adjust_shape_key_edit
+                .as_ref()
+                .map(|session| session.layer_idx),
+            Some(1)
+        );
+    }
+
+    /// Esc は開いているキー編集も編集前へ戻す。
+    ///
+    /// 戻さないと、Esc のあとに畳む処理が走って「取り消したはずの編集」を確定する。
+    #[test]
+    fn escape_reverts_an_open_key_run() {
+        let mut app = seam_app_with_shape();
+        let start = seam_shape_center(&app);
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.05, 0.0);
+        assert_ne!(seam_shape_center(&app)[0], start[0]);
+
+        assert!(app.cancel_local_adjust_canvas_edit_from_shortcut());
+
+        assert_eq!(seam_shape_center(&app), start, "Esc が編集前へ戻していない");
+        assert!(app.local_adjust_shape_key_edit.is_none());
+
+        // 取り消したものを、後の畳みが復活させない。
+        let undo_before = app.meta_undo.undo_len();
+        app.fold_local_adjust_edit_state();
+        assert_eq!(seam_shape_center(&app), start);
+        assert_eq!(app.meta_undo.undo_len(), undo_before);
+    }
+
+    /// Esc はキャンバスドラッグ (グラデーション等) も編集前へ戻す。
+    ///
+    /// 戻さないと、Esc がモード終了へ落ちて、途中のドラッグを確定してしまう。
+    #[test]
+    fn escape_reverts_a_canvas_drag() {
+        let mut app = seam_test_app();
+        let before =
+            local_adjust_core::LocalAdjustmentLayers::clone(&app.local_adjust_page_layers[&0]);
+        app.local_adjust_canvas_drag = Some(crate::app::LocalAdjustCanvasDrag {
+            fs_idx: 0,
+            layer_idx: 0,
+            kind: crate::app::LocalAdjustCanvasDragKind::LinearGradientStart,
+            start: [0.0, 0.0],
+        });
+        app.local_adjust_canvas_drag_before_layers =
+            Some(local_adjust_core::LocalAdjustmentLayers::clone(&before));
+        app.set_local_adjust_layers_for_idx_memory_only(
+            0,
+            Arc::new(vec![layer_with_mask(local_adjust_core::LocalMask::Full)]),
+        );
+
+        assert!(
+            app.cancel_local_adjust_canvas_edit_from_shortcut(),
+            "キャンバスドラッグを取り消せていない (Esc がモード終了へ落ちる)"
+        );
+
+        assert_eq!(
+            app.local_adjust_page_layers[&0].as_slice(),
+            before.as_slice(),
+            "ドラッグ前の姿へ戻っていない"
+        );
+        assert!(app.local_adjust_canvas_drag.is_none());
+        assert!(app.local_adjust_canvas_drag_before_layers.is_none());
+    }
+
+    /// ツールを替えるときも確定する。捨てるとメモリにしか無い編集が消える。
+    #[test]
+    fn switching_the_mask_tool_commits_instead_of_discarding() {
+        let mut app = seam_app_with_shape();
+        let undo_before = app.meta_undo.undo_len();
+        app.local_adjust_mask_tool = LocalAdjustMaskTool::Select;
+        app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0);
+
+        app.set_local_adjust_mask_tool_from_shortcut(LocalAdjustMaskTool::Brush);
+
+        assert!(app.local_adjust_shape_key_edit.is_none());
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_before + 1,
+            "ツール切替で編集が捨てられている"
+        );
+    }
+
     /// 圧縮の要否判定と圧縮そのものが食い違わないこと。
     ///
     /// 判定が甘いと、落とすものが無いのに原寸マスクを 1 枚複製する。判定が辛いと、
@@ -2911,6 +3042,40 @@ mod local_adjust_fold_audit {
     //! 手法は `layer_parse_audit` (src/local_adjust_db.rs) と同じ。実行時テストでは
     //! 「まだ書かれていない 9 番目の入口」を捕まえられないので、ソースを見る。
 
+    /// `impl` 直下の `fn` を境界にして、行を関数へ割り当てる。
+    ///
+    /// 行の近さ (±N 行) で「同じ処理」とみなすと、隣の関数のコードや死んだ分岐でも
+    /// 条件を満たしてしまう (2026-08-31 Codex P3)。実際 `close_fullscreen_now` は
+    /// 確定を関数の先頭へ動かした結果、行の窓から外れた。
+    fn enclosing_functions(source: &str) -> Vec<(String, Vec<(usize, String)>)> {
+        let mut out: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+        for (number, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            let is_fn_header = indent <= 4
+                && (trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("async fn ")
+                    || trimmed.starts_with("pub(crate) async fn "));
+            if is_fn_header {
+                let name = trimmed
+                    .split("fn ")
+                    .nth(1)
+                    .unwrap_or(trimmed)
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                out.push((name, Vec::new()));
+            }
+            if let Some((_, body)) = out.last_mut() {
+                body.push((number + 1, line.to_string()));
+            }
+        }
+        out
+    }
+
     fn rust_sources() -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut walk = vec![std::path::PathBuf::from("src")];
@@ -2945,51 +3110,49 @@ mod local_adjust_fold_audit {
         out
     }
 
-    /// 補正レイヤーモードを抜ける箇所は、必ず確定を通す。
-    ///
-    /// 抜けたあとにモード外の処理が保留を触ることは無いので、**同じ関数の中で**
-    /// `fold_local_adjust_edit_state` を呼んでいれば十分とする。
+    /// 補正レイヤーモードを抜ける関数は、必ず確定を通す。
     #[test]
     fn every_exit_from_local_adjust_mode_folds_the_pending_edits() {
         let mut offenders = Vec::new();
         for (relative, source) in rust_sources() {
-            let lines: Vec<&str> = source.lines().collect();
-            for (number, line) in lines.iter().enumerate() {
-                if !line.trim().starts_with("self.local_adjust_mode = false;") {
+            for (name, body) in enclosing_functions(&source) {
+                let exits: Vec<usize> = body
+                    .iter()
+                    .filter(|(_, line)| line.trim() == "self.local_adjust_mode = false;")
+                    .map(|(number, _)| *number)
+                    .collect();
+                if exits.is_empty() {
                     continue;
                 }
-                // 前後 40 行を同じ「畳む処理」の範囲とみなす。
-                let from = number.saturating_sub(40);
-                let to = (number + 40).min(lines.len());
-                let folds = lines[from..to]
-                    .iter()
-                    .any(|near| near.contains("fold_local_adjust_edit_state()"));
+                let folds = body.iter().any(|(_, line)| {
+                    line.contains("fold_local_adjust_edit_state()")
+                        || line.contains("commit_local_adjust_pending_edits()")
+                });
                 if !folds {
-                    offenders.push(format!("{relative}:{}", number + 1));
+                    for number in exits {
+                        offenders.push(format!("{relative}:{number} ({name})"));
+                    }
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "補正レイヤーモードを抜けるのに編集を確定していない箇所がある。\
+            "補正レイヤーモードを抜けるのに編集を確定していない関数がある。\
              `fold_local_adjust_edit_state()` を呼ぶこと (保留を捨てるとメモリにしか\
              無い編集がそのまま消える):\n  {}",
             offenders.join("\n  ")
         );
     }
 
-    /// ジェスチャの所有者以外は、保留を `None` で潰さない。
+    /// 保留を `None` で潰してよいのは、確定 / 取り消し / ジェスチャ自体の終了だけ。
     ///
-    /// 潰すのは「捨てる」であって「確定する」ではない。畳む側 (モードを抜ける・
-    /// フルスクリーンを閉じる・フォルダを読み直す) が個別に潰していたのが元の欠陥で、
-    /// メモリにしか無い編集がそのまま消えていた。
-    ///
-    /// [`ui_adjustment_panel`](self) だけは対象外。ここはキャンバス入力の所有者で、
-    /// 「ポインタが離れた」「ツールを切り替えた」といったジェスチャ自体の終了を
-    /// 正当に書く。確定 ([`App::commit_local_adjust_pending_edits`]) と
-    /// 取り消し ([`App::cancel_local_adjust_canvas_edit_from_shortcut`]) もここにある。
+    /// 「捨てる」は「確定する」でも「取り消す」でもない。畳む側が個別に潰していたのが
+    /// 元の欠陥で、メモリにしか無い編集が消えていた。ジェスチャの所有者
+    /// (キャンバス入力ハンドラ) は「ポインタが離れた」等を正当に書くので、そこだけ
+    /// 名前で許可する。**ファイル単位で許可しない** — それだと同じファイルに
+    /// 書かれた別の破棄を見逃す (2026-08-31 Codex P1 が実際にこれで 2 件すり抜けた)。
     #[test]
-    fn nothing_outside_the_gesture_owner_discards_a_pending_edit() {
+    fn only_the_gesture_owners_may_clear_a_pending_edit() {
         const FIELDS: &[&str] = &[
             "local_adjust_shape_key_edit",
             "local_adjust_shape_drag",
@@ -2999,52 +3162,122 @@ mod local_adjust_fold_audit {
             "local_adjust_canvas_drag_before_layers",
             "local_adjust_mask_brush_before_layers",
         ];
+        // 保留を直接触ってよい関数。増やすときは「なぜ確定でも取り消しでもないのか」を
+        // 説明できること。
+        const OWNERS: &[&str] = &[
+            // 確定 / 取り消し。確定は、ジェスチャの無い `before` の取り残しも捨てる。
+            "commit_local_adjust_pending_edits",
+            "persist_local_adjust_shape_key_edit",
+            "persist_local_adjust_shape_drag",
+            "persist_local_adjust_canvas_drag",
+            "persist_local_adjust_mask_brush_stroke",
+            "cancel_local_adjust_canvas_edit_from_shortcut",
+            // キャンバス入力ハンドラ。ジェスチャ自体の開始 / 終了を書く。
+            "handle_local_adjust_canvas_input",
+            "handle_local_adjust_canvas_pointer",
+            // 図形削除は削除そのものが確定を伴う。
+            "delete_selected_local_adjust_shape_from_shortcut",
+        ];
 
         let mut offenders = Vec::new();
         for (relative, source) in rust_sources() {
-            if relative == "src/ui_adjustment_panel.rs" {
-                continue;
-            }
-            for (number, line) in source.lines().enumerate() {
-                // 構造体リテラルの初期化 (`field: None,`) は対象外。潰しているのは
-                // 代入の方。
-                for field in FIELDS {
-                    if line.contains(&format!("{field} = None")) {
-                        offenders.push(format!("{relative}:{}", number + 1));
+            for (name, body) in enclosing_functions(&source) {
+                if OWNERS.contains(&name.as_str()) {
+                    continue;
+                }
+                for (number, line) in body {
+                    for field in FIELDS {
+                        if line.contains(&format!("{field} = None")) {
+                            offenders.push(format!("{relative}:{number} ({name})"));
+                        }
                     }
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "保留中の補正レイヤー編集を、ジェスチャの所有者以外が捨てている。\
-             畳むなら `fold_local_adjust_edit_state()` を通すこと\
-             (捨てると、メモリにしか無い編集がそのまま消える):\n  {}",
+            "保留中の補正レイヤー編集を、所有者でない関数が捨てている。\
+             確定なら `commit_local_adjust_pending_edits()`、取り消しなら\
+             `cancel_local_adjust_canvas_edit_from_shortcut()` を通すこと:\n  {}",
             offenders.join("\n  ")
         );
     }
 
-    /// 確定は 4 種類すべてを畳む。
+    /// キー編集セッションの無操作判定は、**グリッド描画より前**で回る。
     ///
-    /// 種類が増えたときに `commit_local_adjust_pending_edits` へ足し忘れると、その
-    /// 種類だけが畳む箇所をすり抜ける。
+    /// `App::update` は in-window フルスクリーンのとき `embedded_fs_active` gate で
+    /// 無条件に return する。そこより後ろに置くと、補正を編集している最中は一度も
+    /// 走らない — つまり本番のいちばん普通の経路で効かない (2026-08-31 Codex P1)。
+    /// 到達可能性は実行時テストでは見えないので、位置をソースで固定する。
     #[test]
-    fn the_commit_covers_every_kind_of_pending_edit() {
-        let source = std::fs::read_to_string("src/ui_adjustment_panel.rs").unwrap();
-        let body = source
-            .split("pub(crate) fn commit_local_adjust_pending_edits(&mut self) {")
+    fn the_key_run_settle_runs_before_the_embedded_fullscreen_early_return() {
+        let source = std::fs::read_to_string("src/app.rs").unwrap();
+        let update = source
+            .split("fn update(&mut self, ctx: &egui::Context")
             .nth(1)
-            .expect("確定関数が見つからない")
-            .split("\n    }")
-            .next()
-            .unwrap();
-        for persist in [
-            "persist_local_adjust_shape_key_edit",
-            "persist_local_adjust_shape_drag",
-            "persist_local_adjust_canvas_drag",
-            "persist_local_adjust_mask_brush_stroke",
-        ] {
-            assert!(body.contains(persist), "確定が {persist} を呼んでいない");
+            .expect("App::update が見つからない");
+        let settle = update
+            .find("self.settle_local_adjust_shape_key_edit()")
+            .expect("無操作判定が `App::update` から呼ばれていない");
+        let poll = update
+            .find("self.poll_local_adjust_write_results()")
+            .expect("保存結果の回収が `App::update` から呼ばれていない");
+        let gate = update
+            .find("if embedded_fs_active || embedded_fs_pending {")
+            .expect("in-window フルスクリーンの gate が見つからない");
+        assert!(
+            settle < gate,
+            "無操作判定が in-window フルスクリーンの early return より後ろにある"
+        );
+        assert!(
+            poll < gate,
+            "保存結果の回収が in-window フルスクリーンの early return より後ろにある"
+        );
+    }
+
+    /// 確定と取り消しは、保留の種類を同じだけ扱う。
+    ///
+    /// 片方が漏らすと、取り消した編集が後の確定で復活する / 確定したはずの編集が
+    /// 残り続ける。種類が増えたときに両方へ足すことを強制する。
+    #[test]
+    fn commit_and_cancel_cover_the_same_kinds_of_pending_edit() {
+        const KINDS: &[(&str, &str)] = &[
+            (
+                "local_adjust_shape_key_edit",
+                "persist_local_adjust_shape_key_edit",
+            ),
+            ("local_adjust_shape_drag", "persist_local_adjust_shape_drag"),
+            (
+                "local_adjust_canvas_drag",
+                "persist_local_adjust_canvas_drag",
+            ),
+            (
+                "local_adjust_mask_brush_stroke",
+                "persist_local_adjust_mask_brush_stroke",
+            ),
+        ];
+        let source = std::fs::read_to_string("src/ui_adjustment_panel.rs").unwrap();
+        let functions = enclosing_functions(&source);
+        let body_of = |wanted: &str| -> String {
+            functions
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, body)| {
+                    body.iter()
+                        .map(|(_, line)| line.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| panic!("{wanted} が見つからない"))
+        };
+        let commit = body_of("commit_local_adjust_pending_edits");
+        let cancel = body_of("cancel_local_adjust_canvas_edit_from_shortcut");
+        for (field, persist) in KINDS {
+            assert!(commit.contains(persist), "確定が {persist} を呼んでいない");
+            assert!(
+                cancel.contains(field),
+                "取り消しが {field} を扱っていない (確定だけが扱う保留がある)"
+            );
         }
     }
 }
@@ -10596,12 +10829,12 @@ impl App {
 
     pub(crate) fn set_local_adjust_mask_tool_from_shortcut(&mut self, tool: LocalAdjustMaskTool) {
         if self.local_adjust_mask_tool != tool {
+            // ツールを替える前に、進行中の編集を確定する。捨てると、メモリの文書には
+            // 入っていて正本には書かれていない編集が消える (2026-08-31 Codex P1)。
+            self.commit_local_adjust_pending_edits();
             self.local_adjust_mask_lasso_points.clear();
             self.local_adjust_mask_shape_drag_start = None;
             self.local_adjust_mask_shape_drag_end = None;
-            self.local_adjust_mask_brush_stroke = None;
-            self.local_adjust_shape_drag = None;
-            self.local_adjust_shape_drag_before_layers = None;
         }
         self.local_adjust_mask_tool = tool;
         self.show_feedback_toast(format!("マスクツール: {}", local_mask_tool_label(tool)));
@@ -11317,19 +11550,35 @@ impl App {
         self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points)
     }
 
+    /// 進行中の編集を**編集前へ戻す** (Esc)。確定
+    /// ([`Self::commit_local_adjust_pending_edits`]) とは逆向きで、両者で保留の
+    /// 種類を取りこぼさないことが要件。取りこぼすと、Esc のあとに畳む処理が走って
+    /// 「取り消したはずの編集」を確定してしまう (2026-08-31 Codex P2)。
     pub(crate) fn cancel_local_adjust_canvas_edit_from_shortcut(&mut self) -> bool {
         let shape_drag = self.local_adjust_shape_drag.take();
         let brush_stroke = self.local_adjust_mask_brush_stroke.take();
+        let canvas_drag = self.local_adjust_canvas_drag.take();
+        let key_edit = self.local_adjust_shape_key_edit.take();
         let had_edit = self.local_adjust_selected_shape.take().is_some()
             || shape_drag.is_some()
             || self.local_adjust_mask_shape_drag_start.take().is_some()
             || self.local_adjust_mask_shape_drag_end.take().is_some()
             || brush_stroke.is_some()
+            || canvas_drag.is_some()
+            || key_edit.is_some()
             || !self.local_adjust_mask_lasso_points.is_empty();
         if let Some(drag) = shape_drag
             && let Some(before) = self.local_adjust_shape_drag_before_layers.take()
         {
             self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+        }
+        if let Some(drag) = canvas_drag
+            && let Some(before) = self.local_adjust_canvas_drag_before_layers.take()
+        {
+            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+        }
+        if let Some(session) = key_edit {
+            self.set_local_adjust_layers_for_idx_memory_only(session.fs_idx, session.before);
         }
         if let Some(stroke) = brush_stroke {
             if let Some(before) = self.local_adjust_mask_brush_before_layers.take() {
@@ -11340,6 +11589,7 @@ impl App {
         self.local_adjust_mask_lasso_points.clear();
         if had_edit {
             self.local_adjust_shape_drag_before_layers = None;
+            self.local_adjust_canvas_drag_before_layers = None;
             self.local_adjust_mask_brush_before_layers = None;
         }
         had_edit
@@ -11347,10 +11597,15 @@ impl App {
 
     /// キー編集セッションを閉じるまでの無操作時間。
     ///
-    /// キーの auto-repeat は最初の 1 回と繰り返しの間に OS 既定で 250〜500ms 空く。
-    /// そこで切れるとホールド 1 回が 2 セッションに割れるので、それより長くとる。
+    /// キーの auto-repeat は最初の 1 回と繰り返しの間に間が空く。Windows の
+    /// `SPI_GETKEYBOARDDELAY` は 0〜3 で **約 250ms〜約 1 秒**なので、いちばん遅い設定でも
+    /// 割れないよう 1 秒より長くとる。短いと、押しっぱなしの 1 回が最初の 1 打と
+    /// リピート以降で 2 セッションに割れる (2026-08-31 Codex P2)。
+    ///
+    /// 長すぎる害は無い: セッションが開いている間もメモリと画面は追随しており、
+    /// 編集状態を畳むとき・終了時には必ず確定する。
     pub(crate) const LOCAL_ADJUST_SHAPE_KEY_IDLE: std::time::Duration =
-        std::time::Duration::from_millis(700);
+        std::time::Duration::from_millis(1_200);
 
     /// キーボードでの図形編集を 1 回分反映する。
     ///
@@ -11385,7 +11640,12 @@ impl App {
         if self
             .local_adjust_shape_key_edit
             .as_ref()
-            .is_some_and(|session| session.fs_idx != fs_idx || session.shape_idx != selected)
+            .is_some_and(|session| {
+                session.fs_idx != fs_idx
+                    || session.layer_idx != layer_idx
+                    || session.target != target
+                    || session.shape_idx != selected
+            })
         {
             self.persist_local_adjust_shape_key_edit();
         }
@@ -11429,6 +11689,8 @@ impl App {
                 None => {
                     self.local_adjust_shape_key_edit = Some(crate::app::LocalAdjustShapeKeyEdit {
                         fs_idx,
+                        layer_idx,
+                        target,
                         shape_idx: selected,
                         before,
                         summary: undo_summary,
@@ -11753,6 +12015,13 @@ impl App {
         self.persist_local_adjust_shape_drag();
         self.persist_local_adjust_canvas_drag();
         self.persist_local_adjust_mask_brush_stroke();
+        // ジェスチャの無い `before` は編集ではなく取り残しの記録。**必ず捨てる。**
+        // `persist_*` はジェスチャが無ければ何もせず戻るので、そこでは落ちない。
+        // 残すと次のジェスチャが `unwrap_or_else` でこれを拾い、**別ページの姿**を
+        // Undo の起点にする (2026-08-29 レビュー R-03 と同じ形)。
+        self.local_adjust_shape_drag_before_layers = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
         debug_assert!(
             !self.has_pending_local_adjust_edit(),
             "確定したのに保留が残っている"
@@ -14576,18 +14845,18 @@ impl App {
         self.local_adjust_mask_edit_target = mask_edit_target;
         self.local_adjust_mask_brush_radius = mask_brush_radius.max(1.0);
         self.local_adjust_mask_paint_add = mask_paint_add;
+        // マスクの編集対象やツールを替える前に、進行中の編集を確定する。捨てると
+        // メモリにしか無い編集が消える。キーボード版
+        // (`set_local_adjust_mask_tool_from_shortcut`) と同じ扱いにする。
         if previous_mask_edit_target != mask_edit_target {
+            self.commit_local_adjust_pending_edits();
             self.local_adjust_selected_shape = None;
-            self.local_adjust_shape_drag = None;
-            self.local_adjust_shape_drag_before_layers = None;
         }
         if previous_mask_tool != mask_tool {
+            self.commit_local_adjust_pending_edits();
             self.local_adjust_mask_lasso_points.clear();
             self.local_adjust_mask_shape_drag_start = None;
             self.local_adjust_mask_shape_drag_end = None;
-            self.local_adjust_mask_brush_stroke = None;
-            self.local_adjust_shape_drag = None;
-            self.local_adjust_shape_drag_before_layers = None;
         }
         self.local_adjust_mask_tool = mask_tool;
         self.local_adjust_mask_line_width = mask_line_width.max(1.0);
@@ -14668,17 +14937,13 @@ impl App {
         // 保留中のブラシ再計算は捨てずに確定させる。捨てると旧ページの cache が
         // 古い描画のまま残る (flush は保留が指す idx の generation を上げる)。
         self.flush_deferred_local_adjust_brush_render();
-        // 進行中のジェスチャと、ドラッグ / ストローク単位 Undo の退避。
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
+        // 進行中の編集は**確定してから**ページを移る。捨てると、メモリの文書には
+        // 入っていて正本には書かれていない編集がそのまま消える (2026-08-31 Codex P1)。
+        self.commit_local_adjust_pending_edits();
         self.local_adjust_mask_lasso_points.clear();
         self.local_adjust_mask_shape_drag_start = None;
         self.local_adjust_mask_shape_drag_end = None;
         self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
         // 画像上で 1 点を拾う操作も、旧ページの画素を指している。
         self.local_adjust_rgb_pick_active = None;
         self.local_adjust_repair_point_pick_active = None;
