@@ -13049,12 +13049,14 @@ impl App {
         let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
             return;
         };
-        let Some(layer) = self
-            .local_adjust_page_layers
-            .get(&fs_idx)
-            .and_then(|layers| layers.get(layer_idx))
-            .cloned()
-        else {
+        // **文書ではなく参照カウントを複製する。**ここは毎フレーム走るので、レイヤーを
+        // 深く複製すると 24MP で 96MB/frame になる (2026-08-31 実測で 1 フレームの 57%)。
+        // `self` から独立した所有ハンドルが要るのは借用の都合だけなので、`Arc` を複製して
+        // その中を借りれば足りる。
+        let Some(layers) = self.local_adjust_page_layers.get(&fs_idx).cloned() else {
+            return;
+        };
+        let Some(layer) = layers.get(layer_idx) else {
             return;
         };
         let image_dims = local_adjust_image_dims(self, fs_idx);
@@ -13068,16 +13070,30 @@ impl App {
             alt_down,
         ) && local_adjust_image_layout(transform, image_dims).is_some()
         {
+            // マスクプレビューは毎フレーム作り直して GPU へ上げている。マスクが変わって
+            // いなくても走るので、残りのコストがここに集まる。次の計測で切り分けられる
+            // よう単独で計る。
+            let preview_t0 = std::time::Instant::now();
             draw_local_adjust_mask_preview_overlay(
                 painter,
                 transform,
-                &layer,
+                layer,
                 source_pixels.as_deref(),
                 image_dims,
                 ui.ctx().input(|i| i.time) as f32,
                 self.local_adjust_mask_color_preset.colors(),
-                effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target),
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target),
                 &mut self.local_adjust_mask_preview_texture,
+            );
+            crate::perf::event(
+                "local_adjust",
+                "mask_preview_rebuild",
+                None,
+                0,
+                &[(
+                    "ms",
+                    serde_json::Value::from(preview_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
             );
             if matches!(&layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
                 ui.ctx()
