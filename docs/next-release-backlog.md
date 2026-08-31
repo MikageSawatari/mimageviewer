@@ -3384,12 +3384,26 @@ clip は旧 `rects` 由来のまま残るので、最終的な可視間隔を he
   `advance_animation` は左右とも呼ばれるのに進めるフレームが無い。
   行き来すると動き出すのは、相方が自分で `fullscreen_idx` になったときに昇格し、
   以後キャッシュに残るため。**§1.154 の変更とは無関係の既存バグ。**
-- 同じ前提が `update_prefetch_window` の upload backlog 掃除にもあり
-  (`entry.idx == current_idx` だけ残す)、昇格の upload が相方だけ捨てられていた。両方直した。
-- 修正: 「いま画面に出ているページか」を `page_is_displayed_now` 1 つで答える
-  (`fullscreen_idx` またはその見開き相方)。単ページ表示では従来どおり 1 枚だけ。
-- 回帰テスト `a_spread_partner_animation_is_promoted_too`。旧判定へ戻す変異で落ちる。
-- **実機確認は未実施** (帰宅後の確認待ち)。
+- **同じ規則が 4 か所に別々に綴られていた** (2026-09-01、1 度目の修正が実機で効かず判明):
+
+  | 場所 | 綴り |
+  | --- | --- |
+  | 昇格の開始ガード | `self.fullscreen_idx != Some(idx)` |
+  | upload backlog の掃除 | `entry.idx == current_idx` だけ残す |
+  | stale 昇格のキャンセル | `idx != current_idx` なら止める |
+  | pending の一括キャンセル | `k != current_idx` かつ昇格なら止める |
+
+  1 度目は上 2 つだけ直したので、**相方の昇格は開始した直後に下 2 つで殺され続けていた**
+  (毎フレーム開始 → 即キャンセルの繰り返し)。利用者報告「一覧から 1 ページ目を開くと
+  2 ページ目は動かない。一度見開きを解除して各ページを見てから戻すと両方動く」がそのまま
+  この形。**「1 か所直して終わりにしない」を守れていなかった。**
+- 修正: `page_is_displayed(idx, current, partner)` 1 つに集約し、4 か所すべてがそれを見る。
+  相方は `displayed_spread_partner` が返す。単ページ表示では従来どおり 1 枚だけ。
+- 回帰テストは 2 本。`a_spread_partner_animation_is_promoted_too` (判定そのもの) と
+  `a_spread_partner_promotion_is_not_cancelled_by_the_prefetch_window`
+  (開始した昇格が `update_prefetch_window` を通しても残る)。
+  **キャンセル 2 か所それぞれを旧綴りへ戻す変異で落ちる。**
+- **実機確認は未実施**。
 
 ### 1.156 見開きの範囲コピーが自動トリムを見ていない — **1・2 対応済み・実機確認済み** (2026-09-01)
 

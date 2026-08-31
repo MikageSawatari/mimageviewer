@@ -33311,6 +33311,41 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// 相方の昇格が、**開始と同時にキャンセルされない**。
+    ///
+    /// 「表示中のページの昇格だけ生かす」規則を 4 か所に別々に綴っていたため、開始のガードを
+    /// 直しても、先読みウィンドウの 2 つのキャンセル経路が相方の昇格を毎フレーム殺していた。
+    /// 一覧から開いた直後に相方が動かないのはこれ (§1.157)。
+    #[test]
+    fn a_spread_partner_promotion_is_not_cancelled_by_the_prefetch_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, "C:/missing/left.gif");
+        let right = push_image(&mut app, "C:/missing/right.gif");
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.start_animation_promotion_if_needed(right),
+            "相方の昇格が開始されない"
+        );
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "開始直後に pending が無い"
+        );
+
+        app.update_prefetch_window(left);
+
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "先読みウィンドウが相方の昇格をキャンセルしている"
+        );
+    }
+
     #[test]
     fn fullscreen_load_spawns_current_with_full_frames_and_prefetch_with_first_frame_only() {
         let mut app = setup_app();

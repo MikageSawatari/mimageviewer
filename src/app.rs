@@ -51384,14 +51384,17 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
-        // 昇格は表示対象 idx にだけ属する。KEEP 範囲内かどうかとは独立に、ページを
-        // 離れた時点で worker を止め、decode 済み backlog も捨てる。
+        // 昇格は**表示中のページ**に属する。見開きでは相方も表示中なので止めない。
+        // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
+        // decode 済み backlog も捨てる。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions: Vec<usize> = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect();
         for idx in stale_promotions {
@@ -51400,18 +51403,10 @@ impl App {
             }
             self.fs_early_dims.remove(&idx);
         }
-        // 昇格の upload は、表示中のページのぶんだけ残す。**見開きでは相方も表示中**なので
-        // 落とさない (落とすと相方のアニメが第 1 フレームのまま止まる)。
-        let displayed_partner = match self.resolve_spread_pair(current_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                Some(if left == current_idx { right } else { left })
-            }
-            _ => None,
-        };
+        // 昇格の upload も、表示中のページのぶんだけ残す。
         self.fs_upload_backlog.retain(|entry| {
             entry.purpose.promotion_started_at_for(entry.idx).is_none()
-                || entry.idx == current_idx
-                || Some(entry.idx) == displayed_partner
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
 
         self.start_animation_promotion_if_needed(current_idx);
@@ -51432,9 +51427,12 @@ impl App {
                     return None;
                 }
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
+                // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
+                // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
                 (current_loading
                     || !keep_set.contains(&k)
-                    || pending.purpose.promotion_started_at_for(k).is_some())
+                    || (pending.purpose.promotion_started_at_for(k).is_some()
+                        && !Self::page_is_displayed(k, current_idx, displayed_partner)))
                 .then_some(k)
             })
             .collect();
@@ -57190,24 +57188,33 @@ impl App {
         }
     }
 
-    /// いま画面に出ているページか。**見開きでは相方も出ている。**
-    ///
-    /// アニメの全フレーム昇格は「表示中の 1 枚」だけを対象にしていたので、見開きの相方は
-    /// 第 1 フレームのまま止まっていた (`advance_animation` は左右とも呼ばれるが、進める
-    /// フレームが存在しない)。一覧から開いた直後に片方だけ動く、行き来すると動き出す、
-    /// という報告はこれで説明が付く — 相方は自分が `fullscreen_idx` になったときに初めて
-    /// 昇格し、以後キャッシュに残る。
-    fn page_is_displayed_now(&mut self, idx: usize) -> bool {
-        if self.fullscreen_idx == Some(idx) {
-            return true;
+    /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
+    fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
+        match self.resolve_spread_pair(current) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                Some(if left == current { right } else { left })
+            }
+            _ => None,
         }
+    }
+
+    /// いま画面に出ているページか。**見開きでは 2 枚。**
+    ///
+    /// アニメの全フレーム昇格は「表示中のページのものだけ走らせ、他は止める」という規則で
+    /// 動く。その規則を **4 か所に別々に綴っていた** (開始のガード / upload backlog の掃除 /
+    /// stale 昇格のキャンセル / pending の一括キャンセル)。相方はどこかで必ず「表示中でない」
+    /// 側に落ちるので、毎フレーム開始しては即キャンセルされ、永久に昇格しなかった (§1.157)。
+    /// **判定はこの 1 つだけを使う。**
+    fn page_is_displayed(idx: usize, current: usize, partner: Option<usize>) -> bool {
+        idx == current || Some(idx) == partner
+    }
+
+    fn page_is_displayed_now(&mut self, idx: usize) -> bool {
         let Some(current) = self.fullscreen_idx else {
             return false;
         };
-        matches!(
-            self.resolve_spread_pair(current),
-            crate::ui_fullscreen::SpreadPair::Double { left, right } if left == idx || right == idx
-        )
+        let partner = self.displayed_spread_partner(current);
+        Self::page_is_displayed(idx, current, partner)
     }
 
     fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
