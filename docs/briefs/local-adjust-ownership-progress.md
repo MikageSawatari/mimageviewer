@@ -227,18 +227,75 @@ Codex は **意味的な別名化・スナップショット順序の欠陥は�
 - **`ContentIdentitySource` を積む時点で控えていない。**idx が動くと content identity の
   記録が単に行われない (誤ったページへ書きはしない)。
 
-## 最後 — 段 (b) キー移動 / 回転の確定タイミング
+## 済み — 段 (b) キー移動 / 回転の確定タイミング
 
-**調査済み**: 編集状態を畳む箇所は 14 箇所あり、`src/app.rs` (4) /
-`src/ui_adjustment_panel.rs` (9) / `src/ui_fullscreen.rs` (1) に散っている。
-**その多くは `= None` で破棄している** — ブラシはそれでよいが、キー移動は完了した編集
-なので破棄できない、というブリーフの警告どおりの形になっている。
+| コミット | 内容 |
+| --- | --- |
+| `368499d9` | キー編集をセッション化し、編集状態を畳む 8 箇所を単一の router へ集約 |
 
-方向: 破棄と確定を各所で判断させず、**単一の state owner に畳む**
-(CLAUDE.md「相互排他的な状態を複数の bool / Option で表さない」)。
-既存の `local_adjust_mask_brush_stroke` / `local_adjust_shape_drag` +
-`persist_*` が同型の先例。監査テストは「畳む箇所すべてがその owner を通ること」を
-ソース走査で検査する形が合う (`layer_parse_audit` が同じ手法)。
+`cargo test -p mimageviewer --lib` は 6800 passed / 0 failed。新規テスト 9 件
+(セッション 6 + 監査 3)。**6 つの変異がそれぞれ意図したテストだけを落とす**ことを確認。
+
+### 着手前の見積もりとの差
+
+- **畳む箇所は 14 ではなく 8 だった** (`local_adjust_mode = false` を書く箇所)。
+  ただし内訳は想定より悪く、**5 箇所が破棄・3 箇所は何もしていなかった**。
+  何もしない 3 箇所はモードを抜けたあとも保留を残すので、次にモードへ入ったときに
+  古いジェスチャが生き返る。
+- **ブラシも破棄してはいけなかった。**ブリーフは「ブラシは破棄でよい」としていたが、
+  塗った画素はメモリの文書に入っているだけで、保存は `persist_*` でしか行われない。
+  破棄すると保存されず、`start_loading_items_inner` はそのあと文書ごと消す。
+  4 種類とも確定する形にした (取り消しは Esc の別経路が持つ)。
+- **キー離しでは閉じられない。**フルスクリーンの編集キャンバスでは egui のキー状態が
+  stale になり得る (修飾キーだけ OS 直読みにしてあるのはそのため)。無操作時間で
+  閉じる形にした。窓は 700ms — OS の auto-repeat 遅延 (既定 250〜500ms) より長くないと、
+  ホールド 1 回が 2 セッションに割れる。
+
+### 監査テスト
+
+`layer_parse_audit` と同じソース走査。実行時テストでは「まだ書かれていない 9 番目の
+入口」を捕まえられないため:
+
+1. `local_adjust_mode = false` を書く箇所は、同じ関数内で `fold_local_adjust_edit_state()`
+   を呼んでいること
+2. ジェスチャの所有者 (`ui_adjustment_panel.rs`) 以外は保留を `= None` で潰さないこと
+3. 確定が 4 種類すべての `persist_*` を呼んでいること
+
+## 未着手 — 補正パネル編集器の毎フレーム複製 (Codex P1、段 (b) には入らなかった)
+
+**前言を訂正する。**段 (d-1) の記録で「段 (b) の state owner に畳む」と書いたが、
+実装しながら見直した結果**別物**だった。(b) の owner は「保留中の編集 (ジェスチャ)」を
+畳むもので、編集器が毎フレーム作る作業用コピーとは扱う対象が違う。
+
+現象は変わらず: `draw_selected_local_adjust_layer_editor`
+([src/ui_adjustment_panel.rs](../../src/ui_adjustment_panel.rs) `3987` 付近) の
+`let mut edited = layer.clone();` が、補正パネルを開いている間**毎フレーム** 1 レイヤーを
+複製する。24MP なら 96MB、`manual_override` 込みで最大 3 枚。
+
+**追加で分かったこと** (着手時に再調査しなくてよい):
+
+- **編集器はマスクの画素を書かない。**書くのは scalar (`opacity` / `mask_inverted` /
+  `mask_*_effect` / `mask_expand_px` / `mask_feather_px`)、マスクの**パラメータ**
+  (グラデーション幾何・許容幅・target RGB)、`shapes` (ベクタ、小さい)、`effect` だけ。
+  原寸の `alpha` は読むだけなので、**複製の大部分は純粋な無駄**。
+- **フレーム内の順序は塗り → パネル描画** (`ui_fullscreen.rs` の
+  `handle_local_adjust_canvas_input` が `draw_local_adjust_panel` より前)。
+  これが効いてくるのが次の点。
+- **有望な形は `RasterVectorMask::alpha` を `Arc<Vec<f32>>` にすること。**
+  そうすると `layer.clone()` が参照カウントの複製になる。塗りの `Arc::make_mut` は、
+  前フレームのパネル用コピーが既に落ちているので refcount 1 = 無料。Undo / 保存 worker が
+  掴んでいる直後だけ 1 回複製する (文書レベルの `Arc` と同じ挙動)。
+- **規模**: `alpha` を書き換えている箇所は crate 全体で 37 前後。`serde` の `rc` feature は
+  有効なので、`mask_codec` の直列化はそのまま通るはず (要確認)。
+
+**効かない案** (検討済み):
+
+- レイヤー単位で `Arc<LocalAdjustmentLayer>` にする — egui のウィジェットは毎フレーム
+  `&mut` を要求するので `Arc::make_mut` が毎フレーム走り、何も変わらない。
+- 編集器の作業用コピーを App の state owner に持たせる — 文書へ publish するときに
+  結局 1 複製が要る (`mem::swap` だと編集器が 1 つ前の姿を掴んでしまう)。
+- パネル描画中だけ文書を map から取り出す (`remove` → `insert`) — 描画中に
+  `self.local_adjust_page_layers` を読む経路が複数あり、それらが空を見る。
 
 ## 環境メモ
 
