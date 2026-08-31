@@ -1268,6 +1268,10 @@ impl crate::app::App {
                 handlers
             }
         };
+        // Windows と同じく、おすすめを先に、その他を後に。**絞り込みはしない**
+        // (絞ると OS の「プログラムから開く」に出るアプリが mIV に出ないことになる)。
+        let mut handlers = handlers;
+        handlers.sort_by_key(|handler| !handler.is_recommended);
         handlers
             .into_iter()
             .map(|handler| AssociatedAppMenuEntry {

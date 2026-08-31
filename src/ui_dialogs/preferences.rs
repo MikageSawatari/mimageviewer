@@ -571,7 +571,12 @@ pub(super) struct ExternalToolLaunchCandidate {
 fn external_tool_launch_candidates(
     handlers: &[crate::open_with::AppHandler],
 ) -> Vec<ExternalToolLaunchCandidate> {
+    // Windows と同じく、おすすめを先に、その他を後に並べる。**絞り込みはしない**
+    // (絞ると OS に出るアプリが mIV に出ないことになる)。
     let mut candidates: Vec<ExternalToolLaunchCandidate> = Vec::new();
+    let mut handlers: Vec<&crate::open_with::AppHandler> = handlers.iter().collect();
+    // `sort_by_key` は安定なので、各グループ内は列挙順のまま。
+    handlers.sort_by_key(|handler| !handler.is_recommended);
     for handler in handlers {
         let launch = crate::external_tool::ExternalToolLaunch::Association {
             handler_id: handler.handler_id.clone(),
@@ -3141,14 +3146,17 @@ mod tests {
             crate::open_with::AppHandler {
                 display_name: "Photos".to_string(),
                 handler_id: "photos.app".to_string(),
+                is_recommended: false,
             },
             crate::open_with::AppHandler {
                 display_name: "Same legacy target".to_string(),
                 handler_id: r"c:\tools\VIEWER.exe".to_string(),
+                is_recommended: false,
             },
             crate::open_with::AppHandler {
                 display_name: "Paint".to_string(),
                 handler_id: "Paint.App".to_string(),
+                is_recommended: false,
             },
         ];
 

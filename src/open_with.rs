@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 pub struct AppHandler {
     pub display_name: String,
     pub handler_id: String,
+    /// Windows が「おすすめ」に分類しているか (`IAssocHandler::IsRecommended`)。
+    ///
+    /// 表示順を決めるためだけの UI ヒントで、起動可否とは無関係。**候補を絞る条件に
+    /// 使わない**: おすすめは利用者操作で変わる状態なので、これで母集団を切ると、
+    /// 保存済みのツールが後から見つからなくなる。
+    pub is_recommended: bool,
 }
 
 /// ファイル選択ダイアログで利用者が明示的に選んだ実行ファイル。
@@ -45,15 +51,19 @@ fn enumerate_handlers_inner(
     extension: &str,
 ) -> Result<Vec<AppHandler>, Box<dyn std::error::Error>> {
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{ASSOC_FILTER_RECOMMENDED, SHAssocEnumHandlers};
+    use windows::Win32::UI::Shell::{ASSOC_FILTER_NONE, SHAssocEnumHandlers};
     use windows::core::PCWSTR;
 
     let _com = initialize_com_sta()?;
 
     let ext_wide: Vec<u16> = extension.encode_utf16().chain(std::iter::once(0)).collect();
 
+    // `RECOMMENDED` で絞ると、Windows の「プログラムから開く」には出るアプリが mIV の
+    // 一覧には出ない。利用者から見るとそれは mIV の不具合にしか見えない
+    // (2026-09-01 利用者指摘)。**起動側の列挙と同じ `NONE` に揃え**、おすすめかどうかは
+    // 属性として持って表示順にだけ使う。
     let enum_handlers =
-        unsafe { SHAssocEnumHandlers(PCWSTR(ext_wide.as_ptr()), ASSOC_FILTER_RECOMMENDED)? };
+        unsafe { SHAssocEnumHandlers(PCWSTR(ext_wide.as_ptr()), ASSOC_FILTER_NONE)? };
 
     let mut result = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
@@ -80,9 +90,11 @@ fn enumerate_handlers_inner(
             if let (Some(display_name), Some(handler_id)) = (display_name, handler_id) {
                 let key = handler_id.to_lowercase();
                 if seen_ids.insert(key) {
+                    let is_recommended = unsafe { handler.IsRecommended() }.is_ok();
                     result.push(AppHandler {
                         display_name,
                         handler_id,
+                        is_recommended,
                     });
                 }
             }
@@ -387,6 +399,7 @@ pub(crate) fn enumerate_handlers_unfiltered(extension: &str) -> Vec<AppHandler> 
             out.push(AppHandler {
                 display_name,
                 handler_id,
+                is_recommended: false,
             });
         }
     }
@@ -655,6 +668,8 @@ fn invoke_association_handler_inner(
             candidates.push(AppHandler {
                 display_name,
                 handler_id,
+                // 起動側は候補の並び替えをしないので、この値は使わない。
+                is_recommended: false,
             });
             handlers.push(handler);
         }
@@ -882,6 +897,7 @@ mod tests {
         AppHandler {
             display_name: display_name.to_string(),
             handler_id: handler_id.to_string(),
+            is_recommended: false,
         }
     }
 
