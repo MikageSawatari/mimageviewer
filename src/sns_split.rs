@@ -1,12 +1,15 @@
 //! SNS のカルーセル投稿向け分割枠の純粋な幾何。
 //!
-//! グループ矩形は利用者が操作する比率固定矩形で、実際の描画と書き出しには
-//! [SnsSplitLayout::frames] が返す整数ピクセルの枠を使う。
+//! グループ矩形は利用者が操作する自由比率の矩形で、実際の描画と書き出しには
+//! [SnsSplitLayout::frames] が返す整数ピクセル境界の枠を使う。
 
 use crate::export_crop::CropRect;
 
 pub const MIN_COUNT: u8 = 2;
 pub const MAX_COUNT: u8 = 4;
+pub const MAX_SEAM_PERMILLE: u16 = 100;
+
+const PERMILLE_DENOMINATOR: u128 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnsTarget {
@@ -38,41 +41,99 @@ impl SnsTarget {
         }
     }
 
-    /// 枠の比率 (横:縦) を約分した整数の組。
-    ///
-    /// **投稿先ごとの比率と隙間は、この 2 つの整数組だけが持ち主**にする。f32 の
-    /// [Self::frame_aspect] / [Self::seam_ratio] も、枠寸法を決める整数演算も、
-    /// すべてここから導出する。同じ数値を別の場所へ書き写すと、片方だけ直した
-    /// ときに描画と出力が食い違う。
-    pub fn frame_aspect_parts(self) -> (u128, u128) {
-        match self {
-            Self::X => (3, 4),
-            Self::Instagram => (4, 5),
-        }
-    }
-
-    /// 継ぎ目で捨てる帯の幅を、枠幅に対する比として表した整数の組。
+    /// 投稿先で一般的な継ぎ目幅を、枠幅に対する比として表した整数の組。
     ///
     /// X の 17/1000 (= 1.7%) の根拠: 2026-09-01 の実測は PC ブラウザ 1.588%、
     /// iOS アプリ 1.869%、モバイル Web 2.652%。隙間の絶対値は環境ごとに違う
     /// (Web 5.33 CSS px / iOS アプリ 4.00 CSS px) ので単一の正解が無い。1.7% なら
     /// PC ブラウザと iOS アプリの誤差がともに 0.4 CSS px 以内に収まる。
     /// 詳細は docs/sns-split-export-plan.md §2.1。
+    /// これは新しいレイアウトの既定値だけを決める。現在の値は
+    /// [SnsSplitLayout::seam_permille] が所有する。
     pub fn seam_ratio_parts(self) -> (u128, u128) {
         match self {
-            Self::X => (17, 1000),
-            Self::Instagram => (0, 1),
+            Self::X => (17, PERMILLE_DENOMINATOR),
+            Self::Instagram => (0, PERMILLE_DENOMINATOR),
         }
     }
 
-    pub fn frame_aspect(self) -> f32 {
-        let (num, den) = self.frame_aspect_parts();
-        num as f32 / den as f32
+    pub fn default_seam_permille(self) -> u16 {
+        let (num, den) = self.seam_ratio_parts();
+        ((num * PERMILLE_DENOMINATOR / den) as u16).min(MAX_SEAM_PERMILLE)
     }
 
+    /// 投稿先の既定値を f32 で返す。現在のレイアウト値には
+    /// [SnsSplitLayout::seam_ratio] を使う。
     pub fn seam_ratio(self) -> f32 {
         let (num, den) = self.seam_ratio_parts();
         num as f32 / den as f32
+    }
+}
+
+/// パネルで選ぶ1枠の比率。永続化には [SnsFrameRatio::stable_key] を使い、
+/// レイアウト自体は結果のグループ矩形だけを所有する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnsFrameRatio {
+    #[default]
+    Free,
+    Ratio3x4,
+    Ratio4x5,
+    Ratio1x1,
+}
+
+impl SnsFrameRatio {
+    pub const ALL: [Self; 4] = [Self::Free, Self::Ratio3x4, Self::Ratio4x5, Self::Ratio1x1];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "自由",
+            Self::Ratio3x4 => "3:4",
+            Self::Ratio4x5 => "4:5",
+            Self::Ratio1x1 => "1:1",
+        }
+    }
+
+    pub fn stable_key(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Ratio3x4 => "3:4",
+            Self::Ratio4x5 => "4:5",
+            Self::Ratio1x1 => "1:1",
+        }
+    }
+
+    pub fn from_stable_key(key: &str) -> Self {
+        match key {
+            "3:4" => Self::Ratio3x4,
+            "4:5" => Self::Ratio4x5,
+            "1:1" => Self::Ratio1x1,
+            _ => Self::Free,
+        }
+    }
+
+    /// 1枠の横/縦を整数比で返す。自由では固定値を持たない。
+    pub fn frame_ratio_parts(self) -> Option<(u128, u128)> {
+        match self {
+            Self::Free => None,
+            Self::Ratio3x4 => Some((3, 4)),
+            Self::Ratio4x5 => Some((4, 5)),
+            Self::Ratio1x1 => Some((1, 1)),
+        }
+    }
+
+    /// 1枠の横/縦。自由では固定値を持たない。
+    pub fn frame_aspect(self) -> Option<f32> {
+        let (width, height) = self.frame_ratio_parts()?;
+        Some(width as f32 / height as f32)
+    }
+
+    /// 枠を横一列に並べたグループ矩形の横/縦。
+    pub fn group_aspect(self, count: u8, seam_permille: u16) -> Option<f32> {
+        let frame_aspect = self.frame_aspect()?;
+        let count = f32::from(clamped_count(count));
+        let seam_ratio =
+            f32::from(clamped_seam_permille(seam_permille)) / PERMILLE_DENOMINATOR as f32;
+        Some(frame_aspect * (count + (count - 1.0) * seam_ratio))
     }
 }
 
@@ -80,69 +141,74 @@ impl SnsTarget {
 pub struct SnsSplitLayout {
     pub target: SnsTarget,
     pub count: u8,
+    /// 枠幅に対する継ぎ目の千分率 (0..=100)。
+    pub seam_permille: u16,
     pub group: CropRect,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct FrameMetrics {
-    width: usize,
+    extent_width: usize,
     height: usize,
-    step: usize,
+    total_units: u128,
+    step_units: u128,
 }
 
 impl SnsSplitLayout {
-    /// グループ矩形の比率 (横/縦)。
-    pub fn group_aspect(target: SnsTarget, count: u8) -> f32 {
-        let count = clamped_count(count);
-        let n = f32::from(count);
-        target.frame_aspect() * (n + (n - 1.0) * target.seam_ratio())
+    pub fn seam_ratio_parts(self) -> (u128, u128) {
+        (
+            u128::from(clamped_seam_permille(self.seam_permille)),
+            PERMILLE_DENOMINATOR,
+        )
+    }
+
+    pub fn seam_ratio(self) -> f32 {
+        f32::from(clamped_seam_permille(self.seam_permille)) / PERMILLE_DENOMINATOR as f32
     }
 
     /// 画像全体に対して最大サイズかつ中央のグループ矩形を作る。
     pub fn centered_max(target: SnsTarget, count: u8, image_size: [usize; 2]) -> Self {
         let count = clamped_count(count);
-        let image_width = image_size[0].max(1) as f32;
-        let image_height = image_size[1].max(1) as f32;
-        let aspect = Self::group_aspect(target, count);
-        let (group_width, group_height) = if image_width / image_height > aspect {
-            (image_height * aspect, image_height)
-        } else {
-            (image_width, image_width / aspect)
-        };
-        let min_x = (image_width - group_width) * 0.5;
-        let min_y = (image_height - group_height) * 0.5;
 
         Self {
             target,
             count,
-            group: CropRect {
-                min_x,
-                min_y,
-                max_x: min_x + group_width,
-                max_y: min_y + group_height,
-            },
+            seam_permille: target.default_seam_permille(),
+            group: CropRect::full(image_size[0], image_size[1]),
         }
         .clamped(image_size)
     }
 
-    /// 描画と書き出しの正になる、同じ整数ピクセル寸法の枠を返す。
+    /// 描画と書き出しの正になる、整数ピクセル境界の枠を返す。
     ///
     /// 公開フィールドから極小のグループを直接渡された場合も、各枠の幅と高さは
-    /// 1px 以上、左端同士の間隔は枠幅以上になる。
+    /// 1px 以上になる。割り切れない幅は累積境界を丸めて全枠へ配るため、枠幅と
+    /// 継ぎ目幅はそれぞれ最大 1px の差を持ち得るが、欠落や重複は作らない。
     pub fn frames(&self) -> Vec<CropRect> {
         let count = clamped_count(self.count);
-        let metrics = frame_metrics(self.target, count, self.group.width());
+        let seam_permille = clamped_seam_permille(self.seam_permille);
+        let metrics = frame_metrics(
+            count,
+            seam_permille,
+            self.group.width(),
+            self.group.height(),
+        );
         let x0 = finite_or(self.group.min_x, 0.0).round();
         let y0 = finite_or(self.group.min_y, 0.0).round();
 
         (0..count)
             .map(|index| {
-                let offset = usize::from(index).saturating_mul(metrics.step) as f32;
-                let min_x = x0 + offset;
+                let start_units = u128::from(index).saturating_mul(metrics.step_units);
+                let end_units = start_units.saturating_add(PERMILLE_DENOMINATOR);
+                let min_x = x0
+                    + partition_offset(metrics.extent_width, start_units, metrics.total_units)
+                        as f32;
+                let max_x = x0
+                    + partition_offset(metrics.extent_width, end_units, metrics.total_units) as f32;
                 CropRect {
                     min_x,
                     min_y: y0,
-                    max_x: min_x + metrics.width as f32,
+                    max_x,
                     max_y: y0 + metrics.height as f32,
                 }
             })
@@ -162,14 +228,28 @@ impl SnsSplitLayout {
         }
     }
 
-    /// 中心と幅を保ちながら投稿先を差し替える。
+    /// グループ矩形を保ちながら投稿先を差し替え、継ぎ目を投稿先の既定へ戻す。
     pub fn with_target(&self, target: SnsTarget, image_size: [usize; 2]) -> Self {
-        self.with_target_and_count(target, self.count, image_size)
+        Self {
+            target,
+            seam_permille: target.default_seam_permille(),
+            ..*self
+        }
+        .clamped(image_size)
     }
 
-    /// 中心と幅を保ちながら枚数を差し替える。
+    /// グループ矩形と継ぎ目を保ちながら枚数を差し替える。
     pub fn with_count(&self, count: u8, image_size: [usize; 2]) -> Self {
-        self.with_target_and_count(self.target, count, image_size)
+        Self { count, ..*self }.clamped(image_size)
+    }
+
+    /// グループ矩形を保ちながら継ぎ目を差し替える。
+    pub fn with_seam_permille(&self, seam_permille: u16, image_size: [usize; 2]) -> Self {
+        Self {
+            seam_permille,
+            ..*self
+        }
+        .clamped(image_size)
     }
 
     /// 実際の整数ピクセル枠を画像の整数バジェットから決定的に構成する。
@@ -190,33 +270,33 @@ impl SnsSplitLayout {
             image_height as f32 * 0.5,
         );
 
-        let requested_width = frame_metrics(self.target, count, self.group.width()).width;
-        let width_budget = max_frame_width_for_image_width(self.target, count, image_width);
-        let height_budget = max_frame_width_for_image_height(self.target, image_height);
-        let mut frame_width = requested_width
-            .min(width_budget.max(1))
-            .min(height_budget.max(1));
-
-        let metrics = loop {
-            let metrics = frame_metrics_for_width(self.target, frame_width);
-            let total_width = frames_total_width(count, metrics);
-            if (total_width <= image_width && metrics.height <= image_height) || frame_width == 1 {
-                break metrics;
-            }
-            frame_width -= 1;
+        let seam_permille = clamped_seam_permille(self.seam_permille);
+        let requested = frame_metrics(
+            count,
+            seam_permille,
+            self.group.width(),
+            self.group.height(),
+        );
+        let minimum_width = usize::from(count);
+        let extent_width = if image_width < minimum_width {
+            minimum_width
+        } else {
+            requested.extent_width.clamp(minimum_width, image_width)
         };
+        let extent_height = requested.height.clamp(1, image_height);
+        let metrics = frame_metrics_for_width(count, seam_permille, extent_width, extent_height);
 
-        let total_width = frames_total_width(count, metrics);
-        let min_x = axis_origin(center_x, total_width, image_width);
+        let min_x = axis_origin(center_x, metrics.extent_width, image_width);
         let min_y = axis_origin(center_y, metrics.height, image_height);
 
         Self {
             target: self.target,
             count,
+            seam_permille,
             group: CropRect {
                 min_x: min_x as f32,
                 min_y: min_y as f32,
-                max_x: min_x.saturating_add(total_width) as f32,
+                max_x: min_x.saturating_add(metrics.extent_width) as f32,
                 max_y: min_y.saturating_add(metrics.height) as f32,
             },
         }
@@ -231,63 +311,51 @@ impl SnsSplitLayout {
         let image_height = image_size[1].max(1) as f32;
         rect_inside(self.frames_extent(), image_width, image_height)
     }
-
-    fn with_target_and_count(&self, target: SnsTarget, count: u8, image_size: [usize; 2]) -> Self {
-        let count = clamped_count(count);
-        let center_x = (self.group.min_x + self.group.max_x) * 0.5;
-        let center_y = (self.group.min_y + self.group.max_y) * 0.5;
-        let group_width = rect_width(self.group);
-        let group_height = group_width / Self::group_aspect(target, count);
-
-        Self {
-            target,
-            count,
-            group: CropRect {
-                min_x: center_x - group_width * 0.5,
-                min_y: center_y - group_height * 0.5,
-                max_x: center_x + group_width * 0.5,
-                max_y: center_y + group_height * 0.5,
-            },
-        }
-        .clamped(image_size)
-    }
 }
 
 fn clamped_count(count: u8) -> u8 {
     count.clamp(MIN_COUNT, MAX_COUNT)
 }
 
-fn frame_metrics(target: SnsTarget, count: u8, group_width: f32) -> FrameMetrics {
+pub fn clamped_seam_permille(seam_permille: u16) -> u16 {
+    seam_permille.min(MAX_SEAM_PERMILLE)
+}
+
+fn frame_metrics(
+    count: u8,
+    seam_permille: u16,
+    group_width: f32,
+    group_height: f32,
+) -> FrameMetrics {
     let count = clamped_count(count);
-    let group_width = finite_positive_or(group_width, 1.0);
-    // clamped() は丸め済み枠の外接幅へ group をスナップする。隙間の丸めで
-    // 理論幅より小さくなる場合も同じ整数枠幅を復元できるよう、最近傍へ丸める。
-    // 1px の下限は公開 frames() を通る全経路でここから適用される。
-    let width = finite_rounded_usize(group_width as f64 / frame_divisor(target, count));
-    frame_metrics_for_width(target, width)
+    let extent_width =
+        finite_rounded_usize(finite_positive_or(group_width, 1.0) as f64).max(usize::from(count));
+    let height = finite_rounded_usize(finite_positive_or(group_height, 1.0) as f64);
+    frame_metrics_for_width(count, seam_permille, extent_width, height)
 }
 
-fn frame_divisor(target: SnsTarget, count: u8) -> f64 {
-    let count = f64::from(clamped_count(count));
-    let (seam_num, seam_den) = target.seam_ratio_parts();
-    let seam_ratio = seam_num as f64 / seam_den as f64;
-    count + (count - 1.0) * seam_ratio
-}
-
-fn frame_metrics_for_width(target: SnsTarget, width: usize) -> FrameMetrics {
-    let width = width.max(1);
-    // 比率も隙間も SnsTarget の整数組から導く。step は (1 + seam) 倍なので
-    // 分子へ分母を足した比で一度に丸める。usize の加算を挟むと極端な幅で
-    // 桁あふれするため、飽和処理を持つ rounded_ratio の中で完結させる。
-    let (aspect_num, aspect_den) = target.frame_aspect_parts();
-    let (seam_num, seam_den) = target.seam_ratio_parts();
-    let height = rounded_ratio(width, aspect_den, aspect_num);
-    let step = rounded_ratio(width, seam_den + seam_num, seam_den);
+fn frame_metrics_for_width(
+    count: u8,
+    seam_permille: u16,
+    extent_width: usize,
+    height: usize,
+) -> FrameMetrics {
+    let count = clamped_count(count);
+    let seam_units = u128::from(clamped_seam_permille(seam_permille));
+    let count_units = u128::from(count);
+    let total_units = PERMILLE_DENOMINATOR
+        .saturating_mul(count_units)
+        .saturating_add(seam_units.saturating_mul(count_units - 1));
     FrameMetrics {
-        width,
+        extent_width: extent_width.max(usize::from(count)),
         height: height.max(1),
-        step: step.max(width),
+        total_units,
+        step_units: PERMILLE_DENOMINATOR.saturating_add(seam_units),
     }
+}
+
+fn partition_offset(extent_width: usize, units: u128, total_units: u128) -> usize {
+    rounded_ratio(extent_width, units.min(total_units), total_units).min(extent_width)
 }
 
 fn rounded_ratio(value: usize, numerator: u128, denominator: u128) -> usize {
@@ -307,31 +375,6 @@ fn finite_rounded_usize(value: f64) -> usize {
     } else {
         value.round() as usize
     }
-}
-
-fn frames_total_width(count: u8, metrics: FrameMetrics) -> usize {
-    usize::from(clamped_count(count) - 1)
-        .saturating_mul(metrics.step)
-        .saturating_add(metrics.width)
-}
-
-fn max_frame_width_for_image_width(target: SnsTarget, count: u8, image_width: usize) -> usize {
-    let count = u128::from(clamped_count(count));
-    let seam_numerator = match target {
-        SnsTarget::X => 17,
-        SnsTarget::Instagram => 0,
-    };
-    let divisor_numerator = 1000 * count + seam_numerator * (count - 1);
-    usize_from_u128((image_width as u128) * 1000 / divisor_numerator)
-}
-
-fn max_frame_width_for_image_height(target: SnsTarget, image_height: usize) -> usize {
-    let image_height = image_height as u128;
-    let width = match target {
-        SnsTarget::X => (3 * image_height + 1) / 4,
-        SnsTarget::Instagram => (4 * image_height + 1) / 5,
-    };
-    usize_from_u128(width)
 }
 
 fn axis_origin(center: f32, occupied: usize, available: usize) -> usize {
@@ -361,10 +404,6 @@ fn finite_positive_or(value: f32, fallback: f32) -> f32 {
     }
 }
 
-fn rect_width(rect: CropRect) -> f32 {
-    finite_positive_or(rect.max_x - rect.min_x, 1.0)
-}
-
 fn rect_inside(rect: CropRect, image_width: f32, image_height: f32) -> bool {
     rect.min_x.is_finite()
         && rect.min_y.is_finite()
@@ -382,48 +421,32 @@ fn rect_inside(rect: CropRect, image_width: f32, image_height: f32) -> bool {
 mod tests {
     use super::*;
 
-    const EPSILON: f32 = 1.0e-3;
-
-    fn raw_width(rect: CropRect) -> f32 {
-        rect.max_x - rect.min_x
+    fn raw_width(rect: CropRect) -> usize {
+        (rect.max_x - rect.min_x).round() as usize
     }
 
-    fn raw_height(rect: CropRect) -> f32 {
-        rect.max_y - rect.min_y
+    fn raw_height(rect: CropRect) -> usize {
+        (rect.max_y - rect.min_y).round() as usize
     }
 
-    fn center(rect: CropRect) -> [f32; 2] {
-        [
-            (rect.min_x + rect.max_x) * 0.5,
-            (rect.min_y + rect.max_y) * 0.5,
-        ]
+    fn gap_width(left: CropRect, right: CropRect) -> usize {
+        (right.min_x - left.max_x).round() as usize
     }
 
-    fn integer_width(rect: CropRect) -> i64 {
-        raw_width(rect).round() as i64
-    }
-
-    fn integer_height(rect: CropRect) -> i64 {
-        raw_height(rect).round() as i64
-    }
-
-    fn integer_gap(left: CropRect, right: CropRect) -> i64 {
-        (right.min_x - left.max_x).round() as i64
-    }
-
-    fn layout_for_frame_width(target: SnsTarget, count: u8, frame_width: f32) -> SnsSplitLayout {
-        let n = f32::from(clamped_count(count));
-        let group_width = frame_width * (n + (n - 1.0) * target.seam_ratio());
+    fn layout_for_extent(
+        target: SnsTarget,
+        count: u8,
+        seam_permille: u16,
+        width: usize,
+        height: usize,
+    ) -> SnsSplitLayout {
         SnsSplitLayout {
             target,
             count,
-            group: CropRect {
-                min_x: 0.0,
-                min_y: 0.0,
-                max_x: group_width,
-                max_y: frame_width / target.frame_aspect(),
-            },
+            seam_permille,
+            group: CropRect::full(width, height),
         }
+        .clamped([width, height])
     }
 
     fn assert_rect_inside(rect: CropRect, image_size: [usize; 2]) {
@@ -441,142 +464,136 @@ mod tests {
         );
     }
 
-    fn assert_layout_aspect(layout: &SnsSplitLayout) {
-        let expected_aspect = SnsSplitLayout::group_aspect(layout.target, layout.count);
-        let residual = (raw_width(layout.group) - expected_aspect * raw_height(layout.group)).abs();
-        let rounding_allowance =
-            (f32::from(clamped_count(layout.count)) - 1.0) * 0.5 + expected_aspect * 0.5;
-        assert!(
-            residual <= rounding_allowance + EPSILON,
-            "residual: {residual}, allowance: {rounding_allowance}, layout: {layout:?}"
+    fn assert_partition_invariants(layout: SnsSplitLayout) {
+        let frames = layout.frames();
+        assert_eq!(frames.len(), usize::from(clamped_count(layout.count)));
+        assert_eq!(layout.frames_extent(), layout.group);
+
+        let widths = frames.iter().copied().map(raw_width).collect::<Vec<_>>();
+        let heights = frames.iter().copied().map(raw_height).collect::<Vec<_>>();
+        let gaps = frames
+            .windows(2)
+            .map(|pair| gap_width(pair[0], pair[1]))
+            .collect::<Vec<_>>();
+
+        assert!(widths.iter().all(|&width| width >= 1));
+        assert!(heights.iter().all(|&height| height >= 1));
+        assert!(heights.iter().all(|&height| height == heights[0]));
+        assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1);
+        if !gaps.is_empty() {
+            assert!(gaps.iter().max().unwrap() - gaps.iter().min().unwrap() <= 1);
+        }
+        assert_eq!(
+            widths.iter().sum::<usize>() + gaps.iter().sum::<usize>(),
+            raw_width(layout.group)
         );
     }
 
-    fn assert_non_degenerate(layout: &SnsSplitLayout) {
-        let frames = layout.frames();
-        for frame in &frames {
-            assert!(integer_width(*frame) >= 1, "zero-width frame: {frame:?}");
-            assert!(integer_height(*frame) >= 1, "zero-height frame: {frame:?}");
-        }
-        for pair in frames.windows(2) {
-            let step = (pair[1].min_x - pair[0].min_x).round() as i64;
-            assert!(step >= integer_width(pair[0]));
-        }
+    #[test]
+    fn measured_full_image_splits_cover_every_source_pixel() {
+        let three = SnsSplitLayout::centered_max(SnsTarget::X, 3, [832, 1216])
+            .with_seam_permille(0, [832, 1216]);
+        let three_frames = three.frames();
+        assert_eq!(
+            three_frames
+                .iter()
+                .copied()
+                .map(raw_width)
+                .collect::<Vec<_>>(),
+            vec![277, 278, 277]
+        );
+        assert!(
+            three_frames
+                .iter()
+                .copied()
+                .all(|frame| raw_height(frame) == 1216)
+        );
+        assert_eq!(three.group, CropRect::full(832, 1216));
+        assert_eq!(three.frames_extent(), three.group);
+        assert_eq!(three_frames[0].min_x, 0.0);
+        assert_eq!(three_frames[0].max_x, three_frames[1].min_x);
+        assert_eq!(three_frames[1].max_x, three_frames[2].min_x);
+        assert_eq!(three_frames[2].max_x, 832.0);
+
+        let four = SnsSplitLayout::centered_max(SnsTarget::X, 4, [1216, 832])
+            .with_seam_permille(0, [1216, 832]);
+        let four_frames = four.frames();
+        assert!(
+            four_frames
+                .iter()
+                .copied()
+                .all(|frame| (raw_width(frame), raw_height(frame)) == (304, 832))
+        );
+        assert_eq!(four.group, CropRect::full(1216, 832));
+        assert_eq!(four.frames_extent(), four.group);
     }
 
     #[test]
-    fn group_aspect_matches_every_target_and_count() {
-        let cases = [
-            (SnsTarget::X, 2, 1.51275),
-            (SnsTarget::X, 3, 2.2755),
-            (SnsTarget::X, 4, 3.03825),
-            (SnsTarget::Instagram, 2, 1.6),
-            (SnsTarget::Instagram, 3, 2.4),
-            (SnsTarget::Instagram, 4, 3.2),
-        ];
-        for (target, count, expected) in cases {
-            let actual = SnsSplitLayout::group_aspect(target, count);
-            assert!((actual - expected).abs() < EPSILON);
-        }
-        let x_four = SnsSplitLayout::group_aspect(SnsTarget::X, 4);
-        assert!((x_four - 3.0383).abs() < EPSILON);
-    }
-
-    #[test]
-    fn frames_count_matches_count() {
-        for target in SnsTarget::ALL {
-            for count in MIN_COUNT..=MAX_COUNT {
-                let layout = layout_for_frame_width(target, count, 1536.0);
-                assert_eq!(layout.frames().len(), usize::from(count));
-            }
-        }
-    }
-
-    #[test]
-    fn every_frame_has_exactly_the_same_integer_dimensions() {
-        for target in SnsTarget::ALL {
-            for count in MIN_COUNT..=MAX_COUNT {
-                let frames = layout_for_frame_width(target, count, 1536.0).frames();
-                let expected_width = integer_width(frames[0]);
-                let expected_height = integer_height(frames[0]);
-                for frame in &frames[1..] {
-                    assert_eq!(integer_width(*frame), expected_width);
-                    assert_eq!(integer_height(*frame), expected_height);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn adjacent_gaps_are_constant_and_follow_the_shared_step() {
-        for target in SnsTarget::ALL {
-            for count in MIN_COUNT..=MAX_COUNT {
-                let frames = layout_for_frame_width(target, count, 1536.0).frames();
-                let width = integer_width(frames[0]);
-                let step = (width as f32 * (1.0 + target.seam_ratio())).round() as i64;
-                let expected_gap = step - width;
+    fn zero_seam_partitions_the_group_without_gaps_or_overlap() {
+        for count in MIN_COUNT..=MAX_COUNT {
+            for width in usize::from(count)..=1031 {
+                let layout = layout_for_extent(SnsTarget::X, count, 0, width, 79);
+                let frames = layout.frames();
                 for pair in frames.windows(2) {
-                    assert_eq!(integer_gap(pair[0], pair[1]), expected_gap);
+                    assert_eq!(pair[0].max_x, pair[1].min_x);
+                }
+                assert_partition_invariants(layout);
+            }
+        }
+    }
+
+    #[test]
+    fn seam_values_follow_the_frame_width_ratio_exactly_when_divisible() {
+        for seam_permille in [0, 17, 100] {
+            for count in MIN_COUNT..=MAX_COUNT {
+                let width =
+                    usize::from(count) * 1000 + usize::from(count - 1) * seam_permille as usize;
+                let layout = layout_for_extent(SnsTarget::X, count, seam_permille, width, 777);
+                let frames = layout.frames();
+                assert!(
+                    frames
+                        .iter()
+                        .copied()
+                        .all(|frame| (raw_width(frame), raw_height(frame)) == (1000, 777))
+                );
+                assert!(
+                    frames
+                        .windows(2)
+                        .all(|pair| gap_width(pair[0], pair[1]) == seam_permille as usize)
+                );
+                assert_eq!(layout.seam_ratio(), seam_permille as f32 / 1000.0);
+                assert_eq!(layout.seam_ratio_parts(), (u128::from(seam_permille), 1000));
+                assert_partition_invariants(layout);
+            }
+        }
+    }
+
+    #[test]
+    fn cumulative_rounding_keeps_arbitrary_width_error_to_one_pixel() {
+        for seam_permille in [0, 1, 17, 53, 100] {
+            for count in MIN_COUNT..=MAX_COUNT {
+                for width in usize::from(count)..=2049 {
+                    assert_partition_invariants(layout_for_extent(
+                        SnsTarget::X,
+                        count,
+                        seam_permille,
+                        width,
+                        313,
+                    ));
                 }
             }
         }
     }
 
     #[test]
-    fn instagram_frames_are_contiguous() {
-        for count in MIN_COUNT..=MAX_COUNT {
-            let frames = layout_for_frame_width(SnsTarget::Instagram, count, 1536.0).frames();
-            for pair in frames.windows(2) {
-                assert_eq!(pair[0].max_x, pair[1].min_x);
-            }
-        }
-    }
-
-    #[test]
-    fn x_gap_is_positive_and_close_to_the_preset_ratio() {
-        for count in MIN_COUNT..=MAX_COUNT {
-            let frames = layout_for_frame_width(SnsTarget::X, count, 1536.0).frames();
-            let width = integer_width(frames[0]) as f32;
-            for pair in frames.windows(2) {
-                let gap = integer_gap(pair[0], pair[1]) as f32;
-                assert!(gap > 0.0);
-                assert!((gap / width - SnsTarget::X.seam_ratio()).abs() <= 1.0 / width);
-            }
-        }
-    }
-
-    #[test]
-    fn x_1536_pixel_frame_uses_about_26_pixels_for_the_seam() {
-        let frames = layout_for_frame_width(SnsTarget::X, 4, 1536.0).frames();
-        let gap = integer_gap(frames[0], frames[1]);
-        assert!((25..=27).contains(&gap));
-    }
-
-    #[test]
-    fn frames_extent_is_the_union_of_the_rounded_frames() {
-        let mut layout = layout_for_frame_width(SnsTarget::X, 4, 1536.0);
-        layout.group.min_x += 12.4;
-        layout.group.max_x += 12.4;
-        layout.group.min_y += 34.6;
-        layout.group.max_y += 34.6;
-        let frames = layout.frames();
-        let extent = layout.frames_extent();
-        assert_eq!(extent.min_x, frames[0].min_x);
-        assert_eq!(extent.min_y, frames[0].min_y);
-        assert_eq!(extent.max_x, frames.last().unwrap().max_x);
-        assert_eq!(extent.max_y, frames[0].max_y);
-    }
-
-    #[test]
-    fn centered_max_stays_inside_and_keeps_the_group_aspect() {
-        let image_sizes = [[4000, 1000], [1000, 4000], [1920, 1080]];
+    fn centered_max_uses_the_whole_image_at_any_aspect() {
         for target in SnsTarget::ALL {
             for count in MIN_COUNT..=MAX_COUNT {
-                for image_size in image_sizes {
+                for image_size in [[4000, 1000], [1000, 4000], [832, 1216], [1920, 1080]] {
                     let layout = SnsSplitLayout::centered_max(target, count, image_size);
+                    assert_eq!(layout.group, CropRect::full(image_size[0], image_size[1]));
+                    assert_eq!(layout.frames_extent(), layout.group);
                     assert!(layout.fits(image_size));
-                    assert_rect_inside(layout.group, image_size);
-                    assert_layout_aspect(&layout);
                     for frame in layout.frames() {
                         assert_rect_inside(frame, image_size);
                     }
@@ -586,244 +603,159 @@ mod tests {
     }
 
     #[test]
-    fn with_count_and_target_keep_center_width_bounds_and_aspect() {
-        let image_size = [8000, 6000];
-        let layout = SnsSplitLayout {
+    fn target_change_preserves_group_and_resets_the_seam_default() {
+        let image_size = [4000, 3000];
+        let original = SnsSplitLayout {
+            target: SnsTarget::X,
+            count: 3,
+            seam_permille: 63,
+            group: CropRect {
+                min_x: 401.0,
+                min_y: 503.0,
+                max_x: 3407.0,
+                max_y: 2709.0,
+            },
+        }
+        .clamped(image_size);
+
+        let instagram = original.with_target(SnsTarget::Instagram, image_size);
+        assert_eq!(instagram.group, original.group);
+        assert_eq!(instagram.count, original.count);
+        assert_eq!(instagram.seam_permille, 0);
+
+        let restored = instagram.with_target(SnsTarget::X, image_size);
+        assert_eq!(restored.group, original.group);
+        assert_eq!(restored.count, original.count);
+        assert_eq!(restored.seam_permille, 17);
+
+        let mut repeated = restored;
+        for _ in 0..20 {
+            repeated = repeated
+                .with_target(SnsTarget::Instagram, image_size)
+                .with_target(SnsTarget::X, image_size);
+        }
+        assert_eq!(repeated.group, original.group);
+    }
+
+    #[test]
+    fn count_and_seam_changes_preserve_the_group() {
+        let image_size = [4000, 3000];
+        let original = SnsSplitLayout {
             target: SnsTarget::X,
             count: 2,
+            seam_permille: 17,
             group: CropRect {
-                min_x: 3000.0,
-                min_y: 2500.0,
-                max_x: 3000.0 + SnsSplitLayout::group_aspect(SnsTarget::X, 2) * 500.0,
+                min_x: 401.0,
+                min_y: 503.0,
+                max_x: 3407.0,
+                max_y: 2709.0,
+            },
+        }
+        .clamped(image_size);
+
+        let four = original.with_count(4, image_size);
+        assert_eq!(four.group, original.group);
+        assert_eq!(four.seam_permille, original.seam_permille);
+        let custom_seam = four.with_seam_permille(73, image_size);
+        assert_eq!(custom_seam.group, original.group);
+        assert_eq!(custom_seam.seam_permille, 73);
+    }
+
+    #[test]
+    fn clamped_limits_width_and_height_independently() {
+        let wide = SnsSplitLayout {
+            target: SnsTarget::X,
+            count: 3,
+            seam_permille: 17,
+            group: CropRect {
+                min_x: -2000.0,
+                min_y: 200.0,
+                max_x: 3000.0,
+                max_y: 323.0,
+            },
+        }
+        .clamped([1000, 800]);
+        assert_eq!((raw_width(wide.group), raw_height(wide.group)), (1000, 123));
+        assert!(wide.fits([1000, 800]));
+
+        let tall = SnsSplitLayout {
+            target: SnsTarget::X,
+            count: 3,
+            seam_permille: 17,
+            group: CropRect {
+                min_x: 200.0,
+                min_y: -2000.0,
+                max_x: 521.0,
                 max_y: 3000.0,
             },
-        };
-        let original_center = center(layout.group);
-        let original_width = raw_width(layout.group);
-        let layouts = [
-            layout.with_count(4, image_size),
-            layout.with_target(SnsTarget::Instagram, image_size),
-        ];
-        for changed in layouts {
-            let changed_center = center(changed.group);
-            assert!((changed_center[0] - original_center[0]).abs() <= 0.5);
-            assert!((changed_center[1] - original_center[1]).abs() <= 0.5);
-            assert!((raw_width(changed.group) - original_width).abs() <= 1.0);
-            assert!(changed.fits(image_size));
-            assert_rect_inside(changed.group, image_size);
-            assert_layout_aspect(&changed);
         }
-    }
-
-    #[test]
-    fn target_round_trip_restores_group_for_multiple_image_sizes_and_counts() {
-        for (image_size, count) in [([4000, 3000], 4), ([2000, 3000], 2)] {
-            let original = SnsSplitLayout::centered_max(SnsTarget::X, count, image_size);
-            let instagram = original.with_target(SnsTarget::Instagram, image_size);
-            let restored = instagram.with_target(SnsTarget::X, image_size);
-
-            for (actual, expected) in [
-                (restored.group.min_x, original.group.min_x),
-                (restored.group.min_y, original.group.min_y),
-                (restored.group.max_x, original.group.max_x),
-                (restored.group.max_y, original.group.max_y),
-            ] {
-                assert!((actual - expected).abs() <= 1.0);
-            }
-            let original_center = center(original.group);
-            let instagram_center = center(instagram.group);
-            let restored_center = center(restored.group);
-            assert!((instagram_center[0] - original_center[0]).abs() <= 0.5);
-            assert!((instagram_center[1] - original_center[1]).abs() <= 0.5);
-            assert!((restored_center[0] - instagram_center[0]).abs() <= 0.5);
-            assert!((restored_center[1] - instagram_center[1]).abs() <= 0.5);
-            assert!((restored_center[0] - original_center[0]).abs() <= 1.0);
-            assert!((restored_center[1] - original_center[1]).abs() <= 1.0);
-            assert!(restored.fits(image_size));
-            assert_layout_aspect(&restored);
-        }
-    }
-
-    #[test]
-    fn count_round_trip_restores_group_within_one_pixel() {
-        let image_size = [4000, 3000];
-        let original = SnsSplitLayout::centered_max(SnsTarget::X, 2, image_size);
-        let four = original.with_count(4, image_size);
-        let restored = four.with_count(2, image_size);
-
-        assert!((raw_width(restored.group) - raw_width(original.group)).abs() <= 1.0);
-        assert!((raw_height(restored.group) - raw_height(original.group)).abs() <= 1.0);
-        assert!((center(restored.group)[0] - center(original.group)[0]).abs() <= 0.5);
-        assert!((center(restored.group)[1] - center(original.group)[1]).abs() <= 0.5);
-        assert!(restored.fits(image_size));
-        assert_layout_aspect(&restored);
-    }
-
-    #[test]
-    fn width_preserving_count_change_shrinks_when_new_height_would_overflow() {
-        let image_size = [4000, 1000];
-        let original = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
-        let original_center = center(original.group);
-        let requested_height =
-            raw_width(original.group) / SnsSplitLayout::group_aspect(SnsTarget::X, 2);
-        assert!(requested_height > image_size[1] as f32);
-
-        let changed = original.with_count(2, image_size);
-
-        assert!(raw_width(changed.group) < raw_width(original.group));
-        assert!(changed.fits(image_size));
-        assert_rect_inside(changed.group, image_size);
-        assert_layout_aspect(&changed);
-        assert!((center(changed.group)[0] - original_center[0]).abs() <= 0.5);
-        assert!((center(changed.group)[1] - original_center[1]).abs() <= 0.5);
-    }
-
-    #[test]
-    fn count_is_clamped_at_every_layout_entry_point() {
-        for (input, expected) in [(0, 2), (1, 2), (5, 4), (255, 4)] {
-            let layout = SnsSplitLayout::centered_max(SnsTarget::X, input, [4000, 3000]);
-            assert_eq!(layout.count, expected);
-            assert_eq!(layout.frames().len(), usize::from(expected));
-
-            let changed = layout.with_count(input, [4000, 3000]);
-            assert_eq!(changed.count, expected);
-
-            let unclamped = SnsSplitLayout {
-                target: SnsTarget::X,
-                count: input,
-                group: layout.group,
-            };
-            assert_eq!(unclamped.clamped([4000, 3000]).count, expected);
-            assert_eq!(unclamped.frames().len(), usize::from(expected));
-        }
+        .clamped([1000, 800]);
+        assert_eq!((raw_width(tall.group), raw_height(tall.group)), (321, 800));
+        assert!(tall.fits([1000, 800]));
     }
 
     #[test]
     fn clamped_moves_overflow_without_resizing() {
         let image_size = [1000, 800];
-        let aspect = SnsSplitLayout::group_aspect(SnsTarget::X, 2);
         let layout = SnsSplitLayout {
             target: SnsTarget::X,
-            count: 2,
+            count: 3,
+            seam_permille: 17,
             group: CropRect {
                 min_x: 900.0,
-                min_y: 300.0,
-                max_x: 900.0 + aspect * 200.0,
-                max_y: 500.0,
+                min_y: 700.0,
+                max_x: 1200.0,
+                max_y: 900.0,
             },
         };
-        let original_frames = layout.frames();
         let moved = layout.clamped(image_size);
-        let moved_frames = moved.frames();
         assert_eq!(
-            integer_width(moved_frames[0]),
-            integer_width(original_frames[0])
+            (raw_width(moved.group), raw_height(moved.group)),
+            (300, 200)
         );
-        assert_eq!(
-            integer_height(moved_frames[0]),
-            integer_height(original_frames[0])
-        );
+        assert_eq!(moved.group.max_x, 1000.0);
+        assert_eq!(moved.group.max_y, 800.0);
         assert!(moved.fits(image_size));
-        assert_rect_inside(moved.group, image_size);
-        assert_layout_aspect(&moved);
+        assert_eq!(moved.group, moved.frames_extent());
     }
 
     #[test]
-    fn clamped_shrinks_oversize_and_keeps_frames_inside() {
-        let image_size = [1000, 800];
-        let aspect = SnsSplitLayout::group_aspect(SnsTarget::X, 2);
-        let layout = SnsSplitLayout {
-            target: SnsTarget::X,
-            count: 2,
-            group: CropRect {
-                min_x: -1000.0,
-                min_y: -1000.0,
-                max_x: -1000.0 + aspect * 2000.0,
-                max_y: 1000.0,
-            },
-        };
-        let shrunk = layout.clamped(image_size);
-        assert!(raw_height(shrunk.group) < raw_height(layout.group));
-        assert!(shrunk.fits(image_size));
-        assert_eq!(shrunk.group, shrunk.frames_extent());
-        assert_rect_inside(shrunk.group, image_size);
-        assert_layout_aspect(&shrunk);
-        for frame in shrunk.frames() {
-            assert_rect_inside(frame, image_size);
+    fn count_and_seam_are_clamped_at_every_entry_point() {
+        for (input, expected) in [(0, 2), (1, 2), (5, 4), (255, 4)] {
+            let layout = SnsSplitLayout::centered_max(SnsTarget::X, input, [4000, 3000]);
+            assert_eq!(layout.count, expected);
+            assert_eq!(layout.frames().len(), usize::from(expected));
+
+            let direct = SnsSplitLayout {
+                target: SnsTarget::X,
+                count: input,
+                seam_permille: u16::MAX,
+                group: CropRect::full(4000, 3000),
+            };
+            let clamped = direct.clamped([4000, 3000]);
+            assert_eq!(clamped.count, expected);
+            assert_eq!(clamped.seam_permille, MAX_SEAM_PERMILLE);
+            assert_eq!(direct.frames(), clamped.frames());
         }
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 3, [4000, 3000])
+            .with_seam_permille(u16::MAX, [4000, 3000]);
+        assert_eq!(layout.seam_permille, MAX_SEAM_PERMILLE);
     }
 
     #[test]
-    fn centered_max_accounts_for_extent_rounding_at_image_edge() {
-        for image_size in [[122, 40], [863, 284]] {
-            let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
-            assert!(layout.fits(image_size));
-            assert_eq!(layout.group, layout.frames_extent());
-            assert_eq!(layout.clamped(image_size), layout);
-            assert_layout_aspect(&layout);
-            for frame in layout.frames() {
-                assert_rect_inside(frame, image_size);
-            }
-        }
-    }
-
-    #[test]
-    fn centered_max_stays_inside_across_floor_boundaries() {
+    fn minimum_non_degenerate_row_reports_when_it_cannot_fit() {
         for target in SnsTarget::ALL {
             for count in MIN_COUNT..=MAX_COUNT {
-                let aspect = SnsSplitLayout::group_aspect(target, count);
-                for image_height in 1..=1024 {
-                    let boundary_width = (aspect * image_height as f32).round() as usize;
-                    let first_width = boundary_width.saturating_sub(2).max(1);
-                    for image_width in first_width..=boundary_width + 2 {
-                        let image_size = [image_width, image_height];
-                        let layout = SnsSplitLayout::centered_max(target, count, image_size);
-                        assert_non_degenerate(&layout);
-                        assert_layout_aspect(&layout);
-                        if layout.fits(image_size) {
-                            assert_rect_inside(layout.group, image_size);
-                            for frame in layout.frames() {
-                                assert_rect_inside(frame, image_size);
-                            }
-                        } else {
-                            assert!(image_width < usize::from(count));
-                        }
-                    }
-                }
-            }
-        }
-    }
+                let too_narrow = [usize::from(count) - 1, 3];
+                let layout = SnsSplitLayout::centered_max(target, count, too_narrow);
+                assert!(!layout.fits(too_narrow));
+                assert_eq!(raw_width(layout.group), usize::from(count));
+                assert_partition_invariants(layout);
 
-    #[test]
-    fn with_count_keeps_minimum_frames_non_degenerate_in_a_narrow_image() {
-        let image_size = [2, 4000];
-        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
-        assert!(!layout.fits(image_size));
-        assert_non_degenerate(&layout);
-        assert_eq!(raw_height(layout.group), 1.0);
-
-        let changed = layout.with_count(2, image_size);
-        assert!(changed.fits(image_size));
-        assert_non_degenerate(&changed);
-        assert_eq!(raw_height(changed.group), 1.0);
-        assert_layout_aspect(&changed);
-        for frame in changed.frames() {
-            assert_rect_inside(frame, image_size);
-        }
-    }
-
-    #[test]
-    fn extremely_tall_image_produces_in_bounds_frames_without_panicking() {
-        let image_size = [100, 4000];
-        for target in SnsTarget::ALL {
-            for count in MIN_COUNT..=MAX_COUNT {
-                let layout = SnsSplitLayout::centered_max(target, count, image_size);
-                assert!(layout.fits(image_size));
-                assert_rect_inside(layout.group, image_size);
-                assert_layout_aspect(&layout);
-                for frame in layout.frames() {
-                    assert_rect_inside(frame, image_size);
-                }
+                let just_wide_enough = [usize::from(count), 1];
+                let layout = SnsSplitLayout::centered_max(target, count, just_wide_enough);
+                assert!(layout.fits(just_wide_enough));
+                assert_partition_invariants(layout);
             }
         }
     }
@@ -833,34 +765,13 @@ mod tests {
         for target in SnsTarget::ALL {
             let layout = SnsSplitLayout::centered_max(target, MAX_COUNT, [0, 0]);
             assert!(!layout.fits([0, 0]));
-            assert_non_degenerate(&layout);
-            assert_eq!(layout.group, layout.frames_extent());
-            assert_layout_aspect(&layout);
+            assert_eq!(raw_height(layout.group), 1);
+            assert_partition_invariants(layout);
         }
     }
 
     #[test]
-    fn reproduced_tiny_x_four_layout_never_returns_zero_sized_frames() {
-        let layout = SnsSplitLayout {
-            target: SnsTarget::X,
-            count: 4,
-            group: CropRect {
-                min_x: 10.0,
-                min_y: 10.0,
-                max_x: 13.0,
-                max_y: 11.0,
-            },
-        };
-
-        assert_non_degenerate(&layout);
-        for frame in layout.frames() {
-            assert!(raw_width(frame) >= 1.0);
-            assert!(raw_height(frame) >= 1.0);
-        }
-    }
-
-    #[test]
-    fn tiny_groups_never_degenerate_for_any_target_or_count() {
+    fn tiny_or_invalid_groups_never_degenerate() {
         let groups = [
             CropRect {
                 min_x: 0.0,
@@ -881,64 +792,35 @@ mod tests {
                 max_y: 6.0,
             },
         ];
-
         for target in SnsTarget::ALL {
             for count in MIN_COUNT..=MAX_COUNT {
-                for group in groups {
-                    assert_non_degenerate(&SnsSplitLayout {
-                        target,
-                        count,
-                        group,
-                    });
+                for seam_permille in [0, 17, 100, u16::MAX] {
+                    for group in groups {
+                        let layout = SnsSplitLayout {
+                            target,
+                            count,
+                            seam_permille,
+                            group,
+                        };
+                        let frames = layout.frames();
+                        assert!(
+                            frames
+                                .iter()
+                                .copied()
+                                .all(|frame| { raw_width(frame) >= 1 && raw_height(frame) >= 1 })
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn image_too_small_reports_not_fitting_without_degenerate_frames() {
-        let image_size = [3, 3];
-        for target in SnsTarget::ALL {
-            let layout = SnsSplitLayout::centered_max(target, 4, image_size);
-            assert!(!layout.fits(image_size));
-            assert_non_degenerate(&layout);
-            assert_eq!(layout.group, layout.frames_extent());
-        }
-    }
-
-    #[test]
-    fn clamped_layout_fits_whenever_the_minimum_frame_row_can_fit() {
-        let image_sizes = [[2, 1], [3, 3], [4, 1], [17, 4], [122, 40], [1920, 1080]];
-        for target in SnsTarget::ALL {
-            for count in MIN_COUNT..=MAX_COUNT {
-                for image_size in image_sizes {
-                    if image_size[0] < usize::from(count) {
-                        continue;
-                    }
-                    let layout = SnsSplitLayout {
-                        target,
-                        count,
-                        group: CropRect {
-                            min_x: -10_000.0,
-                            min_y: -10_000.0,
-                            max_x: 20_000.0,
-                            max_y: 20_000.0,
-                        },
-                    }
-                    .clamped(image_size);
-                    assert!(layout.fits(image_size), "{target:?}/{count}/{image_size:?}");
-                    assert_eq!(layout.group, layout.frames_extent());
-                    assert_non_degenerate(&layout);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn extreme_width_and_one_pixel_height_terminate_with_a_canonical_layout() {
+    fn extreme_requested_extent_terminates_with_a_canonical_layout() {
         let layout = SnsSplitLayout {
             target: SnsTarget::X,
             count: 4,
+            seam_permille: 100,
             group: CropRect {
                 min_x: -1.0e30,
                 min_y: -1.0e30,
@@ -949,22 +831,64 @@ mod tests {
         .clamped([1_000_000, 1]);
 
         assert!(layout.fits([1_000_000, 1]));
-        assert_non_degenerate(&layout);
         assert_eq!(layout.group, layout.frames_extent());
         assert_eq!(layout.clamped([1_000_000, 1]), layout);
+        assert_partition_invariants(layout);
     }
 
     #[test]
-    fn stable_keys_round_trip_and_unknown_keys_fall_back_to_x() {
+    fn frames_extent_tracks_a_rounded_offset_group() {
+        let layout = SnsSplitLayout {
+            target: SnsTarget::X,
+            count: 4,
+            seam_permille: 53,
+            group: CropRect {
+                min_x: 12.4,
+                min_y: 34.6,
+                max_x: 935.4,
+                max_y: 812.6,
+            },
+        }
+        .clamped([2000, 1600]);
+        let frames = layout.frames();
+        let extent = layout.frames_extent();
+        assert_eq!(extent, layout.group);
+        assert_eq!(extent.min_x, frames[0].min_x);
+        assert_eq!(extent.min_y, frames[0].min_y);
+        assert_eq!(extent.max_x, frames.last().unwrap().max_x);
+        assert_eq!(extent.max_y, frames[0].max_y);
+    }
+
+    #[test]
+    fn stable_keys_and_target_seam_defaults_round_trip() {
         assert_eq!(SnsTarget::from_stable_key("unknown"), SnsTarget::X);
         for target in SnsTarget::ALL {
             assert_eq!(SnsTarget::from_stable_key(target.stable_key()), target);
         }
         assert_eq!(SnsTarget::X.label(), "X");
         assert_eq!(SnsTarget::Instagram.label(), "Instagram");
-        assert_eq!(SnsTarget::X.frame_aspect(), 0.75);
-        assert_eq!(SnsTarget::Instagram.frame_aspect(), 0.8);
+        assert_eq!(SnsTarget::X.seam_ratio_parts(), (17, 1000));
+        assert_eq!(SnsTarget::Instagram.seam_ratio_parts(), (0, 1000));
+        assert_eq!(SnsTarget::X.default_seam_permille(), 17);
+        assert_eq!(SnsTarget::Instagram.default_seam_permille(), 0);
         assert_eq!(SnsTarget::X.seam_ratio(), 0.017);
         assert_eq!(SnsTarget::Instagram.seam_ratio(), 0.0);
+    }
+
+    #[test]
+    fn frame_ratio_keys_and_group_aspects_are_canonical() {
+        for ratio in SnsFrameRatio::ALL {
+            assert_eq!(SnsFrameRatio::from_stable_key(ratio.stable_key()), ratio);
+        }
+        assert_eq!(
+            SnsFrameRatio::from_stable_key("future-ratio"),
+            SnsFrameRatio::Free
+        );
+        assert_eq!(SnsFrameRatio::Free.group_aspect(3, 17), None);
+        assert_eq!(SnsFrameRatio::Ratio3x4.frame_ratio_parts(), Some((3, 4)));
+        assert_eq!(SnsFrameRatio::Ratio4x5.frame_ratio_parts(), Some((4, 5)));
+        assert_eq!(SnsFrameRatio::Ratio1x1.frame_ratio_parts(), Some((1, 1)));
+        assert_eq!(SnsFrameRatio::Ratio1x1.group_aspect(3, 0), Some(3.0));
+        assert!((SnsFrameRatio::Ratio3x4.group_aspect(4, 100).unwrap() - 3.225).abs() < 0.000_001);
     }
 }

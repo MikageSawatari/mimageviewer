@@ -3377,9 +3377,9 @@ fn scale_sns_split_frames_to_export_pixels(
     source_size: [usize; 2],
     target_size: [usize; 2],
 ) -> Result<Vec<crate::export_crop::CropRect>, String> {
-    let Some(first_frame) = frames.first().copied() else {
+    if frames.is_empty() {
         return Ok(Vec::new());
-    };
+    }
     let source_width = source_size[0].max(1) as f64;
     let source_height = source_size[1].max(1) as f64;
     let target_width = target_size[0].max(1);
@@ -3387,49 +3387,44 @@ fn scale_sns_split_frames_to_export_pixels(
     let scale_x = target_width as f64 / source_width;
     let scale_y = target_height as f64 / source_height;
 
-    // frames() が保証する同一寸法・同一間隔を一度だけ整数化する。各枠の端や
-    // 原点を個別に丸めると、非整数倍率では端数の位相だけで 1px 差が生じる。
+    // source の共有境界を同じ最近傍丸めで target へ写す。先頭枠の幅を全枠へ
+    // 複製すると、割り切れない余り (832 / 3 など) が末尾から失われる。
     let frame_count = frames.len();
     if target_width < frame_count {
         return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
     }
-    let mut frame_width =
-        ((f64::from(first_frame.width()) * scale_x).round() as usize).clamp(1, target_width);
-    let frame_height =
-        ((f64::from(first_frame.height()) * scale_y).round() as usize).clamp(1, target_height);
-    let step = if let Some(second_frame) = frames.get(1) {
-        let source_gap = (second_frame.min_x - first_frame.max_x).max(0.0);
-        let desired_gap = (f64::from(source_gap) * scale_x).round() as usize;
-        let max_non_overlapping_width = target_width / frame_count;
-        frame_width = frame_width.min(max_non_overlapping_width);
-        let width_budget = frame_width.saturating_mul(frame_count);
-        let max_gap = (target_width - width_budget) / (frame_count - 1);
-        frame_width.saturating_add(desired_gap.min(max_gap))
-    } else {
-        0
-    };
-    let frames_width = frame_width.saturating_add((frame_count - 1).saturating_mul(step));
-    let first_min_x = (f64::from(first_frame.min_x) * scale_x)
-        .round()
-        .clamp(0.0, target_width.saturating_sub(frames_width) as f64)
-        as usize;
-    let first_min_y = (f64::from(first_frame.min_y) * scale_y)
-        .round()
-        .clamp(0.0, (target_height - frame_height) as f64) as usize;
 
-    Ok(frames
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let min_x = first_min_x.saturating_add(index.saturating_mul(step));
-            crate::export_crop::CropRect {
-                min_x: min_x as f32,
-                min_y: first_min_y as f32,
-                max_x: min_x.saturating_add(frame_width) as f32,
-                max_y: first_min_y.saturating_add(frame_height) as f32,
-            }
-        })
-        .collect())
+    let scale_boundary = |value: f32, scale: f64, limit: usize| -> Option<usize> {
+        let scaled = f64::from(value) * scale;
+        scaled
+            .is_finite()
+            .then(|| scaled.round().clamp(0.0, limit as f64) as usize)
+    };
+    let mut scaled = Vec::with_capacity(frame_count);
+    for frame in frames {
+        let Some(min_x) = scale_boundary(frame.min_x, scale_x, target_width) else {
+            return Err("SNS 分割枠の座標が不正です".to_string());
+        };
+        let Some(max_x) = scale_boundary(frame.max_x, scale_x, target_width) else {
+            return Err("SNS 分割枠の座標が不正です".to_string());
+        };
+        let Some(min_y) = scale_boundary(frame.min_y, scale_y, target_height) else {
+            return Err("SNS 分割枠の座標が不正です".to_string());
+        };
+        let Some(max_y) = scale_boundary(frame.max_y, scale_y, target_height) else {
+            return Err("SNS 分割枠の座標が不正です".to_string());
+        };
+        if max_x <= min_x || max_y <= min_y {
+            return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
+        }
+        scaled.push(crate::export_crop::CropRect {
+            min_x: min_x as f32,
+            min_y: min_y as f32,
+            max_x: max_x as f32,
+            max_y: max_y as f32,
+        });
+    }
+    Ok(scaled)
 }
 
 fn export_batch_selection_update(
@@ -37040,7 +37035,31 @@ mod tests {
     }
 
     #[test]
-    fn sns_split_frames_keep_equal_sizes_and_gaps_at_fractional_scale() {
+    fn sns_split_identity_scale_preserves_the_measured_remainder_distribution() {
+        let layout = crate::sns_split::SnsSplitLayout::centered_max(
+            crate::sns_split::SnsTarget::X,
+            3,
+            [832, 1216],
+        )
+        .with_seam_permille(0, [832, 1216]);
+
+        let scaled =
+            scale_sns_split_frames_to_export_pixels(&layout.frames(), [832, 1216], [832, 1216])
+                .unwrap();
+        let bounds = scaled
+            .iter()
+            .map(|frame| frame.pixel_bounds(832, 1216))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            bounds,
+            vec![(0, 0, 277, 1216), (277, 0, 278, 1216), (555, 0, 277, 1216),]
+        );
+        assert_eq!(bounds.last().unwrap().0 + bounds.last().unwrap().2, 832);
+    }
+
+    #[test]
+    fn sns_split_frames_keep_coverage_with_one_pixel_rounding_at_fractional_scale() {
         let frames = [
             crate::export_crop::CropRect {
                 min_x: 0.0,
@@ -37086,13 +37105,18 @@ mod tests {
             .map(|pair| pair[1].0 - (pair[0].0 + pair[0].1))
             .collect::<Vec<_>>();
 
-        assert!(
-            bounds
-                .iter()
-                .all(|(_, width, height)| (*width, *height) == (40, 39))
+        assert_eq!(
+            bounds,
+            vec![(0, 40, 39), (41, 40, 39), (83, 39, 39), (124, 40, 39)]
         );
-        assert_eq!(steps, vec![41, 41, 41]);
-        assert_eq!(gaps, vec![1, 1, 1]);
+        assert_eq!(steps, vec![41, 42, 41]);
+        assert_eq!(gaps, vec![1, 2, 2]);
+        let widths = bounds
+            .iter()
+            .map(|(_, width, _)| *width)
+            .collect::<Vec<_>>();
+        assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1);
+        assert!(gaps.iter().max().unwrap() - gaps.iter().min().unwrap() <= 1);
     }
 
     #[test]
@@ -37116,7 +37140,7 @@ mod tests {
         let first = scaled[0].pixel_bounds(11, 6);
         let second = scaled[1].pixel_bounds(11, 6);
 
-        assert_eq!((first.2, first.3), (5, 6));
+        assert_eq!((first.2, first.3), (6, 6));
         assert_eq!((second.2, second.3), (5, 6));
         assert_eq!(first.0 + first.2, second.0);
     }
