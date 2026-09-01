@@ -68,13 +68,12 @@ impl SnsSplitPanelSummary {
 }
 
 fn sns_split_target_description(target: SnsTarget) -> String {
-    let (aspect_width, aspect_height) = target.frame_aspect_parts();
     let (seam_numerator, seam_denominator) = target.seam_ratio_parts();
     if seam_numerator == 0 {
-        format!("枠は{aspect_width}:{aspect_height} / 継ぎ目の除外なし")
+        "継ぎ目の既定は「なし」".to_string()
     } else {
         let seam_percent = seam_numerator as f64 * 100.0 / seam_denominator as f64;
-        format!("枠は{aspect_width}:{aspect_height} / 継ぎ目で枠幅の{seam_percent:.1}%を除外")
+        format!("継ぎ目の既定は枠幅の{seam_percent:.1}%")
     }
 }
 
@@ -174,7 +173,7 @@ fn draw_sns_split_preview(
         egui::vec2(ui.available_width().max(1.0), PREVIEW_H),
         egui::Sense::hover(),
     );
-    let paint_rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+    let paint_rects = sns_split_preview_rects(bounds, &frames, layout.seam_ratio());
     let uv_rects = sns_split_frame_uvs(&frames, image_size);
     let painter = ui.painter_at(bounds);
     painter.rect_filled(
@@ -815,10 +814,7 @@ impl App {
                 end[1] - start[1],
                 image_size[0],
                 image_size[1],
-                Some(SnsSplitLayout::group_aspect(
-                    drag.base.target,
-                    drag.base.count,
-                )),
+                None,
             );
             self.sns_split = Some(SnsSplitLayout { group, ..drag.base }.clamped(image_size));
             ui.ctx()
@@ -892,7 +888,7 @@ mod tests {
         let frames = layout.frames();
         let bounds =
             egui::Rect::from_min_size(egui::pos2(11.0, 17.0), egui::vec2(216.0, PREVIEW_H));
-        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+        let rects = sns_split_preview_rects(bounds, &frames, layout.seam_ratio());
 
         assert_eq!(rects.len(), frames.len());
         for rect in &rects[1..] {
@@ -901,7 +897,7 @@ mod tests {
         }
         for pair in rects.windows(2) {
             let gap = pair[1].left() - pair[0].right();
-            let expected_gap = (pair[0].width() * SnsTarget::X.seam_ratio()).max(MIN_PREVIEW_SEAM);
+            let expected_gap = (pair[0].width() * layout.seam_ratio()).max(MIN_PREVIEW_SEAM);
             assert!((gap - expected_gap).abs() < 0.001);
             assert!(gap >= MIN_PREVIEW_SEAM - 0.001);
         }
@@ -916,12 +912,12 @@ mod tests {
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, [2400, 1800]);
         let frames = layout.frames();
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
-        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+        let rects = sns_split_preview_rects(bounds, &frames, layout.seam_ratio());
 
         for pair in rects.windows(2) {
             let gap = pair[1].left() - pair[0].right();
             assert!(gap > MIN_PREVIEW_SEAM);
-            assert!((gap / pair[0].width() - SnsTarget::X.seam_ratio()).abs() < 0.0001);
+            assert!((gap / pair[0].width() - layout.seam_ratio()).abs() < 0.0001);
         }
         assert!(rects[0].left() >= bounds.left() - 0.001);
         assert!(rects.last().unwrap().right() <= bounds.right() + 0.001);
@@ -932,7 +928,7 @@ mod tests {
         let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, [2400, 1800]);
         let frames = layout.frames();
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(216.0, PREVIEW_H));
-        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+        let rects = sns_split_preview_rects(bounds, &frames, layout.seam_ratio());
 
         assert_eq!(rects.len(), 3);
         for pair in rects.windows(2) {
@@ -945,8 +941,8 @@ mod tests {
         let x = sns_split_target_description(SnsTarget::X);
         let instagram = sns_split_target_description(SnsTarget::Instagram);
 
-        assert_eq!(x, "枠は3:4 / 継ぎ目で枠幅の1.7%を除外");
-        assert_eq!(instagram, "枠は4:5 / 継ぎ目の除外なし");
+        assert_eq!(x, "継ぎ目の既定は枠幅の1.7%");
+        assert_eq!(instagram, "継ぎ目の既定は「なし」");
         assert!(!x.contains("必ず"));
         assert!(!instagram.contains("必ず"));
     }
@@ -989,8 +985,8 @@ mod tests {
 
         assert_eq!(layout.target, SnsTarget::Instagram);
         assert_eq!(layout.frames().len(), 4);
-        let expected = SnsSplitLayout::group_aspect(SnsTarget::Instagram, 4);
-        assert!((layout.group.width() / layout.group.height() - expected).abs() < 0.01);
+        assert_eq!(layout.group, CropRect::full(image_size[0], image_size[1]));
+        assert_eq!(layout.seam_permille, 0);
     }
 
     #[test]
@@ -1001,7 +997,7 @@ mod tests {
 
         assert!(summary.warning.is_some());
         assert!(summary.warning.unwrap().contains("書き出しには進めません"));
-        assert_eq!(summary.dimensions, "1 x 1 x 4 枚");
+        assert_eq!(summary.dimensions, "1 x 3 x 4 枚");
     }
 
     #[test]
