@@ -1566,12 +1566,16 @@ impl crate::app::App {
             } => {
                 let launch_target =
                     crate::external_tool::LaunchTarget::from_grid_item(Some(&target.item));
-                if let Ok(file) = launch_target.real_file() {
-                    self.start_open_with(
+                // 実ファイルが取れないときに黙って戻らない。ここは仮想ページで必ず
+                // 通る経路で、利用者からは「選んだのに何も起きない」に見える
+                // (2026-09-01 に別件の調査中に発見)。
+                match launch_target.real_file() {
+                    Ok(file) => self.start_open_with(
                         display_name,
                         crate::external_tool::ExternalToolLaunch::Association { handler_id },
                         file.to_path_buf(),
-                    );
+                    ),
+                    Err(reason) => self.show_feedback_toast(reason),
                 }
                 None
             }
