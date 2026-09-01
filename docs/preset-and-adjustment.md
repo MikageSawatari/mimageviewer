@@ -953,6 +953,37 @@ session またぎの retained final AI は残す。
 下位入力として保持する。生成中または stale 中は下位入力を表示し、完了後に
 `local_adjust_cache` へ差し替える。
 
+### 4.0.1 補正レイヤー文書の所有権と保存
+
+補正レイヤー文書 (`Vec<LocalAdjustmentLayer>`) は 1 レイヤーごとに画像原寸の
+`Vec<f32>` マスクを持つ。24MP なら 1 枚 96MB で、`manual_override` の add / subtract を
+足すと 1 レイヤーで最大 3 枚になる。そのため**値ではなく共有所有で持ち回る**:
+
+- 型は `local_adjust_core::LocalAdjustmentLayers` (= `Arc<Vec<LocalAdjustmentLayer>>`)。
+  `App::local_adjust_page_layers` / `SidecarEntry::local_adjust_layers` /
+  `LocalAdjustmentChange` (Undo) / `PageEditBundle` / `BakedEditSnapshot` すべて同じ型。
+- **書き手だけが `Arc::make_mut` で実複製を払う。**読むだけの経路 (保存・Undo の
+  スナップショット・サイドカーミラー・描画 worker への受け渡し) は参照カウントの複製で済む。
+  `SidecarFile::items` (`df245720`) と同じ形。
+- **複製する前に「本当に書き換えるか」を判定する。**マップが常に 1 つ握っているので
+  `Arc::make_mut` は必ず実複製になる。`compact_local_adjust_manual_override_in` は
+  落とすものがあるときだけ複製する。
+- サイドカー JSON と `local_adjust.db` の形式は**素の配列のまま**
+  (`serde` の `rc` feature が `Arc<T>` を `T` として直列化する)。出荷済みのディスク形式で、
+  フォルダ移動時の復元がここを読む。
+
+保存 (`App::set_local_adjust_layers_for_idx`) は**メモリと presence を進めて worker へ
+積むだけ**で戻る。直列化 (q8 量子化 → deflate → base64) と SQLite 書き込みは
+`local_adjust_write_worker` が行う。マスク系スライダーのドラッグ中は
+`Slider::changed()` が毎フレーム真になるため、この経路は**ストローク単位ではなく
+フレーム単位**で走る点に注意 (同じ page key は最新 generation だけ書く)。
+
+サイドカーへのミラーは、正本が受理した (`EditStoreOutcome::Committed`) ときだけ
+`App::apply_local_adjust_write_completion` が行う。**この順序が R-26 の境界**で、
+崩すと利用者に何も出ないまま編集が消える。詳細と、非同期化で新しく必要になった 3 点
+(ミラー先座標の固定 / key 付け替え前の drain / 終了時の書き切り) は
+[async-architecture.md §5.7](async-architecture.md) を参照。
+
 ### 4.1 ヘルパー関数
 
 `App` には final pipeline 用の無効化ヘルパーがある:

@@ -77,7 +77,7 @@ enum PipelineDebugStageWork {
         name: String,
         note: String,
         source: Arc<egui::ColorImage>,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     },
     ConcealCompose {
         name: String,

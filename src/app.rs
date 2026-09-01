@@ -3378,11 +3378,11 @@ pub(crate) struct EditMaterializeRequest {
 
 pub(crate) enum EditMaterializePayload {
     LocalReady {
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
         image: egui::ColorImage,
     },
     LocalInactive {
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     },
     ConcealDisplayReady {
         image: egui::ColorImage,
@@ -3632,6 +3632,12 @@ pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) paint: bool,
     pub(crate) edge_seed: Option<[u8; 3]>,
     pub(crate) previous: [f32; 2],
+    /// このストロークで **1 画素でも塗れたか**。
+    ///
+    /// 塗れなかったストロークを release で保存すると、マスクの材質化 (Raster から
+    /// RasterVector への昇格など) だけで before と after が食い違い、何も起きていない
+    /// クリックに Undo が 1 件増える。確定するかはこの値で決める。
+    pub(crate) applied: bool,
 }
 
 pub(crate) const LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS: u64 = 150;
@@ -3662,7 +3668,7 @@ pub(crate) struct ExportCropCreateDrag {
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
-    layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    layers: local_adjust_core::LocalAdjustmentLayers,
     cancel: Arc<AtomicBool>,
 ) -> LocalAdjustRenderResult {
     if cancel.load(Ordering::Relaxed) {
@@ -3697,7 +3703,7 @@ fn run_local_adjust_render(
 }
 
 enum LocalMaterializeLayers {
-    Memory(Vec<local_adjust_core::LocalAdjustmentLayer>),
+    Memory(local_adjust_core::LocalAdjustmentLayers),
     Database { path: PathBuf, page_key: String },
 }
 
@@ -3775,7 +3781,9 @@ fn run_local_materialize(
             let Some(json) = json else {
                 return EditMaterializeResult::Ready {
                     request,
-                    payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                    payload: EditMaterializePayload::LocalInactive {
+                        layers: local_adjust_core::LocalAdjustmentLayers::default(),
+                    },
                 };
             };
             if cancel.load(Ordering::Relaxed) {
@@ -3791,14 +3799,16 @@ fn run_local_materialize(
                 decode_t0,
             );
             match parsed {
-                Ok(layers) => layers,
+                Ok(layers) => local_adjust_core::LocalAdjustmentLayers::new(layers),
                 Err(err) => {
                     crate::logger::log(format!(
                         "local_adjust: invalid layers_json key={page_key} error={err}"
                     ));
                     return EditMaterializeResult::Ready {
                         request,
-                        payload: EditMaterializePayload::LocalInactive { layers: Vec::new() },
+                        payload: EditMaterializePayload::LocalInactive {
+                            layers: local_adjust_core::LocalAdjustmentLayers::default(),
+                        },
                     };
                 }
             }
@@ -7589,6 +7599,53 @@ pub(crate) enum EditStoreOutcome {
     Unavailable,
     /// 正本が拒否した。
     Failed(String),
+}
+
+/// キーボードで図形マスクを動かしている間の保留。
+///
+/// キーリピート 1 回ごとに保存すると、リピートの数だけ Undo が積まれ、保存も毎回
+/// 積まれる。編集はメモリへ即反映して見た目を追随させ、**保存と Undo はセッションの
+/// 終わりに 1 回だけ**行う。
+///
+/// セッションが閉じるのは 3 つ:
+/// - 一定時間キー編集が来なかったとき ([`App::LOCAL_ADJUST_SHAPE_KEY_IDLE`])
+/// - 別のページ / 別の図形を編集し始めたとき
+/// - 編集状態を畳むとき ([`App::commit_local_adjust_pending_edits`])
+///
+/// **畳むときに捨ててはいけない。**ドラッグ中のブラシと違い、キー編集は 1 回ごとが
+/// 完了した編集で、捨てると利用者の操作がそのまま消える。
+pub(crate) struct LocalAdjustShapeKeyEdit {
+    pub fs_idx: usize,
+    /// 対象のレイヤー。同じ数値の図形 index は別レイヤーにも在るので、これが無いと
+    /// 無関係なレイヤーの編集が 1 つのセッションに混ざる。
+    pub layer_idx: usize,
+    /// 対象のマスク (Base / 追加 / 削除)。図形 index は各マスクで独立している。
+    pub target: LocalAdjustMaskEditTarget,
+    /// 対象の図形。別の図形へ移ったらセッションを閉じる。
+    pub shape_idx: usize,
+    /// セッション開始前の文書。Undo を 1 件にまとめる。
+    pub before: local_adjust_core::LocalAdjustmentLayers,
+    /// Undo に出す操作名。移動と回転が混ざったら丸める。
+    pub summary: &'static str,
+    /// 最後にキー編集が来た時刻。無操作でセッションを閉じる判定に使う。
+    pub last_edit_at: std::time::Instant,
+}
+
+/// 積んだ補正レイヤー保存 1 件について、完了時に必要になるものだけを控えた記録。
+///
+/// **サイドカー座標を控えるのが要点。**完了が返る頃には一覧の idx が別のページを
+/// 指し得るので、そのとき解決し直すと無関係なページへミラーする。`idx` も持つが、
+/// これは idx 依存の後続処理を「まだ同じページを指しているか」で gate するためだけに使う。
+///
+/// key ごとに**最後に積んだ 1 件**だけを持つ。同じ key の古い完了もこの座標でミラーして
+/// よい (key が同じなら指すページも同じ)。
+pub(crate) struct LocalAdjustWritePending {
+    /// この key について最後に積んだ generation。記録を畳む時期を決めるのに使う。
+    pub generation: u64,
+    /// 積んだ時点の一覧 idx。
+    pub idx: usize,
+    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
+    pub sidecar: Option<(std::path::PathBuf, String)>,
 }
 
 /// メタ操作 (タグ付与など) を発火させた UI 面。
@@ -11745,7 +11802,7 @@ pub struct App {
     /// フルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。表示合成は後段の
     /// `local_adjust_cache` / worker が担当する。
     pub(crate) local_adjust_page_layers:
-        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        std::collections::HashMap<usize, local_adjust_core::LocalAdjustmentLayers>,
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
     /// `local_adjust.db` の `page_path` exact lookup だけで復元し、サムネイルには
     /// 補正レイヤー結果自体を反映しない。
@@ -11851,13 +11908,15 @@ pub struct App {
     pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
     /// 図形ドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
     pub(crate) local_adjust_shape_drag_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
     /// キャンバスドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
     pub(crate) local_adjust_canvas_drag_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
     /// 手描きブラシ開始前の補正レイヤー配列。Undo をストローク単位にまとめる。
     pub(crate) local_adjust_mask_brush_before_layers:
-        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+        Option<local_adjust_core::LocalAdjustmentLayers>,
+    /// キーボードでの図形移動 / 回転の保留。Undo と保存をセッション単位にまとめる。
+    pub(crate) local_adjust_shape_key_edit: Option<LocalAdjustShapeKeyEdit>,
     /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
     pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
@@ -11980,6 +12039,13 @@ pub struct App {
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
     /// 補正レイヤー DB ハンドル
     pub(crate) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
+    /// 補正レイヤー保存の worker。最初の保存で遅延起動する。
+    pub(crate) local_adjust_write_handle:
+        Option<crate::local_adjust_write_worker::LocalAdjustWriteHandle>,
+    /// 積んだ保存の未完了分 (page key → 記録)。同じ key を積み直すと上書きするので、
+    /// 常に「最後に積んだ 1 件」だけが残る。
+    pub(crate) local_adjust_write_pending:
+        std::collections::HashMap<String, LocalAdjustWritePending>,
     /// 最後段 crop DB ハンドル
     pub(crate) export_crop_db: Option<crate::export_crop::CropDb>,
     /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
@@ -14302,6 +14368,7 @@ impl App {
             local_adjust_shape_drag_before_layers: None,
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
+            local_adjust_shape_key_edit: None,
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
@@ -14345,6 +14412,8 @@ impl App {
             adjustment_dragging: false,
             adjustment_db,
             local_adjust_db,
+            local_adjust_write_handle: None,
+            local_adjust_write_pending: std::collections::HashMap::new(),
             export_crop_db,
             slot_save_dialog: None,
             favorite_default_clear_confirm: None,
@@ -23830,6 +23899,8 @@ impl App {
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
+        // **文書を捨てる前に確定する。**メモリにしか無い編集はここで消える。
+        self.fold_local_adjust_edit_state();
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
@@ -23855,17 +23926,6 @@ impl App {
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
         self.local_adjust_effect_position_handles_visible = true;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
@@ -26527,7 +26587,10 @@ impl App {
         };
 
         let loaded = !layers.is_empty();
-        self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+        self.set_local_adjust_layers_for_idx_memory_only_inner(
+            idx,
+            local_adjust_core::LocalAdjustmentLayers::new(layers),
+        );
         loaded
     }
 
@@ -28264,9 +28327,18 @@ impl App {
             .edit_preview_cache
             .as_ref()
             .is_some_and(|cache| cache.has_pending_commands());
+        // 補正レイヤーの保存も `local_adjust.db` を直接書く。積んだままリネーム移行を
+        // 始めると、移した後に古い key の保存が着地して行を復活させる。未回収の完了も
+        // 数える (完了を適用するとサイドカーへミラーが書かれるため)。
+        let local_adjust_busy = self
+            .local_adjust_write_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_unfinished_work())
+            || !self.local_adjust_write_pending.is_empty();
         tag_busy
             || rating_busy
             || edit_preview_busy
+            || local_adjust_busy
             || !self.book_bookmark_pending_requests.is_empty()
     }
 
@@ -30862,6 +30934,8 @@ impl App {
         if mappings.is_empty() {
             return;
         }
+        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
+        self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
         for (from, to) in mappings {
             self.copy_book_page_edit_key(&from, &to, &mut errors);
@@ -30911,6 +30985,8 @@ impl App {
             })
             .collect::<Vec<_>>();
 
+        // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
+        self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
         for (from, temp, _) in &temp_mappings {
             self.move_book_page_edit_key(from, temp, &mut errors);
@@ -37878,17 +37954,7 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
+        self.fold_local_adjust_edit_state();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
         self.cancel_all_local_adjust_pending();
@@ -51419,14 +51485,17 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
-        // 昇格は表示対象 idx にだけ属する。KEEP 範囲内かどうかとは独立に、ページを
-        // 離れた時点で worker を止め、decode 済み backlog も捨てる。
+        // 昇格は**表示中のページ**に属する。見開きでは相方も表示中なので止めない。
+        // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
+        // decode 済み backlog も捨てる。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions: Vec<usize> = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect();
         for idx in stale_promotions {
@@ -51435,8 +51504,10 @@ impl App {
             }
             self.fs_early_dims.remove(&idx);
         }
+        // 昇格の upload も、表示中のページのぶんだけ残す。
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
 
         self.start_animation_promotion_if_needed(current_idx);
@@ -51457,9 +51528,12 @@ impl App {
                     return None;
                 }
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
+                // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
+                // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
                 (current_loading
                     || !keep_set.contains(&k)
-                    || pending.purpose.promotion_started_at_for(k).is_some())
+                    || (pending.purpose.promotion_started_at_for(k).is_some()
+                        && !Self::page_is_displayed(k, current_idx, displayed_partner)))
                 .then_some(k)
             })
             .collect();
@@ -51776,6 +51850,11 @@ impl App {
             let now = close_t0.elapsed().as_secs_f64() * 1000.0;
             stages.push((name, now - previous));
         };
+        // **いちばん先に確定する。**この関数は下で edit preview を snapshot し、
+        // フルスクリーン中の Undo スタックを捨てる。後で畳むと、確定前の画素が
+        // サムネイルとして焼かれ、捨てたはずのスタックへ Undo が 1 件戻る
+        // (2026-08-31 Codex P2)。
+        self.fold_local_adjust_edit_state();
         #[cfg(windows)]
         self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::FullscreenExit);
         close_stage("seek_strip", &mut close_stages);
@@ -52168,17 +52247,6 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
-        self.local_adjust_brush_deferred_render = None;
         self.local_adjust_segmentation_pending = None;
         self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
@@ -54255,6 +54323,16 @@ impl App {
         }
         self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
+        // **まず確定する。**保留のままの編集は、メモリにしか無いのでここで消える。
+        self.commit_local_adjust_pending_edits();
+        // 保存 worker の在庫を書き切らせ、そのミラーを sidecar へ入れてから flush する。
+        // 終了経路では worker を止めて join する (在庫は drain してから止まる)。トレイ
+        // 退避では worker も読み手も生き続けるので、届いている分だけ回収する。
+        if scope.waits_for_sidecar_writer() {
+            self.finish_local_adjust_writes();
+        } else {
+            self.poll_local_adjust_write_results();
+        }
         self.flush_all_sidecars();
         if scope.waits_for_sidecar_writer() {
             // 終了経路だけ待つ。ここから先プロセスが止まるので、積んだだけの書き込みは
@@ -54475,45 +54553,196 @@ impl App {
 
     // ── local_adjust_cache / conceal_cache の世代管理 + invalidate ヘルパー ──
 
-    /// 指定 idx の補正レイヤー配列を DB と in-memory state に反映する。
-    /// 空配列は「補正レイヤーなし」として DB からも削除する。
+    /// 指定 idx の補正レイヤー配列を in-memory state に反映し、正本への保存を
+    /// **worker へ積む**。空配列は「補正レイヤーなし」として DB からも削除する。
+    ///
+    /// 直列化 (q8 量子化 → deflate → base64) と SQLite 書き込みは 24MP で 70.6ms かかり、
+    /// マスク系スライダーのドラッグ中は毎フレーム走っていた。ここでは積むだけで戻る。
+    ///
+    /// **成否が後から返ることが R-26 との接点。**同期版は「正本が受理したときだけ
+    /// sidecar ミラーを書く」順序でこの境界を守っていた。非同期でも順序は同じで、
+    /// ミラーを書くのは [`Self::apply_local_adjust_write_completion`] が `Committed` を
+    /// 受け取ったときだけ。ここでは**メモリと presence だけ**を進める。
     pub(crate) fn set_local_adjust_layers_for_idx(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         let key = match self.page_path_key(idx) {
             Some(key) => key,
             None => return,
         };
         self.invalidate_edit_preview_cache_for_key(&key);
-        let written = Self::edit_store_write(
-            self.local_adjust_db
-                .as_ref()
-                .map(|db| db.set_layers(&key, &layers)),
-        );
+        // presence は「画面に出ている状態」を表す。保存の成否ではないので、同期版と
+        // 同じく結果を待たずに立てる (失敗しても編集は画面に残す)。
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
-        if !self.edit_store_write_succeeded("補正レイヤー", written) {
+        self.set_local_adjust_layers_for_idx_memory_only(
+            idx,
+            local_adjust_core::LocalAdjustmentLayers::clone(&layers),
+        );
+        self.submit_local_adjust_write(idx, key, layers);
+    }
+
+    /// 保存要求を worker へ積み、完了時にミラー先を復元するための座標を控える。
+    ///
+    /// **サイドカー座標は積む時点で固定する。**完了が返る頃には一覧の idx が別のページを
+    /// 指し得るので、そのとき解決し直すと無関係なページへミラーする。
+    fn submit_local_adjust_write(
+        &mut self,
+        idx: usize,
+        key: String,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+    ) {
+        self.ensure_local_adjust_write_handle();
+        let layer_count = layers.len();
+        let submitted = match self.local_adjust_write_handle.as_ref() {
+            Some(handle) => handle.submit(key.clone(), layers),
+            None => Err(EditStoreOutcome::Failed(
+                "保存ワーカーを起動できません".to_string(),
+            )),
+        };
+        let generation = match submitted {
+            Ok(generation) => generation,
+            Err(outcome) => {
+                // worker が受け取らなかった = 正本には何も書かれない。黙って積んだ
+                // ことにすると、画面には編集が残ったまま保存されない状態が続く。
+                // 他の失敗と同じ扱い (ミラーを書かず、利用者へ伝える) にする。
+                debug_assert!(!matches!(outcome, EditStoreOutcome::Committed));
+                let _ = self.edit_store_write_succeeded("補正レイヤー", outcome);
+                self.local_adjust_write_pending.remove(&key);
+                return;
+            }
+        };
+        crate::perf::event(
+            "local_adjust",
+            "save_enqueue",
+            Some(&key),
+            generation,
+            &[("layers", serde_json::Value::from(layer_count))],
+        );
+        let sidecar = if self.idx_is_compiled_book_page(idx) {
+            None
+        } else {
+            self.sidecar_coords(idx)
+        };
+        self.local_adjust_write_pending.insert(
+            key,
+            LocalAdjustWritePending {
+                generation,
+                idx,
+                sidecar,
+            },
+        );
+    }
+
+    pub(crate) fn ensure_local_adjust_write_handle(&mut self) {
+        if self.local_adjust_write_handle.is_none() {
+            self.local_adjust_write_handle = Some(
+                crate::local_adjust_write_worker::LocalAdjustWriteHandle::spawn(
+                    crate::local_adjust_db::LocalAdjustDb::db_path(),
+                ),
+            );
+        }
+    }
+
+    /// worker から返った保存結果を回収する。`App::update` から毎フレーム呼ぶ。
+    pub(crate) fn poll_local_adjust_write_results(&mut self) {
+        let mut completions = Vec::new();
+        if let Some(handle) = self.local_adjust_write_handle.as_ref() {
+            while let Some(completion) = handle.try_recv() {
+                completions.push(completion);
+            }
+        }
+        for completion in completions {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 終了時: worker を止めて在庫を書き切らせ、その結果をミラーへ反映する。
+    ///
+    /// 時間で諦める形にすると「間に合わなかった保存」が環境ごとに変わるので、
+    /// join してから受け取り切る。正本は worker が書き切っているので、ここを飛ばしても
+    /// 編集自体は消えない。飛ばすと sidecar (フォルダ移動時の復元源) だけが古くなる。
+    pub(crate) fn finish_local_adjust_writes(&mut self) {
+        let Some(handle) = self.local_adjust_write_handle.take() else {
+            return;
+        };
+        for completion in handle.shutdown_and_collect() {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 積んである保存が着地するまで待ち、結果を反映する。
+    ///
+    /// **page key を付け替える直前に呼ぶ。**付け替えは worker を経由しないので、
+    /// 待たずに走らせると「rename が行を移した後で、古い key の保存が着地して書き戻す」
+    /// 順序が起き得る。同期保存だった頃はこの順序が構造的に起きなかった。
+    pub(crate) fn wait_for_local_adjust_writes(&mut self) {
+        let Some(handle) = self.local_adjust_write_handle.as_ref() else {
+            return;
+        };
+        for completion in handle.drain_blocking() {
+            self.apply_local_adjust_write_completion(completion);
+        }
+    }
+
+    /// 保存結果 1 件を UI 状態へ反映する。**R-26 の境界はここ。**
+    ///
+    /// - `Committed` — 正本が受理した。**worker が実際に書いた文書**を sidecar へ写す。
+    ///   メモリから取り直すと、その間に入った編集を「保存済み」として写してしまう。
+    /// - `Unavailable` / `Failed` — トーストだけ。**ミラーは書かない。**書くと、次回起動の
+    ///   import が「中央が authoritative」として新しい sidecar を捨て、利用者からは編集が
+    ///   消えたように見える。
+    ///
+    /// **古い generation の完了も同じように処理する。**worker は key ごとに順に書くので、
+    /// 完了は必ず古い順に届く。受理された古い完了を「新しい要求が控えているから」と
+    /// 捨てると、その新しい要求が失敗したときに**正本には古い内容があるのに sidecar には
+    /// 何も無い**状態で止まる (2026-08-31 Codex P2)。
+    pub(crate) fn apply_local_adjust_write_completion(
+        &mut self,
+        completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+    ) {
+        let crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+            key,
+            generation,
+            layers,
+            outcome,
+        } = completion;
+        let Some(pending) = self.local_adjust_write_pending.get(&key) else {
+            return;
+        };
+        let sidecar = pending.sidecar.clone();
+        let idx = pending.idx;
+        // 記録を畳むのは最新の完了だけ。古い完了で畳むと、後から届く最新の完了が
+        // ミラー先を失う。
+        if pending.generation == generation {
+            self.local_adjust_write_pending.remove(&key);
+        }
+
+        if !self.edit_store_write_succeeded("補正レイヤー", outcome) {
             // 画面には残す。durable な mirror だけ書かない。
-            self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
             return;
         }
         if layers.is_empty() {
-            self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
+            self.with_sidecar_coords_mut(sidecar.as_ref(), |sc, rel| {
+                sc.remove_local_adjust_layers(rel)
+            });
         } else {
-            let sidecar_layers = layers.clone();
-            self.with_sidecar_mut(idx, move |sc, rel| {
-                sc.set_local_adjust_layers(rel, sidecar_layers)
+            self.with_sidecar_coords_mut(sidecar.as_ref(), move |sc, rel| {
+                sc.set_local_adjust_layers(rel, layers)
             });
         }
-        self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        self.record_content_identity_for_idx(
-            idx,
-            crate::content_identity::ContentIdentityTrigger::Edit,
-        );
+        // idx は完了までに別のページを指し得る。同じ key を指したままのときだけ
+        // idx 依存の後続処理を走らせる。
+        if self.page_path_key(idx).as_deref() == Some(key.as_str()) {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
     }
 
     /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
@@ -54521,7 +54750,7 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_memory_only(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.bump_local_adjust_generation(idx);
@@ -54530,7 +54759,7 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.defer_local_adjust_brush_render(idx);
@@ -54539,7 +54768,7 @@ impl App {
     fn set_local_adjust_layers_for_idx_memory_only_inner(
         &mut self,
         idx: usize,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
@@ -55095,10 +55324,10 @@ impl App {
         &self,
         idx: usize,
         layer_idx: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let mut layers = self.local_adjust_layers_for_render(idx)?;
-        let layer = layers.get_mut(layer_idx)?;
-        layer.enabled = false;
+        // バイパス済みの文書は元と別物なので、ここだけは実複製を払う。
+        Arc::make_mut(&mut layers).get_mut(layer_idx)?.enabled = false;
         layers
             .iter()
             .any(|layer| layer.enabled && layer.opacity > 0.0)
@@ -55109,23 +55338,23 @@ impl App {
         &self,
         idx: usize,
         layer_count: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let layers = self.local_adjust_page_layers.get(&idx)?;
         let count = layer_count.min(layers.len());
         if count == 0 || count >= layers.len() {
             return None;
         }
-        let preview_layers = layers[..count].to_vec();
+        let preview_layers = &layers[..count];
         preview_layers
             .iter()
             .any(|layer| layer.enabled && layer.opacity > 0.0)
-            .then_some(preview_layers)
+            .then(|| local_adjust_core::LocalAdjustmentLayers::new(preview_layers.to_vec()))
     }
 
     fn local_adjust_layers_for_render(
         &self,
         idx: usize,
-    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
         let layers = self.local_adjust_page_layers.get(&idx)?;
         layers
             .iter()
@@ -57219,8 +57448,37 @@ impl App {
         }
     }
 
+    /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
+    pub(crate) fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
+        match self.resolve_spread_pair(current) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                Some(if left == current { right } else { left })
+            }
+            _ => None,
+        }
+    }
+
+    /// いま画面に出ているページか。**見開きでは 2 枚。**
+    ///
+    /// アニメの全フレーム昇格は「表示中のページのものだけ走らせ、他は止める」という規則で
+    /// 動く。その規則を **4 か所に別々に綴っていた** (開始のガード / upload backlog の掃除 /
+    /// stale 昇格のキャンセル / pending の一括キャンセル)。相方はどこかで必ず「表示中でない」
+    /// 側に落ちるので、毎フレーム開始しては即キャンセルされ、永久に昇格しなかった (§1.157)。
+    /// **判定はこの 1 つだけを使う。**
+    pub(crate) fn page_is_displayed(idx: usize, current: usize, partner: Option<usize>) -> bool {
+        idx == current || Some(idx) == partner
+    }
+
+    pub(crate) fn page_is_displayed_now(&mut self, idx: usize) -> bool {
+        let Some(current) = self.fullscreen_idx else {
+            return false;
+        };
+        let partner = self.displayed_spread_partner(current);
+        Self::page_is_displayed(idx, current, partner)
+    }
+
     fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
-        if self.fullscreen_idx != Some(idx)
+        if !self.page_is_displayed_now(idx)
             || self
                 .fs_cache
                 .get(&idx)
@@ -63482,16 +63740,7 @@ impl App {
         self.sns_split_drag = None;
         self.sns_split_spread_ctx = None;
         self.fs_loupe_locked = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_mask_shape_drag_start = None;
-        self.local_adjust_mask_shape_drag_end = None;
-        self.local_adjust_selected_shape = None;
-        self.local_adjust_shape_drag = None;
-        self.local_adjust_canvas_drag_before_layers = None;
-        self.local_adjust_shape_drag_before_layers = None;
-        self.local_adjust_mask_brush_before_layers = None;
+        self.fold_local_adjust_edit_state();
         self.local_adjust_segmentation_pending = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
@@ -64201,7 +64450,13 @@ impl App {
             self.fs_pending.remove(&key);
             self.fs_early_dims.remove(&key);
             if purpose.promotion_started_at_for(key).is_some() {
-                self.mark_animation_promotion_failed(key);
+                // **こちらが止めたものを「失敗」にしない。** `PromotionFailed` は再試行を
+                // しない終端状態なので、画面から外れて cancel した昇格をここへ落とすと、
+                // 戻ってきても二度と動かない (§1.157: 見開きの相方が止まったままになる)。
+                // 表示中のまま送信側が消えたときだけ、本当の失敗として扱う。
+                if self.page_is_displayed_now(key) {
+                    self.mark_animation_promotion_failed(key);
+                }
             }
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
@@ -64306,7 +64561,9 @@ impl App {
                 continue;
             }
             if purpose.promotion_started_at_for(key).is_some() {
-                if self.fullscreen_idx != Some(key) {
+                // 見開きでは相方も表示中。ここで捨てると、昇格が完了しても
+                // 第 1 フレームのままになる (§1.157)。
+                if !self.page_is_displayed_now(key) {
                     continue;
                 }
                 if !matches!(result, FsLoadResult::Animated(_)) {
@@ -66388,6 +66645,20 @@ impl eframe::App for App {
             ctx.request_repaint_after(delay);
         } else if had_deferred_local_adjust_brush {
             ctx.request_repaint();
+        }
+        // 補正レイヤーの保存結果とキー編集セッションは、**グリッド描画より前**で回す。
+        // in-window フルスクリーンは下の `embedded_fs_active` gate で無条件に return
+        // するので、そこより後ろに置くと編集中は一度も走らない (2026-08-31 Codex P1)。
+        // 補正の編集はまさにフルスクリーン中に行われる。
+        self.poll_local_adjust_write_results();
+        if !self.local_adjust_write_pending.is_empty() {
+            // 最後の保存の直後に egui が眠ると、失敗トーストとサイドカーミラーが
+            // 次の入力まで出ない。
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.settle_local_adjust_shape_key_edit() {
+            // セッションが開いている間はフレームを回す。眠ると無操作判定が来ない。
+            ctx.request_repaint_after(Self::LOCAL_ADJUST_SHAPE_KEY_IDLE);
         }
 
         #[cfg(windows)]

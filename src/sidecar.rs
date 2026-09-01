@@ -87,7 +87,7 @@ pub struct SidecarEntry {
     /// 補正レイヤー配列。中央 `local_adjust.db` が authoritative で、サイドカーは
     /// フォルダ移動時の復元用バックアップとして扱う。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_adjust_layers: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    pub local_adjust_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
     /// 最後段 crop 設定。表示・コピー・書き出しの最終段でだけ適用する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_crop: Option<crate::export_crop::CropSettings>,
@@ -362,7 +362,7 @@ impl SidecarFile {
     pub fn set_local_adjust_layers(
         &mut self,
         rel_key: &str,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
         if layers.is_empty() {
             self.remove_local_adjust_layers(rel_key);
@@ -1264,7 +1264,10 @@ mod tests {
                 vectors: Vec::new(),
             },
         );
-        s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("layer")]);
+        s.set_local_adjust_layers(
+            "img.jpg",
+            Arc::new(vec![sample_local_adjust_layer("layer")]),
+        );
         s.set_export_crop("img.jpg", sample_export_crop());
         s.set_tags("img.jpg", ["#tag"]);
         assert_eq!(s.items().len(), 1);
@@ -1316,7 +1319,7 @@ mod tests {
     #[test]
     fn set_local_adjust_layers_is_independent_of_other_fields() {
         let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
-        s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("look")]);
+        s.set_local_adjust_layers("img.jpg", Arc::new(vec![sample_local_adjust_layer("look")]));
         let entry = s.items().get("img.jpg").unwrap();
         assert!(entry.adjust.is_none());
         assert!(entry.mask.is_none());
@@ -1403,10 +1406,10 @@ mod tests {
             );
             s.set_local_adjust_layers(
                 "img.jpg",
-                vec![
+                Arc::new(vec![
                     sample_local_adjust_layer("base"),
                     sample_local_adjust_layer("finish"),
-                ],
+                ]),
             );
             s.set_export_crop("img.jpg", sample_export_crop());
             s.set_tags("img.jpg", ["#Cat", "dog"]);
@@ -1453,10 +1456,10 @@ mod tests {
         let mut s = SidecarFile::new(folder.to_path_buf());
         let imported_layers = vec![sample_local_adjust_layer("from sidecar")];
         let existing_layers = vec![sample_local_adjust_layer("already in db")];
-        s.set_local_adjust_layers("fresh.png", imported_layers.clone());
+        s.set_local_adjust_layers("fresh.png", Arc::new(imported_layers.clone()));
         s.set_local_adjust_layers(
             "existing.png",
-            vec![sample_local_adjust_layer("stale sidecar")],
+            Arc::new(vec![sample_local_adjust_layer("stale sidecar")]),
         );
 
         let db_dir = tempfile::tempdir().unwrap();
@@ -1825,7 +1828,7 @@ mod writer_tests {
 
     fn sample_layer() -> local_adjust_core::LocalAdjustmentLayer {
         let mut mask = local_adjust_core::RasterVectorMask::empty(4, 4);
-        mask.alpha[5] = 1.0;
+        mask.alpha_mut()[5] = 1.0;
         local_adjust_core::LocalAdjustmentLayer::new(
             "layer",
             local_adjust_core::LocalMask::RasterVector(mask),
@@ -2058,18 +2061,19 @@ mod writer_tests {
         // 1000x1000 は実データ (3082x4486) より小さいが、旧形式なら 1 枚で
         // 4 MB を超える。packed ならページ数を増やしても効かない。
         let mut mask = local_adjust_core::RasterVectorMask::empty(1000, 1000);
+        let alpha = mask.alpha_mut();
         for y in 100..140 {
             for x in 100..180 {
-                mask.alpha[y * 1000 + x] = 1.0;
+                alpha[y * 1000 + x] = 1.0;
             }
         }
         sidecar.set_local_adjust_layers(
             "img.jpg",
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "layer",
                 local_adjust_core::LocalMask::RasterVector(mask),
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         assert!(sidecar.flush_blocking());
         let size = std::fs::metadata(dir.path().join(SIDECAR_FILENAME))
@@ -2081,13 +2085,34 @@ mod writer_tests {
         );
     }
 
+    /// サイドカーは出荷済みのディスク形式で、フォルダを移動したときの復元源になる。
+    /// 補正レイヤーを共有所有 (`Arc`) で持つようにしても、書き出す形は**素の配列**の
+    /// ままでなければならない。ここが包まれると、旧版が書いたファイルを新版が読めず
+    /// (逆も) 移動したフォルダの補正が黙って消える。
+    #[test]
+    fn local_adjust_layers_are_still_written_as_a_plain_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_local_adjust_layers("img.jpg", Arc::new(vec![sample_layer()]));
+        assert!(sidecar.flush_blocking());
+
+        let written = std::fs::read_to_string(dir.path().join(SIDECAR_FILENAME)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let layers = &parsed["items"]["img.jpg"]["local_adjust_layers"];
+        assert!(
+            layers.is_array(),
+            "補正レイヤーは配列として書かれること: {written}"
+        );
+        assert_eq!(layers.as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn the_periodic_deadline_is_measured_from_when_editing_started() {
         // 最後の変更時刻で測ると、編集し続けている間は一度も書かれない。
         let mut sidecar = SidecarFile::new(std::path::PathBuf::from("nowhere"));
-        sidecar.set_local_adjust_layers("img.jpg", vec![sample_layer()]);
+        sidecar.set_local_adjust_layers("img.jpg", Arc::new(vec![sample_layer()]));
         let first = sidecar.dirty_since().expect("dirty since the first edit");
-        sidecar.set_local_adjust_layers("other.jpg", vec![sample_layer()]);
+        sidecar.set_local_adjust_layers("other.jpg", Arc::new(vec![sample_layer()]));
         assert_eq!(
             sidecar.dirty_since(),
             Some(first),

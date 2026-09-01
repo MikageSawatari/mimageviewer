@@ -1,0 +1,68 @@
+## 判定
+
+**現行 HEAD (`de8249b6`) は最終承認できません。** 重大 3 件、中程度 3 件を確認しました。C の明示的な 8 判定箇所は現在すべて共有述語を通っていますが、監査対象となるライフサイクル自体が不足しています。
+
+## 指摘
+
+1. **重大: 相方アニメーションの完了取込・駒送りが repaint 依存です**
+
+   相方は描画時に `advance_animation` されますが、`handle_fs_repaint` は pending と `next_frame_at` の両方を `fullscreen_idx` だけで判定しています。[src/ui_fullscreen.rs:14218](C:/home/mimageviewer/src/ui_fullscreen.rs:14218) [src/ui_fullscreen.rs:25538](C:/home/mimageviewer/src/ui_fullscreen.rs:25538)
+
+   現ページが静止画、相方が `FirstFrameOnly` GIF の場合、相方の昇格 worker は通常の mpsc 送信だけで egui を wake しないため、完了を次の入力まで poll できません。[src/app.rs:50630](C:/home/mimageviewer/src/app.rs:50630) [src/app.rs:64147](C:/home/mimageviewer/src/app.rs:64147)
+
+   偶発的に完了を取り込んでも、相方の `next_frame_at` は deadline に登録されません。左右とも Animated でも、相方の 50ms フレームが現ページの 1 秒 deadline に拘束されます。連結読みも全ページを進める一方、scheduler は現ページだけです。[src/ui_fullscreen.rs:16465](C:/home/mimageviewer/src/ui_fullscreen.rs:16465) [src/ui_fullscreen.rs:27515](C:/home/mimageviewer/src/ui_fullscreen.rs:27515)
+
+   さらに進捗表示も現ページ限定なので、相方 promotion による 33ms repaint も発生しません。[src/app.rs:57258](C:/home/mimageviewer/src/app.rs:57258) [src/ui_fullscreen.rs:32641](C:/home/mimageviewer/src/ui_fullscreen.rs:32641)
+
+   **表示中 unit 全体の pending と最短 `next_frame_at` を同じ所有者で集約する必要があります。**
+
+2. **重大: `RectSnapMode::None` では前回指摘した再補間が残ります**
+
+   `quantize_display_bbox_to_paint_pixels` は端数倍率の拡大で即 return し、trim 辺を量子化しません。[src/displayed_image_transform.rs:1014](C:/home/mimageviewer/src/displayed_image_transform.rs:1014) [src/displayed_image_transform.rs:876](C:/home/mimageviewer/src/displayed_image_transform.rs:876)
+
+   しかしこの倍率でも visible-region Lanczos は整数サイズの出力を作ります。[src/gpu_lanczos.rs:78](C:/home/mimageviewer/src/gpu_lanczos.rs:78) [src/gpu_lanczos.rs:1119](C:/home/mimageviewer/src/gpu_lanczos.rs:1119) 出力は未量子化 source region の矩形へ貼られるため、例えば幅 1000、trim 幅 0.8037、倍率 1.5 なら、出力 1205px に対して貼り先は 1205.55px となり、再度 Linear stretch されます。[src/displayed_image_transform.rs:469](C:/home/mimageviewer/src/displayed_image_transform.rs:469)
+
+   2,430 件テストも `RectSnapMode::None` では移動量・原点・extent 検査を明示的にスキップしています。[src/ui_fullscreen.rs:37186](C:/home/mimageviewer/src/ui_fullscreen.rs:37186)
+
+   したがって、前回指摘 1 は縮小・整数倍率では直っていますが、**visible-region upscale との交差では未解決**です。
+
+3. **重大: 連結読み＋動画混在では、共有述語へ渡す「相方」が誤っています**
+
+   `displayed_spread_partner` は動画を含む通常ナビ列から相方を解きます。[src/app.rs:57191](C:/home/mimageviewer/src/app.rs:57191) [src/ui_fullscreen.rs:7852](C:/home/mimageviewer/src/ui_fullscreen.rs:7852) 一方、連結読み unit は動画を除いた静止画列から作られます。[src/ui_helpers.rs:1374](C:/home/mimageviewer/src/ui_helpers.rs:1374) [src/ui_fullscreen.rs:26571](C:/home/mimageviewer/src/ui_fullscreen.rs:26571)
+
+   例えば `[animated image 0, video 1, animated image 2]`、LTR 連結読み、current=0 では、実表示は `[0,2]` ですが通常 resolver は 0 を単独扱いします。2 の promotion は開始ガードで拒否され、進行中なら連結先読み掃除でキャンセルされます。[src/app.rs:57220](C:/home/mimageviewer/src/app.rs:57220) [src/ui_fullscreen.rs:27231](C:/home/mimageviewer/src/ui_fullscreen.rs:27231)
+
+   ページ送り側は既に連結時だけ静止画列へ切り替えています。[src/ui_fullscreen.rs:18449](C:/home/mimageviewer/src/ui_fullscreen.rs:18449) 相方判定も同じ `ContinuousReadingUnitSpec` から導く必要があります。
+
+4. **中: 量子化済み trim が範囲コピーと detached single snapshot で失われます**
+
+   transform は量子化済み `paint_rect` / `uv_rect` を作りますが、`content_bbox` には元の未量子化 bbox を保持します。[src/displayed_image_transform.rs:224](C:/home/mimageviewer/src/displayed_image_transform.rs:224) [src/displayed_image_transform.rs:261](C:/home/mimageviewer/src/displayed_image_transform.rs:261)
+
+   見開き範囲コピーはその raw bbox を `Proportional` transform に渡し直すため、選択可能境界が実際に描いた端から最大約 0.5 画面 px、縮小時には数 source px ずれます。[src/ui_fullscreen.rs:33436](C:/home/mimageviewer/src/ui_fullscreen.rs:33436) [src/ui_fullscreen.rs:33503](C:/home/mimageviewer/src/ui_fullscreen.rs:33503) B の「トリム全体を無視する」問題は直っていますが、**表示済み量子化境界との完全一致はまだありません**。
+
+   テストは `400 × 0.8` という整数境界を helper へ直接渡すため検出しません。[src/ui_fullscreen.rs:48358](C:/home/mimageviewer/src/ui_fullscreen.rs:48358)
+
+   detached single snapshot も full rect と raw bboxだけを持ち出して再構築するため、live から passive へ移る際に同じ差が戻ります。[src/ui_fullscreen.rs:10883](C:/home/mimageviewer/src/ui_fullscreen.rs:10883) [src/app.rs:41202](C:/home/mimageviewer/src/app.rs:41202) [src/ui_fullscreen.rs:11183](C:/home/mimageviewer/src/ui_fullscreen.rs:11183)
+
+5. **中: 連結読みの unit 間 gap は raw bbox と量子化済み bbox が混在します**
+
+   unit の visible width/height とスクロール offset は未量子化 `content_bbox` から計算されます。[src/ui_fullscreen.rs:3973](C:/home/mimageviewer/src/ui_fullscreen.rs:3973) [src/ui_fullscreen.rs:26898](C:/home/mimageviewer/src/ui_fullscreen.rs:26898) 後段 transform は bbox 辺を量子化しますが、追加 alignment は同じ2ページ unit 内の横方向だけです。[src/ui_fullscreen.rs:30273](C:/home/mimageviewer/src/ui_fullscreen.rs:30273)
+
+   そのため隣接 unit 間の実際の可視 gap は丸め誤差の差だけ最大ほぼ 1 physical px 変わり、gap=0 の非重なりも保証されません。production テストは単一の2ページ unit の内部 x-gap しか測っていません。
+
+6. **中: ソース検査テストは再発防止として不十分です**
+
+   テストは `promotion_started_at_for` の前後3行と、4種類の文字列比較だけを検査します。[src/app/tests.rs:33355](C:/home/mimageviewer/src/app/tests.rs:33355)
+
+   実際に取りこぼした disconnect 経路は anchor が [src/app.rs:64198](C:/home/mimageviewer/src/app.rs:64198)、述語が [src/app.rs:64203](C:/home/mimageviewer/src/app.rs:64203) と5行離れているため、ここを再び `fullscreen_idx == Some(key)` に戻してもテストは通ります。今回見つかった repaint scheduler や誤った partner resolver も `promotion_started_at_for` を含まないので完全に網外です。
+
+   `cancel → disconnect → 再表示時に再試行`、相方 completed upload の実適用、静止画＋相方 GIF の repaint、動画混在連結読みを lifecycle テストとして通すべきです。
+
+## その他の確認結果
+
+- 明示的な昇格判定 8 箇所は、現時点ではすべて `page_is_displayed` 系を通っています。通してはいけない frozen/passive 経路への誤適用もありません。
+- `rotate_bbox_to_source` と `forward_uv` / `inverse_uv` の 90・180・270 度往復は正しいです。[src/displayed_image_transform.rs:1053](C:/home/mimageviewer/src/displayed_image_transform.rs:1053)
+- `7c7a9f02` の二段化そのものには具体的退行を見つけませんでした。加工予算は unique idx 1件のままで、分割表示の同一 idx も同一フレームに2コマ進みません。[src/ui_fullscreen.rs:8039](C:/home/mimageviewer/src/ui_fullscreen.rs:8039) [src/ui_fullscreen.rs:27505](C:/home/mimageviewer/src/ui_fullscreen.rs:27505)
+- B の変更は単ページ範囲コピーと通常のコピー／書き出し pixel job には波及していません。[src/ui_fullscreen.rs:33513](C:/home/mimageviewer/src/ui_fullscreen.rs:33513) [src/ui_fullscreen.rs:33735](C:/home/mimageviewer/src/ui_fullscreen.rs:33735)
+- frozen 2 経路を今回その場で直さない判断、壊れた現状を passing test で固定しない判断は妥当です。ただし continuous frozen は trim を落とし、spread frozen は左右を独立再 snap する既知の P2 が残っています。[src/ui_fullscreen.rs:10791](C:/home/mimageviewer/src/ui_fullscreen.rs:10791) [src/ui_fullscreen.rs:11017](C:/home/mimageviewer/src/ui_fullscreen.rs:11017) 出荷するなら「live のみ修正済み」という明示的な例外扱いが必要です。
+- 2,430 件走査は production wiring ではなく helper 合成です。実 `draw_fs_spread` / `draw_fs_continuous_reading` のテストは、静止画2枚・trimなし・既定 DPI の単一 fixture に留まります。[src/ui_fullscreen.rs:36733](C:/home/mimageviewer/src/ui_fullscreen.rs:36733) [src/ui_fullscreen.rs:36815](C:/home/mimageviewer/src/ui_fullscreen.rs:36815)

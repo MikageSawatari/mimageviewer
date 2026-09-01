@@ -29,7 +29,7 @@ pub struct PageEditBundle {
     pub adjust: Option<AdjustParams>,
     pub mask: Option<EditMaskSnapshot>,
     pub conceal: Option<EditMaskSnapshot>,
-    pub local_adjust_layers: Option<Vec<LocalAdjustmentLayer>>,
+    pub local_adjust_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
     pub export_crop: Option<CropSettings>,
     pub comic: Option<Vec<AnnotationObject>>,
 }
@@ -77,7 +77,7 @@ pub struct PreparedPageEditBundle {
     pub adjust_json: Option<String>,
     pub mask: Option<PreparedEditMask>,
     pub conceal: Option<PreparedEditMask>,
-    pub local_adjust_layers: Option<Vec<LocalAdjustmentLayer>>,
+    pub local_adjust_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
     pub local_adjust_json: Option<String>,
     pub export_crop: Option<CropSettings>,
     pub comic: Option<Vec<AnnotationObject>>,
@@ -174,7 +174,8 @@ impl PageEditBundle {
             .local_adjust_layers
             .as_ref()
             .map(|layers| transform_local_adjust_layers(layers, target_size, length_scale))
-            .transpose()?;
+            .transpose()?
+            .map(local_adjust_core::LocalAdjustmentLayers::new);
 
         let export_crop = self.export_crop.map(|crop| {
             crop.with_legacy_source_size(self.source_size)
@@ -270,21 +271,25 @@ fn transform_local_adjust_layers(
     Ok(transformed)
 }
 
+/// サイズ変換の JSON 往復から原寸バッファを外して持っておく入れ物。
+///
+/// 中身は共有所有のまま持つ。ここで値へ落とすと、外した意味 (大きなバッファを
+/// 動かさない) が消える。
 enum DetachedMaskPayload {
     None,
-    Raster(Vec<f32>),
-    RasterVector(Vec<f32>),
+    Raster(local_adjust_core::MaskAlpha),
+    RasterVector(local_adjust_core::MaskAlpha),
     Subject {
-        alpha: Vec<f32>,
-        source_alpha: Option<Vec<f32>>,
+        alpha: local_adjust_core::MaskAlpha,
+        source_alpha: Option<local_adjust_core::MaskAlpha>,
     },
-    Segmentation(Vec<u32>),
+    Segmentation(local_adjust_core::MaskLabels),
 }
 
 struct DetachedLocalAdjustPayloads {
     mask: DetachedMaskPayload,
-    manual_add_alpha: Option<Vec<f32>>,
-    manual_subtract_alpha: Option<Vec<f32>>,
+    manual_add_alpha: Option<local_adjust_core::MaskAlpha>,
+    manual_subtract_alpha: Option<local_adjust_core::MaskAlpha>,
     cube_lut_table: Option<Vec<[f32; 3]>>,
 }
 
@@ -378,7 +383,7 @@ impl DetachedLocalAdjustPayloads {
 
 fn restore_manual_mask_alpha(
     mask: &mut Option<local_adjust_core::RasterVectorMask>,
-    alpha: Option<Vec<f32>>,
+    alpha: Option<local_adjust_core::MaskAlpha>,
     payload_mismatch: &impl Fn() -> String,
 ) -> Result<(), String> {
     match (mask.as_mut(), alpha) {
@@ -756,8 +761,10 @@ mod tests {
         let subject = local_adjust_core::SubjectMask {
             width: 2,
             height: 2,
-            alpha: vec![0.0, 0.25, 0.75, 1.0],
-            source_alpha: Some(vec![1.0, 0.75, 0.25, 0.0]),
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.25, 0.75, 1.0]),
+            source_alpha: Some(local_adjust_core::MaskAlpha::new(vec![
+                1.0, 0.75, 0.25, 0.0,
+            ])),
             refinement: local_adjust_core::SubjectMaskRefinement {
                 enabled: true,
                 threshold: 0.5,
@@ -782,7 +789,7 @@ mod tests {
         layer.manual_override.add = Some(local_adjust_core::RasterVectorMask {
             width: 2,
             height: 2,
-            alpha: vec![0.0, 1.0, 0.0, 1.0],
+            alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 0.0, 1.0]),
             shapes: vec![local_adjust_core::MaskShape::Line {
                 op: local_adjust_core::ShapeOp::Add,
                 kind: local_adjust_core::LineKind::Diagonal,
@@ -832,7 +839,7 @@ mod tests {
                 LocalMask::Raster(local_adjust_core::RasterMask {
                     width: 2,
                     height: 2,
-                    alpha: vec![0.0, 0.25, 0.75, 1.0],
+                    alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 0.25, 0.75, 1.0]),
                 }),
                 LocalEffect::None,
             ),
@@ -841,7 +848,7 @@ mod tests {
                 LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
                     width: 2,
                     height: 2,
-                    alpha: vec![0.0, 1.0, 1.0, 0.0],
+                    alpha: local_adjust_core::MaskAlpha::new(vec![0.0, 1.0, 1.0, 0.0]),
                     shapes: Vec::new(),
                 }),
                 LocalEffect::None,
@@ -851,7 +858,7 @@ mod tests {
                 LocalMask::Segmentation(local_adjust_core::RegionMask {
                     width: 2,
                     height: 2,
-                    labels: vec![0, 1, 1, 0],
+                    labels: local_adjust_core::MaskLabels::new(vec![0, 1, 1, 0]),
                     selected: vec![false, true],
                 }),
                 LocalEffect::None,
@@ -974,7 +981,7 @@ mod tests {
         let bundle = PageEditBundle {
             source_size: [2, 2],
             adjust: Some(replacement),
-            local_adjust_layers: Some(Vec::new()),
+            local_adjust_layers: Some(local_adjust_core::LocalAdjustmentLayers::default()),
             ..Default::default()
         };
         assert!(bundle.prepare().unwrap().apply_atomic(&paths, key).is_err());
@@ -984,5 +991,37 @@ mod tests {
                 .get_page_params(key),
             Some(old_adjust)
         );
+    }
+
+    /// 貼り付け束の補正レイヤーは共有所有 (`Arc`) で持つが、`local_adjust.db` へ入る
+    /// JSON は素の配列のまま。ここが包まれると、貼り付けた補正を次の起動で読めない。
+    #[test]
+    fn a_shared_local_adjust_document_still_prepares_as_a_plain_array() {
+        let layers =
+            local_adjust_core::LocalAdjustmentLayers::new(vec![LocalAdjustmentLayer::new(
+                "pasted",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )]);
+        let bundle = PageEditBundle {
+            source_size: [2, 2],
+            local_adjust_layers: Some(local_adjust_core::LocalAdjustmentLayers::clone(&layers)),
+            ..Default::default()
+        };
+
+        let json = bundle
+            .prepare()
+            .unwrap()
+            .local_adjust_json
+            .expect("非空の文書は JSON になる");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.is_array(),
+            "補正レイヤーは配列として書かれること: {json}"
+        );
+
+        // `local_adjust.db` の唯一の復元入口で読み戻せる (= 往復する)。
+        let restored = crate::local_adjust_db::parse_layers_json(&json).unwrap();
+        assert_eq!(restored.as_slice(), layers.as_slice());
     }
 }

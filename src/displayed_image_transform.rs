@@ -588,6 +588,15 @@ impl FullscreenPageLayout {
             .map(|(page, _)| page)
     }
 
+    /// 直近のフレームで**実際に描いたページ**の index。
+    ///
+    /// 「いま画面に出ているのはどれか」の読み取り専用の正本。見開きなら 2 枚、連結読みなら
+    /// 可視ユニットのぶんだけ入る。アニメーションの次コマ期限をここから集めることで、
+    /// 現在ページ以外のコマ送りが止まるのを防ぐ (§1.157、Codex Sol の指摘 1)。
+    pub(crate) fn page_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pages.iter().map(|page| page.transform.page_idx)
+    }
+
     pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
         self.pages.iter().find(|page| page.page_idx() == page_idx)
     }

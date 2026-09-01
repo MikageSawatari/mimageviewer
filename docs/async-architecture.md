@@ -78,6 +78,7 @@
 | 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_structure=true`) | `search_index.db` は SQLite 単独なので複数 supervisor が真並列で動く |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
 | タグ書き込みワーカー | `std::thread` (常駐) | 1 | UI の Toggle / Add / Remove / Clear / SetTags を serial に処理し、**`tags.db` だけ**を更新する。メディア本体 / XMP / Tantivy には書かない (`docs/tag-catalog-redesign-plan.md` D13)。サイドカー `mimageviewer.dat` へのミラーは結果を受けた UI スレッド側が行う |
+| 補正レイヤー書き込みワーカー | `std::thread` (常駐、最初の保存で遅延起動) | 1 | 補正レイヤー文書の直列化 (q8 量子化 → deflate → base64) + `local_adjust.db` 書き込み。24MP で 70.6ms、かつマスク系スライダーのドラッグ中は毎フレーム走っていた。**同じ page key は最新 generation だけ書く** (要求 1 件が原寸マスクを抱えるので、合体しないとキューにメモリが積み上がる)。サイドカー `mimageviewer.dat` へのミラーは、結果 (`EditStoreOutcome`) が `Committed` のときだけ UI スレッド側が行う (R-26、§5.7) |
 | タスクトレイ (v0.9) | `std::thread` (常駐) | 1 (設定 ON 時のみ) | `mimv-tray` スレッド。`tray-icon` クレートで隠し HWND を作成 → `PeekMessageW` ポンプ (50ms 周期) + `TrayIconEvent` / `MenuEvent` の try_recv → `TrayEvent::Open / TogglePause / Quit` を UI に送信。`ActivityGate::set_paused` + `GlobalIoSemaphore::set_throttled` はメインスレッドで適用 |
 
 **rayon は通常サムネイル生成には使っていない** (逐次ワーカーの方がキャンセル制御しやすいため)。
@@ -146,6 +147,7 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 | Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
 | `DebouncedChange` (notify-rs) | FsWatcher → supervisor | 500ms ウィンドウで集約した変更イベント (`favorite_id`, `path`, `ChangeKind`) |
 | `SupervisorCommand` | UI (`IndexerManager`) → supervisor | 一時停止 / 再開 / フル再スキャン要求 |
+| `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
 | `IndexerManager.writer` | 全書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。 ingest worker (Background) と tag_write_worker (Interactive) は `WriterJob::Upsert` / `Delete` / `Commit` / `Batch` を `submit` するだけで、writer に直接触らない (§5.5)。 |
 
 ### 2.3 ワーカーキュー
@@ -904,6 +906,81 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
 今回は諦める」) のみ。`try_lock` の後に sleep して再試行する構造は避ける。
 
 ---
+
+### 5.5.1 「同じ key の最新だけ」はチャネルでは作れない
+
+大きな値を運ぶ書き込みワーカーで「同じ key は最新だけ書く」を実現するとき、
+**チャネルへ積んでから取り出し時に古い方を捨てる形は合体になっていない**。
+捨てるまでキューが全要求を抱えたままなので、要求 1 件が大きいほど積み上がる
+(補正レイヤーは 24MP で 1 件 96MB)。
+
+`local_adjust_write_worker` は `Mutex + Condvar` で保護したキューを持ち、
+**key ごとに未処理の値を 1 つだけ**置く枠を別に持つ。同じ key の再要求はその枠を
+差し替えるので、古い値はその瞬間に落ちる。並び順は最初に積まれた位置のまま動かさない。
+
+### 5.5.2 残件カウンタで待ち合わせない
+
+「積んだ数と終わった数が一致するまで結果を受け取る」形はロストウェイクアップを作る。
+最後の結果を受け取った直後、ワーカーがカウンタを進める前にもう一度 `recv` すると、
+空で接続済みのチャネルを永久に待つ (カウンタの更新では起きない)。**カウンタを
+`send` の前に進めても後に進めても、どちらかの欠陥が残る**。
+
+`drain_blocking` は**フェンスを 1 つ積んで ACK を待つ**。ワーカーはキューを順に
+処理するので、ACK が返った時点でフェンスより前の要求はすべて終わっている。
+**ワーカーが panic しても待ち手が起きること**が要件で、drop guard が残った
+フェンスを落として `Disconnected` で起こす。
+
+### 5.5.3 止まったワーカーへ黙って積まない
+
+spawn 失敗と panic はどちらも「以後すべての書き込みが消える」に直結する。
+ハンドルが `Some` のまま残り、`submit` が送信失敗を無視すると、UI は成功したつもりで
+状態を進め続ける。`local_adjust_write_worker` は drop guard が生存フラグを落とし、
+`submit` は生きていなければ**その場で `EditStoreOutcome::Failed` を返す**ので、
+呼び出し側の失敗処理 (ミラーを書かない + 利用者へ伝える) がそのまま働く。
+
+`rating_write_worker` / `tag_write_worker` は従来のフラグ + ポーリング方式のまま。
+同型なので将来揃えてよいが、揃えていないこと自体は不具合ではない。
+
+### 5.7 非同期にした保存で「開けなかった」を「書けた」にしない (R-26)
+
+編集の正本 DB 書き込みは `EditStoreOutcome` (`Committed` / `Unavailable` / `Failed`)
+を返す。**`Unavailable` を `Committed` と同じに扱わないこと。**presence を立てて
+サイドカーへミラーすると、次回起動の `import_to_dbs` が「中央が authoritative」として
+その サイドカーを捨て、**利用者にはエラーもトーストも出ないまま編集が消える**
+(`b8cb3ce5`)。
+
+保存を worker へ出すと**成否が後から返る**ので、同期版が持っていた
+「書けたときだけミラーを書く」という順序がそのままでは成り立たない。補正レイヤーでは
+判断を 1 か所 (`App::apply_local_adjust_write_completion`) に集約して保った:
+
+| 結果 | サイドカーミラー | トースト | 画面 |
+| --- | --- | --- | --- |
+| `Committed` | **worker が書いた文書**を写す | なし | そのまま |
+| `Unavailable` / `Failed` | 書かない | 出す | そのまま (やり直せる) |
+
+**古い generation の完了も同じように処理する。**完了は key ごとに順に届くので、
+受理された古い完了を「新しい要求が控えているから」と捨てると、その新しい要求が
+失敗したときに**正本には古い内容があるのに sidecar には何も無い**状態で止まる。
+記録を畳むのは最新の完了だけにする (古い完了で畳むと、後から届く最新の完了が
+ミラー先を失う)。
+
+非同期化で新しく必要になった点が 3 つある。**同じ形の保存を非同期にするときは
+どれも要る**:
+
+1. **ミラー先の座標は積む時点で固定する。**完了が返る頃には一覧 idx が別のページを
+   指し得るので、そのとき解決し直すと無関係なページへ書く
+   (`with_sidecar_coords_mut` がこの用途)。idx 依存の後続処理は
+   `page_path_key(idx)` が同じ key を返すときだけ走らせる。
+2. **worker を経由しない同 DB 操作の前に drain / gate する。**製本ページの key 付け替え
+   (`copy_entry_key` / `move_entry_key`) は UI スレッドが直接書くので、待たずに
+   走らせると「付け替えの後に古い key の保存が着地して行を書き戻す」順序が起き得る。
+   同期保存だった頃は構造的に起きなかった。**既存の直接書き込み barrier
+   (`rename_migration_writers_busy`) にも自分を足すこと** — こちらは待つのではなく
+   「終わるまで始めない」形。未回収の完了も「終わっていない」に数える (完了を適用すると
+   サイドカーへミラーが書かれるため)。
+3. **終了経路で在庫を書き切ってからサイドカーを flush する。**正本は worker が
+   drain-on-shutdown で書き切るので編集自体は消えないが、飛ばすとサイドカー
+   (フォルダ移動時の復元源) だけが古くなる。
 
 ### 5.6 タスクトレイ常駐 + インデクサ throttle / pause (v0.9)
 

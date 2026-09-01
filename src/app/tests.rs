@@ -15408,6 +15408,367 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    // ── 補正レイヤー保存を worker へ出しても R-26 の境界は動かない ──────────
+    //
+    // 保存は積むだけで戻り、成否は後から返る。同期版が「正本が受理したときだけ
+    // サイドカーを書く」順序で守っていた境界を、非同期でも同じ順序で保つ。
+    // 以下は `App::apply_local_adjust_write_completion` の状態遷移を、成功経路と
+    // **失敗経路の両方**で固定する。
+
+    fn local_adjust_doc(name: &str) -> local_adjust_core::LocalAdjustmentLayers {
+        local_adjust_core::LocalAdjustmentLayers::new(vec![
+            local_adjust_core::LocalAdjustmentLayer::new(
+                name,
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            ),
+        ])
+    }
+
+    /// サイドカーを持てる実在フォルダの 1 ページを用意する。
+    fn app_with_one_page_for_local_adjust() -> (phase_c_support::AppTestEnv, PathBuf) {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("pics");
+        std::fs::create_dir_all(&folder).unwrap();
+        let image = folder.join("page.png");
+        std::fs::write(&image, b"x").unwrap();
+        app.settings.sidecar_backup_enabled = true;
+        app.items = vec![GridItem::Image(image)];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        (app, folder)
+    }
+
+    /// 唯一積まれている保存の (key, generation)。
+    fn only_pending_local_adjust_write(app: &App) -> (String, u64) {
+        assert_eq!(app.local_adjust_write_pending.len(), 1);
+        app.local_adjust_write_pending
+            .iter()
+            .map(|(key, pending)| (key.clone(), pending.generation))
+            .next()
+            .unwrap()
+    }
+
+    fn mirrored_local_adjust(
+        app: &App,
+        folder: &Path,
+    ) -> Option<local_adjust_core::LocalAdjustmentLayers> {
+        app.sidecars.get(folder).and_then(|sidecar| {
+            sidecar
+                .items()
+                .values()
+                .find_map(|entry| entry.local_adjust_layers.clone())
+        })
+    }
+
+    /// 積んだ時点ではまだ**サイドカーを書かない**。
+    ///
+    /// ここで書いてしまうと、正本が受け取らなかった編集を「保存済み」と主張することに
+    /// なる。次回起動の import は「中央が authoritative」なので、中央に古い行があると
+    /// その sidecar を捨てる = 利用者には何も出ないまま編集が消える。
+    #[test]
+    fn enqueueing_a_local_adjust_save_updates_the_screen_but_not_the_sidecar() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+
+        assert!(
+            app.local_adjust_pages.contains(&0),
+            "編集は即座に画面へ出る"
+        );
+        assert!(
+            !app.local_adjust_page_keys.is_empty(),
+            "バッジ用の presence も即座に立つ"
+        );
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "正本の返事を待たずにサイドカーへ写している"
+        );
+        assert_eq!(
+            app.local_adjust_write_pending.len(),
+            1,
+            "完了を照合するための記録が残っていない"
+        );
+    }
+
+    /// 正本が受理したら、**worker が実際に書いた文書**をサイドカーへ写す。
+    ///
+    /// メモリから取り直すと、積んでから完了までの間に入った編集を「保存済み」として
+    /// 写してしまう (書いた内容とミラーがずれる)。
+    #[test]
+    fn a_committed_write_mirrors_exactly_the_document_that_was_written() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("enqueued"));
+        let (key, generation) = only_pending_local_adjust_write(&app);
+        // 完了までの間にもう一度編集された状況を作る。写るのは worker が書いた方。
+        app.set_local_adjust_layers_for_idx_memory_only(0, local_adjust_doc("later"));
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation,
+                layers: local_adjust_doc("written"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+
+        assert_eq!(
+            mirrored_local_adjust(&app, &folder)
+                .expect("受理された編集はサイドカーへ写る")
+                .as_slice(),
+            local_adjust_doc("written").as_slice(),
+            "書いた文書ではなく、その後のメモリを写している"
+        );
+        assert!(
+            app.local_adjust_write_pending.is_empty(),
+            "完了した記録が残り続けている"
+        );
+    }
+
+    /// **正本を開けなかった**とき。サイドカーへは書かず、利用者に伝える。
+    ///
+    /// 同期版の `Unavailable` は「起動時に開けなかった」だったが、worker 版では
+    /// 「書き手が開けなかった」になる。呼び出し側の扱いは同じでなければならない。
+    #[test]
+    fn a_write_with_no_store_open_is_not_mirrored_and_is_reported() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+        let (key, generation) = only_pending_local_adjust_write(&app);
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation,
+                layers: local_adjust_doc("edited"),
+                outcome: crate::app::EditStoreOutcome::Unavailable,
+            },
+        );
+
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "正本を開けていないのにサイドカーへ写している (次回起動時に古い正本が勝つ)"
+        );
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存できなかったことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(
+            app.local_adjust_pages.contains(&0),
+            "保存できなかっただけで、編集が画面から消えている"
+        );
+    }
+
+    /// **正本が拒否した**とき。扱いは開けなかったときと同じ。
+    #[test]
+    fn a_refused_write_is_not_mirrored_and_is_reported() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+        let (key, generation) = only_pending_local_adjust_write(&app);
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation,
+                layers: local_adjust_doc("edited"),
+                outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
+            },
+        );
+
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "正本が受け取らなかった編集をサイドカーへ写している"
+        );
+        assert!(
+            toast_text(&app).contains("disk full"),
+            "拒否の理由が利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(app.local_adjust_pages.contains(&0));
+    }
+
+    /// 積めなかった保存は**その場で失敗として扱う**。
+    ///
+    /// worker が止まっていると、積んだつもりの保存は正本に何も書かない。黙って
+    /// 受け付けると、画面には編集が残ったまま保存されていない状態が続く。
+    #[test]
+    fn a_save_the_worker_could_not_take_is_reported_and_not_mirrored() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        // worker を先に用意し、抜けた状態にしてから保存する。
+        app.ensure_local_adjust_write_handle();
+        app.local_adjust_write_handle
+            .as_ref()
+            .unwrap()
+            .mark_worker_stopped_for_test();
+
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "積めていない保存をサイドカーへ写している"
+        );
+        assert!(
+            toast_text(&app).contains("保存できませんでした"),
+            "保存できなかったことが利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(
+            app.local_adjust_write_pending.is_empty(),
+            "着地しない保存の記録が残り続けている"
+        );
+        assert!(
+            app.local_adjust_pages.contains(&0),
+            "保存できなかっただけで、編集が画面から消えている"
+        );
+    }
+
+    /// 新しい保存が控えていても、**受理された古い完了は publish する**。
+    ///
+    /// worker は key ごとに順に書くので完了は古い順に届く。ここで古い完了を捨てると、
+    /// 次の完了が失敗したときに「正本には古い内容があるのに sidecar には何も無い」
+    /// 状態で止まる (2026-08-31 Codex P2)。下の合成遷移テストがその筋を通しで見る。
+    #[test]
+    fn an_older_committed_completion_still_publishes_while_a_newer_save_is_pending() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("first"));
+        let (key, stale_generation) = only_pending_local_adjust_write(&app);
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("second"));
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key: key.clone(),
+                generation: stale_generation,
+                layers: local_adjust_doc("first"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+
+        assert_eq!(
+            mirrored_local_adjust(&app, &folder)
+                .expect("受理された内容はサイドカーへ写る")
+                .as_slice(),
+            local_adjust_doc("first").as_slice(),
+            "正本が受理した内容がサイドカーに無い"
+        );
+        assert!(
+            app.local_adjust_write_pending.contains_key(&key),
+            "新しい保存の記録まで畳んでいる (その完了がミラー先を失う)"
+        );
+    }
+
+    /// **合成遷移**: 古い保存が受理され、新しい保存が失敗する。
+    ///
+    /// この順序でサイドカーが空のまま残ると、正本 (古い内容あり) と食い違ったまま
+    /// 次の保存まで直らない。フォルダを移すとその古い内容も復元できない。
+    #[test]
+    fn a_committed_save_stays_mirrored_when_the_next_save_fails() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("committed"));
+        let (key, committed_generation) = only_pending_local_adjust_write(&app);
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("doomed"));
+        let (_, doomed_generation) = only_pending_local_adjust_write(&app);
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key: key.clone(),
+                generation: committed_generation,
+                layers: local_adjust_doc("committed"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation: doomed_generation,
+                layers: local_adjust_doc("doomed"),
+                outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
+            },
+        );
+
+        assert_eq!(
+            mirrored_local_adjust(&app, &folder)
+                .expect("受理された内容が残っていない")
+                .as_slice(),
+            local_adjust_doc("committed").as_slice(),
+            "失敗した保存が、受理済みのミラーを消している / 上書きしている"
+        );
+        assert!(
+            toast_text(&app).contains("disk full"),
+            "失敗が利用者に伝わっていない: {:?}",
+            toast_text(&app)
+        );
+        assert!(app.local_adjust_write_pending.is_empty());
+    }
+
+    /// 空の文書を受理したら、サイドカーからも消す。
+    #[test]
+    fn a_committed_empty_document_removes_the_sidecar_entry() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+        let (key, generation) = only_pending_local_adjust_write(&app);
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key: key.clone(),
+                generation,
+                layers: local_adjust_doc("edited"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+        assert!(mirrored_local_adjust(&app, &folder).is_some());
+
+        app.set_local_adjust_layers_for_idx(0, local_adjust_core::LocalAdjustmentLayers::default());
+        let generation = app.local_adjust_write_pending[&key].generation;
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation,
+                layers: local_adjust_core::LocalAdjustmentLayers::default(),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_none(),
+            "全削除がサイドカーへ伝わっていない"
+        );
+    }
+
+    /// ミラー先は**積んだ時点で固定**する。
+    ///
+    /// 完了が返る頃には一覧の idx が別のページを指し得る。そのとき解決し直すと、
+    /// 無関係なページのサイドカーへ書き込む。
+    #[test]
+    fn the_mirror_target_is_the_one_fixed_when_the_save_was_enqueued() {
+        let (mut app, folder) = app_with_one_page_for_local_adjust();
+        app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
+        let (key, generation) = only_pending_local_adjust_write(&app);
+
+        // 一覧が入れ替わり、idx 0 は別フォルダの別ページを指すようになった。
+        let other = app.tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_image = other.join("elsewhere.png");
+        std::fs::write(&other_image, b"y").unwrap();
+        app.items = vec![GridItem::Image(other_image)];
+
+        app.apply_local_adjust_write_completion(
+            crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
+                key,
+                generation,
+                layers: local_adjust_doc("written"),
+                outcome: crate::app::EditStoreOutcome::Committed,
+            },
+        );
+
+        assert!(
+            mirrored_local_adjust(&app, &folder).is_some(),
+            "積んだ時点のフォルダへ写っていない"
+        );
+        assert!(
+            mirrored_local_adjust(&app, &other).is_none(),
+            "完了時の idx で解決し直し、無関係なページへ書いている"
+        );
+    }
+
     #[test]
     fn delete_mask_shortcuts_remove_existing_masks_and_clear_caches() {
         let ctx = egui::Context::default();
@@ -16261,7 +16622,7 @@ mod favorite_adjustment_defaults_tests {
         app.set_local_adjust_layers_for_idx_with_undo(
             idx,
             before,
-            vec![layer],
+            Arc::new(vec![layer]),
             "test local adjust".to_string(),
         );
         assert_eq!(app.local_adjust_page_layers.get(&idx).unwrap().len(), 1);
@@ -27411,9 +27772,9 @@ mod favorite_adjustment_defaults_tests {
         app.local_adjust_selected_shape = Some(0);
         app.local_adjust_mask_shape_drag_start = Some([0.1, 0.1]);
         app.local_adjust_mask_shape_drag_end = Some([0.3, 0.3]);
-        app.local_adjust_shape_drag_before_layers = Some(Vec::new());
-        app.local_adjust_canvas_drag_before_layers = Some(Vec::new());
-        app.local_adjust_mask_brush_before_layers = Some(Vec::new());
+        app.local_adjust_shape_drag_before_layers = Some(Arc::new(Vec::new()));
+        app.local_adjust_canvas_drag_before_layers = Some(Arc::new(Vec::new()));
+        app.local_adjust_mask_brush_before_layers = Some(Arc::new(Vec::new()));
         app.local_adjust_selective_color_pick_active = true;
 
         app.switch_local_adjust_target_in_spread(1);
@@ -27957,16 +28318,17 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!((a, b, c), (0, 1, 2));
 
         app.local_adjust_page_layers
-            .insert(a, vec![layer("A0"), layer("A1")]);
+            .insert(a, Arc::new(vec![layer("A0"), layer("A1")]));
         app.local_adjust_pages.insert(a);
         app.local_adjust_selected_layers.insert(a, 1);
 
-        app.local_adjust_page_layers.insert(b, vec![layer("B0")]);
+        app.local_adjust_page_layers
+            .insert(b, Arc::new(vec![layer("B0")]));
         app.local_adjust_pages.insert(b);
         app.local_adjust_selected_layers.insert(b, 0);
 
         app.local_adjust_page_layers
-            .insert(c, vec![layer("C0"), layer("C1"), layer("C2")]);
+            .insert(c, Arc::new(vec![layer("C0"), layer("C1"), layer("C2")]));
         app.local_adjust_pages.insert(c);
         app.local_adjust_selected_layers.insert(c, 2);
 
@@ -28006,11 +28368,11 @@ mod favorite_adjustment_defaults_tests {
         // b は 1 layer だが選択 idx を意図的に過大 (5) にしておく。
         app.local_adjust_page_layers.insert(
             b,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "B0",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(b);
         app.local_adjust_selected_layers.insert(b, 5);
@@ -28070,11 +28432,11 @@ mod favorite_adjustment_defaults_tests {
 
         app.local_adjust_page_layers.insert(
             a,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "stale",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(a);
         app.local_adjust_selected_layers.insert(a, 0);
@@ -28090,7 +28452,12 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.local_adjust_selected_layers.is_empty());
 
         assert!(app.load_local_adjust_layers_for_book_snapshot_sync(b));
-        assert_eq!(app.local_adjust_page_layers.get(&b), Some(&layers));
+        assert_eq!(
+            app.local_adjust_page_layers
+                .get(&b)
+                .map(|stored| stored.as_slice()),
+            Some(layers.as_slice())
+        );
     }
 
     /// Codex P1: snapshot 有効化で items を subset へ差し替えたら、idx-keyed なページ編集
@@ -28240,11 +28607,11 @@ mod favorite_adjustment_defaults_tests {
             .insert(0, params_with_brightness(5.0));
         app.local_adjust_page_layers.insert(
             0,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "L",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::None,
-            )],
+            )]),
         );
         app.local_adjust_pages.insert(0);
         app.local_adjust_selected_layers.insert(0, 3);
@@ -29018,7 +29385,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/layer-bypass.jpg");
         app.local_adjust_page_layers.insert(
             idx,
-            vec![
+            Arc::new(vec![
                 local_adjust_core::LocalAdjustmentLayer::new(
                     "A",
                     local_adjust_core::LocalMask::Full,
@@ -29034,7 +29401,7 @@ mod pipeline_cache_refactor_tests {
                     local_adjust_core::LocalMask::Full,
                     local_adjust_core::LocalEffect::None,
                 ),
-            ],
+            ]),
         );
 
         let preview_layers = app
@@ -30141,7 +30508,7 @@ mod pipeline_cache_refactor_tests {
         assert!(crate::colorize::is_near_monochrome(&edited, 12));
 
         install_raw_static_source(&mut app, &ctx, idx, "gate_local_desaturate_raw", raw);
-        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![layer]);
+        app.set_local_adjust_layers_for_idx_memory_only(idx, Arc::new(vec![layer]));
         install_colorize_summary_edit_result(&mut app, idx, edited);
         app.fullscreen_idx = Some(idx);
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -30235,14 +30602,14 @@ mod pipeline_cache_refactor_tests {
         );
         app.set_local_adjust_layers_for_idx_memory_only(
             idx,
-            vec![local_adjust_core::LocalAdjustmentLayer::new(
+            Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
                 "pending-local-adjust",
                 local_adjust_core::LocalMask::Full,
                 local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
                     saturation: -100.0,
                     ..Default::default()
                 }),
-            )],
+            )]),
         );
         app.fullscreen_idx = Some(idx);
 
@@ -31412,7 +31779,10 @@ mod pipeline_cache_refactor_tests {
         let (edit_key, final_key) =
             insert_edit_and_final_cache(&mut app, &ctx, idx, "brush_defer_final");
 
-        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(
+            idx,
+            Arc::new(vec![brush_layer()]),
+        );
         let pending = app
             .local_adjust_brush_deferred_render
             .expect("brush render should be deferred");
@@ -31449,11 +31819,14 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/pipeline-brush-release.jpg");
 
-        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(
+            idx,
+            Arc::new(vec![brush_layer()]),
+        );
         let pending = app
             .local_adjust_brush_deferred_render
             .expect("brush render should be deferred");
-        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![brush_layer()]);
+        app.set_local_adjust_layers_for_idx_memory_only(idx, Arc::new(vec![brush_layer()]));
 
         assert_eq!(app.local_adjust_generation.get(&idx), Some(&1));
         assert!(app.local_adjust_brush_deferred_render.is_none());
@@ -31580,7 +31953,8 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-lab-parity.jpg");
         let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
-        app.local_adjust_page_layers.insert(idx, layers.clone());
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(layers.clone()));
 
         // 各 layer_idx について、mIV と lab で同じ (name, enabled) 並びになる
         for layer_idx in 0..layers.len() {
@@ -31625,7 +31999,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-boundaries.jpg");
         let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
-        app.local_adjust_page_layers.insert(idx, layers);
+        app.local_adjust_page_layers.insert(idx, Arc::new(layers));
 
         // layer_count = 0 → None
         assert!(
@@ -31668,7 +32042,7 @@ mod pipeline_cache_refactor_tests {
 
         // ケース 1: 唯一のレイヤーを bypass → 残り 0
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("only")]);
+            .insert(idx, Arc::new(vec![full_layer("only")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 0)
                 .is_none(),
@@ -31679,7 +32053,7 @@ mod pipeline_cache_refactor_tests {
         let mut a = full_layer("A");
         a.enabled = false;
         app.local_adjust_page_layers
-            .insert(idx, vec![a, full_layer("B")]);
+            .insert(idx, Arc::new(vec![a, full_layer("B")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
                 .is_none(),
@@ -31690,7 +32064,7 @@ mod pipeline_cache_refactor_tests {
         let mut zero_op = full_layer("zero");
         zero_op.opacity = 0.0;
         app.local_adjust_page_layers
-            .insert(idx, vec![zero_op, full_layer("real")]);
+            .insert(idx, Arc::new(vec![zero_op, full_layer("real")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
                 .is_none(),
@@ -31699,7 +32073,7 @@ mod pipeline_cache_refactor_tests {
 
         // ケース 4: 範囲外 idx → None
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("a"), full_layer("b")]);
+            .insert(idx, Arc::new(vec![full_layer("a"), full_layer("b")]));
         assert!(
             app.local_adjust_layers_with_selected_layer_bypassed(idx, 99)
                 .is_none(),
@@ -31814,7 +32188,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/cancel-bypass.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
@@ -31850,7 +32224,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/cancel-keep-this.jpg");
         let other_idx = push_image(&mut app, "C:/pics/cancel-keep-other.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
@@ -31893,7 +32267,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-cache.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         // cache に同 key を仕込む
         let ctx = egui::Context::default();
@@ -31930,7 +32304,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-same-key.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let result_key = app.current_local_adjust_key(idx);
         let layer_idx = 1usize;
@@ -31960,7 +32334,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/bypass-guard-no-layers.jpg");
         // 単一 layer のみ → bypass すると残り 0 → None
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("only")]);
+            .insert(idx, Arc::new(vec![full_layer("only")]));
 
         // 別 key の pending を立てておく → guard で抜けたかの判定材料
         let mut other_key = app.current_local_adjust_key(idx);
@@ -31990,7 +32364,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/bypass-guard-no-source.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         // mask_pages に入れる → current_local_adjust_source_pixels が None
         app.mask_pages.insert(idx);
 
@@ -32030,7 +32404,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-cache.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let ctx = egui::Context::default();
         let key = app.current_local_adjust_prefix_preview_key(idx, 1);
@@ -32064,7 +32438,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-same-key.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let result_key = app.current_local_adjust_key(idx);
         let layer_count = 1usize;
@@ -32092,7 +32466,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-boundaries.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
 
         let mut other_key = app.current_local_adjust_key(idx);
         other_key.idx = idx + 100;
@@ -32233,7 +32607,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/prefix-guard-no-source.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         app.mask_pages.insert(idx);
 
         let mut other_key = app.current_local_adjust_key(idx);
@@ -33281,6 +33655,165 @@ mod pipeline_cache_refactor_tests {
             },
         );
         texture_id
+    }
+
+    /// 見開きの**相方**もアニメの全フレーム昇格の対象になる。
+    ///
+    /// 昇格は `fullscreen_idx` の 1 枚だけを見ていたので、見開きの相方は第 1 フレームのまま
+    /// 止まっていた (`advance_animation` は左右とも呼ばれるが、進めるフレームが無い)。
+    /// 一覧から開いた直後は片方だけ動き、行き来すると動き出す — 相方は自分が
+    /// `fullscreen_idx` になったときに初めて昇格し、以後キャッシュに残るため。
+    #[test]
+    fn a_spread_partner_animation_is_promoted_too() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, r"C:\missing\left.gif");
+        let right = push_image(&mut app, r"C:\missing\right.gif");
+        // 見開きの相方解決は表示順 (`visible_indices`) から組む。
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.page_is_displayed_now(left),
+            "現在ページが表示中と判定されない"
+        );
+        assert!(
+            app.page_is_displayed_now(right),
+            "見開きの相方が表示中と判定されない (昇格対象から外れる)"
+        );
+
+        // 単ページ表示に戻せば相方はもう表示中ではない。
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        assert!(app.page_is_displayed_now(left));
+        assert!(
+            !app.page_is_displayed_now(right),
+            "単ページなのに隣まで表示中と判定している"
+        );
+    }
+
+    /// 相方の昇格が、**開始と同時にキャンセルされない**。
+    ///
+    /// 「表示中のページの昇格だけ生かす」規則を 4 か所に別々に綴っていたため、開始のガードを
+    /// 直しても、先読みウィンドウの 2 つのキャンセル経路が相方の昇格を毎フレーム殺していた。
+    /// 一覧から開いた直後に相方が動かないのはこれ (§1.157)。
+    #[test]
+    fn a_spread_partner_promotion_is_not_cancelled_by_the_prefetch_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, "C:/missing/left.gif");
+        let right = push_image(&mut app, "C:/missing/right.gif");
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.start_animation_promotion_if_needed(right),
+            "相方の昇格が開始されない"
+        );
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "開始直後に pending が無い"
+        );
+
+        app.update_prefetch_window(left);
+
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "先読みウィンドウが相方の昇格をキャンセルしている"
+        );
+    }
+
+    /// 連結読みでは、相方も**動画を除いた静止画列**から解く。
+    ///
+    /// 連結読みの unit は静止画だけで組まれるので、動画が間に挟まった並びでは通常ナビ列と
+    /// 答えが変わる。相方判定だけ違う列を見ていると、表示中でないページを表示中と誤り、
+    /// 本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+    #[test]
+    fn a_continuous_spread_partner_skips_videos_like_the_units_do() {
+        let mut app = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.gif");
+        app.items
+            .push(GridItem::Video(PathBuf::from("C:/pics/clip.mp4")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let video = app.items.len() - 1;
+        let right = push_image(&mut app, "C:/pics/b.gif");
+        app.visible_indices = vec![left, video, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+
+        // 通常 (ページ送り) では動画も並びに入るので、左の相方は動画側。
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        assert_ne!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "通常ナビで静止画列を使ってしまっている"
+        );
+
+        // 連結読みでは動画を飛ばして静止画同士が 1 unit になる。
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        assert_eq!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "連結読みなのに動画を含む並びで相方を解いている"
+        );
+    }
+
+    /// **「表示中のページの昇格だけ生かす」規則の綴りは 1 つだけ。**
+    ///
+    /// この規則は 8 か所に散っており、2 度に分けて直そうとして 2 度とも取りこぼした
+    /// (§1.157)。`current_idx` / `fullscreen_idx` と直接比べている書き方が新しく生えたら、
+    /// また同じことが起きる。**共有述語を経由していない綴りをここで禁止する。**
+    #[test]
+    fn promotion_only_asks_one_predicate_whether_a_page_is_displayed() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for relative in ["src/app.rs", "src/ui_fullscreen.rs"] {
+            let source = std::fs::read_to_string(manifest_dir.join(relative))
+                .expect("read Rust source as UTF-8");
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("promotion_started_at_for") {
+                    continue;
+                }
+                // 判定は anchor の少し後ろに書かれる。**コメントを挟むと離れる** ので広めに
+                // 取り、コメント行は落としてから見る (実際に取りこぼした disconnect 経路は、
+                // 説明コメント 4 行を挟んで 5 行下にあり、前後 3 行の窓では素通りしていた
+                // — Codex Sol の指摘 6)。
+                let from = index.saturating_sub(8);
+                let to = (index + 24).min(lines.len());
+                let window = lines[from..to]
+                    .iter()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let compares_directly = window.contains("!= current_idx")
+                    || window.contains("== current_idx")
+                    || window.contains("!= Some(key)")
+                    || window.contains("== Some(key)")
+                    || window.contains("fullscreen_idx == Some")
+                    || window.contains("fullscreen_idx != Some");
+                if compares_directly && !window.contains("page_is_displayed") {
+                    offenders.push(format!("{relative}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "昇格の可視判定を共有述語 (`page_is_displayed`) を通さずに綴っている箇所:
+{}",
+            offenders.join(
+                "
+"
+            )
+        );
     }
 
     #[test]
@@ -35101,7 +35634,7 @@ mod pipeline_cache_refactor_tests {
         let mut disabled = full_layer("d");
         disabled.enabled = false;
         app.local_adjust_page_layers
-            .insert(idx, vec![disabled.clone()]);
+            .insert(idx, Arc::new(vec![disabled.clone()]));
         assert!(
             !app.has_active_local_adjust_layers(idx),
             "all-disabled => not active"
@@ -35110,7 +35643,8 @@ mod pipeline_cache_refactor_tests {
         // opacity=0 のみ
         let mut zero = full_layer("z");
         zero.opacity = 0.0;
-        app.local_adjust_page_layers.insert(idx, vec![zero.clone()]);
+        app.local_adjust_page_layers
+            .insert(idx, Arc::new(vec![zero.clone()]));
         assert!(
             !app.has_active_local_adjust_layers(idx),
             "opacity=0 only => not active"
@@ -35118,7 +35652,7 @@ mod pipeline_cache_refactor_tests {
 
         // 1 つでも enabled && opacity>0 があれば active
         app.local_adjust_page_layers
-            .insert(idx, vec![disabled, zero, full_layer("real")]);
+            .insert(idx, Arc::new(vec![disabled, zero, full_layer("real")]));
         assert!(
             app.has_active_local_adjust_layers(idx),
             "any enabled & opaque layer => active"
@@ -35182,7 +35716,7 @@ mod pipeline_cache_refactor_tests {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/poll-stale.jpg");
         app.local_adjust_page_layers
-            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+            .insert(idx, Arc::new(vec![full_layer("A"), full_layer("B")]));
         let old_result_key = app.current_local_adjust_key(idx);
 
         let (bypass_pending, _bypass_cancel, bypass_tx) =
@@ -35431,7 +35965,7 @@ mod pipeline_display_edit_split_tests {
             egui::Color32::from_rgb(1, 2, 3),
         );
         app.local_adjust_page_layers
-            .insert(idx, vec![active_tone_layer()]);
+            .insert(idx, Arc::new(vec![active_tone_layer()]));
 
         assert!(
             app.current_conceal_source_pixels(idx).is_none(),
@@ -35504,7 +36038,7 @@ mod edit_materialize_worker_tests {
                 ready: Some(EditMaterializeResult::Ready {
                     request,
                     payload: EditMaterializePayload::LocalReady {
-                        layers: vec![active_layer()],
+                        layers: Arc::new(vec![active_layer()]),
                         image,
                     },
                 }),
@@ -35592,7 +36126,7 @@ mod edit_materialize_worker_tests {
             },
         );
         app.local_adjust_page_layers
-            .insert(idx, vec![active_layer()]);
+            .insert(idx, Arc::new(vec![active_layer()]));
         app.local_adjust_pages.insert(idx);
         let request = local_request(&app, idx);
         let (tx, rx) = mpsc::channel();
@@ -45570,6 +46104,35 @@ mod still_window_mode_key_tests {
         );
 
         app.book_bookmark_pending_requests.clear();
+        assert!(!app.rename_migration_writers_busy());
+    }
+
+    /// リネーム移行は補正レイヤーの保存も待つ。
+    ///
+    /// 保存は worker 経由、key の付け替えは UI スレッドが直接 `local_adjust.db` を
+    /// 書き換える。待たずに始めると、移した後に古い key の保存が着地して行を復活させる。
+    /// **未回収の完了も「まだ終わっていない」に数える** — 完了を適用するとサイドカーへ
+    /// ミラーが書かれるため (2026-08-31 Codex P1)。
+    #[test]
+    fn rename_migration_waits_for_the_local_adjust_write_worker() {
+        let mut app = setup_app();
+        assert!(!app.rename_migration_writers_busy());
+
+        // 積んだが完了を回収していない状態。
+        app.local_adjust_write_pending.insert(
+            "c:/pics/page.png".to_string(),
+            crate::app::LocalAdjustWritePending {
+                generation: 1,
+                idx: 0,
+                sidecar: None,
+            },
+        );
+        assert!(
+            app.rename_migration_writers_busy(),
+            "付け替えが、着地していない補正レイヤーの保存を追い越している"
+        );
+
+        app.local_adjust_write_pending.clear();
         assert!(!app.rename_migration_writers_busy());
     }
 

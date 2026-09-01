@@ -108,6 +108,29 @@ impl<'a> RgbaImageRef<'a> {
     }
 }
 
+/// A source-resolution alpha buffer, held by shared ownership.
+///
+/// At 24 MP this is 96 MB. A layer can hold several (base mask, subject matte and
+/// its source copy, two manual override masks), and `LocalAdjustmentLayer::clone`
+/// runs on paths that execute **every frame** -- the panel editor needs an owned
+/// value for egui to write scalars into. Copying the pixels there costs hundreds of
+/// megabytes per frame while nothing about them changes.
+///
+/// So the pixels are shared and the writer pays for a copy through `Arc::make_mut`.
+/// **Hoist that call out of pixel loops**: calling it per pixel copies per pixel.
+pub type MaskAlpha = std::sync::Arc<Vec<f32>>;
+
+/// Region labels, shared for the same reason as [`MaskAlpha`].
+pub type MaskLabels = std::sync::Arc<Vec<u32>>;
+
+/// One page's worth of local adjustment layers, held by shared ownership.
+///
+/// Every layer can carry a source-resolution `Vec<f32>` mask (96 MB for a 24 MP image).
+/// Saving, undo history and the sidecar mirror all need "the document as it was", but only
+/// one place ever writes it, so the document is handed out as an `Arc` and the writer alone
+/// pays for a copy through `Arc::make_mut`. This is the same shape as `SidecarFile::items`.
+pub type LocalAdjustmentLayers = std::sync::Arc<Vec<LocalAdjustmentLayer>>;
+
 /// A non-destructive local adjustment layer.
 ///
 /// Serialization contract: fields that represent lengths in source-image pixels must end in
@@ -218,7 +241,7 @@ pub struct RasterMask {
     pub width: usize,
     pub height: usize,
     #[serde(with = "crate::mask_codec::alpha")]
-    pub alpha: Vec<f32>,
+    pub alpha: MaskAlpha,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -257,13 +280,13 @@ pub struct SubjectMask {
     pub width: usize,
     pub height: usize,
     #[serde(with = "crate::mask_codec::alpha")]
-    pub alpha: Vec<f32>,
+    pub alpha: MaskAlpha,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::mask_codec::alpha_opt"
     )]
-    pub source_alpha: Option<Vec<f32>>,
+    pub source_alpha: Option<MaskAlpha>,
     #[serde(default)]
     pub refinement: SubjectMaskRefinement,
 }
@@ -274,16 +297,25 @@ pub struct RegionMask {
     pub height: usize,
     /// 0 means no region / background. Positive labels index into `selected`.
     #[serde(with = "crate::mask_codec::labels")]
-    pub labels: Vec<u32>,
+    pub labels: MaskLabels,
     pub selected: Vec<bool>,
 }
 
 impl RegionMask {
+    /// ラベルを書き換えるための可変参照。**共有されていればここで 1 回だけ複製する。**
+    ///
+    /// `Arc::make_mut` を呼び出し側に散らすと、いつか誰かがループの**内側**で呼び、
+    /// ラベルごとに 原寸バッファ を複製する。書き換えの入口をここに 1 つだけ置く。
+    /// **ループの外で 1 度呼ぶこと。**
+    pub fn labels_mut(&mut self) -> &mut Vec<u32> {
+        std::sync::Arc::make_mut(&mut self.labels)
+    }
+
     pub fn empty(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
-            labels: vec![0; width.saturating_mul(height)],
+            labels: MaskLabels::new(vec![0; width.saturating_mul(height)]),
             selected: vec![false],
         }
     }
@@ -310,17 +342,35 @@ pub struct RasterVectorMask {
     pub height: usize,
     /// Bitmap strokes and filled polygon results.
     #[serde(with = "crate::mask_codec::alpha")]
-    pub alpha: Vec<f32>,
+    pub alpha: MaskAlpha,
     /// Editable object mask shapes, applied on top of the bitmap alpha.
     pub shapes: Vec<MaskShape>,
 }
 
 impl RasterVectorMask {
+    /// 画素と寸法をまとめて借りる。
+    ///
+    /// `alpha_mut()` は `*self` を可変借用するので、同じ式の中で `mask.width` を
+    /// 読めない。寸法を先に控えてから借用を返す。
+    pub fn alpha_and_dims_mut(&mut self) -> (&mut Vec<f32>, usize, usize) {
+        let (width, height) = (self.width, self.height);
+        (std::sync::Arc::make_mut(&mut self.alpha), width, height)
+    }
+
+    /// 画素を書き換えるための可変参照。**共有されていればここで 1 回だけ複製する。**
+    ///
+    /// `Arc::make_mut` を呼び出し側に散らすと、いつか誰かがループの**内側**で呼び、
+    /// 画素ごとに 96MB を複製する。書き換えの入口をここに 1 つだけ置く。
+    /// **ループの外で 1 度呼ぶこと。**
+    pub fn alpha_mut(&mut self) -> &mut Vec<f32> {
+        std::sync::Arc::make_mut(&mut self.alpha)
+    }
+
     pub fn empty(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
-            alpha: vec![0.0; width.saturating_mul(height)],
+            alpha: MaskAlpha::new(vec![0.0; width.saturating_mul(height)]),
             shapes: Vec::new(),
         }
     }
@@ -521,11 +571,29 @@ fn scale_mask_shape(shape: &mut MaskShape, sx: f32, sy: f32) {
 }
 
 impl RasterMask {
+    /// 画素と寸法をまとめて借りる。
+    ///
+    /// `alpha_mut()` は `*self` を可変借用するので、同じ式の中で `mask.width` を
+    /// 読めない。寸法を先に控えてから借用を返す。
+    pub fn alpha_and_dims_mut(&mut self) -> (&mut Vec<f32>, usize, usize) {
+        let (width, height) = (self.width, self.height);
+        (std::sync::Arc::make_mut(&mut self.alpha), width, height)
+    }
+
+    /// 画素を書き換えるための可変参照。**共有されていればここで 1 回だけ複製する。**
+    ///
+    /// `Arc::make_mut` を呼び出し側に散らすと、いつか誰かがループの**内側**で呼び、
+    /// 画素ごとに 96MB を複製する。書き換えの入口をここに 1 つだけ置く。
+    /// **ループの外で 1 度呼ぶこと。**
+    pub fn alpha_mut(&mut self) -> &mut Vec<f32> {
+        std::sync::Arc::make_mut(&mut self.alpha)
+    }
+
     pub fn empty(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
-            alpha: vec![0.0; width.saturating_mul(height)],
+            alpha: MaskAlpha::new(vec![0.0; width.saturating_mul(height)]),
         }
     }
 
@@ -533,7 +601,7 @@ impl RasterMask {
         Self {
             width,
             height,
-            alpha: vec![1.0; width.saturating_mul(height)],
+            alpha: MaskAlpha::new(vec![1.0; width.saturating_mul(height)]),
         }
     }
 
@@ -554,7 +622,13 @@ impl RasterMask {
         if self.matches_dims(new_w, new_h) {
             return;
         }
-        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        self.alpha = MaskAlpha::new(resize_mask_bilinear(
+            &self.alpha,
+            self.width,
+            self.height,
+            new_w,
+            new_h,
+        ));
         self.width = new_w;
         self.height = new_h;
     }
@@ -569,6 +643,12 @@ impl RasterMask {
 }
 
 impl SubjectMask {
+    /// 画素を書き換えるための可変参照。**共有されていればここで 1 回だけ複製する。**
+    /// ループの外で 1 度呼ぶこと ([`RasterVectorMask::alpha_mut`] と同じ理由)。
+    pub fn alpha_mut(&mut self) -> &mut Vec<f32> {
+        std::sync::Arc::make_mut(&mut self.alpha)
+    }
+
     pub fn empty(width: usize, height: usize) -> Self {
         Self::from_raster(RasterMask::empty(width, height))
     }
@@ -628,10 +708,21 @@ impl SubjectMask {
         if self.matches_dims(new_w, new_h) {
             return;
         }
-        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        self.alpha = MaskAlpha::new(resize_mask_bilinear(
+            &self.alpha,
+            self.width,
+            self.height,
+            new_w,
+            new_h,
+        ));
         if let Some(source_alpha) = &mut self.source_alpha {
-            *source_alpha =
-                resize_mask_bilinear(source_alpha, self.width, self.height, new_w, new_h);
+            *source_alpha = MaskAlpha::new(resize_mask_bilinear(
+                source_alpha,
+                self.width,
+                self.height,
+                new_w,
+                new_h,
+            ));
         }
         self.width = new_w;
         self.height = new_h;
@@ -658,7 +749,13 @@ impl RegionMask {
         if self.matches_dims(new_w, new_h) {
             return;
         }
-        self.labels = resize_labels_nearest(&self.labels, self.width, self.height, new_w, new_h);
+        self.labels = MaskLabels::new(resize_labels_nearest(
+            &self.labels,
+            self.width,
+            self.height,
+            new_w,
+            new_h,
+        ));
         self.width = new_w;
         self.height = new_h;
     }
@@ -687,7 +784,13 @@ impl RasterVectorMask {
                 scale_mask_shape(shape, sx, sy);
             }
         }
-        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        self.alpha = MaskAlpha::new(resize_mask_bilinear(
+            &self.alpha,
+            self.width,
+            self.height,
+            new_w,
+            new_h,
+        ));
         self.width = new_w;
         self.height = new_h;
     }
@@ -16655,7 +16758,7 @@ mod tests {
         LocalMask::Raster(RasterMask {
             width,
             height,
-            alpha,
+            alpha: MaskAlpha::new(alpha),
         })
     }
 
@@ -16804,7 +16907,7 @@ mod tests {
             LocalMask::Raster(RasterMask {
                 width: 1,
                 height: 1,
-                alpha: vec![1.0],
+                alpha: MaskAlpha::new(vec![1.0]),
             }),
             LocalEffect::Tone(ToneParams::default()),
         );
@@ -16817,7 +16920,7 @@ mod tests {
         let mask = RegionMask {
             width: 3,
             height: 1,
-            labels: vec![1, 2, 0],
+            labels: MaskLabels::new(vec![1, 2, 0]),
             selected: vec![false, true, false],
         };
         let layer = LocalAdjustmentLayer::new(
@@ -16837,20 +16940,20 @@ mod tests {
             LocalMask::Raster(RasterMask {
                 width: 3,
                 height: 1,
-                alpha: vec![0.0, 0.5, 1.0],
+                alpha: MaskAlpha::new(vec![0.0, 0.5, 1.0]),
             }),
             LocalEffect::Tone(ToneParams::default()),
         );
         layer.manual_override.add = Some(RasterVectorMask {
             width: 3,
             height: 1,
-            alpha: vec![1.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![1.0, 0.0, 0.0]),
             shapes: Vec::new(),
         });
         layer.manual_override.subtract = Some(RasterVectorMask {
             width: 3,
             height: 1,
-            alpha: vec![0.0, 0.0, 1.0],
+            alpha: MaskAlpha::new(vec![0.0, 0.0, 1.0]),
             shapes: Vec::new(),
         });
 
@@ -16955,7 +17058,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
         });
         let effect = LocalEffect::Wind(WindParams {
             direction: WindDirection::Right,
@@ -16989,10 +17092,10 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 5,
-            alpha: vec![
+            alpha: MaskAlpha::new(vec![
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            ],
+            ]),
         });
         let layer = LocalAdjustmentLayer::new(
             "bokeh",
@@ -17029,7 +17132,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
         });
         let effect = LocalEffect::Wind(WindParams {
             direction: WindDirection::Right,
@@ -17057,7 +17160,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 3,
             height: 3,
-            alpha: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
         });
         let layer = LocalAdjustmentLayer::new(
             "outline",
@@ -17112,7 +17215,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 3,
             height: 3,
-            alpha: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
         });
         let layer = LocalAdjustmentLayer::new(
             "rim",
@@ -17177,7 +17280,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 5,
-            alpha,
+            alpha: MaskAlpha::new(alpha),
         });
         let layer = LocalAdjustmentLayer::new(
             "contact",
@@ -17240,7 +17343,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 5,
-            alpha,
+            alpha: MaskAlpha::new(alpha),
         });
         let layer = LocalAdjustmentLayer::new(
             "contact",
@@ -17275,7 +17378,7 @@ mod tests {
         let mask = LocalMask::Raster(RasterMask {
             width: 32,
             height: 32,
-            alpha,
+            alpha: MaskAlpha::new(alpha),
         });
         let layer = LocalAdjustmentLayer::new(
             "outline",
@@ -17369,7 +17472,7 @@ mod tests {
         let mut mask = RasterVectorMask {
             width: 5,
             height: 5,
-            alpha: vec![1.0; 25],
+            alpha: MaskAlpha::new(vec![1.0; 25]),
             shapes: Vec::new(),
         };
         mask.shapes.push(MaskShape::Ellipse {
@@ -20416,7 +20519,7 @@ mod tests {
         let mask = RasterMask {
             width: 2,
             height: 1,
-            alpha: vec![1.0, 0.0],
+            alpha: MaskAlpha::new(vec![1.0, 0.0]),
         };
         let layer = LocalAdjustmentLayer::new(
             "fill",
@@ -21050,7 +21153,7 @@ mod tests {
             LocalMask::Raster(RasterMask {
                 width: 4,
                 height: 1,
-                alpha: vec![1.0, 0.0, 0.0, 0.0],
+                alpha: MaskAlpha::new(vec![1.0, 0.0, 0.0, 0.0]),
             }),
             LocalEffect::Mosaic(MosaicParams {
                 tile_mode: MosaicTileMode::FixedPx(4),
@@ -21075,7 +21178,7 @@ mod tests {
             LocalMask::Raster(RasterMask {
                 width: 4,
                 height: 1,
-                alpha: vec![1.0, 0.0, 0.0, 0.0],
+                alpha: MaskAlpha::new(vec![1.0, 0.0, 0.0, 0.0]),
             }),
             LocalEffect::Mosaic(MosaicParams {
                 tile_mode: MosaicTileMode::FixedPx(4),
@@ -21101,7 +21204,7 @@ mod tests {
             LocalMask::Raster(RasterMask {
                 width: 4,
                 height: 1,
-                alpha: vec![1.0, 0.0, 0.0, 0.0],
+                alpha: MaskAlpha::new(vec![1.0, 0.0, 0.0, 0.0]),
             }),
             LocalEffect::Mosaic(MosaicParams {
                 tile_mode: MosaicTileMode::FixedPx(4),
@@ -21826,7 +21929,7 @@ LUT_3D_SIZE 2
         let mask = LocalMask::Raster(RasterMask {
             width: 3,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 1.0, 0.0]),
         });
         let layer = LocalAdjustmentLayer::new(
             "color dodge glow",
@@ -21960,7 +22063,7 @@ LUT_3D_SIZE 2
         let mask = LocalMask::Raster(RasterMask {
             width: 5,
             height: 1,
-            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+            alpha: MaskAlpha::new(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
         });
         let layer = LocalAdjustmentLayer::new(
             "anamorphic flare",
@@ -23967,7 +24070,7 @@ LUT_3D_SIZE 2
             LocalMask::Raster(RasterMask {
                 width: 3,
                 height: 1,
-                alpha: vec![0.0, 1.0, 0.0],
+                alpha: MaskAlpha::new(vec![0.0, 1.0, 0.0]),
             }),
             LocalEffect::Repair(RepairParams {
                 mode: RepairMode::Solid,
@@ -24023,7 +24126,7 @@ LUT_3D_SIZE 2
             LocalMask::Raster(RasterMask {
                 width: 4,
                 height: 1,
-                alpha: vec![0.0, 0.0, 0.0, 1.0],
+                alpha: MaskAlpha::new(vec![0.0, 0.0, 0.0, 1.0]),
             }),
             LocalEffect::Repair(RepairParams {
                 mode: RepairMode::Clone,
@@ -24063,7 +24166,7 @@ LUT_3D_SIZE 2
             LocalMask::Raster(RasterMask {
                 width,
                 height,
-                alpha: alpha.clone(),
+                alpha: MaskAlpha::new(alpha.clone()),
             }),
             LocalEffect::Repair(RepairParams {
                 mode: RepairMode::Surrounding,
@@ -24136,7 +24239,7 @@ LUT_3D_SIZE 2
             LocalMask::Raster(RasterMask {
                 width,
                 height,
-                alpha: alpha.clone(),
+                alpha: MaskAlpha::new(alpha.clone()),
             }),
             LocalEffect::Repair(RepairParams {
                 mode: RepairMode::Surrounding,
@@ -24200,7 +24303,7 @@ LUT_3D_SIZE 2
             LocalMask::Raster(RasterMask {
                 width,
                 height,
-                alpha,
+                alpha: MaskAlpha::new(alpha),
             }),
             LocalEffect::Repair(RepairParams {
                 mode: RepairMode::Surrounding,

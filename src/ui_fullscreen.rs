@@ -4272,6 +4272,20 @@ fn continuous_reading_page_rects(
     rects
 }
 
+/// 再生中のページの次コマ時刻から、**最も早いもの**を選ぶ。
+///
+/// 現在ページ 1 枚だけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+/// しか進まなかった (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる。
+/// §1.157、Codex Sol の指摘 1)。渡すのは**描いたページ**に限る — 描いていないページの
+/// 過ぎた期限を混ぜると 0ms 起床を繰り返し、アイドルで空転する。
+fn earliest_animation_deadline(deadlines: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    deadlines
+        .flatten()
+        .fold(None, |earliest: Option<f64>, next| {
+            Some(earliest.map_or(next, |current: f64| current.min(next)))
+        })
+}
+
 fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation) -> egui::Vec2 {
     match rotation {
         crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
@@ -5118,6 +5132,7 @@ impl App {
             self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.cache_current_edit_preview_if_ready();
             self.local_adjust_mode = false;
+            self.fold_local_adjust_edit_state();
             self.local_adjust_repair_point_pick_active = None;
             self.local_adjust_add_layer_dialog_open = false;
             self.local_adjust_change_mask_dialog_open = false;
@@ -6052,7 +6067,7 @@ impl App {
             let total_layers = self
                 .local_adjust_page_layers
                 .get(&idx)
-                .map(Vec::len)
+                .map(|layers| layers.len())
                 .unwrap_or(0);
             let focus_viewport = if self.fullscreen_embedded_still_active() {
                 ctx.viewport_id()
@@ -14553,6 +14568,14 @@ impl App {
         let mut fs_hud_ms = 0.0_f64;
         let mut fs_panels_ms = 0.0_f64;
         let mut fs_hover_bar_ms = 0.0_f64;
+        // 編集ツールのキャンバス (消しゴム / 隠蔽 / テキスト / 補正レイヤー / crop)。
+        // ここは `central_unaccounted_ms` の中身で、24MP のブラシ操作中はフレームの
+        // 半分近くを占めていた (2026-08-31 実測)。塗りと重ね描きを分けて計る。
+        let mut fs_edit_canvas_ms = 0.0_f64;
+        let mut fs_la_canvas_input_ms = 0.0_f64;
+        let mut fs_la_canvas_overlay_ms = 0.0_f64;
+        // hover bar より後ろのオーバーレイ / ダイアログ群。
+        let mut fs_tail_ms = 0.0_f64;
         let mut fs_central_ms = 0.0_f64;
         let mut fs_vst_manager_ms = 0.0_f64;
         let mut fs_closure_ms = 0.0_f64;
@@ -15345,6 +15368,7 @@ impl App {
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
+                        let edit_canvas_t0 = std::time::Instant::now();
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
                         // `is_spread_double` はキー入力ハンドラより前 (フレーム冒頭) で
                         // 計算されるので、見開き中に [E] を押した最初のフレームだけは
@@ -15400,8 +15424,14 @@ impl App {
                             && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
+                                let la_input_t0 = std::time::Instant::now();
                                 self.handle_local_adjust_canvas_input(ctx, full_rect, transform);
+                                fs_la_canvas_input_ms =
+                                    la_input_t0.elapsed().as_secs_f64() * 1000.0;
+                                let la_overlay_t0 = std::time::Instant::now();
                                 self.draw_local_adjust_canvas_overlay(ui, transform);
+                                fs_la_canvas_overlay_ms =
+                                    la_overlay_t0.elapsed().as_secs_f64() * 1000.0;
                             }
                         } else if self.local_adjust_mode {
                             ctx.request_repaint();
@@ -15469,6 +15499,8 @@ impl App {
                         } else if self.export_crop_mode || self.sns_split.is_some() {
                             ctx.request_repaint();
                         }
+
+                        fs_edit_canvas_ms = edit_canvas_t0.elapsed().as_secs_f64() * 1000.0;
 
                         let overlay_t0 = std::time::Instant::now();
                         self.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
@@ -16144,6 +16176,8 @@ impl App {
                             }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
+
+                        let tail_t0 = std::time::Instant::now();
                         if let Some(rotation) = rotation_choice {
                             self.set_image_rotation(fs_idx, rotation);
                         }
@@ -16272,6 +16306,7 @@ impl App {
                             self.persist_current_reading_flow();
                             ctx.request_repaint();
                         }
+                        fs_tail_ms = tail_t0.elapsed().as_secs_f64() * 1000.0;
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -16465,10 +16500,12 @@ impl App {
             let fs_closure_unaccounted_ms = (fs_closure_ms - fs_closure_tracked_ms).max(0.0);
             let fs_central_tracked_ms = fs_input_ms
                 + fs_media_ms
+                + fs_edit_canvas_ms
                 + fs_overlay_ms
                 + fs_hud_ms
                 + fs_panels_ms
-                + fs_hover_bar_ms;
+                + fs_hover_bar_ms
+                + fs_tail_ms;
             let fs_central_unaccounted_ms = (fs_central_ms - fs_central_tracked_ms).max(0.0);
             let (video_playing, video_pending_frames, video_state, video_seq) =
                 match self.fs_cache.get(&fs_idx) {
@@ -16555,6 +16592,16 @@ impl App {
                     ("hud_ms", serde_json::Value::from(fs_hud_ms)),
                     ("panels_ms", serde_json::Value::from(fs_panels_ms)),
                     ("hover_bar_ms", serde_json::Value::from(fs_hover_bar_ms)),
+                    ("edit_canvas_ms", serde_json::Value::from(fs_edit_canvas_ms)),
+                    (
+                        "la_canvas_input_ms",
+                        serde_json::Value::from(fs_la_canvas_input_ms),
+                    ),
+                    (
+                        "la_canvas_overlay_ms",
+                        serde_json::Value::from(fs_la_canvas_overlay_ms),
+                    ),
+                    ("tail_ms", serde_json::Value::from(fs_tail_ms)),
                     ("vst_manager_ms", serde_json::Value::from(fs_vst_manager_ms)),
                     ("is_video", serde_json::Value::from(fs_state_is_video)),
                     ("gpu_video", serde_json::Value::from(fs_state_gpu_video)),
@@ -18553,7 +18600,16 @@ impl App {
             return SpreadPair::Single;
         }
 
-        let nav = self.get_nav_indices();
+        // **連結読みは動画を除いた静止画列で unit を組む** (`still_image_display_indices`)。
+        // 通常ナビ列 (動画を含む) で相方を解くと、動画が間に挟まった並びで別のページを
+        // 相方と答える。ページ送り側は既に同じ切り替えをしている
+        // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
+        // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+        let nav = if self.continuous_reading_active_for_idx(idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
@@ -19516,6 +19572,7 @@ impl App {
                 } else {
                     self.cache_current_edit_preview_if_ready();
                     self.local_adjust_mode = false;
+                    self.fold_local_adjust_edit_state();
                     self.local_adjust_repair_point_pick_active = None;
                     self.local_adjust_add_layer_dialog_open = false;
                     self.local_adjust_change_mask_dialog_open = false;
@@ -25744,14 +25801,29 @@ impl App {
         }
         self.request_mouse_ring_flick_repaint(ctx);
 
-        // アニメーション: 次フレームの時刻まで待ってから再描画
+        // アニメーション: 次フレームの時刻まで待ってから再描画。
+        //
+        // **描いた全ページのうち最も早い期限で起こす。** 現在ページだけを見ていたので、
+        // 見開きの相方や連結読みの他ページは、現在ページの都合でしか進まなかった
+        // (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる)。
+        // 対象は `fullscreen_page_layout` = 直近フレームで実際に描いたページに限る。
+        // `fs_cache` 全体から拾うと、描いていないページの過ぎた期限で 0ms 起床を
+        // 繰り返す (アイドル時の空転)。
         if !is_video {
-            if let Some(FsCacheEntry::Animated {
-                playback: AnimationPlayback::Playing { next_frame_at },
-                ..
-            }) = self.fs_cache.get(&fs_idx)
-            {
-                let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
+            let now = ctx.input(|i| i.time);
+            let earliest = earliest_animation_deadline(
+                std::iter::once(fs_idx)
+                    .chain(self.fullscreen_page_layout.page_indices())
+                    .map(|idx| match self.fs_cache.get(&idx) {
+                        Some(FsCacheEntry::Animated {
+                            playback: AnimationPlayback::Playing { next_frame_at },
+                            ..
+                        }) => Some(*next_frame_at),
+                        _ => None,
+                    }),
+            );
+            if let Some(next_frame_at) = earliest {
+                let delay = (next_frame_at - now).max(0.0);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             }
         }
@@ -26618,10 +26690,7 @@ impl App {
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_canvas_drag = None;
-        self.local_adjust_mask_brush_stroke = None;
-        self.local_adjust_mask_lasso_points.clear();
-        self.local_adjust_selected_shape = None;
+        self.fold_local_adjust_edit_state();
     }
 
     /// 見開きモード (`SpreadMode`) を適用する。キーボードのショートカット 1〜5 と
@@ -27417,12 +27486,16 @@ impl App {
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
+        // 連結読みも見開き構成なら相方が一緒に出ている。**昇格を止めるのは画面から
+        // 外れたページだけ** (§1.157: この判定が 8 か所に散っていた)。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect::<Vec<_>>();
         for idx in stale_promotions {
@@ -27434,7 +27507,8 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
         let current_loading = keep_set.contains(&current_idx)
             && self.fs_page_load_state(current_idx).waiting_for_display();
@@ -33689,7 +33763,11 @@ impl App {
                     page.transform.full_image_rect,
                     source_size,
                     self.get_rotation(idx),
-                    page.transform.content_bbox,
+                    // **描いたときに寄せた後の trim を渡す。** `content_bbox` は要求された
+                    // ままの未量子化の矩形なので、そちらを渡すと選択できる端が実際に描いた
+                    // 端と最大 0.5 画面 px ずれる (縮小時は元画像で数 px。Codex Sol の指摘 4)。
+                    // `uv_rect` は寄せた表示矩形を元画像空間へ戻したもので、描いた端そのもの。
+                    page.transform.content_bbox.map(|_| page.transform.uv_rect),
                     ctx.pixels_per_point(),
                 )
                 .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
@@ -34319,6 +34397,7 @@ impl App {
                 self.local_adjust_db
                     .as_ref()
                     .and_then(|db| db.get_layers(key))
+                    .map(local_adjust_core::LocalAdjustmentLayers::new)
             }
             .filter(|layers| !layers.is_empty())
             .ok_or_else(|| "補正レイヤーを読み取れません".to_string())?
@@ -37317,6 +37396,43 @@ mod tests {
                 "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
             );
         }
+    }
+
+    /// アニメの次コマ期限は、**描いた全ページのうち最も早いもの**で起こす。
+    ///
+    /// 現在ページだけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+    /// しか進まなかった。現在ページが静止画なら期限が一切立たず、相方は入力があるまで
+    /// 止まる (§1.157、Codex Sol の指摘 1)。
+    ///
+    /// **描いていないページを混ぜてはいけない** — 期限が過ぎたまま残るので 0ms 起床を
+    /// 繰り返し、アイドルで空転する。
+    #[test]
+    fn the_animation_deadline_comes_from_the_pages_that_were_drawn() {
+        // 現在ページが静止画 (期限なし)、相方が 50ms 後。相方の期限で起きる。
+        assert_eq!(
+            earliest_animation_deadline([None, Some(0.05)].into_iter()),
+            Some(0.05),
+            "静止画の隣のアニメが起こされない"
+        );
+        // 両方アニメなら早い方。**順序に依らない** (最後や最初を取る実装を弾く)。
+        assert_eq!(
+            earliest_animation_deadline([Some(1.0), Some(0.05)].into_iter()),
+            Some(0.05),
+            "遅い方の期限に引きずられている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "並び順で答えが変わっている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.5), Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "中間にある最早の期限を落としている"
+        );
+        // 再生中のページが無ければ期限も無い (空転しない)。
+        assert_eq!(earliest_animation_deadline([None, None].into_iter()), None);
+        assert_eq!(earliest_animation_deadline(std::iter::empty()), None);
     }
 
     /// 連結読みで間隔を合わせる相手は、**同じ unit の 2 ページだけ**。
@@ -48785,6 +48901,66 @@ mod tests {
                 max_y: 200.0,
             },
         );
+    }
+
+    /// 範囲コピーの境界は、**描いたときに寄せた後の trim** と一致する (Codex Sol の指摘 4)。
+    ///
+    /// `content_bbox` は要求されたままの未量子化の矩形。描画は出力テクセル境界へ寄せた
+    /// 矩形を使うので、キャプチャへ生の bbox を渡すと選択できる端が最大 0.5 画面 px、
+    /// 縮小時は元画像で数 px ずれる。テクセル境界に乗らない比率で確かめる。
+    #[test]
+    fn capture_region_spread_target_uses_the_trim_the_draw_quantized() {
+        let pixels_per_point = 1.0_f32;
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+        let page = egui::vec2(1249.0, 2000.0);
+        // わざとテクセル境界に乗らない比率。
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0173, 0.0), egui::pos2(0.9411, 1.0));
+        let layout_rect = egui::Rect::from_min_size(egui::pos2(300.0, 40.0), page * 0.6);
+        let drawn = resolve_fs_transform_in_layout_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: page,
+                texture_size: page,
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: Some(bbox),
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            layout_rect,
+        )
+        .expect("drawn transform");
+        assert_ne!(
+            drawn.uv_rect.min.x, bbox.min.x,
+            "この比率では寄せが起きないので、テストが前提を満たしていない"
+        );
+
+        let captured = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn.full_image_rect,
+            [page.x as usize, page.y as usize],
+            crate::rotation_db::Rotation::None,
+            drawn.content_bbox.map(|_| drawn.uv_rect),
+            pixels_per_point,
+        )
+        .expect("capture transform");
+
+        for (label, drawn_edge, captured_edge) in [
+            ("左端", drawn.paint_rect.min.x, captured.paint_rect.min.x),
+            ("右端", drawn.paint_rect.max.x, captured.paint_rect.max.x),
+        ] {
+            assert!(
+                (drawn_edge - captured_edge).abs() < 1e-3,
+                "{label}が描いた位置 {drawn_edge} と違う: {captured_edge}"
+            );
+        }
     }
 
     /// 見開きの範囲コピーは、**見えている範囲を越えて選べない** (§1.156)。
