@@ -2415,6 +2415,17 @@ impl crate::app::App {
         }
     }
 
+    /// 準備進捗 modal がこの frame で描かれるか。**表示条件の唯一の持ち主**にして、
+    /// 入力ブロック判定 (`modal_dialog_block_reason`) もここから導く。
+    pub(crate) fn external_tool_materialize_progress_visible(&self) -> bool {
+        self.external_tool_materialize_pending
+            .iter()
+            .any(|pending| {
+                self.external_tool_materializer
+                    .generation_is_current(pending.generation)
+            })
+    }
+
     pub(crate) fn show_external_tool_materialize_progress(&mut self, ctx: &egui::Context) {
         let Some(index) = self
             .external_tool_materialize_pending
@@ -2426,6 +2437,13 @@ impl crate::app::App {
         else {
             return;
         };
+        // 専用フルスクリーン viewport では main update の tail が飛ばないので、
+        // fs body と tail の両方がここへ来る。前に来た方 (= 前面の Context) に描かせ、
+        // もう片方は降りる。両方描くと同じ modal が 2 つの window に出る。
+        if self.external_tool_launch_ui_frame == Some(self.frame_counter) {
+            return;
+        }
+        self.external_tool_launch_ui_frame = Some(self.frame_counter);
         let (completed, total, stage) = self.external_tool_materialize_pending[index]
             .progress
             .snapshot();
@@ -2835,6 +2853,53 @@ mod tests {
             },
             "混在でも仮想ページを見失わず、editing / RealFileOnly を正しく判定する"
         );
+    }
+
+    /// supersede 済みの要求は進捗 modal に出ない。**入力ブロックも同じ述語から導く**ので、
+    /// 「ダイアログが無いのにクリックが効かない」状態を作らない。
+    ///
+    /// この 2 つを別々の条件で書いていたのが実機の固着の一部だった (2026-09-02)。
+    #[test]
+    fn a_superseded_materialize_request_blocks_no_input_because_it_draws_no_dialog() {
+        let mut app = crate::app::setup_app_for_test();
+        let generation = app.external_tool_materializer.begin_generation();
+        app.external_tool_materialize_pending
+            .push(materialize_pending_for_test(generation));
+
+        assert!(app.external_tool_materialize_progress_visible());
+        assert_eq!(
+            app.modal_dialog_block_reason(),
+            Some("external_tool_materialize_progress")
+        );
+
+        // 次の要求が世代を進めると、この要求は描かれなくなる。入力も同時に解放される。
+        app.external_tool_materializer.begin_generation();
+
+        assert!(!app.external_tool_materialize_progress_visible());
+        assert_eq!(app.modal_dialog_block_reason(), None);
+        assert!(
+            !app.external_tool_materialize_pending.is_empty(),
+            "drain されるまで pending は残る。残っていても入力は止めない、が要件"
+        );
+    }
+
+    /// この test は channel を触らない (見えるか / 入力を止めるか だけを見る) ので、
+    /// 送信側は落としてよい。
+    fn materialize_pending_for_test(generation: u64) -> ExternalMaterializePending {
+        let (_, completion_rx) = mpsc::channel();
+        let (_, boundary_rx) = mpsc::channel();
+        let (decision_tx, _) = mpsc::channel();
+        ExternalMaterializePending {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: completion_rx,
+            launch_boundary_rx: boundary_rx,
+            launch_decision_tx: Some(decision_tx),
+            progress: Arc::new(MaterializeProgress::new(1)),
+            generation,
+            worker: None,
+            user_cancelled: false,
+            launch_ui_checkpoint_passed: false,
+        }
     }
 
     #[test]

@@ -11705,6 +11705,13 @@ pub struct App {
     pub(crate) external_tool_materializer: crate::materializer::Materializer,
     pub(crate) external_tool_materialize_pending:
         Vec<crate::external_tool::ExternalMaterializePending>,
+    /// 準備進捗 modal を**この frame で既に描いた** frame 番号。
+    ///
+    /// 描き手は 1 人でよいが、その 1 人は frame ごとに変わる。フルスクリーン中は
+    /// `render_fs_body` が前面の Context へ描き、そうでなければ main update の tail が描く。
+    /// `bool` では持てない: embedded フルスクリーンの frame は tail ごと飛ぶので
+    /// (`app.rs` の early return)、clear する場所が無い frame ができて次の frame へ残る。
+    pub(crate) external_tool_launch_ui_frame: Option<u64>,
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_launch_confirmation:
         Option<crate::external_tool::ExternalLaunchConfirmation>,
@@ -14287,6 +14294,7 @@ impl App {
             external_tool_launch_pending: Vec::new(),
             external_tool_materializer: crate::materializer::Materializer::new(),
             external_tool_materialize_pending: Vec::new(),
+            external_tool_launch_ui_frame: None,
             external_tool_launch_confirmation: None,
             external_tool_picker: None,
             cached_nav_indices: None,
@@ -15931,7 +15939,10 @@ impl App {
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
             self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
             self.external_tool_picker.is_some() => "external_tool_picker",
-            !self.external_tool_materialize_pending.is_empty() => "external_tool_materialize_progress",
+            // **描く条件と同じ述語から導く。** pending の非空から導くと、supersede 済みで
+            // まだ drain されていない要求が「ダイアログが無いのに入力だけ止まる」状態を作る
+            // (2026-09-02)。
+            self.external_tool_materialize_progress_visible() => "external_tool_materialize_progress",
             self.show_settings_restore => "settings_restore",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
