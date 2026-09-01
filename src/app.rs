@@ -21279,44 +21279,14 @@ impl App {
     fn install_rating_view_rows(&mut self) {
         let previous_selected = self.selected;
         let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
-        crate::rating_view::sort_rows(&mut self.rating_view_rows, self.rating_view_sort);
-        let mut items: Vec<GridItem> = self
-            .rating_view_rows
-            .iter()
-            .map(|row| row.item.clone())
-            .collect();
-        let mut image_metas: Vec<Option<(i64, i64)>> = self
-            .rating_view_rows
-            .iter()
-            .map(|row| row.image_meta)
-            .collect();
-        // ★設定時刻順を含む rating view 固有の行内順序は維持し、カテゴリ行だけを共通
-        // helper で組み替える。Normal sort も直前の sort_rows で既に確定済み。
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
+        // ★時刻順のときはカテゴリ再配置を通さない (§1.142)。通すとフォルダ / アーカイブが
+        // 時刻に関係なく先頭へ出て、「★を付けた順に一列で見る」という要求が壊れる。
+        // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
+        let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
+            &mut self.rating_view_rows,
+            self.rating_view_sort,
             &self.settings.grid_display_order,
-            None,
         );
-        let mut rows_by_item: std::collections::HashMap<
-            String,
-            std::collections::VecDeque<crate::rating_view::RatingViewRow>,
-        > = std::collections::HashMap::new();
-        for row in self.rating_view_rows.drain(..) {
-            rows_by_item
-                .entry(row.item.perf_key())
-                .or_default()
-                .push_back(row);
-        }
-        self.rating_view_rows = items
-            .iter()
-            .map(|item| {
-                rows_by_item
-                    .get_mut(&item.perf_key())
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .expect("arranged rating item must retain its source row")
-            })
-            .collect();
         let video_items: Vec<(usize, PathBuf, u64)> = items
             .iter()
             .enumerate()
@@ -30272,45 +30242,12 @@ impl App {
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
         let return_grid = self.take_bookmark_restore_grid();
-        crate::bookmark_browser::sort_rows(
+        // 登録日時順のときはカテゴリ再配置を通さない (§1.142、レーティング一覧と同じ規約)。
+        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
             &mut self.bookmark_browser_rows,
             self.bookmark_view_sort,
-        );
-        let mut items: Vec<GridItem> = self
-            .bookmark_browser_rows
-            .iter()
-            .map(|row| row.item.clone())
-            .collect();
-        let mut image_metas: Vec<Option<(i64, i64)>> = self
-            .bookmark_browser_rows
-            .iter()
-            .map(|row| row.image_meta)
-            .collect();
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
             &self.settings.grid_display_order,
-            None,
         );
-        let mut rows_by_item: std::collections::HashMap<
-            String,
-            std::collections::VecDeque<crate::bookmark_browser::BookmarkBrowserRow>,
-        > = std::collections::HashMap::new();
-        for row in self.bookmark_browser_rows.drain(..) {
-            rows_by_item
-                .entry(row.item.perf_key())
-                .or_default()
-                .push_back(row);
-        }
-        self.bookmark_browser_rows = items
-            .iter()
-            .map(|item| {
-                rows_by_item
-                    .get_mut(&item.perf_key())
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .expect("arranged bookmark item must retain its source row")
-            })
-            .collect();
         let installed_keys: Vec<_> = self
             .bookmark_browser_rows
             .iter()
