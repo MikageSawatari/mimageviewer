@@ -4186,6 +4186,20 @@ fn continuous_reading_page_rects(
     rects
 }
 
+/// 再生中のページの次コマ時刻から、**最も早いもの**を選ぶ。
+///
+/// 現在ページ 1 枚だけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+/// しか進まなかった (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる。
+/// §1.157、Codex Sol の指摘 1)。渡すのは**描いたページ**に限る — 描いていないページの
+/// 過ぎた期限を混ぜると 0ms 起床を繰り返し、アイドルで空転する。
+fn earliest_animation_deadline(deadlines: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    deadlines
+        .flatten()
+        .fold(None, |earliest: Option<f64>, next| {
+            Some(earliest.map_or(next, |current: f64| current.min(next)))
+        })
+}
+
 fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation) -> egui::Vec2 {
     match rotation {
         crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
@@ -18404,7 +18418,16 @@ impl App {
             return SpreadPair::Single;
         }
 
-        let nav = self.get_nav_indices();
+        // **連結読みは動画を除いた静止画列で unit を組む** (`still_image_display_indices`)。
+        // 通常ナビ列 (動画を含む) で相方を解くと、動画が間に挟まった並びで別のページを
+        // 相方と答える。ページ送り側は既に同じ切り替えをしている
+        // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
+        // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+        let nav = if self.continuous_reading_active_for_idx(idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
@@ -25558,14 +25581,29 @@ impl App {
         }
         self.request_mouse_ring_flick_repaint(ctx);
 
-        // アニメーション: 次フレームの時刻まで待ってから再描画
+        // アニメーション: 次フレームの時刻まで待ってから再描画。
+        //
+        // **描いた全ページのうち最も早い期限で起こす。** 現在ページだけを見ていたので、
+        // 見開きの相方や連結読みの他ページは、現在ページの都合でしか進まなかった
+        // (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる)。
+        // 対象は `fullscreen_page_layout` = 直近フレームで実際に描いたページに限る。
+        // `fs_cache` 全体から拾うと、描いていないページの過ぎた期限で 0ms 起床を
+        // 繰り返す (アイドル時の空転)。
         if !is_video {
-            if let Some(FsCacheEntry::Animated {
-                playback: AnimationPlayback::Playing { next_frame_at },
-                ..
-            }) = self.fs_cache.get(&fs_idx)
-            {
-                let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
+            let now = ctx.input(|i| i.time);
+            let earliest = earliest_animation_deadline(
+                std::iter::once(fs_idx)
+                    .chain(self.fullscreen_page_layout.page_indices())
+                    .map(|idx| match self.fs_cache.get(&idx) {
+                        Some(FsCacheEntry::Animated {
+                            playback: AnimationPlayback::Playing { next_frame_at },
+                            ..
+                        }) => Some(*next_frame_at),
+                        _ => None,
+                    }),
+            );
+            if let Some(next_frame_at) = earliest {
+                let delay = (next_frame_at - now).max(0.0);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             }
         }
@@ -36880,6 +36918,43 @@ mod tests {
                 "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
             );
         }
+    }
+
+    /// アニメの次コマ期限は、**描いた全ページのうち最も早いもの**で起こす。
+    ///
+    /// 現在ページだけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+    /// しか進まなかった。現在ページが静止画なら期限が一切立たず、相方は入力があるまで
+    /// 止まる (§1.157、Codex Sol の指摘 1)。
+    ///
+    /// **描いていないページを混ぜてはいけない** — 期限が過ぎたまま残るので 0ms 起床を
+    /// 繰り返し、アイドルで空転する。
+    #[test]
+    fn the_animation_deadline_comes_from_the_pages_that_were_drawn() {
+        // 現在ページが静止画 (期限なし)、相方が 50ms 後。相方の期限で起きる。
+        assert_eq!(
+            earliest_animation_deadline([None, Some(0.05)].into_iter()),
+            Some(0.05),
+            "静止画の隣のアニメが起こされない"
+        );
+        // 両方アニメなら早い方。**順序に依らない** (最後や最初を取る実装を弾く)。
+        assert_eq!(
+            earliest_animation_deadline([Some(1.0), Some(0.05)].into_iter()),
+            Some(0.05),
+            "遅い方の期限に引きずられている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "並び順で答えが変わっている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.5), Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "中間にある最早の期限を落としている"
+        );
+        // 再生中のページが無ければ期限も無い (空転しない)。
+        assert_eq!(earliest_animation_deadline([None, None].into_iter()), None);
+        assert_eq!(earliest_animation_deadline(std::iter::empty()), None);
     }
 
     /// 連結読みで間隔を合わせる相手は、**同じ unit の 2 ページだけ**。

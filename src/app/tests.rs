@@ -33346,6 +33346,41 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// 連結読みでは、相方も**動画を除いた静止画列**から解く。
+    ///
+    /// 連結読みの unit は静止画だけで組まれるので、動画が間に挟まった並びでは通常ナビ列と
+    /// 答えが変わる。相方判定だけ違う列を見ていると、表示中でないページを表示中と誤り、
+    /// 本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+    #[test]
+    fn a_continuous_spread_partner_skips_videos_like_the_units_do() {
+        let mut app = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.gif");
+        app.items
+            .push(GridItem::Video(PathBuf::from("C:/pics/clip.mp4")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let video = app.items.len() - 1;
+        let right = push_image(&mut app, "C:/pics/b.gif");
+        app.visible_indices = vec![left, video, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+
+        // 通常 (ページ送り) では動画も並びに入るので、左の相方は動画側。
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        assert_ne!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "通常ナビで静止画列を使ってしまっている"
+        );
+
+        // 連結読みでは動画を飛ばして静止画同士が 1 unit になる。
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        assert_eq!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "連結読みなのに動画を含む並びで相方を解いている"
+        );
+    }
+
     /// **「表示中のページの昇格だけ生かす」規則の綴りは 1 つだけ。**
     ///
     /// この規則は 8 か所に散っており、2 度に分けて直そうとして 2 度とも取りこぼした
@@ -33363,14 +33398,24 @@ mod pipeline_cache_refactor_tests {
                 if !line.contains("promotion_started_at_for") {
                     continue;
                 }
-                // 判定は前後 3 行に収まる範囲で書かれている。
-                let from = index.saturating_sub(3);
-                let to = (index + 4).min(lines.len());
-                let window = lines[from..to].join(" ");
+                // 判定は anchor の少し後ろに書かれる。**コメントを挟むと離れる** ので広めに
+                // 取り、コメント行は落としてから見る (実際に取りこぼした disconnect 経路は、
+                // 説明コメント 4 行を挟んで 5 行下にあり、前後 3 行の窓では素通りしていた
+                // — Codex Sol の指摘 6)。
+                let from = index.saturating_sub(8);
+                let to = (index + 24).min(lines.len());
+                let window = lines[from..to]
+                    .iter()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let compares_directly = window.contains("!= current_idx")
                     || window.contains("== current_idx")
                     || window.contains("!= Some(key)")
-                    || window.contains("== Some(key)");
+                    || window.contains("== Some(key)")
+                    || window.contains("fullscreen_idx == Some")
+                    || window.contains("fullscreen_idx != Some");
                 if compares_directly && !window.contains("page_is_displayed") {
                     offenders.push(format!("{relative}:{}: {}", index + 1, line.trim()));
                 }
