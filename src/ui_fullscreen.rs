@@ -16425,6 +16425,19 @@ impl App {
                     self.show_remote_session_dialog(ctx);
                 }
 
+                // 外部ツールへ渡すファイルの準備進捗も、押された viewport 上に出す。
+                //
+                // **メイン update の tail はフルスクリーン中 early return で飛ぶ**ので
+                // (`app.rs` の「会計はここで出す」コメント参照)、ここで描かないと進捗が
+                // 見えないだけでなく、**spawn 境界の ACK を返す `authorize_...` も走らない**。
+                // その結果 worker が起動許可を待ったまま止まり、進捗 modal が入力を掴んだ
+                // まま解放されず、クリックが効かなくなる (実機 2026-09-02)。
+                // 上の編集用追加パックと同じ理由・同じ対処。
+                if !embedded {
+                    self.show_external_tool_materialize_progress(ctx);
+                    self.authorize_external_tool_launch_boundaries_after_ui();
+                }
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
                 fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);

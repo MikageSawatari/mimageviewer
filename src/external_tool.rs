@@ -529,6 +529,11 @@ impl ExternalMaterializePending {
             Ok(()) => true,
             Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => {
+                // ここに来ると decision を返す口を閉じるので、worker は永久に待つ。
+                crate::logger::log(
+                    "external_tool: boundary channel disconnected; decision can no longer be sent"
+                        .to_string(),
+                );
                 self.launch_decision_tx = None;
                 false
             }
