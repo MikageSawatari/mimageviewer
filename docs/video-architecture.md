@@ -300,7 +300,11 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 固定したバーは映像へ重ねず、`compute_video_visual_transform` の target 矩形から上部 54pt / 下部
 64pt と `fullscreen_fixed_bar_gap_px` の共通余白を除外し、残った領域へ映像を letterbox fit する。
 `BarAndStrip` では presenter が所有する `Option<NativeOverlaySeekStrip>` が `Some` のときだけ
-ストリップ 104pt も下部予約領域へ足す。`Some` / `None` の変化は transform と表示解像度 surface の
+ストリップの高さも下部予約領域へ足す。**その高さは選んだプリセット (大 104 / 中 72 / 小 48pt) で
+変わるので、`VideoVisualLayout` は「表示中か」ではなく占めている points を運ぶ。** 高さの正本は
+overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・セル寸法・波形ラスタの要求・左右パネルの
+hover band も同じ `SeekStripLayout` から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md)
+の「全体表示と高さ」)。`Some` / `None` の変化は transform と表示解像度 surface の
 準備状態を更新し、ストリップを「なし」にしたときは固定設定を保持したまま領域だけを解放する。
 論理 pt と余白は native overlay の pixels-per-point で物理 px に変換する。presenter HWND は monitor
 全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
@@ -798,11 +802,18 @@ thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰ま
 BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
 側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
 
-動画シークストリップの persisted source of truth は
-`Settings.video_seek_strip_state` (`none / thumbnails / waveform`) ひとつで、開閉 bool と mode を
-分けない。`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
+動画シークストリップの表示状態は、非表示を含む 5 値 (`SeekStripView` = 非表示 +
+(場面 / 波形) × (周辺 / 全体)) ひとつで、開閉 bool と内容と範囲を分けない。表示内容は
+`Settings.video_seek_strip_state` (`none / thumbnails / waveform`)、表示範囲は
+`SeekStripSpan` が持ち、合わせるのは `App::video_seek_strip_view()` の 1 か所だけ。
+`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
 明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
 サムネイル軸、2 種類の worker を 1 session として所有する。
+
+**全体表示では中心位置は状態ではなく導出値**で、`pin_whole_center` だけが書く。軸の真ん中
+(場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した
+まま、中身を止めて赤線だけを動かせる。場面の軸は `StripAxis::whole` (尺を帯のセル数で等分した
+`TimeGrid`) で、セル数は presenter が実寸から報告する。
 
 **セッションを畳む境界と、記憶している選択は別物である** (§1.146、2026-08-31)。
 `Settings.video_seek_strip_state` を消すのは `SeekStripCloseCause::is_user_dismissal`
@@ -919,11 +930,13 @@ strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする 
 中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
 同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
 100ms cadence で
-playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。HUD の vector
-film-strip button は `none → thumbnails → waveform → none` を 1 クリック巡回し、OFF は非アクティブ、
-waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
-ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
-従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
+playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。**この追従と
+ドラッグ移動は周辺表示だけのもの**で、全体表示は帯を動かさず、離した位置の時刻へ 1 回 seek する。
+HUD の vector film-strip button はメニューを開き、非表示・4 表示・3 高さを直接選べる
+(巡回は `Shift+S`)。OFF は非アクティブ、waveform はフィルム上の vector 音符で区別する。
+ストリップ本体にはモード切替 UI を置かず、全域を
+ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ選んだ高さのぶん上へ退避し、
+非表示時は従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
 
 **D17 の共有 1 枚プレビュー**: seek bar と seek strip は presenter-local な同じ preview target を
 更新し、`ThumbnailWorker` の latest-wins request、許容値計算、texture、描画出口を共有する。
