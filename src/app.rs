@@ -6415,7 +6415,7 @@ pub(crate) struct AiJob {
     _local_activity: LocalAiActivityLease,
 }
 
-pub(crate) struct LocalAiActivityLease {
+pub struct LocalAiActivityLease {
     active: Arc<AtomicUsize>,
 }
 

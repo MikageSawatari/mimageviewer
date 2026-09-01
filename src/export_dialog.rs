@@ -160,7 +160,8 @@ pub struct ExportRequest {
     pub include_metadata: bool,
     /// プリセット再合成が final AI を回している間、ローカル AI 利用中であることを
     /// remote 側の acquire barrier へ見せ続ける lease。AI を使わない export では `None`。
-    pub(crate) local_ai_activity: Option<crate::app::LocalAiActivityLease>,
+    /// lease は crate 内でしか作れないので、外から組み立てるときは常に `None`。
+    pub local_ai_activity: Option<crate::app::LocalAiActivityLease>,
 }
 
 /// プリセット出力 (`_1`〜`_4`) を作り直すための「隠蔽適用前」スナップショット。
@@ -211,7 +212,7 @@ pub struct ExportPagePixels {
     pub base_pixels: Arc<egui::ColorImage>,
     /// プリセット出力用の再合成材料。`None` ならこのページはプリセット出力できない
     /// (= 隠蔽マスクが無い)。
-    pub(crate) conceal_variant: Option<Arc<ConcealVariantSource>>,
+    pub conceal_variant: Option<Arc<ConcealVariantSource>>,
     pub crop: Option<crate::export_crop::CropRect>,
     pub rotation: crate::rotation_db::Rotation,
 }
