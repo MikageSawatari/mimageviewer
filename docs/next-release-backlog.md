@@ -3506,18 +3506,26 @@ clip は旧 `rects` 由来のまま残るので、最終的な可視間隔を he
   スナップショットを捨てるので、そのあいだだけ確保が 104pt 減って**映像が広がり**、
   新しい素材が届いた瞬間に縮む。新規オープンでも素材が届くまで同じことが起きる。
 - **修正**: 確保を「**描けるか**」ではなく「**利用者がピンしているか**」に従わせた。
-  `seek_strip_reserves_space(has_strip, availability)` を 1 つ置き、スナップショットがある
-  あいだと、素材の有無がまだ判明していない (`Unknown`) あいだは場所を確保する。
-  素材が無いと判明した (`Unavailable`) 時点で解放する。`set_overlay_seek_strip` の
-  transform 更新条件も、表示の有無ではなくこの確保の変化で判定する。
+  `seek_strip_reserves_space(has_strip, availability)` を 1 つ置き、ピンしているあいだは
+  **この動画に素材を作れないと分かっている (`Unavailable`) 場合だけ**解放する。
+  `set_overlay_seek_strip` の transform 更新条件も、表示の有無ではなくこの確保の変化で
+  判定する。
+  - 最初は「スナップショットがあるか、または素材が未判明 (`Unknown`) なら確保」と書いたが、
+    それだと**セッションを畳む瞬間** (`stop_video_seek_strip_session` → `None` +
+    `Available`) に確保が外れ、一覧へ戻る直前に映像が 104pt 広がってから閉じた
+    (実機 2026-09-01)。payload が外れることと「この動画に素材があるか」は別の話なので、
+    後者だけで判定する形に直した。ピンそのものを外す操作は `close_video_seek_strip` が
+    固定も外す (`is_user_dismissal`) ので、この述語には来ない。`FullscreenExit` は
+    user dismissal ではないため、閉じてもピンは残る。
   - 切替中の 104pt はいったん空 (黒) になるが、**位置は動かない**。ピンした場所を
     先に空けておく形なので、確保が外れて広がってから縮むより破綻が少ない。
   - hover パネルの下端 (`native_panel_hover_bottom`) は「描かれているか」に従うままで
     よい (問いが違う: 映像がどこで終わるか vs ホバー帯がどこで終わるか)。
 - **テスト**: `a_pinned_strip_keeps_its_space_while_the_next_video_is_still_preparing`
   (切替中の rect が表示中と一致する / 素材が無いと判明したら 104pt 解放する) と
-  `the_strip_reserve_follows_the_pin_until_the_material_is_known`。述語を元の
-  「スナップショットがあるか」に戻すと前者が落ちることを確認済み。
+  `the_strip_reserve_follows_the_pin_unless_this_video_cannot_have_one`
+  (表示中 / 切替中 / **セッションを畳む瞬間** / 作れない動画 の 4 条件)。述語を
+  「スナップショットがあるか」や「`Unknown` なら確保」に戻すと落ちることを確認済み。
 
 #### 3 つ目の原因 (本命): 切替中のナビゲーションプレビューが全画面に敷かれていた
 

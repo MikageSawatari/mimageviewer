@@ -12245,17 +12245,18 @@ impl From<bool> for VideoVisualLayout {
 
 /// ストリップが場所を占めるか。**描くか**とは別の問い。
 ///
-/// 固定表示 (ピン) を選んでいる間は、素材がまだ用意できていない段階でも場所を確保する。
-/// 「いまスナップショットがあるか」だけで決めると、動画を切り替えるたびに確保が外れて
-/// 映像が 104pt 分広がり、素材が届いた瞬間に縮む (backlog §1.162)。
+/// ピンしているあいだは、**この動画にストリップを作れないと分かっている場合を除いて**
+/// 場所を確保する。スナップショットの有無で決めると、無くなる瞬間 (動画の切替、
+/// セッションを畳むとき) のたびに確保が外れて映像が 104pt 広がる (backlog §1.162)。
+/// ピンそのものを外す操作は `close_video_seek_strip` が固定も外すので、ここには来ない。
 pub(super) fn seek_strip_reserves_space(
     has_strip: bool,
     availability: crate::video::seek_strip::SeekStripMaterialAvailability,
 ) -> bool {
     has_strip
-        || matches!(
+        || !matches!(
             availability,
-            crate::video::seek_strip::SeekStripMaterialAvailability::Unknown
+            crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(_)
         )
 }
 
@@ -14731,32 +14732,36 @@ mod tests {
         assert_eq!(unavailable.height, showing.height + SEEK_STRIP_HEIGHT);
     }
 
-    /// 確保は「場所を占めるか」であって「描くか」ではない。素材が判明していない
-    /// あいだも占め、判明して無ければ空ける。
+    /// 確保は「場所を占めるか」であって「描くか」ではない。ピンしているあいだは、
+    /// この動画に作れないと分かっている場合だけ空ける。
     #[test]
-    fn the_strip_reserve_follows_the_pin_until_the_material_is_known() {
+    fn the_strip_reserve_follows_the_pin_unless_this_video_cannot_have_one() {
         use crate::video::seek_strip::{SeekStripMaterialAvailability, StripAxisUnavailableReason};
 
+        let unavailable = SeekStripMaterialAvailability::Unavailable(
+            StripAxisUnavailableReason::KeyframesTooSparse,
+        );
+
+        // 表示中。
         assert!(seek_strip_reserves_space(
             true,
             SeekStripMaterialAvailability::Available
         ));
+        // 動画の切替中: 次の動画の素材はまだ分からない。
         assert!(seek_strip_reserves_space(
             false,
             SeekStripMaterialAvailability::Unknown
         ));
+        // セッションを畳む瞬間: payload は外れるが、この動画に素材はある。
+        // ここを外すと、一覧へ戻る直前に映像が 104pt 広がってから閉じる。
         assert!(seek_strip_reserves_space(
-            true,
-            SeekStripMaterialAvailability::Unavailable(
-                StripAxisUnavailableReason::KeyframesTooSparse
-            )
-        ));
-        assert!(!seek_strip_reserves_space(
             false,
-            SeekStripMaterialAvailability::Unavailable(
-                StripAxisUnavailableReason::KeyframesTooSparse
-            )
+            SeekStripMaterialAvailability::Available
         ));
+        // 作れないと分かった動画だけ空ける。
+        assert!(!seek_strip_reserves_space(false, unavailable));
+        // 出ているものには必ず場所がある。
+        assert!(seek_strip_reserves_space(true, unavailable));
     }
 
     #[test]
