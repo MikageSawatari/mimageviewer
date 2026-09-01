@@ -506,21 +506,35 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             )
             .weak(),
         );
+        ui.label(
+            egui::RichText::new(
+                "一覧の上から 10 件が固定キースロット 1〜10 です。「上へ」「下へ」で並べ替えると、対応するスロットも変わります。11 件目以降は固定キーの対象外です。",
+            )
+            .weak(),
+        );
         ui.add_space(6.0);
 
         // 一覧はフルパスと引数を出さない。出すと横幅がダイアログを突き抜け、
         // 広げないと右端が読めなくなる (2026-08-31 利用者報告)。どちらも下の
         // 「選択したツールの設定」に出ているので、ここは選ぶための最小限にする。
         egui::Grid::new("external_tools_table")
-            .num_columns(2)
+            .num_columns(3)
             .striped(true)
             .min_col_width(120.0)
             .show(ui, |ui| {
+                ui.strong("固定キースロット");
                 ui.strong("名前");
                 ui.strong("起動方法");
                 ui.end_row();
-                for tool in state.settings.external_tools.clone() {
+                for (index, tool) in state
+                    .settings
+                    .external_tools
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                {
                     let selected = state.external_tool_selected == Some(tool.id);
+                    ui.label(external_tool_key_slot_label(index));
                     if ui.selectable_label(selected, tool.display_name()).clicked() {
                         state.select_external_tool(Some(tool.id));
                     }
@@ -865,6 +879,14 @@ fn enum_combo<T: Copy + PartialEq>(
                 ui.selectable_value(value, *candidate, *label);
             }
         });
+}
+
+fn external_tool_key_slot_label(index: usize) -> String {
+    if index < 10 {
+        (index + 1).to_string()
+    } else {
+        "なし（対象外）".to_owned()
+    }
 }
 
 fn draw_external_tool_add_purpose(ctx: &egui::Context, state: &mut PreferencesState) {
@@ -8701,13 +8723,21 @@ mod tests {
         OperationAssignmentTarget, PreferencesState, apply_command_editor,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
         compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
-        keyboard_picker_cell_width, keyboard_picker_label_width, keyboard_picker_main_rows,
-        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
-        ring_bindings_for_key_action,
+        external_tool_key_slot_label, keyboard_picker_cell_width, keyboard_picker_label_width,
+        keyboard_picker_main_rows, modifier_hold_editor_choice, natural_operation_label_cmp,
+        open_operation_assignment_editor, ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, KeyName, ModKind};
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+
+    #[test]
+    fn external_tool_key_slot_labels_mark_the_ten_slot_boundary() {
+        assert_eq!(external_tool_key_slot_label(0), "1");
+        assert_eq!(external_tool_key_slot_label(9), "10");
+        assert_eq!(external_tool_key_slot_label(10), "なし（対象外）");
+        assert_eq!(external_tool_key_slot_label(usize::MAX), "なし（対象外）");
+    }
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
     /// render-to-target 後も最終 AI / composite は `MAX_TEXTURE_DIM` 以下に保つ。

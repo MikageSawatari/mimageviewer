@@ -13,7 +13,9 @@ use crate::final_composite::{
     build_final_composite_plan_without_ai, execute_final_composite,
     final_composite_colorize_applies, resolve_effective_params,
 };
-use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
+use crate::keymap::{
+    CommandScope, EXTERNAL_TOOL_ACTIONS, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS,
+};
 
 /// ZIP/対応アーカイブ、および本扱いの画像のみフォルダを読むときのページ順。
 /// 一覧整理用のソート設定から独立した、Windows に近いファイル名自然順で固定する。
@@ -11636,6 +11638,8 @@ pub struct App {
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_launch_confirmation:
         Option<crate::external_tool::ExternalLaunchConfirmation>,
+    /// キー操作で開いた外部ツール選択モーダル。対象は open 時点の snapshot を保持する。
+    pub(crate) external_tool_picker: Option<crate::external_tool::ExternalToolPickerRequest>,
 
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
@@ -14196,6 +14200,7 @@ impl App {
             cached_handlers: None,
             external_tool_launch_pending: Vec::new(),
             external_tool_launch_confirmation: None,
+            external_tool_picker: None,
             cached_nav_indices: None,
             cached_fs_seek_info: None,
 
@@ -15831,6 +15836,7 @@ impl App {
             self.show_preferences => "preferences",
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
             self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
+            self.external_tool_picker.is_some() => "external_tool_picker",
             self.show_settings_restore => "settings_restore",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
@@ -33939,6 +33945,34 @@ impl App {
                 .consume_first_action(ctx, &[CommandScope::Grid], PINNED_TAG_ACTIONS)
         {
             self.apply_pinned_tag_key_action(action, "grid-pinned-tag-key");
+            return None;
+        }
+
+        // 全 action の既定キーは空なので、既存の予約キーや既定 shortcut の優先順位は変えない。
+        // 外部 process / modal を key repeat で複数回発火させないため no-repeat で消費する。
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::ExternalToolPicker)
+        {
+            self.request_grid_external_tool_picker();
+            return None;
+        }
+        if let Some(action) = EXTERNAL_TOOL_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| self.keymap.consume_action_no_repeat(ctx, *action))
+        {
+            let slot = action
+                .external_tool_slot_number()
+                .expect("external tool action array contains only numbered slots");
+            self.launch_grid_external_tool_slot(slot);
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::ExternalToolForContainer)
+        {
+            self.request_container_external_tool_picker();
             return None;
         }
 
@@ -67546,6 +67580,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_external_tool_picker(ctx);
         self.show_external_tool_launch_confirmation(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);

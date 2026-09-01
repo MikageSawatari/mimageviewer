@@ -228,6 +228,22 @@ pub enum ExternalTargetSource {
     Container { path: Option<PathBuf> },
 }
 
+/// キー操作から開く外部ツール選択モーダルの対象種別。
+///
+/// 対象そのものは [`ExternalToolPickerRequest::targets`] にスナップショットする。
+/// モーダル表示中にグリッドの選択や現在地が変わっても、別の項目を起動しないためである。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalToolPickerTargetKind {
+    GridItems,
+    Container,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalToolPickerRequest {
+    targets: Vec<LaunchTarget>,
+    target_kind: ExternalToolPickerTargetKind,
+}
+
 fn ordered_checked_indices(
     checked: &HashSet<usize>,
     primary: Option<usize>,
@@ -283,6 +299,39 @@ pub fn resolve_external_targets(
         .filter_map(|index| items.get(index))
         .map(|item| LaunchTarget::from_grid_item(Some(item)))
         .collect()
+}
+
+/// 現在地から外部ツールへ渡すコンテナー 1 件を解決する純関数。
+///
+/// `unavailable` はドライブ一覧・検索結果一覧・スナップショット等、表示中の items が
+/// `effective_folder` そのものの内容ではない場合に立てる。古い物理パスを誤って渡さない。
+pub(crate) fn resolve_external_container_targets(
+    effective_folder: Option<&Path>,
+    unavailable: bool,
+) -> Vec<LaunchTarget> {
+    if unavailable {
+        return Vec::new();
+    }
+    effective_folder
+        .map(|path| LaunchTarget::RealFile(path.to_path_buf()))
+        .into_iter()
+        .collect()
+}
+
+/// 1-based の固定キースロットから登録済みツールを解決する純関数。
+pub(crate) fn resolve_external_tool_slot(
+    tools: &[ExternalTool],
+    slot: usize,
+) -> Result<&ExternalTool, String> {
+    if !(1..=10).contains(&slot) {
+        return Err(format!(
+            "外部ツールスロット {slot} は使用できません (1〜10 を指定してください)"
+        ));
+    }
+    let index = slot - 1;
+    tools
+        .get(index)
+        .ok_or_else(|| format!("外部ツールスロット {slot} にはツールが登録されていません"))
 }
 
 #[derive(Clone, Debug)]
@@ -1136,6 +1185,75 @@ fn external_launch_completion_summary(completions: &[ExternalLaunchCompletion]) 
 }
 
 impl crate::app::App {
+    fn external_tool_grid_key_targets(&self) -> Vec<LaunchTarget> {
+        resolve_external_targets(
+            &self.items,
+            self.current_grid_order(),
+            &self.checked,
+            ExternalTargetSource::GridKey {
+                selected: self.selected,
+            },
+        )
+    }
+
+    pub(crate) fn external_tool_container_targets(&self) -> Vec<LaunchTarget> {
+        let effective_folder = self.effective_folder();
+        let unavailable = self.items_are_drive_list
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.items_are_reading_history_view
+            || self.items_are_bookmark_view
+            || self.items_are_rating_view
+            || self.is_snapshot_active()
+            || self.favsearch.on_results_grid()
+            || self.tag_view.on_results_grid()
+            || effective_folder
+                .as_deref()
+                .is_some_and(crate::app::is_synthetic_view_path);
+        resolve_external_container_targets(effective_folder.as_deref(), unavailable)
+    }
+
+    fn request_external_tool_picker(
+        &mut self,
+        targets: Vec<LaunchTarget>,
+        target_kind: ExternalToolPickerTargetKind,
+    ) {
+        if let Err(error) = real_files_from_targets(&targets) {
+            self.show_feedback_toast(error);
+            return;
+        }
+        if self.settings.external_tools.is_empty() {
+            self.show_feedback_toast("外部ツールが登録されていません".to_string());
+            return;
+        }
+        self.external_tool_picker = Some(ExternalToolPickerRequest {
+            targets,
+            target_kind,
+        });
+    }
+
+    pub(crate) fn request_grid_external_tool_picker(&mut self) {
+        let targets = self.external_tool_grid_key_targets();
+        self.request_external_tool_picker(targets, ExternalToolPickerTargetKind::GridItems);
+    }
+
+    pub(crate) fn request_container_external_tool_picker(&mut self) {
+        let targets = self.external_tool_container_targets();
+        self.request_external_tool_picker(targets, ExternalToolPickerTargetKind::Container);
+    }
+
+    pub(crate) fn launch_grid_external_tool_slot(&mut self, slot: usize) {
+        let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
+            Ok(tool) => tool.clone(),
+            Err(error) => {
+                self.show_feedback_toast(error);
+                return;
+            }
+        };
+        let targets = self.external_tool_grid_key_targets();
+        self.queue_external_tool_launch_targets(&tool, &targets);
+    }
+
     pub(crate) fn queue_external_tool_launch(
         &mut self,
         tool: &ExternalTool,
@@ -1290,6 +1408,69 @@ impl crate::app::App {
             }
         } else if cancel {
             self.external_tool_launch_confirmation = None;
+        }
+    }
+
+    pub(crate) fn show_external_tool_picker(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.external_tool_picker.as_ref() else {
+            return;
+        };
+        let target_kind = request.target_kind;
+        let tools: Vec<_> = self
+            .settings
+            .external_tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| (tool.id, index + 1, tool.display_name()))
+            .collect();
+        let mut selected_tool = None;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("external_tool_picker")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading(match target_kind {
+                ExternalToolPickerTargetKind::GridItems => "外部ツールを選択",
+                ExternalToolPickerTargetKind::Container => "フォルダー / 本を開く外部ツールを選択",
+            });
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for (tool_id, slot, display_name) in &tools {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::Button::new(format!("{slot}. {display_name}")),
+                            )
+                            .clicked()
+                        {
+                            selected_tool = Some(*tool_id);
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            if ui.button("キャンセル").clicked() {
+                cancel = true;
+            }
+        });
+        if response.should_close() || self.dialog_escape_pressed(ctx) {
+            cancel = true;
+        }
+        if let Some(tool_id) = selected_tool {
+            let tool = self
+                .settings
+                .external_tools
+                .iter()
+                .find(|tool| tool.id == tool_id)
+                .cloned();
+            let request = self.external_tool_picker.take();
+            if let (Some(tool), Some(request)) = (tool, request) {
+                self.queue_external_tool_launch_targets(&tool, &request.targets);
+            } else {
+                self.show_feedback_toast("外部ツールを選択できませんでした".to_string());
+            }
+        } else if cancel {
+            self.external_tool_picker = None;
         }
     }
 }
@@ -1598,6 +1779,107 @@ mod tests {
                 },
             )),
             [PathBuf::from("book.zip")]
+        );
+    }
+
+    #[test]
+    fn external_tool_slot_reports_an_unregistered_slot() {
+        let tools: Vec<_> = (1..=3)
+            .map(|slot| {
+                let mut tool = ExternalTool::defaults_for_viewing();
+                tool.name = format!("Tool {slot}");
+                tool
+            })
+            .collect();
+        assert_eq!(
+            resolve_external_tool_slot(&tools, 1).unwrap().name,
+            "Tool 1"
+        );
+        assert_eq!(
+            resolve_external_tool_slot(&tools, 3).unwrap().name,
+            "Tool 3"
+        );
+        assert_eq!(
+            resolve_external_tool_slot(&tools, 5).unwrap_err(),
+            "外部ツールスロット 5 にはツールが登録されていません"
+        );
+        assert!(resolve_external_tool_slot(&tools, 0).is_err());
+        let mut eleven_tools = tools.clone();
+        eleven_tools.resize_with(11, ExternalTool::defaults_for_viewing);
+        assert!(resolve_external_tool_slot(&eleven_tools, 11).is_err());
+    }
+
+    #[test]
+    fn missing_external_tool_key_slot_is_a_reasoned_noop() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = (1..=3)
+            .map(|slot| {
+                let mut tool = ExternalTool::defaults_for_viewing();
+                tool.name = format!("Tool {slot}");
+                tool
+            })
+            .collect();
+        app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+            "selected.jpg",
+        ))];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+
+        app.launch_grid_external_tool_slot(5);
+
+        assert!(app.external_tool_launch_pending.is_empty());
+        assert!(app.external_tool_launch_confirmation.is_none());
+        assert!(app.external_tool_picker.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == "外部ツールスロット 5 にはツールが登録されていません"
+        }));
+    }
+
+    #[test]
+    fn picker_rejects_virtual_targets_before_open_and_snapshots_real_targets() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = vec![ExternalTool::defaults_for_viewing()];
+        app.request_external_tool_picker(
+            vec![LaunchTarget::Virtual(
+                crate::grid_item::FileOperationRefusal::VirtualPage,
+            )],
+            ExternalToolPickerTargetKind::GridItems,
+        );
+        assert!(app.external_tool_picker.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == &crate::grid_item::checked_virtual_selection_message("外部ツールで開くことが")
+        }));
+
+        app.request_external_tool_picker(
+            vec![LaunchTarget::RealFile(PathBuf::from("original.jpg"))],
+            ExternalToolPickerTargetKind::GridItems,
+        );
+        app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+            "changed.jpg",
+        ))];
+        assert_eq!(
+            app.external_tool_picker
+                .as_ref()
+                .map(|request| request.targets.clone()),
+            Some(vec![LaunchTarget::RealFile(PathBuf::from("original.jpg"))])
+        );
+        assert_eq!(
+            app.modal_dialog_block_reason(),
+            Some("external_tool_picker")
+        );
+    }
+
+    #[test]
+    fn external_container_target_is_one_effective_folder_or_book() {
+        for path in ["pictures", "book.zip", "book.pdf", "book.7z"] {
+            assert_eq!(
+                resolve_external_container_targets(Some(Path::new(path)), false),
+                vec![LaunchTarget::RealFile(PathBuf::from(path))]
+            );
+        }
+        assert!(resolve_external_container_targets(None, false).is_empty());
+        assert!(
+            resolve_external_container_targets(Some(Path::new("stale-origin")), true).is_empty()
         );
     }
 

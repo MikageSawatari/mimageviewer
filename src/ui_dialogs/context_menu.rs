@@ -1177,7 +1177,21 @@ impl crate::app::App {
                 .unwrap_or_default()
         };
         let external_tool_targets = if is_folder_context {
-            vec![crate::external_tool::LaunchTarget::Unsupported]
+            // 背景は checked 項目ではなく、現在開いているフォルダー / 本そのものを渡す。
+            // effective_folder を所有する共通 helper 経由なので、変換 cache の ZIP ではなく
+            // ユーザー視点の元アーカイブになり、合成一覧の stale origin は拒否される。
+            self.external_tool_container_targets()
+        } else if surface == ContextMenuSurface::Grid && item.container_path().is_some() {
+            // コンテナー項目の右クリックは「項目集合を開く」ではなく「このコンテナーを開く」
+            // 専用入口。既存の平坦なツール列は保ち、対象だけ Container の 1 件へ切り替える。
+            crate::external_tool::resolve_external_targets(
+                &self.items,
+                self.current_grid_order(),
+                &self.checked,
+                crate::external_tool::ExternalTargetSource::Container {
+                    path: item.container_path().map(Path::to_path_buf),
+                },
+            )
         } else {
             let source = match surface {
                 ContextMenuSurface::Grid => {
@@ -2652,6 +2666,68 @@ mod delete_confirm_tests {
                 PathBuf::from(r"C:\media\zero.jpg"),
             ]
         );
+    }
+
+    #[test]
+    fn external_tool_container_item_targets_only_the_clicked_container() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\checked.jpg")),
+            GridItem::ZipFile(PathBuf::from(r"C:\media\book.zip")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.checked.insert(0);
+
+        let target = app.context_menu_target(
+            1,
+            app.items[1].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+
+        assert_eq!(
+            target.external_tool_targets,
+            vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
+                r"C:\media\book.zip"
+            ))]
+        );
+    }
+
+    #[test]
+    fn external_tool_folder_background_uses_effective_container_and_rejects_aggregate_view() {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some(PathBuf::from(r"C:\cache\book.zip"));
+        app.archive_source_override = Some(PathBuf::from(r"C:\books\book.7z"));
+        let target = app.context_menu_target(
+            usize::MAX,
+            GridItem::Folder(PathBuf::from(r"C:\cache\book.zip")),
+            true,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        assert_eq!(
+            target.external_tool_targets,
+            vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
+                r"C:\books\book.7z"
+            ))]
+        );
+
+        app.items_are_global_search_view = true;
+        let target = app.context_menu_target(
+            usize::MAX,
+            GridItem::Folder(PathBuf::from(r"C:\cache\book.zip")),
+            true,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        assert!(target.external_tool_targets.is_empty());
     }
 
     #[test]
