@@ -33647,6 +33647,165 @@ mod pipeline_cache_refactor_tests {
         texture_id
     }
 
+    /// 見開きの**相方**もアニメの全フレーム昇格の対象になる。
+    ///
+    /// 昇格は `fullscreen_idx` の 1 枚だけを見ていたので、見開きの相方は第 1 フレームのまま
+    /// 止まっていた (`advance_animation` は左右とも呼ばれるが、進めるフレームが無い)。
+    /// 一覧から開いた直後は片方だけ動き、行き来すると動き出す — 相方は自分が
+    /// `fullscreen_idx` になったときに初めて昇格し、以後キャッシュに残るため。
+    #[test]
+    fn a_spread_partner_animation_is_promoted_too() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, r"C:\missing\left.gif");
+        let right = push_image(&mut app, r"C:\missing\right.gif");
+        // 見開きの相方解決は表示順 (`visible_indices`) から組む。
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.page_is_displayed_now(left),
+            "現在ページが表示中と判定されない"
+        );
+        assert!(
+            app.page_is_displayed_now(right),
+            "見開きの相方が表示中と判定されない (昇格対象から外れる)"
+        );
+
+        // 単ページ表示に戻せば相方はもう表示中ではない。
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        assert!(app.page_is_displayed_now(left));
+        assert!(
+            !app.page_is_displayed_now(right),
+            "単ページなのに隣まで表示中と判定している"
+        );
+    }
+
+    /// 相方の昇格が、**開始と同時にキャンセルされない**。
+    ///
+    /// 「表示中のページの昇格だけ生かす」規則を 4 か所に別々に綴っていたため、開始のガードを
+    /// 直しても、先読みウィンドウの 2 つのキャンセル経路が相方の昇格を毎フレーム殺していた。
+    /// 一覧から開いた直後に相方が動かないのはこれ (§1.157)。
+    #[test]
+    fn a_spread_partner_promotion_is_not_cancelled_by_the_prefetch_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let left = push_image(&mut app, "C:/missing/left.gif");
+        let right = push_image(&mut app, "C:/missing/right.gif");
+        app.visible_indices = vec![left, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        let format = crate::canonical_image_loader::CanonicalAnimatedFormat::Gif;
+        insert_animation_first_frame(&mut app, &ctx, left, format);
+        insert_animation_first_frame(&mut app, &ctx, right, format);
+
+        assert!(
+            app.start_animation_promotion_if_needed(right),
+            "相方の昇格が開始されない"
+        );
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "開始直後に pending が無い"
+        );
+
+        app.update_prefetch_window(left);
+
+        assert!(
+            app.fs_pending.contains_key(&right),
+            "先読みウィンドウが相方の昇格をキャンセルしている"
+        );
+    }
+
+    /// 連結読みでは、相方も**動画を除いた静止画列**から解く。
+    ///
+    /// 連結読みの unit は静止画だけで組まれるので、動画が間に挟まった並びでは通常ナビ列と
+    /// 答えが変わる。相方判定だけ違う列を見ていると、表示中でないページを表示中と誤り、
+    /// 本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+    #[test]
+    fn a_continuous_spread_partner_skips_videos_like_the_units_do() {
+        let mut app = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.gif");
+        app.items
+            .push(GridItem::Video(PathBuf::from("C:/pics/clip.mp4")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let video = app.items.len() - 1;
+        let right = push_image(&mut app, "C:/pics/b.gif");
+        app.visible_indices = vec![left, video, right];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+
+        // 通常 (ページ送り) では動画も並びに入るので、左の相方は動画側。
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        assert_ne!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "通常ナビで静止画列を使ってしまっている"
+        );
+
+        // 連結読みでは動画を飛ばして静止画同士が 1 unit になる。
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        assert_eq!(
+            app.displayed_spread_partner(left),
+            Some(right),
+            "連結読みなのに動画を含む並びで相方を解いている"
+        );
+    }
+
+    /// **「表示中のページの昇格だけ生かす」規則の綴りは 1 つだけ。**
+    ///
+    /// この規則は 8 か所に散っており、2 度に分けて直そうとして 2 度とも取りこぼした
+    /// (§1.157)。`current_idx` / `fullscreen_idx` と直接比べている書き方が新しく生えたら、
+    /// また同じことが起きる。**共有述語を経由していない綴りをここで禁止する。**
+    #[test]
+    fn promotion_only_asks_one_predicate_whether_a_page_is_displayed() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for relative in ["src/app.rs", "src/ui_fullscreen.rs"] {
+            let source = std::fs::read_to_string(manifest_dir.join(relative))
+                .expect("read Rust source as UTF-8");
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("promotion_started_at_for") {
+                    continue;
+                }
+                // 判定は anchor の少し後ろに書かれる。**コメントを挟むと離れる** ので広めに
+                // 取り、コメント行は落としてから見る (実際に取りこぼした disconnect 経路は、
+                // 説明コメント 4 行を挟んで 5 行下にあり、前後 3 行の窓では素通りしていた
+                // — Codex Sol の指摘 6)。
+                let from = index.saturating_sub(8);
+                let to = (index + 24).min(lines.len());
+                let window = lines[from..to]
+                    .iter()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let compares_directly = window.contains("!= current_idx")
+                    || window.contains("== current_idx")
+                    || window.contains("!= Some(key)")
+                    || window.contains("== Some(key)")
+                    || window.contains("fullscreen_idx == Some")
+                    || window.contains("fullscreen_idx != Some");
+                if compares_directly && !window.contains("page_is_displayed") {
+                    offenders.push(format!("{relative}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "昇格の可視判定を共有述語 (`page_is_displayed`) を通さずに綴っている箇所:
+{}",
+            offenders.join(
+                "
+"
+            )
+        );
+    }
+
     #[test]
     fn fullscreen_load_spawns_current_with_full_frames_and_prefetch_with_first_frame_only() {
         let mut app = setup_app();

@@ -51450,14 +51450,17 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
-        // 昇格は表示対象 idx にだけ属する。KEEP 範囲内かどうかとは独立に、ページを
-        // 離れた時点で worker を止め、decode 済み backlog も捨てる。
+        // 昇格は**表示中のページ**に属する。見開きでは相方も表示中なので止めない。
+        // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
+        // decode 済み backlog も捨てる。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions: Vec<usize> = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect();
         for idx in stale_promotions {
@@ -51466,8 +51469,10 @@ impl App {
             }
             self.fs_early_dims.remove(&idx);
         }
+        // 昇格の upload も、表示中のページのぶんだけ残す。
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
 
         self.start_animation_promotion_if_needed(current_idx);
@@ -51488,9 +51493,12 @@ impl App {
                     return None;
                 }
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
+                // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
+                // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
                 (current_loading
                     || !keep_set.contains(&k)
-                    || pending.purpose.promotion_started_at_for(k).is_some())
+                    || (pending.purpose.promotion_started_at_for(k).is_some()
+                        && !Self::page_is_displayed(k, current_idx, displayed_partner)))
                 .then_some(k)
             })
             .collect();
@@ -57401,8 +57409,37 @@ impl App {
         }
     }
 
+    /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
+    pub(crate) fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
+        match self.resolve_spread_pair(current) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                Some(if left == current { right } else { left })
+            }
+            _ => None,
+        }
+    }
+
+    /// いま画面に出ているページか。**見開きでは 2 枚。**
+    ///
+    /// アニメの全フレーム昇格は「表示中のページのものだけ走らせ、他は止める」という規則で
+    /// 動く。その規則を **4 か所に別々に綴っていた** (開始のガード / upload backlog の掃除 /
+    /// stale 昇格のキャンセル / pending の一括キャンセル)。相方はどこかで必ず「表示中でない」
+    /// 側に落ちるので、毎フレーム開始しては即キャンセルされ、永久に昇格しなかった (§1.157)。
+    /// **判定はこの 1 つだけを使う。**
+    pub(crate) fn page_is_displayed(idx: usize, current: usize, partner: Option<usize>) -> bool {
+        idx == current || Some(idx) == partner
+    }
+
+    pub(crate) fn page_is_displayed_now(&mut self, idx: usize) -> bool {
+        let Some(current) = self.fullscreen_idx else {
+            return false;
+        };
+        let partner = self.displayed_spread_partner(current);
+        Self::page_is_displayed(idx, current, partner)
+    }
+
     fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
-        if self.fullscreen_idx != Some(idx)
+        if !self.page_is_displayed_now(idx)
             || self
                 .fs_cache
                 .get(&idx)
@@ -64371,7 +64408,13 @@ impl App {
             self.fs_pending.remove(&key);
             self.fs_early_dims.remove(&key);
             if purpose.promotion_started_at_for(key).is_some() {
-                self.mark_animation_promotion_failed(key);
+                // **こちらが止めたものを「失敗」にしない。** `PromotionFailed` は再試行を
+                // しない終端状態なので、画面から外れて cancel した昇格をここへ落とすと、
+                // 戻ってきても二度と動かない (§1.157: 見開きの相方が止まったままになる)。
+                // 表示中のまま送信側が消えたときだけ、本当の失敗として扱う。
+                if self.page_is_displayed_now(key) {
+                    self.mark_animation_promotion_failed(key);
+                }
             }
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
@@ -64476,7 +64519,9 @@ impl App {
                 continue;
             }
             if purpose.promotion_started_at_for(key).is_some() {
-                if self.fullscreen_idx != Some(key) {
+                // 見開きでは相方も表示中。ここで捨てると、昇格が完了しても
+                // 第 1 フレームのままになる (§1.157)。
+                if !self.page_is_displayed_now(key) {
                     continue;
                 }
                 if !matches!(result, FsLoadResult::Animated(_)) {
@@ -70801,8 +70846,10 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
     target_secs.clamp(0.0, upper)
 }
 
+// テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
+// `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Crate-wide `App` test fixture.
 ///

@@ -3898,6 +3898,10 @@ struct VerticalReadingPage {
     idx: usize,
     rect: egui::Rect,
     content_bbox: Option<egui::Rect>,
+    /// このページが属する表示ユニット。**見開き構成では 1 unit に左右 2 ページが入る**ので、
+    /// 通常見開きと同じ間隔合わせ (§1.154) をここで区別する必要がある。ページの並びだけでは
+    /// 「隣は同じ unit の相方か、次の unit の 1 ページ目か」が分からない。
+    unit_id: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -4182,6 +4186,20 @@ fn continuous_reading_page_rects(
     rects
 }
 
+/// 再生中のページの次コマ時刻から、**最も早いもの**を選ぶ。
+///
+/// 現在ページ 1 枚だけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+/// しか進まなかった (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる。
+/// §1.157、Codex Sol の指摘 1)。渡すのは**描いたページ**に限る — 描いていないページの
+/// 過ぎた期限を混ぜると 0ms 起床を繰り返し、アイドルで空転する。
+fn earliest_animation_deadline(deadlines: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    deadlines
+        .flatten()
+        .fold(None, |earliest: Option<f64>, next| {
+            Some(earliest.map_or(next, |current: f64| current.min(next)))
+        })
+}
+
 fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation) -> egui::Vec2 {
     match rotation {
         crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
@@ -4222,6 +4240,27 @@ fn fs_texture_content_rect(
 /// The layout rectangle is therefore only a containing frame. Re-resolve the final
 /// image rectangle from the actual texture at this ownership boundary so no caller
 /// can publish a non-uniform pixel scale when those aspects differ transiently.
+/// 連結読みのページ列から、**左右に並ぶ 2 ページの組**を取り出す。
+///
+/// unit は連続して積まれるので、同じ `unit_id` が続く範囲が 1 つの unit。ちょうど 2 ページの
+/// unit だけが見開きで、1 ページの unit (表紙 / 横長 / 端数) は間隔を持たない。
+/// **並びだけで隣を相方と決めない** — 次の unit の 1 ページ目と区別が付かない。
+fn continuous_spread_pair_positions(pages: &[VerticalReadingPage]) -> Vec<[usize; 2]> {
+    let mut pairs = Vec::new();
+    let mut start = 0usize;
+    while start < pages.len() {
+        let mut end = start + 1;
+        while end < pages.len() && pages[end].unit_id == pages[start].unit_id {
+            end += 1;
+        }
+        if end - start == 2 {
+            pairs.push([start, start + 1]);
+        }
+        start = end;
+    }
+    pairs
+}
+
 /// 見開きの左右を、寄せ終わった後に**一体で**置き直すための平行移動量。
 ///
 /// `layout_spread_page_rects` は小数のまま設定どおりの間隔を空けるが、その後 `RectPixelFit`
@@ -4238,7 +4277,6 @@ fn align_spread_pages_for_gap(
     left: &DisplayedImageTransform,
     right: &DisplayedImageTransform,
     gap_px: f32,
-    center_x: f32,
     pixels_per_point: f32,
 ) -> (egui::Vec2, egui::Vec2) {
     // **倍率や `RectSnapMode` で分岐しない。** 見える 2 辺を直接置くので、寄せ済みかどうかに
@@ -4268,8 +4306,11 @@ fn align_spread_pages_for_gap(
     // トリム中に全体矩形を整数へ寄せても意味が無い。ラスタライズされるのは `paint_rect` の
     // 頂点で、全体矩形は使われないからである。寄せる相手を間違えると間隔は端数のまま残り、
     // **ページごとに違う太さに見える** (実測ページで -0.48px 〜 +1.70px。利用者報告)。
+    // 組の中心は**渡された 2 つから決める**。呼び出し側 (通常見開き / 連結読みの unit) が
+    // それぞれ別の中心を綴ると、同じ関数が窓ごとに違う答えを出す。
+    let center_px = (to_px(left.paint_rect.min.x) + to_px(right.paint_rect.max.x)) * 0.5;
     let total_visible_px = left_visible_px + gap_px + right_visible_px;
-    let visible_start_px = to_px(center_x) - total_visible_px * 0.5;
+    let visible_start_px = center_px - total_visible_px * 0.5;
     // 左ページの右端 = 間隔の左側の境界。ここを物理ピクセル境界へ置く。
     // トリムが無ければ可視幅は整数なので、左ページの左端も従来どおり整数に乗る。
     let boundary_px = (visible_start_px + left_visible_px).round();
@@ -18410,7 +18451,16 @@ impl App {
             return SpreadPair::Single;
         }
 
-        let nav = self.get_nav_indices();
+        // **連結読みは動画を除いた静止画列で unit を組む** (`still_image_display_indices`)。
+        // 通常ナビ列 (動画を含む) で相方を解くと、動画が間に挟まった並びで別のページを
+        // 相方と答える。ページ送り側は既に同じ切り替えをしている
+        // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
+        // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
+        let nav = if self.continuous_reading_active_for_idx(idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
@@ -25565,14 +25615,29 @@ impl App {
         }
         self.request_mouse_ring_flick_repaint(ctx);
 
-        // アニメーション: 次フレームの時刻まで待ってから再描画
+        // アニメーション: 次フレームの時刻まで待ってから再描画。
+        //
+        // **描いた全ページのうち最も早い期限で起こす。** 現在ページだけを見ていたので、
+        // 見開きの相方や連結読みの他ページは、現在ページの都合でしか進まなかった
+        // (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる)。
+        // 対象は `fullscreen_page_layout` = 直近フレームで実際に描いたページに限る。
+        // `fs_cache` 全体から拾うと、描いていないページの過ぎた期限で 0ms 起床を
+        // 繰り返す (アイドル時の空転)。
         if !is_video {
-            if let Some(FsCacheEntry::Animated {
-                playback: AnimationPlayback::Playing { next_frame_at },
-                ..
-            }) = self.fs_cache.get(&fs_idx)
-            {
-                let delay = (next_frame_at - ctx.input(|i| i.time)).max(0.0);
+            let now = ctx.input(|i| i.time);
+            let earliest = earliest_animation_deadline(
+                std::iter::once(fs_idx)
+                    .chain(self.fullscreen_page_layout.page_indices())
+                    .map(|idx| match self.fs_cache.get(&idx) {
+                        Some(FsCacheEntry::Animated {
+                            playback: AnimationPlayback::Playing { next_frame_at },
+                            ..
+                        }) => Some(*next_frame_at),
+                        _ => None,
+                    }),
+            );
+            if let Some(next_frame_at) = earliest {
+                let delay = (next_frame_at - now).max(0.0);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             }
         }
@@ -26990,6 +27055,7 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            let unit_id = u32::try_from(list_pos).unwrap_or(u32::MAX);
             for (idx, rect, content_bbox) in
                 continuous_reading_page_rects(unit_rect, size, pixels_per_point)
             {
@@ -26997,6 +27063,7 @@ impl App {
                     idx,
                     rect,
                     content_bbox,
+                    unit_id,
                 });
             }
         }
@@ -27048,6 +27115,7 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            let unit_id = u32::try_from(pages.len()).unwrap_or(u32::MAX);
             for (idx, rect, content_bbox) in
                 continuous_reading_page_rects(unit_rect, &size, pixels_per_point)
             {
@@ -27055,6 +27123,7 @@ impl App {
                     idx,
                     rect,
                     content_bbox,
+                    unit_id,
                 });
             }
         }
@@ -27229,12 +27298,16 @@ impl App {
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
+        // 連結読みも見開き構成なら相方が一緒に出ている。**昇格を止めるのは画面から
+        // 外れたページだけ** (§1.157: この判定が 8 か所に散っていた)。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect::<Vec<_>>();
         for idx in stale_promotions {
@@ -27246,7 +27319,8 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
         let current_loading = keep_set.contains(&current_idx)
             && self.fs_page_load_state(current_idx).waiting_for_display();
@@ -27496,10 +27570,18 @@ impl App {
         let mut any_raw_work_pending = false;
         let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
         let mut painted_sources = FsNavigatorTextureSources::default();
-        for page in pages {
+
+        // **貼るテクスチャは描画より前に 1 回だけ決める。**
+        //
+        // 見開き unit の間隔合わせ (§1.154) は、描画と同じ矩形を先に知る必要がある。テクスチャが
+        // 違えば寸法も丸めも違うので、ここを 2 か所に綴ると「合わせた矩形」と「描いた矩形」が
+        // 別のテクスチャ由来になる。最初の実装が実際にそれで、連結読みだけ直っていなかった。
+        //
+        // アニメーションの駒送りはテクスチャを変えるので、選ぶ前に済ませる。
+        let mut page_textures: Vec<Option<FullscreenPaintResource>> =
+            Vec::with_capacity(pages.len());
+        for page in &pages {
             self.advance_animation(ctx, page.idx);
-            let rotation = self.get_rotation(page.idx);
-            let location = self.location_display_for_loading(page.idx);
             let pass_through_target_page = pass_through_target_pages
                 .as_ref()
                 .is_some_and(|target_pages| target_pages.contains(&page.idx));
@@ -27560,6 +27642,26 @@ impl App {
                         })
                     })
             };
+            let allow_thumbnail = !pass_through_target_page
+                && (original_preview_active
+                    || !self.colorize_display_requires_final_effect(page.idx));
+            page_textures.push(display_tex.or_else(|| {
+                allow_thumbnail
+                    .then(|| {
+                        self.fs_thumbnail_texture_for_display(page.idx)
+                            .map(FullscreenPaintResource::direct)
+                    })
+                    .flatten()
+            }));
+        }
+
+        // 間隔合わせは、上で決めたテクスチャで矩形を解決する。
+        let spread_offsets =
+            self.continuous_spread_gap_offsets(&pages, &page_textures, image_rect, ctx);
+
+        for (position, page) in pages.iter().enumerate() {
+            let rotation = self.get_rotation(page.idx);
+            let location = self.location_display_for_loading(page.idx);
             if matches!(self.fs_cache.get(&page.idx), Some(FsCacheEntry::Failed)) {
                 painter.text(
                     page.rect.center(),
@@ -27579,17 +27681,7 @@ impl App {
             {
                 any_raw_work_pending = true;
             }
-            let allow_thumbnail = !pass_through_target_page
-                && (original_preview_active
-                    || !self.colorize_display_requires_final_effect(page.idx));
-            let draw_tex = display_tex.or_else(|| {
-                allow_thumbnail
-                    .then(|| {
-                        self.fs_thumbnail_texture_for_display(page.idx)
-                            .map(FullscreenPaintResource::direct)
-                    })
-                    .flatten()
-            });
+            let draw_tex = page_textures[position].take();
             let source_size = self
                 .source_dims_for_idx(page.idx)
                 .map(|(w, h)| egui::vec2(w, h));
@@ -27608,8 +27700,10 @@ impl App {
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                // 連結読みは 1 ページずつ積むので、左右の間隔合わせは要らない。
-                egui::Vec2::ZERO,
+                spread_offsets
+                    .get(&page.idx)
+                    .copied()
+                    .unwrap_or(egui::Vec2::ZERO),
             ) {
                 self.trace_fs_continuous_page_draw(
                     page.idx,
@@ -29966,7 +30060,6 @@ impl App {
                         &left,
                         &right,
                         (effective_gap.max(0.0) * pixels_per_point).round(),
-                        center.x,
                         pixels_per_point,
                     ),
                     // 片方でも最終矩形が出せないなら合わせない (もう片方だけ動かすと
@@ -30242,6 +30335,63 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 連結読みの見開き unit について、左右の間隔を設定どおりにするための平行移動量。
+    ///
+    /// 通常見開きと**同じ関数**で決める。unit ごとに独立していて、1 ページの unit
+    /// (表紙 / 横長 / 端数) には何もしない。
+    fn continuous_spread_gap_offsets(
+        &mut self,
+        pages: &[VerticalReadingPage],
+        page_textures: &[Option<FullscreenPaintResource>],
+        image_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) -> std::collections::HashMap<usize, egui::Vec2> {
+        let pixels_per_point = ctx.pixels_per_point();
+        let gap_px = (quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        )
+        .max(0.0)
+            * pixels_per_point)
+            .round();
+        let mut offsets = std::collections::HashMap::new();
+        for [start, second] in continuous_spread_pair_positions(pages) {
+            let (left_idx, right_idx) = (pages[start].idx, pages[second].idx);
+            let resolved: Vec<Option<DisplayedImageTransform>> = [start, second]
+                .into_iter()
+                .map(|position| {
+                    // **描画と同じテクスチャで解く。** 別に選び直すと、合わせた矩形と描いた
+                    // 矩形が別のテクスチャ由来になり、出した移動量が描画側に合わない。
+                    let handle = page_textures.get(position)?.clone()?;
+                    let page = &pages[position];
+                    let rotation = self.get_rotation(page.idx);
+                    let source_size = self
+                        .source_dims_for_idx(page.idx)
+                        .map(|(w, h)| egui::vec2(w, h));
+                    self.resolve_fs_spread_page_transform(
+                        &handle,
+                        image_rect,
+                        page.rect,
+                        page.idx,
+                        source_size,
+                        FsPageLayoutSource::CurrentItem,
+                        rotation,
+                        page.content_bbox,
+                        pixels_per_point,
+                        ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    )
+                })
+                .collect();
+            if let [Some(left), Some(right)] = resolved.as_slice() {
+                let (left_offset, right_offset) =
+                    align_spread_pages_for_gap(left, right, gap_px, pixels_per_point);
+                offsets.insert(left_idx, left_offset);
+                offsets.insert(right_idx, right_offset);
+            }
+        }
+        offsets
+    }
+
     fn draw_fs_spread_page(
         &mut self,
         painter: &egui::Painter,
@@ -33342,31 +33492,55 @@ impl App {
         Ok(job.source.size)
     }
 
+    /// 範囲コピー用に、**描いた矩形の中で**元画像座標へ写す transform を作る。
+    ///
+    /// `page_rect` には描画に使った (= 見開きの間隔合わせ済みの) 矩形が入る。表示テクスチャの
+    /// 縦横比が元画像と違うことがあるので、元画像の比で letterbox し直す。
+    ///
+    /// **`Proportional` で作る。** `Texels` にすると寄せ直しが入り、間隔合わせで動かした分だけ
+    /// 元へ戻ってしまう。描画側は `x≈252.82`、キャプチャ側は `x=253` のように食い違い、同じ
+    /// 画面位置が別の元画像座標を指す (§1.154、Codex Sol の指摘 3)。ここで欲しいのは
+    /// **描いた位置と同じ写像**であって、貼り先の画素境界ではない。
+    #[allow(clippy::too_many_arguments)]
     fn capture_region_spread_transform_for_source(
         idx: usize,
         page_rect: egui::Rect,
         source_size: [usize; 2],
         rotation: crate::rotation_db::Rotation,
+        content_bbox: Option<egui::Rect>,
         pixels_per_point: f32,
     ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
-        DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-            pixel_fit: RectPixelFit::Texels,
-            page_idx: idx,
-            viewport_rect: page_rect,
-            source_size: tex_size,
-            texture_size: tex_size,
-            rotation,
-            free_rotation_rad: 0.0,
-            content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
-            fit_scale_limits: FullscreenFitScaleLimits {
+        // 描いた矩形の中へ元画像の縦横比で letterbox するだけ。**`resolve` は使わない** —
+        // あれはトリム後の内容を viewport いっぱいに合わせ直すので、渡した矩形とは別の倍率に
+        // なる。ここで欲しいのは「描いた矩形の中の、元画像座標への写像」。
+        let image_rect =
+            fit_display_size_in_rect(page_rect, rotated_display_size(tex_size, rotation));
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Proportional,
+                page_idx: idx,
+                viewport_rect: page_rect,
+                source_size: tex_size,
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                // **表示トリムを落とさない。** 落とすと `paint_rect` が画像全体になり、
+                // `hit_rect` が見えている範囲を越えて隣のページへ張り出す。そのまま
+                // `screen_to_source` へ渡すと、可視領域の外は**トリムで切ったこちら側の画素**を
+                // 指すので、選択も取れる画も見えているものと合わない (§1.156)。
+                // 単一ページ経路は描画時の transform をそのまま使うのでこの症状が無かった。
+                content_bbox,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
                 pixels_per_point,
-                ..FullscreenFitScaleLimits::default()
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
             },
-            pixels_per_point,
-            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-        })
+            image_rect,
+        )
     }
 
     fn capture_region_target_at(
@@ -33401,6 +33575,11 @@ impl App {
                     page.transform.full_image_rect,
                     source_size,
                     self.get_rotation(idx),
+                    // **描いたときに寄せた後の trim を渡す。** `content_bbox` は要求された
+                    // ままの未量子化の矩形なので、そちらを渡すと選択できる端が実際に描いた
+                    // 端と最大 0.5 画面 px ずれる (縮小時は元画像で数 px。Codex Sol の指摘 4)。
+                    // `uv_rect` は寄せた表示矩形を元画像空間へ戻したもので、描いた端そのもの。
+                    page.transform.content_bbox.map(|_| page.transform.uv_rect),
                     ctx.pixels_per_point(),
                 )
                 .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
@@ -36574,13 +36753,8 @@ mod tests {
                         let left = resolve(rects.left_rect, left_page);
                         let right = resolve(rects.right_rect, right_page);
                         let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
-                        let (left_offset, right_offset) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
+                        let (left_offset, right_offset) =
+                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
                         let left = left.translated_by(left_offset);
                         let right = right.translated_by(right_offset);
 
@@ -36621,6 +36795,238 @@ mod tests {
 "
             )
         );
+    }
+
+    /// **production の描画経路**を通した見開きの間隔 (§1.154、Codex Sol のテスト提案 3)。
+    ///
+    /// helper を直接呼ぶテストは「描画がどのテクスチャで矩形を解いたか」を見られない。
+    /// 実際、連結読みでは合わせが別のテクスチャで解かれていて、helper のテストは全部
+    /// 通ったまま実機で直っていなかった。ここは `draw_fs_spread` を実際に走らせ、
+    /// **描画が積んだ最終 transform** で測る。
+    #[test]
+    fn the_drawn_spread_puts_the_configured_gap_between_the_pages() {
+        for gap in [0_u32, 1, 2, 3] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            let left_path = std::path::PathBuf::from(r"C:\pics\spread-left.png");
+            let right_path = std::path::PathBuf::from(r"C:\pics\spread-right.png");
+            app.items = vec![
+                GridItem::Image(left_path.clone()),
+                GridItem::Image(right_path.clone()),
+            ];
+            app.settings.spread_page_gap_px = gap;
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.fullscreen_idx = Some(0);
+            // 縮小表示になる寸法。片ページの幅に端数が出る組み合わせを使う。
+            // egui の既定 Context は最大テクスチャ辺 2048。縮小表示で片ページ幅に
+            // 端数が出る組み合わせにする。
+            for (idx, size) in [(0usize, [1249_usize, 2000_usize]), (1, [1245, 1990])] {
+                let image = egui::ColorImage::new(
+                    [size[0], size[1]],
+                    vec![egui::Color32::WHITE; size[0] * size[1]],
+                );
+                let tex = ctx.load_texture(
+                    format!("spread_test_{idx}"),
+                    image.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    crate::fs_animation::FsCacheEntry::Static {
+                        tex,
+                        pixels: std::sync::Arc::new(image),
+                        source_dims: Some(size),
+                        load_seq: 0,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+            }
+
+            let image_rect =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_fs_spread(
+                        ui,
+                        ctx,
+                        image_rect,
+                        0,
+                        1,
+                        false,
+                        FsPageTurnDecision::normal(),
+                        None,
+                    );
+                });
+            });
+
+            let pixels_per_point = ctx.pixels_per_point();
+            let left = app
+                .fullscreen_page_layout
+                .page_by_idx(0)
+                .expect("左ページが積まれていない");
+            let right = app
+                .fullscreen_page_layout
+                .page_by_idx(1)
+                .expect("右ページが積まれていない");
+            let painted = (right.transform.paint_rect.min.x - left.transform.paint_rect.max.x)
+                * pixels_per_point;
+            let want = (quantize_points_to_physical_pixels(gap as f32, pixels_per_point)
+                * pixels_per_point)
+                .round();
+            assert!(
+                (painted - want).abs() < 1e-3,
+                "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
+            );
+        }
+    }
+
+    /// **連結読みも production の描画経路**で間隔が設定どおりになる (Codex Sol のテスト提案 2)。
+    ///
+    /// 連結読みは見開き構成のとき 1 unit に左右 2 ページを並べる。ここが helper テストでは
+    /// 守れておらず、合わせが**別のテクスチャで解かれていた**まま 5 回目の実機報告に至った。
+    /// `draw_fs_continuous_reading` を実際に走らせ、積まれた最終 transform で測る。
+    #[test]
+    fn the_drawn_continuous_spread_puts_the_configured_gap_between_the_pages() {
+        for gap in [0_u32, 1, 2] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            app.items = vec![
+                GridItem::Image(std::path::PathBuf::from("C:/pics/cont-left.png")),
+                GridItem::Image(std::path::PathBuf::from("C:/pics/cont-right.png")),
+            ];
+            // 連結読みの unit は `current_grid_order` (= `visible_indices`) から組む。
+            app.visible_indices = vec![0, 1];
+            app.settings.spread_page_gap_px = gap;
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.reading_flow = crate::settings::ReadingFlow::Vertical;
+            app.fullscreen_idx = Some(0);
+            for (idx, size) in [(0usize, [1249_usize, 2000_usize]), (1, [1245, 1990])] {
+                let image = egui::ColorImage::new(
+                    [size[0], size[1]],
+                    vec![egui::Color32::WHITE; size[0] * size[1]],
+                );
+                let tex = ctx.load_texture(
+                    format!("cont_test_{idx}"),
+                    image.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.fs_cache.insert(
+                    idx,
+                    crate::fs_animation::FsCacheEntry::Static {
+                        tex,
+                        pixels: std::sync::Arc::new(image),
+                        source_dims: Some(size),
+                        load_seq: 0,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+            }
+
+            let image_rect =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_fs_continuous_reading(
+                        ui,
+                        ctx,
+                        image_rect,
+                        0,
+                        false,
+                        FsPageTurnDecision::normal(),
+                    );
+                });
+            });
+
+            let pixels_per_point = ctx.pixels_per_point();
+            let (Some(left), Some(right)) = (
+                app.fullscreen_page_layout.page_by_idx(0),
+                app.fullscreen_page_layout.page_by_idx(1),
+            ) else {
+                panic!("連結読みで左右 2 ページが積まれていない (gap={gap})");
+            };
+            let painted = (right.transform.paint_rect.min.x - left.transform.paint_rect.max.x)
+                * pixels_per_point;
+            let want = (quantize_points_to_physical_pixels(gap as f32, pixels_per_point)
+                * pixels_per_point)
+                .round();
+            assert!(
+                (painted - want).abs() < 1e-3,
+                "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
+            );
+        }
+    }
+
+    /// アニメの次コマ期限は、**描いた全ページのうち最も早いもの**で起こす。
+    ///
+    /// 現在ページだけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
+    /// しか進まなかった。現在ページが静止画なら期限が一切立たず、相方は入力があるまで
+    /// 止まる (§1.157、Codex Sol の指摘 1)。
+    ///
+    /// **描いていないページを混ぜてはいけない** — 期限が過ぎたまま残るので 0ms 起床を
+    /// 繰り返し、アイドルで空転する。
+    #[test]
+    fn the_animation_deadline_comes_from_the_pages_that_were_drawn() {
+        // 現在ページが静止画 (期限なし)、相方が 50ms 後。相方の期限で起きる。
+        assert_eq!(
+            earliest_animation_deadline([None, Some(0.05)].into_iter()),
+            Some(0.05),
+            "静止画の隣のアニメが起こされない"
+        );
+        // 両方アニメなら早い方。**順序に依らない** (最後や最初を取る実装を弾く)。
+        assert_eq!(
+            earliest_animation_deadline([Some(1.0), Some(0.05)].into_iter()),
+            Some(0.05),
+            "遅い方の期限に引きずられている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "並び順で答えが変わっている"
+        );
+        assert_eq!(
+            earliest_animation_deadline([Some(0.5), Some(0.05), Some(1.0)].into_iter()),
+            Some(0.05),
+            "中間にある最早の期限を落としている"
+        );
+        // 再生中のページが無ければ期限も無い (空転しない)。
+        assert_eq!(earliest_animation_deadline([None, None].into_iter()), None);
+        assert_eq!(earliest_animation_deadline(std::iter::empty()), None);
+    }
+
+    /// 連結読みで間隔を合わせる相手は、**同じ unit の 2 ページだけ**。
+    ///
+    /// unit は縦に積まれるので、並びだけで隣を相方と決めると「次の unit の 1 ページ目」を
+    /// 掴む。1 ページの unit (表紙 / 横長 / 端数) は間隔を持たないので対象外。
+    #[test]
+    fn only_two_page_units_are_a_continuous_spread_pair() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0));
+        let page = |idx: usize, unit_id: u32| VerticalReadingPage {
+            idx,
+            rect,
+            content_bbox: None,
+            unit_id,
+        };
+        // 表紙 1 枚 -> 見開き -> 見開き -> 端数 1 枚。
+        let pages = vec![
+            page(0, 0),
+            page(1, 1),
+            page(2, 1),
+            page(3, 2),
+            page(4, 2),
+            page(5, 3),
+        ];
+        assert_eq!(
+            continuous_spread_pair_positions(&pages),
+            vec![[1, 2], [3, 4]]
+        );
+
+        // 3 ページの unit は見開きではない (現状は作られないが、掴んだら間隔が壊れる)。
+        let odd = vec![page(0, 7), page(1, 7), page(2, 7)];
+        assert!(continuous_spread_pair_positions(&odd).is_empty());
+
+        // 単ページばかりでも、隣同士を組にしない。
+        let singles = vec![page(0, 0), page(1, 1), page(2, 2)];
+        assert!(continuous_spread_pair_positions(&singles).is_empty());
     }
 
     /// 貼るテクスチャが差し替わっても、間隔は変わらない (§1.154、利用者報告)。
@@ -36702,13 +37108,8 @@ mod tests {
                         };
                         let left = resolve(rects.left_rect, left_page);
                         let right = resolve(rects.right_rect, right_page);
-                        let (left_offset, right_offset) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
+                        let (left_offset, right_offset) =
+                            align_spread_pages_for_gap(&left, &right, gap_px, pixels_per_point);
                         let left = left.translated_by(left_offset);
                         let right = right.translated_by(right_offset);
                         let painted =
@@ -36749,105 +37150,193 @@ mod tests {
                 Some((0.015, 0.025, 0.985, 0.975)),
             ),
             (Some((0.0, 0.0, 1.0, 1.0)), Some((0.0, 0.0, 1.0, 1.0))),
+            // 片側だけトリム。自動トリムは左右で結果が違うので、これが普通の状態
+            // (Codex Sol のテスト提案 4)。
+            (Some((0.0, 0.04, 0.97, 0.96)), None),
+            (None, Some((0.03, 0.0, 1.0, 0.95))),
         ];
+        // 左右で違う解像度のテクスチャ。片側だけ AI アップスケールが先に届く、
+        // 片側だけサムネイルのまま、といった状態が実際に起きる。
+        let texture_factors = [(1.0_f32, 1.0_f32), (1.0, 4.0), (1.0 / 8.0, 1.0)];
+        // 回転は bbox を表示空間へ写してから寄せるので、寄せ・UV・逆写像がまとめて効く。
+        // viewport の原点が 0 でない場合も混ぜる (Codex Sol のテスト提案 4)。
+        let rotations = [
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::Cw180,
+        ];
+        let viewport_origins = [egui::pos2(0.0, 0.0), egui::pos2(37.0, 19.0)];
         for (lp, rp) in pairs {
             for (lt, rt) in trims {
-                for gap in [0.0_f32, 1.0, 2.0] {
-                    for pixels_per_point in [1.0_f32, 1.25, 1.5] {
-                        total += 1;
-                        let viewport = egui::Rect::from_min_size(
-                            egui::pos2(0.0, 0.0),
-                            egui::vec2(2560.0, 1440.0),
-                        );
-                        let unit =
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                        let mk = |t: Option<(f32, f32, f32, f32)>| {
-                            t.map(|(a, b, c, d)| {
-                                egui::Rect::from_min_max(egui::pos2(a, b), egui::pos2(c, d))
-                            })
-                        };
-                        let lb = mk(lt);
-                        let rb = mk(rt);
-                        let left_page = egui::vec2(lp.0, lp.1);
-                        let right_page = egui::vec2(rp.0, rp.1);
-                        let left_bbox = lb.unwrap_or(unit);
-                        let right_bbox = rb.unwrap_or(unit);
-                        let content_active = lb.is_some() || rb.is_some();
-                        let geometry = spread_layout_geometry(
-                            left_page, right_page, left_bbox, right_bbox, true,
-                        );
-                        let spread_gap = quantize_points_to_physical_pixels(gap, pixels_per_point);
-                        let fit_scale = ((viewport.width() - spread_gap).max(1.0)
-                            / geometry.fit_size.x)
-                            .min(viewport.height() / geometry.fit_size.y);
-                        let center = viewport.center() - geometry.content_center_offset * fit_scale;
-                        let rects = layout_spread_page_rects(
-                            center,
-                            geometry,
-                            fit_scale,
-                            spread_gap,
-                            pixels_per_point,
-                            left_bbox,
-                            right_bbox,
-                            content_active,
-                        );
-                        let resolve =
-                            |rect: egui::Rect, page: egui::Vec2, bbox: Option<egui::Rect>| {
-                                resolve_fs_transform_in_layout_rect(
-                                    DisplayedImageTransformInput {
-                                        pixel_fit: RectPixelFit::Texels,
-                                        page_idx: 0,
-                                        viewport_rect: viewport,
-                                        source_size: page,
-                                        texture_size: page,
-                                        rotation: crate::rotation_db::Rotation::None,
-                                        free_rotation_rad: 0.0,
-                                        content_bbox: bbox,
-                                        fit_mode: FullscreenFitMode::Page,
-                                        fit_scale_limits: FullscreenFitScaleLimits {
-                                            pixels_per_point,
-                                            ..FullscreenFitScaleLimits::default()
-                                        },
+                for (left_factor, right_factor) in texture_factors {
+                    for rotation in rotations {
+                        for viewport_origin in viewport_origins {
+                            for gap in [0.0_f32, 1.0, 2.0] {
+                                for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+                                    total += 1;
+                                    let viewport = egui::Rect::from_min_size(
+                                        viewport_origin,
+                                        egui::vec2(2560.0, 1440.0),
+                                    );
+                                    let unit = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    );
+                                    let mk = |t: Option<(f32, f32, f32, f32)>| {
+                                        t.map(|(a, b, c, d)| {
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(a, b),
+                                                egui::pos2(c, d),
+                                            )
+                                        })
+                                    };
+                                    let lb = mk(lt);
+                                    let rb = mk(rt);
+                                    let left_page = egui::vec2(lp.0, lp.1);
+                                    let right_page = egui::vec2(rp.0, rp.1);
+                                    // レイアウトは回転後の表示寸法で組む (production と同じ)。
+                                    let left_display = rotated_display_size(left_page, rotation);
+                                    let right_display = rotated_display_size(right_page, rotation);
+                                    let left_bbox = lb.unwrap_or(unit);
+                                    let right_bbox = rb.unwrap_or(unit);
+                                    let content_active = lb.is_some() || rb.is_some();
+                                    let geometry = spread_layout_geometry(
+                                        left_display,
+                                        right_display,
+                                        left_bbox,
+                                        right_bbox,
+                                        true,
+                                    );
+                                    let spread_gap =
+                                        quantize_points_to_physical_pixels(gap, pixels_per_point);
+                                    let fit_scale = ((viewport.width() - spread_gap).max(1.0)
+                                        / geometry.fit_size.x)
+                                        .min(viewport.height() / geometry.fit_size.y);
+                                    let center = viewport.center()
+                                        - geometry.content_center_offset * fit_scale;
+                                    let rects = layout_spread_page_rects(
+                                        center,
+                                        geometry,
+                                        fit_scale,
+                                        spread_gap,
                                         pixels_per_point,
-                                        placement: ResolvedDisplayPlacement::Normal {
-                                            zoom_pan: None,
-                                        },
-                                    },
-                                    rect,
-                                )
-                                .expect("t")
-                            };
-                        let left = resolve(rects.left_rect, left_page, lb);
-                        let right = resolve(rects.right_rect, right_page, rb);
-                        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
-                        let (lo, ro) = align_spread_pages_for_gap(
-                            &left,
-                            &right,
-                            gap_px,
-                            center.x,
-                            pixels_per_point,
-                        );
-                        let left = left.translated_by(lo);
-                        let right = right.translated_by(ro);
-                        let painted =
-                            (right.paint_rect.min.x - left.paint_rect.max.x) * pixels_per_point;
-                        let mode = format!(
-                            "{:?}",
-                            crate::displayed_image_transform::rect_snap_mode(
-                                left.total_scale,
-                                pixels_per_point
-                            )
-                        );
-                        if (painted - gap_px).abs() >= 1e-3 {
-                            failures.push(format!(
-                                "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}: painted={painted} want={gap_px}",
-                                lp.0, lp.1, rp.0, rp.1, lb.is_some()
-                            ));
+                                        left_bbox,
+                                        right_bbox,
+                                        content_active,
+                                    );
+                                    let resolve =
+                                        |rect: egui::Rect,
+                                         page: egui::Vec2,
+                                         bbox: Option<egui::Rect>,
+                                         factor: f32| {
+                                            resolve_fs_transform_in_layout_rect(
+                                                DisplayedImageTransformInput {
+                                                    pixel_fit: RectPixelFit::Texels,
+                                                    page_idx: 0,
+                                                    viewport_rect: viewport,
+                                                    source_size: page,
+                                                    texture_size: (page * factor).round(),
+                                                    rotation,
+                                                    free_rotation_rad: 0.0,
+                                                    content_bbox: bbox,
+                                                    fit_mode: FullscreenFitMode::Page,
+                                                    fit_scale_limits: FullscreenFitScaleLimits {
+                                                        pixels_per_point,
+                                                        ..FullscreenFitScaleLimits::default()
+                                                    },
+                                                    pixels_per_point,
+                                                    placement: ResolvedDisplayPlacement::Normal {
+                                                        zoom_pan: None,
+                                                    },
+                                                },
+                                                rect,
+                                            )
+                                            .expect("t")
+                                        };
+                                    let left = resolve(rects.left_rect, left_page, lb, left_factor);
+                                    let right =
+                                        resolve(rects.right_rect, right_page, rb, right_factor);
+                                    let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+                                    let (left_offset, right_offset) = align_spread_pages_for_gap(
+                                        &left,
+                                        &right,
+                                        gap_px,
+                                        pixels_per_point,
+                                    );
+                                    let left = left.translated_by(left_offset);
+                                    let right = right.translated_by(right_offset);
+                                    let painted = (right.paint_rect.min.x - left.paint_rect.max.x)
+                                        * pixels_per_point;
+                                    let mode = format!(
+                                        "{:?}",
+                                        crate::displayed_image_transform::rect_snap_mode(
+                                            left.total_scale,
+                                            pixels_per_point
+                                        )
+                                    );
+                                    let case = format!(
+                                        "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}",
+                                        lp.0,
+                                        lp.1,
+                                        rp.0,
+                                        rp.1,
+                                        lb.is_some()
+                                    );
+                                    if (painted - gap_px).abs() >= 1e-3 {
+                                        failures.push(format!(
+                                            "{case}: painted={painted} want={gap_px}"
+                                        ));
+                                    }
+                                    // **§1.0e**: trim があっても貼り先は物理ピクセル境界に乗ったまま。
+                                    // 端数で動かすとテクセルが画素中心から外れ、Lanczos の結果へ
+                                    // 二度目の線形補間が掛かる (Codex Sol の指摘 1)。
+                                    for (side, transform, offset) in [
+                                        ("left", &left, left_offset),
+                                        ("right", &right, right_offset),
+                                    ] {
+                                        if matches!(
+                                            crate::displayed_image_transform::rect_snap_mode(
+                                                transform.total_scale,
+                                                pixels_per_point
+                                            ),
+                                            crate::displayed_image_transform::RectSnapMode::None
+                                        ) {
+                                            continue;
+                                        }
+                                        let offset_px = offset.x * pixels_per_point;
+                                        if (offset_px - offset_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                        "{case}: {side} の移動量が {offset_px}px (整数でない)"
+                                    ));
+                                        }
+                                        let min_px =
+                                            transform.full_image_rect.min.x * pixels_per_point;
+                                        if (min_px - min_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                                "{case}: {side} の原点が {min_px} (画素境界から外れた)"
+                                            ));
+                                        }
+                                        // **貼り先は出力テクセルの整数個ぶん。** リサンプラは
+                                        // 整数サイズのテクスチャを作るので、貼り先が半端だと
+                                        // egui/wgpu がもう一度補間する (§1.0e)。trim があっても、
+                                        // 寄せた bbox のおかげで可視幅は整数テクセルになる
+                                        // (Codex Sol のテスト提案 1)。
+                                        let extent_px =
+                                            transform.paint_rect.width() * pixels_per_point;
+                                        if (extent_px - extent_px.round()).abs() >= 1e-3 {
+                                            failures.push(format!(
+                                                "{case}: {side} の貼り先幅 {extent_px}px がテクセル整数個でない"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        assert!(total >= 2000, "走査が狭すぎる: {total} 件");
         assert!(
             failures.is_empty(),
             "{}/{} 件失敗:
@@ -47972,6 +48461,140 @@ mod tests {
         );
     }
 
+    /// 範囲コピーの境界は、**描いたときに寄せた後の trim** と一致する (Codex Sol の指摘 4)。
+    ///
+    /// `content_bbox` は要求されたままの未量子化の矩形。描画は出力テクセル境界へ寄せた
+    /// 矩形を使うので、キャプチャへ生の bbox を渡すと選択できる端が最大 0.5 画面 px、
+    /// 縮小時は元画像で数 px ずれる。テクセル境界に乗らない比率で確かめる。
+    #[test]
+    fn capture_region_spread_target_uses_the_trim_the_draw_quantized() {
+        let pixels_per_point = 1.0_f32;
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+        let page = egui::vec2(1249.0, 2000.0);
+        // わざとテクセル境界に乗らない比率。
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0173, 0.0), egui::pos2(0.9411, 1.0));
+        let layout_rect = egui::Rect::from_min_size(egui::pos2(300.0, 40.0), page * 0.6);
+        let drawn = resolve_fs_transform_in_layout_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: page,
+                texture_size: page,
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: Some(bbox),
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            layout_rect,
+        )
+        .expect("drawn transform");
+        assert_ne!(
+            drawn.uv_rect.min.x, bbox.min.x,
+            "この比率では寄せが起きないので、テストが前提を満たしていない"
+        );
+
+        let captured = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn.full_image_rect,
+            [page.x as usize, page.y as usize],
+            crate::rotation_db::Rotation::None,
+            drawn.content_bbox.map(|_| drawn.uv_rect),
+            pixels_per_point,
+        )
+        .expect("capture transform");
+
+        for (label, drawn_edge, captured_edge) in [
+            ("左端", drawn.paint_rect.min.x, captured.paint_rect.min.x),
+            ("右端", drawn.paint_rect.max.x, captured.paint_rect.max.x),
+        ] {
+            assert!(
+                (drawn_edge - captured_edge).abs() < 1e-3,
+                "{label}が描いた位置 {drawn_edge} と違う: {captured_edge}"
+            );
+        }
+    }
+
+    /// 見開きの範囲コピーは、**見えている範囲を越えて選べない** (§1.156)。
+    ///
+    /// 表示トリムを落とすと `paint_rect` が画像全体になり、`hit_rect` が隣のページへ張り出す。
+    /// そこを選ぶと、取れる画は隣のページではなく**トリムで切ったこちら側**になる。
+    #[test]
+    fn capture_region_spread_target_cannot_reach_past_the_trim() {
+        let drawn = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(400.0, 200.0));
+        // 右 20% を切ったトリム。
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.8, 1.0));
+        let transform = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn,
+            [400, 200],
+            crate::rotation_db::Rotation::None,
+            Some(bbox),
+            1.0,
+        )
+        .unwrap();
+
+        assert!(
+            transform.hit_rect.right() <= drawn.left() + drawn.width() * 0.8 + 1e-3,
+            "見えていない右 20% まで選べてしまう: hit_rect={:?}",
+            transform.hit_rect
+        );
+
+        // 画面右端まで引いても、取れるのは見えている範囲まで。
+        let target = CaptureRegionTarget {
+            idx: 0,
+            source_size: [400, 200],
+            transform,
+        };
+        let crop = crate::app::App::capture_region_crop_from_screen(
+            target,
+            egui::Rect::from_min_max(egui::pos2(100.0, 40.0), egui::pos2(600.0, 240.0)),
+        )
+        .expect("crop");
+        assert!(
+            crop.max_x <= 320.0 + 1e-3,
+            "トリムで切った領域まで取れている: max_x={}",
+            crop.max_x
+        );
+    }
+
+    /// キャプチャ用 transform は、**描いた矩形の位置をそのまま**引き継ぐ。
+    ///
+    /// 見開きの間隔合わせで動かした分を寄せ直しで戻すと、同じ画面位置が別の元画像座標を
+    /// 指す (§1.154、Codex Sol の指摘 3)。縦横比が同じなら位置は完全に一致するはず。
+    #[test]
+    fn capture_region_spread_target_keeps_the_rect_it_was_drawn_at() {
+        // 間隔合わせで画素境界から外れた位置を模す。
+        let drawn = egui::Rect::from_min_size(egui::pos2(252.82, 40.0), egui::vec2(200.0, 100.0));
+        let transform = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn,
+            [400, 200],
+            crate::rotation_db::Rotation::None,
+            None,
+            1.0,
+        )
+        .unwrap();
+        assert!(
+            (transform.full_image_rect.left() - drawn.left()).abs() < 1e-3,
+            "描いた位置 {} からずれた: {}",
+            drawn.left(),
+            transform.full_image_rect.left()
+        );
+        assert!(
+            (transform.full_image_rect.width() - drawn.width()).abs() < 1e-3,
+            "描いた幅 {} からずれた: {}",
+            drawn.width(),
+            transform.full_image_rect.width()
+        );
+    }
+
     #[test]
     fn capture_region_spread_target_uses_letterboxed_image_rect() {
         let page_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
@@ -47980,6 +48603,7 @@ mod tests {
             page_rect,
             [200, 100],
             crate::rotation_db::Rotation::None,
+            None,
             1.0,
         )
         .unwrap();
@@ -48811,11 +49435,13 @@ mod tests {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 0,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 1,
             },
         ];
 
@@ -48838,11 +49464,13 @@ mod tests {
                 idx: 1,
                 rect: egui::Rect::from_center_size(image_rect.center(), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 0,
             },
             VerticalReadingPage {
                 idx: 2,
                 rect: egui::Rect::from_center_size(egui::pos2(50.0, 120.0), egui::vec2(80.0, 80.0)),
                 content_bbox: None,
+                unit_id: 1,
             },
         ];
 
