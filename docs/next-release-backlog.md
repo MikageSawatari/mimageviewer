@@ -3519,6 +3519,29 @@ clip は旧 `rects` 由来のまま残るので、最終的な可視間隔を he
   `the_strip_reserve_follows_the_pin_until_the_material_is_known`。述語を元の
   「スナップショットがあるか」に戻すと前者が落ちることを確認済み。
 
+#### 3 つ目の原因 (本命): 切替中のナビゲーションプレビューが全画面に敷かれていた
+
+- 上の 2 つを入れても動画同士の切り替えで再現し、**上下 HUD の両方を無視して一瞬全画面**に
+  出るとの報告。ここで利用者の「動画のサムネイルでは」という推測が当たっていたと分かる。
+  ただし静止画経路のサムネイルではなく、**native overlay の navigation preview**
+  (`draw_native_navigation_preview`) だった。切替中に次の動画のサムネイルを出して、
+  前の動画の最終フレームが見えるのを防ぐためのもの。
+- **原因**: プレビュー画像の配置が overlay 全体 (`overlay_width_points` ×
+  `overlay_height_points`) に fit していた。映像は固定バーの内側に置かれるので、
+  プレビュー → 実映像で必ず「全画面 → バーの内側へ縮む」に見える。上下**両方**を
+  無視するのはこのため (映像側の確保計算はまったく通っていない)。
+- **修正**: 確保量を points で返す `video_bar_reserved_points` を切り出し、
+  映像の transform (物理 px) とプレビューの配置 (points) が同じ関数を通るようにした。
+  overlay に `fixed_bar_gap_px` を持たせ (`set_bar_lock_state` は
+  `NativeBarLockState` を 1 つ受け取る形へ)、`video_content_rect_points` で
+  「映像が出る場所」を求めてプレビュー画像をそこに収める。
+  黒背景は従来どおり overlay 全体に敷く (前の動画の最終フレームを隠す役目は変えない)。
+  compact 表示は映像側だけの見せ方なので、全画面を置き換えるプレビューには反映しない。
+- **テスト**: `the_navigation_preview_stays_inside_the_place_the_video_will_use`。
+  画像 rect を overlay 中心基準に戻すと落ちることを確認済み。
+- **再開位置の設定は原因ではない**が、体感には効く。「前回の位置から再生」は最初のフレーム
+  までに seek が入るぶんプレビューが長く残るので、切替が目立ちやすい。
+
 ### 1.161 端数倍率の拡大で、貼り先と出力テクセル数が合わずボケる — §1.0e の未解決部分
 
 - 出典: Codex Sol の 2 度目のレビュー (2026-09-01) 指摘 2。

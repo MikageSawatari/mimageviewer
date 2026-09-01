@@ -4646,10 +4646,30 @@ pub(super) fn draw_native_top_bar_tile(
         });
 }
 
+/// 切替中のプレビュー画像を置く矩形。**映像が出る場所と同じ**でなければならない。
+/// ここを overlay 全体にすると、固定表示のバーを無視した全画面の絵が一瞬出てから
+/// 映像がバーの内側へ縮む (backlog §1.162)。
+pub(super) fn navigation_preview_image_rect(
+    content_rect: egui::Rect,
+    image_width: u32,
+    image_height: u32,
+) -> egui::Rect {
+    let img_w = image_width.max(1) as f32;
+    let img_h = image_height.max(1) as f32;
+    let scale = (content_rect.width() / img_w)
+        .min(content_rect.height() / img_h)
+        .max(0.0);
+    egui::Rect::from_center_size(
+        content_rect.center(),
+        egui::vec2(img_w * scale, img_h * scale),
+    )
+}
+
 pub(super) fn draw_native_navigation_preview(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    content_rect: egui::Rect,
     preview: &NativeOverlayNavigationPreview,
     preview_texture_id: Option<egui::TextureId>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -4679,13 +4699,8 @@ pub(super) fn draw_native_navigation_preview(
             if let (Some(texture_id), Some(thumbnail)) =
                 (preview_texture_id, preview.thumbnail.as_ref())
             {
-                let img_w = thumbnail.width.max(1) as f32;
-                let img_h = thumbnail.height.max(1) as f32;
-                let scale = (overlay_width_points / img_w)
-                    .min(overlay_height_points / img_h)
-                    .max(0.0);
-                let dst_size = egui::vec2(img_w * scale, img_h * scale);
-                let dst_rect = egui::Rect::from_center_size(full_rect.center(), dst_size);
+                let dst_rect =
+                    navigation_preview_image_rect(content_rect, thumbnail.width, thumbnail.height);
                 painter.image(
                     texture_id,
                     dst_rect,
@@ -7633,6 +7648,47 @@ mod tests {
         assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    /// 動画を切り替えると、次の動画のサムネイルが一瞬だけ出る。これを overlay 全体に
+    /// 敷くと、固定表示のバーを無視した全画面の絵が出てから映像がバーの内側へ縮む。
+    /// プレビューは映像と同じ場所に置く (backlog §1.162)。
+    #[test]
+    fn the_navigation_preview_stays_inside_the_place_the_video_will_use() {
+        use crate::settings::VideoBottomLock;
+        use crate::video::native_presenter::render_core::{
+            VideoVisualLayout, video_bar_reserved_points,
+        };
+
+        let overlay_w = 1920.0_f32;
+        let overlay_h = 1080.0_f32;
+        let (top, bottom) = video_bar_reserved_points(VideoVisualLayout {
+            compact: false,
+            pixels_per_point: 1.0,
+            top_bar_locked: true,
+            bottom_lock: VideoBottomLock::BarAndStrip,
+            seek_strip_visible: true,
+            fixed_bar_gap_px: 0,
+        });
+        assert!(top > 0.0 && bottom > 0.0, "この設定では上下とも確保される");
+
+        let content_rect = egui::Rect::from_min_max(
+            egui::pos2(0.0, top),
+            egui::pos2(overlay_w, overlay_h - bottom),
+        );
+        let preview = navigation_preview_image_rect(content_rect, 1920, 1080);
+
+        assert!(
+            preview.min.y >= content_rect.min.y - 0.01,
+            "上の固定バーに食い込んでいる: {preview:?}"
+        );
+        assert!(
+            preview.max.y <= content_rect.max.y + 0.01,
+            "下の固定バー / ストリップに食い込んでいる: {preview:?}"
+        );
+        // 16:9 を 16:9 より低い枠に入れるので、高さで律速して横は余る。
+        assert!((preview.height() - content_rect.height()).abs() < 0.01);
+        assert!(preview.width() < overlay_w);
     }
 
     #[test]

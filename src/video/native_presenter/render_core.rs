@@ -1521,6 +1521,9 @@ struct NativeEguiOverlay {
     /// App settings から同期される、上部バーと動画下部の固定状態。
     top_bar_locked: bool,
     bottom_lock: VideoBottomLock,
+    /// 固定バーと映像のあいだに置く隙間 (px)。overlay が「映像の場所」を
+    /// 自分で求める (`video_content_rect_points`) ために持つ。
+    fixed_bar_gap_px: u32,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -3135,10 +3138,7 @@ impl NativeRenderCore {
                         Ok(mut overlay) => {
                             // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
                             // 1 回「固定なし」で描かれてから固定表示へ動く。
-                            overlay.set_bar_lock_state(
-                                initial_bar_lock.top_locked,
-                                initial_bar_lock.bottom_lock,
-                            );
+                            overlay.set_bar_lock_state(initial_bar_lock);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -3206,10 +3206,7 @@ impl NativeRenderCore {
                         Ok(mut overlay) => {
                             // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
                             // 1 回「固定なし」で描かれてから固定表示へ動く。
-                            overlay.set_bar_lock_state(
-                                initial_bar_lock.top_locked,
-                                initial_bar_lock.bottom_lock,
-                            );
+                            overlay.set_bar_lock_state(initial_bar_lock);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -5906,7 +5903,7 @@ impl NativeRenderCore {
         self.video_bottom_lock = requested.bottom_lock;
         self.fullscreen_fixed_bar_gap_px = requested.fixed_bar_gap_px;
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_bar_lock_state(requested.top_locked, requested.bottom_lock);
+            overlay.set_bar_lock_state(requested);
         }
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
@@ -6906,6 +6903,7 @@ impl NativeEguiOverlay {
             jump_panel_visible: false,
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
+            fixed_bar_gap_px: 0,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -7821,15 +7819,40 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_bar_lock_state(&mut self, top_locked: bool, bottom_lock: VideoBottomLock) {
-        if self.top_bar_locked == top_locked && self.bottom_lock == bottom_lock {
+    fn set_bar_lock_state(&mut self, lock: crate::video::NativeBarLockState) {
+        let lock = lock.clamped();
+        if self.top_bar_locked == lock.top_locked
+            && self.bottom_lock == lock.bottom_lock
+            && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
+        {
             return;
         }
         // touch chrome latch は入力セッションの状態として独立させる。固定表示への変更で
         // latch を開閉すると、固定解除後の中央タップ状態や左右ハンドルまで変わってしまう。
-        self.top_bar_locked = top_locked;
-        self.bottom_lock = bottom_lock;
+        self.top_bar_locked = lock.top_locked;
+        self.bottom_lock = lock.bottom_lock;
+        self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
         self.dirty = true;
+    }
+
+    /// プレビューなど overlay 側が描く「映像の場所」。映像の transform と同じ
+    /// 確保量を通す (`video_bar_reserved_points`)。compact 表示は映像側だけの
+    /// 見せ方なので、全画面を置き換えるプレビューでは反映しない。
+    fn video_content_rect_points(&self, overlay_w: f32, overlay_h: f32) -> egui::Rect {
+        let (top, bottom) = video_bar_reserved_points(VideoVisualLayout {
+            compact: false,
+            pixels_per_point: 1.0,
+            top_bar_locked: self.top_bar_locked,
+            bottom_lock: self.bottom_lock,
+            seek_strip_visible: self.seek_strip_reserves_space(),
+            fixed_bar_gap_px: self.fixed_bar_gap_px,
+        });
+        let top = top.min((overlay_h - 1.0).max(0.0));
+        let bottom_edge = (overlay_h - bottom).max(top + 1.0).min(overlay_h);
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, top),
+            egui::pos2(overlay_w.max(1.0), bottom_edge),
+        )
     }
 
     fn reset_side_panel_session(&mut self) {
@@ -9381,6 +9404,9 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
+        // 切替中のプレビューは映像と同じ場所に置く。closure の前に確定させる。
+        let navigation_preview_content_rect =
+            self.video_content_rect_points(overlay_width_points, overlay_height_points);
         let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
         let touch_panel_handle_rects = self.touch_panel_handle_rects();
         let touch_panel_handles_visible = touch_panel_handle_rects.iter().any(Option::is_some);
@@ -9733,6 +9759,7 @@ impl NativeEguiOverlay {
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    navigation_preview_content_rect,
                     preview,
                     navigation_preview_texture_id,
                     &mut commands,
@@ -12232,6 +12259,33 @@ pub(super) fn seek_strip_reserves_space(
         )
 }
 
+/// 固定表示のバーが上下に確保する量を **points** で返す。
+///
+/// 映像の transform (物理 px) と、ナビゲーションプレビューの画像配置 (points) の
+/// 両方がここを通る。片方だけ別に数えると、切替中のプレビューだけ HUD を無視して
+/// 全画面に出る (backlog §1.162)。
+pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32) {
+    let gap_points = layout
+        .fixed_bar_gap_px
+        .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
+    let top = if layout.top_bar_locked {
+        HUD_TOP_HEIGHT + gap_points
+    } else {
+        0.0
+    };
+    let bottom = if layout.bottom_lock.bar_locked() {
+        let strip_height = if layout.bottom_lock.strip_locked() && layout.seek_strip_visible {
+            SEEK_STRIP_HEIGHT
+        } else {
+            0.0
+        };
+        HUD_BOTTOM_HEIGHT + gap_points + strip_height
+    } else {
+        0.0
+    };
+    (top, bottom)
+}
+
 pub(super) fn compute_video_visual_target_rect(
     win_w: u32,
     win_h: u32,
@@ -12244,24 +12298,9 @@ pub(super) fn compute_video_visual_target_rect(
     } else {
         1.0
     };
-    let gap_points = layout
-        .fixed_bar_gap_px
-        .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
-    let top_reserved = if layout.top_bar_locked {
-        (HUD_TOP_HEIGHT + gap_points) * ppp
-    } else {
-        0.0
-    };
-    let bottom_reserved = if layout.bottom_lock.bar_locked() {
-        let strip_height = if layout.bottom_lock.strip_locked() && layout.seek_strip_visible {
-            SEEK_STRIP_HEIGHT
-        } else {
-            0.0
-        };
-        (HUD_BOTTOM_HEIGHT + gap_points + strip_height) * ppp
-    } else {
-        0.0
-    };
+    let (top_points, bottom_points) = video_bar_reserved_points(layout);
+    let top_reserved = top_points * ppp;
+    let bottom_reserved = bottom_points * ppp;
     let content_top = top_reserved.min(win_h - 1.0);
     let content_bottom = (win_h - bottom_reserved).max(content_top + 1.0).min(win_h);
     let content_height = (content_bottom - content_top).max(1.0);
