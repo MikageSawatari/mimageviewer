@@ -2118,7 +2118,7 @@ impl App {
             .as_mut()
             .and_then(|state| state.external_tool_launch_requested.take());
         if let Some((tool, target)) = external_launch {
-            self.queue_external_tool_launch(&tool, &target);
+            self.queue_external_tool_launch(ctx, &tool, &target);
         }
 
         let mut close_requested_this_frame = false;

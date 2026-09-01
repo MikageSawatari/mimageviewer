@@ -880,6 +880,22 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 }
             }
 
+            if tool.selection == crate::external_tool::SelectionPolicy::Single
+                && tool.spread == crate::external_tool::SpreadPolicy::BothPages
+            {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "見開き表示中は 2 件になるため、この組み合わせでは起動しません。",
+                        )
+                        .color(ui.visuals().warn_fg_color),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
+
             if let Some(note) = external_tool_batch_behavior_note(&tool) {
                 ui.label("");
                 ui.add(

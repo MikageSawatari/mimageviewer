@@ -3363,13 +3363,13 @@ fn compare_source_size_matches_canonical(
     (lhs - rhs).abs() <= scale * 0.005
 }
 
-struct ExportDialogTarget {
+pub(crate) struct ExportDialogTarget {
     source: crate::export_dialog::ExportSource,
     source_label: String,
     original_format: crate::save_with_metadata::SrcFormat,
     source_dir: std::path::PathBuf,
-    basename: String,
-    pixels: crate::export_dialog::ExportPixels,
+    pub(crate) basename: String,
+    pub(crate) pixels: crate::export_dialog::ExportPixels,
 }
 
 fn scale_sns_split_frames_to_export_pixels(
@@ -34849,7 +34849,7 @@ impl App {
         })
     }
 
-    fn prepare_spread_export_dialog_target(
+    pub(crate) fn prepare_spread_export_dialog_target(
         &mut self,
         ctx: &egui::Context,
         left_idx: usize,

@@ -34084,7 +34084,7 @@ impl App {
             let slot = action
                 .external_tool_slot_number()
                 .expect("external tool action array contains only numbered slots");
-            self.launch_grid_external_tool_slot(slot);
+            self.launch_grid_external_tool_slot(ctx, slot);
             return None;
         }
         if self

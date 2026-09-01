@@ -1546,6 +1546,7 @@ impl crate::app::App {
                     return None;
                 };
                 self.queue_external_tool_launch_targets_from_context_menu(
+                    ctx,
                     &tool,
                     &target.external_tool_targets,
                     target.surface == ContextMenuSurface::Fullscreen,

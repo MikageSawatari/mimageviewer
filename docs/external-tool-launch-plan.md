@@ -424,9 +424,6 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 
 したがって**連結読みでも起動できるようにする**。
 
-> **⚠ 以下の段落は P4 の姿** (`SpreadPolicy` を入れた後)。**P3 までは見開き中でも現在ページ 1 件**を
-> 渡す (§4.5 の 2026-08-31 決定)。
-
 ページの選び方は Ctrl+S / Ctrl+E と同じ
 [`resolve_visible_spread_pair()`](../src/ui_fullscreen.rs:18268) を共有し、判断を二重に持たない。
 連結読みでは `FullscreenPageLayout` の種別が `Continuous` になり `spread_pair()` が `None` を返すため
@@ -480,7 +477,7 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 - 旧 `Original` は `TempOriginal` として残る。**ZIP 内の加工済みページの加工前バイト列**も
   引き続き取れる。
 
-見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる (**P4 から**。P3 までは現在ページ 1 件)。
+見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる。
 合成には対応する元ファイルが存在しないため、この場合は常に焼き込みになる。
 
 `VideoPolicy` — **動画は別軸にする。**「見えているもの」が動画そのものかフレームかが曖昧で、
@@ -642,10 +639,24 @@ SumatraPDF で同上:                       -page {page} "{container}"
 - `PayloadPolicy::OriginalFile` と `Merged` は両立しない (合成物に元ファイルは無い)。
   `OriginalFile` のツールでは `Merged` を選択肢から外し、`BothPages` / `MainPageOnly` だけにする。
   `BothPages` は無加工なら実ファイル 2 件なので成立する。既定は `MainPageOnly`。
-- **`SpreadPolicy` は 3 値まとめて P4 で入れる** (2026-08-31 決定)。既定が `Merged` で、その合成が P4 に
-  ある以上、`BothPages` / `MainPageOnly` だけ先に入れると**既定値だけが設定どおりに動かない**版が
-  1 つできる。それは設定画面に嘘が出るのと同じ。
-  **P3 まで、フルスクリーンからの起動は現在ページ 1 件**を渡す (今の挙動のまま)。
+- **`SpreadPolicy` は 3 値まとめて入れた** (2026-08-31 決定 / P4 で実装)。既定が `Merged` で、その合成が
+  P4 にある以上、`BothPages` / `MainPageOnly` だけ先に入れると**既定値だけが設定どおりに動かない**版が
+  1 つできてしまう。それは設定画面に嘘が出るのと同じ。
+
+**P4 実装 (2026-09-02)。** 展開は `external_tool_spread_expansion` が担い、**stack 展開の隣・件数
+判定より前**に置く。どちらも「利用者が 1 つ選んだものが、ツールから見ると何件になるか」を決める段。
+
+- 効くのは**フルスクリーンで見えているページを渡すときだけ**。対象が `fullscreen_idx` と
+  一致しなければ従来どおり 1 件で渡す (一覧から選んだ 1 件がたまたま同じページでも展開しない)。
+- 見えている組の解決は <kbd>Ctrl+S</kbd> / <kbd>Ctrl+E</kbd> と同じ `resolve_visible_spread_pair()`。
+- `BothPages` は**画面の左右ではなく読み順** (ページ番号の昇順) で渡す
+  (`spread_reading_order`)。右綴じでも左綴じでも「先のページが先」になる。
+- `Merged` の合成は <kbd>Ctrl+E</kbd> と**同じ経路** (`prepare_spread_export_dialog_target` →
+  `render_export_pixels`)。見えているものと渡るものが食い違わないよう、判断を二重に持たない。
+  結果は `MaterializeSource::Rendered` として実体化ワーカーへ渡り、encode だけされる
+  (画素は既に補正・注釈込みなので、そこから焼き込むものが無い)。
+- `SelectionPolicy::Single` + `BothPages` は見開き中に 2 件になるので起動しない。設定画面で
+  その旨を警告色で出す (**黙って片方だけ渡さない**)。
 
 ### 4.6 一時ファイルの寿命
 
@@ -890,7 +901,7 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 | **P2b-2 (2026-09-01 に一度実装)** | ツールバーのセクション、メニューバー「ファイル ▸ 外部ツール」、`OsDefault + Batch` の設定 UI 説明。前二者は P2c で撤去 | S |
 | **P2c (実装済み 2026-09-01)** | 導線を右クリック + 固定キースロットへ整理、全登録ツールを右クリックへ表示、`Single` の複数拒否、既定 `Each`、ツール別の確認 / 上限、`Executable + Batch` のコマンドライン長検査 | S |
 | **P3 (実装済み 2026-09-01)** | 汎用の一時実体化基盤 (ワーカー + 進捗 / キャンセル + 世代管理 + 寿命管理 + PID-scoped 孤児回収)、`PayloadPolicy`、ZIP / PDF page と Stack の対象化、**編集用ツールの 2 段ガード** (§4.8) | L |
-| **P4** | `VideoPolicy::CurrentFrame`、**`SpreadPolicy` 3 値まとめて** (`Merged` の合成を含む。§4.5 の 2026-08-31 決定)、`{container}`/`{entry}`/`{page}`/`{time}` | M |
+| **P4 (一部実装済み 2026-09-02)** | `{container}`/`{entry}`/`{page}`/`{time}` と **`SpreadPolicy` 3 値** (`Merged` の合成を含む) は実装済み。**`VideoPolicy::CurrentFrame` が残り** | M |
 | **P5** | round-trip の残り (実ファイルの mtime 監視 + 再読み込み) | M |
 
 利用者判断により P0〜P4 は一括で出す。P5 は分けてよい。
@@ -903,7 +914,7 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 
 ### 済み
 
-P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 / P3.5 を実装。
+P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 / P3.5 / P4 (`VideoPolicy::CurrentFrame` を除く) を実装。
 master v3.4.0 を取り込み済み。P3.5 = `PayloadPolicy` 3 値化 (一時ファイル 2 種 + 元のファイル) と
 `for_editing` / `Container` / `RealFileOnly` の廃止 (§4.3 / §4.8 / §6 の 2026-09-02 決定)。
 v3.4.0 では外部ツールを revert して出したので、**再投入時は revert コミットを revert してから
@@ -955,11 +966,16 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 
 ### 残りの段
 
-- **P4**: 動画の現在フレーム、`SpreadPolicy` 3 値、`{container}` / `{entry}` / `{page}` / `{time}`
+- **P4 の残り**: `VideoPolicy::CurrentFrame` (動画の現在フレームを画像として渡す)。
+  受け皿の `MaterializeSource::Rendered` は見開き合成で入ったので、あとは
+  「UI スレッドでフレームを掴んで `rendered_pixels` へ載せる」だけ
 - P5: round-trip (mtime 監視)
 
 ### 未確認の実機項目
 
+- **見開き 3 値**: 既定 (合成 1 枚) / 両ページ (2 件、読み順) / 主ページのみ
+- **`{container}` / `{entry}` / `{page}` / `{time}`** が引数に乗ること
+  (例: SumatraPDF に `-page {page} "{container}"`)
 - **準備中のキャンセル** (実機では ZIP / PDF の展開が速すぎて押せなかった。
   大きい PDF を 8192 で、または多数ページを Batch で渡すと窓が開く)
 - **同じ準備中に別のツールを起動** (上の (2) が出る経路)
@@ -969,8 +985,7 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 
 ### 仕様どおりで不具合ではないもの
 
-- **見開き表示中に片側のページだけ渡る。** `SpreadPolicy` は P4 (§4.5 の 2026-08-31 決定)。
-  P3 までは見開き中でも現在ページ 1 件を渡す。
+- (無し。**見開き表示中に片側のページだけ渡る**のは P4 で解消した。既定は合成 1 枚)
 
 ## 6. 決定済み / 未決事項
 

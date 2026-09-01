@@ -898,6 +898,19 @@ pub(crate) fn external_tool_menu_items(
         .collect()
 }
 
+/// 見開きを 2 件で渡すときの順序。
+///
+/// **画面の左右ではなく読み順で返す。** `resolve_visible_spread_pair` が返すのは画面上の
+/// 左右で、右綴じでは右が先のページになる。ツールが受け取る順は綴じ方向によらず
+/// 「先のページが先」であってほしいので、ページ番号の昇順に直す。
+fn spread_reading_order(left: usize, right: usize) -> (usize, usize) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
 fn external_tool_capability(
     tool: &ExternalTool,
     target: ExternalToolMenuTarget,
@@ -2172,8 +2185,108 @@ impl crate::app::App {
                 } else {
                     tool.pdf_render_long_edge
                 },
+                rendered_pixels: None,
             },
             facts,
+        })
+    }
+
+    /// フルスクリーンで見開きが見えているとき、ツールの `SpreadPolicy` に従って対象を
+    /// 組み替える。**それ以外では `None` を返して従来どおりに扱う。**
+    ///
+    /// ここでしかできない理由は 2 つある。見えている組は `resolve_visible_spread_pair` が
+    /// `&mut self` で解決するもので、`Merged` の合成には表示画素 (`ctx` が要る) が必要になる。
+    fn external_tool_spread_expansion(
+        &mut self,
+        ctx: &egui::Context,
+        tool: &ExternalTool,
+        targets: &[LaunchTarget],
+    ) -> Result<Option<Vec<ExternalMaterializeTarget>>, String> {
+        if targets.len() != 1 {
+            return Ok(None);
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return Ok(None);
+        };
+        // 「いまフルスクリーンで見えているページ」以外は見開きの話ではない。一覧から
+        // 選んだ 1 件がたまたま同じページでも、そちらは 1 件のまま渡す。
+        if self.launch_target_item_index(&targets[0]) != Some(fs_idx) {
+            return Ok(None);
+        }
+        let crate::ui_fullscreen::SpreadPair::Double { left, right } =
+            self.resolve_visible_spread_pair(fs_idx)
+        else {
+            return Ok(None);
+        };
+        match tool.spread {
+            // 現在ページ 1 件。呼び出し側の従来経路をそのまま使う。
+            SpreadPolicy::MainPageOnly => Ok(None),
+            SpreadPolicy::BothPages => {
+                let (first, second) = spread_reading_order(left, right);
+                let mut expanded = Vec::with_capacity(2);
+                for index in [first, second] {
+                    let target = LaunchTarget::from_grid_item(self.items.get(index));
+                    expanded.push(self.materialize_target(tool, &target)?);
+                }
+                Ok(Some(expanded))
+            }
+            SpreadPolicy::Merged => Ok(Some(vec![
+                self.merged_spread_target(ctx, tool, left, right)?,
+            ])),
+        }
+    }
+
+    /// 見開き 2 ページを 1 枚へ合成した対象を作る。
+    ///
+    /// 合成そのものは <kbd>Ctrl+E</kbd> のエクスポートと**同じ経路**を通す
+    /// ([`prepare_spread_export_dialog_target`] → [`render_export_pixels`])。
+    /// 見えているものと書き出されるものが食い違わないよう、判断を二重に持たない。
+    fn merged_spread_target(
+        &mut self,
+        ctx: &egui::Context,
+        tool: &ExternalTool,
+        left: usize,
+        right: usize,
+    ) -> Result<ExternalMaterializeTarget, String> {
+        use sha2::Digest as _;
+
+        let export = self.prepare_spread_export_dialog_target(ctx, left, right)?;
+        let image = crate::export_dialog::render_export_pixels(&export.pixels, None, None)?;
+        let mut digest = sha2::Sha256::new();
+        digest.update((image.size[0] as u64).to_le_bytes());
+        digest.update((image.size[1] as u64).to_le_bytes());
+        for pixel in &image.pixels {
+            digest.update(pixel.to_array());
+        }
+        let fingerprint: [u8; 32] = digest.finalize().into();
+
+        Ok(ExternalMaterializeTarget {
+            request: crate::materializer::MaterializeRequest {
+                source: crate::materializer::MaterializeSource::Rendered {
+                    label: export.basename.clone(),
+                    fingerprint,
+                },
+                policy: materialize_policy(tool.payload),
+                // 表示画素は補正も注釈も反映済み。ここから更に焼き込むものは無い。
+                page_edits: None,
+                pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
+                    DEFAULT_PDF_RENDER_LONG_EDGE
+                } else {
+                    tool.pdf_render_long_edge
+                },
+                rendered_pixels: Some(Arc::new(image.into_owned())),
+            },
+            // 合成物に固有のページ番号もエントリ名も無い。`{container}` は 2 ページが
+            // 属するもの — 左ページの側から取る。
+            facts: PlaceholderFacts {
+                container: self
+                    .placeholder_facts_for_target(
+                        &LaunchTarget::from_grid_item(self.items.get(left)),
+                        Some(left),
+                    )
+                    .container,
+                ..PlaceholderFacts::default()
+            },
         })
     }
 
@@ -2239,7 +2352,8 @@ impl crate::app::App {
     }
 
     fn build_materialize_operation(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
         origin: MaterializeOperationOrigin,
@@ -2247,16 +2361,21 @@ impl crate::app::App {
         validate_materializable_targets(targets)?;
         let targets = self.expand_external_stack_targets(targets)?;
         validate_materializable_targets(&targets)?;
+        // 見開き展開は stack 展開の隣。どちらも「利用者が 1 つ選んだものが、ツールから見ると
+        // 何件になるか」を決める段で、件数の判定より前に済ませる必要がある。
+        let targets = match self.external_tool_spread_expansion(ctx, tool, &targets)? {
+            Some(expanded) => expanded,
+            None => targets
+                .iter()
+                .map(|target| self.materialize_target(tool, target))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         let target_count_decision = evaluate_target_count(
             tool.selection,
             targets.len(),
             tool.confirmation_threshold,
             tool.max_targets,
         )?;
-        let targets = targets
-            .iter()
-            .map(|target| self.materialize_target(tool, target))
-            .collect::<Result<Vec<_>, _>>()?;
         // 発火面 (`origin`) は要求の組み立てに影響しない。以前はここで「フルスクリーンの
         // 現在ページ」を控え、実体化中に一致しなくなったら打ち切っていたが、その打ち切りを
         // やめた (2026-09-01 決定、正本 §4.7)。
@@ -2332,7 +2451,7 @@ impl crate::app::App {
         self.request_external_tool_picker(targets, ExternalToolPickerTargetKind::Container);
     }
 
-    pub(crate) fn launch_grid_external_tool_slot(&mut self, slot: usize) {
+    pub(crate) fn launch_grid_external_tool_slot(&mut self, ctx: &egui::Context, slot: usize) {
         let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
             Ok(tool) => tool.clone(),
             Err(error) => {
@@ -2341,23 +2460,26 @@ impl crate::app::App {
             }
         };
         let targets = self.external_tool_grid_key_targets();
-        self.queue_external_tool_launch_targets(&tool, &targets);
+        self.queue_external_tool_launch_targets(ctx, &tool, &targets);
     }
 
     pub(crate) fn queue_external_tool_launch(
         &mut self,
+        ctx: &egui::Context,
         tool: &ExternalTool,
         target: &LaunchTarget,
     ) {
-        self.queue_external_tool_launch_targets(tool, std::slice::from_ref(target));
+        self.queue_external_tool_launch_targets(ctx, tool, std::slice::from_ref(target));
     }
 
     pub(crate) fn queue_external_tool_launch_targets(
         &mut self,
+        ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
     ) {
         self.queue_external_tool_launch_targets_with_origin(
+            ctx,
             tool,
             targets,
             MaterializeOperationOrigin::GridOrContainer,
@@ -2366,6 +2488,7 @@ impl crate::app::App {
 
     pub(crate) fn queue_external_tool_launch_targets_from_context_menu(
         &mut self,
+        ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
         fullscreen_will_close: bool,
@@ -2375,16 +2498,17 @@ impl crate::app::App {
         } else {
             MaterializeOperationOrigin::GridOrContainer
         };
-        self.queue_external_tool_launch_targets_with_origin(tool, targets, origin);
+        self.queue_external_tool_launch_targets_with_origin(ctx, tool, targets, origin);
     }
 
     fn queue_external_tool_launch_targets_with_origin(
         &mut self,
+        ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
         origin: MaterializeOperationOrigin,
     ) {
-        let operation = match self.build_materialize_operation(tool, targets, origin) {
+        let operation = match self.build_materialize_operation(ctx, tool, targets, origin) {
             Ok(operation) => operation,
             Err(error) => {
                 self.show_feedback_toast(format!("{}: {error}", tool.display_name()));
@@ -2755,7 +2879,7 @@ impl crate::app::App {
                         "対象が移動したため、外部ツールをもう一度選択してください".to_string(),
                     );
                 } else {
-                    self.queue_external_tool_launch_targets(&tool, &request.targets);
+                    self.queue_external_tool_launch_targets(ctx, &tool, &request.targets);
                 }
             } else {
                 self.show_feedback_toast("外部ツールを選択できませんでした".to_string());
@@ -3341,7 +3465,7 @@ mod tests {
         app.visible_indices = vec![0];
         app.selected = Some(0);
 
-        app.launch_grid_external_tool_slot(5);
+        app.launch_grid_external_tool_slot(&egui::Context::default(), 5);
 
         assert!(app.external_tool_launch_pending.is_empty());
         assert!(app.external_tool_launch_confirmation.is_none());
@@ -3482,6 +3606,14 @@ mod tests {
                 OsString::from("00:01:23.457"),
             ]
         );
+    }
+
+    /// 右綴じ (画面の右が先のページ) でも、ツールが受け取る順は読み順。
+    #[test]
+    fn a_spread_is_handed_over_in_reading_order_not_screen_order() {
+        assert_eq!(spread_reading_order(4, 5), (4, 5));
+        assert_eq!(spread_reading_order(5, 4), (4, 5));
+        assert_eq!(spread_reading_order(7, 7), (7, 7));
     }
 
     #[test]

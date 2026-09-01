@@ -28,6 +28,15 @@ pub enum MaterializeSource {
         page_num: u32,
         password: Option<String>,
     },
+    /// UI スレッドで既に組み上がった画素。見開きの合成と動画のフレームがここへ来る。
+    ///
+    /// **ディスク上のどのファイルでもない。** 画素は `MaterializeRequest::rendered_pixels`
+    /// が運ぶ (`Arc<ColorImage>` は Hash にできないので cache key には入れられない)。
+    /// ここには一時ファイル名にする `label` と、画素の `fingerprint` だけを置く。
+    Rendered {
+        label: String,
+        fingerprint: [u8; 32],
+    },
 }
 
 impl MaterializeSource {
@@ -43,16 +52,21 @@ impl MaterializeSource {
             Self::PdfPage {
                 pdf_path, page_num, ..
             } => format!("{} / {} ページ", pdf_path.display(), page_num + 1),
+            Self::Rendered { label, .. } => label.clone(),
         }
     }
 
     /// decode / source validation に使う物理ファイル。変換アーカイブでは、利用者から
     /// 見えている書庫ではなく cache ZIP を指す。
-    fn source_path(&self) -> &Path {
+    ///
+    /// `Rendered` は物理ファイルを持たないので `None`。**空パスで代用しない** —
+    /// 呼び出し側に「無いときどうするか」を書かせる。
+    fn source_path(&self) -> Option<&Path> {
         match self {
-            Self::File { path, .. } => path,
-            Self::ZipEntry { zip_path, .. } => zip_path,
-            Self::PdfPage { pdf_path, .. } => pdf_path,
+            Self::File { path, .. } => Some(path),
+            Self::ZipEntry { zip_path, .. } => Some(zip_path),
+            Self::PdfPage { pdf_path, .. } => Some(pdf_path),
+            Self::Rendered { .. } => None,
         }
     }
 
@@ -66,6 +80,7 @@ impl MaterializeSource {
             } => MaterializeSourceKind::OtherFile,
             Self::ZipEntry { .. } => MaterializeSourceKind::ZipEntry,
             Self::PdfPage { .. } => MaterializeSourceKind::PdfPage,
+            Self::Rendered { .. } => MaterializeSourceKind::Rendered,
         }
     }
 
@@ -91,6 +106,7 @@ impl MaterializeSource {
                     .unwrap_or_else(|| "document".to_string());
                 format!("{stem}-page-{}.png", page_num + 1)
             }
+            Self::Rendered { label, .. } => format!("{label}.png"),
         }
     }
 }
@@ -124,6 +140,10 @@ pub struct MaterializeRequest {
     pub policy: MaterializePolicy,
     pub page_edits: Option<PageEditContext>,
     pub pdf_render_long_edge: u32,
+    /// `MaterializeSource::Rendered` のときだけ `Some`。UI スレッドで組み上げた画素を
+    /// そのまま運ぶ。cache key に入れられない (`Arc<ColorImage>` は Hash ではない) ので
+    /// source ではなく request が持つ。
+    pub rendered_pixels: Option<Arc<egui::ColorImage>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +151,8 @@ pub enum MaterializeSourceKind {
     ImageFile,
     OtherFile,
     ZipEntry,
+    /// 既に組み上がった画素 (見開き合成 / 動画フレーム)。
+    Rendered,
     PdfPage,
 }
 
@@ -158,9 +180,10 @@ pub fn decide_materialization(
             MaterializeSourceKind::ImageFile | MaterializeSourceKind::OtherFile => {
                 MaterializeDecision::DirectOriginal
             }
-            MaterializeSourceKind::ZipEntry | MaterializeSourceKind::PdfPage => {
-                MaterializeDecision::RefuseVirtualPage
-            }
+            // 合成した見開きにも動画のフレームにも、対応する元ファイルは存在しない。
+            MaterializeSourceKind::ZipEntry
+            | MaterializeSourceKind::PdfPage
+            | MaterializeSourceKind::Rendered => MaterializeDecision::RefuseVirtualPage,
         },
         // 動画・音声 (`OtherFile`) はどちらの一時ポリシーでも実ファイルを渡す。
         // 数 GB を一時フォルダーへ複製する代償が、上書き保存に対する安全側の利益に
@@ -169,7 +192,10 @@ pub fn decide_materialization(
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
             MaterializeSourceKind::ImageFile => MaterializeDecision::CopyOriginalFile,
             MaterializeSourceKind::ZipEntry => MaterializeDecision::ExtractOriginal,
-            MaterializeSourceKind::PdfPage => MaterializeDecision::RenderPng,
+            // 合成も動画フレームも「加工前」に戻せない。組み上がった画素を書き出す。
+            MaterializeSourceKind::PdfPage | MaterializeSourceKind::Rendered => {
+                MaterializeDecision::RenderPng
+            }
         },
         // 加工が無ければ焼き込まない。表示と元データが同じなのに再エンコードすると、
         // JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
@@ -183,7 +209,8 @@ pub fn decide_materialization(
             }
             MaterializeSourceKind::ImageFile
             | MaterializeSourceKind::ZipEntry
-            | MaterializeSourceKind::PdfPage => MaterializeDecision::RenderPng,
+            | MaterializeSourceKind::PdfPage
+            | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
         },
     }
 }
@@ -192,7 +219,7 @@ fn normalized_pdf_render_long_edge(edge: u32) -> u32 {
     if edge == 0 { 4096 } else { edge }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FileStamp {
     modified_ns: Option<u128>,
     size: u64,
@@ -444,13 +471,22 @@ impl MaterializeSession {
             return Err(virtual_page_refusal_message(&request.source));
         }
         if decision == MaterializeDecision::DirectOriginal {
-            let direct_path = request.source.source_path();
+            let direct_path = request
+                .source
+                .source_path()
+                .ok_or_else(|| "渡せる実ファイルがありません".to_string())?;
             std::fs::metadata(direct_path).map_err(|error| {
                 format!("対象を確認できません: {}: {error}", direct_path.display())
             })?;
             return Ok(PreparedMaterializedFile::direct(direct_path.to_path_buf()));
         }
-        let source_stamp = file_stamp(request.source.source_path())?;
+        // `Rendered` には元ファイルが無いので stamp を採れない。**空 stamp は cache を
+        // 常に miss させる** (`lookup_reusable` が `modified_ns.is_some()` を要求する)。
+        // 画素は既に手元にあり、やり直しは encode だけなので、これでよい。
+        let source_stamp = match request.source.source_path() {
+            Some(path) => file_stamp(path)?,
+            None => FileStamp::default(),
+        };
 
         let edit_fingerprint = loaded_edits
             .as_ref()
@@ -494,12 +530,23 @@ impl MaterializeSession {
                     generation,
                 ),
                 MaterializeDecision::RenderPng => {
-                    let source = composite_source(&request.source)?;
-                    let image = crate::books::decode_composite_source_for_materialization(
-                        &source,
-                        pdf_render_long_edge,
-                        Arc::clone(cancel),
-                    )?;
+                    // 既に組み上がった画素は decode も焼き込みもせず、そのまま encode する。
+                    // 補正・回転・注釈は UI 側で反映済みの表示画素だから。
+                    let image = if let MaterializeSource::Rendered { .. } = &request.source {
+                        let pixels = request
+                            .rendered_pixels
+                            .as_ref()
+                            .ok_or_else(|| "組み上げた画素が渡されていません".to_string())?;
+                        egui::ColorImage::clone(pixels)
+                    } else {
+                        let source = composite_source(&request.source)?;
+                        let image = crate::books::decode_composite_source_for_materialization(
+                            &source,
+                            pdf_render_long_edge,
+                            Arc::clone(cancel),
+                        )?;
+                        image
+                    };
                     check_current(&self.inner, cancel, generation)?;
                     let image = if let Some(loaded) = loaded_edits {
                         if loaded.requires_composite {
@@ -709,6 +756,9 @@ fn virtual_page_refusal_message(source: &MaterializeSource) -> String {
         MaterializeSource::ZipEntry { .. } => "圧縮ファイル内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::PdfPage { .. } => "PDF 内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::File { .. } => "元のファイルを渡せません".to_string(),
+        MaterializeSource::Rendered { .. } => {
+            "見開きの合成と動画のフレームには元のファイルがありません。「一時ファイル」を渡す設定にしてください".to_string()
+        }
     }
 }
 
@@ -779,6 +829,9 @@ fn composite_source(source: &MaterializeSource) -> Result<crate::books::Composit
         MaterializeSource::File {
             image_page: false, ..
         } => return Err("この実ファイルは画像として実体化できません".to_string()),
+        MaterializeSource::Rendered { .. } => {
+            return Err("組み上げた画素は decode 経路へ渡せません".to_string());
+        }
     })
 }
 
@@ -1422,6 +1475,7 @@ mod tests {
             policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
+            rendered_pixels: None,
         }
     }
 
@@ -1529,6 +1583,87 @@ mod tests {
                 MaterializeDecision::RefuseVirtualPage
             );
         }
+    }
+
+    /// 合成した見開きにも動画のフレームにも、対応する元ファイルは無い。**それらしい
+    /// 一時ファイルを「元のファイル」として渡さない。**
+    #[test]
+    fn rendered_pixels_encode_under_temp_policies_and_refuse_the_real_file_policy() {
+        for policy in [
+            MaterializePolicy::TempAsDisplayed,
+            MaterializePolicy::TempOriginal,
+        ] {
+            assert_eq!(
+                decide_materialization(MaterializeSourceKind::Rendered, policy, false),
+                MaterializeDecision::RenderPng,
+                "{policy:?}"
+            );
+        }
+        assert_eq!(
+            decide_materialization(
+                MaterializeSourceKind::Rendered,
+                MaterializePolicy::OriginalFile,
+                false,
+            ),
+            MaterializeDecision::RefuseVirtualPage
+        );
+    }
+
+    /// 画素は request が運ぶ。source だけ来て画素が無い組み合わせは**黙って空の PNG を
+    /// 書かず**、失敗として返す。
+    #[test]
+    fn a_rendered_source_without_pixels_fails_instead_of_writing_an_empty_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 82, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            source: MaterializeSource::Rendered {
+                label: "spread".to_string(),
+                fingerprint: [7; 32],
+            },
+            policy: MaterializePolicy::TempAsDisplayed,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+            rendered_pixels: None,
+        };
+
+        let error = match manager.session().materialize(&request, &cancel, generation) {
+            Ok(_) => panic!("a Rendered source without pixels must not produce a file"),
+            Err(error) => error,
+        };
+        assert!(error.contains("画素"));
+    }
+
+    #[test]
+    fn rendered_pixels_are_written_under_the_label_they_were_given() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 83, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let image = egui::ColorImage::new([2, 1], vec![egui::Color32::from_rgb(9, 9, 9); 2]);
+        let request = MaterializeRequest {
+            source: MaterializeSource::Rendered {
+                label: "page04_page05".to_string(),
+                fingerprint: [1; 32],
+            },
+            policy: MaterializePolicy::TempAsDisplayed,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+            rendered_pixels: Some(Arc::new(image)),
+        };
+
+        let prepared = manager
+            .session()
+            .materialize(&request, &cancel, generation)
+            .unwrap();
+
+        assert!(!prepared.is_original());
+        assert_eq!(
+            prepared.path().file_name().unwrap().to_string_lossy(),
+            "page04_page05.png"
+        );
+        assert!(prepared.path().metadata().unwrap().len() > 0);
     }
 
     #[test]
@@ -1725,6 +1860,7 @@ mod tests {
             policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
+            rendered_pixels: None,
         };
 
         let prepared = manager
