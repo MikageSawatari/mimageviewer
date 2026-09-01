@@ -856,6 +856,74 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 
 ---
 
+## 5.1 現在地 (2026-09-02)
+
+### 済み
+
+P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 を実装。master v3.4.0 を取り込み済み。
+v3.4.0 では外部ツールを revert して出したので、**再投入時は revert コミットを revert してから
+マージする** (backlog §1.117。素直にマージすると「既にマージ済み」と判断されて実装が消える)。
+
+### 実機で残っている問題
+
+**フルスクリーンから ZIP / PDF ページの外部ツールを起動すると固まる。**
+
+計測で確定した原因: フルスクリーン中は `App::update` が tail の手前で early return する
+([app.rs](../src/app.rs) の「会計はここで出す」コメント参照)。進捗 modal を描く
+`show_external_tool_materialize_progress` と、spawn 境界を ACK する
+`authorize_external_tool_launch_boundaries_after_ui` は**その tail にある**。結果、
+worker が起動許可を待ったまま止まり、modal が入力を掴んだままになる。
+
+`ui_fullscreen.rs` の共通描画 closure から両者を呼ぶよう直した。**最初 `if !embedded` を
+付けて失敗した** — 隣の `show_remote_session_dialog` を真似たが、その `!embedded` の前提
+(「embedded は main update 終端で描く」) は**この early return 経路では成り立たない**。
+実機ログで `embedded=true` を確認して外した。**未検証。**
+
+### この修正では足りない点 (Codex Sol 分析、2026-09-02)
+
+1. **ACK の位置が早すぎる。** 現在の呼び出し位置の後に `handle_fs_navigation` が走るので、
+   「全 UI と navigation の後に ACK する」という自身の契約を満たしていない。
+2. **専用 fullscreen では main 側と二重描画し得る。**
+3. **入力 blocker の導出が描画条件と食い違う。** blocker は「pending が 1 件でもある」
+   ([app.rs](../src/app.rs) の `modal_dialog_block_reason`)、描画は「current generation の
+   pending がある」。**supersede / cancel 済み worker の終了待ちだけが残ると、
+   ダイアログが描かれないのに入力だけ止まる**同型の穴が残っている。
+4. `launch_ui_checkpoint_passed` は frame 番号を持たない永続 bool なので、tail が飛ぶと
+   次 frame へ残る。「同じ frame で Cancel を確認した」という契約を型で保証できていない。
+
+### 構造的な直し方 (未着手)
+
+```
+App::update
+  ├─ update_frame_body    ← 内部の early return はここだけを抜ける
+  └─ finalize_ui_frame    ← 全 early return の後に必ず通る。ACK は exactly once
+```
+
+加えて、1 要求の phase を `launch_boundary_rx` / `Option<launch_decision_tx>` / `cancel` /
+generation / checkpoint bool へ分散させず、**単一の typed phase owner** にする:
+
+`Materializing → ReadyToLaunch → LaunchCommitted | Cancelled → Finished`
+
+入力 blocker もその phase の `blocks_input` から導出する (pending Vec の非空から導かない)。
+
+### 波及 (別件、要対応)
+
+`show_remote_session_dialog` の `!embedded` ガードも同じ前提に立っており、**同じ穴を持つ**
+可能性が高い ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。リモート側の担当で確認が要る。
+
+### 残りの段
+
+- **P4**: 動画の現在フレーム、`SpreadPolicy` 3 値、`{container}` / `{entry}` / `{page}` / `{time}`
+- P5: round-trip (mtime 監視)
+
+### 未確認の実機項目
+
+- ZIP / PDF ページの起動 (上記修正後)
+- 準備中のキャンセル
+- 編集用ツールをグレー表示したときの理由ツールチップ (出ないという報告あり。
+  理由は設定されており tooltip 生成の失敗ログも無いので、未再現)
+- 終了後に `%TEMP%\mimageviewer\ext-<pid>` が残らないこと
+
 ## 6. 決定済み / 未決事項
 
 ### 決定済み (2026-08-29、利用者判断)
