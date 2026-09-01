@@ -32,12 +32,7 @@ impl PageEditUndoInvalidation {
 
 impl App {
     pub(crate) fn is_page_edit_bundle_target(&self, idx: usize) -> bool {
-        matches!(
-            self.items.get(idx),
-            Some(GridItem::Image(_))
-                | Some(GridItem::ZipImage { .. })
-                | Some(GridItem::PdfPage { .. })
-        )
+        self.items.get(idx).is_some_and(GridItem::has_page_data)
     }
 
     pub(crate) fn has_page_edit_bundle_clipboard(&self) -> bool {

@@ -20,6 +20,43 @@ use crate::edit_bundle::{
 use crate::grid_item::GridItem;
 use crate::rotation_db::Rotation;
 
+#[derive(Clone, Default)]
+enum KeptRuntimeValue<T> {
+    #[default]
+    ReadDatabase,
+    Absent,
+    Present(T),
+}
+
+impl<T: Clone> KeptRuntimeValue<T> {
+    fn from_memory_state(memory: Option<T>, present: bool) -> Self {
+        match memory {
+            Some(value) => Self::Present(value),
+            None if !present => Self::Absent,
+            None => Self::ReadDatabase,
+        }
+    }
+
+    fn resolve(
+        &self,
+        read_database: impl FnOnce() -> Result<Option<T>, String>,
+    ) -> Result<Option<T>, String> {
+        match self {
+            Self::ReadDatabase => read_database(),
+            Self::Absent => Ok(None),
+            Self::Present(value) => Ok(Some(value.clone())),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct KeptRuntimeOverrides {
+    adjustment: KeptRuntimeValue<crate::adjustment::AdjustParams>,
+    local_adjust: KeptRuntimeValue<local_adjust_core::LocalAdjustmentLayers>,
+    export_crop: KeptRuntimeValue<crate::export_crop::CropSettings>,
+    comic: KeptRuntimeValue<Vec<comic_core::AnnotationObject>>,
+}
+
 #[derive(Clone)]
 struct BulkPageEditTarget {
     idx: usize,
@@ -28,9 +65,8 @@ struct BulkPageEditTarget {
     item: GridItem,
     sidecar_coords: Option<(PathBuf, String)>,
     known_size: Option<[usize; 2]>,
-    /// 部分リセットで補正レイヤーを残す場合の、UI memory を正本とした snapshot。
-    /// Some(empty) は保存失敗後も画面上では削除済み、None は DB から読むことを表す。
-    kept_local_adjust_override: Option<local_adjust_core::LocalAdjustmentLayers>,
+    /// 部分リセットで残す種類について、worker開始前のUI memoryを固定したsnapshot。
+    kept_runtime_overrides: KeptRuntimeOverrides,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,14 +399,15 @@ impl ResetBundleReaders {
     fn load_kept_bundle(
         &self,
         key: &str,
-        local_adjust_override: Option<&local_adjust_core::LocalAdjustmentLayers>,
+        overrides: &KeptRuntimeOverrides,
     ) -> Result<PageEditBundle, String> {
-        let adjust = self
-            .adjustment
-            .as_ref()
-            .map(|db| db.get_page_params_checked(key))
-            .transpose()?
-            .flatten();
+        let adjust = overrides.adjustment.resolve(|| {
+            self.adjustment
+                .as_ref()
+                .map(|db| db.get_page_params_checked(key))
+                .transpose()
+                .map(Option::flatten)
+        })?;
         let mask = self
             .mask
             .as_ref()
@@ -393,29 +430,33 @@ impl ResetBundleReaders {
                 shapes,
                 size,
             });
-        let local_adjust_layers = match local_adjust_override {
-            Some(layers) => Some(layers.clone()),
-            None => self
-                .local_adjust
+        let local_adjust_layers = overrides
+            .local_adjust
+            .resolve(|| {
+                self.local_adjust
+                    .as_ref()
+                    .map(|db| db.get_layers_checked(key))
+                    .transpose()
+                    .map(Option::flatten)
+                    .map(|layers| layers.map(local_adjust_core::LocalAdjustmentLayers::new))
+            })?
+            .filter(|layers| !layers.is_empty());
+        let export_crop = overrides.export_crop.resolve(|| {
+            self.export_crop
                 .as_ref()
-                .map(|db| db.get_layers_checked(key))
-                .transpose()?
-                .flatten()
-                .map(local_adjust_core::LocalAdjustmentLayers::new),
-        }
-        .filter(|layers| !layers.is_empty());
-        let export_crop = self
-            .export_crop
-            .as_ref()
-            .map(|db| db.get_checked_strict(key))
-            .transpose()?
-            .flatten();
-        let comic = self
+                .map(|db| db.get_checked_strict(key))
+                .transpose()
+                .map(Option::flatten)
+        })?;
+        let comic = overrides
             .comic
-            .as_ref()
-            .map(|db| db.get_checked_strict(key))
-            .transpose()?
-            .flatten()
+            .resolve(|| {
+                self.comic
+                    .as_ref()
+                    .map(|db| db.get_checked_strict(key))
+                    .transpose()
+                    .map(Option::flatten)
+            })?
             .filter(|objects| !objects.is_empty());
         Ok(PageEditBundle {
             // reset は変換しない。mask / conceal は各 snapshot の保存寸法を持つ。
@@ -473,10 +514,7 @@ fn prepare_and_apply_target(
         BulkPageEditOp::Reset { kinds } => {
             let readers = reset_readers.map_err(str::to_string)?;
             apply_reset_kinds(
-                readers.load_kept_bundle(
-                    &target.page_key,
-                    target.kept_local_adjust_override.as_ref(),
-                )?,
+                readers.load_kept_bundle(&target.page_key, &target.kept_runtime_overrides)?,
                 *kinds,
             )
             .prepare()?
@@ -656,7 +694,7 @@ impl App {
                 item,
                 sidecar_coords,
                 known_size: self.known_page_source_size(idx),
-                kept_local_adjust_override: None,
+                kept_runtime_overrides: KeptRuntimeOverrides::default(),
             });
         }
         (targets, selection.dropped_non_targets)
@@ -752,7 +790,7 @@ impl App {
                     return;
                 }
             }
-            self.snapshot_bulk_kept_local_adjust(&mut targets, &op);
+            self.snapshot_bulk_kept_overrides(&mut targets, &op);
         }
 
         let total = targets.len();
@@ -802,7 +840,7 @@ impl App {
         });
     }
 
-    fn snapshot_bulk_kept_local_adjust(
+    fn snapshot_bulk_kept_overrides(
         &self,
         targets: &mut [BulkPageEditTarget],
         op: &BulkPageEditOp,
@@ -810,17 +848,37 @@ impl App {
         let BulkPageEditOp::Reset { kinds } = op else {
             return;
         };
-        if kinds.local_adjust {
-            return;
-        }
+        // 単一コピーがmemory overrideを渡す4種類と揃える。adjustmentも通常確定時は
+        // DBと同時だが、drag中と保存失敗時はmemoryが先行する。mask / concealの編集中
+        // bufferはページ別runtime cacheではなく、既存コピーも意図的にDBを正本とする。
         for target in targets {
             let current_idx = self.current_idx_for_bulk_target(target);
-            target.kept_local_adjust_override = current_idx
-                .and_then(|idx| self.local_adjust_page_layers.get(&idx).cloned())
-                .or_else(|| {
-                    (!self.local_adjust_page_keys.contains(&target.page_key))
-                        .then(local_adjust_core::LocalAdjustmentLayers::default)
-                });
+            if !kinds.adjustment {
+                target.kept_runtime_overrides.adjustment = KeptRuntimeValue::from_memory_state(
+                    current_idx.and_then(|idx| self.adjustment_page_params.get(&idx).cloned()),
+                    self.adjusted_page_keys.contains(&target.page_key),
+                );
+            }
+            if !kinds.local_adjust {
+                target.kept_runtime_overrides.local_adjust = KeptRuntimeValue::from_memory_state(
+                    current_idx.and_then(|idx| self.local_adjust_page_layers.get(&idx).cloned()),
+                    self.local_adjust_page_keys.contains(&target.page_key),
+                );
+            }
+            if !kinds.export_crop
+                && let Some(idx) = current_idx
+            {
+                target.kept_runtime_overrides.export_crop = KeptRuntimeValue::from_memory_state(
+                    self.export_crop_page_settings.get(&idx).copied(),
+                    self.export_crop_pages.contains(&idx),
+                );
+            }
+            if !kinds.comic {
+                target.kept_runtime_overrides.comic = KeptRuntimeValue::from_memory_state(
+                    self.comic_docs.get(&target.page_key).cloned(),
+                    self.comic_page_keys.contains(&target.page_key),
+                );
+            }
         }
     }
 
@@ -1571,6 +1629,89 @@ mod tests {
     }
 
     #[test]
+    fn partial_reset_keeps_newer_in_memory_comic_and_adjustment() {
+        let mut app = crate::app::setup_app_for_test();
+        let page_path = app.tmp.path().join("page.png");
+        app.items = vec![GridItem::Image(page_path)];
+        let key = app.page_path_key(0).unwrap();
+        let comic = |id, text: &str| {
+            vec![comic_core::AnnotationObject::new_text(
+                id,
+                (10.0, 20.0),
+                comic_core::TextBlock {
+                    text: text.to_string(),
+                    ..comic_core::TextBlock::default()
+                },
+            )]
+        };
+        let stale_db_comic = comic(1, "DB");
+        let newer_memory_comic = comic(2, "memory");
+        let mut stale_db_adjustment = crate::adjustment::AdjustParams::default();
+        stale_db_adjustment.brightness = 0.1;
+        let mut newer_memory_adjustment = stale_db_adjustment.clone();
+        newer_memory_adjustment.brightness = 0.25;
+        let paths = EditBundleDbPaths::default_data_dir();
+        PageEditBundle {
+            source_size: [1, 1],
+            adjust: Some(stale_db_adjustment),
+            mask: Some(EditMaskSnapshot {
+                pixels: vec![true],
+                shapes: Vec::new(),
+                size: [1, 1],
+            }),
+            comic: Some(stale_db_comic),
+            ..PageEditBundle::default()
+        }
+        .prepare()
+        .unwrap()
+        .apply_atomic(&paths, &key)
+        .unwrap();
+
+        app.adjusted_page_keys.insert(key.clone());
+        app.adjustment_page_params
+            .insert(0, newer_memory_adjustment.clone());
+        app.mask_page_keys.insert(key.clone());
+        app.mask_pages.insert(0);
+        app.comic_page_keys.insert(key.clone());
+        app.comic_pages.insert(0);
+        app.comic_docs
+            .insert(key.clone(), newer_memory_comic.clone());
+
+        let kinds = ResetKinds {
+            mask: true,
+            ..ResetKinds::default()
+        };
+        let op = BulkPageEditOp::Reset { kinds };
+        let (mut targets, dropped_non_targets) = app.bulk_page_edit_targets(0);
+        assert_eq!(dropped_non_targets, 0);
+        assert_eq!(targets.len(), 1);
+        app.snapshot_bulk_kept_overrides(&mut targets, &op);
+
+        let readers = ResetBundleReaders::open(&paths, kinds).unwrap();
+        let prepared = prepare_and_apply_target(&targets[0], &op, &paths, Ok(&readers)).unwrap();
+        app.apply_bulk_worker_success(&targets[0], prepared, BulkRunEffect::Reset { kinds })
+            .unwrap();
+
+        assert_eq!(app.comic_docs.get(&key), Some(&newer_memory_comic));
+        assert_eq!(
+            app.adjustment_page_params.get(&0),
+            Some(&newer_memory_adjustment)
+        );
+        assert_eq!(
+            crate::comic_db::ComicDb::open_at(&paths.comic)
+                .unwrap()
+                .get(&key),
+            Some(newer_memory_comic)
+        );
+        assert_eq!(
+            crate::adjustment_db::AdjustmentDb::open_at(&paths.adjustment)
+                .unwrap()
+                .get_page_params(&key),
+            Some(newer_memory_adjustment)
+        );
+    }
+
+    #[test]
     fn edit_bundle_bulk_exit_drain_receives_item_before_bounded_worker_finishes() {
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
@@ -1581,7 +1722,7 @@ mod tests {
                 item: image("page.png"),
                 sidecar_coords: None,
                 known_size: Some([1, 1]),
-                kept_local_adjust_override: None,
+                kept_runtime_overrides: KeptRuntimeOverrides::default(),
             };
             let prepared = PageEditBundle {
                 source_size: [1, 1],
@@ -1646,7 +1787,12 @@ mod tests {
             ..ResetKinds::default()
         };
         let readers = ResetBundleReaders::open(&paths, kinds).unwrap();
-        let reset = apply_reset_kinds(readers.load_kept_bundle(key, None).unwrap(), kinds);
+        let reset = apply_reset_kinds(
+            readers
+                .load_kept_bundle(key, &KeptRuntimeOverrides::default())
+                .unwrap(),
+            kinds,
+        );
         assert_eq!(reset.source_size, [0, 0]);
         let prepared = reset.prepare().unwrap();
         prepared.apply_atomic(&paths, key).unwrap();
@@ -1708,14 +1854,15 @@ mod tests {
             ..ResetKinds::default()
         };
         let readers = ResetBundleReaders::open(&paths, kinds).unwrap();
-        apply_reset_kinds(
-            readers.load_kept_bundle(key, Some(&memory_layers)).unwrap(),
-            kinds,
-        )
-        .prepare()
-        .unwrap()
-        .apply_atomic(&paths, key)
-        .unwrap();
+        let overrides = KeptRuntimeOverrides {
+            local_adjust: KeptRuntimeValue::Present(memory_layers.clone()),
+            ..KeptRuntimeOverrides::default()
+        };
+        apply_reset_kinds(readers.load_kept_bundle(key, &overrides).unwrap(), kinds)
+            .prepare()
+            .unwrap()
+            .apply_atomic(&paths, key)
+            .unwrap();
 
         assert_eq!(
             crate::local_adjust_db::LocalAdjustDb::open_at(&paths.local_adjust)
