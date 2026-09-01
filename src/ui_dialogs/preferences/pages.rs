@@ -729,54 +729,105 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
             ui.end_row();
 
-            ui.label("渡す内容");
+            ui.label("渡すもの");
             enum_combo(
                 ui,
                 "external_tool_payload",
                 &mut tool.payload,
                 &[
                     (
-                        crate::external_tool::PayloadPolicy::AsDisplayed,
-                        "表示どおり",
+                        crate::external_tool::PayloadPolicy::TempAsDisplayed,
+                        "一時ファイル (表示どおり)",
                     ),
-                    (crate::external_tool::PayloadPolicy::Original, "元ファイル"),
-                    (crate::external_tool::PayloadPolicy::Container, "コンテナー"),
                     (
-                        crate::external_tool::PayloadPolicy::RealFileOnly,
-                        "実ファイルのみ",
+                        crate::external_tool::PayloadPolicy::TempOriginal,
+                        "一時ファイル (加工前)",
+                    ),
+                    (
+                        crate::external_tool::PayloadPolicy::OriginalFile,
+                        "元のファイル",
                     ),
                 ],
             );
             ui.end_row();
 
-            ui.label("動画");
-            enum_combo(
-                ui,
-                "external_tool_video",
-                &mut tool.video,
-                &[
-                    (crate::external_tool::VideoPolicy::File, "動画ファイル"),
-                    (
-                        crate::external_tool::VideoPolicy::CurrentFrame,
-                        "現在フレーム",
-                    ),
-                ],
+            let passes_real_file =
+                tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(if passes_real_file {
+                        "ディスク上のファイルそのものを渡します。ツールで上書き保存すると                         元のファイルが変わり、mIV が読み直します。圧縮ファイル内のページと                          PDF のページには元のファイルが無いため、起動できません。"
+                    } else {
+                        "一時ファイルへ書き出して渡します。ツールで上書き保存しても元の                         ファイルは変わりません。加工が掛かっていなければ再エンコードせず、                         元のデータをそのまま書き出します。"
+                    })
+                    .weak(),
+                )
+                .wrap(),
             );
             ui.end_row();
+
+            ui.label("動画");
+            ui.add_enabled_ui(!passes_real_file, |ui| {
+                enum_combo(
+                    ui,
+                    "external_tool_video",
+                    &mut tool.video,
+                    &[
+                        (crate::external_tool::VideoPolicy::File, "動画ファイル"),
+                        (
+                            crate::external_tool::VideoPolicy::CurrentFrame,
+                            "表示中のフレーム",
+                        ),
+                    ],
+                );
+            })
+            .response
+            .on_disabled_hover_text(
+                "「元のファイル」を渡すツールでは、動画も動画ファイルそのものを渡します",
+            );
+            ui.end_row();
+
+            if !passes_real_file
+                && tool.video == crate::external_tool::VideoPolicy::File
+            {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "動画は一時ファイルへコピーせず、動画ファイルそのものを渡します                              (数 GB になるため)。",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
 
             ui.label("見開き");
             enum_combo(
                 ui,
                 "external_tool_spread",
                 &mut tool.spread,
-                &[
-                    (crate::external_tool::SpreadPolicy::Merged, "合成"),
-                    (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
-                    (
-                        crate::external_tool::SpreadPolicy::MainPageOnly,
-                        "主ページのみ",
-                    ),
-                ],
+                if passes_real_file {
+                    // 合成した見開きに対応する元ファイルは存在しない。
+                    &[
+                        (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
+                        (
+                            crate::external_tool::SpreadPolicy::MainPageOnly,
+                            "主ページのみ",
+                        ),
+                    ][..]
+                } else {
+                    &[
+                        (crate::external_tool::SpreadPolicy::Merged, "合成"),
+                        (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
+                        (
+                            crate::external_tool::SpreadPolicy::MainPageOnly,
+                            "主ページのみ",
+                        ),
+                    ][..]
+                },
             );
             ui.end_row();
 
@@ -849,9 +900,12 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         });
 
     ui.horizontal_wrapped(|ui| {
-        ui.checkbox(&mut tool.for_editing, "編集に使う");
         ui.checkbox(&mut tool.keep_temp, "一時ファイルを残す");
     });
+
+    // payload と両立しない下位設定を、保存前にここで揃える。設定画面に「効かない選択」を
+    // 残さない (`normalize_for_payload` の doc comment を参照)。
+    tool.normalize_for_payload();
 
     let launch_changed = tool.launch != state.settings.external_tools[index].launch;
     let working_directory_changed =

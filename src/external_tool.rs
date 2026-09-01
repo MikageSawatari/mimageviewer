@@ -13,7 +13,7 @@ pub const DEFAULT_MAX_TARGETS: u32 = 10;
 #[cfg(windows)]
 const CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS: usize = 32_767;
 const ASSOCIATED_APP_DISPLAY_NAME: &str = "関連付けアプリ";
-pub(crate) const VIRTUAL_EDITING_DISABLED_REASON: &str = "圧縮ファイル / PDF 内のページは編集用ツールで開けません。「コンテナー」を渡す設定にするか、書き出してから編集してください (フルスクリーンで Ctrl+E)";
+pub(crate) const VIRTUAL_ORIGINAL_FILE_DISABLED_REASON: &str = "圧縮ファイル / PDF 内のページには元のファイルがありません。「一時ファイル」を渡す設定にするか、書き出してから編集してください (フルスクリーンで Ctrl+E)";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -89,12 +89,20 @@ pub(crate) fn classify_legacy_recent_launch(
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// 外部ツールへ何を渡すか。
+///
+/// **一時ファイルと元ファイルを 1 つの値の中で混ぜない** (§4.3 の 2026-09-02 決定)。
+/// 混ぜると、同じ設定・同じツールでもページによって上書き保存の意味が変わる
+/// (無加工のページだけ実ファイルが渡り、利用者が元データを壊す)。加工の有無は
+/// ツール側から見えないので、保存する前に区別する手段が無い。
 pub enum PayloadPolicy {
+    /// 一時ファイル (表示どおり)。加工が無ければ焼き込まず元バイト列をコピーする。
     #[default]
-    AsDisplayed,
-    Original,
-    Container,
-    RealFileOnly,
+    TempAsDisplayed,
+    /// 一時ファイル (加工前)。
+    TempOriginal,
+    /// 元のファイルそのもの。仮想ページでは起動しない (§4.8)。
+    OriginalFile,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -134,7 +142,6 @@ pub struct ExternalTool {
     pub confirmation_threshold: u32,
     pub max_targets: u32,
     pub pdf_render_long_edge: u32,
-    pub for_editing: bool,
     pub keep_temp: bool,
 }
 
@@ -761,24 +768,39 @@ impl ExternalTool {
             launch: ExternalToolLaunch::OsDefault,
             arguments: "{file}".to_string(),
             working_directory: None,
-            payload: PayloadPolicy::AsDisplayed,
+            payload: PayloadPolicy::TempAsDisplayed,
             video: VideoPolicy::File,
             spread: SpreadPolicy::Merged,
             selection: SelectionPolicy::Each,
             confirmation_threshold: DEFAULT_CONFIRMATION_THRESHOLD,
             max_targets: DEFAULT_MAX_TARGETS,
             pdf_render_long_edge: DEFAULT_PDF_RENDER_LONG_EDGE,
-            for_editing: false,
             keep_temp: false,
         }
     }
 
     pub fn defaults_for_editing() -> Self {
         Self {
-            payload: PayloadPolicy::Original,
+            payload: PayloadPolicy::OriginalFile,
             spread: SpreadPolicy::MainPageOnly,
-            for_editing: true,
             ..Self::defaults_for_viewing()
+        }
+    }
+
+    /// `payload` と両立しない下位設定を、保存前に揃える。
+    ///
+    /// 「効かない選択が設定画面に残っている」状態を作らないための正規化で、読み出し側に
+    /// `effective_video()` のような派生を増やさない。保存値そのものを常に整合させる。
+    pub fn normalize_for_payload(&mut self) {
+        if self.payload != PayloadPolicy::OriginalFile {
+            return;
+        }
+        // 一時 PNG のフレームは「元のファイル」ではない。
+        self.video = VideoPolicy::File;
+        // 合成した見開きに対応する元ファイルは存在しない。両ページは実ファイル 2 件
+        // なので成立する。
+        if self.spread == SpreadPolicy::Merged {
+            self.spread = SpreadPolicy::MainPageOnly;
         }
     }
 }
@@ -827,14 +849,13 @@ fn external_tool_capability(
     if !target.has_target || target.has_unsupported {
         return None;
     }
-    if target.has_virtual_page && tool.payload == PayloadPolicy::RealFileOnly {
-        return None;
-    }
-    let virtual_editing_refusal =
-        target.has_virtual_page && tool.for_editing && tool.payload != PayloadPolicy::Container;
+    // 「元のファイル」のツールだけは、無効でも**隠さずグレーで理由を出す** (§4.8)。
+    // 利用者は「このツールで編集できる」と思っているので、黙って消えるより理由が見えた
+    // 方がよい。
+    let virtual_refusal = target.has_virtual_page && tool.payload == PayloadPolicy::OriginalFile;
     Some((
-        !virtual_editing_refusal,
-        virtual_editing_refusal.then_some(VIRTUAL_EDITING_DISABLED_REASON),
+        !virtual_refusal,
+        virtual_refusal.then_some(VIRTUAL_ORIGINAL_FILE_DISABLED_REASON),
     ))
 }
 
@@ -1192,10 +1213,9 @@ fn validate_materializable_targets(targets: &[LaunchTarget]) -> Result<(), Strin
 
 fn materialize_policy(payload: PayloadPolicy) -> crate::materializer::MaterializePolicy {
     match payload {
-        PayloadPolicy::AsDisplayed => crate::materializer::MaterializePolicy::AsDisplayed,
-        PayloadPolicy::Original => crate::materializer::MaterializePolicy::Original,
-        PayloadPolicy::Container => crate::materializer::MaterializePolicy::Container,
-        PayloadPolicy::RealFileOnly => crate::materializer::MaterializePolicy::RealFileOnly,
+        PayloadPolicy::TempAsDisplayed => crate::materializer::MaterializePolicy::TempAsDisplayed,
+        PayloadPolicy::TempOriginal => crate::materializer::MaterializePolicy::TempOriginal,
+        PayloadPolicy::OriginalFile => crate::materializer::MaterializePolicy::OriginalFile,
     }
 }
 
@@ -1549,7 +1569,7 @@ fn run_materialize_launch_operation(
             index,
             format!("{} / {} 件目を準備しています", index + 1, target_count),
         );
-        let label = request.source.container_path().display().to_string();
+        let label = request.source.display_label();
         match session.materialize(request, cancel, generation) {
             Ok(file) => prepared.push(Some(file)),
             Err(error) => {
@@ -1954,16 +1974,6 @@ impl crate::app::App {
             } => (
                 MaterializeSource::ZipEntry {
                     zip_path: zip_path.clone(),
-                    container_path: self
-                        .archive_source_override
-                        .as_ref()
-                        .filter(|_| {
-                            self.current_folder.as_deref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(zip_path, current)
-                            })
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| zip_path.clone()),
                     entry_name: entry_name.clone(),
                 },
                 Some(crate::adjustment_db::zip_entry_key(zip_path, entry_name)),
@@ -2025,7 +2035,6 @@ impl crate::app::App {
             } else {
                 tool.pdf_render_long_edge
             },
-            for_editing: tool.for_editing,
         })
     }
 
@@ -2607,11 +2616,10 @@ mod tests {
     }
 
     #[test]
-    fn editing_defaults_preserve_original_main_page() {
+    fn editing_defaults_pass_the_real_file_and_one_page() {
         let tool = ExternalTool::defaults_for_editing();
-        assert_eq!(tool.payload, PayloadPolicy::Original);
+        assert_eq!(tool.payload, PayloadPolicy::OriginalFile);
         assert_eq!(tool.spread, SpreadPolicy::MainPageOnly);
-        assert!(tool.for_editing);
         assert_eq!(tool.arguments, "{file}");
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
@@ -2619,14 +2627,13 @@ mod tests {
     #[test]
     fn viewing_defaults_use_displayed_each_file_policy_and_count_limits() {
         let tool = ExternalTool::defaults_for_viewing();
-        assert_eq!(tool.payload, PayloadPolicy::AsDisplayed);
+        assert_eq!(tool.payload, PayloadPolicy::TempAsDisplayed);
         assert_eq!(tool.video, VideoPolicy::File);
         assert_eq!(tool.spread, SpreadPolicy::Merged);
         assert_eq!(tool.selection, SelectionPolicy::Each);
         assert_eq!(tool.confirmation_threshold, DEFAULT_CONFIRMATION_THRESHOLD);
         assert_eq!(tool.max_targets, DEFAULT_MAX_TARGETS);
         assert_eq!(tool.launch, ExternalToolLaunch::OsDefault);
-        assert!(!tool.for_editing);
         assert!(!tool.keep_temp);
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
@@ -2665,12 +2672,12 @@ mod tests {
         assert_eq!(next_id(&tools), ExternalToolId(2));
     }
 
-    fn menu_tool(id: u32, name: &str, for_editing: bool) -> ExternalTool {
+    fn menu_tool(id: u32, name: &str, payload: PayloadPolicy) -> ExternalTool {
         ExternalTool {
             id: ExternalToolId(id),
             name: name.to_string(),
             launch: ExternalToolLaunch::Executable(PathBuf::from(format!(r"C:\Tools\{name}.exe"))),
-            for_editing,
+            payload,
             ..ExternalTool::defaults_for_viewing()
         }
     }
@@ -2678,7 +2685,13 @@ mod tests {
     #[test]
     fn real_file_menu_keeps_every_registered_tool_in_order_without_a_cap() {
         let tools: Vec<_> = (0..12)
-            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false))
+            .map(|index| {
+                menu_tool(
+                    index + 1,
+                    &format!("tool-{index}"),
+                    PayloadPolicy::TempAsDisplayed,
+                )
+            })
             .collect();
 
         let items = external_tool_menu_items(
@@ -2715,14 +2728,11 @@ mod tests {
     }
 
     #[test]
-    fn virtual_page_menu_enables_viewers_disables_editors_and_hides_real_only() {
-        let viewer = menu_tool(1, "viewer", false);
-        let editor = menu_tool(2, "editor", true);
-        let mut container_editor = menu_tool(3, "container-editor", true);
-        container_editor.payload = PayloadPolicy::Container;
-        let mut real_only = menu_tool(4, "real-only", false);
-        real_only.payload = PayloadPolicy::RealFileOnly;
-        let tools = vec![viewer, editor, container_editor, real_only];
+    fn virtual_page_menu_greys_original_file_tools_with_a_reason_and_keeps_temp_tools() {
+        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempAsDisplayed);
+        let pre_edit = menu_tool(2, "pre-edit", PayloadPolicy::TempOriginal);
+        let real_file = menu_tool(3, "real-file", PayloadPolicy::OriginalFile);
+        let tools = vec![displayed, pre_edit, real_file];
 
         let target = ExternalToolMenuTarget::from_launch_targets(&[LaunchTarget::ZipPage {
             zip_path: PathBuf::from("book.zip"),
@@ -2735,21 +2745,22 @@ mod tests {
             vec![
                 ExternalToolMenuItem {
                     tool_id: ExternalToolId(1),
-                    label: "viewerで開く".to_string(),
+                    label: "displayedで開く".to_string(),
                     enabled: true,
                     disabled_reason: None,
                 },
                 ExternalToolMenuItem {
                     tool_id: ExternalToolId(2),
-                    label: "editorで開く".to_string(),
-                    enabled: false,
-                    disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
-                },
-                ExternalToolMenuItem {
-                    tool_id: ExternalToolId(3),
-                    label: "container-editorで開く".to_string(),
+                    label: "pre-editで開く".to_string(),
                     enabled: true,
                     disabled_reason: None,
+                },
+                // 隠さずグレーにする。利用者は「このツールで編集できる」と思っている。
+                ExternalToolMenuItem {
+                    tool_id: ExternalToolId(3),
+                    label: "real-fileで開く".to_string(),
+                    enabled: false,
+                    disabled_reason: Some(VIRTUAL_ORIGINAL_FILE_DISABLED_REASON),
                 },
             ]
         );
@@ -2764,15 +2775,12 @@ mod tests {
 
     #[test]
     fn virtual_page_picker_filters_and_disables_before_showing() {
-        let viewer = menu_tool(1, "viewer", false);
-        let editor = menu_tool(2, "editor", true);
-        let mut container_editor = menu_tool(3, "container-editor", true);
-        container_editor.payload = PayloadPolicy::Container;
-        let mut real_only = menu_tool(4, "real-only", false);
-        real_only.payload = PayloadPolicy::RealFileOnly;
+        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempAsDisplayed);
+        let pre_edit = menu_tool(2, "pre-edit", PayloadPolicy::TempOriginal);
+        let real_file = menu_tool(3, "real-file", PayloadPolicy::OriginalFile);
 
         let items = external_tool_picker_items(
-            &[viewer, editor, container_editor, real_only],
+            &[displayed, pre_edit, real_file],
             &[LaunchTarget::PdfPage {
                 pdf_path: PathBuf::from("book.pdf"),
                 page_num: 2,
@@ -2785,23 +2793,23 @@ mod tests {
                 ExternalToolPickerItem {
                     tool_id: ExternalToolId(1),
                     slot: 1,
-                    label: "viewer".to_string(),
+                    label: "displayed".to_string(),
                     enabled: true,
                     disabled_reason: None,
                 },
                 ExternalToolPickerItem {
                     tool_id: ExternalToolId(2),
                     slot: 2,
-                    label: "editor".to_string(),
-                    enabled: false,
-                    disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
+                    label: "pre-edit".to_string(),
+                    enabled: true,
+                    disabled_reason: None,
                 },
                 ExternalToolPickerItem {
                     tool_id: ExternalToolId(3),
                     slot: 3,
-                    label: "container-editor".to_string(),
-                    enabled: true,
-                    disabled_reason: None,
+                    label: "real-file".to_string(),
+                    enabled: false,
+                    disabled_reason: Some(VIRTUAL_ORIGINAL_FILE_DISABLED_REASON),
                 },
             ]
         );
@@ -2851,7 +2859,7 @@ mod tests {
                 has_virtual_page: true,
                 has_unsupported: false,
             },
-            "混在でも仮想ページを見失わず、editing / RealFileOnly を正しく判定する"
+            "混在でも仮想ページを見失わず、OriginalFile を正しく判定する"
         );
     }
 

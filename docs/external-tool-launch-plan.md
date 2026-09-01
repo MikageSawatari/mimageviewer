@@ -903,71 +903,74 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 
 ### 済み
 
-P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 を実装。master v3.4.0 を取り込み済み。
+P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 / P3.5 を実装。
+master v3.4.0 を取り込み済み。P3.5 = `PayloadPolicy` 3 値化 (一時ファイル 2 種 + 元のファイル) と
+`for_editing` / `Container` / `RealFileOnly` の廃止 (§4.3 / §4.8 / §6 の 2026-09-02 決定)。
 v3.4.0 では外部ツールを revert して出したので、**再投入時は revert コミットを revert してから
 マージする** (backlog §1.117。素直にマージすると「既にマージ済み」と判断されて実装が消える)。
 
-### 実機で残っている問題
+### 固着 (解決、実機確認済み 2026-09-02)
 
-**フルスクリーンから ZIP / PDF ページの外部ツールを起動すると固まる。**
+**症状**: フルスクリーンから ZIP / PDF ページの外部ツールを起動すると固まり、
+クリックが効かなくなる。**原因は 2 つあり、どちらも単独でこの症状を起こせた。**
 
-計測で確定した原因: フルスクリーン中は `App::update` が tail の手前で early return する
-([app.rs](../src/app.rs) の「会計はここで出す」コメント参照)。進捗 modal を描く
-`show_external_tool_materialize_progress` と、spawn 境界を ACK する
-`authorize_external_tool_launch_boundaries_after_ui` は**その tail にある**。結果、
-worker が起動許可を待ったまま止まり、modal が入力を掴んだままになる。
+**(1) フルスクリーン中は ACK が返らない。** フルスクリーン中は `App::update` が tail の
+手前で early return する ([app.rs](../src/app.rs) の「会計はここで出す」コメント参照)。
+進捗 modal を描く `show_external_tool_materialize_progress` と、spawn 境界を ACK する
+`authorize_external_tool_launch_boundaries_after_ui` は**その tail にあった**。worker が
+起動許可を待ったまま止まり、modal が入力を掴んだままになる。
 
 `ui_fullscreen.rs` の共通描画 closure から両者を呼ぶよう直した。**最初 `if !embedded` を
 付けて失敗した** — 隣の `show_remote_session_dialog` を真似たが、その `!embedded` の前提
 (「embedded は main update 終端で描く」) は**この early return 経路では成り立たない**。
-実機ログで `embedded=true` を確認して外した。**未検証。**
+実機ログで `embedded=true` を確認して外した。
 
-### この修正では足りない点 (Codex Sol 分析、2026-09-02)
+**(2) 描画条件と入力ブロック条件が別々に書かれていた。** 入力ブロックは
+「pending が 1 件でもある」、描画は「現世代の pending がある」。**supersede 済みでまだ
+drain されていない要求が残っている間、前者だけが真になり、ダイアログが無いのに入力だけ
+止まる**。(1) の修正で supersede 済み要求はすぐ cancel されるようになったが、条件が
+2 つある限り同じ形で再発する。描画側の述語から導くようにした
+(`external_tool_materialize_progress_visible`)。
 
-1. **ACK の位置が早すぎる。** 現在の呼び出し位置の後に `handle_fs_navigation` が走るので、
-   「全 UI と navigation の後に ACK する」という自身の契約を満たしていない。
-2. **専用 fullscreen では main 側と二重描画し得る。**
-3. **入力 blocker の導出が描画条件と食い違う。** blocker は「pending が 1 件でもある」
-   ([app.rs](../src/app.rs) の `modal_dialog_block_reason`)、描画は「current generation の
-   pending がある」。**supersede / cancel 済み worker の終了待ちだけが残ると、
-   ダイアログが描かれないのに入力だけ止まる**同型の穴が残っている。
-4. `launch_ui_checkpoint_passed` は frame 番号を持たない永続 bool なので、tail が飛ぶと
-   次 frame へ残る。「同じ frame で Cancel を確認した」という契約を型で保証できていない。
+あわせて、**専用フルスクリーンでは main tail が飛ばない**ため同じ modal が 2 つの window に
+出る二重描画も直した。この frame で先に到達した Context が描き、もう片方は降りる。目印は
+bool ではなく frame 番号 — embedded の frame は tail ごと飛ぶので、bool を clear する場所が
+無い frame ができて次の frame へ残る。
 
-### 構造的な直し方 (未着手)
+Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は**不具合ではない**。
+§4.7 で「準備中に移動しても打ち切らない」と決めており、要求は対象を具体的に保持している
+(ZIP パス + エントリ / PDF パス + ページ) ので、一覧が入れ替わっても対象は有効。
 
-```
-App::update
-  ├─ update_frame_body    ← 内部の early return はここだけを抜ける
-  └─ finalize_ui_frame    ← 全 early return の後に必ず通る。ACK は exactly once
-```
-
-加えて、1 要求の phase を `launch_boundary_rx` / `Option<launch_decision_tx>` / `cancel` /
-generation / checkpoint bool へ分散させず、**単一の typed phase owner** にする:
-
-`Materializing → ReadyToLaunch → LaunchCommitted | Cancelled → Finished`
-
-入力 blocker もその phase の `blocks_input` から導出する (pending Vec の非空から導かない)。
+**残る構造的改善 (任意)**: 1 要求の phase が `launch_boundary_rx` /
+`Option<launch_decision_tx>` / `cancel` / generation / checkpoint bool へ分散している。
+`Materializing → ReadyToLaunch → LaunchCommitted | Cancelled → Finished` の
+**単一 typed phase owner** に寄せると、上の 2 つのような「条件が 2 か所にある」バグを
+構造的に防げる。今は実害が無いので着手していない。
 
 ### 波及 (別件、要対応)
 
 `show_remote_session_dialog` の `!embedded` ガードも同じ前提に立っており、**同じ穴を持つ**
-可能性が高い ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。リモート側の担当で確認が要る。
+(embedded フルスクリーンでは描かれない) ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。
+リモート側の担当で確認が要る。
 
 ### 残りの段
 
-- **P3.5 (P4 より先)**: `PayloadPolicy` の 2 値化と `for_editing` 廃止 (§4.3 / §4.8 の 2026-09-02 決定)。
-  **固着の実機確認を通してから着手する** (未検証の差分を積み上げないため)
 - **P4**: 動画の現在フレーム、`SpreadPolicy` 3 値、`{container}` / `{entry}` / `{page}` / `{time}`
 - P5: round-trip (mtime 監視)
 
 ### 未確認の実機項目
 
-- ZIP / PDF ページの起動 (上記修正後)
-- 準備中のキャンセル
-- 編集用ツールをグレー表示したときの理由ツールチップ (出ないという報告あり。
+- **準備中のキャンセル** (実機では ZIP / PDF の展開が速すぎて押せなかった。
+  大きい PDF を 8192 で、または多数ページを Batch で渡すと窓が開く)
+- **同じ準備中に別のツールを起動** (上の (2) が出る経路)
+- 「元のファイル」ツールをグレー表示したときの理由ツールチップ (出ないという報告あり。
   理由は設定されており tooltip 生成の失敗ログも無いので、未再現)
 - 終了後に `%TEMP%\mimageviewer\ext-<pid>` が残らないこと
+
+### 仕様どおりで不具合ではないもの
+
+- **見開き表示中に片側のページだけ渡る。** `SpreadPolicy` は P4 (§4.5 の 2026-08-31 決定)。
+  P3 までは見開き中でも現在ページ 1 件を渡す。
 
 ## 6. 決定済み / 未決事項
 

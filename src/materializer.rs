@@ -21,9 +21,6 @@ pub enum MaterializeSource {
     ZipEntry {
         /// 実際に entry bytes を読む ZIP。変換アーカイブでは cache ZIP を指す。
         zip_path: PathBuf,
-        /// 利用者から見た書庫本体。通常は `zip_path` と同じだが、変換アーカイブでは
-        /// 元の RAR / 7z / LZH を指す。
-        container_path: PathBuf,
         entry_name: String,
     },
     PdfPage {
@@ -34,16 +31,23 @@ pub enum MaterializeSource {
 }
 
 impl MaterializeSource {
-    pub fn container_path(&self) -> &Path {
+    /// 失敗を利用者へ見せるときの名前。ZIP / PDF は「どのページか」まで出す。
+    /// パスだけだと、複数ページを渡したときにどれが失敗したのか分からない。
+    pub fn display_label(&self) -> String {
         match self {
-            Self::File { path, .. } => path,
-            Self::ZipEntry { container_path, .. } => container_path,
-            Self::PdfPage { pdf_path, .. } => pdf_path,
+            Self::File { path, .. } => path.display().to_string(),
+            Self::ZipEntry {
+                zip_path,
+                entry_name,
+            } => format!("{} / {entry_name}", zip_path.display()),
+            Self::PdfPage {
+                pdf_path, page_num, ..
+            } => format!("{} / {} ページ", pdf_path.display(), page_num + 1),
         }
     }
 
-    /// decode / source validation に使う物理ファイル。`container_path()` は UI 上の
-    /// コンテナーを返すため、変換アーカイブではこの値と異なる。
+    /// decode / source validation に使う物理ファイル。変換アーカイブでは、利用者から
+    /// 見えている書庫ではなく cache ZIP を指す。
     fn source_path(&self) -> &Path {
         match self {
             Self::File { path, .. } => path,
@@ -106,10 +110,12 @@ pub struct PageEditContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MaterializePolicy {
-    AsDisplayed,
-    Original,
-    Container,
-    RealFileOnly,
+    /// 一時ファイルへ、表示を再現したデータを書き出す。
+    TempAsDisplayed,
+    /// 一時ファイルへ、加工前のデータを書き出す。
+    TempOriginal,
+    /// ディスク上の実ファイルをそのまま渡す。仮想ページには渡せない。
+    OriginalFile,
 }
 
 #[derive(Clone)]
@@ -118,7 +124,6 @@ pub struct MaterializeRequest {
     pub policy: MaterializePolicy,
     pub page_edits: Option<PageEditContext>,
     pub pdf_render_long_edge: u32,
-    pub for_editing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +136,15 @@ pub enum MaterializeSourceKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializeDecision {
+    /// 実ファイルをそのまま渡す。`OriginalFile` だけがここへ来る。
     DirectOriginal,
+    /// 実ファイルの中身を一時ファイルへコピーする (再エンコードしない)。
+    CopyOriginalFile,
+    /// ZIP エントリの元バイト列を一時ファイルへ書き出す (再エンコードしない)。
     ExtractOriginal,
     RenderPng,
-    RefuseRealFileOnly,
+    /// 仮想ページに `OriginalFile` を要求された。元ファイルが無いので起動しない。
+    RefuseVirtualPage,
 }
 
 /// DB snapshot を読み終えた後の最終出力判断。UI の同期 capability 判定とは分ける。
@@ -144,26 +154,29 @@ pub fn decide_materialization(
     requires_composite: bool,
 ) -> MaterializeDecision {
     match policy {
-        MaterializePolicy::Container => MaterializeDecision::DirectOriginal,
-        MaterializePolicy::RealFileOnly => match source {
+        MaterializePolicy::OriginalFile => match source {
             MaterializeSourceKind::ImageFile | MaterializeSourceKind::OtherFile => {
                 MaterializeDecision::DirectOriginal
             }
             MaterializeSourceKind::ZipEntry | MaterializeSourceKind::PdfPage => {
-                MaterializeDecision::RefuseRealFileOnly
+                MaterializeDecision::RefuseVirtualPage
             }
         },
-        MaterializePolicy::Original => match source {
-            MaterializeSourceKind::ImageFile | MaterializeSourceKind::OtherFile => {
-                MaterializeDecision::DirectOriginal
-            }
+        // 動画・音声 (`OtherFile`) はどちらの一時ポリシーでも実ファイルを渡す。
+        // 数 GB を一時フォルダーへ複製する代償が、上書き保存に対する安全側の利益に
+        // 見合わない (§4.3 の 2026-09-02 決定)。UI もこれを「動画ファイル」と表示する。
+        MaterializePolicy::TempOriginal => match source {
+            MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
+            MaterializeSourceKind::ImageFile => MaterializeDecision::CopyOriginalFile,
             MaterializeSourceKind::ZipEntry => MaterializeDecision::ExtractOriginal,
             MaterializeSourceKind::PdfPage => MaterializeDecision::RenderPng,
         },
-        MaterializePolicy::AsDisplayed => match source {
+        // 加工が無ければ焼き込まない。表示と元データが同じなのに再エンコードすると、
+        // JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
+        MaterializePolicy::TempAsDisplayed => match source {
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
             MaterializeSourceKind::ImageFile if !requires_composite => {
-                MaterializeDecision::DirectOriginal
+                MaterializeDecision::CopyOriginalFile
             }
             MaterializeSourceKind::ZipEntry if !requires_composite => {
                 MaterializeDecision::ExtractOriginal
@@ -408,16 +421,17 @@ impl MaterializeSession {
     ) -> Result<PreparedMaterializedFile, String> {
         check_current(&self.inner, cancel, generation)?;
 
-        let loaded_edits =
-            if request.policy == MaterializePolicy::AsDisplayed && request.page_edits.is_some() {
-                Some(self.load_page_edits(
-                    request.page_edits.as_ref().expect("checked above"),
-                    cancel,
-                    generation,
-                )?)
-            } else {
-                None
-            };
+        let loaded_edits = if request.policy == MaterializePolicy::TempAsDisplayed
+            && request.page_edits.is_some()
+        {
+            Some(self.load_page_edits(
+                request.page_edits.as_ref().expect("checked above"),
+                cancel,
+                generation,
+            )?)
+        } else {
+            None
+        };
         let requires_composite = loaded_edits
             .as_ref()
             .is_some_and(|loaded| loaded.requires_composite);
@@ -426,20 +440,11 @@ impl MaterializeSession {
             request.policy,
             requires_composite,
         );
-        if decision == MaterializeDecision::RefuseRealFileOnly {
-            return Err(
-                "このツールは実ファイルだけを受け取るため、仮想ページを開けません".to_string(),
-            );
-        }
-        if request.for_editing && decision != MaterializeDecision::DirectOriginal {
-            return Err(editing_refusal_message(&request.source, decision));
+        if decision == MaterializeDecision::RefuseVirtualPage {
+            return Err(virtual_page_refusal_message(&request.source));
         }
         if decision == MaterializeDecision::DirectOriginal {
-            let direct_path = if request.policy == MaterializePolicy::Container {
-                request.source.container_path()
-            } else {
-                request.source.source_path()
-            };
+            let direct_path = request.source.source_path();
             std::fs::metadata(direct_path).map_err(|error| {
                 format!("対象を確認できません: {}: {error}", direct_path.display())
             })?;
@@ -472,6 +477,14 @@ impl MaterializeSession {
         let output_path = lease.path().to_path_buf();
         let write_result = (|| -> Result<(), String> {
             match decision {
+                MaterializeDecision::CopyOriginalFile => copy_original_file(
+                    &request.source,
+                    lease.file_mut()?,
+                    &output_path,
+                    &self.inner,
+                    cancel,
+                    generation,
+                ),
                 MaterializeDecision::ExtractOriginal => write_zip_entry(
                     &request.source,
                     lease.file_mut()?,
@@ -512,7 +525,7 @@ impl MaterializeSession {
                         &rgba,
                     )
                 }
-                MaterializeDecision::DirectOriginal | MaterializeDecision::RefuseRealFileOnly => {
+                MaterializeDecision::DirectOriginal | MaterializeDecision::RefuseVirtualPage => {
                     unreachable!("handled above")
                 }
             }
@@ -691,11 +704,52 @@ impl MaterializeSession {
     }
 }
 
-fn editing_refusal_message(source: &MaterializeSource, decision: MaterializeDecision) -> String {
-    match (source, decision) {
-        (MaterializeSource::ZipEntry { .. }, _) => "圧縮ファイル内のページは編集用ツールで開けません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
-        (MaterializeSource::PdfPage { .. }, _) => "PDF 内のページは編集用ツールで開けません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
-        _ => "表示用の加工結果は編集用ツールへ渡せません。元ファイルを渡す設定にするか、書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
+fn virtual_page_refusal_message(source: &MaterializeSource) -> String {
+    match source {
+        MaterializeSource::ZipEntry { .. } => "圧縮ファイル内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
+        MaterializeSource::PdfPage { .. } => "PDF 内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
+        MaterializeSource::File { .. } => "元のファイルを渡せません".to_string(),
+    }
+}
+
+/// 元ファイルの中身を一時ファイルへ流す。**全部読んでから書かない**。
+/// 数百 MB の RAW / TIFF でもメモリを積まず、途中でキャンセルも効く。
+fn copy_original_file(
+    source: &MaterializeSource,
+    file: &mut std::fs::File,
+    path: &Path,
+    inner: &MaterializerInner,
+    cancel: &Arc<AtomicBool>,
+    generation: u64,
+) -> Result<(), String> {
+    let MaterializeSource::File {
+        path: source_path, ..
+    } = source
+    else {
+        return Err("実ファイルではありません".to_string());
+    };
+    let mut reader = std::fs::File::open(source_path).map_err(|error| {
+        format!(
+            "元ファイルを読み取れません: {}: {error}",
+            source_path.display()
+        )
+    })?;
+    use std::io::{Read as _, Write as _};
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        check_current(inner, cancel, generation)?;
+        let read = reader.read(&mut buffer).map_err(|error| {
+            format!(
+                "元ファイルを読み取れません: {}: {error}",
+                source_path.display()
+            )
+        })?;
+        if read == 0 {
+            return Ok(());
+        }
+        file.write_all(&buffer[..read]).map_err(|error| {
+            format!("一時ファイルを書き込めません: {}: {error}", path.display())
+        })?;
     }
 }
 
@@ -759,7 +813,12 @@ fn write_zip_entry(
 
 fn materialized_name(source: &MaterializeSource, decision: MaterializeDecision) -> String {
     let original = source.original_name();
-    if decision == MaterializeDecision::ExtractOriginal {
+    // 再エンコードしない出力は元の名前と拡張子のまま渡す。ツールのタイトルバーにも
+    // 「名前を付けて保存」にも、利用者が知っている名前が出る。
+    if matches!(
+        decision,
+        MaterializeDecision::CopyOriginalFile | MaterializeDecision::ExtractOriginal
+    ) {
         return crate::books::sanitize_materialized_basename(&original, "page");
     }
     let stem = Path::new(&original)
@@ -1358,34 +1417,47 @@ mod tests {
         MaterializeRequest {
             source: MaterializeSource::ZipEntry {
                 zip_path: path.to_path_buf(),
-                container_path: path.to_path_buf(),
                 entry_name: entry_name.to_string(),
             },
-            policy: MaterializePolicy::Original,
+            policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
-            for_editing: false,
         }
     }
 
+    /// 一時ポリシーは**実ファイルもコピーする**。渡した先で上書き保存されても元データが
+    /// 変わらないことが、この 2 値を分けている理由 (§4.3 の 2026-09-02 決定)。
     #[test]
-    fn decision_keeps_unmodified_real_file_without_copy() {
+    fn temp_policies_copy_even_an_unmodified_real_file() {
+        for policy in [
+            MaterializePolicy::TempAsDisplayed,
+            MaterializePolicy::TempOriginal,
+        ] {
+            assert_eq!(
+                decide_materialization(MaterializeSourceKind::ImageFile, policy, false),
+                MaterializeDecision::CopyOriginalFile,
+                "{policy:?} は実ファイルでもコピーする"
+            );
+        }
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::ImageFile,
-                MaterializePolicy::AsDisplayed,
+                MaterializePolicy::OriginalFile,
                 false,
             ),
-            MaterializeDecision::DirectOriginal
+            MaterializeDecision::DirectOriginal,
+            "「元のファイル」だけが実ファイルをそのまま渡す"
         );
     }
 
+    /// コピーするが**焼き込みはしない**。表示と元データが同じなのに再エンコードすると、
+    /// JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
     #[test]
-    fn decision_extracts_zip_original_and_renders_edited_zip() {
+    fn as_displayed_bakes_only_what_actually_carries_edits() {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::ZipEntry,
-                MaterializePolicy::Original,
+                MaterializePolicy::TempAsDisplayed,
                 false,
             ),
             MaterializeDecision::ExtractOriginal
@@ -1393,19 +1465,45 @@ mod tests {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::ZipEntry,
-                MaterializePolicy::AsDisplayed,
+                MaterializePolicy::TempAsDisplayed,
                 true,
             ),
             MaterializeDecision::RenderPng
         );
+        assert_eq!(
+            decide_materialization(
+                MaterializeSourceKind::ZipEntry,
+                MaterializePolicy::TempOriginal,
+                true,
+            ),
+            MaterializeDecision::ExtractOriginal,
+            "「加工前」は加工が掛かっていても焼き込まない"
+        );
+    }
+
+    /// 動画・音声はどの一時ポリシーでも実ファイルを渡す。数 GB のコピーが、上書き保存に
+    /// 対する安全側の利益に見合わない (§4.3 の 2026-09-02 決定)。
+    #[test]
+    fn video_and_audio_are_never_copied_into_the_temp_directory() {
+        for policy in [
+            MaterializePolicy::TempAsDisplayed,
+            MaterializePolicy::TempOriginal,
+            MaterializePolicy::OriginalFile,
+        ] {
+            assert_eq!(
+                decide_materialization(MaterializeSourceKind::OtherFile, policy, false),
+                MaterializeDecision::DirectOriginal,
+                "{policy:?}"
+            );
+        }
     }
 
     #[test]
-    fn decision_pdf_uses_png_except_for_container() {
+    fn pdf_pages_always_render_and_refuse_only_the_real_file_policy() {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::PdfPage,
-                MaterializePolicy::Original,
+                MaterializePolicy::TempOriginal,
                 false,
             ),
             MaterializeDecision::RenderPng
@@ -1413,22 +1511,22 @@ mod tests {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::PdfPage,
-                MaterializePolicy::Container,
+                MaterializePolicy::TempAsDisplayed,
                 false,
             ),
-            MaterializeDecision::DirectOriginal
+            MaterializeDecision::RenderPng
         );
     }
 
     #[test]
-    fn real_file_only_refuses_virtual_pages() {
+    fn the_real_file_policy_refuses_virtual_pages() {
         for source in [
             MaterializeSourceKind::ZipEntry,
             MaterializeSourceKind::PdfPage,
         ] {
             assert_eq!(
-                decide_materialization(source, MaterializePolicy::RealFileOnly, false),
-                MaterializeDecision::RefuseRealFileOnly
+                decide_materialization(source, MaterializePolicy::OriginalFile, false),
+                MaterializeDecision::RefuseVirtualPage
             );
         }
     }
@@ -1609,35 +1707,46 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (1, 1));
     }
 
+    /// コピーは中身も名前も変えない。**再エンコードしない**ので、JPEG は JPEG のまま
+    /// 渡り、ツールの「名前を付けて保存」にも利用者が知っている名前が出る。
     #[test]
-    fn container_policy_uses_user_facing_converted_archive_not_cache_zip() {
+    fn copying_a_real_file_preserves_its_bytes_and_its_name() {
         let temp = tempfile::tempdir().unwrap();
-        let cache_zip = temp.path().join("cache.zip");
-        let original_archive = temp.path().join("book.7z");
-        write_test_zip(&cache_zip, "page.jpg", b"page");
-        std::fs::write(&original_archive, b"7z").unwrap();
-        let manager = Materializer::new_at(temp.path().join("materialized"), 82, false);
+        let source = temp.path().join("original.jpg");
+        std::fs::write(&source, b"not really a jpeg, but exact bytes matter").unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 81, false);
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
-            source: MaterializeSource::ZipEntry {
-                zip_path: cache_zip,
-                container_path: original_archive.clone(),
-                entry_name: "page.jpg".to_string(),
+            source: MaterializeSource::File {
+                path: source.clone(),
+                image_page: true,
             },
-            policy: MaterializePolicy::Container,
+            policy: MaterializePolicy::TempOriginal,
             page_edits: None,
             pdf_render_long_edge: 4096,
-            for_editing: false,
         };
+
         let prepared = manager
             .session()
             .materialize(&request, &cancel, generation)
             .unwrap();
-        assert_eq!(prepared.path(), original_archive);
-        assert!(prepared.is_original());
-    }
 
+        assert_ne!(
+            prepared.path(),
+            source,
+            "元ファイルそのものを渡してはいけない"
+        );
+        assert!(!prepared.is_original());
+        assert_eq!(
+            prepared.path().file_name().unwrap().to_string_lossy(),
+            "original.jpg"
+        );
+        assert_eq!(
+            std::fs::read(prepared.path()).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+    }
     #[test]
     fn edit_fingerprint_covers_erase_tolerance_and_comic_source_dimensions() {
         let fingerprint = |tolerance, dimensions| {
@@ -1692,8 +1801,10 @@ mod tests {
         assert!(keep_path.exists());
     }
 
+    /// 「元のファイル」を ZIP 内ページに要求されたら、**それらしい一時ファイルを黙って
+    /// 渡さない**。渡すと「編集したのに反映されない」という一番分かりにくい失敗になる。
     #[test]
-    fn editing_guard_rejects_exact_but_temporary_zip_original() {
+    fn the_real_file_policy_refuses_a_zip_page_instead_of_handing_over_a_lookalike() {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("book.zip");
         write_test_zip(&zip_path, "page.jpg", b"page");
@@ -1701,12 +1812,12 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut request = zip_request(&zip_path, "page.jpg");
-        request.for_editing = true;
+        request.policy = MaterializePolicy::OriginalFile;
         let error = match manager.session().materialize(&request, &cancel, generation) {
-            Ok(_) => panic!("editing a temporary ZIP entry must be refused"),
+            Ok(_) => panic!("a ZIP page has no original file to hand over"),
             Err(error) => error,
         };
-        assert!(error.contains("編集用ツール"));
+        assert!(error.contains("元のファイルがありません"));
         assert!(error.contains("Ctrl+E"));
     }
 
@@ -1724,7 +1835,7 @@ mod tests {
                 path: temp.path().join("source.png"),
                 image_page: true,
             },
-            policy: MaterializePolicy::AsDisplayed,
+            policy: MaterializePolicy::TempAsDisplayed,
             pdf_render_long_edge: 4096,
             edit_fingerprint: [0; 32],
         };
@@ -1753,7 +1864,7 @@ mod tests {
                 path: temp.path().join("source.png"),
                 image_page: true,
             },
-            policy: MaterializePolicy::AsDisplayed,
+            policy: MaterializePolicy::TempAsDisplayed,
             pdf_render_long_edge: 4096,
             edit_fingerprint: [0; 32],
         };

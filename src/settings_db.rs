@@ -1541,7 +1541,6 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             confirmation_threshold INTEGER NOT NULL,
             max_targets          INTEGER NOT NULL,
             pdf_render_long_edge INTEGER NOT NULL,
-            for_editing          INTEGER NOT NULL,
             keep_temp            INTEGER NOT NULL,
             sort_index           INTEGER NOT NULL
          );
@@ -1582,7 +1581,10 @@ fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqli
     let current_schema = table_has_column(conn, "external_tools", "launch_kind")?
         && table_has_column(conn, "external_tools", "confirmation_threshold")?
         && table_has_column(conn, "external_tools", "max_targets")?
-        && !table_has_column(conn, "external_tools", "show_in_context_menu")?;
+        && !table_has_column(conn, "external_tools", "show_in_context_menu")?
+        // `for_editing` は `payload` の値 (`OriginalFile`) へ統合して廃止した
+        // (§4.8 の 2026-09-02 決定)。列が残っている DB は旧形式なので作り直す。
+        && !table_has_column(conn, "external_tools", "for_editing")?;
     if current_schema {
         return Ok(());
     }
@@ -1603,7 +1605,6 @@ fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqli
             confirmation_threshold INTEGER NOT NULL,
             max_targets          INTEGER NOT NULL,
             pdf_render_long_edge INTEGER NOT NULL,
-            for_editing          INTEGER NOT NULL,
             keep_temp            INTEGER NOT NULL,
             sort_index           INTEGER NOT NULL
          );
@@ -2324,10 +2325,9 @@ fn read_legacy_open_with_apps(
 
 fn payload_policy_text(value: PayloadPolicy) -> &'static str {
     match value {
-        PayloadPolicy::AsDisplayed => "AsDisplayed",
-        PayloadPolicy::Original => "Original",
-        PayloadPolicy::Container => "Container",
-        PayloadPolicy::RealFileOnly => "RealFileOnly",
+        PayloadPolicy::TempAsDisplayed => "TempAsDisplayed",
+        PayloadPolicy::TempOriginal => "TempOriginal",
+        PayloadPolicy::OriginalFile => "OriginalFile",
     }
 }
 
@@ -2403,8 +2403,8 @@ fn write_external_tools(
         "INSERT INTO external_tools (
             id, name, launch_kind, launch_value, arguments, working_directory,
             payload, video, spread, selection, confirmation_threshold, max_targets,
-            pdf_render_long_edge, for_editing, keep_temp, sort_index
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            pdf_render_long_edge, keep_temp, sort_index
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     // パスは既存の recent/custom テーブルと同じく TEXT (UTF-8) で持つ。Windows の
     // ファイルダイアログが返すパスは有効な UTF-16 なので、ここで lossy になるのは
@@ -2430,7 +2430,6 @@ fn write_external_tools(
             i64::from(tool.confirmation_threshold),
             i64::from(tool.max_targets),
             i64::from(tool.pdf_render_long_edge),
-            i64::from(tool.for_editing),
             i64::from(tool.keep_temp),
             sort_index as i64,
         ])?;
@@ -2452,7 +2451,6 @@ struct ExternalToolRow {
     confirmation_threshold: i64,
     max_targets: i64,
     pdf_render_long_edge: i64,
-    for_editing: i64,
     keep_temp: i64,
 }
 
@@ -2467,7 +2465,7 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
     let mut stmt = conn.prepare(
         "SELECT id, name, launch_kind, launch_value, arguments, working_directory,
                 payload, video, spread, selection, confirmation_threshold, max_targets,
-                pdf_render_long_edge, for_editing, keep_temp
+                pdf_render_long_edge, keep_temp
          FROM external_tools
          ORDER BY sort_index ASC",
     )?;
@@ -2486,8 +2484,7 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             confirmation_threshold: row.get(10)?,
             max_targets: row.get(11)?,
             pdf_render_long_edge: row.get(12)?,
-            for_editing: row.get(13)?,
-            keep_temp: row.get(14)?,
+            keep_temp: row.get(13)?,
         })
     })?;
     let mut tools = Vec::new();
@@ -2532,7 +2529,6 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             confirmation_threshold,
             max_targets,
             pdf_render_long_edge,
-            for_editing: row.for_editing != 0,
             keep_temp: row.keep_temp != 0,
         });
     }
@@ -4024,32 +4020,30 @@ mod tests {
                 launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\a.exe")),
                 arguments: "--edit {file}".to_string(),
                 working_directory: Some(PathBuf::from(r"C:\Work A")),
-                payload: PayloadPolicy::Original,
-                video: VideoPolicy::CurrentFrame,
+                payload: PayloadPolicy::OriginalFile,
+                video: VideoPolicy::File,
                 spread: SpreadPolicy::BothPages,
                 selection: SelectionPolicy::Each,
                 confirmation_threshold: 3,
                 max_targets: 8,
                 pdf_render_long_edge: 2048,
-                for_editing: true,
                 keep_temp: true,
             },
             ExternalTool {
                 id: ExternalToolId(7),
-                name: "Container Tool".to_string(),
+                name: "Pre-edit Tool".to_string(),
                 launch: ExternalToolLaunch::Association {
-                    handler_id: "Container.App".to_string(),
+                    handler_id: "PreEdit.App".to_string(),
                 },
-                arguments: "--container {file}".to_string(),
+                arguments: "--pre-edit {file}".to_string(),
                 working_directory: None,
-                payload: PayloadPolicy::Container,
+                payload: PayloadPolicy::TempOriginal,
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::MainPageOnly,
                 selection: SelectionPolicy::Batch,
                 confirmation_threshold: 17,
                 max_targets: 40,
                 pdf_render_long_edge: 8192,
-                for_editing: false,
                 keep_temp: false,
             },
             ExternalTool {
@@ -4058,14 +4052,13 @@ mod tests {
                 launch: ExternalToolLaunch::OsDefault,
                 arguments: "{file} --readonly".to_string(),
                 working_directory: Some(PathBuf::from(r"D:\Viewer")),
-                payload: PayloadPolicy::RealFileOnly,
+                payload: PayloadPolicy::TempAsDisplayed,
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::BothPages,
                 selection: SelectionPolicy::Each,
                 confirmation_threshold: 0,
                 max_targets: 1,
                 pdf_render_long_edge: 1024,
-                for_editing: false,
                 keep_temp: true,
             },
         ]
@@ -4384,6 +4377,7 @@ mod tests {
         assert!(table_has_column(&conn, "external_tools", "max_targets").unwrap());
         assert!(!table_has_column(&conn, "external_tools", "show_in_context_menu").unwrap());
         assert!(!table_has_column(&conn, "external_tools", "executable").unwrap());
+        assert!(!table_has_column(&conn, "external_tools", "for_editing").unwrap());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))
             .unwrap();
@@ -4603,10 +4597,12 @@ mod tests {
         assert_eq!(loaded.external_tools[0].arguments, "{file}");
         assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
         assert_eq!(loaded.external_tools[1].name, "Second");
-        assert_eq!(loaded.external_tools[1].payload, PayloadPolicy::AsDisplayed);
+        assert_eq!(
+            loaded.external_tools[1].payload,
+            PayloadPolicy::TempAsDisplayed
+        );
         assert_eq!(loaded.external_tools[1].confirmation_threshold, 5);
         assert_eq!(loaded.external_tools[1].max_targets, 10);
-        assert!(!loaded.external_tools[1].for_editing);
         assert!(external_tools_migration_marker_present(&db));
 
         // save_full は読み取り専用の移行元フィールドを書き戻さない。旧 write が残って
