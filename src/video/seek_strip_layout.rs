@@ -39,20 +39,26 @@ impl SeekStripSpan {
 
 /// ストリップの高さプリセット。
 ///
-/// egui の UI は DPI に応じた論理座標なので、設定名には px 数を出さず「大 / 中 / 小」で
+/// egui の UI は DPI に応じた論理座標なので、設定名には px 数を出さず「大 / 中 / 小 / 最小」で
 /// 選ばせる。`Large` は従来の固定値そのままで、既存の見た目を変えない。
+///
+/// `Smallest` は実機確認で足した段 (2026-09-01)。全体表示の枚数はセルの高さで決まるので、
+/// 「小」でも思ったほど並ばない、という利用者の報告への答えがこれ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SeekStripHeight {
     #[default]
     Large,
     Medium,
     Small,
+    Smallest,
 }
 
 /// 帯の高さ (points)。`Large` は 2 段化リデザイン以来の値。
 const SEEK_STRIP_HEIGHT_LARGE: f32 = 104.0;
 const SEEK_STRIP_HEIGHT_MEDIUM: f32 = 72.0;
 const SEEK_STRIP_HEIGHT_SMALL: f32 = 48.0;
+/// 鍵ボタン (28pt + 上の余白 4pt) が収まる下限に近い。これ以上詰めるとボタンが帯からはみ出す。
+const SEEK_STRIP_HEIGHT_SMALLEST: f32 = 36.0;
 
 /// 周辺表示のセル幅 (points)。
 ///
@@ -61,6 +67,7 @@ const SEEK_STRIP_HEIGHT_SMALL: f32 = 48.0;
 const SEEK_STRIP_CELL_WIDTH_LARGE: f32 = 152.0;
 const SEEK_STRIP_CELL_WIDTH_MEDIUM: f32 = 102.0;
 const SEEK_STRIP_CELL_WIDTH_SMALL: f32 = 64.0;
+const SEEK_STRIP_CELL_WIDTH_SMALLEST: f32 = 45.0;
 
 /// 帯の高さとセルの高さの差 (上下の余白の合計)。
 pub(crate) const SEEK_STRIP_CELL_VERTICAL_INSET: f32 = 10.0;
@@ -76,6 +83,7 @@ impl SeekStripHeight {
             Self::Large => SEEK_STRIP_HEIGHT_LARGE,
             Self::Medium => SEEK_STRIP_HEIGHT_MEDIUM,
             Self::Small => SEEK_STRIP_HEIGHT_SMALL,
+            Self::Smallest => SEEK_STRIP_HEIGHT_SMALLEST,
         }
     }
 
@@ -84,6 +92,7 @@ impl SeekStripHeight {
             Self::Large => SEEK_STRIP_CELL_WIDTH_LARGE,
             Self::Medium => SEEK_STRIP_CELL_WIDTH_MEDIUM,
             Self::Small => SEEK_STRIP_CELL_WIDTH_SMALL,
+            Self::Smallest => SEEK_STRIP_CELL_WIDTH_SMALLEST,
         }
     }
 
@@ -92,10 +101,11 @@ impl SeekStripHeight {
             Self::Large => "大",
             Self::Medium => "中",
             Self::Small => "小",
+            Self::Smallest => "最小",
         }
     }
 
-    pub const ALL: [Self; 3] = [Self::Large, Self::Medium, Self::Small];
+    pub const ALL: [Self; 4] = [Self::Large, Self::Medium, Self::Small, Self::Smallest];
 }
 
 /// 表示内容と表示範囲の組。非表示は [`SeekStripView`] 側が持つ。
@@ -460,6 +470,39 @@ mod tests {
         // 理想幅 (高さ x アスペクト) から数 % 以内に収まる。
         let ideal = layout.cell_height * (16.0 / 9.0);
         assert!((layout.cell_width - ideal).abs() / ideal < 0.1);
+    }
+
+    /// 高さの段は上から下へ単調に縮み、全体表示では**下の段ほど枚数が増える**。
+    /// この順序が崩れると「もっと並べたいから小さくする」が成り立たなくなる。
+    #[test]
+    fn each_step_down_is_shorter_and_fits_more_whole_cells() {
+        let cells = |height| {
+            SeekStripLayout::resolve(
+                egui::vec2(1920.0, 1080.0),
+                HUD_BOTTOM,
+                height,
+                SeekStripSpan::Whole,
+                Some(16.0 / 9.0),
+            )
+        };
+        for pair in SeekStripHeight::ALL.windows(2) {
+            let (taller, shorter) = (pair[0], pair[1]);
+            assert!(
+                taller.points() > shorter.points(),
+                "{taller:?} は {shorter:?} より高いはず"
+            );
+            assert!(
+                taller.window_cell_width_points() > shorter.window_cell_width_points(),
+                "{taller:?} のセルは {shorter:?} より広いはず"
+            );
+            assert!(
+                cells(taller).whole_cell_count < cells(shorter).whole_cell_count,
+                "{shorter:?} で枚数が増えていない"
+            );
+        }
+        // 一番下の段でも、鍵ボタン (28pt + 上余白 4pt) が帯に収まる。
+        let smallest = SeekStripHeight::ALL[SeekStripHeight::ALL.len() - 1];
+        assert!(smallest.points() >= 32.0, "鍵ボタンが帯からはみ出す");
     }
 
     #[test]
