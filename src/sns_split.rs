@@ -162,12 +162,12 @@ impl SnsSplitLayout {
         }
     }
 
-    /// 中心と高さを保ちながら投稿先を差し替える。
+    /// 中心と幅を保ちながら投稿先を差し替える。
     pub fn with_target(&self, target: SnsTarget, image_size: [usize; 2]) -> Self {
         self.with_target_and_count(target, self.count, image_size)
     }
 
-    /// 中心と高さを保ちながら枚数を差し替える。
+    /// 中心と幅を保ちながら枚数を差し替える。
     pub fn with_count(&self, count: u8, image_size: [usize; 2]) -> Self {
         self.with_target_and_count(self.target, count, image_size)
     }
@@ -236,8 +236,8 @@ impl SnsSplitLayout {
         let count = clamped_count(count);
         let center_x = (self.group.min_x + self.group.max_x) * 0.5;
         let center_y = (self.group.min_y + self.group.max_y) * 0.5;
-        let group_height = rect_height(self.group);
-        let group_width = group_height * Self::group_aspect(target, count);
+        let group_width = rect_width(self.group);
+        let group_height = group_width / Self::group_aspect(target, count);
 
         Self {
             target,
@@ -361,8 +361,8 @@ fn finite_positive_or(value: f32, fallback: f32) -> f32 {
     }
 }
 
-fn rect_height(rect: CropRect) -> f32 {
-    finite_positive_or(rect.max_y - rect.min_y, 1.0)
+fn rect_width(rect: CropRect) -> f32 {
+    finite_positive_or(rect.max_x - rect.min_x, 1.0)
 }
 
 fn rect_inside(rect: CropRect, image_width: f32, image_height: f32) -> bool {
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn with_count_and_target_keep_center_height_bounds_and_aspect() {
+    fn with_count_and_target_keep_center_width_bounds_and_aspect() {
         let image_size = [8000, 6000];
         let layout = SnsSplitLayout {
             target: SnsTarget::X,
@@ -599,7 +599,7 @@ mod tests {
             },
         };
         let original_center = center(layout.group);
-        let original_height = raw_height(layout.group);
+        let original_width = raw_width(layout.group);
         let layouts = [
             layout.with_count(4, image_size),
             layout.with_target(SnsTarget::Instagram, image_size),
@@ -608,11 +608,74 @@ mod tests {
             let changed_center = center(changed.group);
             assert!((changed_center[0] - original_center[0]).abs() <= 0.5);
             assert!((changed_center[1] - original_center[1]).abs() <= 0.5);
-            assert!((raw_height(changed.group) - original_height).abs() <= 1.0);
+            assert!((raw_width(changed.group) - original_width).abs() <= 1.0);
             assert!(changed.fits(image_size));
             assert_rect_inside(changed.group, image_size);
             assert_layout_aspect(&changed);
         }
+    }
+
+    #[test]
+    fn target_round_trip_restores_group_for_multiple_image_sizes_and_counts() {
+        for (image_size, count) in [([4000, 3000], 4), ([2000, 3000], 2)] {
+            let original = SnsSplitLayout::centered_max(SnsTarget::X, count, image_size);
+            let instagram = original.with_target(SnsTarget::Instagram, image_size);
+            let restored = instagram.with_target(SnsTarget::X, image_size);
+
+            for (actual, expected) in [
+                (restored.group.min_x, original.group.min_x),
+                (restored.group.min_y, original.group.min_y),
+                (restored.group.max_x, original.group.max_x),
+                (restored.group.max_y, original.group.max_y),
+            ] {
+                assert!((actual - expected).abs() <= 1.0);
+            }
+            let original_center = center(original.group);
+            let instagram_center = center(instagram.group);
+            let restored_center = center(restored.group);
+            assert!((instagram_center[0] - original_center[0]).abs() <= 0.5);
+            assert!((instagram_center[1] - original_center[1]).abs() <= 0.5);
+            assert!((restored_center[0] - instagram_center[0]).abs() <= 0.5);
+            assert!((restored_center[1] - instagram_center[1]).abs() <= 0.5);
+            assert!((restored_center[0] - original_center[0]).abs() <= 1.0);
+            assert!((restored_center[1] - original_center[1]).abs() <= 1.0);
+            assert!(restored.fits(image_size));
+            assert_layout_aspect(&restored);
+        }
+    }
+
+    #[test]
+    fn count_round_trip_restores_group_within_one_pixel() {
+        let image_size = [4000, 3000];
+        let original = SnsSplitLayout::centered_max(SnsTarget::X, 2, image_size);
+        let four = original.with_count(4, image_size);
+        let restored = four.with_count(2, image_size);
+
+        assert!((raw_width(restored.group) - raw_width(original.group)).abs() <= 1.0);
+        assert!((raw_height(restored.group) - raw_height(original.group)).abs() <= 1.0);
+        assert!((center(restored.group)[0] - center(original.group)[0]).abs() <= 0.5);
+        assert!((center(restored.group)[1] - center(original.group)[1]).abs() <= 0.5);
+        assert!(restored.fits(image_size));
+        assert_layout_aspect(&restored);
+    }
+
+    #[test]
+    fn width_preserving_count_change_shrinks_when_new_height_would_overflow() {
+        let image_size = [4000, 1000];
+        let original = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
+        let original_center = center(original.group);
+        let requested_height =
+            raw_width(original.group) / SnsSplitLayout::group_aspect(SnsTarget::X, 2);
+        assert!(requested_height > image_size[1] as f32);
+
+        let changed = original.with_count(2, image_size);
+
+        assert!(raw_width(changed.group) < raw_width(original.group));
+        assert!(changed.fits(image_size));
+        assert_rect_inside(changed.group, image_size);
+        assert_layout_aspect(&changed);
+        assert!((center(changed.group)[0] - original_center[0]).abs() <= 0.5);
+        assert!((center(changed.group)[1] - original_center[1]).abs() <= 0.5);
     }
 
     #[test]

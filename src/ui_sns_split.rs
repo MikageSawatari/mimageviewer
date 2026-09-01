@@ -8,6 +8,7 @@ const PANEL_W: f32 = 240.0;
 const PANEL_MARGIN: f32 = 14.0;
 const PANEL_TOP: f32 = 72.0;
 const PREVIEW_H: f32 = 84.0;
+const MIN_PREVIEW_SEAM: f32 = 1.0;
 
 pub(crate) const SNS_SPLIT_ROTATION_DISABLED_REASON: &str =
     "回転しているページでは使えません。回転をリセットしてから実行してください";
@@ -66,6 +67,17 @@ impl SnsSplitPanelSummary {
     }
 }
 
+fn sns_split_target_description(target: SnsTarget) -> String {
+    let (aspect_width, aspect_height) = target.frame_aspect_parts();
+    let (seam_numerator, seam_denominator) = target.seam_ratio_parts();
+    if seam_numerator == 0 {
+        format!("枠は{aspect_width}:{aspect_height} / 継ぎ目の除外なし")
+    } else {
+        let seam_percent = seam_numerator as f64 * 100.0 / seam_denominator as f64;
+        format!("枠は{aspect_width}:{aspect_height} / 継ぎ目で枠幅の{seam_percent:.1}%を除外")
+    }
+}
+
 fn sns_split_preview_rects(
     bounds: egui::Rect,
     frames: &[CropRect],
@@ -89,10 +101,24 @@ fn sns_split_preview_rects(
         0.0
     };
     let divisor = count + (count - 1.0) * seam_ratio;
-    let frame_width =
-        (bounds.width().max(0.0) / divisor).min(bounds.height().max(0.0) * frame_aspect);
+    let bounds_width = bounds.width().max(0.0);
+    let minimum_seam = if seam_ratio > 0.0 {
+        MIN_PREVIEW_SEAM
+    } else {
+        0.0
+    };
+    let ratio_limited_width = bounds_width / divisor;
+    let minimum_seam_limited_width = (bounds_width - (count - 1.0) * minimum_seam).max(0.0) / count;
+    let frame_width = ratio_limited_width
+        .min(minimum_seam_limited_width)
+        .min(bounds.height().max(0.0) * frame_aspect);
     let frame_height = frame_width / frame_aspect;
-    let step = frame_width * (1.0 + seam_ratio);
+    let seam_width = if seam_ratio > 0.0 {
+        (frame_width * seam_ratio).max(MIN_PREVIEW_SEAM)
+    } else {
+        0.0
+    };
+    let step = frame_width + seam_width;
     let total_width = frame_width + step * (count - 1.0);
     let origin = egui::pos2(
         bounds.center().x - total_width * 0.5,
@@ -602,6 +628,11 @@ impl App {
                 ui.selectable_value(&mut target, option, option.label());
             }
         });
+        ui.label(
+            egui::RichText::new(sns_split_target_description(target))
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
 
         ui.add_space(6.0);
         ui.label("枚数");
@@ -854,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_rects_match_count_size_seam_and_bounds() {
+    fn preview_rects_match_count_size_minimum_seam_and_bounds() {
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, [2400, 1800]);
         let frames = layout.frames();
         let bounds =
@@ -868,12 +899,30 @@ mod tests {
         }
         for pair in rects.windows(2) {
             let gap = pair[1].left() - pair[0].right();
-            assert!((gap / pair[0].width() - SnsTarget::X.seam_ratio()).abs() < 0.0001);
+            let expected_gap = (pair[0].width() * SnsTarget::X.seam_ratio()).max(MIN_PREVIEW_SEAM);
+            assert!((gap - expected_gap).abs() < 0.001);
+            assert!(gap >= MIN_PREVIEW_SEAM - 0.001);
         }
         assert!(rects[0].left() >= bounds.left() - 0.001);
         assert!(rects.last().unwrap().right() <= bounds.right() + 0.001);
         assert!(rects[0].top() >= bounds.top() - 0.001);
         assert!(rects[0].bottom() <= bounds.bottom() + 0.001);
+    }
+
+    #[test]
+    fn x_preview_uses_the_preset_ratio_above_the_minimum_seam() {
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, [2400, 1800]);
+        let frames = layout.frames();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let rects = sns_split_preview_rects(bounds, &frames, layout.target.seam_ratio());
+
+        for pair in rects.windows(2) {
+            let gap = pair[1].left() - pair[0].right();
+            assert!(gap > MIN_PREVIEW_SEAM);
+            assert!((gap / pair[0].width() - SnsTarget::X.seam_ratio()).abs() < 0.0001);
+        }
+        assert!(rects[0].left() >= bounds.left() - 0.001);
+        assert!(rects.last().unwrap().right() <= bounds.right() + 0.001);
     }
 
     #[test]
@@ -887,6 +936,17 @@ mod tests {
         for pair in rects.windows(2) {
             assert!((pair[1].left() - pair[0].right()).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn target_descriptions_explain_aspect_and_seam_without_a_connection_guarantee() {
+        let x = sns_split_target_description(SnsTarget::X);
+        let instagram = sns_split_target_description(SnsTarget::Instagram);
+
+        assert_eq!(x, "枠は3:4 / 継ぎ目で枠幅の1.7%を除外");
+        assert_eq!(instagram, "枠は4:5 / 継ぎ目の除外なし");
+        assert!(!x.contains("必ず"));
+        assert!(!instagram.contains("必ず"));
     }
 
     #[test]
