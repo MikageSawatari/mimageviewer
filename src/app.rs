@@ -7971,6 +7971,43 @@ impl PageOrderViewKind {
     }
 }
 
+/// 一覧のソート選択 UI を無効化する理由。
+///
+/// ツールバーとメニューは同じ理由を見て、同じ文面を出す。理由ごとに文面をその場で
+/// 書き足していたため、無効化条件も文面も入口ごとにずれていた (§1.143(a))。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GridSortLockReason {
+    /// 本として表示中 / 閲覧履歴。ページ順そのものが固定されている。
+    PageOrderFixed,
+    /// 詳細一覧の列ヘッダが並びを所有している。
+    DetailsHeaderSort,
+}
+
+impl GridSortLockReason {
+    /// 無効化中に現状を示す短い表示 (ツールバーのコンボ / メニュー項目)。
+    ///
+    /// 無効なまま選べないソート名を出すと、実際の並びと食い違ったまま黙って残る。
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::PageOrderFixed => "固定",
+            Self::DetailsHeaderSort => "列ヘッダ",
+        }
+    }
+
+    /// 無効化の理由。無効ウィジェットは通常の hover を sense しないので、
+    /// 呼び出し側は disabled 専用ツールチップで出す。
+    pub(crate) fn tooltip(self) -> &'static str {
+        match self {
+            Self::PageOrderFixed => {
+                "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
+            }
+            Self::DetailsHeaderSort => {
+                "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
+            }
+        }
+    }
+}
+
 /// 物理一覧を本として扱い、ページ順を固定するか。本体 UI と Remote が共有する判定境界。
 pub(crate) fn physical_page_order_locked(
     settings: &crate::settings::Settings,
@@ -21008,6 +21045,9 @@ impl App {
         }
         self.rating_view_stars = stars;
         self.rating_view_sort = crate::rating_view::RatingViewSort::default();
+        // ビューの既定ソートを入れ直すのと同じ場所で、詳細表示の列ソートの所有権も
+        // 戻す。別フォルダの列ソートが持ち込まれて★時刻順を上書きしないように (§1.143)。
+        self.reset_details_sort_to_toolbar();
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
@@ -30136,6 +30176,9 @@ impl App {
         self.clear_bookmark_view_return_state();
         self.record_folder_nav_transition(&bookmark_view_synthetic_path());
         self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
+        // レーティング一覧と同じ規約 (§1.143): ビューの既定ソートを入れ直す場所で、
+        // 詳細表示の列ソートの所有権も戻す。
+        self.reset_details_sort_to_toolbar();
         self.enter_bookmark_view();
     }
 
@@ -46968,6 +47011,39 @@ impl App {
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
     }
 
+    /// 一覧のソート選択 UI を無効化する理由。無ければ選べる。
+    ///
+    /// ツールバーもメニューも必ずこの 1 つの述語を見る。片方だけが見ていると、選べるのに
+    /// 何も起きない入口が残る (§1.143(a): メニューの「ソート順」は列ヘッダ並べ替え中でも
+    /// 選べてしまい、選んでも表示は変わらなかった)。
+    pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        if self.page_order_locked_for_current_view() {
+            Some(GridSortLockReason::PageOrderFixed)
+        } else if self.details_header_sort_active() {
+            Some(GridSortLockReason::DetailsHeaderSort)
+        } else {
+            None
+        }
+    }
+
+    /// 詳細表示の列ソートの所有権を、ビュー側のソート (ツールバー / メニュー) へ戻す。
+    ///
+    /// `settings.details_sort_key` は全フォルダ共通の永続設定なので、別のフォルダで列
+    /// ヘッダを押した状態がそのままレーティング / ブックマーク一覧へ持ち込まれ、ビュー
+    /// 固有の時刻順を黙って上書きする (§1.143(a))。ビューの既定ソートを入れ直すのと同じ
+    /// 場所で戻し、以後その一覧で列ヘッダを押したときだけ列ソートが所有権を取る。
+    pub(crate) fn reset_details_sort_to_toolbar(&mut self) {
+        if self.settings.details_sort_key == crate::settings::DetailsSortKey::Toolbar
+            && self.settings.details_sort_ascending
+        {
+            return;
+        }
+        self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+        self.settings.details_sort_ascending = true;
+        self.rebuild_details_order();
+        self.settings.save();
+    }
+
     pub(crate) fn reset_details_sort_if_hidden(&mut self) {
         if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
@@ -47062,14 +47138,12 @@ impl App {
         self.details_order_revision = self.details_order_revision.wrapping_add(1);
         self.cached_nav_indices = None;
         self.cached_fs_seek_info = None;
-        let mut key = self.settings.details_sort_key;
-        let mut ascending = self.settings.details_sort_ascending;
-        if !self.details_sort_key_visible(key) {
+        if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
             self.settings.details_sort_ascending = true;
-            key = self.settings.details_sort_key;
-            ascending = self.settings.details_sort_ascending;
         }
+        let key = self.settings.details_sort_key;
+        let ascending = self.settings.details_sort_ascending;
         if key == crate::settings::DetailsSortKey::PageCount
             && !self.details_image_dims_state.is_ready()
         {
@@ -47078,10 +47152,10 @@ impl App {
             self.details_order = self.visible_indices.clone();
             return;
         }
-        if key == crate::settings::DetailsSortKey::Toolbar
-            || self.current_folder_is_book_folder()
-            || self.items_are_reading_history_view
-        {
+        // 列ヘッダが並びを所有していない状態 (ソートなし / 本のページ順 / 閲覧履歴 /
+        // そもそも詳細表示でない) では、ツールバー順をそのまま使う。所有権の判定は
+        // `details_header_sort_active` が唯一の所有者で、UI の無効化もそこから導く。
+        if !self.details_header_sort_active() {
             self.details_order = self.visible_indices.clone();
             return;
         }
