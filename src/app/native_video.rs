@@ -4036,7 +4036,8 @@ impl App {
             | Ev::OpenSeekStrip
             | Ev::MoveSeekStrip { .. }
             | Ev::CommitSeekStrip { .. }
-            | Ev::CycleSeekStripView
+            | Ev::SetSeekStripView { .. }
+            | Ev::SetSeekStripHeight { .. }
             | Ev::StepSeekStripRange { .. }
             | Ev::ToggleTileMode
             | Ev::TogglePerfOverlay
@@ -4596,8 +4597,14 @@ impl App {
                     Self::request_video_seek_strip_window(session);
                 }
             }
-            crate::video::NativeVideoOutputEvent::CycleSeekStripView => {
-                if self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripCycle) {
+            crate::video::NativeVideoOutputEvent::SetSeekStripView { view } => {
+                if self.set_video_seek_strip_view(fs_idx, view) {
+                    self.mark_native_video_hud_activity(ctx);
+                    self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetSeekStripHeight { height } => {
+                if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
@@ -8009,6 +8016,28 @@ impl App {
             }
         }
         Self::request_video_seek_strip_window(session);
+        true
+    }
+
+    /// 帯の高さを変える。
+    ///
+    /// 高さは映像の予約と帯の寸法の両方を動かすので、presenter へは固定バーの状態と
+    /// 同じ経路 (`NativeBarLockState`) で送る。全体表示ではセル数も変わるが、その
+    /// 作り直しは帯が新しい枚数を報告したときに起きる。
+    #[cfg(windows)]
+    pub(crate) fn set_video_seek_strip_height(
+        &mut self,
+        fs_idx: usize,
+        height: crate::video::seek_strip_layout::SeekStripHeight,
+    ) -> bool {
+        if self.video_seek_strip_height == height {
+            return false;
+        }
+        self.video_seek_strip_height = height;
+        let bar_lock = self.native_bar_lock_state();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_bar_lock_state(bar_lock);
+        }
         true
     }
 

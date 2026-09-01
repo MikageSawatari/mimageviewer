@@ -724,7 +724,12 @@ pub enum NativeVideoOutputEvent {
         pixel_width: usize,
         pixel_height: usize,
     },
-    CycleSeekStripView,
+    SetSeekStripView {
+        view: seek_strip_layout::SeekStripView,
+    },
+    SetSeekStripHeight {
+        height: seek_strip_layout::SeekStripHeight,
+    },
     StepSeekStripRange {
         step: seek_strip::SeekStripRangeStep,
     },
@@ -4005,7 +4010,10 @@ fn send_native_overlay_command(
             pixel_width,
             pixel_height,
         },
-        Command::CycleSeekStripView => NativeVideoOutputEvent::CycleSeekStripView,
+        Command::SetSeekStripView { view } => NativeVideoOutputEvent::SetSeekStripView { view },
+        Command::SetSeekStripHeight { height } => {
+            NativeVideoOutputEvent::SetSeekStripHeight { height }
+        }
         Command::StepSeekStripRange { step } => NativeVideoOutputEvent::StepSeekStripRange { step },
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
@@ -6158,11 +6166,18 @@ fn run_native_video_output(
                                     },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::CycleSeekStripView => {
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::CycleSeekStripView,
+                                    NativeVideoOutputEvent::SetSeekStripView { view },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripHeight { height },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { step } => {

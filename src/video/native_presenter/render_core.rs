@@ -893,13 +893,13 @@ fn draw_native_seek_strip(
         .inner
 }
 
-fn draw_native_seek_strip_cycle_button(
+fn draw_native_seek_strip_menu_button(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     button_rect: egui::Rect,
     view: crate::video::seek_strip_layout::SeekStripView,
+    menu_open: &mut bool,
     unavailable_tooltip: Option<&'static str>,
-    commands: &mut Vec<NativeOverlayCommand>,
 ) {
     use crate::video::seek_strip_layout::{SeekStripSpan, SeekStripView};
     let state = match view.mode() {
@@ -920,7 +920,7 @@ fn draw_native_seek_strip_cycle_button(
         painter,
         button_rect,
         response.hovered() && enabled,
-        enabled && state != crate::settings::VideoSeekStripState::None,
+        enabled && (*menu_open || state != crate::settings::VideoSeekStripState::None),
     );
     draw_seek_strip_film_icon(
         painter,
@@ -958,10 +958,215 @@ fn draw_native_seek_strip_cycle_button(
         }
     });
     if enabled && response.clicked() {
-        // 次に何が来るかは巡回の設定を持つ App が決める。ここで次の値を組み立てると、
-        // `Shift+S` と 2 つの巡回順ができてしまう。
-        commands.push(NativeOverlayCommand::CycleSeekStripView);
+        *menu_open = !*menu_open;
     }
+    if !enabled {
+        *menu_open = false;
+    }
+}
+
+/// 右下のストリップボタンから吊るすメニュー。非表示と 4 つの表示、そして高さを直接選ぶ。
+///
+/// **巡回から外したモードにもここから届く**ので、環境設定で巡回を絞っても到達できない
+/// 表示は生まれない。
+fn draw_native_seek_strip_menu(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    button_rect: egui::Rect,
+    view: crate::video::seek_strip_layout::SeekStripView,
+    height: crate::video::seek_strip_layout::SeekStripHeight,
+    menu_open: &mut bool,
+    menu_rect_out: &mut Option<egui::Rect>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    use crate::video::seek_strip_layout::{
+        SEEK_STRIP_SHOWING_ORDER, SeekStripHeight, SeekStripView,
+    };
+
+    *menu_rect_out = None;
+    if !*menu_open {
+        return;
+    }
+
+    let rows: Vec<(String, bool, NativeOverlayCommand)> = std::iter::once((
+        "非表示".to_owned(),
+        !view.is_visible(),
+        NativeOverlayCommand::SetSeekStripView {
+            view: SeekStripView::Hidden,
+        },
+    ))
+    .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
+        (
+            showing.label().to_owned(),
+            view == SeekStripView::Showing(*showing),
+            NativeOverlayCommand::SetSeekStripView {
+                view: SeekStripView::Showing(*showing),
+            },
+        )
+    }))
+    .chain(SeekStripHeight::ALL.iter().map(|preset| {
+        (
+            format!("高さ: {}", preset.label()),
+            height == *preset,
+            NativeOverlayCommand::SetSeekStripHeight { height: *preset },
+        )
+    }))
+    .collect();
+    // 高さの段の手前に区切りを入れる。表示の選択と高さの選択は別の問い。
+    let separator_before = 1 + SEEK_STRIP_SHOWING_ORDER.len();
+
+    let label_font = egui::FontId::proportional(13.0);
+    let content_width = ctx.fonts_mut(|fonts| {
+        rows.iter().fold(0.0_f32, |widest, (label, _, _)| {
+            widest.max(
+                fonts
+                    .layout_no_wrap(label.clone(), label_font.clone(), egui::Color32::WHITE)
+                    .rect
+                    .width(),
+            )
+        })
+    });
+    let size = egui::vec2(
+        (content_width + SEEK_STRIP_MENU_TEXT_LEFT + 16.0).max(150.0),
+        rows.len() as f32 * SEEK_STRIP_MENU_ROW_HEIGHT
+            + SEEK_STRIP_MENU_VERTICAL_PADDING * 2.0
+            + SEEK_STRIP_MENU_SEPARATOR_HEIGHT,
+    );
+    let anchor = native_seek_strip_menu_rect(full_rect, button_rect, size);
+
+    let mut selected = None;
+    let mut drawn_rect = anchor;
+    egui::Area::new(egui::Id::new("native_video_seek_strip_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor.min)
+        .show(ctx, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            drawn_rect = rect;
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
+                ),
+                egui::StrokeKind::Outside,
+            );
+            for (row_index, (label, is_current, command)) in rows.iter().enumerate() {
+                let item_rect = native_seek_strip_menu_row_rect(rect, row_index, separator_before);
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(("native_video_seek_strip_menu_item", row_index)),
+                    egui::Sense::click(),
+                );
+                if item_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let background = if *is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                painter.rect_filled(item_rect, 4.0, background);
+                painter.text(
+                    egui::pos2(
+                        item_rect.min.x + SEEK_STRIP_MENU_TEXT_LEFT,
+                        item_rect.center().y,
+                    ),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    label_font.clone(),
+                    egui::Color32::from_gray(226),
+                );
+                if row_index + 1 == separator_before {
+                    let y = item_rect.max.y + SEEK_STRIP_MENU_SEPARATOR_HEIGHT * 0.5;
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.min.x + 8.0, y),
+                            egui::pos2(rect.max.x - 8.0, y),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                    );
+                }
+                if item_resp.clicked() {
+                    selected = Some(command.clone());
+                }
+            }
+        });
+
+    if let Some(command) = selected {
+        commands.push(command);
+        *menu_open = false;
+    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+        && !drawn_rect.contains(pos)
+        && !button_rect.contains(pos)
+        && ctx.input(|input| input.pointer.any_pressed())
+    {
+        *menu_open = false;
+    }
+    if *menu_open {
+        *menu_rect_out = Some(drawn_rect);
+    }
+}
+
+const SEEK_STRIP_MENU_ROW_HEIGHT: f32 = 26.0;
+const SEEK_STRIP_MENU_TEXT_LEFT: f32 = 14.0;
+const SEEK_STRIP_MENU_VERTICAL_PADDING: f32 = 6.0;
+const SEEK_STRIP_MENU_SEPARATOR_HEIGHT: f32 = 7.0;
+
+/// メニューはボタンの**上**へ吊るす。下 HUD の中にあるので、下へ開くと画面外に出る。
+fn native_seek_strip_menu_rect(
+    full_rect: egui::Rect,
+    button_rect: egui::Rect,
+    size: egui::Vec2,
+) -> egui::Rect {
+    let margin = 8.0;
+    let min_x = full_rect.min.x + margin;
+    let max_x = (full_rect.max.x - margin - size.x).max(min_x);
+    let x = (button_rect.center().x - size.x * 0.5).clamp(min_x, max_x);
+    let min_y = full_rect.min.y + margin;
+    let y = (button_rect.min.y - 6.0 - size.y).max(min_y);
+    egui::Rect::from_min_size(egui::pos2(x, y), size)
+}
+
+fn native_seek_strip_menu_row_rect(
+    menu_rect: egui::Rect,
+    row_index: usize,
+    separator_before: usize,
+) -> egui::Rect {
+    let separator = if row_index >= separator_before {
+        SEEK_STRIP_MENU_SEPARATOR_HEIGHT
+    } else {
+        0.0
+    };
+    egui::Rect::from_min_size(
+        egui::pos2(
+            menu_rect.min.x + 4.0,
+            menu_rect.min.y
+                + SEEK_STRIP_MENU_VERTICAL_PADDING
+                + separator
+                + row_index as f32 * SEEK_STRIP_MENU_ROW_HEIGHT,
+        ),
+        egui::vec2(menu_rect.width() - 8.0, SEEK_STRIP_MENU_ROW_HEIGHT - 2.0),
+    )
+}
+
+/// メニューが開いているあいだ、その矩形も HUD の当たり判定に含める。
+fn native_seek_strip_menu_hud_rect(
+    menu_open: bool,
+    last_drawn_rect: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    menu_open
+        .then_some(last_drawn_rect?)
+        .map(|rect| rect.expand(4.0))
 }
 
 fn seek_status_visible_for_times(
@@ -1428,6 +1633,8 @@ struct NativeEguiOverlay {
     seek_status_visible: bool,
     video_speed_popup_open: bool,
     panorama_projection_popup_open: bool,
+    /// 右下のストリップボタンのメニューが開いているか。
+    seek_strip_menu_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
@@ -1482,6 +1689,8 @@ struct NativeEguiOverlay {
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
     /// `None` なら popup 非表示または未描画。
     last_drawn_speed_popup_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画したストリップメニューの実 rect。HUD の当たり判定に足す。
+    last_drawn_seek_strip_menu_rect: Option<egui::Rect>,
     /// 直近 egui run で描画した投影方式一覧の actual rect。
     /// HUD HWND の入力 region に同じ矩形を登録し、行クリックが背面の 360 見回し
     /// ドラッグへ抜けないようにする。
@@ -2617,8 +2826,13 @@ pub enum NativeOverlayCommand {
         pixel_width: usize,
         pixel_height: usize,
     },
-    /// 巡回の設定に従って次の表示へ進める。次の値は App が決める。
-    CycleSeekStripView,
+    /// 右下のメニューから表示を直接選ぶ。巡回から外したモードにもここから届く。
+    SetSeekStripView {
+        view: crate::video::seek_strip_layout::SeekStripView,
+    },
+    SetSeekStripHeight {
+        height: crate::video::seek_strip_layout::SeekStripHeight,
+    },
     StepSeekStripRange {
         step: crate::video::seek_strip::SeekStripRangeStep,
     },
@@ -6872,6 +7086,7 @@ impl NativeEguiOverlay {
             seek_status_visible: false,
             video_speed_popup_open: false,
             panorama_projection_popup_open: false,
+            seek_strip_menu_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
@@ -6905,6 +7120,7 @@ impl NativeEguiOverlay {
             last_emitted_vst3_panel_pos: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
+            last_drawn_seek_strip_menu_rect: None,
             last_drawn_panorama_projection_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
@@ -8983,6 +9199,16 @@ impl NativeEguiOverlay {
             }
         }
 
+        if let Some(rect) = native_seek_strip_menu_hud_rect(
+            self.seek_strip_menu_open,
+            self.last_drawn_seek_strip_menu_rect,
+        ) {
+            let rect_px = rect_to_px(rect);
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
         // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
         //
@@ -9211,6 +9437,10 @@ impl NativeEguiOverlay {
     }
 
     fn hud_visible(&self) -> bool {
+        // メニューはボタンの上に出るので、HUD が引っ込むとメニューごと消える。
+        if self.seek_strip_menu_open {
+            return true;
+        }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         Self::native_hud_bottom_visible_from_hover(
             self.visibility_hover_pos(),
@@ -9724,6 +9954,10 @@ impl NativeEguiOverlay {
         let mut hover_preview_anchor_x = self.hover_preview_anchor_x;
         let mut video_speed_popup_open = self.video_speed_popup_open;
         let mut panorama_projection_popup_open = self.panorama_projection_popup_open;
+        let mut seek_strip_menu_open = self.seek_strip_menu_open;
+        let mut seek_strip_menu_button_rect = None;
+        let mut seek_strip_menu_rect = None;
+        let seek_strip_height = self.seek_strip_height;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
@@ -11547,14 +11781,15 @@ impl NativeEguiOverlay {
                                     )
                                 },
                             );
-                            draw_native_seek_strip_cycle_button(
+                            draw_native_seek_strip_menu_button(
                                 ui,
                                 painter,
                                 seek_strip_selector_rect,
                                 seek_strip_view,
+                                &mut seek_strip_menu_open,
                                 seek_strip_unavailable_tooltip,
-                                &mut commands,
                             );
+                            seek_strip_menu_button_rect = Some(seek_strip_selector_rect);
                         }
                         draw_native_bar_lock_button(
                             ui,
@@ -11591,6 +11826,34 @@ impl NativeEguiOverlay {
                             );
                         }
                     });
+                // ストリップのメニューはボタンを描いた後、同じ pass の中で吊るす。
+                // 下 HUD の Area の外に出すのは、Area 内では上へはみ出せないため。
+                if let Some(button_rect) = seek_strip_menu_button_rect {
+                    let seek_strip_view = seek_strip.as_ref().map_or(
+                        crate::video::seek_strip_layout::SeekStripView::Hidden,
+                        |strip| {
+                            crate::video::seek_strip_layout::SeekStripView::showing(
+                                strip.center.mode(),
+                                strip.span,
+                            )
+                        },
+                    );
+                    draw_native_seek_strip_menu(
+                        ctx,
+                        egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(overlay_width_points, overlay_height_points),
+                        ),
+                        button_rect,
+                        seek_strip_view,
+                        seek_strip_height,
+                        &mut seek_strip_menu_open,
+                        &mut seek_strip_menu_rect,
+                        &mut commands,
+                    );
+                } else {
+                    seek_strip_menu_open = false;
+                }
             } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
             // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI
             // 描画の最後** に置く。同じ Order::Foreground の Area は描画順 = z-order なので、
@@ -11696,6 +11959,13 @@ impl NativeEguiOverlay {
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
+        // HUD が引っ込んだフレームではボタンごと消えるので、メニューも閉じる。
+        if !bottom_hud_visible {
+            seek_strip_menu_open = false;
+            seek_strip_menu_rect = None;
+        }
+        self.seek_strip_menu_open = seek_strip_menu_open;
+        self.last_drawn_seek_strip_menu_rect = seek_strip_menu_rect;
         self.panorama_projection_popup_open = panorama_projection_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
@@ -13317,6 +13587,125 @@ mod tests {
         )
         .rect
         .center()
+    }
+
+    /// メニューはボタンの上へ出て、画面の中に収まる。下 HUD の中で下へ開くと画面外に出る。
+    #[test]
+    fn the_strip_menu_hangs_above_its_button_and_stays_on_screen() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let size = egui::vec2(180.0, 260.0);
+        // 右端に寄ったボタン (実際の配置に近い)。
+        let button = egui::Rect::from_min_size(egui::pos2(1230.0, 676.0), egui::vec2(28.0, 28.0));
+        let menu = super::native_seek_strip_menu_rect(full, button, size);
+        assert!(menu.max.y <= button.min.y, "ボタンに重なっている: {menu:?}");
+        assert!(full.contains_rect(menu), "画面からはみ出している: {menu:?}");
+
+        // 狭い画面でも左上の余白を優先し、負のサイズにしない。
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let narrow_menu = super::native_seek_strip_menu_rect(narrow, button, size);
+        assert!(narrow_menu.min.x >= narrow.min.x);
+        assert!(narrow_menu.min.y >= narrow.min.y);
+    }
+
+    /// 巡回から外したモードにもメニューからは届く。ここが到達可能性の保証。
+    #[test]
+    fn every_view_and_height_is_reachable_from_the_strip_menu() {
+        use crate::video::seek_strip_layout::{
+            SEEK_STRIP_SHOWING_ORDER, SeekStripHeight, SeekStripView,
+        };
+
+        let overlay_size = egui::vec2(1280.0, 720.0);
+        let button = egui::Rect::from_min_size(egui::pos2(1180.0, 676.0), egui::vec2(28.0, 28.0));
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size);
+        let wanted: Vec<super::NativeOverlayCommand> =
+            std::iter::once(super::NativeOverlayCommand::SetSeekStripView {
+                view: SeekStripView::Hidden,
+            })
+            .chain(SEEK_STRIP_SHOWING_ORDER.iter().map(|showing| {
+                super::NativeOverlayCommand::SetSeekStripView {
+                    view: SeekStripView::Showing(*showing),
+                }
+            }))
+            .chain(
+                SeekStripHeight::ALL.iter().map(|height| {
+                    super::NativeOverlayCommand::SetSeekStripHeight { height: *height }
+                }),
+            )
+            .collect();
+
+        for (row_index, expected) in wanted.iter().enumerate() {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let mut menu_open = true;
+            let mut menu_rect = None;
+            let mut commands = Vec::new();
+            // 1 パス目で行の位置を測り、2 パス目でその行を押す。
+            let mut row_center = egui::Pos2::ZERO;
+            for pass in 0..5 {
+                let events = match pass {
+                    1 => Vec::new(),
+                    2 => vec![egui::Event::PointerMoved(row_center)],
+                    3 => vec![egui::Event::PointerButton {
+                        pos: row_center,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    4 => vec![egui::Event::PointerButton {
+                        pos: row_center,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    _ => Vec::new(),
+                };
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(full),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        super::draw_native_seek_strip_menu(
+                            ctx,
+                            full,
+                            button,
+                            SeekStripView::Hidden,
+                            SeekStripHeight::Large,
+                            &mut menu_open,
+                            &mut menu_rect,
+                            &mut commands,
+                        );
+                    },
+                );
+                // Area は 1 フレーム目にまだ `fixed_pos` へ落ち着いていない。押す位置は
+                // 落ち着いた後 (pass 1) の実 rect から取る。
+                if pass <= 1 {
+                    let rect = menu_rect.expect("メニューは開いている");
+                    row_center = super::native_seek_strip_menu_row_rect(
+                        rect,
+                        row_index,
+                        1 + SEEK_STRIP_SHOWING_ORDER.len(),
+                    )
+                    .center();
+                }
+            }
+            assert!(
+                commands.iter().any(|command| match (command, expected) {
+                    (
+                        super::NativeOverlayCommand::SetSeekStripView { view },
+                        super::NativeOverlayCommand::SetSeekStripView { view: wanted },
+                    ) => view == wanted,
+                    (
+                        super::NativeOverlayCommand::SetSeekStripHeight { height },
+                        super::NativeOverlayCommand::SetSeekStripHeight { height: wanted },
+                    ) => height == wanted,
+                    _ => false,
+                }),
+                "{row_index} 行目からこの選択に届かない: {expected:?}"
+            );
+            assert!(!menu_open, "選んだらメニューは閉じる");
+        }
     }
 
     #[test]
