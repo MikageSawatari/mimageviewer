@@ -402,7 +402,6 @@ struct ExternalMaterializeOperation {
     tool: ExternalTool,
     requests: Vec<crate::materializer::MaterializeRequest>,
     target_count_decision: TargetCountDecision,
-    context: MaterializeContextStamp,
 }
 
 impl ExternalMaterializeOperation {
@@ -472,38 +471,10 @@ pub(crate) struct ExternalLaunchConfirmation {
     network_executable: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
-struct MaterializeContextStamp {
-    items_generation: u64,
-    viewer: MaterializeViewerContext,
-}
-
-#[derive(Clone, Debug)]
-enum MaterializeViewerContext {
-    Untracked,
-    /// フルスクリーン右クリックは command dispatch 後に viewer を意図的に閉じる。
-    /// その `Some -> None` だけは対象移動ではないため許可する。
-    FullscreenContextMenu {
-        target: LaunchTarget,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MaterializeOperationOrigin {
     GridOrContainer,
     FullscreenContextMenu,
-}
-
-fn materialize_viewer_context_matches(
-    expected: &MaterializeViewerContext,
-    current: Option<&LaunchTarget>,
-) -> bool {
-    match expected {
-        MaterializeViewerContext::Untracked => true,
-        MaterializeViewerContext::FullscreenContextMenu { target } => {
-            current.is_none_or(|current| current == target)
-        }
-    }
 }
 
 struct MaterializeProgress {
@@ -545,7 +516,6 @@ pub(crate) struct ExternalMaterializePending {
     launch_decision_tx: Option<mpsc::Sender<MaterializeLaunchDecision>>,
     progress: Arc<MaterializeProgress>,
     generation: u64,
-    context: MaterializeContextStamp,
     worker: Option<std::thread::JoinHandle<()>>,
     user_cancelled: bool,
     /// この frame の progress UI で Cancel / Esc を処理済みなら true。
@@ -1117,6 +1087,18 @@ pub fn expand_arguments_for_files(
     result
 }
 
+/// 設定画面の引数プレビュー用。**毎フレーム呼ばれる**ので計画をログに出さない。
+pub(crate) fn build_launch_request_for_preview(
+    tool: &ExternalTool,
+    target: &LaunchTarget,
+) -> Result<ExternalLaunchRequest, String> {
+    let mut operation = build_launch_operation_inner(tool, std::slice::from_ref(target), false)?;
+    operation
+        .requests
+        .pop()
+        .ok_or_else(|| "外部ツールの起動要求を組み立てられませんでした".to_string())
+}
+
 pub(crate) fn build_launch_request(
     tool: &ExternalTool,
     target: &LaunchTarget,
@@ -1343,6 +1325,14 @@ pub(crate) fn build_launch_operation(
     tool: &ExternalTool,
     targets: &[LaunchTarget],
 ) -> Result<ExternalLaunchOperation, String> {
+    build_launch_operation_inner(tool, targets, true)
+}
+
+fn build_launch_operation_inner(
+    tool: &ExternalTool,
+    targets: &[LaunchTarget],
+    log_plan: bool,
+) -> Result<ExternalLaunchOperation, String> {
     let files = real_files_from_targets(targets)?;
     let target_count = files.len();
     let target_count_decision = evaluate_target_count(
@@ -1371,22 +1361,24 @@ pub(crate) fn build_launch_operation(
     // 起動計画をログに残す。Single / Each / Batch の違いは、起動したプロセス数と
     // 1 プロセスへ渡したファイル数にしか出ないので、外から確かめる手段がこれしかない
     // (2026-09-01 利用者要望)。
-    crate::logger::log(format!(
-        "external_tool: plan tool={:?} selection={:?} launch={} targets={} processes={} files_per_process={:?}",
-        tool.display_name(),
-        tool.selection,
-        match &tool.launch {
-            ExternalToolLaunch::Executable(_) => "Executable",
-            ExternalToolLaunch::Association { .. } => "Association",
-            ExternalToolLaunch::OsDefault => "OsDefault",
-        },
-        target_count,
-        requests.len(),
-        requests
-            .iter()
-            .map(|request| request.files.len())
-            .collect::<Vec<_>>(),
-    ));
+    if log_plan {
+        crate::logger::log(format!(
+            "external_tool: plan tool={:?} selection={:?} launch={} targets={} processes={} files_per_process={:?}",
+            tool.display_name(),
+            tool.selection,
+            match &tool.launch {
+                ExternalToolLaunch::Executable(_) => "Executable",
+                ExternalToolLaunch::Association { .. } => "Association",
+                ExternalToolLaunch::OsDefault => "OsDefault",
+            },
+            target_count,
+            requests.len(),
+            requests
+                .iter()
+                .map(|request| request.files.len())
+                .collect::<Vec<_>>(),
+        ));
+    }
     Ok(ExternalLaunchOperation {
         tool_name: tool.display_name(),
         requests,
@@ -1500,7 +1492,6 @@ fn start_materialize_launch_worker(
     let progress_worker = Arc::clone(&progress);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
-    let context = operation.context.clone();
     let (tx, rx) = mpsc::channel();
     let (launch_boundary_tx, launch_boundary_rx) = mpsc::channel();
     let (launch_decision_tx, launch_decision_rx) = mpsc::channel();
@@ -1527,7 +1518,6 @@ fn start_materialize_launch_worker(
         launch_decision_tx: Some(launch_decision_tx),
         progress,
         generation,
-        context,
         worker: Some(worker),
         user_cancelled: false,
         launch_ui_checkpoint_passed: false,
@@ -2053,25 +2043,14 @@ impl crate::app::App {
             .iter()
             .map(|target| self.materialize_request_for_target(tool, target))
             .collect::<Result<Vec<_>, _>>()?;
-        let viewer = match origin {
-            MaterializeOperationOrigin::GridOrContainer => MaterializeViewerContext::Untracked,
-            MaterializeOperationOrigin::FullscreenContextMenu => {
-                let target = self
-                    .fullscreen_idx
-                    .and_then(|index| self.items.get(index))
-                    .map(|item| LaunchTarget::from_grid_item(Some(item)))
-                    .ok_or_else(|| "フルスクリーンの対象を解決できませんでした".to_string())?;
-                MaterializeViewerContext::FullscreenContextMenu { target }
-            }
-        };
+        // 発火面 (`origin`) は要求の組み立てに影響しない。以前はここで「フルスクリーンの
+        // 現在ページ」を控え、実体化中に一致しなくなったら打ち切っていたが、その打ち切りを
+        // やめた (2026-09-01 決定、正本 §4.7)。
+        let _ = origin;
         Ok(ExternalMaterializeOperation {
             tool: tool.clone(),
             requests,
             target_count_decision,
-            context: MaterializeContextStamp {
-                items_generation: self.items_generation,
-                viewer,
-            },
         })
     }
 
@@ -2241,30 +2220,12 @@ impl crate::app::App {
         }
     }
 
-    fn materialize_context_is_current(&self, context: &MaterializeContextStamp) -> bool {
-        if self.items_generation != context.items_generation {
-            return false;
-        }
-        let current = self
-            .fullscreen_idx
-            .and_then(|index| self.items.get(index))
-            .map(|item| LaunchTarget::from_grid_item(Some(item)));
-        materialize_viewer_context_matches(&context.viewer, current.as_ref())
-    }
-
     fn start_external_queued_operation(&mut self, operation: ExternalQueuedOperation) {
         match operation {
             ExternalQueuedOperation::Ready(operation) => {
                 self.start_external_launch_operation(operation)
             }
             ExternalQueuedOperation::Materialize(operation) => {
-                if !self.materialize_context_is_current(&operation.context) {
-                    self.show_feedback_toast(format!(
-                        "{}: 対象が移動したため、もう一度実行してください",
-                        operation.tool_name()
-                    ));
-                    return;
-                }
                 for pending in &mut self.external_tool_materialize_pending {
                     pending.cancel(false);
                 }
@@ -2303,14 +2264,20 @@ impl crate::app::App {
         }
         let mut materialize_index = 0;
         while materialize_index < self.external_tool_materialize_pending.len() {
-            let context_current = {
+            // 打ち切るのは「同じツールの新しい要求に置き換えられたとき」だけ
+            // (2026-09-01 決定、正本 §4.7)。一覧の差し替えやビューア位置では打ち切らない。
+            let superseded = {
                 let pending = &self.external_tool_materialize_pending[materialize_index];
-                self.materialize_context_is_current(&pending.context)
-                    && self
-                        .external_tool_materializer
-                        .generation_is_current(pending.generation)
+                !self
+                    .external_tool_materializer
+                    .generation_is_current(pending.generation)
             };
-            if !context_current {
+            if superseded {
+                let generation =
+                    self.external_tool_materialize_pending[materialize_index].generation;
+                crate::logger::log(format!(
+                    "external_tool: materialize superseded (request={generation})"
+                ));
                 self.external_tool_materialize_pending[materialize_index].cancel(false);
             }
             if let Some(completion) =
@@ -2357,19 +2324,21 @@ impl crate::app::App {
         while index < self.external_tool_materialize_pending.len() {
             let ui_checkpoint_passed =
                 self.external_tool_materialize_pending[index].take_launch_ui_checkpoint();
-            let context_current = {
+            let current = {
                 let pending = &self.external_tool_materialize_pending[index];
-                self.materialize_context_is_current(&pending.context)
-                    && self
-                        .external_tool_materializer
-                        .generation_is_current(pending.generation)
+                self.external_tool_materializer
+                    .generation_is_current(pending.generation)
             };
             if ui_checkpoint_passed
-                && context_current
+                && current
                 && self.external_tool_materialize_pending[index].can_cancel_before_launch()
             {
                 self.external_tool_materialize_pending[index].resolve_launch_boundary(true);
-            } else if !context_current {
+            } else if !current {
+                let generation = self.external_tool_materialize_pending[index].generation;
+                crate::logger::log(format!(
+                    "external_tool: materialize superseded at launch boundary (request={generation})"
+                ));
                 self.external_tool_materialize_pending[index].cancel(false);
             }
             index += 1;
@@ -2875,10 +2844,6 @@ mod tests {
             launch_decision_tx: Some(decision_tx),
             progress: Arc::new(MaterializeProgress::new(1)),
             generation: 1,
-            context: MaterializeContextStamp {
-                items_generation: 1,
-                viewer: MaterializeViewerContext::Untracked,
-            },
             worker: None,
             user_cancelled: false,
             launch_ui_checkpoint_passed: false,
@@ -2958,27 +2923,6 @@ mod tests {
             evaluate_target_count(SelectionPolicy::Batch, expanded.len(), 4, 10).unwrap(),
             TargetCountDecision::Confirm { target_count: 5 }
         );
-    }
-
-    #[test]
-    fn fullscreen_context_accepts_intentional_close_but_rejects_another_page() {
-        let expected = LaunchTarget::ImagePage(PathBuf::from("page-1.jpg"));
-        let context = MaterializeViewerContext::FullscreenContextMenu {
-            target: expected.clone(),
-        };
-        assert!(materialize_viewer_context_matches(
-            &context,
-            Some(&expected)
-        ));
-        assert!(materialize_viewer_context_matches(&context, None));
-        assert!(!materialize_viewer_context_matches(
-            &context,
-            Some(&LaunchTarget::ImagePage(PathBuf::from("page-2.jpg")))
-        ));
-        assert!(materialize_viewer_context_matches(
-            &MaterializeViewerContext::Untracked,
-            Some(&LaunchTarget::ImagePage(PathBuf::from("unrelated.jpg")))
-        ));
     }
 
     fn resolver_items() -> Vec<crate::grid_item::GridItem> {

@@ -875,7 +875,10 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     }
 
     ui.add_space(6.0);
-    match crate::external_tool::build_launch_request(&tool, &state.external_tool_target) {
+    // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
+    // (環境設定を開いているだけで plan 行が毎フレーム流れ、実際の起動が埋もれる)。
+    match crate::external_tool::build_launch_request_for_preview(&tool, &state.external_tool_target)
+    {
         Ok(request) => {
             ui.label(egui::RichText::new("現在の対象での引数プレビュー").strong());
             match &request.launch {

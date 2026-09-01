@@ -262,26 +262,22 @@ enum NativeGridContextMenuOutcome {
     Fallback,
 }
 
-fn native_external_tool_closes_fullscreen(surface: ContextMenuSurface, tool_exists: bool) -> bool {
-    surface == ContextMenuSurface::Fullscreen && tool_exists
-}
-
 /// このコマンドを実行する前にフルスクリーンを抜けるか。
 ///
-/// **メインウィンドウ側にしか出ない物を開くコマンドはここへ足す。** フルスクリーンの
+/// **メインウィンドウ側にしか出ない物を開くコマンドだけがここに入る。** フルスクリーンの
 /// まま開くと画面の裏に隠れ、利用者からは「何も起きない」に見える (2026-09-01 に
 /// 外部ツールの設定で実際に起きた)。判断を呼び出し側の match に散らさない。
+///
+/// **外部ツールと関連付けアプリの起動はここに入れない** (2026-09-01 決定、正本 §4.7)。
+/// 外部アプリは自分で前面に出るので閉じる必要がなく、勝手に閉じると利用者には何が
+/// 起きたか分からない。さらに実害があった: ZIP / PDF の中から閉じると親フォルダが
+/// 読み込まれ、実体化の staleness 判定がそれを「対象が移動した」と読んで、
+/// **起動が自分の始めた展開を打ち切っていた**。
 fn native_menu_command_closes_fullscreen(
     command: &MenuCommand,
     surface: ContextMenuSurface,
-    tool_exists: bool,
 ) -> bool {
     match command {
-        MenuCommand::ExternalTool(_) => {
-            native_external_tool_closes_fullscreen(surface, tool_exists)
-        }
-        // 外部アプリが前面に出るので、フルスクリーンのままにしない。
-        MenuCommand::OpenWithAssociation { .. } => surface == ContextMenuSurface::Fullscreen,
         // 環境設定はメインウィンドウ側に出る。
         MenuCommand::OpenExternalToolSettings => surface == ContextMenuSurface::Fullscreen,
         _ => false,
@@ -1099,16 +1095,8 @@ impl crate::app::App {
                 }
             }
             NativeContextMenuResult::MivCommand(command) => {
-                let tool_exists = match &command {
-                    MenuCommand::ExternalTool(id) => self
-                        .settings
-                        .external_tools
-                        .iter()
-                        .any(|tool| tool.id == *id),
-                    _ => false,
-                };
                 let close_fullscreen =
-                    native_menu_command_closes_fullscreen(&command, target.surface, tool_exists);
+                    native_menu_command_closes_fullscreen(&command, target.surface);
                 let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
                 NativeGridContextMenuOutcome::Consumed {
                     nav,
@@ -1739,17 +1727,9 @@ impl crate::app::App {
                 }
             });
         if let Some(command) = selected_command {
-            close_fullscreen = match &command {
-                MenuCommand::ExternalTool(id) => native_external_tool_closes_fullscreen(
-                    target.surface,
-                    self.settings
-                        .external_tools
-                        .iter()
-                        .any(|tool| tool.id == *id),
-                ),
-                MenuCommand::OpenWithAssociation { .. } => true,
-                _ => false,
-            };
+            // フォールバックメニューにも同じ判断が別々に書かれていた (しかも
+            // OpenWithAssociation は surface を見ずに常に閉じていた)。共有の述語へ寄せる。
+            close_fullscreen = native_menu_command_closes_fullscreen(&command, target.surface);
             let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
             close = true;
         }
@@ -2878,34 +2858,33 @@ mod delete_confirm_tests {
         assert!(native_menu_command_closes_fullscreen(
             &MenuCommand::OpenExternalToolSettings,
             ContextMenuSurface::Fullscreen,
-            false
         ));
         assert!(!native_menu_command_closes_fullscreen(
             &MenuCommand::OpenExternalToolSettings,
             ContextMenuSurface::Grid,
-            false
         ));
         // 一覧に留まってよいコマンドまで巻き込まない。
         assert!(!native_menu_command_closes_fullscreen(
             &MenuCommand::CopyPath,
             ContextMenuSurface::Fullscreen,
-            false
         ));
     }
 
+    /// 外部アプリは自分で前面に出るので、起動のために viewer を閉じない
+    /// (2026-09-01 決定、正本 §4.7)。閉じると ZIP / PDF の中では親フォルダが
+    /// 読み込まれ、実体化が自分の始めた展開を打ち切っていた。
     #[test]
-    fn native_external_tool_closes_only_fullscreen_surface_after_lookup() {
-        assert!(native_external_tool_closes_fullscreen(
+    fn launching_a_tool_leaves_the_viewer_open() {
+        assert!(!native_menu_command_closes_fullscreen(
+            &MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(1)),
             ContextMenuSurface::Fullscreen,
-            true
         ));
-        assert!(!native_external_tool_closes_fullscreen(
-            ContextMenuSurface::Grid,
-            true
-        ));
-        assert!(!native_external_tool_closes_fullscreen(
+        assert!(!native_menu_command_closes_fullscreen(
+            &MenuCommand::OpenWithAssociation {
+                display_name: "Photos".to_string(),
+                handler_id: "photos.app".to_string(),
+            },
             ContextMenuSurface::Fullscreen,
-            false
         ));
     }
 
