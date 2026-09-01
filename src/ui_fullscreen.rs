@@ -4072,6 +4072,48 @@ impl ContinuousReadingPageSize {
     fn visible_height(&self) -> f32 {
         (self.height * self.bbox().height()).max(1.0)
     }
+
+    /// **描画が実際に置く**可視帯 (ページ全体矩形の先頭からの points)。
+    ///
+    /// `visible_width` / `visible_height` は倍率を掛けただけの理想値で、貼り先はそれを
+    /// 物理ピクセルへ寄せた値になる。連結読みは前者で場所を空け後者で描いていたので、
+    /// 差のぶんだけ unit 間の間隔がばらついた (backlog §1.159)。ここは transform と
+    /// **同じ入口** (`visible_paint_band_px`) を通す。
+    fn drawn_band(&self, axis: ContinuousAxis, pixels_per_point: f32) -> (f32, f32) {
+        let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
+        let bbox = self.bbox();
+        let (len, min, max) = match axis {
+            ContinuousAxis::X => (self.width, bbox.min.x, bbox.max.x),
+            ContinuousAxis::Y => (self.height, bbox.min.y, bbox.max.y),
+        };
+        let scale = if self.logical_scale.is_finite() && self.logical_scale > 0.0 {
+            self.logical_scale
+        } else {
+            1.0
+        };
+        let (lo, hi) = crate::displayed_image_transform::visible_paint_band_px(
+            len / scale,
+            scale * ppp,
+            min,
+            max,
+        );
+        (lo / ppp, hi / ppp)
+    }
+
+    fn drawn_visible_len(&self, axis: ContinuousAxis, pixels_per_point: f32) -> f32 {
+        let (lo, hi) = self.drawn_band(axis, pixels_per_point);
+        (hi - lo).max(1.0 / pixels_per_point.max(1.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuousAxis {
+    X,
+    Y,
 }
 
 #[derive(Clone, Debug)]
@@ -4202,74 +4244,78 @@ fn continuous_reading_page_rects(
     if size.pages.is_empty() {
         return rects;
     }
-    if size.pages.len() == 1 {
-        let page = &size.pages[0];
-        let bbox = page.bbox();
-        let visible_size = egui::vec2(page.visible_width(), page.visible_height());
-        let visible_rect = egui::Rect::from_center_size(unit_rect.center(), visible_size);
-        let mut rect_min = egui::pos2(
-            visible_rect.min.x - bbox.min.x * page.width,
-            visible_rect.min.y - bbox.min.y * page.height,
-        );
-        if physical_scale_is_near_integer(page.logical_scale, pixels_per_point) {
-            rect_min.x = quantize_points_to_physical_pixels(rect_min.x, pixels_per_point);
-            rect_min.y = quantize_points_to_physical_pixels(rect_min.y, pixels_per_point);
-        }
-        let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
-        rects.push((page.idx, rect, page.content_bbox));
-        return rects;
-    }
-
-    let total_visible_w = size
-        .pages
-        .iter()
-        .map(ContinuousReadingPageSize::visible_width)
-        .sum::<f32>()
-        + quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point)
-            * size.pages.len().saturating_sub(1) as f32;
-    let (visible_y_min, visible_y_max) = size.pages.iter().fold(
-        (f32::INFINITY, f32::NEG_INFINITY),
-        |(min_y, max_y), page| {
-            let bbox = page.bbox();
-            (
-                min_y.min(-page.height * 0.5 + bbox.min.y * page.height),
-                max_y.max(-page.height * 0.5 + bbox.max.y * page.height),
-            )
-        },
-    );
-    let visible_y_min = if visible_y_min.is_finite() {
-        visible_y_min
-    } else {
-        0.0
-    };
-    let visible_y_max = if visible_y_max.is_finite() {
-        visible_y_max
-    } else {
-        size.height.max(1.0)
-    };
-    let visible_center_y = (visible_y_min + visible_y_max) * 0.5;
-    let mut visible_x = unit_rect.center().x - total_visible_w.max(1.0) * 0.5;
-    let unit_snap = physical_scale_is_near_integer(size.logical_scale, pixels_per_point);
+    // 位置は**描画が実際に置く帯**から決める (§1.159)。理想値で置いて描画で寄せると、
+    // 寄せの差だけ unit の端が動き、間隔が最大 1 物理 px ばらつく。倍率で分岐もしない
+    // — 貼り先はどの倍率でも寄るようになった (§1.161)。
+    let span = continuous_unit_drawn_span(size, pixels_per_point);
     let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
+    let mut visible_x = unit_rect.center().x - span.x_len * 0.5;
+    let visible_center_y = (span.y_min + span.y_max) * 0.5;
 
     for page in &size.pages {
-        let bbox = page.bbox();
-        let mut rect_min = egui::pos2(
-            visible_x - bbox.min.x * page.width,
-            unit_rect.center().y - visible_center_y - page.height * 0.5,
+        let (band_x_lo, band_x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
+        // 帯の左端を置きたい位置から、ページ全体矩形の原点へ戻す。縦は unit 内の
+        // 相対位置がそのまま `span` に入っているので、中心から引くだけでよい。
+        //
+        // **倍率で分岐せず必ず寄せる。** 以前は「整数近傍の倍率のときだけ」だったが、
+        // それは貼り先が端数倍率で寄っていなかった時代の条件で、§1.161 で消えた。
+        // 整数画素ぶんの平行移動と丸めは可換なので、寄せても unit 間の間隔は保たれる。
+        let rect_min = egui::pos2(
+            quantize_points_to_physical_pixels(visible_x - band_x_lo, pixels_per_point),
+            quantize_points_to_physical_pixels(
+                unit_rect.center().y - visible_center_y - page.height * 0.5,
+                pixels_per_point,
+            ),
         );
-        if physical_scale_is_near_integer(page.logical_scale, pixels_per_point) {
-            rect_min.x = quantize_points_to_physical_pixels(rect_min.x, pixels_per_point);
-            rect_min.y = quantize_points_to_physical_pixels(rect_min.y, pixels_per_point);
-        }
         let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
-        visible_x += page.visible_width() + page_gap;
-        if unit_snap {
-            visible_x = quantize_points_to_physical_pixels(visible_x, pixels_per_point);
-        }
+        visible_x += (band_x_hi - band_x_lo) + page_gap;
         rects.push((page.idx, rect, page.content_bbox));
     }
     rects
+}
+
+/// unit が**実際に描かれる**範囲。場所を空ける側と描く側が同じ値を見るための 1 か所。
+///
+/// `x_len` は横に並べたページの可視帯と間隔の合計、`y_min` / `y_max` は unit の中心を
+/// 原点としたときの可視帯の上下端 (points)。連結読みのスクロール軸の長さはこれで決まる
+/// (backlog §1.159)。
+#[derive(Clone, Copy, Debug)]
+struct ContinuousUnitDrawnSpan {
+    x_len: f32,
+    y_min: f32,
+    y_max: f32,
+}
+
+fn continuous_unit_drawn_span(
+    size: &ContinuousReadingUnitSize,
+    pixels_per_point: f32,
+) -> ContinuousUnitDrawnSpan {
+    let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
+    let x_len = size
+        .pages
+        .iter()
+        .map(|page| page.drawn_visible_len(ContinuousAxis::X, pixels_per_point))
+        .sum::<f32>()
+        + page_gap * size.pages.len().saturating_sub(1) as f32;
+    let (y_min, y_max) = size.pages.iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(min_y, max_y), page| {
+            let (lo, hi) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
+            (
+                min_y.min(-page.height * 0.5 + lo),
+                max_y.max(-page.height * 0.5 + hi),
+            )
+        },
+    );
+    ContinuousUnitDrawnSpan {
+        x_len: x_len.max(1.0),
+        y_min: if y_min.is_finite() { y_min } else { 0.0 },
+        y_max: if y_max.is_finite() {
+            y_max
+        } else {
+            size.height.max(1.0)
+        },
+    }
 }
 
 /// 再生中のページの次コマ時刻から、**最も早いもの**を選ぶ。
@@ -7986,36 +8032,54 @@ pub(crate) fn seek_overlay_media_counts(items: &[GridItem]) -> (usize, usize, us
     (image_count, video_count, other_count)
 }
 
+/// unit の中心を、隣り合う端と端が `gap` だけ離れるように並べる。
+///
+/// **1 段ごとに丸めない。** `heights` は既に描画が置く物理ピクセル数ちょうどで、`gap` も
+/// 整数画素なので、中心間の距離は「整数画素 + 半画素」になり得る。ここで走行合計を
+/// 丸めると、その半画素が段ごとに違う向きへ倒れて**端と端の距離が 1px ずれる**
+/// (backlog §1.159)。丸めずに置けば、隣との差はちょうど整数画素になり、各 unit の貼り先を
+/// 物理ピクセルへ寄せる段階 (§1.161) を通しても差は保たれる — 整数だけずらした値の
+/// 丸めは、丸めてから同じだけずらした値に等しいからである。
+///
+/// かつては「全 unit の倍率が整数近傍のときだけ丸める」ゲートを持っていた。矩形を寄せて
+/// いない倍率では位置を寄せても意味が無い、という当時の前提によるもので、その前提は
+/// §1.161 で消えた。
+///
+/// **積算は物理ピクセルの f64 で行う。** 丸めをやめた代わりに、points の f32 で足し続けると
+/// 1 段あたり数 µpx の誤差が段数に比例して積もる (257 段で 0.03px を実測)。長い本ほど効く
+/// うえ、丸めで消すと上の半画素問題に戻る。整数・半整数の px を f64 で足せばどちらも起きない。
 fn vertical_reading_offsets(
     heights: &[f32],
     gap: f32,
     current_pos: usize,
     pixels_per_point: f32,
-    snap_to_physical_pixels: bool,
 ) -> Vec<f32> {
     if heights.is_empty() || current_pos >= heights.len() {
         return Vec::new();
     }
-    let gap = if snap_to_physical_pixels {
-        quantize_points_to_physical_pixels(gap.max(0.0), pixels_per_point)
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        f64::from(pixels_per_point)
     } else {
-        gap.max(0.0)
+        1.0
     };
-    let quantize = |offset: f32| {
-        if snap_to_physical_pixels {
-            quantize_points_to_physical_pixels(offset, pixels_per_point)
-        } else {
-            offset
-        }
-    };
-    let mut offsets = vec![0.0; heights.len()];
+    let gap_px = f64::from(quantize_points_to_physical_pixels(
+        gap.max(0.0),
+        pixels_per_point,
+    )) * ppp;
+    let height_px = |pos: usize| f64::from(heights[pos]) * ppp;
+    let mut offsets_px = vec![0.0_f64; heights.len()];
     for pos in current_pos + 1..heights.len() {
-        offsets[pos] = quantize(offsets[pos - 1] + (heights[pos - 1] + heights[pos]) * 0.5 + gap);
+        offsets_px[pos] =
+            offsets_px[pos - 1] + (height_px(pos - 1) + height_px(pos)) * 0.5 + gap_px;
     }
     for pos in (0..current_pos).rev() {
-        offsets[pos] = quantize(offsets[pos + 1] - (heights[pos] + heights[pos + 1]) * 0.5 - gap);
+        offsets_px[pos] =
+            offsets_px[pos + 1] - (height_px(pos) + height_px(pos + 1)) * 0.5 - gap_px;
     }
-    offsets
+    offsets_px
+        .into_iter()
+        .map(|offset_px| (offset_px / ppp) as f32)
+        .collect()
 }
 
 fn clamp_vertical_reading_scroll(
@@ -26227,15 +26291,11 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
-        let snap_to_physical_pixels = sizes
-            .iter()
-            .all(|size| physical_scale_is_near_integer(size.logical_scale, pixels_per_point));
         let offsets = vertical_reading_offsets(
             &extents,
             self.settings.continuous_reading_gap_px.min(200) as f32,
             current_pos,
             pixels_per_point,
-            snap_to_physical_pixels,
         );
         vertical_reading_scroll_range(&offsets, &extents, viewport_len)
     }
@@ -27051,6 +27111,13 @@ impl App {
             page.height = (page.height * scale).max(1.0);
             page.logical_scale *= scale;
         }
+        // **場所を空ける長さは、描画が実際に置く長さにする** (§1.159)。理想値のままだと
+        // 描画側の寄せとの差が unit ごとに残り、見える間隔が最大 1 物理 px ばらつく。
+        // `width` / `height` は unit 矩形の寸法としては使われず、連結の並び (スクロール軸の
+        // 長さ・スクロール範囲・可視判定) だけがこれを読む。
+        let span = continuous_unit_drawn_span(&base, pixels_per_point);
+        base.width = span.x_len;
+        base.height = (span.y_max - span.y_min).max(1.0);
         base
     }
 
@@ -27124,15 +27191,11 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
-            let snap_to_physical_pixels = sizes
-                .iter()
-                .all(|size| physical_scale_is_near_integer(size.logical_scale, pixels_per_point));
             offsets = vertical_reading_offsets(
                 &extents,
                 self.settings.continuous_reading_gap_px.min(200) as f32,
                 current_pos,
                 pixels_per_point,
-                snap_to_physical_pixels,
             );
             scroll_range =
                 vertical_reading_scroll_range(&offsets, &extents, viewport_len).unwrap_or_default();
@@ -37337,6 +37400,116 @@ mod tests {
                 "gap={gap}: 描いた間隔 {painted}px (設定 {want}px)"
             );
         }
+    }
+
+    /// **連結読みの unit と unit の間**も、設定どおりの間隔で描かれる (backlog §1.159)。
+    ///
+    /// v3.4.0 で合わせたのは unit の**内側** (見開きの左右) だけだった。unit 間は、可視
+    /// 高さが未量子化のまま中心間距離だけを画素へ寄せていたので、見える間隔が最大 1 物理
+    /// px ばらついた。既定 20px では 19〜21px で気付きにくいが、0px / 1px にしている
+    /// 利用者には見開きの継ぎ目とまったく同じ形で出る。
+    ///
+    /// helper ではなく `draw_fs_continuous_reading` を走らせ、**積まれた最終 transform**
+    /// で測る。連結は「別のテクスチャで解かれていた」前科があるので、production 経路で
+    /// 測らないと直ったことにならない。
+    #[test]
+    fn the_drawn_continuous_units_are_all_the_configured_distance_apart() {
+        let mut failures = Vec::new();
+        for gap in [0_u32, 1, 20] {
+            for pixels_per_point in [1.0_f32, 1.25] {
+                let mut app = crate::app::tests::phase_c_support::setup_app();
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(pixels_per_point);
+                // 端数の出る高さを並べる。同じ高さだと丸めが揃って問題が隠れる。
+                let sizes = [
+                    [2000_usize, 301_usize],
+                    [1997, 307],
+                    [2003, 299],
+                    [1999, 311],
+                    [2001, 303],
+                ];
+                app.items = (0..sizes.len())
+                    .map(|idx| GridItem::Image(std::path::PathBuf::from(format!("C:/p/{idx}.png"))))
+                    .collect();
+                app.visible_indices = (0..sizes.len()).collect();
+                app.settings.continuous_reading_gap_px = gap;
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+                app.spread_mode = crate::settings::SpreadMode::Single;
+                app.reading_flow = crate::settings::ReadingFlow::Vertical;
+                app.fullscreen_idx = Some(0);
+                for (idx, size) in sizes.iter().enumerate() {
+                    let image = egui::ColorImage::new(
+                        [size[0], size[1]],
+                        vec![egui::Color32::WHITE; size[0] * size[1]],
+                    );
+                    let tex = ctx.load_texture(
+                        format!("unit_gap_{idx}"),
+                        image.clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    app.fs_cache.insert(
+                        idx,
+                        crate::fs_animation::FsCacheEntry::Static {
+                            tex,
+                            pixels: std::sync::Arc::new(image),
+                            source_dims: Some(*size),
+                            load_seq: 0,
+                            animation: crate::fs_animation::StaticAnimationState::Still,
+                        },
+                    );
+                }
+
+                let image_rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_fs_continuous_reading(
+                            ui,
+                            ctx,
+                            image_rect,
+                            0,
+                            false,
+                            FsPageTurnDecision::normal(),
+                        );
+                    });
+                });
+
+                let mut drawn = app
+                    .fullscreen_page_layout
+                    .page_indices()
+                    .filter_map(|idx| app.fullscreen_page_layout.page_by_idx(idx))
+                    .map(|page| page.transform.paint_rect)
+                    .collect::<Vec<_>>();
+                drawn.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+                if drawn.len() < 3 {
+                    failures.push(format!(
+                        "gap={gap} ppp={pixels_per_point}: 描かれた unit が {} 個しかない",
+                        drawn.len()
+                    ));
+                    continue;
+                }
+                let want = (gap as f32 * pixels_per_point).round();
+                for pair in drawn.windows(2) {
+                    let painted = (pair[1].top() - pair[0].bottom()) * pixels_per_point;
+                    if (painted - want).abs() >= 1e-3 {
+                        failures.push(format!(
+                            "gap={gap} ppp={pixels_per_point}: 間隔 {painted}px (設定 {want}px)"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} 件失敗:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// アニメの次コマ期限は、**描いた全ページのうち最も早いもの**で起こす。
@@ -49526,8 +49699,45 @@ mod tests {
 
     #[test]
     fn vertical_reading_offsets_center_current_page() {
-        let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1, 1.0, false);
+        let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1, 1.0);
         assert_eq!(offsets, vec![-110.0, 0.0, 110.0]);
+    }
+
+    /// 長い本でも、端と端の距離が設定どおりのまま**積もらない** (backlog §1.159)。
+    ///
+    /// 1 段ごとの丸めをやめたので、代わりに f32 の積算誤差が段数に比例して出る経路が
+    /// できていた (points の f32 で 257 段 0.03px、4000 段なら 0.5px 級)。物理ピクセルの
+    /// f64 で足しているかを、段数を増やして端の距離で見る。中心ではなく**端**で測る
+    /// のは、利用者に見えるのが端と端の隙間だからである。
+    #[test]
+    fn a_long_book_keeps_every_unit_gap_exact_without_drifting() {
+        for pixels_per_point in [1.0_f32, 1.25, 1.5] {
+            for gap in [0.0_f32, 1.0, 20.0] {
+                // 描画が置く帯は整数物理 px。奇数を混ぜて中心が半画素になる並びにする。
+                let heights = (0..4000)
+                    .map(|pos| (301.0 + (pos % 7) as f32) / pixels_per_point)
+                    .collect::<Vec<_>>();
+                let offsets =
+                    vertical_reading_offsets(&heights, gap, heights.len() / 2, pixels_per_point);
+                let gap_px = (quantize_points_to_physical_pixels(gap, pixels_per_point)
+                    * pixels_per_point)
+                    .round();
+                for pos in 1..heights.len() {
+                    let bottom = (offsets[pos - 1] + heights[pos - 1] * 0.5) * pixels_per_point;
+                    let top = (offsets[pos] - heights[pos] * 0.5) * pixels_per_point;
+                    // **許容は f32 が表せる粒度まで。** 遠く離れた段の座標は f32 の刻みが
+                    // 粗くなる (60 万 px で 1/16px) が、そこは描かれない。描かれるのは
+                    // 現在段の近くで、そちらは刻みが細かいので実質厳密になる。
+                    // 積算誤差はこの粒度より速く育つので、これで捕まる。
+                    let tolerance = 0.01 + top.abs() * 4.0 * f32::EPSILON;
+                    assert!(
+                        (top - bottom - gap_px).abs() < tolerance,
+                        "ppp={pixels_per_point} gap={gap} pos={pos}: 間隔 {}px (設定 {gap_px}px)",
+                        top - bottom
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -49535,8 +49745,7 @@ mod tests {
         let pixels_per_point = 1.25;
         let page_height = 101.0 / pixels_per_point;
         let heights = vec![page_height; 257];
-        let offsets =
-            vertical_reading_offsets(&heights, 1.0, heights.len() / 2, pixels_per_point, true);
+        let offsets = vertical_reading_offsets(&heights, 1.0, heights.len() / 2, pixels_per_point);
         let mut page = ContinuousReadingPageSize::full(0, page_height, page_height);
         page.logical_scale = physical_pixel_scale(pixels_per_point);
         let size = ContinuousReadingUnitSize {
@@ -49675,7 +49884,7 @@ mod tests {
     #[test]
     fn vertical_reading_visible_positions_follow_scroll() {
         let heights = [100.0, 100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0, false);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0);
 
         assert_eq!(
             vertical_reading_visible_positions(&offsets, &heights, 0.0, 100.0),
@@ -49724,7 +49933,7 @@ mod tests {
     #[test]
     fn vertical_reading_scroll_clamps_to_book_edges() {
         let heights = [100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 0, 1.0, false);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 0, 1.0);
 
         assert_eq!(
             vertical_reading_scroll_range(&offsets, &heights, 100.0),
@@ -49743,7 +49952,7 @@ mod tests {
     #[test]
     fn vertical_reading_reanchor_keeps_visual_position() {
         let heights = [100.0, 100.0, 100.0];
-        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0, false);
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1, 1.0);
 
         assert_eq!(vertical_reading_reanchor_scroll(110.0, &offsets, 2), 0.0);
         assert_eq!(vertical_reading_reanchor_scroll(-110.0, &offsets, 0), 0.0);

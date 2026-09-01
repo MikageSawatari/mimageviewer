@@ -1097,24 +1097,47 @@ fn quantize_display_bbox_to_paint_pixels(
         return bbox;
     }
     let axis = |min: f32, max: f32, len_px: f32| {
-        let mut lo = (min * len_px).round();
-        let mut hi = (max * len_px).round();
-        lo = lo.clamp(0.0, len_px);
-        hi = hi.clamp(0.0, len_px);
-        // 丸めて潰れたら 1 画素だけ残す。空の矩形を返すと描画も hit-test も消える。
-        if hi <= lo {
-            if lo >= len_px {
-                lo = len_px - 1.0;
-                hi = len_px;
-            } else {
-                hi = lo + 1.0;
-            }
-        }
+        let (lo, hi) = quantized_band_px(len_px, min, max);
         (lo / len_px, hi / len_px)
     };
     let (min_x, max_x) = axis(bbox.min.x, bbox.max.x, width_px);
     let (min_y, max_y) = axis(bbox.min.y, bbox.max.y, height_px);
     egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y))
+}
+
+/// 全体矩形の 1 辺の中で、trim 後の可視帯が占める**物理ピクセルの範囲**。
+///
+/// **レイアウトと transform の唯一の共通入口。** 場所を空ける側と実際に描く側が別々の式で
+/// 長さを出すと、その差だけ連結読みの unit 間の間隔がばらつく (backlog §1.159)。
+/// 返すのは辺の先頭からの画素数で、`(lo, hi)` はどちらも整数。
+pub(crate) fn quantized_band_px(len_px: f32, min: f32, max: f32) -> (f32, f32) {
+    let mut lo = (min * len_px).round().clamp(0.0, len_px);
+    let mut hi = (max * len_px).round().clamp(0.0, len_px);
+    // 丸めて潰れたら 1 画素だけ残す。空の矩形を返すと描画も hit-test も消える。
+    if hi <= lo {
+        if lo >= len_px {
+            lo = len_px - 1.0;
+            hi = len_px;
+        } else {
+            hi = lo + 1.0;
+        }
+    }
+    (lo, hi)
+}
+
+/// 元テクスチャの 1 辺と倍率から、貼り先の可視帯を物理ピクセルで数える。
+///
+/// [`quantized_band_px`] と [`physical_pixel_extent`] を transform と同じ順で通す。
+/// レイアウトが「この unit は何画素ぶんの場所を取るか」を決めるときの入口
+/// (backlog §1.159)。`source_len` は**回転後の表示軸**で数えた長さ。
+pub(crate) fn visible_paint_band_px(
+    source_len: f32,
+    physical_scale: f32,
+    min: f32,
+    max: f32,
+) -> (f32, f32) {
+    let full_px = physical_pixel_extent(source_len, physical_scale) as f32;
+    quantized_band_px(full_px, min, max)
 }
 
 /// [`rotate_bbox_to_display`] の逆。寄せた表示空間の矩形を、UV に使う元画像空間へ戻す。
