@@ -107,16 +107,21 @@ impl CropAspectMode {
     }
 
     pub fn from_stable_key(key: &str) -> Self {
+        Self::from_stable_key_checked(key).unwrap_or(Self::Free)
+    }
+
+    fn from_stable_key_checked(key: &str) -> Option<Self> {
         match key {
-            "keep" => Self::Keep,
-            "square" => Self::Square,
-            "4x3" => Self::Ratio4x3,
-            "3x4" => Self::Ratio3x4,
-            "4x5" => Self::Ratio4x5,
-            "16x9" => Self::Ratio16x9,
-            "191x100" => Self::Ratio191x100,
-            "9x16" => Self::Ratio9x16,
-            _ => Self::Free,
+            "free" => Some(Self::Free),
+            "keep" => Some(Self::Keep),
+            "square" => Some(Self::Square),
+            "4x3" => Some(Self::Ratio4x3),
+            "3x4" => Some(Self::Ratio3x4),
+            "4x5" => Some(Self::Ratio4x5),
+            "16x9" => Some(Self::Ratio16x9),
+            "191x100" => Some(Self::Ratio191x100),
+            "9x16" => Some(Self::Ratio9x16),
+            _ => None,
         }
     }
 
@@ -777,6 +782,64 @@ impl CropDb {
         .map_err(|error| error.to_string())
     }
 
+    /// 部分リセットで未選択行を再保存するための strict reader。
+    ///
+    /// 通常表示は将来版の未知キーを従来どおり Free として読める一方、bulk がそれを
+    /// Free へ書き戻して不可逆に丸めないよう、未知キーだけは明示的な失敗にする。
+    pub(crate) fn get_checked_strict(
+        &self,
+        page_key: &str,
+    ) -> Result<Option<CropSettings>, String> {
+        use rusqlite::OptionalExtension as _;
+        type RawCropRow = (f32, f32, f32, f32, String, Option<i64>, Option<i64>);
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT min_x, min_y, max_x, max_y, aspect_mode,
+                        source_width, source_height
+                 FROM export_crop_pages WHERE page_path = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let raw: Option<RawCropRow> = stmt
+            .query_row([page_key], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((min_x, min_y, max_x, max_y, aspect, source_width, source_height)) = raw else {
+            return Ok(None);
+        };
+        let aspect_mode = CropAspectMode::from_stable_key_checked(&aspect)
+            .ok_or_else(|| format!("切り取りDBの比率キーが不明です: {aspect}"))?;
+        let source_size = match (source_width, source_height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => {
+                match (usize::try_from(width), usize::try_from(height)) {
+                    (Ok(width), Ok(height)) => Some([width, height]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(Some(CropSettings {
+            rect: CropRect {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            },
+            aspect_mode,
+            source_size,
+        }))
+    }
+
     pub fn set(&self, page_key: &str, settings: CropSettings) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO export_crop_pages
@@ -1338,6 +1401,41 @@ mod tests {
         db.set(key, settings).unwrap();
 
         assert_eq!(db.get(key), Some(settings));
+    }
+
+    #[test]
+    fn edit_bundle_bulk_strict_reader_rejects_unknown_aspect_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CropDb::open_at(&dir.path().join("crop.db")).unwrap();
+        let key = "c:/imgs/future.png";
+        db.set(
+            key,
+            CropSettings {
+                rect: CropRect {
+                    min_x: 1.0,
+                    min_y: 2.0,
+                    max_x: 30.0,
+                    max_y: 40.0,
+                },
+                aspect_mode: CropAspectMode::Free,
+                source_size: Some([100, 100]),
+            },
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE export_crop_pages SET aspect_mode = 'future-ratio'
+                 WHERE page_path = ?1",
+                [key],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.get_checked(key).unwrap().unwrap().aspect_mode,
+            CropAspectMode::Free,
+            "通常readerの前方互換fallbackは保つ"
+        );
+        assert!(db.get_checked_strict(key).is_err());
     }
 
     #[test]

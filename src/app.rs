@@ -112,6 +112,7 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
+pub(crate) use metadata_ops::probe_image_dims_from_bytes;
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
@@ -10474,6 +10475,8 @@ pub struct App {
     pub(crate) edit_bundle_paste_pending: Option<crate::edit_bundle::EditBundlePasteRequest>,
     /// 異サイズ変換 + 6 DB transaction の worker。
     pub(crate) edit_bundle_apply_pending: Option<crate::edit_bundle::EditBundleApplyPending>,
+    /// 複数ページの貼り付け / リセット。確認・実行・キャンセルを1つの型で所有する。
+    pub(crate) edit_bundle_bulk_pending: Option<crate::edit_bundle_bulk::BulkPageEditPending>,
     /// 削除対象のファイル / フォルダパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
@@ -13860,6 +13863,7 @@ impl App {
             edit_bundle_copy_pending: None,
             edit_bundle_paste_pending: None,
             edit_bundle_apply_pending: None,
+            edit_bundle_bulk_pending: None,
             delete_targets: Vec::new(),
             delete_confirm_label: None,
             pending_reload: false,
@@ -15971,6 +15975,7 @@ impl App {
             self.show_delete_confirm => "delete_confirm",
             self.edit_bundle_paste_pending.is_some() => "edit_bundle_paste_pending",
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
+            self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
             self.show_pdf_password_dialog => "pdf_password",
             self.show_about_dialog => "about",
@@ -47800,7 +47805,8 @@ impl App {
         }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_cw();
-        self.apply_rotation(idx, new_rot);
+        // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+        let _ = self.apply_rotation(idx, new_rot);
     }
 
     /// 指定 idx の画像を反時計回りに 90° 回転する。
@@ -47811,7 +47817,8 @@ impl App {
         }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_ccw();
-        self.apply_rotation(idx, new_rot);
+        // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+        let _ = self.apply_rotation(idx, new_rot);
     }
 
     /// 指定 idx の画像を選択された絶対角度へ設定する。
@@ -47819,24 +47826,33 @@ impl App {
         &mut self,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
-    ) {
+    ) -> Result<(), String> {
         if self.idx_is_compiled_book_page(idx) {
             self.show_feedback_toast("本のページは回転できません".to_string());
-            return;
+            return Err("本のページは回転できません".to_string());
         }
-        self.apply_rotation(idx, rotation);
+        self.apply_rotation(idx, rotation)
     }
 
-    fn apply_rotation(&mut self, idx: usize, rot: crate::rotation_db::Rotation) {
+    fn apply_rotation(
+        &mut self,
+        idx: usize,
+        rot: crate::rotation_db::Rotation,
+    ) -> Result<(), String> {
         let Some(key) = self.rotation_key_for_idx(idx) else {
-            return;
+            return Err("回転対象のページキーを取得できませんでした".to_string());
         };
         let exit_sns_split =
             self.sns_split.is_some() && self.fullscreen_idx == Some(idx) && !rot.is_none();
+        let persist_result = self
+            .rotation_db
+            .as_ref()
+            .ok_or_else(|| "回転DBを利用できません".to_string())
+            .and_then(|db| {
+                db.set_key(&key, rot)
+                    .map_err(|error| format!("回転を保存できませんでした: {error}"))
+            });
         self.rotation_cache.insert(idx, rot);
-        if let Some(ref db) = self.rotation_db {
-            let _ = db.set_key(&key, rot);
-        }
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
@@ -47851,6 +47867,7 @@ impl App {
                 crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON.to_string(),
             );
         }
+        persist_result
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -67997,6 +68014,7 @@ impl eframe::App for App {
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_edit_bundle_paste_confirm_dialog(ctx);
+        self.show_bulk_page_edit_dialog(ctx);
         self.show_delete_progress_dialog(ctx);
         self.show_batch_convert_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);

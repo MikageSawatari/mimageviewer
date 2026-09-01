@@ -352,6 +352,9 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        // 一括編集が中央DBへcommit済みなら、成功 outcome をsidecarへ反映してから
+        // 後段の終了時flushへ渡す。未着手の次itemはcancelで開始しない。
+        self.finish_bulk_page_edit_for_exit();
         // 明示メタ情報転送を先にキャンセルして worker を join する。import は現在項目の
         // transaction 境界まで、export は原子的 publish 前までで止まり、その後の終了時
         // DB flush と競合しない。

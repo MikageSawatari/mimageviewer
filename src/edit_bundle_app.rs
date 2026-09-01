@@ -9,6 +9,27 @@ use crate::edit_bundle::{
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 
+#[derive(Clone, Copy)]
+pub(crate) struct PageEditUndoInvalidation {
+    pub(crate) adjustment: bool,
+    pub(crate) mask: bool,
+    pub(crate) conceal: bool,
+    pub(crate) local_adjust: bool,
+    pub(crate) comic: bool,
+}
+
+impl PageEditUndoInvalidation {
+    pub(crate) const fn all() -> Self {
+        Self {
+            adjustment: true,
+            mask: true,
+            conceal: true,
+            local_adjust: true,
+            comic: true,
+        }
+    }
+}
+
 impl App {
     pub(crate) fn is_page_edit_bundle_target(&self, idx: usize) -> bool {
         matches!(
@@ -23,7 +44,7 @@ impl App {
         self.edit_bundle_clipboard.is_some()
     }
 
-    fn known_page_source_size(&self, idx: usize) -> Option<[usize; 2]> {
+    pub(crate) fn known_page_source_size(&self, idx: usize) -> Option<[usize; 2]> {
         if let Some((width, height)) = self.source_dims_for_idx(idx) {
             return Some([
                 width.round().max(1.0) as usize,
@@ -40,7 +61,7 @@ impl App {
         None
     }
 
-    fn edit_bundle_databases_available(&self) -> bool {
+    pub(crate) fn edit_bundle_databases_available(&self) -> bool {
         self.adjustment_db.is_some()
             && self.mask_db.is_some()
             && self.conceal_db.is_some()
@@ -50,6 +71,10 @@ impl App {
     }
 
     pub(crate) fn copy_page_edit_bundle(&mut self, idx: usize) {
+        if self.edit_bundle_bulk_pending.is_some() {
+            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            return;
+        }
         if !self.is_page_edit_bundle_target(idx) {
             return;
         }
@@ -109,6 +134,10 @@ impl App {
     }
 
     pub(crate) fn request_paste_page_edit_bundle(&mut self, idx: usize) {
+        if self.edit_bundle_bulk_pending.is_some() {
+            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            return;
+        }
         if !self.is_page_edit_bundle_target(idx) || self.edit_bundle_clipboard.is_none() {
             return;
         }
@@ -148,7 +177,7 @@ impl App {
         }
     }
 
-    fn page_has_any_bundle_edit(&self, idx: usize, key: &str) -> bool {
+    pub(crate) fn page_has_any_bundle_edit(&self, idx: usize, key: &str) -> bool {
         self.adjusted_page_keys.contains(key)
             || self.mask_page_keys.contains(key)
             || self.conceal_page_keys.contains(key)
@@ -157,7 +186,11 @@ impl App {
             || self.export_crop_pages.contains(&idx)
     }
 
-    fn start_apply_page_edit_bundle(&mut self, request: EditBundlePasteRequest) {
+    pub(crate) fn start_apply_page_edit_bundle(&mut self, request: EditBundlePasteRequest) {
+        if self.edit_bundle_bulk_pending.is_some() {
+            self.show_feedback_toast("複数ページの編集内容を処理しています".to_string());
+            return;
+        }
         if self.edit_bundle_apply_pending.is_some() {
             self.show_feedback_toast("別の編集内容を貼り付けています".to_string());
             return;
@@ -168,6 +201,9 @@ impl App {
             self.show_feedback_toast(
                 "一覧が更新されたため、編集内容の貼り付けをキャンセルしました".to_string(),
             );
+            return;
+        }
+        if self.defer_single_page_edit_apply_for_local_adjust(request.clone()) {
             return;
         }
         let Some(clipboard) = self.edit_bundle_clipboard.clone() else {
@@ -203,7 +239,7 @@ impl App {
         }
     }
 
-    fn commit_page_edit_bundle_to_runtime(
+    pub(crate) fn commit_page_edit_bundle_to_runtime(
         &mut self,
         idx: Option<usize>,
         key: &str,
@@ -279,6 +315,55 @@ impl App {
         }
         // set_local_adjust_layers_for_idx_memory_only が local generation を進める。
         self.mark_comic_dirty();
+    }
+
+    /// bundle の全置換は Undo entry を作らない。その代わり、成功前の編集状態を指す
+    /// 対象ページ・対象種類の履歴だけを破棄する。★ / tag と別ページの履歴は残す。
+    pub(crate) fn invalidate_page_edit_undo_after_bundle_apply(
+        &mut self,
+        requested_idx: usize,
+        current_idx: Option<usize>,
+        key: &str,
+        kinds: PageEditUndoInvalidation,
+    ) {
+        let mut indices = vec![requested_idx];
+        if let Some(current_idx) = current_idx
+            && current_idx != requested_idx
+        {
+            indices.push(current_idx);
+        }
+        self.meta_undo.discard_page_edit_changes(
+            &indices,
+            key,
+            kinds.adjustment,
+            kinds.local_adjust,
+        );
+
+        if kinds.adjustment
+            && self
+                .adjustment_drag_session
+                .as_ref()
+                .is_some_and(|session| indices.contains(&session.fs_idx))
+        {
+            self.adjustment_drag_session = None;
+        }
+
+        let is_current_fullscreen = current_idx.is_some() && current_idx == self.fullscreen_idx;
+        if is_current_fullscreen && kinds.mask {
+            self.erase_undo_stack.clear();
+            self.erase_redo_stack.clear();
+            self.erase_last_undo_at = None;
+        }
+        if is_current_fullscreen && kinds.conceal {
+            self.conceal_undo_stack.clear();
+            self.conceal_redo_stack.clear();
+            self.conceal_last_undo_at = None;
+        }
+        if kinds.comic && self.comic_undo_key.as_deref() == Some(key) {
+            self.comic_undo_stack.clear();
+            self.comic_redo_stack.clear();
+            self.comic_undo_baseline = self.comic_docs.get(key).cloned().unwrap_or_default();
+        }
     }
 
     pub(crate) fn show_edit_bundle_paste_confirm_dialog(&mut self, ctx: &egui::Context) {
@@ -405,6 +490,12 @@ impl App {
                         &pending.request.target_key,
                         pending.request.sidecar_coords.as_ref(),
                         prepared,
+                    );
+                    self.invalidate_page_edit_undo_after_bundle_apply(
+                        pending.request.target_idx,
+                        current_idx,
+                        &pending.request.target_key,
+                        PageEditUndoInvalidation::all(),
                     );
                     self.show_feedback_toast(format!(
                         "{} の編集内容を貼り付けました: {}",
