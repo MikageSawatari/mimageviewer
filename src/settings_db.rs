@@ -35,8 +35,8 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::external_tool::{
-    ExternalTool, ExternalToolId, ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy,
-    VideoPolicy, classify_legacy_recent_launch,
+    DEFAULT_PDF_RENDER_LONG_EDGE, ExternalTool, ExternalToolId, ExternalToolLaunch, PayloadPolicy,
+    SelectionPolicy, SpreadPolicy, VideoPolicy, classify_legacy_recent_launch,
 };
 use crate::settings::{
     FavoriteEntry, LegacyOpenWithApp, RecentApp, Settings, TagDef, Vst3ChainPresetSlot,
@@ -2502,6 +2502,11 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
                 row.pdf_render_long_edge
             ))
         })?;
+        let pdf_render_long_edge = if pdf_render_long_edge == 0 {
+            DEFAULT_PDF_RENDER_LONG_EDGE
+        } else {
+            pdf_render_long_edge
+        };
         let confirmation_threshold = u32::try_from(row.confirmation_threshold).map_err(|_| {
             SettingsDbError::Corrupted(format!(
                 "external_tools.confirmation_threshold out of range: {}",
@@ -4321,6 +4326,24 @@ mod tests {
             loaded.external_tools[2].launch,
             ExternalToolLaunch::OsDefault
         );
+    }
+
+    #[test]
+    fn external_tool_pdf_render_edge_zero_loads_as_default_without_changing_nonzero_values() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.external_tools = nondefault_external_tools();
+        settings.external_tools[0].pdf_render_long_edge = 0;
+
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(
+            loaded.external_tools[0].pdf_render_long_edge,
+            DEFAULT_PDF_RENDER_LONG_EDGE
+        );
+        assert_eq!(loaded.external_tools[1].pdf_render_long_edge, 8192);
+        assert_eq!(loaded.external_tools[2].pdf_render_long_edge, 1024);
     }
 
     #[test]

@@ -115,8 +115,8 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 
 | 機能・入口 | 実ファイル (`Image` / `Video` / `Audio`) | `Folder` | コンテナファイル (`ZipFile` / `PdfFile`) | `ZipImage` | `PdfPage` | `Stack` | `ZipDir` | 保存先・対象ファイルの変更 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **拒否 (P3 まで)**。単独では viewing tool を非表示、editing tool を理由付き disabled にする。実ファイルとの混在時は選択全体を起動前に拒否し、部分起動しない。 | **拒否 (P3 まで)**。`ZipImage` と同じ仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。mIV は実 path を process / association / OS default へ渡すだけで対象 file を変更しない。外部 process が行う変更は mIV 管理外。 |
-| ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P2a では 1 件のままで、`SpreadPolicy` は P4 まで適用しない。ただし spawn 成功前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身でなく子ページが viewer target になるため、親へ fallback しない。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ `settings.db` の tool 定義を読む。mIV は file を書き換えず、外部 process の動作は管理外。 |
+| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `AsDisplayed` で加工がある場合だけ PNG 化し、それ以外の実ファイルはコピーしない。`VideoPolicy::CurrentFrame` は P4 まで適用せず動画本体を渡す。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応 (P3)**。`Original` または無加工の `AsDisplayed` は元バイト列を一時展開し、加工ありは PNG、`Container` は外側の元書庫を渡す。`RealFileOnly` は非表示。編集用 tool は `Container` 以外を同期判定で無効化し、native / egui menu の hover で理由を表示する。worker でも temp 出力を拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応 (P3)**。`Original` / `AsDisplayed` はツール指定長辺で PNG、`Container` は PDF 本体を渡す。`RealFileOnly` と編集用 tool の扱いは `ZipImage` と同じ。 | **対応 (P3)**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
+| ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P4 までは現在ページ 1 件で、`SpreadPolicy` 3 値は適用しない。ただし起動完了前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身は viewer leaf にしない。現在の ZIP / PDF page で `Container` を選んだ場合は各 page セルのとおり親本体を渡す。 | **対応 (P3)**。現在の ZIP page をグリッドと同じ materializer へ渡す。`Container` は外側の元書庫を渡す。 | **対応 (P3)**。現在の PDF page をグリッドと同じ materializer へ渡す。`Container` は PDF 本体を渡す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ tool 定義・worker・一時ファイル寿命を使う。mIV は元 file を書き換えない。 |
 
 `SelectionPolicy::Single` は対象が 1 件のときだけ渡し、2 件以上なら全体を拒否する。既定の `Each` は
 1 件ずつ、`Batch` は全件を 1 回で渡す。
@@ -131,9 +131,10 @@ P2b-1 の `ExternalToolPicker` / `ExternalTool1` .. `ExternalTool10` /
 最後は現在の `effective_folder()` からフォルダー / 本 1 件を解決する。変換アーカイブでは変換 cache ZIP
 でなく元アーカイブを渡し、検索・タグ・履歴・snapshot 等の集約ビュー背景では単一の現在地を決めず
 拒否する。右クリックは登録済みの全ツールを平坦に並べ、フォルダー背景と
-コンテナー項目だけ対象をコンテナー 1 件へ切り替える。これらの入口を追加しても、ページ対象に含まれる
-仮想ページの P3 までの全体拒否は変わらない。P2b-2 で一度追加したツールバー / メニューバーの
-直接起動は P2c で撤去し、導線は右クリックと固定キースロットに絞った。
+コンテナー項目だけ対象をコンテナー 1 件へ切り替える。P3 ではページ対象に含まれる `ZipImage` /
+`PdfPage` を materializer へ渡せるため、実ファイルとの混在を含む暫定全体拒否を解除した。
+`RealFileOnly` や `ZipDir` は capability 判定で拒否する。P2b-2 で一度追加したツールバー /
+メニューバーの直接起動は P2c で撤去し、導線は右クリックと固定キースロットに絞った。
 
 ## 5. スマートフォルダと検索
 
@@ -209,10 +210,10 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
     classifier は拡張子が厳密に `zip` の場合しか索引しない。そのため同じ `ZipFile` variant
     でも `.cbz` は検索されない (`src/folder_tree.rs:137-141`,
     `src/name_bulk_indexer.rs:339-362`)。
-13. **ExternalTool × virtual page / `Stack` / `ZipDir`** — P3 の実体化までは仮想対象として扱う。
-    単独では閲覧 tool が menu から消え、編集 tool だけ理由付き disabled になる。実項目との混在では
-    tool の入口を残すが、起動境界で選択全体を理由付き拒否する。親 fallback や部分実行はない
-    (`LaunchTarget::Virtual`, `virtual_target_error`)。
+13. **ExternalTool × virtual page / `Stack` / `ZipDir` (P3 で一部解消)** — `ZipImage` / `PdfPage` は
+    実体化、`Stack` は全 member 展開により対応した。`RealFileOnly` は仮想 page で非表示、元 file 以外を
+    渡す編集用 tool は理由付き disabled + worker 最終拒否になる。`ZipDir` は未対応のため、実項目との
+    混在でも親 fallback / 部分実行をせず全体を拒否する (`MaterializeSource`, `validate_materializable_targets`)。
 14. **ExternalTool × checked selection × menu 対象全種別 (P2a で解消)** — menu 構築時に checked
     全件を `current_grid_order()` 順で snapshot し、右クリック項目が checked 内なら先頭へ移す。
     menu 表示後に checked が変わっても dispatch は同じ snapshot を使い、`SelectionPolicy` を適用する

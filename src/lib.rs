@@ -129,6 +129,7 @@ pub mod logger;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
+pub mod materializer;
 pub mod metadata_cleanup;
 pub mod modifier_ownership;
 mod modifier_probe;

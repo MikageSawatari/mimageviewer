@@ -11635,6 +11635,10 @@ pub struct App {
     /// 外部ツールの process spawn を UI スレッド外で行う、操作単位の短命 worker。
     /// `Each` の複数結果は各 pending 内で集約し、別々の利用者操作はこの Vec で並行保持する。
     pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
+    /// 仮想ページの実体化から spawn までを所有する P3 worker。新要求は世代を進めて旧要求を破棄する。
+    pub(crate) external_tool_materializer: crate::materializer::Materializer,
+    pub(crate) external_tool_materialize_pending:
+        Vec<crate::external_tool::ExternalMaterializePending>,
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_launch_confirmation:
         Option<crate::external_tool::ExternalLaunchConfirmation>,
@@ -14199,6 +14203,8 @@ impl App {
             pdf_placeholder_count: None,
             cached_handlers: None,
             external_tool_launch_pending: Vec::new(),
+            external_tool_materializer: crate::materializer::Materializer::new(),
+            external_tool_materialize_pending: Vec::new(),
             external_tool_launch_confirmation: None,
             external_tool_picker: None,
             cached_nav_indices: None,
@@ -15837,6 +15843,7 @@ impl App {
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
             self.external_tool_launch_confirmation.is_some() => "external_tool_launch_confirmation",
             self.external_tool_picker.is_some() => "external_tool_picker",
+            !self.external_tool_materialize_pending.is_empty() => "external_tool_materialize_progress",
             self.show_settings_restore => "settings_restore",
             self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
             self.show_operation_customize => "operation_customize",
@@ -67582,6 +67589,7 @@ impl eframe::App for App {
         self.show_preferences_dialog(ctx);
         self.show_external_tool_picker(ctx);
         self.show_external_tool_launch_confirmation(ctx);
+        self.show_external_tool_materialize_progress(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
@@ -68745,6 +68753,10 @@ impl eframe::App for App {
         crate::key_debug::render_overlay(ctx);
         self.show_remote_session_dialog(ctx);
         self.show_remote_connection_dialog(ctx);
+        // progress UI の Cancel / Esc と、その後の late-frame items mutation の双方を
+        // 確定してから spawn 境界を ACK する。progress より後に積まれた新要求は
+        // UI checkpoint 未通過なので次 frame まで ACK されない。
+        self.authorize_external_tool_launch_boundaries_after_ui();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

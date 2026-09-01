@@ -843,12 +843,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui,
                 "external_tool_pdf_edge",
                 &mut tool.pdf_render_long_edge,
-                &[
-                    (0, "表示相当"),
-                    (2048, "2048"),
-                    (4096, "4096"),
-                    (8192, "8192"),
-                ],
+                &[(2048, "2048"), (4096, "4096"), (8192, "8192")],
             );
             ui.end_row();
         });

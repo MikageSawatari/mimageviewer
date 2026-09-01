@@ -180,6 +180,11 @@ mod windows_impl {
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::{OleSetClipboard, ReleaseStgMedium};
+    use windows::Win32::UI::Controls::{
+        ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_ABSOLUTE,
+        TTF_TRACK, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
+        TTM_TRACKPOSITION, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    };
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
         BHID_SFUIObject, CFSTR_PREFERREDDROPEFFECT, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
@@ -188,12 +193,14 @@ mod windows_impl {
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetCursorPos, HMENU, MF_BYPOSITION,
-        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
-        WM_MENUCHAR,
+        AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DeleteMenu, DestroyMenu,
+        DestroyWindow, GetCursorPos, HMENU, HWND_TOPMOST, MF_BYPOSITION, MF_GRAYED, MF_POPUP,
+        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_STYLE,
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT, WS_EX_TOPMOST,
+        WS_POPUP,
     };
-    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
+    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
 
     const SUBCLASS_ID: usize = 0x6d69_7643; // "mivC"
     const SLOW_NATIVE_MENU_STAGE_LOG_MS: f64 = 120.0;
@@ -398,9 +405,13 @@ mod windows_impl {
 
         let stage_t0 = Instant::now();
         let mut leaf_index = 0;
-        if let Err(reason) =
-            append_miv_menu_nodes(menu.handle(), &request.miv_items, &mut leaf_index)
-        {
+        let mut disabled_reasons = std::collections::HashMap::new();
+        if let Err(reason) = append_miv_menu_nodes(
+            menu.handle(),
+            &request.miv_items,
+            &mut leaf_index,
+            &mut disabled_reasons,
+        ) {
             return NativeContextMenuResult::Fallback { reason };
         }
         emit_native_menu_timing(
@@ -492,15 +503,29 @@ mod windows_impl {
         }
 
         let stage_t0 = Instant::now();
-        let forwarder = shell_menu
+        let shell_forwarder = shell_menu
             .as_ref()
             .map(|menu| ContextMenuMessageForwarder::new(menu, lazy_shell_submenu));
-        let _subclass_guard = match forwarder.as_ref() {
-            Some(forwarder) => match MenuSubclassGuard::install(hwnd, forwarder) {
-                Ok(guard) => guard,
-                Err(reason) => return NativeContextMenuResult::Fallback { reason },
-            },
-            None => None,
+        let tooltip = if disabled_reasons.is_empty() {
+            None
+        } else {
+            match TrackedMenuTooltip::new(hwnd, disabled_reasons) {
+                Ok(tooltip) => Some(RefCell::new(tooltip)),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: disabled reason tooltip unavailable: {error}"
+                    ));
+                    None
+                }
+            }
+        };
+        let message_state = MenuMessageState {
+            shell: shell_forwarder,
+            tooltip,
+        };
+        let _subclass_guard = match MenuSubclassGuard::install(hwnd, &message_state) {
+            Ok(guard) => guard,
+            Err(reason) => return NativeContextMenuResult::Fallback { reason },
         };
         emit_native_menu_timing(
             "show_subclass",
@@ -540,6 +565,7 @@ mod windows_impl {
             )
             .0 as u32
         };
+        message_state.hide_tooltip();
         emit_native_menu_timing(
             "show_track_popup_block",
             Some(target_kind),
@@ -549,7 +575,8 @@ mod windows_impl {
             &[("selected_id", Value::from(selected as u64))],
         );
         if selected == 0 {
-            if let Some(reason) = forwarder
+            if let Some(reason) = message_state
+                .shell
                 .as_ref()
                 .and_then(ContextMenuMessageForwarder::lazy_query_error)
             {
@@ -950,6 +977,7 @@ mod windows_impl {
         menu: HMENU,
         nodes: &[MenuNode],
         leaf_index: &mut usize,
+        disabled_reasons: &mut std::collections::HashMap<u32, String>,
     ) -> Result<(), String> {
         for node in nodes {
             match node {
@@ -957,11 +985,22 @@ mod windows_impl {
                     unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
                         .map_err(|error| format!("AppendMenuW(mIV separator) failed: {error}"))?;
                 }
-                MenuNode::Item { label, enabled, .. } => {
+                MenuNode::Item {
+                    label,
+                    enabled,
+                    disabled_reason,
+                    ..
+                } => {
                     let id = miv_command_id(*leaf_index)
                         .ok_or_else(|| "too many mIV context menu commands".to_string())?;
                     append_menu_string(menu, id, label, *enabled)
                         .map_err(|error| format!("AppendMenuW(mIV) failed: {error}"))?;
+                    record_disabled_reason(
+                        disabled_reasons,
+                        id,
+                        *enabled,
+                        disabled_reason.as_deref(),
+                    );
                     *leaf_index += 1;
                 }
                 MenuNode::Submenu { label, children } => {
@@ -969,7 +1008,7 @@ mod windows_impl {
                         MenuGuard::new(unsafe { CreatePopupMenu() }.map_err(|error| {
                             format!("CreatePopupMenu(submenu) failed: {error}")
                         })?);
-                    append_miv_menu_nodes(child.handle(), children, leaf_index)?;
+                    append_miv_menu_nodes(child.handle(), children, leaf_index, disabled_reasons)?;
                     let escaped = label.replace('&', "&&");
                     let wide = wide_null(&escaped);
                     unsafe {
@@ -987,6 +1026,20 @@ mod windows_impl {
             }
         }
         Ok(())
+    }
+
+    fn record_disabled_reason(
+        reasons: &mut std::collections::HashMap<u32, String>,
+        command_id: u32,
+        enabled: bool,
+        reason: Option<&str>,
+    ) {
+        if !enabled
+            && let Some(reason) = reason
+            && !reason.is_empty()
+        {
+            reasons.insert(command_id, reason.to_string());
+        }
     }
 
     fn append_menu_string(
@@ -1332,17 +1385,222 @@ mod windows_impl {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MenuTooltipSelection {
+        Hide,
+        Show(u32),
+    }
+
+    fn menu_tooltip_selection(wparam: usize, lparam: isize) -> MenuTooltipSelection {
+        let command_id = (wparam & 0xffff) as u32;
+        let flags = ((wparam >> 16) & 0xffff) as u32;
+        if (flags == 0xffff && lparam == 0)
+            || flags & MF_POPUP.0 != 0
+            || flags & MF_SEPARATOR.0 != 0
+        {
+            MenuTooltipSelection::Hide
+        } else {
+            MenuTooltipSelection::Show(command_id)
+        }
+    }
+
+    fn pack_track_position(x: i32, y: i32) -> isize {
+        let x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        let y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        (x | (y << 16)) as isize
+    }
+
+    struct TrackedMenuTooltip {
+        owner: HWND,
+        hwnd: HWND,
+        reasons: std::collections::HashMap<u32, String>,
+        text: Vec<u16>,
+        active_id: Option<u32>,
+    }
+
+    impl TrackedMenuTooltip {
+        fn new(
+            owner: HWND,
+            reasons: std::collections::HashMap<u32, String>,
+        ) -> Result<Self, String> {
+            let common_controls = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_BAR_CLASSES,
+            };
+            if !unsafe { InitCommonControlsEx(&common_controls) }.as_bool() {
+                return Err(format!(
+                    "InitCommonControlsEx(tooltip) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOPMOST,
+                    TOOLTIPS_CLASSW,
+                    PCWSTR::null(),
+                    WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    Some(owner),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|error| format!("CreateWindowExW(tooltip) failed: {error}"))?;
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+            unsafe { SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(500))) };
+            Ok(Self {
+                owner,
+                hwnd,
+                reasons,
+                text: Vec::new(),
+                active_id: None,
+            })
+        }
+
+        fn tool_info(&mut self) -> TTTOOLINFOW {
+            TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                hwnd: self.owner,
+                uId: 1,
+                lpszText: PWSTR(self.text.as_mut_ptr()),
+                ..Default::default()
+            }
+        }
+
+        fn handle_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) {
+            match menu_tooltip_selection(wparam.0, lparam.0) {
+                MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id) => self.show(id),
+                MenuTooltipSelection::Hide | MenuTooltipSelection::Show(_) => self.hide(),
+            }
+        }
+
+        fn show(&mut self, id: u32) {
+            if self.active_id == Some(id) {
+                return;
+            }
+            self.hide();
+            let Some(reason) = self.reasons.get(&id).cloned() else {
+                return;
+            };
+            self.text = wide_null(&reason);
+            let tool_info = self.tool_info();
+            let added = unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_ADDTOOLW,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                )
+            };
+            if added.0 == 0 {
+                self.text.clear();
+                return;
+            }
+            let mut cursor = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut cursor) };
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKPOSITION,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(pack_track_position(cursor.x + 12, cursor.y + 20))),
+                );
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKACTIVATE,
+                    Some(WPARAM(1)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+            }
+            self.active_id = Some(id);
+        }
+
+        fn hide(&mut self) {
+            if self.active_id.is_none() {
+                return;
+            }
+            let tool_info = self.tool_info();
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKACTIVATE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+                SendMessageW(
+                    self.hwnd,
+                    TTM_DELTOOLW,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+            }
+            self.active_id = None;
+            self.text.clear();
+        }
+    }
+
+    impl Drop for TrackedMenuTooltip {
+        fn drop(&mut self) {
+            self.hide();
+            let _ = unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+
+    struct MenuMessageState {
+        shell: Option<ContextMenuMessageForwarder>,
+        tooltip: Option<RefCell<TrackedMenuTooltip>>,
+    }
+
+    impl MenuMessageState {
+        fn needs_subclass(&self) -> bool {
+            self.tooltip.is_some()
+                || self
+                    .shell
+                    .as_ref()
+                    .is_some_and(ContextMenuMessageForwarder::needs_subclass)
+        }
+
+        fn hide_tooltip(&self) {
+            if let Some(tooltip) = &self.tooltip {
+                tooltip.borrow_mut().hide();
+            }
+        }
+
+        unsafe fn forward(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+            if msg == WM_MENUSELECT
+                && let Some(tooltip) = &self.tooltip
+            {
+                tooltip.borrow_mut().handle_menu_select(wparam, lparam);
+            }
+            self.shell
+                .as_ref()
+                .and_then(|shell| unsafe { shell.forward(msg, wparam, lparam) })
+        }
+    }
+
     struct MenuSubclassGuard {
         hwnd: HWND,
         installed: bool,
     }
 
     impl MenuSubclassGuard {
-        fn install(
-            hwnd: HWND,
-            forwarder: &ContextMenuMessageForwarder,
-        ) -> Result<Option<Self>, String> {
-            if !forwarder.needs_subclass() {
+        fn install(hwnd: HWND, state: &MenuMessageState) -> Result<Option<Self>, String> {
+            if !state.needs_subclass() {
                 return Ok(None);
             }
             let installed = unsafe {
@@ -1350,7 +1608,7 @@ mod windows_impl {
                     hwnd,
                     Some(context_menu_subclass_proc),
                     SUBCLASS_ID,
-                    forwarder as *const ContextMenuMessageForwarder as usize,
+                    state as *const MenuMessageState as usize,
                 )
                 .as_bool()
             };
@@ -1380,8 +1638,8 @@ mod windows_impl {
         ref_data: usize,
     ) -> LRESULT {
         if ref_data != 0 {
-            let forwarder = unsafe { &*(ref_data as *const ContextMenuMessageForwarder) };
-            if let Some(result) = unsafe { forwarder.forward(msg, wparam, lparam) } {
+            let state = unsafe { &*(ref_data as *const MenuMessageState) };
+            if let Some(result) = unsafe { state.forward(msg, wparam, lparam) } {
                 return result;
             }
         }
@@ -1391,6 +1649,47 @@ mod windows_impl {
     #[cfg(test)]
     mod data_object_smoke_test {
         use super::*;
+
+        #[test]
+        fn disabled_reason_map_records_only_disabled_nonempty_leaf_reasons() {
+            let mut reasons = std::collections::HashMap::new();
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST, false, Some("reason"));
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 1, true, Some("enabled"));
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 2, false, None);
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 3, false, Some(""));
+            assert_eq!(
+                reasons,
+                std::collections::HashMap::from([(MIV_ID_FIRST, "reason".to_string())])
+            );
+        }
+
+        #[test]
+        fn menu_selection_shows_only_plain_command_ids_and_hides_menu_metadata() {
+            let pack = |id: u32, flags: u32| (id as usize) | ((flags as usize) << 16);
+            assert_eq!(
+                menu_tooltip_selection(pack(MIV_ID_FIRST, 0), 1),
+                MenuTooltipSelection::Show(MIV_ID_FIRST)
+            );
+            assert_eq!(
+                menu_tooltip_selection(pack(2, MF_POPUP.0), 1),
+                MenuTooltipSelection::Hide
+            );
+            assert_eq!(
+                menu_tooltip_selection(pack(0, MF_SEPARATOR.0), 1),
+                MenuTooltipSelection::Hide
+            );
+            assert_eq!(
+                menu_tooltip_selection(0xffff_0000, 0),
+                MenuTooltipSelection::Hide
+            );
+        }
+
+        #[test]
+        fn tooltip_track_position_preserves_signed_screen_coordinates() {
+            let packed = pack_track_position(-12, 345);
+            assert_eq!((packed as u32 & 0xffff) as u16 as i16, -12);
+            assert_eq!(((packed as u32 >> 16) & 0xffff) as u16 as i16, 345);
+        }
 
         #[test]
         fn cross_folder_clipboard_data_object_exposes_preferred_move_effect() {

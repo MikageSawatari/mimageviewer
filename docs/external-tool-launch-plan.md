@@ -393,7 +393,8 @@ ACL 保護下の到達できないパスとして保存されていた。3 件�
 フォルダー / ZIP / PDF / 変換アーカイブのコンテナー項目から **1 件だけ**を渡し、checked 選択へは
 広げない。背景からの起動は `effective_folder()` を正本とし、変換アーカイブでは変換 cache ZIP でなく
 元アーカイブを渡す。検索・タグ・履歴・snapshot 等、現在地を 1 コンテナーに定められない集約ビューの
-背景では起動を拒否する。ページ対象の仮想ページ全体拒否は P3 まで継続する (§4.5)。
+背景では起動を拒否する。ページ対象の仮想ページ全体拒否は P3 で解除済みで、実体化できる
+ZIP / PDF ページは `PayloadPolicy` に従って渡す (§4.3、§4.5)。
 
 
 **連結読み中はどうするか (2026-08-29 調査)**
@@ -425,7 +426,7 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 
 したがって**連結読みでも起動できるようにする**。
 
-> **⚠ 以下の段落は P4 の姿** (`SpreadPolicy` を入れた後)。**P2 では見開き中でも現在ページ 1 件**を
+> **⚠ 以下の段落は P4 の姿** (`SpreadPolicy` を入れた後)。**P3 までは見開き中でも現在ページ 1 件**を
 > 渡す (§4.5 の 2026-08-31 決定)。
 
 ページの選び方は Ctrl+S / Ctrl+E と同じ
@@ -460,7 +461,7 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 - 焼き込みコスト (デコード + 再エンコード) を、実際に加工されている項目にだけ払う。
 - 画像編集ソフトへ渡したとき、**元ファイルを直接編集できる** (§4.8 の round-trip が成立する)。
 
-見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる (**P4 から**。P2 では現在ページ 1 件)。
+見開き表示中は `SpreadPolicy::Merged` が既定 (§4.5) なので合成 1 枚になる (**P4 から**。P3 までは現在ページ 1 件)。
 合成には対応する元ファイルが存在しないため、この場合は常に焼き込みになる。
 
 `VideoPolicy` — **動画は別軸にする。**「見えているもの」が動画そのものかフレームかが曖昧で、
@@ -481,14 +482,25 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 | 加工なしの ZIP エントリ | **元バイト列をそのまま**書き出す (製本 [books.rs:916](../src/books.rs:916) と同じ) | 無し。無劣化 |
 | 加工ありのページ | 焼き込んで PNG (`CompositeSource` + `BakedEditSnapshot` を再利用) | 無し (製本と同じ経路) |
 | PDF ページ | PNG へレンダリング | 解像度は**ツールごとに選べる。既定は長辺 4096** (製本と同じ)。選択肢は **2048 / 4096 / 8192 のみ** |
+| 動画フレーム | PNG (`capture_frame()` → encode) | 既定 PNG。品質はキャプチャ設定を流用 |
+| 見開き合成 | `RenderedSpread` を PNG 化 (エクスポート [export_dialog.rs:129](../src/export_dialog.rs:129) を再利用) | 無し |
+
+**P3 実装済み (2026-09-01)。** 汎用の [`materializer.rs`](../src/materializer.rs) が上表の
+出力判断、ZIP 展開、PDF / 画像 decode、`BakedEditSnapshot` による焼き込み、PNG encode を担う。
+UI は軽量な request snapshot だけを作り、補正 DB の read-only open と読み込みを含む実体化処理は
+`external-tool-materialize` worker 上で行う。`ExternalTool` 起動側は実体化後の実 path だけを既存の
+`Executable` / `Association` / `OsDefault` 境界へ渡す。worker は spawn / Invoke の直前に UI へ
+launch-boundary 通知を返し、UI が items generation と起動元 viewer target を再検証して ACK した場合だけ
+起動する。ACK は同じ frame の進捗 modal が Cancel / Esc を処理し、その後の items mutation も
+すべて終えた frame tail でだけ返す。進捗表示より後に積まれた新要求は次 frame の UI checkpoint
+まで ACK せず、ACK 後はキャンセル操作を表示しない。これにより navigation と次の poll の競合でも
+古い対象を起動せず、起動境界に到達した frame のキャンセルも spawn より先に確定する。
 
 **「表示相当」は選択肢に入れない (2026-09-01 決定)。** P1 の実装で `0 = 表示相当` という
 選択肢だけが入り、正本にも意味の定義が無かった。実装上も `render_page(.., 0, ..)` は
 実質 1px になる。**そもそもグリッドやキースロットからの起動には「表示」が存在しない**
 (viewport があるのはフルスクリーンだけ) ため、大半の入口で定義できない。
 正しく実装すると viewport 経路まで範囲が広がる。保存済みの `0` は **4096 として読む**。
-| 動画フレーム | PNG (`capture_frame()` → encode) | 既定 PNG。品質はキャプチャ設定を流用 |
-| 見開き合成 | `RenderedSpread` を PNG 化 (エクスポート [export_dialog.rs:129](../src/export_dialog.rs:129) を再利用) | 無し |
 
 **AI アップスケール結果は焼き込まない** (利用者判断 2026-08-29)。表示中に AI 拡大が効いていても、
 外部ツールへ渡すのは等倍。AI アップスケールは**自分の表示用**という位置づけで、製本と同じ扱いに揃える。
@@ -587,7 +599,8 @@ SumatraPDF で同上:                       -page {page} "{container}"
   理由は、ファイル操作 (コピー / 削除 / D&D) で同じ判断を既にしているため
   ([context-menu-unification-plan.md](context-menu-unification-plan.md) §1 の 8)。
   5 件選んで 3 件だけ Photoshop が開く方が、何も起きないより分かりにくい。
-  **P3 でページを実体化できるようになったらこの制限は消える**ので、暫定である旨をコード側にも残す。
+  **P3 実装後は、実体化できる ZIP / PDF ページと実ファイルの混在ではこの全体拒否を外し、全件を
+  `SelectionPolicy` へ渡す。** `ZipDir` など実体化できない項目を含む集合は引き続き全体を拒否する。
 
 `SpreadPolicy` (連結読み・見開き表示中のみ)。**選べるようにし、既定は合成 1 枚**
 (利用者判断 2026-08-29。「利用者に見えているものをそのまま渡す」が期待される動作なので)。
@@ -604,7 +617,7 @@ SumatraPDF で同上:                       -page {page} "{container}"
 - **`SpreadPolicy` は 3 値まとめて P4 で入れる** (2026-08-31 決定)。既定が `Merged` で、その合成が P4 に
   ある以上、`BothPages` / `MainPageOnly` だけ先に入れると**既定値だけが設定どおりに動かない**版が
   1 つできる。それは設定画面に嘘が出るのと同じ。
-  **P2 の間、フルスクリーンからの起動は現在ページ 1 件**を渡す (今の挙動のまま)。
+  **P3 まで、フルスクリーンからの起動は現在ページ 1 件**を渡す (今の挙動のまま)。
 
 ### 4.6 一時ファイルの寿命
 
@@ -624,7 +637,10 @@ SumatraPDF で同上:                       -page {page} "{container}"
      **mIV が 2 つ同時に走ることは実際にある**ため、全消しは相手の使用中ファイルを消す。
      単一起動 mutex はポータブル版とインストール版で分離してあり (ポータブル版の要件)、
      `--data-dir` の隔離起動も通常版の隣で動く。両方が `%TEMP%` を使う構成は今は無いが、
-     「生きている PID のものは触らない」なら将来どう組み合わせても壊れない
+     「生きている別 PID のものは触らない」なら将来どう組み合わせても壊れない。
+     ただし起動掃除より前から存在する**現プロセスと同じ PID 名**のディレクトリは、PID 再利用で残った
+     stale directory と確定できるため、最初の process directory 作成前に掃除する。PID の生死を
+     問い合わせられない場合は alive 扱いとし、別プロセスの directory を推測で消さない
   3. `keep_temp` が立つツールで作ったものは 1 の対象外にし、次回起動時の 2 で回収する
 - 掃除はワーカーで行う。UI スレッドでディレクトリ走査・削除をしない。
 
@@ -645,6 +661,16 @@ SumatraPDF で同上:                       -page {page} "{container}"
 | 展開中にキャンセル | ワーカーが自分で消す |
 | 展開完了・**起動前**にキャンセル | 要求を捨てるときに消す |
 | **起動後** | **消さない。** mIV 終了時にディレクトリごと |
+
+**P3 実装済み (2026-09-01)。** `Materializer` は source の mtime / size、出力の mtime / size、
+policy、PDF 長辺、編集 fingerprint を照合して同じ出力を再利用する。mtime / size のどちらかを
+取得できない場合は再利用しない。起動要求が所有する
+RAII temp lease は `create_new` で path を claim し、handoff 前の cancel / 失敗 / stale 世代で
+予約を保持したまま自分が作ったファイルだけを削除する。出力 stamp は予約 handle を閉じた後に取得し、
+spawn / Invoke 成功後だけ process directory 所有へ移す。
+cache hit は process-owned file の借用なので、失敗した要求が削除しない。起動時の孤児回収は dead PID
+(および process directory 作成前から存在する現 PID 名) の `ext-*` だけを対象にし、終了時の掃除と
+ともに root / process directory を列挙前に検証して reparse point を辿らない worker で実行する。
 
 ### 4.7 起動と失敗通知
 
@@ -677,6 +703,9 @@ temp を編集しても元の ZIP / PDF / 動画には戻らないので、黙�
 - メニューでは**無効表示 (グレー) + 理由のツールチップ**にする。ここは §4.9 の
   「無効なツールは積まない」の例外にする。利用者は「このツールで編集できる」と思っているので、
   黙って消えるより理由が見えた方がよい。
+  P3 の native `HMENU` は既存の window subclass で `WM_MENUSELECT` を受け、無効 leaf の command ID に
+  対応する理由を tracking tooltip としてカーソル付近へ表示する。submenu / separator / menu close では
+  消し、native menu 構築失敗時の egui fallback も disabled hover で同じ理由を表示する。
 - ZipPla の「外部プログラムが終了するまで先読みを停止」は、mIV では編集用フラグの立ったツールに
   実ファイルを渡している間だけ、その項目の再読み込みを抑制する形で検討する (P5)。
 
@@ -747,7 +776,8 @@ P2b-1 のコンテナー入口でも、この **平坦なツール一覧をそ�
 **P2b-1 実装済み (2026-09-01)。** これらは main-window の Grid 専用 action とし、既定キーは
 すべて未設定にする。`ExternalToolPicker` と `ExternalTool1` .. `ExternalTool10` は checked 優先・
 無ければ selected のページ対象、`ExternalToolForContainer` は §4.2 のコンテナー対象を使う。
-ピッカーは表示前に対象の有無と仮想ページ拒否を検証し、表示時点の対象 snapshot に対して起動する。
+ピッカーは表示前に対象の有無と tool / item capability を検証し、表示時点の対象 snapshot に対して
+起動する。P3 では ZIP / PDF page も実体化可能な payload なら候補に含める。
 **P2b-2 では一度ツールバーと「ファイル ▸ 外部ツール」を実装したが、同日の P2c で撤去済み。**
 P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起動する旨の設定 UI 説明だけを残す。
 
@@ -788,7 +818,7 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 | **P2b-1 (実装済み 2026-09-01)** | Grid 専用の固定キースロット / ピッカー UI、フォルダー背景・コンテナー項目からコンテナー 1 件を渡す入口。右クリックの平坦なツール一覧は維持 | S |
 | **P2b-2 (2026-09-01 に一度実装)** | ツールバーのセクション、メニューバー「ファイル ▸ 外部ツール」、`OsDefault + Batch` の設定 UI 説明。前二者は P2c で撤去 | S |
 | **P2c (実装済み 2026-09-01)** | 導線を右クリック + 固定キースロットへ整理、全登録ツールを右クリックへ表示、`Single` の複数拒否、既定 `Each`、ツール別の確認 / 上限、`Executable + Batch` のコマンドライン長検査 | S |
-| **P3** | 一時実体化基盤 (ワーカー + キャンセル + 寿命管理 + 孤児回収)、`PayloadPolicy`、**編集用ツールのガード** (§4.8) | L |
+| **P3 (実装済み 2026-09-01)** | 汎用の一時実体化基盤 (ワーカー + 進捗 / キャンセル + 世代管理 + 寿命管理 + PID-scoped 孤児回収)、`PayloadPolicy`、ZIP / PDF page と Stack の対象化、**編集用ツールの 2 段ガード** (§4.8) | L |
 | **P4** | `VideoPolicy::CurrentFrame`、**`SpreadPolicy` 3 値まとめて** (`Merged` の合成を含む。§4.5 の 2026-08-31 決定)、`{container}`/`{entry}`/`{page}`/`{time}` | M |
 | **P5** | round-trip の残り (実ファイルの mtime 監視 + 再読み込み) | M |
 

@@ -122,15 +122,22 @@ impl RotationDb {
     ///
     /// ZIP/PDF ページのように実ファイルパスだけでは一意にならない対象で使う。
     pub fn get_key(&self, key: &str) -> Option<Rotation> {
+        self.get_key_checked(key).ok().flatten()
+    }
+
+    /// 正規化済みページキーから回転角度を取得し、DB/query failure を呼び出し側へ返す。
+    /// 元ファイルを外部編集へ渡せるかの最終 guard など、失敗を「回転なし」と扱えない経路で使う。
+    pub fn get_key_checked(&self, key: &str) -> Result<Option<Rotation>, rusqlite::Error> {
+        use rusqlite::OptionalExtension as _;
+
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT angle FROM rotations WHERE path = ?1")
-            .ok()?;
+            .prepare_cached("SELECT angle FROM rotations WHERE path = ?1")?;
         stmt.query_row([key], |row| {
             let deg: i32 = row.get(0)?;
             Ok(Rotation::from_degrees(deg))
         })
-        .ok()
+        .optional()
     }
 
     /// 正規化済みページキーをchunked IN queryで一括取得する。

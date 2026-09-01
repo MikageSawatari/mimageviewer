@@ -1557,7 +1557,11 @@ impl crate::app::App {
                     self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
                     return None;
                 };
-                self.queue_external_tool_launch_targets(&tool, &target.external_tool_targets);
+                self.queue_external_tool_launch_targets_from_context_menu(
+                    &tool,
+                    &target.external_tool_targets,
+                    target.surface == ContextMenuSurface::Fullscreen,
+                );
                 None
             }
             MenuCommand::OpenWithAssociation {
@@ -2735,7 +2739,7 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn external_tool_mixed_checked_selection_is_rejected_before_partial_launch() {
+    fn external_tool_mixed_checked_selection_is_materializable_after_p3() {
         let mut app = crate::app::setup_app_for_test();
         let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
         tool.id = crate::external_tool::ExternalToolId(7);
@@ -2770,19 +2774,14 @@ mod delete_confirm_tests {
                 }
             )
         }));
-        let action = app.dispatch_native_grid_context_command(
-            &egui::Context::default(),
-            MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
-            &target,
-        );
-
-        assert!(action.is_none());
-        assert!(app.external_tool_launch_pending.is_empty());
-        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
-            text.contains("test-tool")
-                && text.contains("ページは外部ツールで開くことができません")
-                && text.contains("ページの選択を外してから")
-        }));
+        assert!(matches!(
+            &target.external_tool_targets[..],
+            [
+                crate::external_tool::LaunchTarget::ImagePage(_),
+                crate::external_tool::LaunchTarget::PdfPage { page_num: 2, .. }
+            ]
+        ));
+        assert!(app.fs_feedback_toast.is_none());
     }
 
     #[test]
