@@ -2396,7 +2396,9 @@ impl ContainerEngine {
                 .local_adjust
                 .map_or(crate::edit_source::EditLayer::Absent, |layers| {
                     crate::edit_source::EditLayer::Materialize(
-                        crate::edit_source::LocalAdjustMaterialize { layers },
+                        crate::edit_source::LocalAdjustMaterialize {
+                            layers: local_adjust_core::LocalAdjustmentLayers::new(layers),
+                        },
                     )
                 });
         let conceal = edits

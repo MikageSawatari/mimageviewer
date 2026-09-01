@@ -460,8 +460,8 @@ impl App {
     pub(crate) fn capture_local_adjustment_undo(
         &mut self,
         idx: usize,
-        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
-        after: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        after: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
         self.push_local_adjustment_undo_entry(
@@ -473,10 +473,17 @@ impl App {
     pub(crate) fn set_local_adjust_layers_for_idx_with_undo(
         &mut self,
         idx: usize,
-        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
-        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        layers: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
+        // 保留中のキー編集は、別の変更が Undo に載る**前に**閉じる。開いたままだと、
+        // 後から確定するセッションの before が別操作より前まで遡り、Undo 1 回で
+        // その別操作まで巻き戻る (2026-08-31 Codex P1)。
+        //
+        // セッションの確定自身もここへ来るが、あちらは先に `take` してから呼ぶので
+        // ここでは `None` を見て即戻る (再入しない)。
+        self.persist_local_adjust_shape_key_edit();
         self.set_local_adjust_layers_for_idx(idx, layers);
         let after = self
             .local_adjust_page_layers

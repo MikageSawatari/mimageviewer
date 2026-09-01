@@ -224,9 +224,20 @@ impl DisplayedImageTransform {
         let (paint_rect, uv_rect) = effective_bbox(input.free_rotation_rad, input.content_bbox)
             .map(|source_bbox| {
                 let display_bbox = rotate_bbox_to_display(source_bbox, input.rotation);
+                // **貼り先と UV は同じ矩形から導く。** 寄せた表示矩形から UV を作り直さないと、
+                // 1 テクセル分だけ拡大縮小が入り、寄せた意味が無くなる。
+                let display_bbox = match input.pixel_fit {
+                    RectPixelFit::Texels => quantize_display_bbox_to_paint_pixels(
+                        display_bbox,
+                        full_image_rect,
+                        total_scale,
+                        input.pixels_per_point,
+                    ),
+                    RectPixelFit::Proportional => display_bbox,
+                };
                 (
                     normalized_sub_rect(full_image_rect, display_bbox),
-                    source_bbox,
+                    rotate_bbox_to_source(display_bbox, input.rotation),
                 )
             })
             .unwrap_or((full_image_rect, full_uv_rect()));
@@ -577,6 +588,15 @@ impl FullscreenPageLayout {
             .map(|(page, _)| page)
     }
 
+    /// 直近のフレームで**実際に描いたページ**の index。
+    ///
+    /// 「いま画面に出ているのはどれか」の読み取り専用の正本。見開きなら 2 枚、連結読みなら
+    /// 可視ユニットのぶんだけ入る。アニメーションの次コマ期限をここから集めることで、
+    /// 現在ページ以外のコマ送りが止まるのを防ぐ (§1.157、Codex Sol の指摘 1)。
+    pub(crate) fn page_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pages.iter().map(|page| page.transform.page_idx)
+    }
+
     pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
         self.pages.iter().find(|page| page.page_idx() == page_idx)
     }
@@ -846,33 +866,60 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
 /// 通常は [`DisplayedImageTransform`] 側 (`RectPixelFit`) が呼ぶ。手で矩形を組んで
 /// リサンプラ出力を貼る場所 (detached の keepalive backstop など) は transform を
 /// 持たないので、そこだけがこの関数を直接呼ぶ。
+/// [`snap_rect_to_physical_pixels`] がその倍率で何をするか。
+///
+/// **分岐をここ 1 か所だけに置く。** 「寄せた後だから整数に揃っているはず」と前提する側が
+/// 別に同じ 3 分岐を書くと、揃っていない矩形を揃っている前提で動かして壊す
+/// (§1.154 の 1 度目の修正が実際にそれで、端数のある拡大の見開きで間隔を崩した)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RectSnapMode {
+    /// 何もしない。端数のある拡大。出力サイズは画像全体ではなく可視領域から決まるので、
+    /// 全体矩形を寄せても一致しない。**矩形は小数のまま。**
+    None,
+    /// 原点だけ寄せる。整数倍拡大はサイズが元から整数。
+    Origin,
+    /// 原点とサイズの両方を寄せる。縮小。リサンプラの整数出力と貼り先を一致させる。
+    OriginAndSize,
+}
+
+pub(crate) fn rect_snap_mode(logical_scale: f32, pixels_per_point: f32) -> RectSnapMode {
+    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
+        return RectSnapMode::Origin;
+    }
+    let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
+    if physical_scale.is_finite() && physical_scale > 0.0 && physical_scale < 1.0 {
+        RectSnapMode::OriginAndSize
+    } else {
+        RectSnapMode::None
+    }
+}
+
 pub(crate) fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
     display_size: egui::Vec2,
     logical_scale: f32,
     pixels_per_point: f32,
 ) -> egui::Rect {
-    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
-        let snapped_min = egui::pos2(
-            quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
-            quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
-        );
-        return egui::Rect::from_min_size(snapped_min, rect.size());
-    }
-    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
-    let physical_scale = logical_scale * pixels_per_point;
-    if !physical_scale.is_finite() || physical_scale <= 0.0 || physical_scale >= 1.0 {
+    let mode = rect_snap_mode(logical_scale, pixels_per_point);
+    if matches!(mode, RectSnapMode::None) {
         return rect;
     }
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
     let snapped_min = egui::pos2(
         quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
         quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
     );
-    let snapped_size = egui::vec2(
-        physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
-        physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
-    );
-    egui::Rect::from_min_size(snapped_min, snapped_size)
+    let size = match mode {
+        RectSnapMode::Origin | RectSnapMode::None => rect.size(),
+        RectSnapMode::OriginAndSize => {
+            let physical_scale = logical_scale * pixels_per_point;
+            egui::vec2(
+                physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
+                physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
+            )
+        }
+    };
+    egui::Rect::from_min_size(snapped_min, size)
 }
 
 fn size_is_valid(size: egui::Vec2) -> bool {
@@ -960,6 +1007,68 @@ pub(crate) fn effective_bbox(
 /// 回転を知らない)。一方 `full_image_rect` と `display_size` は回転後の寸法なので、
 /// 描画位置と fit にはこちらを使う。UV は元画像空間のまま渡す。
 /// 写像は screen ↔ source と同じ [`forward_uv`] を使う (別の式を書かない)。
+/// 表示空間の trim 矩形を、**出力テクスチャのテクセル境界へ寄せる**。
+///
+/// これが無いと、trim の端は任意の小数比なので `paint_rect` の辺も小数になる。すると
+///
+/// - 見開きの間隔を設定どおりにするには小数の平行移動が要り、動かした瞬間に**テクセルが
+///   画素中心から外れて二度目の線形補間が起きる** (§1.0e が避けたもの)
+/// - 逆に整数しか動かさないと、間隔が端数のまま残ってページごとに太さが変わる (§1.154)
+///
+/// どちらも「trim の端が画素境界に無い」ことが根で、両立させるには端を寄せるしかない。
+/// 寄せる量は 1 出力画素未満なので、切り取り位置としては見えない。
+///
+/// 寄せないのは、そもそも矩形を寄せていないとき (端数のある拡大)。そこには守るべき位相が
+/// 無く、寄せると trim だけが動く。
+fn quantize_display_bbox_to_paint_pixels(
+    bbox: egui::Rect,
+    full_image_rect: egui::Rect,
+    total_scale: f32,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    if matches!(
+        rect_snap_mode(total_scale, pixels_per_point),
+        RectSnapMode::None
+    ) {
+        return bbox;
+    }
+    let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
+    let width_px = full_image_rect.width() * pixels_per_point;
+    let height_px = full_image_rect.height() * pixels_per_point;
+    if !(width_px.is_finite() && height_px.is_finite() && width_px >= 1.0 && height_px >= 1.0) {
+        return bbox;
+    }
+    let axis = |min: f32, max: f32, len_px: f32| {
+        let mut lo = (min * len_px).round();
+        let mut hi = (max * len_px).round();
+        lo = lo.clamp(0.0, len_px);
+        hi = hi.clamp(0.0, len_px);
+        // 丸めて潰れたら 1 画素だけ残す。空の矩形を返すと描画も hit-test も消える。
+        if hi <= lo {
+            if lo >= len_px {
+                lo = len_px - 1.0;
+                hi = len_px;
+            } else {
+                hi = lo + 1.0;
+            }
+        }
+        (lo / len_px, hi / len_px)
+    };
+    let (min_x, max_x) = axis(bbox.min.x, bbox.max.x, width_px);
+    let (min_y, max_y) = axis(bbox.min.y, bbox.max.y, height_px);
+    egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y))
+}
+
+/// [`rotate_bbox_to_display`] の逆。寄せた表示空間の矩形を、UV に使う元画像空間へ戻す。
+fn rotate_bbox_to_source(bbox: egui::Rect, rotation: Rotation) -> egui::Rect {
+    let (ax, ay) = inverse_uv(rotation, bbox.min.x, bbox.min.y);
+    let (bx, by) = inverse_uv(rotation, bbox.max.x, bbox.max.y);
+    egui::Rect::from_min_max(
+        egui::pos2(ax.min(bx), ay.min(by)),
+        egui::pos2(ax.max(bx), ay.max(by)),
+    )
+}
+
 pub(crate) fn rotate_bbox_to_display(bbox: egui::Rect, rotation: Rotation) -> egui::Rect {
     let (ax, ay) = forward_uv(rotation, bbox.min.x, bbox.min.y);
     let (bx, by) = forward_uv(rotation, bbox.max.x, bbox.max.y);

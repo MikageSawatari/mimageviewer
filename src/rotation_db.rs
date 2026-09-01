@@ -307,7 +307,13 @@ mod tests {
 
     #[test]
     fn db_set_get_clear() {
-        let db = RotationDb::open().unwrap();
+        // `RotationDb::open()` は data_dir の test override を読む。この関数は自分で
+        // override を張っていなかったので、たまたま生きている他テストのガードへ相乗り
+        // していた。そのガードが先に落ちると temp dir ごと消えていて CannotOpen になる
+        // (2026-09-01、リリースの test gate で発生)。兄弟の
+        // `get_many_returns_only_stored_keys` と同じく、自分の DB ファイルを明示して開く。
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = RotationDb::open_at(&temp.path().join("rotation.db")).unwrap();
         let p = Path::new("C:/test/image.jpg");
 
         // 初期状態: 未登録

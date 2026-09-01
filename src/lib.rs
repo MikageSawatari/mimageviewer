@@ -125,6 +125,7 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_write_worker;
 pub mod logger;
 mod manual_mask_tools;
 pub mod margin_fit;
@@ -187,6 +188,7 @@ pub mod shell_file_ops;
 pub mod sidecar;
 pub mod single_instance;
 pub mod snapshot;
+mod sns_split;
 pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;
@@ -209,6 +211,7 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
+mod ui_sns_split;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]

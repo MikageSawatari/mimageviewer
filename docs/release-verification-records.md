@@ -12,6 +12,56 @@
 
 ---
 
+## v3.4.0 (2026-09-01)
+
+- **依存**: PDFium を `chromium/8021` → **`chromium/8035` へ更新**。FFmpeg は
+  `setup-ffmpeg.sh check` が「新版あり」と言うが**誤検知**で、提示された
+  `n7.1.5-12-g1fdbca85aa` は現行 `n7.1.5-16-g9a4bb2c579` より**古い** (12 < 16、
+  文字列比較のため)。DLL の ProductVersion は `n7.1.5-16-g9a4bb2c579-20260816` で
+  `vendor/ffmpeg/VERSION` と一致しており、LGPL 対応ソースのズレも無し。更新不要。
+  VST3 bridge は C++ ソースが 2026-05-16 から変更無しで再ビルド不要 (`-SkipVst3Bridge`)。
+  Susie ワーカーは再ビルド済み (ソース変更無し)。
+- **非 Windows ビルド**: `check-non-windows-shadow.ps1` で **PASS**。
+  master は未 push だったので GitHub Actions は前版のまま = このローカル検査が代替。
+- **Rust テスト**: `test-full.ps1` で **7,846 件通過 / 失敗 0**。
+- **idle health**: `static-foreground` / `static-background` / `tray-residency` の
+  **3 シナリオとも PASS**。全区間で perf event 0 件 (完全 sleep)、CPU 1 コア比は
+  0.0062 / 0.0083 / 0.0167。`tray-residency` は `8/0 visible`。
+  **`video-pin-background` は未実施** — 動画を代表画像に固定したフォルダを用意できず。
+  この版はアイドル高画質化の経路に触れていないため waiver とした。
+- **perf smoke**: フレーム 5,112 / 16ms 以上のギャップ 94 件 /
+  ギャップ p50 27ms・p95 314ms・max 483ms。
+  **100ms を超えた 15 件はすべて説明が付いた**: `request_repaint_after_idle_upgrade`
+  11 件 (実測ギャップが `idle_upgrade_delay_ms` 222〜447ms と整合)、`none` 3 件 (就寝)、
+  最初の `tail_repaint` より前 1 件 (起動直後の `load_folder_end=145.6ms`)。
+  **それ以外の 100ms 超は 0 件。**
+  `pre_grid_breakdown.total_ms` は **p50 0.129 / p95 0.183ms** (健全基準 0.3ms 以下)。
+  max 37.98ms は `Ctrl+G` で検索バーを初めて開いた 1 フレームの
+  `global_search_bar_ms=37.75` のみで、2 番目は同じ場所の 2.30ms。
+
+- **v3.3.1 が「次版から見る」とした「描画中のみの比率」は取れなかった。**
+  perf smoke の解析後にアプリを再度動かしたため、同じ `perf_events.jsonl` に別セッションが
+  追記され、`analyze_perf.py` が見た 5,112 フレームの区間を後から復元できなくなった
+  (先頭 5,112 件で切っても件数が合わない)。
+  **次版からは、smoke 直後に perf log を版名付きでコピーしてから解析する。**
+
+### この版の test gate が見つけたもの
+
+- **`FtsWriterDispatcher` の起床通知取りこぼし (2026-04-22 混入、v2.x から出荷済み)**。
+  test gate が `ingest_worker::tests::cancel_mid_ingest_flushes_partial_and_returns_cancelled`
+  で 47 分ハング。**プロセスが生きているうちに cdb で両スレッドのスタックを採取**して確定
+  (テスト側 = `Drop` → `JoinHandle::join`、dispatcher = `Condvar::wait`)。
+  `Drop` が停止フラグを Mutex の**外**で立ててから notify していたため、dispatcher が
+  「述語を確認したが wait に入る前」の窓に落ちると通知が失われる。フラグを `Queue` の
+  フィールドへ移して構造的に解消 (`e935c79b`)。本番では最後の `Arc` が落ちる場所
+  = 終了時に踏み得るので、「アプリが終了しきらない」症状として出ていた可能性がある。
+- **`rotation_db` / `book_resume_db` のテスト分離不備** (`af60acff`)。
+  data_dir の test override を自分で張らず、同時に走る別テストのガードへ相乗りしていた。
+  ガードが先に落ちると temp dir ごと消えて `CannotOpen`。他 worktree で cargo が 4 本
+  走っている負荷下で初めて出た。**他 5 ファイルはガードを張っており、この 2 件だけ。**
+
+---
+
 ## v3.3.1 (2026-08-30)
 
 - **依存**: PDFium `chromium/8021` は最新で更新なし。**FFmpeg を

@@ -432,6 +432,28 @@ fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_sh
     placement.is_child_window() && activate_on_show
 }
 
+/// 上下バーの固定表示状態を 1 つの値として扱う。presenter の生成時に渡す初期値と、
+/// 後からの変更 (`SetBarLockState`) の両方が同じ型を通ることで、「生まれたときだけ固定を
+/// 知らない」状態を作らない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeBarLockState {
+    pub top_locked: bool,
+    pub bottom_lock: crate::settings::VideoBottomLock,
+    pub fixed_bar_gap_px: u32,
+}
+
+impl NativeBarLockState {
+    /// 隙間 px の上限クランプはここだけが所有する (初期値も後からの変更も同じ上限)。
+    pub fn clamped(self) -> Self {
+        Self {
+            fixed_bar_gap_px: self
+                .fixed_bar_gap_px
+                .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX),
+            ..self
+        }
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub struct NativeVideoOutputConfig {
@@ -495,6 +517,10 @@ pub struct NativeVideoOutputConfig {
     ///   tick に十分な間隔にして無駄なスピンを避ける。
     /// `false` のとき従来の動画経路と**バイト等価**。
     pub audio_only: bool,
+    /// presenter が最初のフレームを出す前から使う上下バー固定状態。
+    /// これを渡さないと presenter は「固定なし」で生まれ、App の次フレームの
+    /// `sync_native_video_metadata` が届くまで全域に描いてから縮む。
+    pub bar_lock: NativeBarLockState,
 }
 
 #[cfg(any(windows, test))]
@@ -4363,6 +4389,7 @@ fn run_native_video_output(
                 ui_scale: config.ui_scale,
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
+                bar_lock: config.bar_lock,
                 scale_filter: config.scale_filter,
                 downscale_smoothing_percent: config.downscale_smoothing_percent,
                 anime4k_variant: config.anime4k_variant,
@@ -4421,6 +4448,9 @@ fn run_native_video_output(
         crate::panorama::PanoUvTransform,
     )> = None;
     let mut cur_scale_filter = config.scale_filter;
+    // presenter を作り直す経路 (F12 の placement 切替) でも固定状態を持ち越す。
+    // open 時の config 値のまま作ると、切替のたびに固定なしの 1 枚が出る。
+    let mut cur_bar_lock = config.bar_lock.clamped();
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
     let mut cur_anime4k_status = crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting;
@@ -4967,6 +4997,12 @@ fn run_native_video_output(
                     bottom_lock,
                     fixed_bar_gap_px,
                 } => {
+                    cur_bar_lock = NativeBarLockState {
+                        top_locked,
+                        bottom_lock,
+                        fixed_bar_gap_px,
+                    }
+                    .clamped();
                     if let Err(err) = presenter.set_overlay_bar_lock_state(
                         top_locked,
                         bottom_lock,
@@ -5556,6 +5592,7 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
+                                bar_lock: cur_bar_lock,
                                 scale_filter: cur_scale_filter,
                                 downscale_smoothing_percent: cur_downscale_smoothing_percent,
                                 anime4k_variant: cur_anime4k_variant,

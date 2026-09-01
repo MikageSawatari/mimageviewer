@@ -978,6 +978,9 @@ pub struct NativeRenderConfig {
     pub anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     pub anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
     pub anime4k_status: NativeVideoAnime4kStatus,
+    /// 生成時点の上下バー固定状態。presenter はこれを最初の transform から使う
+    /// (後から `SetBarLockState` が届くまで固定なしで描かない)。
+    pub bar_lock: crate::video::NativeBarLockState,
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     pub(crate) window_epoch: u64,
 }
@@ -1518,6 +1521,9 @@ struct NativeEguiOverlay {
     /// App settings から同期される、上部バーと動画下部の固定状態。
     top_bar_locked: bool,
     bottom_lock: VideoBottomLock,
+    /// 固定バーと映像のあいだに置く隙間 (px)。overlay が「映像の場所」を
+    /// 自分で求める (`video_content_rect_points`) ために持つ。
+    fixed_bar_gap_px: u32,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -2926,6 +2932,9 @@ impl NativeRenderCore {
     ) -> Result<(Self, HostWindowTopology, Vec<NativeWindowIntent>), String> {
         let health = Arc::clone(&config.health);
         let window_epoch = config.window_epoch;
+        // 上限クランプは `NativeBarLockState::clamped` が所有する
+        // (`set_overlay_bar_lock_state` と同じ規則を初期値にも通す)。
+        let initial_bar_lock = config.bar_lock.clamped();
         let _attach_operation = health.begin_render_operation(
             crate::video::native_window_health::NativeRenderOperation::Attach,
             window_epoch,
@@ -3127,6 +3136,9 @@ impl NativeRenderCore {
                     overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
                     match overlay_result {
                         Ok(mut overlay) => {
+                            // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
+                            // 1 回「固定なし」で描かれてから固定表示へ動く。
+                            overlay.set_bar_lock_state(initial_bar_lock);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -3192,6 +3204,9 @@ impl NativeRenderCore {
                     overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
                     match overlay_result {
                         Ok(mut overlay) => {
+                            // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
+                            // 1 回「固定なし」で描かれてから固定表示へ動く。
+                            overlay.set_bar_lock_state(initial_bar_lock);
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -3374,9 +3389,9 @@ impl NativeRenderCore {
                     .is_some(),
                 last_pixel_probe: None,
                 video_compact: false,
-                video_top_bar_locked: false,
-                video_bottom_lock: VideoBottomLock::None,
-                fullscreen_fixed_bar_gap_px: 0,
+                video_top_bar_locked: initial_bar_lock.top_locked,
+                video_bottom_lock: initial_bar_lock.bottom_lock,
+                fullscreen_fixed_bar_gap_px: initial_bar_lock.fixed_bar_gap_px,
                 sar_num: 1,
                 sar_den: 1,
                 orientation: VideoOrientation::IDENTITY,
@@ -5875,16 +5890,20 @@ impl NativeRenderCore {
         bottom_lock: VideoBottomLock,
         fixed_bar_gap_px: u32,
     ) -> Result<(), String> {
-        let fixed_bar_gap_px =
-            fixed_bar_gap_px.min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX);
-        let layout_changed = self.video_top_bar_locked != top_locked
-            || self.video_bottom_lock != bottom_lock
-            || self.fullscreen_fixed_bar_gap_px != fixed_bar_gap_px;
-        self.video_top_bar_locked = top_locked;
-        self.video_bottom_lock = bottom_lock;
-        self.fullscreen_fixed_bar_gap_px = fixed_bar_gap_px;
+        let requested = crate::video::NativeBarLockState {
+            top_locked,
+            bottom_lock,
+            fixed_bar_gap_px,
+        }
+        .clamped();
+        let layout_changed = self.video_top_bar_locked != requested.top_locked
+            || self.video_bottom_lock != requested.bottom_lock
+            || self.fullscreen_fixed_bar_gap_px != requested.fixed_bar_gap_px;
+        self.video_top_bar_locked = requested.top_locked;
+        self.video_bottom_lock = requested.bottom_lock;
+        self.fullscreen_fixed_bar_gap_px = requested.fixed_bar_gap_px;
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_bar_lock_state(top_locked, bottom_lock);
+            overlay.set_bar_lock_state(requested);
         }
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
@@ -5929,18 +5948,18 @@ impl NativeRenderCore {
         seek_strip: Option<NativeOverlaySeekStrip>,
         material_availability: crate::video::seek_strip::SeekStripMaterialAvailability,
     ) -> Result<bool, String> {
-        let was_visible = self
+        let was_reserved = self
             .egui_overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.seek_strip.is_some());
+            .is_some_and(|overlay| overlay.seek_strip_reserves_space());
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_seek_strip(seek_strip, material_availability);
         }
-        let is_visible = self
+        let is_reserved = self
             .egui_overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.seek_strip.is_some());
-        let layout_changed = was_visible != is_visible && self.video_bottom_lock.strip_locked();
+            .is_some_and(|overlay| overlay.seek_strip_reserves_space());
+        let layout_changed = was_reserved != is_reserved && self.video_bottom_lock.strip_locked();
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
         }
@@ -6284,7 +6303,7 @@ impl NativeRenderCore {
             seek_strip_visible: self
                 .egui_overlay
                 .as_ref()
-                .is_some_and(|overlay| overlay.seek_strip.is_some()),
+                .is_some_and(|overlay| overlay.seek_strip_reserves_space()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
         }
     }
@@ -6884,6 +6903,7 @@ impl NativeEguiOverlay {
             jump_panel_visible: false,
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
+            fixed_bar_gap_px: 0,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -7799,15 +7819,40 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_bar_lock_state(&mut self, top_locked: bool, bottom_lock: VideoBottomLock) {
-        if self.top_bar_locked == top_locked && self.bottom_lock == bottom_lock {
+    fn set_bar_lock_state(&mut self, lock: crate::video::NativeBarLockState) {
+        let lock = lock.clamped();
+        if self.top_bar_locked == lock.top_locked
+            && self.bottom_lock == lock.bottom_lock
+            && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
+        {
             return;
         }
         // touch chrome latch は入力セッションの状態として独立させる。固定表示への変更で
         // latch を開閉すると、固定解除後の中央タップ状態や左右ハンドルまで変わってしまう。
-        self.top_bar_locked = top_locked;
-        self.bottom_lock = bottom_lock;
+        self.top_bar_locked = lock.top_locked;
+        self.bottom_lock = lock.bottom_lock;
+        self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
         self.dirty = true;
+    }
+
+    /// プレビューなど overlay 側が描く「映像の場所」。映像の transform と同じ
+    /// 確保量を通す (`video_bar_reserved_points`)。compact 表示は映像側だけの
+    /// 見せ方なので、全画面を置き換えるプレビューでは反映しない。
+    fn video_content_rect_points(&self, overlay_w: f32, overlay_h: f32) -> egui::Rect {
+        let (top, bottom) = video_bar_reserved_points(VideoVisualLayout {
+            compact: false,
+            pixels_per_point: 1.0,
+            top_bar_locked: self.top_bar_locked,
+            bottom_lock: self.bottom_lock,
+            seek_strip_visible: self.seek_strip_reserves_space(),
+            fixed_bar_gap_px: self.fixed_bar_gap_px,
+        });
+        let top = top.min((overlay_h - 1.0).max(0.0));
+        let bottom_edge = (overlay_h - bottom).max(top + 1.0).min(overlay_h);
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, top),
+            egui::pos2(overlay_w.max(1.0), bottom_edge),
+        )
     }
 
     fn reset_side_panel_session(&mut self) {
@@ -8119,6 +8164,19 @@ impl NativeEguiOverlay {
         self.seek_strip = seek_strip;
         self.seek_strip_material_availability = material_availability;
         self.dirty = true;
+    }
+
+    /// ストリップが場所を占めるか。**描くか**とは別の問い。
+    ///
+    /// 固定表示 (ピン) を選んでいる間は、素材がまだ用意できていない段階でも場所を
+    /// 確保する。ここを「いまスナップショットがあるか」だけで決めると、動画を
+    /// 切り替えるたびに確保が外れて映像が 104pt 分広がり、素材が届いた瞬間に縮む
+    /// (backlog §1.162)。素材が無いと判明した (`Unavailable`) 時点で確保をやめる。
+    fn seek_strip_reserves_space(&self) -> bool {
+        seek_strip_reserves_space(
+            self.seek_strip.is_some(),
+            self.seek_strip_material_availability,
+        )
     }
 
     fn clear_seek_preview(&mut self) {
@@ -9346,6 +9404,9 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
+        // 切替中のプレビューは映像と同じ場所に置く。closure の前に確定させる。
+        let navigation_preview_content_rect =
+            self.video_content_rect_points(overlay_width_points, overlay_height_points);
         let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
         let touch_panel_handle_rects = self.touch_panel_handle_rects();
         let touch_panel_handles_visible = touch_panel_handle_rects.iter().any(Option::is_some);
@@ -9698,6 +9759,7 @@ impl NativeEguiOverlay {
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    navigation_preview_content_rect,
                     preview,
                     navigation_preview_texture_id,
                     &mut commands,
@@ -12181,6 +12243,50 @@ impl From<bool> for VideoVisualLayout {
     }
 }
 
+/// ストリップが場所を占めるか。**描くか**とは別の問い。
+///
+/// ピンしているあいだは、**この動画にストリップを作れないと分かっている場合を除いて**
+/// 場所を確保する。スナップショットの有無で決めると、無くなる瞬間 (動画の切替、
+/// セッションを畳むとき) のたびに確保が外れて映像が 104pt 広がる (backlog §1.162)。
+/// ピンそのものを外す操作は `close_video_seek_strip` が固定も外すので、ここには来ない。
+pub(super) fn seek_strip_reserves_space(
+    has_strip: bool,
+    availability: crate::video::seek_strip::SeekStripMaterialAvailability,
+) -> bool {
+    has_strip
+        || !matches!(
+            availability,
+            crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(_)
+        )
+}
+
+/// 固定表示のバーが上下に確保する量を **points** で返す。
+///
+/// 映像の transform (物理 px) と、ナビゲーションプレビューの画像配置 (points) の
+/// 両方がここを通る。片方だけ別に数えると、切替中のプレビューだけ HUD を無視して
+/// 全画面に出る (backlog §1.162)。
+pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32) {
+    let gap_points = layout
+        .fixed_bar_gap_px
+        .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
+    let top = if layout.top_bar_locked {
+        HUD_TOP_HEIGHT + gap_points
+    } else {
+        0.0
+    };
+    let bottom = if layout.bottom_lock.bar_locked() {
+        let strip_height = if layout.bottom_lock.strip_locked() && layout.seek_strip_visible {
+            SEEK_STRIP_HEIGHT
+        } else {
+            0.0
+        };
+        HUD_BOTTOM_HEIGHT + gap_points + strip_height
+    } else {
+        0.0
+    };
+    (top, bottom)
+}
+
 pub(super) fn compute_video_visual_target_rect(
     win_w: u32,
     win_h: u32,
@@ -12193,24 +12299,9 @@ pub(super) fn compute_video_visual_target_rect(
     } else {
         1.0
     };
-    let gap_points = layout
-        .fixed_bar_gap_px
-        .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
-    let top_reserved = if layout.top_bar_locked {
-        (HUD_TOP_HEIGHT + gap_points) * ppp
-    } else {
-        0.0
-    };
-    let bottom_reserved = if layout.bottom_lock.bar_locked() {
-        let strip_height = if layout.bottom_lock.strip_locked() && layout.seek_strip_visible {
-            SEEK_STRIP_HEIGHT
-        } else {
-            0.0
-        };
-        (HUD_BOTTOM_HEIGHT + gap_points + strip_height) * ppp
-    } else {
-        0.0
-    };
+    let (top_points, bottom_points) = video_bar_reserved_points(layout);
+    let top_reserved = top_points * ppp;
+    let bottom_reserved = bottom_points * ppp;
     let content_top = top_reserved.min(win_h - 1.0);
     let content_bottom = (win_h - bottom_reserved).max(content_top + 1.0).min(win_h);
     let content_height = (content_bottom - content_top).max(1.0);
@@ -12463,7 +12554,7 @@ mod tests {
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, panorama_takes_the_wheel, pointer_region_owns_wheel,
-        sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        sample_cpu_rgba_pixel, seek_strip_reserves_space, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
@@ -14600,6 +14691,77 @@ mod tests {
         // SAR=0.5 → display_w=480, display_h=540, ratio M11/M22 = 0.5
         let ratio = m11 / m22;
         assert!((ratio - 0.5).abs() < 1e-4);
+    }
+
+    /// 動画を切り替えると、新しい動画のストリップ素材が用意できるまでスナップショットは
+    /// 無い。確保をスナップショットの有無で決めると、そのあいだだけ映像が広がって
+    /// 素材が届いた瞬間に縮む。ピンしている間は確保を保つ。
+    #[test]
+    fn a_pinned_strip_keeps_its_space_while_the_next_video_is_still_preparing() {
+        use crate::video::seek_strip::{SeekStripMaterialAvailability, StripAxisUnavailableReason};
+
+        let rect = |has_strip, availability| {
+            compute_video_visual_target_rect(
+                1920,
+                1080,
+                VideoVisualLayout {
+                    compact: false,
+                    pixels_per_point: 1.0,
+                    top_bar_locked: true,
+                    bottom_lock: VideoBottomLock::BarAndStrip,
+                    seek_strip_visible: seek_strip_reserves_space(has_strip, availability),
+                    fixed_bar_gap_px: 0,
+                },
+            )
+        };
+
+        let showing = rect(true, SeekStripMaterialAvailability::Available);
+        let switching = rect(false, SeekStripMaterialAvailability::Unknown);
+        assert_eq!(
+            switching, showing,
+            "切替中に確保が外れると、映像が広がってから縮む"
+        );
+
+        // 素材が無いと判明したら確保をやめる。空きを抱えたままにしない。
+        let unavailable = rect(
+            false,
+            SeekStripMaterialAvailability::Unavailable(
+                StripAxisUnavailableReason::KeyframesTooSparse,
+            ),
+        );
+        assert_eq!(unavailable.height, showing.height + SEEK_STRIP_HEIGHT);
+    }
+
+    /// 確保は「場所を占めるか」であって「描くか」ではない。ピンしているあいだは、
+    /// この動画に作れないと分かっている場合だけ空ける。
+    #[test]
+    fn the_strip_reserve_follows_the_pin_unless_this_video_cannot_have_one() {
+        use crate::video::seek_strip::{SeekStripMaterialAvailability, StripAxisUnavailableReason};
+
+        let unavailable = SeekStripMaterialAvailability::Unavailable(
+            StripAxisUnavailableReason::KeyframesTooSparse,
+        );
+
+        // 表示中。
+        assert!(seek_strip_reserves_space(
+            true,
+            SeekStripMaterialAvailability::Available
+        ));
+        // 動画の切替中: 次の動画の素材はまだ分からない。
+        assert!(seek_strip_reserves_space(
+            false,
+            SeekStripMaterialAvailability::Unknown
+        ));
+        // セッションを畳む瞬間: payload は外れるが、この動画に素材はある。
+        // ここを外すと、一覧へ戻る直前に映像が 104pt 広がってから閉じる。
+        assert!(seek_strip_reserves_space(
+            false,
+            SeekStripMaterialAvailability::Available
+        ));
+        // 作れないと分かった動画だけ空ける。
+        assert!(!seek_strip_reserves_space(false, unavailable));
+        // 出ているものには必ず場所がある。
+        assert!(seek_strip_reserves_space(true, unavailable));
     }
 
     #[test]

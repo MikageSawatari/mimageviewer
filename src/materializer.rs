@@ -561,7 +561,10 @@ impl MaterializeSession {
             .local_adjust
             .get_layers_checked(key)
             .map_err(|error| format!("補正レイヤーを読み取れません: {error}"))?
-            .filter(|layers| !layers.is_empty());
+            .filter(|layers| !layers.is_empty())
+            // v3.4.0 の master で BakedEditSnapshot::local_adjust が Arc 化された
+            // (合成側で clone を避けるため)。ここも合わせる。
+            .map(std::sync::Arc::new);
         check_current(&self.inner, cancel, generation)?;
         let conceal_raw = databases
             .conceal
@@ -593,7 +596,7 @@ impl MaterializeSession {
             &params,
             rotation,
             erase_raw.as_ref(),
-            local_adjust.as_ref(),
+            local_adjust.as_deref(),
             conceal_raw.as_ref(),
             &context.conceal_preset,
             comic_objects.as_ref(),

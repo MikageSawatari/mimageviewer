@@ -2420,11 +2420,7 @@ impl App {
         if targets_viewer {
             return !self.any_modal_dialog_open_for_fullscreen_keys()
                 && self.fs_context_menu_idx.is_none()
-                && !self.erase_mode
-                && !self.conceal_mode
-                && !self.local_adjust_mode
-                && !self.export_crop_mode
-                && !self.text_mode;
+                && !self.is_overlay_edit_mode_active();
         }
         !self.shortcuts_blocked_by_text_input(ctx) && !ctx.is_popup_open()
     }

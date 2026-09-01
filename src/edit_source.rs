@@ -26,7 +26,7 @@ pub(crate) struct EraseMaterialize {
 }
 
 pub(crate) struct LocalAdjustMaterialize {
-    pub(crate) layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    pub(crate) layers: local_adjust_core::LocalAdjustmentLayers,
 }
 
 pub(crate) struct ConcealMaterialize {
@@ -251,19 +251,25 @@ pub(crate) fn materialize_erase(
 
 pub(crate) struct LocalAdjustMaterializeOutput {
     pub(crate) pixels: Arc<egui::ColorImage>,
-    pub(crate) layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    pub(crate) layers: local_adjust_core::LocalAdjustmentLayers,
     pub(crate) active: bool,
 }
 
 pub(crate) fn materialize_local_adjust(
     source: &Arc<egui::ColorImage>,
-    mut layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    mut layers: local_adjust_core::LocalAdjustmentLayers,
     cancel: &Arc<AtomicBool>,
 ) -> Result<LocalAdjustMaterializeOutput, EditSourceError> {
     let [width, height] = source.size;
-    for layer in &mut layers {
-        if !layer.masks_match_dims(width.max(1), height.max(1)) {
-            layer.resize_masks_to(width.max(1), height.max(1));
+    // 文書は共有所有なので、寸法を直す必要があるときだけ実複製を払う。
+    if layers
+        .iter()
+        .any(|layer| !layer.masks_match_dims(width.max(1), height.max(1)))
+    {
+        for layer in Arc::make_mut(&mut layers) {
+            if !layer.masks_match_dims(width.max(1), height.max(1)) {
+                layer.resize_masks_to(width.max(1), height.max(1));
+            }
         }
     }
     let active = layers
@@ -549,7 +555,8 @@ mod tests {
         )
         .unwrap();
         let actual =
-            materialize_local_adjust(&source, layers, &Arc::new(AtomicBool::new(false))).unwrap();
+            materialize_local_adjust(&source, Arc::new(layers), &Arc::new(AtomicBool::new(false)))
+                .unwrap();
         assert_eq!(actual.pixels.size, [expected.width, expected.height]);
         assert_eq!(
             crate::capture::color_image_to_rgba(&actual.pixels),

@@ -286,7 +286,7 @@ fn full_mask_with_large_subtract_buffer_completes_quickly() {
     let height = 2160;
     let pixels = vec![128_u8; width * height * 4];
     let mut subtract = RasterVectorMask::empty(width, height);
-    subtract.alpha[width * height - 1] = 1.0;
+    subtract.alpha_mut()[width * height - 1] = 1.0;
     let mut layer = LocalAdjustmentLayer::new("full", LocalMask::Full, LocalEffect::None);
     layer.manual_override.subtract = Some(subtract);
     let img_ref = RgbaImageRef {
@@ -330,7 +330,7 @@ fn mask_resize_preserves_alpha_distribution() {
         LocalMask::Raster(RasterMask {
             width,
             height,
-            alpha,
+            alpha: local_adjust_core::MaskAlpha::new(alpha),
         }),
         LocalEffect::None,
     );
@@ -362,7 +362,7 @@ fn mask_resize_preserves_alpha_distribution() {
 #[test]
 fn raster_vector_resize_scales_shapes_and_manual_overrides() {
     let mut base = RasterVectorMask::empty(10, 8);
-    base.alpha[4 * 10 + 5] = 1.0;
+    base.alpha_mut()[4 * 10 + 5] = 1.0;
     base.shapes.push(MaskShape::Line {
         op: ShapeOp::Add,
         kind: LineKind::Diagonal,
@@ -371,7 +371,7 @@ fn raster_vector_resize_scales_shapes_and_manual_overrides() {
         thickness: 4.0,
     });
     let mut add = RasterVectorMask::empty(10, 8);
-    add.alpha[2 * 10 + 3] = 1.0;
+    add.alpha_mut()[2 * 10 + 3] = 1.0;
     let mut layer = LocalAdjustmentLayer::new(
         "raster-vector",
         LocalMask::RasterVector(base),
@@ -631,7 +631,7 @@ fn raster_mask_with_wrong_dimensions_does_not_crash() {
     let wrong_mask = RasterMask {
         width: 3, // 意図的に違う
         height: 3,
-        alpha: vec![1.0; 9],
+        alpha: local_adjust_core::MaskAlpha::new(vec![1.0; 9]),
     };
     let layer =
         LocalAdjustmentLayer::new("raster", LocalMask::Raster(wrong_mask), LocalEffect::None);

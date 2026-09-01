@@ -1459,6 +1459,53 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-01 SNS 分割 P6 で、通常 `FsExport` を root viewport から既存の
+export guard へ配送する (ClaudeCode の P6 ブリーフが通常 `Ctrl+E` の ownership を
+`FsExport` に残す不変条件を指定し、Codex が §2 に照らして配送境界を確認):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`SNS_SPLIT_ROOT_INPUT_PROBE_SCOPES` と root input probe の回帰テスト、および
+[src/ui_sns_split.rs](../src/ui_sns_split.rs) の SNS mode handler。
+detached / switching predicate、viewport ID / 登録 / recreate、runtime / host ownership、
+placement / focus / window lifecycle は変更しない。
+
+**不変条件と所有境界**: `SnsSplitExecute` は利用者割り当てを保ち、SNS handler が最初に
+消費する。専用 action が消費しなかったキーだけを通常の `FsExport` として同じ handler が
+`open_export_dialog_for_current` へ渡す。main/root に届いた effective `FsExport` chord でも
+同じ owner を起動できるよう、root の入力有無 probe に `FsImage` scope を含める。
+固定の `E` キー特例は足さず、`FsExport` の利用者割り当て変更にも追従する。実 handler は
+`SnsSplitExecute` / `FsExport` だけを消費し、他の `FsImage` action は SNS mode 中に実行しない。
+
+**なぜ症状パッチではないか**: P6 の要求は SNS 専用 `Ctrl+E` を残すことではなく、
+通常 `FsExport` の既存 guard を唯一の owner として再利用することにある。root と fullscreen の
+どちらへ key event が届いても effective keymap → 同じ handler → 同じ guard という既存の
+配送構造へ揃え、新規 state、detached 分岐、固定キー判定、時間窓、retry、repaint、fallback を
+追加しない。通常 `Ctrl+E` が `FsImage` scope を含むときだけ root probe を通ることを純ロジック
+テストで固定するため、症状別の viewport workaround ではなく入力 ownership 境界の整合である。
+
+**2026-09-01 SNS 分割 P2 の transient editor lifecycle を既存の foreground cleanup owner
+へ追加する (ClaudeCode の P2 ブリーフが同型の構造的追加を指定し、Codex が §2 に照らして
+ownership 境界を確認):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の
+reconcile_page_edit_spread_pivots と reset_detached_pause_foreground_modes、
+[src/app/tests.rs](../src/app/tests.rs) の lifecycle 回帰証明。viewer context bundle の型、
+mount / stash、viewport、HWND、presentation transition の経路は変更しない。
+
+**不変条件と所有境界**: SNS 分割の layout / drag / spread pivot は、ページに保存しない
+一度きりの foreground editor state である。したがって inactive / parked context の bundle
+には載せず、detached pause が foreground を手放す前に、既存の crop / text と同じ cleanup
+owner で破棄する。通常のモード退場だけが saved spread を復元し、pause / fullscreen close /
+panorama / non-paged 遷移は pivot を先に破棄して遷移先の idx / Single 表示を巻き戻さない。
+mode marker が別の lifecycle で先に落ちた場合は、全ページ編集ツール共通の reconcile が
+stale pivot を一度だけ回収する。
+
+**なぜ症状パッチではないか**: detached 固有の判定、bool、pending state、時間窓、retry、
+focus / geometry heuristic は追加しない。新モードの transient state を既存の foreground
+editor ownership 表へ 1 行追加し、bundle に保存しない契約を明示しただけである。
+pause 後の parked bundle に state が残らないことと、通常退場だけが spread を復元することを
+状態遷移テストで固定する。
+
 **2026-08-30 detached close identity を、内部 teardown と利用者 OS close の発生源ではなく
 session lease の寿命で分離する (v3.3.0 出荷前レビュー close identity。ClaudeCode / Codex
 双方が第三案を構造的修正と合意):**
@@ -2374,6 +2421,23 @@ foreground のままになる環境では、タッチの primary start ごとに
 touch Phase 3 Step 3g は相関済み touch canvas gesture へ primary 抑止を適用しない修正だけを行い、
 focus claim、debounce、viewport / detached predicate には変更を入れていない。後続リワークで
 foreground ownership を扱う際の観測として残す。
+
+**未修正の報告 (2026-08-31、BA-7 系):** 補正レイヤーの進行中編集
+(`local_adjust_shape_drag` / `local_adjust_canvas_drag` / `local_adjust_mask_brush_stroke` と
+それぞれの `*_before_layers`、および 2026-08-31 に追加した `local_adjust_shape_key_edit`) は
+**App-global**である一方、対象の文書 `local_adjust_page_layers` は `ViewerContextBundle`
+所有で swap される。detached の描画後にメイン context へ戻ってから確定が走ると、
+確定は「いま mount されている map」を `fs_idx` だけで引き直すため、**detached 側の編集が
+未保存のまま、同じ index のメインページを保存 / 削除し得る**。文書が見つからない場合は
+空として扱うので、削除に化ける経路もある。
+
+これは R-07 (b) の作業 (`368499d9` / `9ccbb934`) が**作った**ものではない。3 つの既存
+ジェスチャが元から App-global で、新しいキー編集セッションが同じ形を踏襲している。
+凍結ルールに従い**症状パッチを入れず報告のみ**とする。直すなら、保留を bundle 所有へ
+移すか、保留が `fs_idx` ではなく context + page key + items generation を持ち、確定時に
+「積んだときと同じ文書か」を検証する形になる。4 つとも同時に動かす必要がある
+(1 つだけ直すと非対称が増える)。指摘元は Codex レビュー、詳細は
+[briefs/local-adjust-ownership-progress.md](briefs/local-adjust-ownership-progress.md)。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |

@@ -272,6 +272,12 @@ impl CropRect {
         height: usize,
         aspect_ratio: Option<f32>,
     ) -> Self {
+        if handle != CropHandle::Body
+            && let Some(ratio) = aspect_ratio
+        {
+            return self.dragged_with_aspect(handle, delta_x, delta_y, width, height, ratio);
+        }
+
         let mut next = self;
         match handle {
             CropHandle::Body => {
@@ -306,12 +312,154 @@ impl CropRect {
                 next.max_y += delta_y;
             }
         }
-        let next = next.sanitized(width, height);
-        if let Some(ratio) = aspect_ratio {
-            next.fit_to_aspect_around_center(ratio, width, height)
-        } else {
-            next
+        next.sanitized(width, height)
+    }
+
+    fn dragged_with_aspect(
+        self,
+        handle: CropHandle,
+        delta_x: f32,
+        delta_y: f32,
+        width: usize,
+        height: usize,
+        aspect_ratio: f32,
+    ) -> Self {
+        debug_assert_ne!(handle, CropHandle::Body);
+
+        let max_w = width.max(1) as f32;
+        let max_h = height.max(1) as f32;
+        let ratio = aspect_ratio.max(0.01);
+        let base = self.sanitized(width, height);
+        let (desired_width, available_width) =
+            aspect_drag_widths(base, handle, delta_x, delta_y, max_w, max_h, ratio);
+
+        // A ratio-locked rectangle needs width >= 1 and height = width / ratio >= 1.
+        // If even that cannot fit around the fixed anchor (possible only for tiny or
+        // otherwise infeasible inputs), keep the existing sanitized rectangle rather
+        // than moving the anchor or returning a sub-pixel crop.
+        let min_width = ratio.max(1.0);
+        if available_width < min_width {
+            return base;
         }
+        let crop_width = desired_width.max(min_width).min(available_width);
+        let crop_height = crop_width / ratio;
+
+        anchored_aspect_rect(base, handle, crop_width, crop_height).sanitized(width, height)
+    }
+}
+
+fn aspect_drag_widths(
+    base: CropRect,
+    handle: CropHandle,
+    delta_x: f32,
+    delta_y: f32,
+    max_w: f32,
+    max_h: f32,
+    ratio: f32,
+) -> (f32, f32) {
+    let center_x = (base.min_x + base.max_x) * 0.5;
+    let center_y = (base.min_y + base.max_y) * 0.5;
+    let centered_width_room = 2.0 * center_x.min(max_w - center_x);
+    let centered_height_room = 2.0 * center_y.min(max_h - center_y);
+
+    match handle {
+        CropHandle::North => (
+            (base.height() - delta_y) * ratio,
+            (base.max_y * ratio).min(centered_width_room),
+        ),
+        CropHandle::South => (
+            (base.height() + delta_y) * ratio,
+            ((max_h - base.min_y) * ratio).min(centered_width_room),
+        ),
+        CropHandle::West => (
+            base.width() - delta_x,
+            base.max_x.min(centered_height_room * ratio),
+        ),
+        CropHandle::East => (
+            base.width() + delta_x,
+            (max_w - base.min_x).min(centered_height_room * ratio),
+        ),
+        // A corner takes the larger of the width implied by each pointer axis.
+        // The constrained corner therefore follows both axes without moving its
+        // opposite anchor; dragging inward shrinks once both axes ask it to.
+        CropHandle::NorthWest => (
+            (base.width() - delta_x).max((base.height() - delta_y) * ratio),
+            base.max_x.min(base.max_y * ratio),
+        ),
+        CropHandle::NorthEast => (
+            (base.width() + delta_x).max((base.height() - delta_y) * ratio),
+            (max_w - base.min_x).min(base.max_y * ratio),
+        ),
+        CropHandle::SouthWest => (
+            (base.width() - delta_x).max((base.height() + delta_y) * ratio),
+            base.max_x.min((max_h - base.min_y) * ratio),
+        ),
+        CropHandle::SouthEast => (
+            (base.width() + delta_x).max((base.height() + delta_y) * ratio),
+            (max_w - base.min_x).min((max_h - base.min_y) * ratio),
+        ),
+        CropHandle::Body => unreachable!(),
+    }
+}
+
+fn anchored_aspect_rect(
+    base: CropRect,
+    handle: CropHandle,
+    crop_width: f32,
+    crop_height: f32,
+) -> CropRect {
+    let center_x = (base.min_x + base.max_x) * 0.5;
+    let center_y = (base.min_y + base.max_y) * 0.5;
+    match handle {
+        CropHandle::North => CropRect {
+            min_x: center_x - crop_width * 0.5,
+            min_y: base.max_y - crop_height,
+            max_x: center_x + crop_width * 0.5,
+            max_y: base.max_y,
+        },
+        CropHandle::South => CropRect {
+            min_x: center_x - crop_width * 0.5,
+            min_y: base.min_y,
+            max_x: center_x + crop_width * 0.5,
+            max_y: base.min_y + crop_height,
+        },
+        CropHandle::West => CropRect {
+            min_x: base.max_x - crop_width,
+            min_y: center_y - crop_height * 0.5,
+            max_x: base.max_x,
+            max_y: center_y + crop_height * 0.5,
+        },
+        CropHandle::East => CropRect {
+            min_x: base.min_x,
+            min_y: center_y - crop_height * 0.5,
+            max_x: base.min_x + crop_width,
+            max_y: center_y + crop_height * 0.5,
+        },
+        CropHandle::NorthWest => CropRect {
+            min_x: base.max_x - crop_width,
+            min_y: base.max_y - crop_height,
+            max_x: base.max_x,
+            max_y: base.max_y,
+        },
+        CropHandle::NorthEast => CropRect {
+            min_x: base.min_x,
+            min_y: base.max_y - crop_height,
+            max_x: base.min_x + crop_width,
+            max_y: base.max_y,
+        },
+        CropHandle::SouthWest => CropRect {
+            min_x: base.max_x - crop_width,
+            min_y: base.min_y,
+            max_x: base.max_x,
+            max_y: base.min_y + crop_height,
+        },
+        CropHandle::SouthEast => CropRect {
+            min_x: base.min_x,
+            min_y: base.min_y,
+            max_x: base.min_x + crop_width,
+            max_y: base.min_y + crop_height,
+        },
+        CropHandle::Body => unreachable!(),
     }
 }
 
@@ -813,6 +961,82 @@ pub(crate) fn read_source_size(
 mod tests {
     use super::*;
 
+    const DRAG_EPSILON: f32 = 0.001;
+    const DRAG_RATIO: f32 = 3.0 / 4.0;
+
+    fn drag_base() -> CropRect {
+        CropRect {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 400.0,
+            max_y: 500.0,
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() <= DRAG_EPSILON);
+    }
+
+    fn assert_rect_close(actual: CropRect, expected: CropRect) {
+        assert_close(actual.min_x, expected.min_x);
+        assert_close(actual.min_y, expected.min_y);
+        assert_close(actual.max_x, expected.max_x);
+        assert_close(actual.max_y, expected.max_y);
+    }
+
+    fn assert_ratio(rect: CropRect, ratio: f32) {
+        assert_close(rect.width(), rect.height() * ratio);
+    }
+
+    fn assert_inside(rect: CropRect, image_size: [usize; 2]) {
+        assert!(rect.min_x >= 0.0);
+        assert!(rect.min_y >= 0.0);
+        assert!(rect.max_x <= image_size[0].max(1) as f32);
+        assert!(rect.max_y <= image_size[1].max(1) as f32);
+    }
+
+    fn assert_opposite_anchor(base: CropRect, actual: CropRect, handle: CropHandle) {
+        let base_center_x = (base.min_x + base.max_x) * 0.5;
+        let base_center_y = (base.min_y + base.max_y) * 0.5;
+        let actual_center_x = (actual.min_x + actual.max_x) * 0.5;
+        let actual_center_y = (actual.min_y + actual.max_y) * 0.5;
+        match handle {
+            CropHandle::NorthWest => {
+                assert_close(actual.max_x, base.max_x);
+                assert_close(actual.max_y, base.max_y);
+            }
+            CropHandle::North => {
+                assert_close(actual.max_y, base.max_y);
+                assert_close(actual_center_x, base_center_x);
+            }
+            CropHandle::NorthEast => {
+                assert_close(actual.min_x, base.min_x);
+                assert_close(actual.max_y, base.max_y);
+            }
+            CropHandle::East => {
+                assert_close(actual.min_x, base.min_x);
+                assert_close(actual_center_y, base_center_y);
+            }
+            CropHandle::SouthEast => {
+                assert_close(actual.min_x, base.min_x);
+                assert_close(actual.min_y, base.min_y);
+            }
+            CropHandle::South => {
+                assert_close(actual.min_y, base.min_y);
+                assert_close(actual_center_x, base_center_x);
+            }
+            CropHandle::SouthWest => {
+                assert_close(actual.max_x, base.max_x);
+                assert_close(actual.min_y, base.min_y);
+            }
+            CropHandle::West => {
+                assert_close(actual.max_x, base.max_x);
+                assert_close(actual_center_y, base_center_y);
+            }
+            CropHandle::Body => unreachable!(),
+        }
+    }
+
     #[test]
     fn aspect_mode_stable_key_round_trips_all_variants() {
         for mode in CropAspectMode::ALL {
@@ -831,6 +1055,230 @@ mod tests {
         // 縦長 (4:5) は < 1、横長 (1.91:1) は > 1。
         assert!(CropAspectMode::Ratio4x5.aspect_ratio().unwrap() < 1.0);
         assert!(CropAspectMode::Ratio191x100.aspect_ratio().unwrap() > 1.0);
+    }
+
+    #[test]
+    fn fixed_aspect_drag_keeps_the_opposite_anchor_for_all_handles() {
+        let base = drag_base();
+        let image_size = [1000, 1000];
+        let cases = [
+            (CropHandle::NorthWest, -60.0, -80.0),
+            (CropHandle::North, 0.0, -60.0),
+            (CropHandle::NorthEast, 60.0, -80.0),
+            (CropHandle::East, 60.0, 0.0),
+            (CropHandle::SouthEast, 60.0, 80.0),
+            (CropHandle::South, 0.0, 60.0),
+            (CropHandle::SouthWest, -60.0, 80.0),
+            (CropHandle::West, -60.0, 0.0),
+        ];
+
+        for (handle, delta_x, delta_y) in cases {
+            let actual = base.dragged(
+                handle,
+                delta_x,
+                delta_y,
+                image_size[0],
+                image_size[1],
+                Some(DRAG_RATIO),
+            );
+            assert_opposite_anchor(base, actual, handle);
+            assert_ratio(actual, DRAG_RATIO);
+            assert_inside(actual, image_size);
+            assert!(actual.width() > base.width() || actual.height() > base.height());
+        }
+    }
+
+    #[test]
+    fn fixed_aspect_edge_drag_reproduction_resizes_instead_of_translating() {
+        let base = drag_base();
+        let cases = [
+            (
+                CropHandle::East,
+                60.0,
+                0.0,
+                CropRect {
+                    min_x: 100.0,
+                    min_y: 60.0,
+                    max_x: 460.0,
+                    max_y: 540.0,
+                },
+            ),
+            (
+                CropHandle::West,
+                -60.0,
+                0.0,
+                CropRect {
+                    min_x: 40.0,
+                    min_y: 60.0,
+                    max_x: 400.0,
+                    max_y: 540.0,
+                },
+            ),
+            (
+                CropHandle::North,
+                0.0,
+                -60.0,
+                CropRect {
+                    min_x: 77.5,
+                    min_y: 40.0,
+                    max_x: 422.5,
+                    max_y: 500.0,
+                },
+            ),
+            (
+                CropHandle::South,
+                0.0,
+                60.0,
+                CropRect {
+                    min_x: 77.5,
+                    min_y: 100.0,
+                    max_x: 422.5,
+                    max_y: 560.0,
+                },
+            ),
+        ];
+
+        for (handle, delta_x, delta_y, expected) in cases {
+            let actual = base.dragged(handle, delta_x, delta_y, 1000, 1000, Some(DRAG_RATIO));
+            assert_rect_close(actual, expected);
+            assert!(actual.width() != base.width() || actual.height() != base.height());
+        }
+    }
+
+    #[test]
+    fn fixed_aspect_corner_uses_the_larger_axis_candidate() {
+        let base = drag_base();
+        let expected_grown = CropRect {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 460.0,
+            max_y: 580.0,
+        };
+        let horizontal = base.dragged(
+            CropHandle::SouthEast,
+            60.0,
+            0.0,
+            1000,
+            1000,
+            Some(DRAG_RATIO),
+        );
+        let vertical = base.dragged(
+            CropHandle::SouthEast,
+            0.0,
+            80.0,
+            1000,
+            1000,
+            Some(DRAG_RATIO),
+        );
+        assert_rect_close(horizontal, expected_grown);
+        assert_rect_close(vertical, expected_grown);
+
+        let shrunk = base.dragged(
+            CropHandle::SouthEast,
+            -60.0,
+            -80.0,
+            1000,
+            1000,
+            Some(DRAG_RATIO),
+        );
+        assert_rect_close(
+            shrunk,
+            CropRect {
+                min_x: 100.0,
+                min_y: 100.0,
+                max_x: 340.0,
+                max_y: 420.0,
+            },
+        );
+    }
+
+    #[test]
+    fn fixed_aspect_bounds_clamp_shrinks_without_moving_the_opposite_anchor() {
+        let image_size = [600, 700];
+        let base = CropRect {
+            min_x: 150.0,
+            min_y: 150.0,
+            max_x: 450.0,
+            max_y: 550.0,
+        };
+        let cases = [
+            (CropHandle::NorthWest, -10_000.0, -10_000.0),
+            (CropHandle::North, 0.0, -10_000.0),
+            (CropHandle::NorthEast, 10_000.0, -10_000.0),
+            (CropHandle::East, 10_000.0, 0.0),
+            (CropHandle::SouthEast, 10_000.0, 10_000.0),
+            (CropHandle::South, 0.0, 10_000.0),
+            (CropHandle::SouthWest, -10_000.0, 10_000.0),
+            (CropHandle::West, -10_000.0, 0.0),
+        ];
+
+        for (handle, delta_x, delta_y) in cases {
+            let actual = base.dragged(
+                handle,
+                delta_x,
+                delta_y,
+                image_size[0],
+                image_size[1],
+                Some(DRAG_RATIO),
+            );
+            assert_opposite_anchor(base, actual, handle);
+            assert_ratio(actual, DRAG_RATIO);
+            assert_inside(actual, image_size);
+            assert!(
+                actual.min_x <= DRAG_EPSILON
+                    || actual.min_y <= DRAG_EPSILON
+                    || (actual.max_x - image_size[0] as f32).abs() <= DRAG_EPSILON
+                    || (actual.max_y - image_size[1] as f32).abs() <= DRAG_EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn free_aspect_drag_keeps_independent_edge_behavior() {
+        let base = drag_base();
+        let east = base.dragged(CropHandle::East, 60.0, 25.0, 1000, 1000, None);
+        assert_rect_close(
+            east,
+            CropRect {
+                min_x: 100.0,
+                min_y: 100.0,
+                max_x: 460.0,
+                max_y: 500.0,
+            },
+        );
+
+        let north_west = base.dragged(CropHandle::NorthWest, -20.0, -30.0, 1000, 1000, None);
+        assert_rect_close(
+            north_west,
+            CropRect {
+                min_x: 80.0,
+                min_y: 70.0,
+                max_x: 400.0,
+                max_y: 500.0,
+            },
+        );
+    }
+
+    #[test]
+    fn body_drag_still_ignores_aspect_and_clamps_without_resizing() {
+        let base = drag_base();
+        let actual = base.dragged(
+            CropHandle::Body,
+            10_000.0,
+            -10_000.0,
+            600,
+            700,
+            Some(DRAG_RATIO),
+        );
+        assert_rect_close(
+            actual,
+            CropRect {
+                min_x: 300.0,
+                min_y: 0.0,
+                max_x: 600.0,
+                max_y: 400.0,
+            },
+        );
     }
 
     #[test]

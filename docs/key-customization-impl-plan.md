@@ -610,6 +610,11 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ### Crop (Ph3) ★
 - CropExit `Esc`(予約) / CropExecute `Ctrl+E` / CropSpacePan `Space` (KH)
 
+### SnsSplit ★
+- FsSnsSplitMode (既定未割り当て) / SnsSplitExecute (既定未割り当て)
+- SnsSplitExit `Esc` は予約。既定の実行導線はパネルの「分割して書き出す」で、
+  通常の FsExport `Ctrl+E` はモード中にそのボタンを案内する。
+
 ### Text (Ph3) ★
 - TextConfirm `Ctrl+T` / TextRedo `Ctrl+Y`,`Ctrl+Shift+Z` / TextUndo `Ctrl+Z`
 - TextSpacePan `Space` (KH)

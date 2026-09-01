@@ -324,6 +324,7 @@ pub(super) fn operation_keyboard_context_filter_label(
         Some(KeyContext::Erase)
         | Some(KeyContext::Conceal)
         | Some(KeyContext::Crop)
+        | Some(KeyContext::SnsSplit)
         | Some(KeyContext::Text)
         | Some(KeyContext::LocalAdjust) => "編集モード",
         Some(context) => context.description(),
@@ -343,6 +344,7 @@ pub(super) fn operation_keyboard_context_filter_matches(
         KeyContext::Erase
             | KeyContext::Conceal
             | KeyContext::Crop
+            | KeyContext::SnsSplit
             | KeyContext::Text
             | KeyContext::LocalAdjust
     ) {
@@ -351,6 +353,7 @@ pub(super) fn operation_keyboard_context_filter_matches(
             KeyContext::Erase
                 | KeyContext::Conceal
                 | KeyContext::Crop
+                | KeyContext::SnsSplit
                 | KeyContext::Text
                 | KeyContext::LocalAdjust
         );
@@ -366,6 +369,7 @@ pub(super) fn operation_keyboard_context_filter_for_context(
         KeyContext::Erase
         | KeyContext::Conceal
         | KeyContext::Crop
+        | KeyContext::SnsSplit
         | KeyContext::Text
         | KeyContext::LocalAdjust => KeyContext::Erase,
         context => context,

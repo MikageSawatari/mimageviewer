@@ -144,6 +144,8 @@ pub struct ExportEntry {
     pub label: String,
     pub suffix: u8,
     pub conceal_preset: Option<ConcealPreset>,
+    /// SNS 分割の枠。`Some` なら [`ExportPagePixels::crop`] より優先する。
+    pub crop: Option<crate::export_crop::CropRect>,
 }
 
 pub struct ExportRequest {
@@ -168,8 +170,15 @@ pub struct ExportPagePixels {
 
 impl ExportPagePixels {
     pub fn render_size(&self) -> [usize; 2] {
+        self.render_size_with_crop(None)
+    }
+
+    pub fn render_size_with_crop(
+        &self,
+        entry_crop: Option<crate::export_crop::CropRect>,
+    ) -> [usize; 2] {
         let [w, h] = self.base_pixels.size;
-        let size = if let Some(crop) = self.crop {
+        let size = if let Some(crop) = entry_crop.or(self.crop) {
             let (_, _, crop_w, crop_h) = crop.pixel_bounds(w, h);
             [crop_w, crop_h]
         } else {
@@ -199,11 +208,18 @@ impl ExportPixels {
     }
 
     pub fn render_size(&self) -> [usize; 2] {
+        self.render_size_with_crop(None)
+    }
+
+    pub fn render_size_with_crop(
+        &self,
+        entry_crop: Option<crate::export_crop::CropRect>,
+    ) -> [usize; 2] {
         match self {
-            Self::Single(page) => page.render_size(),
+            Self::Single(page) => page.render_size_with_crop(entry_crop),
             Self::Spread { left, right } => {
-                let [left_w, left_h] = left.render_size();
-                let [right_w, right_h] = right.render_size();
+                let [left_w, left_h] = left.render_size_with_crop(entry_crop);
+                let [right_w, right_h] = right.render_size_with_crop(entry_crop);
                 [left_w + right_w, left_h.max(right_h)]
             }
         }
@@ -223,6 +239,8 @@ pub struct ExportDialogState {
     pub include_metadata: bool,
     pub selection: [bool; 5],
     pub has_conceal_mask: bool,
+    /// SNS 分割から開いたときの枠。空なら通常のエクスポート。
+    pub sns_split_frames: Vec<crate::export_crop::CropRect>,
     /// ダイアログを開いた瞬間の base pixels と composite mask をスナップショット。
     /// 保存ボタンを押すまでに animation frame が進行したり AI upscale が完了したり
     /// しても、Ctrl+E を押した瞬間の image が export されるようにする
@@ -246,6 +264,67 @@ impl ExportDialogState {
     pub fn reset_output_dir_to_source_dir(&mut self) {
         self.output_dir_text = self.source_dir.display().to_string();
     }
+
+    pub fn render_size(&self) -> [usize; 2] {
+        self.pixels
+            .render_size_with_crop(self.sns_split_frames.first().copied())
+    }
+}
+
+pub(crate) fn plan_export_entries(
+    sns_split_frames: &[crate::export_crop::CropRect],
+    selection: &[bool; 5],
+    has_conceal_mask: bool,
+    current_conceal_preset: Option<ConcealPreset>,
+    preset_slots: &crate::conceal::ConcealPresetSlots,
+) -> Result<Vec<ExportEntry>, String> {
+    if !sns_split_frames.is_empty() {
+        let total = sns_split_frames.len();
+        if total > usize::from(u8::MAX) {
+            return Err("SNS 分割の枚数が多すぎます".to_string());
+        }
+        return Ok(sns_split_frames
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, crop)| ExportEntry {
+                label: format!("{} / {total}", index + 1),
+                suffix: (index + 1) as u8,
+                conceal_preset: None,
+                crop: Some(crop),
+            })
+            .collect());
+    }
+
+    let mut entries = Vec::new();
+    if selection[0] {
+        entries.push(ExportEntry {
+            label: "現在の設定".to_string(),
+            suffix: 0,
+            conceal_preset: current_conceal_preset,
+            crop: None,
+        });
+    }
+    for (slot_idx, preset) in preset_slots.iter().enumerate() {
+        if !selection[slot_idx + 1] || !has_conceal_mask {
+            continue;
+        }
+        let Some(preset) = preset.clone() else {
+            continue;
+        };
+        let label = if preset.name.trim().is_empty() {
+            format!("プリセット{}", slot_idx + 1)
+        } else {
+            format!("プリセット{}: {}", slot_idx + 1, preset.name)
+        };
+        entries.push(ExportEntry {
+            label,
+            suffix: (slot_idx + 1) as u8,
+            conceal_preset: Some(preset),
+            crop: None,
+        });
+    }
+    Ok(entries)
 }
 
 #[derive(Clone, Debug)]
@@ -448,7 +527,11 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             entry.suffix,
             extension,
         );
-        let pixels = match render_export_pixels(&request.pixels, entry.conceal_preset.as_ref()) {
+        let pixels = match render_export_pixels(
+            &request.pixels,
+            entry.conceal_preset.as_ref(),
+            entry.crop,
+        ) {
             Ok(pixels) => pixels,
             Err(message) => {
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {
@@ -514,12 +597,13 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
 fn render_export_pixels<'a>(
     pixels: &'a ExportPixels,
     preset: Option<&ConcealPreset>,
+    entry_crop: Option<crate::export_crop::CropRect>,
 ) -> Result<Cow<'a, egui::ColorImage>, String> {
     match pixels {
-        ExportPixels::Single(page) => render_export_page_pixels(page, preset),
+        ExportPixels::Single(page) => render_export_page_pixels(page, preset, entry_crop),
         ExportPixels::Spread { left, right } => {
-            let left = render_export_page_pixels(left, preset)?;
-            let right = render_export_page_pixels(right, preset)?;
+            let left = render_export_page_pixels(left, preset, entry_crop)?;
+            let right = render_export_page_pixels(right, preset, entry_crop)?;
             let combined =
                 crate::capture::combine_spread_color_images(left.as_ref(), right.as_ref())?;
             Ok(Cow::Owned(combined))
@@ -530,6 +614,7 @@ fn render_export_pixels<'a>(
 fn render_export_page_pixels<'a>(
     page: &'a ExportPagePixels,
     preset: Option<&ConcealPreset>,
+    entry_crop: Option<crate::export_crop::CropRect>,
 ) -> Result<Cow<'a, egui::ColorImage>, String> {
     let rendered = match (&page.conceal_mask, preset) {
         (Some(mask), Some(preset)) => Cow::Owned(compose_conceal_for_export(
@@ -539,7 +624,7 @@ fn render_export_page_pixels<'a>(
         )?),
         _ => Cow::Borrowed(page.base_pixels.as_ref()),
     };
-    if let Some(crop) = page.crop {
+    if let Some(crop) = entry_crop.or(page.crop) {
         let cropped = crate::export_crop::crop_color_image(rendered.as_ref(), crop)?;
         if page.rotation.is_none() {
             return Ok(Cow::Owned(cropped));
@@ -631,6 +716,94 @@ mod tests {
     }
 
     #[test]
+    fn sns_split_entry_plan_uses_one_numbered_entry_per_frame_without_presets() {
+        let frames = (0..4)
+            .map(|index| crate::export_crop::CropRect {
+                min_x: (index * 10) as f32,
+                min_y: 0.0,
+                max_x: (index * 10 + 8) as f32,
+                max_y: 12.0,
+            })
+            .collect::<Vec<_>>();
+        let preset = ConcealPreset {
+            name: "batch preset".to_string(),
+            ..Default::default()
+        };
+        let slots = [
+            Some(preset.clone()),
+            Some(preset.clone()),
+            Some(preset.clone()),
+            Some(preset.clone()),
+        ];
+
+        let entries = plan_export_entries(&frames, &[true; 5], true, Some(preset), &slots).unwrap();
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1 / 4", "2 / 4", "3 / 4", "4 / 4"]
+        );
+        for (entry, frame) in entries.iter().zip(&frames) {
+            assert!(entry.conceal_preset.is_none());
+            assert_eq!(entry.crop, Some(*frame));
+        }
+    }
+
+    #[test]
+    fn normal_entry_plan_preserves_current_and_selected_preset_variants() {
+        let current = ConcealPreset {
+            name: "current".to_string(),
+            ..Default::default()
+        };
+        let slots = [
+            Some(ConcealPreset {
+                name: "one".to_string(),
+                ..Default::default()
+            }),
+            None,
+            Some(ConcealPreset {
+                name: "three".to_string(),
+                ..Default::default()
+            }),
+            Some(ConcealPreset {
+                name: String::new(),
+                ..Default::default()
+            }),
+        ];
+
+        let entries = plan_export_entries(
+            &[],
+            &[true, true, true, false, true],
+            true,
+            Some(current),
+            &slots,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.label.as_str(), entry.suffix))
+                .collect::<Vec<_>>(),
+            vec![
+                ("現在の設定", 0),
+                ("プリセット1: one", 1),
+                ("プリセット4", 4)
+            ]
+        );
+        assert!(entries.iter().all(|entry| entry.crop.is_none()));
+        assert!(entries.iter().all(|entry| entry.conceal_preset.is_some()));
+    }
+
+    #[test]
     fn worker_writes_selected_entries_without_overwriting() {
         let temp = tempfile::tempdir().unwrap();
         let pixels = Arc::new(egui::ColorImage::new(
@@ -655,11 +828,13 @@ mod tests {
                     label: "current".to_string(),
                     suffix: 0,
                     conceal_preset: None,
+                    crop: None,
                 },
                 ExportEntry {
                     label: "preset1".to_string(),
                     suffix: 1,
                     conceal_preset: None,
+                    crop: None,
                 },
             ],
             include_metadata: false,
@@ -683,6 +858,72 @@ mod tests {
         assert_eq!(completed, 2);
         assert!(temp.path().join("out_0.png").exists());
         assert!(temp.path().join("out_1.png").exists());
+    }
+
+    #[test]
+    fn worker_forwards_entry_crop_and_overrides_page_crop() {
+        let temp = tempfile::tempdir().unwrap();
+        let red = egui::Color32::from_rgb(255, 0, 0);
+        let pixels = Arc::new(egui::ColorImage::new(
+            [4, 1],
+            vec![
+                red,
+                egui::Color32::from_rgb(0, 255, 0),
+                egui::Color32::from_rgb(0, 0, 255),
+                egui::Color32::WHITE,
+            ],
+        ));
+        let pending = spawn_export_worker(ExportRequest {
+            source: ExportSource::PdfPage,
+            original_format: SrcFormat::Other("pdf".to_string()),
+            output_format: ExportFormat::Png,
+            output_dir: temp.path().to_path_buf(),
+            basename: "entry_crop".to_string(),
+            pixels: ExportPixels::Single(ExportPagePixels {
+                base_pixels: pixels,
+                conceal_mask: None,
+                crop: Some(crate::export_crop::CropRect {
+                    min_x: 1.0,
+                    min_y: 0.0,
+                    max_x: 3.0,
+                    max_y: 1.0,
+                }),
+                rotation: crate::rotation_db::Rotation::None,
+            }),
+            scale: ExportScale::Full,
+            entries: vec![ExportEntry {
+                label: "first frame".to_string(),
+                suffix: 1,
+                conceal_preset: None,
+                crop: Some(crate::export_crop::CropRect {
+                    min_x: 0.0,
+                    min_y: 0.0,
+                    max_x: 1.0,
+                    max_y: 1.0,
+                }),
+            }],
+            include_metadata: false,
+        })
+        .unwrap();
+
+        loop {
+            match pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                ExportEvent::Failed(err) => panic!("unexpected export failure: {err:?}"),
+                ExportEvent::AllDone => break,
+                ExportEvent::Started { .. } | ExportEvent::Completed(_) => {}
+                ExportEvent::Cancelled => panic!("unexpected cancel"),
+            }
+        }
+
+        let out = image::open(temp.path().join("entry_crop_1.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!([out.width(), out.height()], [1, 1]);
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
@@ -710,6 +951,7 @@ mod tests {
                     conceal_type: crate::conceal::ConcealType::BlackFill,
                     ..Default::default()
                 }),
+                crop: None,
             }],
             include_metadata: false,
         })
@@ -757,11 +999,48 @@ mod tests {
             rotation: crate::rotation_db::Rotation::None,
         };
 
-        let out = render_export_page_pixels(&page, None).unwrap();
+        let out = render_export_page_pixels(&page, None, None).unwrap();
 
         assert_eq!(out.size, [2, 1]);
         assert_eq!(out.pixels[0], egui::Color32::from_rgb(0, 255, 0));
         assert_eq!(out.pixels[1], egui::Color32::from_rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn render_export_page_pixels_prefers_entry_crop_over_page_crop() {
+        let red = egui::Color32::from_rgb(255, 0, 0);
+        let pixels = Arc::new(egui::ColorImage::new(
+            [4, 1],
+            vec![
+                red,
+                egui::Color32::from_rgb(0, 255, 0),
+                egui::Color32::from_rgb(0, 0, 255),
+                egui::Color32::WHITE,
+            ],
+        ));
+        let page = ExportPagePixels {
+            base_pixels: pixels,
+            conceal_mask: None,
+            crop: Some(crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 1.0,
+            }),
+            rotation: crate::rotation_db::Rotation::None,
+        };
+        let entry_crop = crate::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+        };
+
+        let out = render_export_page_pixels(&page, None, Some(entry_crop)).unwrap();
+
+        assert_eq!(out.size, [1, 1]);
+        assert_eq!(out.pixels, vec![red]);
+        assert_eq!(page.render_size_with_crop(Some(entry_crop)), [1, 1]);
     }
 
     #[test]
@@ -783,7 +1062,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::Cw90,
         };
 
-        let out = render_export_page_pixels(&page, None).unwrap();
+        let out = render_export_page_pixels(&page, None, None).unwrap();
 
         assert_eq!(out.size, [2, 2]);
         assert_eq!(out.pixels, vec![px(5), px(2), px(6), px(3)]);
@@ -884,6 +1163,7 @@ mod tests {
                 label: "current".to_string(),
                 suffix: 0,
                 conceal_preset: None,
+                crop: None,
             }],
             include_metadata: false,
         })
@@ -944,6 +1224,7 @@ mod tests {
                     conceal_type: crate::conceal::ConcealType::BlackFill,
                     ..Default::default()
                 }),
+                crop: None,
             }],
             include_metadata: false,
         })

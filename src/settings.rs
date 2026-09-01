@@ -4114,6 +4114,20 @@ pub struct Settings {
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
 
+    // ── SNS 分割 ──────────────────────────────────────────────
+    /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
+    #[serde(default = "default_sns_split_target")]
+    pub sns_split_target: Option<String>,
+    /// 直前に選んだ分割枚数 (2..=4)。ページ固有の配置は保存しない。
+    #[serde(default = "default_sns_split_count")]
+    pub sns_split_count: u8,
+    /// 直前に選んだ継ぎ目幅。枠幅に対する千分率 (0..=100)。
+    #[serde(default = "default_sns_split_seam_permille")]
+    pub sns_split_seam_permille: u16,
+    /// 直前に選んだ枠比率 ("free" / "3:4" / "4:5" / "1:1")。
+    #[serde(default = "default_sns_split_frame_ratio")]
+    pub sns_split_frame_ratio: Option<String>,
+
     // ── フルスクリーン表示モード ────────────────────────────
     /// デフォルトのページ構成
     #[serde(default)]
@@ -5742,6 +5756,26 @@ pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
 
+fn default_sns_split_target() -> Option<String> {
+    Some(crate::sns_split::SnsTarget::X.stable_key().to_owned())
+}
+
+fn default_sns_split_count() -> u8 {
+    crate::sns_split::MIN_COUNT
+}
+
+fn default_sns_split_seam_permille() -> u16 {
+    crate::sns_split::SnsTarget::X.default_seam_permille()
+}
+
+fn default_sns_split_frame_ratio() -> Option<String> {
+    Some(
+        crate::sns_split::SnsFrameRatio::Free
+            .stable_key()
+            .to_owned(),
+    )
+}
+
 fn sanitize_details_column_order(order: &mut Vec<DetailsColumnId>) {
     if order.is_empty() {
         return;
@@ -6156,6 +6190,10 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            sns_split_target: default_sns_split_target(),
+            sns_split_count: default_sns_split_count(),
+            sns_split_seam_permille: default_sns_split_seam_permille(),
+            sns_split_frame_ratio: default_sns_split_frame_ratio(),
         }
     }
 }
@@ -7548,6 +7586,19 @@ impl Settings {
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
+        let sns_split_target = crate::sns_split::SnsTarget::from_stable_key(
+            self.sns_split_target.as_deref().unwrap_or_default(),
+        );
+        self.sns_split_target = Some(sns_split_target.stable_key().to_owned());
+        self.sns_split_count = self
+            .sns_split_count
+            .clamp(crate::sns_split::MIN_COUNT, crate::sns_split::MAX_COUNT);
+        self.sns_split_seam_permille =
+            crate::sns_split::clamped_seam_permille(self.sns_split_seam_permille);
+        let sns_split_frame_ratio = crate::sns_split::SnsFrameRatio::from_stable_key(
+            self.sns_split_frame_ratio.as_deref().unwrap_or_default(),
+        );
+        self.sns_split_frame_ratio = Some(sns_split_frame_ratio.stable_key().to_owned());
         self.grid_display_order.normalize();
         self.subfolder_expansion_filter_kinds.retain(|kind| {
             matches!(
@@ -8012,6 +8063,12 @@ impl Settings {
         // 環境設定側の古い snapshot で巻き戻らないよう live 値を引き継ぐ。
         self.keymap = src.keymap.clone();
         self.ring_shortcuts = src.ring_shortcuts.clone();
+        // SNS 分割パネルでライブ更新する直前値。環境設定側の古い snapshot で
+        // 投稿先・枚数・継ぎ目・枠比率を巻き戻さない。
+        self.sns_split_target = src.sns_split_target.take();
+        self.sns_split_count = src.sns_split_count;
+        self.sns_split_seam_permille = src.sns_split_seam_permille;
+        self.sns_split_frame_ratio = src.sns_split_frame_ratio.take();
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
@@ -8275,6 +8332,105 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sns_split_settings_have_stable_defaults() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(defaults.sns_split_count, 2);
+        assert_eq!(defaults.sns_split_seam_permille, 17);
+        assert_eq!(defaults.sns_split_frame_ratio.as_deref(), Some("free"));
+
+        let missing_fields: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing_fields.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(missing_fields.sns_split_count, 2);
+        assert_eq!(missing_fields.sns_split_seam_permille, 17);
+        assert_eq!(
+            missing_fields.sns_split_frame_ratio.as_deref(),
+            Some("free")
+        );
+    }
+
+    #[test]
+    fn sns_split_settings_round_trip_every_panel_selection() {
+        let mut saved = Settings::default();
+        saved.sns_split_target = Some(
+            crate::sns_split::SnsTarget::Instagram
+                .stable_key()
+                .to_owned(),
+        );
+        saved.sns_split_count = 4;
+        saved.sns_split_seam_permille = 100;
+        saved.sns_split_frame_ratio = Some("4:5".to_owned());
+
+        let mut restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        restored.sanitize();
+        assert_eq!(restored.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(restored.sns_split_count, 4);
+        assert_eq!(restored.sns_split_seam_permille, 100);
+        assert_eq!(restored.sns_split_frame_ratio.as_deref(), Some("4:5"));
+    }
+
+    #[test]
+    fn sns_split_settings_sanitize_unknown_keys_and_out_of_range_numbers() {
+        let mut below_minimum: Settings = serde_json::from_str(
+            r#"{"sns_split_target":"future-service","sns_split_count":0,"sns_split_seam_permille":65535,"sns_split_frame_ratio":"future-ratio"}"#,
+        )
+        .unwrap();
+        below_minimum.sanitize();
+        assert_eq!(below_minimum.sns_split_target.as_deref(), Some("x"));
+        assert_eq!(below_minimum.sns_split_count, crate::sns_split::MIN_COUNT);
+        assert_eq!(
+            below_minimum.sns_split_seam_permille,
+            crate::sns_split::MAX_SEAM_PERMILLE
+        );
+        assert_eq!(below_minimum.sns_split_frame_ratio.as_deref(), Some("free"));
+
+        below_minimum.sns_split_target = Some("instagram".to_owned());
+        below_minimum.sns_split_count = u8::MAX;
+        below_minimum.sns_split_seam_permille = 0;
+        below_minimum.sns_split_frame_ratio = Some("1:1".to_owned());
+        below_minimum.sanitize();
+        assert_eq!(below_minimum.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(below_minimum.sns_split_count, crate::sns_split::MAX_COUNT);
+        assert_eq!(below_minimum.sns_split_seam_permille, 0);
+        assert_eq!(below_minimum.sns_split_frame_ratio.as_deref(), Some("1:1"));
+
+        for key in ["free", "3:4", "4:5", "1:1"] {
+            let mut settings = Settings {
+                sns_split_frame_ratio: Some(key.to_owned()),
+                ..Settings::default()
+            };
+            settings.sanitize();
+            assert_eq!(settings.sns_split_frame_ratio.as_deref(), Some(key));
+        }
+        for invalid in [None, Some(String::new()), Some("future-ratio".to_owned())] {
+            let mut settings = Settings {
+                sns_split_frame_ratio: invalid,
+                ..Settings::default()
+            };
+            settings.sanitize();
+            assert_eq!(settings.sns_split_frame_ratio.as_deref(), Some("free"));
+        }
+    }
+
+    #[test]
+    fn preferences_ok_preserves_live_sns_split_selection() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        live.sns_split_target = Some("instagram".to_owned());
+        live.sns_split_count = 4;
+        live.sns_split_seam_permille = 100;
+        live.sns_split_frame_ratio = Some("3:4".to_owned());
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.sns_split_target.as_deref(), Some("instagram"));
+        assert_eq!(edited.sns_split_count, 4);
+        assert_eq!(edited.sns_split_seam_permille, 100);
+        assert_eq!(edited.sns_split_frame_ratio.as_deref(), Some("3:4"));
+    }
 
     /// **モードと読み順は互いの逆向きでなければならない。**
     ///
