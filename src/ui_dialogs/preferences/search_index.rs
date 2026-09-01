@@ -133,29 +133,10 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
-        "external-tools/list",
-        ExternalTools,
-        "登録した外部ツール",
-        [
-            "外部ツール",
-            "アプリケーションで開く",
-            "open with",
-            "関連付け",
-            "実行ファイル",
-            "引数"
-        ]
-    ),
-    entry!(
-        "explorer/context-menu-inline",
+        "explorer/context-menu",
         ExplorerIntegration,
-        "mIV の右クリックメニュー",
-        [
-            "コンテキストメニュー",
-            "shell",
-            "サブメニュー",
-            "併記",
-            "windows のメニュー"
-        ]
+        "実ファイル/実フォルダでは Windows 標準の右クリックメニューを使う",
+        ["コンテキストメニュー", "shell", "右クリック"]
     ),
     entry!(
         "explorer/sendto",

@@ -355,12 +355,11 @@ Keep the existing image clipboard code separate:
 
 ## 8. Native context menu architecture
 
-Implementation status: implemented for the main grid and fullscreen real/virtual paths. The helper
+Implementation status: implemented for the main grid real-file path. The helper
 is `src/native_context_menu.rs`, and `src/ui_dialogs/context_menu.rs` routes
-all supported items to it. `Settings::use_native_shell_context_menu` controls
-whether real files/folders also receive Shell commands. The implementation inserts mIV commands first,
-puts Shell commands in a lazy "Windows のメニュー" submenu by default, uses
-`TrackPopupMenuEx(..., TPM_RETURNCMD, ...)`, dispatches Shell
+real files/folders to it when `Settings::use_native_shell_context_menu` is
+enabled. The implementation inserts mIV commands first, asks Shell to populate
+the rest, uses `TrackPopupMenuEx(..., TPM_RETURNCMD, ...)`, dispatches Shell
 commands with `IContextMenu::InvokeCommand`, and temporarily subclasses the main
 HWND to forward `IContextMenu2` / `IContextMenu3` owner-draw and submenu
 messages.
@@ -404,13 +403,11 @@ Current routing details:
   command invocation paths. Slow stages (120 ms or more, 80 ms for
   `app_prepare`) are also summarized in the normal log.
 - Checked selections use the Shell menu only when every checked item has a real
-  file-operation path. Mixed real + ZIP/PDF virtual selections use the native
-  mIV-only menu; path copy and delete reject the whole selection with a toast.
+  file-operation path. Mixed real + ZIP/PDF virtual selections keep the egui
+  fallback.
 - ZIP/PDF pages, ZIP directories, search containers, and other virtual items
-  use the same native HMENU populated only with mIV commands.
-- In the default submenu mode, `QueryContextMenu` runs from `WM_INITMENUPOPUP`
-  only when "Windows のメニュー" is opened. `show_windows_context_menu_inline`
-  restores the eager same-level layout.
+  still use the egui mIV-command menu until the Win32 custom virtual menu is
+  implemented.
 
 Windows-only module: `src/native_context_menu.rs`.
 
@@ -466,11 +463,10 @@ Message forwarding:
 
 Settings:
 
-- `use_native_shell_context_menu` defaults on and controls whether native menus
-  for real items include Shell commands. Turning it off keeps the native mIV-only
-  menu; Ctrl+C/Ctrl+X/Ctrl+V still use Shell verbs.
-- `show_windows_context_menu_inline` defaults off. ON restores the legacy
-  same-level Shell layout; OFF uses the lazy submenu.
+- `use_native_shell_context_menu` is implemented and defaults on so the Shell
+  menu is visible in development builds immediately. It is a right-click menu
+  presentation toggle: turning it off avoids the native right-click menu path,
+  but Ctrl+C/Ctrl+X/Ctrl+V still use Shell verbs.
 - Add a second setting if needed later: `show_miv_commands_in_native_menu`,
   default on.
 - If a Shell menu crashes/hangs reports appear, users can disable the native
@@ -592,7 +588,7 @@ Status: implemented.
 
 ### Phase 3 - Real filesystem native context menu
 
-Status: implemented for the main grid and fullscreen.
+Status: implemented for the main grid. Fullscreen can be aligned later.
 
 - Add `src/native_context_menu.rs`.
 - Route real filesystem right-clicks through native `HMENU`.
@@ -602,8 +598,6 @@ Status: implemented for the main grid and fullscreen.
 - Add an experimental setting for native Shell context menus.
 
 ### Phase 4 - Virtual native custom menu
-
-Status: implemented (2026-08-30).
 
 - Replace egui context menu for `ZipImage`, `PdfPage`, `ZipDir`, and mixed
   virtual selections with native custom `HMENU`.

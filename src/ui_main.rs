@@ -199,8 +199,6 @@ fn checked_selection_overlay_fill(dark_mode: bool) -> egui::Color32 {
     }
 }
 
-pub(crate) const CHECKED_SELECTION_OVERLAY_ID: &str = "checked_selection_count_overlay";
-
 /// チェック件数をメイン一覧の右上へ表示する。「選択解除」が押されたら true を返す。
 fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> bool {
     let Some(count_label) = checked_selection_overlay_label(checked_count) else {
@@ -208,7 +206,7 @@ fn show_checked_selection_overlay(ctx: &egui::Context, checked_count: usize) -> 
     };
     let top_offset = ctx.available_rect().top() + 8.0;
     let mut clear_clicked = false;
-    egui::Area::new(egui::Id::new(CHECKED_SELECTION_OVERLAY_ID))
+    egui::Area::new(egui::Id::new("checked_selection_count_overlay"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top_offset))
         .show(ctx, |ui| {
@@ -1694,8 +1692,7 @@ pub(crate) enum DragDecision {
 ///   ドラッグ対象にする。仮想アイテム (`ZipImage` / `PdfPage`) が混在していれば除外し、
 ///   完了後トーストで件数を明示する。実パスが 0 件なら即時トーストのみ。
 /// - `idx` が複数選択外 → エクスプローラ流に、掴んだ単体だけをドラッグ
-///   (実ファイル / 実フォルダのとき)。実パスを持たない item は no-op にせず、
-///   種別に応じた理由をトーストで返す (`GridItem::file_operation_refusal`)。
+///   (実ファイル / 実フォルダのとき)。仮想アイテム等なら no-op。
 ///
 /// 純粋関数にして `App` 構築なしでユニットテストできるようにしている。
 pub(crate) fn decide_drag_payload(
@@ -1735,21 +1732,12 @@ pub(crate) fn decide_drag_payload(
             post_drag_toast,
         }
     } else {
-        let Some(item) = items.get(idx) else {
-            return DragDecision::None;
-        };
-        match item.drag_source_path() {
+        match items.get(idx).and_then(GridItem::drag_source_path) {
             Some(p) => DragDecision::Start {
                 paths: vec![p.to_path_buf()],
                 post_drag_toast: None,
             },
-            // 掴んで動かした = 意図のある操作なので、Ctrl+C と同じ答えを返す
-            // (docs/item-kind-capability-matrix.md §6-8)。touch 由来の drag は
-            // `native_grid_drag_start_allowed` が既に除いている。
-            None => match item.file_operation_refusal() {
-                Some(reason) => DragDecision::ImmediateToast(reason.message("ドラッグ")),
-                None => DragDecision::None,
-            },
+            None => DragDecision::None,
         }
     }
 }
@@ -5661,6 +5649,39 @@ impl App {
                                         .clicked()
                                     {
                                         self.request_tag_clear_for_selection(crate::app::ActionSurface::MainWindow);
+                                        ui.close();
+                                    }
+                                    let legacy_xmp_count = self.legacy_xmp_target_path_count();
+                                    let has_legacy_xmp_target = legacy_xmp_count > 0;
+                                    ui.separator();
+                                    if ui
+                                .add_enabled(
+                                    has_legacy_xmp_target,
+                                    egui::Button::new(format!("旧XMPタグを取り込む ({legacy_xmp_count})")),
+                                )
+                                .hover_tip(
+                                    "ファイル内に残っている旧mIVの #タグをアプリ内タグへ取り込みます。",
+                                )
+                                .clicked()
+                            {
+                                self.request_legacy_xmp_import_for_selection(
+                                    crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportOnly,
+                                );
+                                ui.close();
+                            }
+                                    if ui
+                                        .add_enabled(
+                                            has_legacy_xmp_target,
+                                            egui::Button::new(format!(
+                                                "旧XMPタグを取り込んでファイルから削除 ({legacy_xmp_count})"
+                                            )),
+                                        )
+                                        .hover_tip("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
+                                        .clicked()
+                                    {
+                                        self.request_legacy_xmp_import_for_selection(
+                                    crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportAndRemove,
+                                );
                                         ui.close();
                                     }
                                     ui.separator();
@@ -21675,47 +21696,14 @@ mod decide_drag_payload_tests {
         }
     }
 
-    /// 掴んで動かしたのに何も起きず何も言わない、を無くす
-    /// (docs/item-kind-capability-matrix.md §6-8)。同じ対象へ Ctrl+C を押すと
-    /// 以前からトーストが出ていたので、答えが入口によって違っていた。
     #[test]
-    fn single_undraggable_item_says_why_instead_of_going_quiet() {
+    fn single_virtual_item_is_noop() {
+        let items = vec![zip_img(r"C:\a.zip", "p1.jpg")];
         let checked = HashSet::new();
-        let cases: Vec<(&str, GridItem, &str)> = vec![
-            ("ZipImage", zip_img(r"C:\a.zip", "p1.jpg"), "ページ"),
-            (
-                "PdfPage",
-                GridItem::PdfPage {
-                    pdf_path: PathBuf::from(r"C:\a.pdf"),
-                    page_num: 0,
-                    content_type: None,
-                },
-                "ページ",
-            ),
-            (
-                "ZipDir",
-                GridItem::ZipDir {
-                    zip_path: PathBuf::from(r"C:\a.zip"),
-                    dir_prefix: "chapter/".to_owned(),
-                    is_archive: false,
-                    representative: None,
-                },
-                "フォルダ",
-            ),
-        ];
-        for (label, item, expected_kind) in cases {
-            let items = vec![item];
-            match decide_drag_payload(&items, &checked, 0) {
-                DragDecision::ImmediateToast(msg) => {
-                    assert!(
-                        msg.contains(expected_kind) && msg.contains("ドラッグできません"),
-                        "{label} の理由が種別に合っていない: {msg}"
-                    );
-                }
-                DragDecision::Start { .. } => panic!("{label} はドラッグできないはず"),
-                DragDecision::None => panic!("{label} が無反応のまま"),
-            }
-        }
+        assert!(matches!(
+            decide_drag_payload(&items, &checked, 0),
+            DragDecision::None
+        ));
     }
 
     #[test]

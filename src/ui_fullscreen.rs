@@ -4710,56 +4710,8 @@ fn format_duration_mm_ss(secs: f64) -> String {
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
+/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
 pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
-const FEEDBACK_TOAST_BASE_CHARS: usize = 20;
-/// 1 文字あたりの加算秒。**日本語の読字速度は毎秒 8 文字程度**なので、その逆数を取る。
-/// 0.06 (= 毎秒 17 文字) では読み切る前に消えた (2026-08-30、混在選択の拒否文で実測報告)。
-const FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR: f32 = 0.12;
-/// 上限。長すぎるトーストは邪魔になるが、拒否理由と対処を書いた長文案内にも
-/// 5 秒以上を確保する。既存の長文ヒント (`NO_IMAGE_FOLDER_HINT_DURATION` = 4.0) より長い。
-const FEEDBACK_TOAST_MAX_DURATION: f32 = 5.5;
-
-/// 短文は従来の 1.2 秒を維持し、20 文字を超えた分だけ表示時間を延ばす。
-/// 日本語を 1 文字として扱うため、byte 長ではなく Unicode scalar value 数で計算する。
-pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
-    let extra_chars = text
-        .chars()
-        .count()
-        .saturating_sub(FEEDBACK_TOAST_BASE_CHARS);
-    (FEEDBACK_TOAST_DURATION + extra_chars as f32 * FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR)
-        .min(FEEDBACK_TOAST_MAX_DURATION)
-}
-
-fn feedback_toast_layer_id(drawing_surface: crate::app::ActionSurface) -> egui::LayerId {
-    let id = match drawing_surface {
-        crate::app::ActionSurface::MainWindow => "feedback_toast_main_window",
-        crate::app::ActionSurface::Viewer => "feedback_toast_viewer",
-    };
-    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(id))
-}
-
-fn feedback_toast_rect(
-    full_rect: egui::Rect,
-    toast_size: egui::Vec2,
-    avoid_rect: Option<egui::Rect>,
-) -> egui::Rect {
-    let mut toast_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            full_rect.max.x - toast_size.x - 20.0,
-            full_rect.min.y + 60.0,
-        ),
-        toast_size,
-    );
-    if let Some(avoid_rect) = avoid_rect
-        && toast_rect.intersects(avoid_rect)
-    {
-        toast_rect = toast_rect.translate(egui::vec2(
-            0.0,
-            avoid_rect.bottom() + 8.0 - toast_rect.top(),
-        ));
-    }
-    toast_rect
-}
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -32820,42 +32772,28 @@ impl App {
         };
         let alpha_u8 = (alpha * 220.0) as u8;
 
-        // Foreground のチェック件数パネルより上で描画し、クリック判定も同じ層へ置く。
-        let toast_layer_id = feedback_toast_layer_id(drawing_surface);
-        let toast_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .layer_id(toast_layer_id)
-                .max_rect(full_rect),
-        );
         let font = egui::FontId::proportional(18.0);
-        let galley =
-            toast_ui
-                .painter()
-                .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
         let text_size = galley.size();
         let padding = egui::vec2(16.0, 10.0);
         let toast_size = text_size + padding * 2.0;
 
-        // 一覧では実測したチェック件数パネルの下へ逃がし、「選択解除」を覆わない。
-        // フルスクリーン、ダイアログ中などパネルが出ない場面は従来位置を維持する。
-        let checked_overlay_rect = (drawing_surface == crate::app::ActionSurface::MainWindow
-            && !self.checked.is_empty()
-            && !self.viewer_session_blocks_main_window()
-            && !self.any_dialog_open())
-        .then(|| {
-            ctx.memory(|memory| {
-                memory.area_rect(egui::Id::new(crate::ui_main::CHECKED_SELECTION_OVERLAY_ID))
-            })
-        })
-        .flatten();
-        let toast_rect = feedback_toast_rect(full_rect, toast_size, checked_overlay_rect);
+        let toast_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                full_rect.max.x - toast_size.x - 20.0,
+                full_rect.min.y + 60.0,
+            ),
+            toast_size,
+        );
 
-        toast_ui.painter().rect_filled(
+        ui.painter().rect_filled(
             toast_rect,
             8.0,
             egui::Color32::from_rgba_unmultiplied(30, 30, 30, alpha_u8),
         );
-        toast_ui.painter().text(
+        ui.painter().text(
             toast_rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
@@ -32864,7 +32802,7 @@ impl App {
         );
 
         if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
-            let resp = toast_ui
+            let resp = ui
                 .interact(
                     toast_rect,
                     egui::Id::new("feedback_toast_reveal_capture"),
@@ -37790,62 +37728,6 @@ mod tests {
 "
             )
         );
-    }
-
-    #[test]
-    fn feedback_toast_short_text_keeps_default_duration() {
-        assert_eq!(
-            feedback_toast_duration("短い確認メッセージ"),
-            FEEDBACK_TOAST_DURATION
-        );
-    }
-
-    #[test]
-    fn feedback_toast_long_japanese_text_extends_by_character_count() {
-        let text = "あ".repeat(FEEDBACK_TOAST_BASE_CHARS + 1);
-        let expected = FEEDBACK_TOAST_DURATION + FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR;
-        assert!((feedback_toast_duration(&text) - expected).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn feedback_toast_duration_is_capped() {
-        assert_eq!(
-            feedback_toast_duration(&"長".repeat(10_000)),
-            FEEDBACK_TOAST_MAX_DURATION
-        );
-    }
-
-    #[test]
-    fn feedback_toast_layer_is_above_checked_selection_overlay() {
-        assert_eq!(
-            feedback_toast_layer_id(crate::app::ActionSurface::MainWindow).order,
-            egui::Order::Tooltip
-        );
-        assert!(egui::Order::Tooltip > egui::Order::Foreground);
-    }
-
-    #[test]
-    fn feedback_toast_moves_below_overlapping_checked_selection_overlay() {
-        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
-        let overlay_rect =
-            egui::Rect::from_min_size(egui::pos2(690.0, 20.0), egui::vec2(100.0, 120.0));
-
-        let toast_rect =
-            feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), Some(overlay_rect));
-
-        assert!(!toast_rect.intersects(overlay_rect));
-        assert_eq!(toast_rect.top(), overlay_rect.bottom() + 8.0);
-        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
-    }
-
-    #[test]
-    fn feedback_toast_keeps_default_position_without_checked_selection_overlay() {
-        let full_rect = egui::Rect::from_min_size(egui::pos2(10.0, 30.0), egui::vec2(800.0, 600.0));
-
-        let toast_rect = feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), None);
-
-        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
-        assert_eq!(toast_rect.top(), full_rect.top() + 60.0);
     }
 
     #[test]
