@@ -27,6 +27,7 @@ UI スレッドをブロックしないための設計方針と、2026-04 の Ct
 | `std::fs::read_dir` + **`Path::is_dir()` / `Path::is_file()`** per-entry | Windows では per-entry で `GetFileAttributes` syscall。500 ファイルで 500-1000ms | `DirEntry::file_type()` を使う (`FindFirstFile` のキャッシュ再利用) |
 | DFS フォルダ走査 (`navigate_folder_with_skip`) | HDD で 20-300ms、最悪 1s+ | 常に別スレッド (`spawn_folder_nav`) |
 | SQLite の `search()` (FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| Windows Shell の `IContextMenu::QueryContextMenu` | シェル拡張が多い環境で 1.2〜1.4 秒 | 右クリック直後には呼ばず、既定では「Windows のメニュー」の `WM_INITMENUPOPUP` まで遅延する。同階層へ併記する設定では従来どおり同期コストを受け入れる |
 
 ### 1.1 Windows 固有: `Path::is_dir` は syscall、`DirEntry::file_type` はキャッシュ
 
