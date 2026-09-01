@@ -10970,6 +10970,18 @@ pub struct App {
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
     video_seek_strip_runtime: native_video::VideoSeekStripRuntime,
+    /// ストリップの表示範囲・高さ・`Shift+S` の巡回対象。
+    ///
+    /// **TODO(§1.155 最終コミット): 設定へ移す。** レーン A が settings.rs を書き換えて
+    /// いるあいだの暫定の持ち主で、いまは永続化しない。表示内容 (場面 / 波形 / なし) は
+    /// 既存の `settings.video_seek_strip_state` が持ち、この 2 つを合わせた 5 値が
+    /// `video_seek_strip_view()` になる。
+    #[cfg(windows)]
+    pub(crate) video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan,
+    #[cfg(windows)]
+    pub(crate) video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    #[cfg(windows)]
+    pub(crate) video_seek_strip_cycle_set: crate::video::seek_strip_layout::SeekStripCycleSet,
     /// 直前のストリップセッションが使っていた波形ワーカー。**同じ動画のあいだだけ持つ。**
     ///
     /// HUD が自動で隠れるたびに捨てていたので、出し直すたびに全尺の粗い解析をやり直して
@@ -14021,6 +14033,13 @@ impl App {
             video_tile_state: None,
             #[cfg(windows)]
             video_seek_strip_runtime: native_video::VideoSeekStripRuntime::Closed,
+            #[cfg(windows)]
+            video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
+            #[cfg(windows)]
+            video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            #[cfg(windows)]
+            video_seek_strip_cycle_set: crate::video::seek_strip_layout::SeekStripCycleSet::default(
+            ),
             #[cfg(windows)]
             video_seek_strip_wave_holdover: None,
             #[cfg(windows)]

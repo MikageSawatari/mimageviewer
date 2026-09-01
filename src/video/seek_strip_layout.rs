@@ -65,6 +65,11 @@ const SEEK_STRIP_CELL_WIDTH_SMALL: f32 = 64.0;
 /// 帯の高さとセルの高さの差 (上下の余白の合計)。
 pub(crate) const SEEK_STRIP_CELL_VERTICAL_INSET: f32 = 10.0;
 
+/// 周辺表示のセル間隔 (points)。出荷済みの見た目。
+const SEEK_STRIP_WINDOW_CELL_GAP: f32 = 4.0;
+/// 全体表示のセル間隔 (points)。区切りが分かる最小限に留め、帯を連続した 1 本に見せる。
+const SEEK_STRIP_WHOLE_CELL_GAP: f32 = 1.0;
+
 impl SeekStripHeight {
     pub const fn points(self) -> f32 {
         match self {
@@ -245,6 +250,36 @@ impl SeekStripCycleSet {
     }
 }
 
+/// 赤線をどこに置くか。
+///
+/// 周辺表示では中央固定で、帯の中身が動く。全体表示では中身が動かず、赤線が再生位置へ
+/// 動く。**座標の原点 (セルと時刻の対応) は両方とも帯の中央のまま**で、動くのは線だけ。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SeekStripMarker {
+    Center,
+    Fraction(f32),
+}
+
+impl SeekStripMarker {
+    /// 再生位置と尺から赤線の位置を決める。全体表示で尺が使えないときは左端に置く
+    /// (中央へ落とすと、動いていない再生位置を中央だと言ってしまう)。
+    pub(crate) fn for_span(span: SeekStripSpan, position_secs: f64, duration_secs: f64) -> Self {
+        match span {
+            SeekStripSpan::Window => Self::Center,
+            SeekStripSpan::Whole => {
+                Self::Fraction(whole_position_fraction(position_secs, duration_secs).unwrap_or(0.0))
+            }
+        }
+    }
+
+    pub(crate) fn x(self, rect: egui::Rect) -> f32 {
+        match self {
+            Self::Center => rect.center().x,
+            Self::Fraction(fraction) => rect.min.x + rect.width() * fraction.clamp(0.0, 1.0),
+        }
+    }
+}
+
 /// 全体表示のセル数の上限。
 ///
 /// 幅と高さから決まるので通常は数十だが、極端な縦横比や将来の高解像度で軸のセル数が
@@ -266,6 +301,10 @@ pub(crate) struct SeekStripLayout {
     pub(crate) cell_width: f32,
     /// セル 1 つの高さ (points)。
     pub(crate) cell_height: f32,
+    /// セル同士のあいだに空ける幅 (points)。
+    ///
+    /// 全体表示は動画全体を隙間なく並べるのが目的なので、区切りが分かる最小限に留める。
+    pub(crate) cell_gap: f32,
     /// 全体表示のセル数。周辺表示は帯の外まで続くので `None`。
     pub(crate) whole_cell_count: Option<usize>,
 }
@@ -299,6 +338,7 @@ impl SeekStripLayout {
                 span,
                 cell_width: height.window_cell_width_points(),
                 cell_height,
+                cell_gap: SEEK_STRIP_WINDOW_CELL_GAP,
                 whole_cell_count: None,
             },
             SeekStripSpan::Whole => {
@@ -308,6 +348,7 @@ impl SeekStripLayout {
                     span,
                     cell_width: rect.width() / count as f32,
                     cell_height,
+                    cell_gap: SEEK_STRIP_WHOLE_CELL_GAP,
                     whole_cell_count: Some(count),
                 }
             }
@@ -359,19 +400,6 @@ pub(crate) fn whole_position_fraction(time_secs: f64, duration_secs: f64) -> Opt
         return None;
     }
     Some((time_secs / duration_secs).clamp(0.0, 1.0) as f32)
-}
-
-/// 全体表示で、帯上の x 座標を時刻へ写像する。
-pub(crate) fn whole_time_at_x(pointer_x: f32, rect: egui::Rect, duration_secs: f64) -> Option<f64> {
-    if !pointer_x.is_finite() || !duration_secs.is_finite() || duration_secs <= 0.0 {
-        return None;
-    }
-    let width = rect.width();
-    if !width.is_finite() || width <= 0.0 {
-        return None;
-    }
-    let fraction = f64::from((pointer_x - rect.min.x) / width).clamp(0.0, 1.0);
-    Some(fraction * duration_secs)
 }
 
 #[cfg(test)]
@@ -555,22 +583,36 @@ mod tests {
 
     #[test]
     fn an_unknown_or_zero_duration_has_no_whole_mapping() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 48.0));
         for duration in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(whole_position_fraction(1.0, duration), None);
-            assert_eq!(whole_time_at_x(10.0, rect, duration), None);
         }
     }
 
     #[test]
-    fn pointer_positions_round_trip_through_the_whole_mapping() {
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 900.0), egui::vec2(1000.0, 48.0));
-        for (x, expected) in [(0.0, 0.0), (500.0, 60.0), (1000.0, 120.0)] {
-            let time = whole_time_at_x(x, rect, 120.0).expect("mapping exists");
-            assert!((time - expected).abs() < 1e-9, "{x} -> {time}");
-            let fraction = whole_position_fraction(time, 120.0).expect("mapping exists");
-            assert!((rect.min.x + rect.width() * fraction - x).abs() < 1e-3);
+    fn the_marker_stays_centered_while_the_window_scrolls() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 900.0), egui::vec2(1000.0, 104.0));
+        for position in [0.0, 30.0, 120.0] {
+            let marker = SeekStripMarker::for_span(SeekStripSpan::Window, position, 120.0);
+            assert_eq!(marker, SeekStripMarker::Center);
+            assert_eq!(marker.x(rect), rect.center().x);
         }
+    }
+
+    #[test]
+    fn the_marker_walks_the_whole_band_from_end_to_end() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 900.0), egui::vec2(1000.0, 48.0));
+        let x = |position| SeekStripMarker::for_span(SeekStripSpan::Whole, position, 120.0).x(rect);
+        assert!((x(0.0) - rect.min.x).abs() < 1e-3);
+        assert!((x(60.0) - rect.center().x).abs() < 1e-3);
+        assert!((x(120.0) - rect.max.x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_whole_marker_without_a_usable_duration_sits_at_the_start() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 900.0), egui::vec2(1000.0, 48.0));
+        let marker = SeekStripMarker::for_span(SeekStripSpan::Whole, 5.0, 0.0);
+        assert_eq!(marker, SeekStripMarker::Fraction(0.0));
+        assert_eq!(marker.x(rect), rect.min.x);
     }
 
     #[test]
