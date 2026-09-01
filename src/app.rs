@@ -56851,7 +56851,7 @@ impl App {
             .and_then(|(_, entry)| entry.texture.clone())
     }
 
-    fn final_ai_key_for_pixels(
+    pub(crate) fn final_ai_key_for_pixels(
         &self,
         edit_key: EditResultKey,
         size: [usize; 2],
@@ -59363,7 +59363,7 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };

@@ -158,12 +158,60 @@ pub struct ExportRequest {
     pub scale: ExportScale,
     pub entries: Vec<ExportEntry>,
     pub include_metadata: bool,
+    /// プリセット再合成が final AI を回している間、ローカル AI 利用中であることを
+    /// remote 側の acquire barrier へ見せ続ける lease。AI を使わない export では `None`。
+    pub(crate) local_ai_activity: Option<crate::app::LocalAiActivityLease>,
+}
+
+/// プリセット出力 (`_1`〜`_4`) を作り直すための「隠蔽適用前」スナップショット。
+///
+/// 表示は `raw → 消しゴム → 補正レイヤー → 隠蔽 → 色補正 → final AI → シャープ →
+/// カラー化 → LUT → post filter → 注釈` の順で合成され、[`ExportPagePixels::base_pixels`]
+/// はその最終結果 = **隠蔽が現在の設定で焼き込み済み**の絵である。プリセット出力は隠蔽の
+/// パラメータだけが違う同じ絵なので、隠蔽の入力まで戻ってそこから先を同じ順で流し直す。
+/// `base_pixels` へマスクを重ねるだけでは隠蔽が二重に掛かる (v1.1.0 の退行の原因)。
+pub struct ConcealVariantSource {
+    /// `raw → 消しゴム → 補正レイヤー` まで済んだ source 解像度のピクセル
+    /// (= 表示側で隠蔽合成の入力になっているものと同じ)。
+    pub base: Arc<egui::ColorImage>,
+    /// `base` と同じ寸法へラスタライズ済みの合成マスク。
+    pub mask: Arc<Vec<bool>>,
+    pub params: crate::adjustment::AdjustParams,
+    pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    /// 表示の final composite が実際に final AI を通っているときだけ `Some`。
+    /// 表示が AI 抜きなら (無効 / サイズ外 / 失敗) ここも `None` にして絵を揃える。
+    pub ai: Option<ConcealVariantAi>,
+    pub comic: Option<ConcealVariantComic>,
+}
+
+/// プリセット再合成で final AI を掛け直すための材料。モデル選択は worker 上で
+/// [`crate::ai::final_pipeline::select_final_ai_models`] に委ね、UI スレッドで分類 (重い)
+/// を走らせない。表示側が分類済みなら `category` で同じ答えを渡す。
+pub struct ConcealVariantAi {
+    pub runtime: Arc<crate::ai::runtime::AiRuntime>,
+    pub manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub feature_mode: crate::settings::AiFeatureMode,
+    pub upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    pub denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    pub category: Option<crate::ai::ImageCategory>,
+    pub transparent_bg_mode: u8,
+}
+
+/// 注釈の焼き込み材料。製本の headless compositor と同じ
+/// [`crate::books::bake_comic_annotations`] を使うためのスナップショット。
+pub struct ConcealVariantComic {
+    pub snapshot: crate::books::BookComicSnapshot,
+    pub source_dims: Option<[usize; 2]>,
 }
 
 #[derive(Clone)]
 pub struct ExportPagePixels {
+    /// ダイアログを開いた瞬間の表示ピクセル (final composite + 注釈)。
+    /// `_0` (現在の設定) はこれをそのまま書き出すので、画面と 1 pixel も違わない。
     pub base_pixels: Arc<egui::ColorImage>,
-    pub conceal_mask: Option<Arc<Vec<bool>>>,
+    /// プリセット出力用の再合成材料。`None` ならこのページはプリセット出力できない
+    /// (= 隠蔽マスクが無い)。
+    pub(crate) conceal_variant: Option<Arc<ConcealVariantSource>>,
     pub crop: Option<crate::export_crop::CropRect>,
     pub rotation: crate::rotation_db::Rotation,
 }
@@ -198,12 +246,26 @@ pub enum ExportPixels {
 }
 
 impl ExportPixels {
+    /// プリセット出力 (`_1`〜`_4`) を作れるか = 隠蔽マスクを持つページがあるか。
     pub fn has_conceal_mask(&self) -> bool {
         match self {
-            Self::Single(page) => page.conceal_mask.is_some(),
+            Self::Single(page) => page.conceal_variant.is_some(),
             Self::Spread { left, right } => {
-                left.conceal_mask.is_some() || right.conceal_mask.is_some()
+                left.conceal_variant.is_some() || right.conceal_variant.is_some()
             }
+        }
+    }
+
+    /// プリセット再合成が final AI を回すか。worker が AI lease を握るかの判定に使う。
+    pub(crate) fn conceal_variant_uses_ai(&self) -> bool {
+        let uses_ai = |page: &ExportPagePixels| {
+            page.conceal_variant
+                .as_ref()
+                .is_some_and(|v| v.ai.is_some())
+        };
+        match self {
+            Self::Single(page) => uses_ai(page),
+            Self::Spread { left, right } => uses_ai(left) || uses_ai(right),
         }
     }
 
@@ -271,11 +333,15 @@ impl ExportDialogState {
     }
 }
 
+/// 書き出すバリエーションを決める。
+///
+/// `_0` (現在の設定) は [`ExportPagePixels::base_pixels`] = 表示スナップショットをそのまま
+/// 出すので `conceal_preset` を持たない。隠蔽は既にそこへ焼き込まれており、preset を
+/// 添えると二重適用になる。プリセット出力だけが隠蔽前 base から再合成する。
 pub(crate) fn plan_export_entries(
     sns_split_frames: &[crate::export_crop::CropRect],
     selection: &[bool; 5],
     has_conceal_mask: bool,
-    current_conceal_preset: Option<ConcealPreset>,
     preset_slots: &crate::conceal::ConcealPresetSlots,
 ) -> Result<Vec<ExportEntry>, String> {
     if !sns_split_frames.is_empty() {
@@ -301,7 +367,7 @@ pub(crate) fn plan_export_entries(
         entries.push(ExportEntry {
             label: "現在の設定".to_string(),
             suffix: 0,
-            conceal_preset: current_conceal_preset,
+            conceal_preset: None,
             crop: None,
         });
     }
@@ -426,6 +492,8 @@ fn session_targets_available(
 }
 
 fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<ExportEvent>) {
+    // ローカル AI 利用中であることを worker 終端まで remote の acquire barrier へ見せる。
+    let _local_ai_activity = request.local_ai_activity;
     let output_src_format = request.output_format.to_src_format();
     // 元 WebP がアニメーション WebP かを検査するため、original が WebP のときは
     // 出力形式に関係なく source bytes を読み込む。出力 PNG/JPEG にしても黙って
@@ -531,9 +599,16 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             &request.pixels,
             entry.conceal_preset.as_ref(),
             entry.crop,
+            &cancel,
         ) {
             Ok(pixels) => pixels,
-            Err(message) => {
+            // プリセット再合成は AI 推論を含み分単位になりうるので、合成の途中で
+            // cancel が立ったら失敗ではなくキャンセルとして畳む。
+            Err(ExportRenderError::Cancelled) => {
+                let _ = tx.send(ExportEvent::Cancelled);
+                return;
+            }
+            Err(ExportRenderError::Failed(message)) => {
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {
                     label: entry.label,
                     message,
@@ -594,16 +669,30 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
     let _ = tx.send(ExportEvent::AllDone);
 }
 
+/// 1 エントリぶんの描画で起きうる終わり方。cancel を失敗として報告しないために分ける。
+#[derive(Debug)]
+enum ExportRenderError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for ExportRenderError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
 fn render_export_pixels<'a>(
     pixels: &'a ExportPixels,
     preset: Option<&ConcealPreset>,
     entry_crop: Option<crate::export_crop::CropRect>,
-) -> Result<Cow<'a, egui::ColorImage>, String> {
+    cancel: &Arc<AtomicBool>,
+) -> Result<Cow<'a, egui::ColorImage>, ExportRenderError> {
     match pixels {
-        ExportPixels::Single(page) => render_export_page_pixels(page, preset, entry_crop),
+        ExportPixels::Single(page) => render_export_page_pixels(page, preset, entry_crop, cancel),
         ExportPixels::Spread { left, right } => {
-            let left = render_export_page_pixels(left, preset, entry_crop)?;
-            let right = render_export_page_pixels(right, preset, entry_crop)?;
+            let left = render_export_page_pixels(left, preset, entry_crop, cancel)?;
+            let right = render_export_page_pixels(right, preset, entry_crop, cancel)?;
             let combined =
                 crate::capture::combine_spread_color_images(left.as_ref(), right.as_ref())?;
             Ok(Cow::Owned(combined))
@@ -615,13 +704,15 @@ fn render_export_page_pixels<'a>(
     page: &'a ExportPagePixels,
     preset: Option<&ConcealPreset>,
     entry_crop: Option<crate::export_crop::CropRect>,
-) -> Result<Cow<'a, egui::ColorImage>, String> {
-    let rendered = match (&page.conceal_mask, preset) {
-        (Some(mask), Some(preset)) => Cow::Owned(compose_conceal_for_export(
-            page.base_pixels.as_ref(),
-            mask.as_ref(),
-            preset,
-        )?),
+    cancel: &Arc<AtomicBool>,
+) -> Result<Cow<'a, egui::ColorImage>, ExportRenderError> {
+    let rendered = match (&page.conceal_variant, preset) {
+        // プリセット出力は隠蔽の入力まで戻って合成し直す。マスクが無いページ
+        // (見開きの片側など) は preset が選ばれていても表示スナップショットのまま。
+        (Some(variant), Some(preset)) => {
+            Cow::Owned(compose_conceal_variant(variant, preset, cancel)?)
+        }
+        // `_0` と SNS 分割は表示スナップショットをそのまま出す。
         _ => Cow::Borrowed(page.base_pixels.as_ref()),
     };
     if let Some(crop) = entry_crop.or(page.crop) {
@@ -676,29 +767,138 @@ fn scale_export_pixels<'a>(
     )))
 }
 
-fn compose_conceal_for_export(
-    base: &egui::ColorImage,
-    mask: &[bool],
-    params: &ConcealPreset,
-) -> Result<egui::ColorImage, String> {
-    let expected = base.size[0]
-        .checked_mul(base.size[1])
+/// プリセット 1 枚ぶんを、表示パイプラインの隠蔽以降と同じ順で組み立て直す。
+///
+/// 隠蔽 -> 色補正 / final AI -> シャープ -> カラー化 -> LUT -> post filter -> 注釈。
+/// 段の順と適用条件は表示側 (docs/display-pipeline.md 3.0) と同一で、違うのは隠蔽の
+/// パラメータだけ。crop と回転は呼び出し元が最終段で掛ける。
+fn compose_conceal_variant(
+    variant: &ConcealVariantSource,
+    preset: &ConcealPreset,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, ExportRenderError> {
+    let expected = variant.base.size[0]
+        .checked_mul(variant.base.size[1])
         .ok_or_else(|| "隠蔽加工マスクのサイズが大きすぎます".to_string())?;
-    if mask.len() != expected {
-        return Err(format!(
+    if variant.mask.len() != expected {
+        return Err(ExportRenderError::Failed(format!(
             "隠蔽加工マスクのサイズが一致しません: mask={}, expected={}",
-            mask.len(),
+            variant.mask.len(),
             expected
-        ));
+        )));
     }
-    Ok(crate::conceal_compose::compose_with_preset(
-        base, mask, params,
-    ))
+    let concealed = crate::conceal_compose::compose_with_preset_cancel(
+        &variant.base,
+        &variant.mask,
+        preset,
+        cancel,
+    )
+    .ok_or(ExportRenderError::Cancelled)?;
+
+    let params = &variant.params;
+    let adjust_only = || (!params.is_color_identity()).then(|| params.clone());
+    let concealed = Arc::new(concealed);
+    let (source, used_upscale, adjust_before_effect) = match &variant.ai {
+        Some(ai) => match crate::ai::final_pipeline::select_final_ai_models(
+            &concealed,
+            params,
+            ai.feature_mode,
+            ai.upscale_limit,
+            ai.denoise_limit,
+            ai.category,
+        ) {
+            Some(models) => {
+                let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
+                    source: Arc::clone(&concealed),
+                    // 隠蔽前 base は色補正前なので、表示の先読み経路と同じく AI 側で焼く。
+                    adjust_before_ai: adjust_only(),
+                    denoise_kind: models.denoise,
+                    upscale_kind: models.upscale,
+                    background_mode: ai.transparent_bg_mode,
+                };
+                match crate::ai::final_pipeline::execute_selected_final_ai(
+                    &ai.runtime,
+                    &ai.manager,
+                    request,
+                    cancel,
+                    &crate::ai::final_pipeline::NoFinalAiProgress,
+                ) {
+                    Ok(output) => (Arc::new(output.image), output.used_upscale, None),
+                    Err(crate::ai::final_pipeline::FinalAiExecutionError::Cancelled) => {
+                        return Err(ExportRenderError::Cancelled);
+                    }
+                    // _0 は AI を通った絵なので、ここで AI 抜きへ落とすと寸法から別物に
+                    // なる。黙って劣化させず、このエントリを失敗として報告する。
+                    Err(crate::ai::final_pipeline::FinalAiExecutionError::Failed(error)) => {
+                        return Err(ExportRenderError::Failed(format!(
+                            "AI 処理に失敗しました: {error}"
+                        )));
+                    }
+                }
+            }
+            None => (concealed, false, adjust_only()),
+        },
+        None => (concealed, false, adjust_only()),
+    };
+
+    let plan = crate::final_composite::FinalCompositePlan {
+        adjust_before_effect,
+        smart_sharpen: params.effective_smart_sharpen(used_upscale),
+        colorize: params.colorize.clone(),
+        colorize_applicable_override: None,
+        creative_lut: variant.creative_lut.clone(),
+        post_filter: params.post_filter,
+    };
+    let composed = match crate::final_composite::execute_final_composite(source, plan, cancel) {
+        crate::final_composite::FinalCompositeResult::Ready { pixels, .. } => pixels,
+        crate::final_composite::FinalCompositeResult::Cancelled => {
+            return Err(ExportRenderError::Cancelled);
+        }
+    };
+
+    Ok(match &variant.comic {
+        Some(comic) => crate::books::bake_comic_annotations(
+            &composed,
+            &comic.snapshot,
+            comic.source_dims,
+            cancel,
+        ),
+        None => Arc::try_unwrap(composed).unwrap_or_else(|shared| (*shared).clone()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 隠蔽マスクだけを持つ最小の再合成材料 (AI / LUT / 注釈 / 色補正なし)。
+    /// この構成では `compose_conceal_variant` は「隠蔽を掛けるだけ」に縮退する。
+    fn mask_only_variant(
+        base: Arc<egui::ColorImage>,
+        mask: Vec<bool>,
+    ) -> Arc<ConcealVariantSource> {
+        Arc::new(ConcealVariantSource {
+            base,
+            mask: Arc::new(mask),
+            params: crate::adjustment::AdjustParams::default(),
+            creative_lut: None,
+            ai: None,
+            comic: None,
+        })
+    }
+
+    fn page(base_pixels: Arc<egui::ColorImage>) -> ExportPagePixels {
+        ExportPagePixels {
+            base_pixels,
+            conceal_variant: None,
+            crop: None,
+            rotation: crate::rotation_db::Rotation::None,
+        }
+    }
+
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     #[test]
     fn session_basename_uses_plain_base_when_free() {
@@ -736,7 +936,7 @@ mod tests {
             Some(preset.clone()),
         ];
 
-        let entries = plan_export_entries(&frames, &[true; 5], true, Some(preset), &slots).unwrap();
+        let entries = plan_export_entries(&frames, &[true; 5], true, &slots).unwrap();
 
         assert_eq!(entries.len(), 4);
         assert_eq!(
@@ -757,11 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_entry_plan_preserves_current_and_selected_preset_variants() {
-        let current = ConcealPreset {
-            name: "current".to_string(),
-            ..Default::default()
-        };
+    fn normal_entry_plan_gives_only_preset_variants_a_conceal_override() {
         let slots = [
             Some(ConcealPreset {
                 name: "one".to_string(),
@@ -778,14 +974,8 @@ mod tests {
             }),
         ];
 
-        let entries = plan_export_entries(
-            &[],
-            &[true, true, true, false, true],
-            true,
-            Some(current),
-            &slots,
-        )
-        .unwrap();
+        let entries =
+            plan_export_entries(&[], &[true, true, true, false, true], true, &slots).unwrap();
 
         assert_eq!(entries.len(), 3);
         assert_eq!(
@@ -800,7 +990,14 @@ mod tests {
             ]
         );
         assert!(entries.iter().all(|entry| entry.crop.is_none()));
-        assert!(entries.iter().all(|entry| entry.conceal_preset.is_some()));
+        // `_0` は表示スナップショット (隠蔽は焼き込み済み) をそのまま出すので override
+        // を持たない。preset を添えると隠蔽が二重に掛かる。
+        assert!(entries[0].conceal_preset.is_none());
+        assert!(
+            entries[1..]
+                .iter()
+                .all(|entry| entry.conceal_preset.is_some())
+        );
     }
 
     #[test]
@@ -818,7 +1015,7 @@ mod tests {
             basename: "out".to_string(),
             pixels: ExportPixels::Single(ExportPagePixels {
                 base_pixels: Arc::clone(&pixels),
-                conceal_mask: None,
+                conceal_variant: None,
                 crop: None,
                 rotation: crate::rotation_db::Rotation::None,
             }),
@@ -838,6 +1035,7 @@ mod tests {
                 },
             ],
             include_metadata: false,
+            local_ai_activity: None,
         })
         .unwrap();
 
@@ -881,7 +1079,7 @@ mod tests {
             basename: "entry_crop".to_string(),
             pixels: ExportPixels::Single(ExportPagePixels {
                 base_pixels: pixels,
-                conceal_mask: None,
+                conceal_variant: None,
                 crop: Some(crate::export_crop::CropRect {
                     min_x: 1.0,
                     min_y: 0.0,
@@ -903,6 +1101,7 @@ mod tests {
                 }),
             }],
             include_metadata: false,
+            local_ai_activity: None,
         })
         .unwrap();
 
@@ -926,11 +1125,16 @@ mod tests {
         assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
+    /// `_0` は表示スナップショットをそのまま、`_1` は隠蔽前 base から掛け直す。
+    /// 2 つの入力を意図的に別の絵にして、どちらがどちらへ流れるかを固定する。
     #[test]
-    fn worker_composes_conceal_preset_before_writing() {
+    fn worker_writes_display_snapshot_for_current_and_recomposes_preset_variants() {
         let temp = tempfile::tempdir().unwrap();
-        let pixels = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]));
-        let mask = Arc::new(vec![true, false, false, false]);
+        let displayed = Arc::new(egui::ColorImage::new(
+            [2, 2],
+            vec![egui::Color32::from_rgb(7, 8, 9); 4],
+        ));
+        let pre_conceal = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]));
         let pending = spawn_export_worker(ExportRequest {
             source: ExportSource::PdfPage,
             original_format: SrcFormat::Other("pdf".to_string()),
@@ -938,22 +1142,34 @@ mod tests {
             output_dir: temp.path().to_path_buf(),
             basename: "masked".to_string(),
             pixels: ExportPixels::Single(ExportPagePixels {
-                base_pixels: pixels,
-                conceal_mask: Some(mask),
+                base_pixels: displayed,
+                conceal_variant: Some(mask_only_variant(
+                    pre_conceal,
+                    vec![true, false, false, false],
+                )),
                 crop: None,
                 rotation: crate::rotation_db::Rotation::None,
             }),
             scale: ExportScale::Full,
-            entries: vec![ExportEntry {
-                label: "black".to_string(),
-                suffix: 0,
-                conceal_preset: Some(ConcealPreset {
-                    conceal_type: crate::conceal::ConcealType::BlackFill,
-                    ..Default::default()
-                }),
-                crop: None,
-            }],
+            entries: vec![
+                ExportEntry {
+                    label: "current".to_string(),
+                    suffix: 0,
+                    conceal_preset: None,
+                    crop: None,
+                },
+                ExportEntry {
+                    label: "black".to_string(),
+                    suffix: 1,
+                    conceal_preset: Some(ConcealPreset {
+                        conceal_type: crate::conceal::ConcealType::BlackFill,
+                        ..Default::default()
+                    }),
+                    crop: None,
+                },
+            ],
             include_metadata: false,
+            local_ai_activity: None,
         })
         .unwrap();
 
@@ -970,11 +1186,97 @@ mod tests {
             }
         }
 
-        let out = image::open(temp.path().join("masked_0.png"))
+        let current = image::open(temp.path().join("masked_0.png"))
             .unwrap()
             .to_rgba8();
-        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
-        assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
+        assert_eq!(current.get_pixel(0, 0).0, [7, 8, 9, 255]);
+        assert_eq!(current.get_pixel(1, 0).0, [7, 8, 9, 255]);
+
+        let variant = image::open(temp.path().join("masked_1.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(variant.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(variant.get_pixel(1, 0).0, [255, 255, 255, 255]);
+    }
+
+    /// プリセット再合成は表示と同じ順 (隠蔽 -> 色補正) で流す。逆順だと黒塗りが
+    /// そのまま残るので、明度を上げた黒塗り画素で順序を固定できる。
+    #[test]
+    fn conceal_variant_applies_tone_after_conceal_like_the_display_pipeline() {
+        let base = Arc::new(egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]));
+        let mut variant = ConcealVariantSource {
+            base,
+            mask: Arc::new(vec![true, false]),
+            params: crate::adjustment::AdjustParams::default(),
+            creative_lut: None,
+            ai: None,
+            comic: None,
+        };
+        variant.params.brightness = 50.0;
+        let preset = ConcealPreset {
+            conceal_type: crate::conceal::ConcealType::BlackFill,
+            ..Default::default()
+        };
+
+        let out = compose_conceal_variant(&variant, &preset, &no_cancel())
+            .unwrap_or_else(|_| panic!("compose failed"));
+
+        // 黒塗り後に明度が乗るので、マスク画素は純黒のままにならない。
+        assert!(out.pixels[0].r() > 100, "got {:?}", out.pixels[0]);
+        assert_eq!(out.pixels[1].r(), 255);
+    }
+
+    #[test]
+    fn conceal_variant_rejects_a_mask_that_does_not_match_the_base() {
+        let base = Arc::new(egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]));
+        let variant = ConcealVariantSource {
+            base,
+            mask: Arc::new(vec![true]),
+            params: crate::adjustment::AdjustParams::default(),
+            creative_lut: None,
+            ai: None,
+            comic: None,
+        };
+
+        let err = compose_conceal_variant(&variant, &ConcealPreset::default(), &no_cancel());
+
+        assert!(matches!(err, Err(ExportRenderError::Failed(_))));
+    }
+
+    #[test]
+    fn conceal_variant_reports_cancel_instead_of_failure() {
+        let base = Arc::new(egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]));
+        let variant = ConcealVariantSource {
+            base,
+            mask: Arc::new(vec![true, false]),
+            params: crate::adjustment::AdjustParams::default(),
+            creative_lut: None,
+            ai: None,
+            comic: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let out = compose_conceal_variant(&variant, &ConcealPreset::default(), &cancel);
+
+        assert!(matches!(out, Err(ExportRenderError::Cancelled)));
+    }
+
+    #[test]
+    fn pages_without_a_mask_keep_the_display_snapshot_even_when_a_preset_is_selected() {
+        let displayed = Arc::new(egui::ColorImage::new(
+            [1, 1],
+            vec![egui::Color32::from_rgb(1, 2, 3)],
+        ));
+        let page = page(displayed);
+        let preset = ConcealPreset {
+            conceal_type: crate::conceal::ConcealType::BlackFill,
+            ..Default::default()
+        };
+
+        let out = render_export_page_pixels(&page, Some(&preset), None, &no_cancel())
+            .unwrap_or_else(|_| panic!("render failed"));
+
+        assert_eq!(out.pixels, vec![egui::Color32::from_rgb(1, 2, 3)]);
     }
 
     #[test]
@@ -989,7 +1291,7 @@ mod tests {
         ));
         let page = ExportPagePixels {
             base_pixels: pixels,
-            conceal_mask: None,
+            conceal_variant: None,
             crop: Some(crate::export_crop::CropRect {
                 min_x: 1.0,
                 min_y: 0.0,
@@ -999,7 +1301,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::None,
         };
 
-        let out = render_export_page_pixels(&page, None, None).unwrap();
+        let out = render_export_page_pixels(&page, None, None, &no_cancel()).unwrap();
 
         assert_eq!(out.size, [2, 1]);
         assert_eq!(out.pixels[0], egui::Color32::from_rgb(0, 255, 0));
@@ -1020,7 +1322,7 @@ mod tests {
         ));
         let page = ExportPagePixels {
             base_pixels: pixels,
-            conceal_mask: None,
+            conceal_variant: None,
             crop: Some(crate::export_crop::CropRect {
                 min_x: 1.0,
                 min_y: 0.0,
@@ -1036,7 +1338,7 @@ mod tests {
             max_y: 1.0,
         };
 
-        let out = render_export_page_pixels(&page, None, Some(entry_crop)).unwrap();
+        let out = render_export_page_pixels(&page, None, Some(entry_crop), &no_cancel()).unwrap();
 
         assert_eq!(out.size, [1, 1]);
         assert_eq!(out.pixels, vec![red]);
@@ -1052,7 +1354,7 @@ mod tests {
         ));
         let page = ExportPagePixels {
             base_pixels: pixels,
-            conceal_mask: None,
+            conceal_variant: None,
             crop: Some(crate::export_crop::CropRect {
                 min_x: 1.0,
                 min_y: 0.0,
@@ -1062,7 +1364,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::Cw90,
         };
 
-        let out = render_export_page_pixels(&page, None, None).unwrap();
+        let out = render_export_page_pixels(&page, None, None, &no_cancel()).unwrap();
 
         assert_eq!(out.size, [2, 2]);
         assert_eq!(out.pixels, vec![px(5), px(2), px(6), px(3)]);
@@ -1076,7 +1378,7 @@ mod tests {
                 [5, 4],
                 vec![egui::Color32::BLACK; 20],
             )),
-            conceal_mask: None,
+            conceal_variant: None,
             crop: Some(crate::export_crop::CropRect {
                 min_x: 1.0,
                 min_y: 1.0,
@@ -1090,7 +1392,7 @@ mod tests {
                 [3, 5],
                 vec![egui::Color32::WHITE; 15],
             )),
-            conceal_mask: None,
+            conceal_variant: None,
             crop: None,
             rotation: crate::rotation_db::Rotation::None,
         };
@@ -1147,13 +1449,13 @@ mod tests {
             pixels: ExportPixels::Spread {
                 left: ExportPagePixels {
                     base_pixels: left,
-                    conceal_mask: None,
+                    conceal_variant: None,
                     crop: None,
                     rotation: crate::rotation_db::Rotation::None,
                 },
                 right: ExportPagePixels {
                     base_pixels: right,
-                    conceal_mask: None,
+                    conceal_variant: None,
                     crop: None,
                     rotation: crate::rotation_db::Rotation::None,
                 },
@@ -1166,6 +1468,7 @@ mod tests {
                 crop: None,
             }],
             include_metadata: false,
+            local_ai_activity: None,
         })
         .unwrap();
 
@@ -1204,14 +1507,14 @@ mod tests {
             basename: "spread".to_string(),
             pixels: ExportPixels::Spread {
                 left: ExportPagePixels {
-                    base_pixels: left,
-                    conceal_mask: Some(Arc::new(vec![true])),
+                    base_pixels: Arc::clone(&left),
+                    conceal_variant: Some(mask_only_variant(left, vec![true])),
                     crop: None,
                     rotation: crate::rotation_db::Rotation::None,
                 },
                 right: ExportPagePixels {
                     base_pixels: right,
-                    conceal_mask: None,
+                    conceal_variant: None,
                     crop: None,
                     rotation: crate::rotation_db::Rotation::None,
                 },
@@ -1219,7 +1522,7 @@ mod tests {
             scale: ExportScale::Full,
             entries: vec![ExportEntry {
                 label: "black".to_string(),
-                suffix: 0,
+                suffix: 1,
                 conceal_preset: Some(ConcealPreset {
                     conceal_type: crate::conceal::ConcealType::BlackFill,
                     ..Default::default()
@@ -1227,6 +1530,7 @@ mod tests {
                 crop: None,
             }],
             include_metadata: false,
+            local_ai_activity: None,
         })
         .unwrap();
 
@@ -1243,7 +1547,7 @@ mod tests {
             }
         }
 
-        let out = image::open(temp.path().join("spread_0.png"))
+        let out = image::open(temp.path().join("spread_1.png"))
             .unwrap()
             .to_rgba8();
         assert_eq!(out.dimensions(), (2, 1));

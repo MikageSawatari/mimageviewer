@@ -1136,26 +1136,7 @@ fn compose_book_page(
     image = crate::adjustment::apply_adjustments_fast(&image, &edits.params);
 
     if let Some(comic) = &edits.comic {
-        let scaled_objects = edits.comic_source_dims.and_then(|[source_w, source_h]| {
-            let s_bake =
-                image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
-            ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
-        });
-        let objects = scaled_objects.as_deref().unwrap_or(&comic.objects);
-        let mut stamp_cache = comic.stamp_cache.clone();
-        let (stamps, _, _) = crate::comic_stamp::build_stamp_images_from_cache_snapshot(
-            objects,
-            &mut stamp_cache,
-            cancel.as_ref(),
-        );
-        let layers = comic_core::bake_annotation_layers(
-            objects,
-            image.size[0],
-            image.size[1],
-            &comic.fonts,
-            &stamps,
-        );
-        image = crate::comic_overlay::composite_annotation_layers(&image, &layers);
+        image = bake_comic_annotations(&image, comic, edits.comic_source_dims, cancel.as_ref());
     }
 
     let crop = edits.export_crop.map(|crop| {
@@ -1191,6 +1172,38 @@ fn compose_book_page(
         image,
         used_diffusion_fallback,
     })
+}
+
+/// 注釈 (comic) を合成済み画像へ焼き込む。
+///
+/// 製本の headless compositor と Ctrl+E のプリセット再合成が、注釈のスケール規則と
+/// スタンプ解決を同じ 1 か所から使うための関数。`source_dims` は注釈を作った時点の
+/// source 寸法で、AI 拡大後などサイズが変わった画像へ焼くときの倍率に使う。
+pub(crate) fn bake_comic_annotations(
+    image: &egui::ColorImage,
+    comic: &BookComicSnapshot,
+    source_dims: Option<[usize; 2]>,
+    cancel: &AtomicBool,
+) -> egui::ColorImage {
+    let scaled_objects = source_dims.and_then(|[source_w, source_h]| {
+        let s_bake = image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
+        ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
+    });
+    let objects = scaled_objects.as_deref().unwrap_or(&comic.objects);
+    let mut stamp_cache = comic.stamp_cache.clone();
+    let (stamps, _, _) = crate::comic_stamp::build_stamp_images_from_cache_snapshot(
+        objects,
+        &mut stamp_cache,
+        cancel,
+    );
+    let layers = comic_core::bake_annotation_layers(
+        objects,
+        image.size[0],
+        image.size[1],
+        &comic.fonts,
+        &stamps,
+    );
+    crate::comic_overlay::composite_annotation_layers(image, &layers)
 }
 
 fn crop_after_rotation(
