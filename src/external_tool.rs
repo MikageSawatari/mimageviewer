@@ -943,7 +943,29 @@ pub(crate) fn build_launch_operation(
                 .collect::<Result<Vec<_>, _>>()?,
         },
     };
-    let target_count = requests.iter().map(|request| request.files.len()).sum();
+    let target_count = requests
+        .iter()
+        .map(|request| request.files.len())
+        .sum::<usize>();
+    // 起動計画をログに残す。Single / Each / Batch の違いは、起動したプロセス数と
+    // 1 プロセスへ渡したファイル数にしか出ないので、外から確かめる手段がこれしかない
+    // (2026-09-01 利用者要望)。
+    crate::logger::log(format!(
+        "external_tool: plan tool={:?} selection={:?} launch={} targets={} processes={} files_per_process={:?}",
+        tool.display_name(),
+        tool.selection,
+        match &tool.launch {
+            ExternalToolLaunch::Executable(_) => "Executable",
+            ExternalToolLaunch::Association { .. } => "Association",
+            ExternalToolLaunch::OsDefault => "OsDefault",
+        },
+        target_count,
+        requests.len(),
+        requests
+            .iter()
+            .map(|request| request.files.len())
+            .collect::<Vec<_>>(),
+    ));
     Ok(ExternalLaunchOperation {
         tool_name: tool.display_name(),
         requests,
@@ -1067,6 +1089,11 @@ fn launch_request(
     } = request;
     match launch {
         ExternalToolLaunch::Executable(executable) => {
+            crate::logger::log(format!(
+                "external_tool: spawn {tool_name:?} exe={executable:?} files={} args={:?}",
+                files.len(),
+                arguments
+            ));
             let mut command = Command::new(executable);
             command
                 .args(arguments)
