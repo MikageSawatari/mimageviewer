@@ -65567,7 +65567,7 @@ mod sns_split_p2_transition_tests {
     }
 
     #[test]
-    fn sns_split_entry_uses_saved_target_count_and_source_dimensions_then_reset_exits() {
+    fn sns_split_entry_uses_every_saved_panel_setting_and_source_dimensions_then_reset_exits() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let source_dims = [3200, 2000];
@@ -65576,6 +65576,8 @@ mod sns_split_p2_transition_tests {
         app.spread_mode = crate::settings::SpreadMode::Single;
         app.settings.sns_split_target = Some("instagram".to_owned());
         app.settings.sns_split_count = 4;
+        app.settings.sns_split_seam_permille = 100;
+        app.settings.sns_split_frame_ratio = Some("1:1".to_owned());
 
         assert!(app.enter_sns_split_mode(idx).is_ok());
 
@@ -65584,15 +65586,19 @@ mod sns_split_p2_transition_tests {
             .expect("entry must set the sole mode sentinel");
         assert_eq!(layout.target, crate::sns_split::SnsTarget::Instagram);
         assert_eq!(layout.count, 4);
+        assert_eq!(layout.seam_permille, 100);
         assert_eq!(layout.frames().len(), 4);
+        let expected_group_aspect = crate::sns_split::SnsFrameRatio::Ratio1x1
+            .group_aspect(layout.count, layout.seam_permille)
+            .unwrap();
         assert_eq!(
-            layout,
-            crate::sns_split::SnsSplitLayout::centered_max(
-                crate::sns_split::SnsTarget::Instagram,
-                4,
-                source_dims,
-            ),
+            layout.group.width(),
+            source_dims[0] as f32,
             "entry geometry must use canonical source dimensions, not the 2x2 GPU test texture"
+        );
+        assert!(
+            (layout.group.width() / layout.group.height() - expected_group_aspect).abs() < 0.01,
+            "saved fixed frame ratio must constrain the initial group"
         );
 
         app.reset_sns_split_mode();
