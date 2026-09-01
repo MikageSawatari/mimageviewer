@@ -70,6 +70,73 @@ impl SnsTarget {
     }
 }
 
+/// パネルで選ぶ1枠の比率。永続化には [SnsFrameRatio::stable_key] を使い、
+/// レイアウト自体は結果のグループ矩形だけを所有する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnsFrameRatio {
+    #[default]
+    Free,
+    Ratio3x4,
+    Ratio4x5,
+    Ratio1x1,
+}
+
+impl SnsFrameRatio {
+    pub const ALL: [Self; 4] = [Self::Free, Self::Ratio3x4, Self::Ratio4x5, Self::Ratio1x1];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "自由",
+            Self::Ratio3x4 => "3:4",
+            Self::Ratio4x5 => "4:5",
+            Self::Ratio1x1 => "1:1",
+        }
+    }
+
+    pub fn stable_key(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Ratio3x4 => "3:4",
+            Self::Ratio4x5 => "4:5",
+            Self::Ratio1x1 => "1:1",
+        }
+    }
+
+    pub fn from_stable_key(key: &str) -> Self {
+        match key {
+            "3:4" => Self::Ratio3x4,
+            "4:5" => Self::Ratio4x5,
+            "1:1" => Self::Ratio1x1,
+            _ => Self::Free,
+        }
+    }
+
+    /// 1枠の横/縦を整数比で返す。自由では固定値を持たない。
+    pub fn frame_ratio_parts(self) -> Option<(u128, u128)> {
+        match self {
+            Self::Free => None,
+            Self::Ratio3x4 => Some((3, 4)),
+            Self::Ratio4x5 => Some((4, 5)),
+            Self::Ratio1x1 => Some((1, 1)),
+        }
+    }
+
+    /// 1枠の横/縦。自由では固定値を持たない。
+    pub fn frame_aspect(self) -> Option<f32> {
+        let (width, height) = self.frame_ratio_parts()?;
+        Some(width as f32 / height as f32)
+    }
+
+    /// 枠を横一列に並べたグループ矩形の横/縦。
+    pub fn group_aspect(self, count: u8, seam_permille: u16) -> Option<f32> {
+        let frame_aspect = self.frame_aspect()?;
+        let count = f32::from(clamped_count(count));
+        let seam_ratio =
+            f32::from(clamped_seam_permille(seam_permille)) / PERMILLE_DENOMINATOR as f32;
+        Some(frame_aspect * (count + (count - 1.0) * seam_ratio))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnsSplitLayout {
     pub target: SnsTarget,
@@ -806,5 +873,22 @@ mod tests {
         assert_eq!(SnsTarget::Instagram.default_seam_permille(), 0);
         assert_eq!(SnsTarget::X.seam_ratio(), 0.017);
         assert_eq!(SnsTarget::Instagram.seam_ratio(), 0.0);
+    }
+
+    #[test]
+    fn frame_ratio_keys_and_group_aspects_are_canonical() {
+        for ratio in SnsFrameRatio::ALL {
+            assert_eq!(SnsFrameRatio::from_stable_key(ratio.stable_key()), ratio);
+        }
+        assert_eq!(
+            SnsFrameRatio::from_stable_key("future-ratio"),
+            SnsFrameRatio::Free
+        );
+        assert_eq!(SnsFrameRatio::Free.group_aspect(3, 17), None);
+        assert_eq!(SnsFrameRatio::Ratio3x4.frame_ratio_parts(), Some((3, 4)));
+        assert_eq!(SnsFrameRatio::Ratio4x5.frame_ratio_parts(), Some((4, 5)));
+        assert_eq!(SnsFrameRatio::Ratio1x1.frame_ratio_parts(), Some((1, 1)));
+        assert_eq!(SnsFrameRatio::Ratio1x1.group_aspect(3, 0), Some(3.0));
+        assert!((SnsFrameRatio::Ratio3x4.group_aspect(4, 100).unwrap() - 3.225).abs() < 0.000_001);
     }
 }
