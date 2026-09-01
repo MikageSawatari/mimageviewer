@@ -6808,6 +6808,9 @@ impl App {
             top_locked: self.settings.video_top_bar_locked,
             bottom_lock: self.settings.video_bottom_lock(),
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
+            // TODO(§1.155 最終コミット): 設定へ移す。レーン A が settings.rs を書き換えて
+            // いる間は既定値のままにしておく。
+            seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
         }
     }
 
@@ -6832,9 +6835,6 @@ impl App {
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
         let bar_lock = self.native_bar_lock_state();
-        let top_bar_locked = bar_lock.top_locked;
-        let bottom_lock = bar_lock.bottom_lock;
-        let fixed_bar_gap_px = bar_lock.fixed_bar_gap_px;
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -6930,7 +6930,7 @@ impl App {
         };
         player.set_native_metadata(Some(metadata));
         player.set_native_side_panel_state(side_panel_mode, info_panel_open);
-        player.set_native_bar_lock_state(top_bar_locked, bottom_lock, fixed_bar_gap_px);
+        player.set_native_bar_lock_state(bar_lock);
     }
 
     #[cfg(windows)]

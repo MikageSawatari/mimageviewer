@@ -142,7 +142,6 @@ pub const HUD_SEEK_ROW_HEIGHT: f32 = 24.0;
 pub const HUD_CONTROLS_ROW_HEIGHT: f32 = 40.0;
 pub const HUD_BOTTOM_HEIGHT: f32 = HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT;
 pub const HUD_TOP_HEIGHT: f32 = 54.0;
-pub const SEEK_STRIP_HEIGHT: f32 = 104.0;
 pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
 const SEEK_STRIP_LOCK_BUTTON_SIZE: f32 = 28.0;
 const SEEK_STRIP_RIGHT_INSET: f32 = 7.0;
@@ -151,16 +150,6 @@ const SEEK_STRIP_RANGE_LOCK_GAP: f32 = 6.0;
 const SEEK_PREVIEW_GAP: f32 = 14.0;
 const SEEK_PREVIEW_SCREEN_MARGIN: f32 = 8.0;
 const SEEK_PREVIEW_ACTION_BAR_HEIGHT: f32 = 38.0;
-
-fn native_seek_strip_rect(width: f32, height: f32) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(
-            0.0,
-            (height - HUD_BOTTOM_HEIGHT - SEEK_STRIP_HEIGHT).max(0.0),
-        ),
-        egui::vec2(width, SEEK_STRIP_HEIGHT.min(height.max(0.0))),
-    )
-}
 
 fn native_seek_strip_lock_button_rect(strip_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
@@ -449,7 +438,7 @@ fn consume_seek_strip_wheel(
 #[allow(clippy::too_many_arguments)]
 fn draw_native_seek_strip(
     ctx: &egui::Context,
-    overlay_size: egui::Vec2,
+    layout: crate::video::seek_strip_layout::SeekStripLayout,
     cursor_hover_pos: Option<egui::Pos2>,
     wheel_enabled: bool,
     strip: &NativeOverlaySeekStrip,
@@ -460,15 +449,14 @@ fn draw_native_seek_strip(
     last_window_request: &mut Option<(u8, u64, u64, usize, usize, usize)>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> NativeSeekStripPreviewHover {
-    let strip_rect = native_seek_strip_rect(overlay_size.x, overlay_size.y);
-    let visible_count = ((strip_rect.width() / SEEK_STRIP_CELL_WIDTH).ceil() as usize)
+    let strip_rect = layout.rect;
+    let cell_width = layout.cell_width;
+    let visible_count = ((strip_rect.width() / cell_width).ceil() as usize)
         .saturating_add(2)
         .max(1);
     let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 4.0);
-    let pixel_width = (strip_rect.width() * pixels_per_point).round().max(1.0) as usize;
-    let pixel_height = ((SEEK_STRIP_HEIGHT - 10.0) * pixels_per_point)
-        .round()
-        .max(1.0) as usize;
+    let pixel_width = layout.wave_pixel_width(pixels_per_point);
+    let pixel_height = layout.wave_pixel_height(pixels_per_point);
     let (mode_key, center_bits, waveform_span_bits) = match strip.center {
         crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
             (0, center_index.to_bits(), 0)
@@ -522,7 +510,7 @@ fn draw_native_seek_strip(
                             egui::Color32::from_gray(210),
                         );
                     } else {
-                        let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
+                        let half_cells = local_rect.width() / (2.0 * cell_width);
                         // D16: cell i spans the continuous index interval [i, i + 1), so its
                         // left edge—not its center—is aligned with keyframe i.
                         let first_index = (center_index - f64::from(half_cells)).floor() as isize;
@@ -533,16 +521,13 @@ fn draw_native_seek_strip(
                                 raw_index as f64,
                                 center_index,
                                 marker_x,
-                                SEEK_STRIP_CELL_WIDTH,
+                                cell_width,
                             ) else {
                                 continue;
                             };
                             let cell_rect = egui::Rect::from_center_size(
-                                egui::pos2(
-                                    cell_left_x + SEEK_STRIP_CELL_WIDTH * 0.5,
-                                    local_rect.center().y,
-                                ),
-                                egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
+                                egui::pos2(cell_left_x + cell_width * 0.5, local_rect.center().y),
+                                egui::vec2(cell_width - 4.0, layout.cell_height),
                             );
                             // 動画の範囲外には枠も背景も描かない。空のセルを枠付きで置くと、
                             // 「まだ出ていないサムネイル」と区別が付かず、黒い絵があるように見える
@@ -784,7 +769,7 @@ fn draw_native_seek_strip(
                     let center = crate::video::seek_strip::seek_strip_center_at_drag_pointer(
                         origin,
                         pointer,
-                        SEEK_STRIP_CELL_WIDTH,
+                        cell_width,
                         local_rect.width(),
                         strip.waveform_span_secs,
                     );
@@ -800,7 +785,7 @@ fn draw_native_seek_strip(
                 let center = crate::video::seek_strip::seek_strip_center_at_drag_pointer(
                     origin,
                     pointer,
-                    SEEK_STRIP_CELL_WIDTH,
+                    cell_width,
                     local_rect.width(),
                     strip.waveform_span_secs,
                 );
@@ -817,7 +802,7 @@ fn draw_native_seek_strip(
                             center_index,
                             pointer.x,
                             marker_x,
-                            SEEK_STRIP_CELL_WIDTH,
+                            cell_width,
                             strip.cell_count,
                         )
                         .map(|cell_index| {
@@ -1524,6 +1509,9 @@ struct NativeEguiOverlay {
     /// 固定バーと映像のあいだに置く隙間 (px)。overlay が「映像の場所」を
     /// 自分で求める (`video_content_rect_points`) ために持つ。
     fixed_bar_gap_px: u32,
+    /// シークストリップの高さプリセット。**帯の矩形・セル寸法・映像の予約・波形ラスタの
+    /// 要求は、すべてここから解決した 1 つの [`SeekStripLayout`] を見る。**
+    seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -5886,17 +5874,17 @@ impl NativeRenderCore {
 
     pub(crate) fn set_overlay_bar_lock_state(
         &mut self,
-        top_locked: bool,
-        bottom_lock: VideoBottomLock,
-        fixed_bar_gap_px: u32,
+        state: crate::video::NativeBarLockState,
     ) -> Result<(), String> {
-        let requested = crate::video::NativeBarLockState {
-            top_locked,
-            bottom_lock,
-            fixed_bar_gap_px,
-        }
-        .clamped();
-        let layout_changed = self.video_top_bar_locked != requested.top_locked
+        let requested = state.clamped();
+        // ストリップの高さは overlay が持つので、presenter 側の field 比較では拾えない。
+        // 「映像がいくつ譲っているか」を前後で見て、高さプリセットの変更でも transform を
+        // 引き直す (`set_overlay_seek_strip` と同じ形)。
+        let strip_points_before = self
+            .egui_overlay
+            .as_ref()
+            .map_or(0.0, |overlay| overlay.seek_strip_visible_points());
+        let mut layout_changed = self.video_top_bar_locked != requested.top_locked
             || self.video_bottom_lock != requested.bottom_lock
             || self.fullscreen_fixed_bar_gap_px != requested.fixed_bar_gap_px;
         self.video_top_bar_locked = requested.top_locked;
@@ -5905,6 +5893,11 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_bar_lock_state(requested);
         }
+        let strip_points_after = self
+            .egui_overlay
+            .as_ref()
+            .map_or(0.0, |overlay| overlay.seek_strip_visible_points());
+        layout_changed |= strip_points_before != strip_points_after;
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
         }
@@ -6300,10 +6293,12 @@ impl NativeRenderCore {
                 .unwrap_or(1.0),
             top_bar_locked: self.video_top_bar_locked,
             bottom_lock: self.video_bottom_lock,
-            seek_strip_visible: self
+            // 高さの正本は overlay が持つ (設定から `set_bar_lock_state` で届く)。
+            // presenter 側に写しを置くと、どちらが本当か決められない値が 2 つになる。
+            seek_strip_visible_points: self
                 .egui_overlay
                 .as_ref()
-                .is_some_and(|overlay| overlay.seek_strip_reserves_space()),
+                .map_or(0.0, |overlay| overlay.seek_strip_visible_points()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
         }
     }
@@ -6904,6 +6899,7 @@ impl NativeEguiOverlay {
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
             fixed_bar_gap_px: 0,
+            seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -7467,11 +7463,13 @@ impl NativeEguiOverlay {
                 let over_seek_strip = self.bottom_hud_visible
                     && self.seek_strip.is_some()
                     && self.tile_overlay.is_none()
-                    && native_seek_strip_rect(
-                        self.width as f32 / pixels_per_point,
-                        self.height as f32 / pixels_per_point,
-                    )
-                    .contains(pos);
+                    && self
+                        .seek_strip_layout(egui::vec2(
+                            self.width as f32 / pixels_per_point,
+                            self.height as f32 / pixels_per_point,
+                        ))
+                        .rect
+                        .contains(pos);
                 let region_owns_wheel = pointer_region_owns_wheel(
                     over_seek_strip,
                     over_scroll_panel,
@@ -7824,6 +7822,7 @@ impl NativeEguiOverlay {
         if self.top_bar_locked == lock.top_locked
             && self.bottom_lock == lock.bottom_lock
             && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
+            && self.seek_strip_height == lock.seek_strip_height
         {
             return;
         }
@@ -7832,7 +7831,35 @@ impl NativeEguiOverlay {
         self.top_bar_locked = lock.top_locked;
         self.bottom_lock = lock.bottom_lock;
         self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
+        self.seek_strip_height = lock.seek_strip_height;
         self.dirty = true;
+    }
+
+    /// 帯の矩形とセル寸法。**この 1 つの値を描画・入力・予約が共有する。**
+    fn seek_strip_layout(
+        &self,
+        overlay_size: egui::Vec2,
+    ) -> crate::video::seek_strip_layout::SeekStripLayout {
+        crate::video::seek_strip_layout::SeekStripLayout::resolve(
+            overlay_size,
+            HUD_BOTTOM_HEIGHT,
+            self.seek_strip_height,
+            crate::video::seek_strip_layout::SeekStripSpan::Window,
+            None,
+        )
+    }
+
+    /// いまストリップが占めている高さ (points)。占めていないときは 0。
+    ///
+    /// 「場所を取るか」(`seek_strip_reserves_space`) と「いくつ取るか」(高さプリセット) を
+    /// 1 か所で掛け合わせる。分けて持つと、片方だけ更新された経路で映像とストリップが
+    /// 重なる。固定していないときに映像へ返す判断は `video_bar_reserved_points` が持つ。
+    fn seek_strip_visible_points(&self) -> f32 {
+        if self.seek_strip_reserves_space() {
+            self.seek_strip_height.points()
+        } else {
+            0.0
+        }
     }
 
     /// プレビューなど overlay 側が描く「映像の場所」。映像の transform と同じ
@@ -7844,7 +7871,7 @@ impl NativeEguiOverlay {
             pixels_per_point: 1.0,
             top_bar_locked: self.top_bar_locked,
             bottom_lock: self.bottom_lock,
-            seek_strip_visible: self.seek_strip_reserves_space(),
+            seek_strip_visible_points: self.seek_strip_visible_points(),
             fixed_bar_gap_px: self.fixed_bar_gap_px,
         });
         let top = top.min((overlay_h - 1.0).max(0.0));
@@ -8712,10 +8739,10 @@ impl NativeEguiOverlay {
             });
         }
         if bottom_hud_visible && self.seek_strip.is_some() && !tile_overlay_visible {
-            regions.push(rect_to_px(native_seek_strip_rect(
-                width_points,
-                height_points,
-            )));
+            regions.push(rect_to_px(
+                self.seek_strip_layout(egui::vec2(width_points, height_points))
+                    .rect,
+            ));
         }
 
         // Center status (error / preparing / slow seek): `draw_native_center_status`
@@ -9165,10 +9192,17 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        let seek_strip_visible = self.seek_strip.is_some()
+        // ホバー帯は「いま帯が描かれているか」で決まる。映像の予約 (ピン) とは別の問い
+        // なので述語は分けたまま、高さだけを同じ 1 か所から取る。
+        let seek_strip_drawn = self.seek_strip.is_some()
             && self.tile_overlay.is_none()
             && self.navigation_preview.is_none();
-        let hover_bottom = native_panel_hover_bottom(overlay_height_points, seek_strip_visible);
+        let strip_points = if seek_strip_drawn {
+            self.seek_strip_height.points()
+        } else {
+            0.0
+        };
+        let hover_bottom = native_panel_hover_bottom(overlay_height_points, strip_points);
         let trigger = crate::ui_helpers::panel_edge_trigger_px(overlay_width_points);
         let margin = crate::ui_helpers::panel_hover_sustain_px(overlay_width_points);
         let in_band = |p: egui::Pos2| p.y >= 0.0 && p.y <= hover_bottom;
@@ -9404,6 +9438,10 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
+        // 帯の寸法は 1 フレームに 1 回だけ解決し、描画・入力・プレビューの逃げ場が
+        // 同じ矩形を見るようにする。
+        let seek_strip_layout =
+            self.seek_strip_layout(egui::vec2(overlay_width_points, overlay_height_points));
         // 切替中のプレビューは映像と同じ場所に置く。closure の前に確定させる。
         let navigation_preview_content_rect =
             self.video_content_rect_points(overlay_width_points, overlay_height_points);
@@ -10113,7 +10151,7 @@ impl NativeEguiOverlay {
                     seek_strip_area_ran = true;
                     seek_strip_preview_hover = draw_native_seek_strip(
                         ctx,
-                        egui::vec2(overlay_width_points, overlay_height_points),
+                        seek_strip_layout,
                         visibility_hover_pos,
                         !bookmark_title_edit_visible
                             && !bulk_bookmark_dialog_visible
@@ -11017,12 +11055,7 @@ impl NativeEguiOverlay {
                                 duration_secs,
                                 |kind| kind == NativeOverlayTimelineMarkerKind::Bookmark,
                             );
-                            let strip_rect = seek_strip_visible.then(|| {
-                                native_seek_strip_rect(
-                                    overlay_width_points,
-                                    overlay_height_points,
-                                )
-                            });
+                            let strip_rect = seek_strip_visible.then_some(seek_strip_layout.rect);
                             let preview_layout = native_seek_preview_layout(
                                 overlay_width_points,
                                 x,
@@ -12225,8 +12258,13 @@ pub(super) struct VideoVisualLayout {
     pub(super) pixels_per_point: f32,
     pub(super) top_bar_locked: bool,
     pub(super) bottom_lock: VideoBottomLock,
-    /// Presenter に渡されたストリップ snapshot (`Some` = 表示中) の有無。
-    pub(super) seek_strip_visible: bool,
+    /// いまストリップが占めている高さ (points)。出ていないときは 0。
+    ///
+    /// bool ではなく量を持つ。高さがプリセットで変わるので、「表示中か」だけを運ぶと
+    /// 予約側が高さを知らず、映像の transform とサーフェス寸法だけ旧値に取り残される。
+    /// 固定 (ピン) しているときだけ映像から取り上げる、という規則は
+    /// `video_bar_reserved_points` が引き続き所有する。
+    pub(super) seek_strip_visible_points: f32,
     pub(super) fixed_bar_gap_px: u32,
 }
 
@@ -12237,7 +12275,7 @@ impl From<bool> for VideoVisualLayout {
             pixels_per_point: 1.0,
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
-            seek_strip_visible: false,
+            seek_strip_visible_points: 0.0,
             fixed_bar_gap_px: 0,
         }
     }
@@ -12275,8 +12313,8 @@ pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32)
         0.0
     };
     let bottom = if layout.bottom_lock.bar_locked() {
-        let strip_height = if layout.bottom_lock.strip_locked() && layout.seek_strip_visible {
-            SEEK_STRIP_HEIGHT
+        let strip_height = if layout.bottom_lock.strip_locked() {
+            layout.seek_strip_visible_points.max(0.0)
         } else {
             0.0
         };
@@ -12537,13 +12575,29 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripLayout, SeekStripSpan};
+
+    /// 既定プリセットの帯の高さ。テストも実装と同じ解決経路を通す。
+    const STRIP_HEIGHT: f32 = SeekStripHeight::Large.points();
+
+    /// テストが使う帯の寸法。overlay の `seek_strip_layout` と同じ引数で解決する。
+    fn test_strip_layout(overlay_size: egui::Vec2) -> SeekStripLayout {
+        SeekStripLayout::resolve(
+            overlay_size,
+            HUD_BOTTOM_HEIGHT,
+            SeekStripHeight::Large,
+            SeekStripSpan::Window,
+            None,
+        )
+    }
+
     use super::{
         HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT, NativeBarVisibilitySnapshot, NativeEguiOverlay,
         NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativeOverlaySeekStrip,
         NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
-        PreparedVideoScaleSettings, SEEK_STRIP_HEIGHT, VideoOrientation,
-        VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
-        VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
+        PreparedVideoScaleSettings, VideoOrientation, VideoScalePreparationSignature,
+        VideoSurfaceContent, VideoVisualLayout, VideoVisualTargetRect,
+        close_panorama_projection_popup_for_context, compare_pixel_probe,
         compute_video_visual_target_rect, compute_video_visual_transform,
         compute_video_visual_transform_for_surface, configure_overlay_style,
         copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
@@ -12615,7 +12669,7 @@ mod tests {
                 |ctx| {
                     draw_native_seek_strip(
                         ctx,
-                        overlay_size,
+                        test_strip_layout(overlay_size),
                         presenter_hover_positions[frame],
                         true,
                         &strip,
@@ -12662,7 +12716,7 @@ mod tests {
             egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT),
             egui::vec2(overlay_size.x, HUD_BOTTOM_HEIGHT),
         );
-        let strip_rect = super::native_seek_strip_rect(overlay_size.x, overlay_size.y);
+        let strip_rect = test_strip_layout(overlay_size).rect;
         let without_strip =
             super::native_seek_preview_layout(overlay_size.x, overlay_size.x * 0.5, hud_rect, None);
         let with_strip = super::native_seek_preview_layout(
@@ -12690,7 +12744,7 @@ mod tests {
             egui::pos2(0.0, short_size.y - HUD_BOTTOM_HEIGHT),
             egui::vec2(short_size.x, HUD_BOTTOM_HEIGHT),
         );
-        let short_strip = super::native_seek_strip_rect(short_size.x, short_size.y);
+        let short_strip = test_strip_layout(short_size).rect;
         let short_layout = super::native_seek_preview_layout(
             short_size.x,
             short_size.x * 0.5,
@@ -12742,7 +12796,7 @@ mod tests {
 
     #[test]
     fn seek_strip_thumbnail_preview_uses_fractional_axis_time() {
-        let rect = super::native_seek_strip_rect(1280.0, 720.0);
+        let rect = test_strip_layout(egui::vec2(1280.0, 720.0)).rect;
         let strip = NativeOverlaySeekStrip {
             center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 1.0 },
             axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
@@ -12778,7 +12832,7 @@ mod tests {
 
     #[test]
     fn seek_strip_wave_preview_uses_pointer_time_but_lock_suppresses_it() {
-        let rect = super::native_seek_strip_rect(1280.0, 720.0);
+        let rect = test_strip_layout(egui::vec2(1280.0, 720.0)).rect;
         let strip = NativeOverlaySeekStrip {
             center: crate::video::seek_strip::SeekStripCenter::Waveform {
                 center_time_secs: 60.0,
@@ -12848,7 +12902,7 @@ mod tests {
 
     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
         let overlay_size = egui::vec2(1280.0, 720.0);
-        let strip_rect = super::native_seek_strip_rect(overlay_size.x, overlay_size.y);
+        let strip_rect = test_strip_layout(overlay_size).rect;
         // Over the plain band and over the lock button, which sits inside the same rect and
         // must not swallow the wheel.
         for pointer in [
@@ -12896,7 +12950,7 @@ mod tests {
                 |ctx| {
                     draw_native_seek_strip(
                         ctx,
-                        overlay_size,
+                        test_strip_layout(overlay_size),
                         Some(pointer),
                         true,
                         &strip,
@@ -12935,7 +12989,7 @@ mod tests {
     #[test]
     fn seek_strip_lock_layout_keeps_the_button_out_of_the_seek_body() {
         let overlay_size = egui::vec2(1280.0, 720.0);
-        let strip_rect = super::native_seek_strip_rect(overlay_size.x, overlay_size.y);
+        let strip_rect = test_strip_layout(overlay_size).rect;
         let lock_rect = super::native_seek_strip_lock_button_rect(strip_rect);
         let range_pos = super::native_seek_strip_range_text_pos(strip_rect);
         assert_eq!(lock_rect.min, egui::pos2(1245.0, 556.0));
@@ -13003,7 +13057,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let overlay_size = egui::vec2(1280.0, 720.0);
-        let strip_rect = super::native_seek_strip_rect(overlay_size.x, overlay_size.y);
+        let strip_rect = test_strip_layout(overlay_size).rect;
         let lock_center = super::native_seek_strip_lock_button_rect(strip_rect).center();
         let body_center = strip_rect.center();
 
@@ -13047,7 +13101,7 @@ mod tests {
                     let mut commands = Vec::new();
                     draw_native_seek_strip(
                         ctx,
-                        overlay_size,
+                        test_strip_layout(overlay_size),
                         Some(pointer),
                         true,
                         &strip,
@@ -13154,7 +13208,7 @@ mod tests {
                         };
                         draw_native_seek_strip(
                             ctx,
-                            overlay_size,
+                            test_strip_layout(overlay_size),
                             Some(pointer),
                             true,
                             &strip,
@@ -13190,10 +13244,9 @@ mod tests {
             // Reach the HUD lock the way the report did: click the strip's own lock first,
             // then move down to the bar's lock and click once.
             if with_strip {
-                let strip_lock = super::native_seek_strip_lock_button_rect(
-                    super::native_seek_strip_rect(overlay_size.x, overlay_size.y),
-                )
-                .center();
+                let strip_lock =
+                    super::native_seek_strip_lock_button_rect(test_strip_layout(overlay_size).rect)
+                        .center();
                 harness.hover_at(strip_lock);
                 harness.run();
                 for pressed in [true, false] {
@@ -14435,7 +14488,7 @@ mod tests {
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
                 bottom_lock: VideoBottomLock::None,
-                seek_strip_visible: false,
+                seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 0,
             },
         );
@@ -14709,7 +14762,12 @@ mod tests {
                     pixels_per_point: 1.0,
                     top_bar_locked: true,
                     bottom_lock: VideoBottomLock::BarAndStrip,
-                    seek_strip_visible: seek_strip_reserves_space(has_strip, availability),
+                    seek_strip_visible_points: if seek_strip_reserves_space(has_strip, availability)
+                    {
+                        STRIP_HEIGHT
+                    } else {
+                        0.0
+                    },
                     fixed_bar_gap_px: 0,
                 },
             )
@@ -14729,7 +14787,7 @@ mod tests {
                 StripAxisUnavailableReason::KeyframesTooSparse,
             ),
         );
-        assert_eq!(unavailable.height, showing.height + SEEK_STRIP_HEIGHT);
+        assert_eq!(unavailable.height, showing.height + STRIP_HEIGHT);
     }
 
     /// 確保は「場所を占めるか」であって「描くか」ではない。ピンしているあいだは、
@@ -14766,7 +14824,7 @@ mod tests {
 
     #[test]
     fn fixed_video_bars_reserve_target_rect_for_all_combinations_and_gap_bounds() {
-        let target = |top_bar_locked, bottom_lock, seek_strip_visible, fixed_bar_gap_px| {
+        let target = |top_bar_locked, bottom_lock, seek_strip_visible: bool, fixed_bar_gap_px| {
             compute_video_visual_target_rect(
                 1920,
                 1080,
@@ -14775,7 +14833,11 @@ mod tests {
                     pixels_per_point: 1.0,
                     top_bar_locked,
                     bottom_lock,
-                    seek_strip_visible,
+                    seek_strip_visible_points: if seek_strip_visible {
+                        STRIP_HEIGHT
+                    } else {
+                        0.0
+                    },
                     fixed_bar_gap_px,
                 },
             )
@@ -14835,41 +14897,48 @@ mod tests {
         );
     }
 
+    /// 予約は選んだ高さぶんだけ動く。どのプリセットでも、映像が譲る量と帯の高さが一致する。
     #[test]
     fn video_bottom_lock_reserves_the_strip_only_for_the_visible_locked_strip() {
-        let expected = [
-            (VideoBottomLock::None, false, 0.0),
-            (VideoBottomLock::None, true, 0.0),
-            (VideoBottomLock::BarOnly, false, HUD_BOTTOM_HEIGHT),
-            (VideoBottomLock::BarOnly, true, HUD_BOTTOM_HEIGHT),
-            (VideoBottomLock::BarAndStrip, false, HUD_BOTTOM_HEIGHT),
-            (
-                VideoBottomLock::BarAndStrip,
-                true,
-                HUD_BOTTOM_HEIGHT + SEEK_STRIP_HEIGHT,
-            ),
-        ];
-        for (bottom_lock, seek_strip_visible, bottom_reserved) in expected {
-            assert_eq!(
-                compute_video_visual_target_rect(
-                    1920,
-                    1080,
-                    VideoVisualLayout {
-                        compact: false,
-                        pixels_per_point: 1.0,
-                        top_bar_locked: false,
-                        bottom_lock,
-                        seek_strip_visible,
-                        fixed_bar_gap_px: 0,
-                    },
+        let expected = |strip_points: f32| {
+            [
+                (VideoBottomLock::None, 0.0, 0.0),
+                (VideoBottomLock::None, strip_points, 0.0),
+                (VideoBottomLock::BarOnly, 0.0, HUD_BOTTOM_HEIGHT),
+                (VideoBottomLock::BarOnly, strip_points, HUD_BOTTOM_HEIGHT),
+                (VideoBottomLock::BarAndStrip, 0.0, HUD_BOTTOM_HEIGHT),
+                (
+                    VideoBottomLock::BarAndStrip,
+                    strip_points,
+                    HUD_BOTTOM_HEIGHT + strip_points,
                 ),
-                VideoVisualTargetRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1920.0,
-                    height: 1080.0 - bottom_reserved,
-                }
-            );
+            ]
+        };
+        for height in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+            for (bottom_lock, seek_strip_visible_points, bottom_reserved) in
+                expected(height.points())
+            {
+                assert_eq!(
+                    compute_video_visual_target_rect(
+                        1920,
+                        1080,
+                        VideoVisualLayout {
+                            compact: false,
+                            pixels_per_point: 1.0,
+                            top_bar_locked: false,
+                            bottom_lock,
+                            seek_strip_visible_points,
+                            fixed_bar_gap_px: 0,
+                        },
+                    ),
+                    VideoVisualTargetRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1920.0,
+                        height: 1080.0 - bottom_reserved,
+                    }
+                );
+            }
         }
     }
 
@@ -14883,7 +14952,7 @@ mod tests {
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
                 bottom_lock: VideoBottomLock::BarOnly,
-                seek_strip_visible: false,
+                seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 10,
             },
         );

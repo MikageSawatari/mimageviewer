@@ -428,7 +428,7 @@ mod tests {
                 pixels_per_point,
                 top_bar_locked,
                 bottom_lock,
-                seek_strip_visible: false,
+                seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px,
             };
             let VideoSurfaceSizeDecision::DisplayResolution { height, .. } =

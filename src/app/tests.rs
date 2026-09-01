@@ -65847,6 +65847,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             top_locked: true,
             bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
             fixed_bar_gap_px: 12,
+            seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
         };
         assert_eq!(config_for(requested).bar_lock, requested);
     }
@@ -65858,6 +65859,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             top_locked: false,
             bottom_lock: crate::settings::VideoBottomLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
+            seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
         };
         assert_eq!(
             config_for(requested).bar_lock.fixed_bar_gap_px,
