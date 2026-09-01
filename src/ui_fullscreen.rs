@@ -16433,10 +16433,14 @@ impl App {
                 // その結果 worker が起動許可を待ったまま止まり、進捗 modal が入力を掴んだ
                 // まま解放されず、クリックが効かなくなる (実機 2026-09-02)。
                 // 上の編集用追加パックと同じ理由・同じ対処。
-                if !embedded {
-                    self.show_external_tool_materialize_progress(ctx);
-                    self.authorize_external_tool_launch_boundaries_after_ui();
-                }
+                // **`embedded` でも呼ぶ。** 上の remote session modal が `!embedded` に
+                // しているのは「embedded なら main update の終端で描かれる」という前提だが、
+                // **その前提はここでは成り立たない**。フルスクリーン中は main update が
+                // tail の手前で early return するので (app.rs の「会計はここで出す」参照)、
+                // embedded でも tail は走らない。実機では embedded=true のまま
+                // 進捗 modal が入力を掴んで固まった (2026-09-02)。
+                self.show_external_tool_materialize_progress(ctx);
+                self.authorize_external_tool_launch_boundaries_after_ui();
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
