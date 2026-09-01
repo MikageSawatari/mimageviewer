@@ -5199,14 +5199,14 @@ impl App {
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
-        visible_source_uv_rect: Option<egui::Rect>,
+        visible_region: Option<crate::displayed_image_transform::VisibleRegionRequest>,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
         let post_filter = self.fullscreen_paint_post_filter(resource);
         self.prepare_fullscreen_paint_resource_with_filter(
             resource,
             logical_scale,
             pixels_per_point,
-            visible_source_uv_rect,
+            visible_region,
             post_filter,
             true,
         )
@@ -5232,7 +5232,7 @@ impl App {
         resource: &crate::gpu_lanczos::FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
-        visible_source_uv_rect: Option<egui::Rect>,
+        visible_region: Option<crate::displayed_image_transform::VisibleRegionRequest>,
         post_filter: crate::adjustment::PostFilter,
         trace_current_item_key: bool,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
@@ -5242,7 +5242,7 @@ impl App {
             resource,
             logical_scale,
             pixels_per_point,
-            visible_source_uv_rect,
+            visible_region,
             post_filter,
             self.settings.downscale_smoothing_percent,
             self.settings.anime_upscale_source_limit,
@@ -10878,7 +10878,7 @@ impl App {
                     &resource,
                     bake_scale,
                     pixels_per_point,
-                    transform.visible_source_uv_rect(full_rect),
+                    transform.visible_region_request(full_rect),
                 );
                 let rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
@@ -11130,14 +11130,14 @@ impl App {
             &left_resource,
             left_bake_scale,
             pixels_per_point,
-            left_transform.and_then(|transform| transform.visible_source_uv_rect(left_clip_rect)),
+            left_transform.and_then(|transform| transform.visible_region_request(left_clip_rect)),
         );
         let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
             right_bake_scale,
             pixels_per_point,
-            right_transform.and_then(|transform| transform.visible_source_uv_rect(right_clip_rect)),
+            right_transform.and_then(|transform| transform.visible_region_request(right_clip_rect)),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(left_bake_rect, full_rect);
@@ -13996,11 +13996,21 @@ impl App {
                                     scale,
                                     vp_ctx.pixels_per_point(),
                                 );
+                            // 出力テクセル数も、いま決めた貼り先から出す。倍率から
+                            // 出し直すと拡大側で 1px 食い違う (§1.161)。
+                            let target_px = |len: f32| {
+                                (len * vp_ctx.pixels_per_point()).round().max(1.0) as u32
+                            };
                             let paint_resource = self.prepare_fullscreen_paint_resource(
                                 resource,
                                 scale,
                                 vp_ctx.pixels_per_point(),
-                                Some(Self::full_uv_rect()),
+                                Some(
+                                    crate::displayed_image_transform::VisibleRegionRequest::full([
+                                        target_px(img_rect.width()),
+                                        target_px(img_rect.height()),
+                                    ]),
+                                ),
                             );
                             ui.painter().image(
                                 paint_resource.paint_texture_id(),
@@ -26016,7 +26026,7 @@ impl App {
                         resource,
                         transform.total_scale,
                         ui.ctx().pixels_per_point(),
-                        transform.visible_source_uv_rect(painter.clip_rect()),
+                        transform.visible_region_request(painter.clip_rect()),
                         post_filter,
                         false,
                     ),
@@ -26024,7 +26034,7 @@ impl App {
                     resource,
                     transform.total_scale,
                     ui.ctx().pixels_per_point(),
-                    transform.visible_source_uv_rect(painter.clip_rect()),
+                    transform.visible_region_request(painter.clip_rect()),
                 ),
             };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
@@ -30578,7 +30588,7 @@ impl App {
                         handle,
                         transform.total_scale,
                         pixels_per_point,
-                        transform.visible_source_uv_rect(painter.clip_rect()),
+                        transform.visible_region_request(painter.clip_rect()),
                         post_filter,
                         false,
                     ),
@@ -30586,7 +30596,7 @@ impl App {
                     handle,
                     transform.total_scale,
                     pixels_per_point,
-                    transform.visible_source_uv_rect(painter.clip_rect()),
+                    transform.visible_region_request(painter.clip_rect()),
                 ),
             };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
@@ -37145,17 +37155,10 @@ mod tests {
                         if (painted - gap_px).abs() >= 1e-3 {
                             failures.push(format!("{case}: 間隔 {painted}px (設定 {gap_px}px)"));
                         }
-                        // §1.0e を戻さないこと。寄せた側は物理ピクセル境界に乗ったまま。
+                        // §1.0e を戻さないこと。貼り先は物理ピクセル境界に乗ったまま。
+                        // **倍率で除外しない** (§1.161)。端数のある拡大も寄せる側に
+                        // 入ったので、ここを飛ばすとその倍率だけ検査が消える。
                         for (side, transform) in [("left", &left), ("right", &right)] {
-                            if matches!(
-                                crate::displayed_image_transform::rect_snap_mode(
-                                    transform.total_scale,
-                                    pixels_per_point
-                                ),
-                                crate::displayed_image_transform::RectSnapMode::None
-                            ) {
-                                continue;
-                            }
                             let min_px = transform.full_image_rect.min.x * pixels_per_point;
                             if (min_px - min_px.round()).abs() >= 1e-3 {
                                 failures.push(format!("{case}: {side} の原点が {min_px}"));
@@ -37647,15 +37650,9 @@ mod tests {
                                     let right = right.translated_by(right_offset);
                                     let painted = (right.paint_rect.min.x - left.paint_rect.max.x)
                                         * pixels_per_point;
-                                    let mode = format!(
-                                        "{:?}",
-                                        crate::displayed_image_transform::rect_snap_mode(
-                                            left.total_scale,
-                                            pixels_per_point
-                                        )
-                                    );
+                                    let physical = left.total_scale * pixels_per_point;
                                     let case = format!(
-                                        "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} mode={mode}",
+                                        "{}x{} / {}x{} trim={} gap={gap} ppp={pixels_per_point} physical={physical}",
                                         lp.0,
                                         lp.1,
                                         rp.0,
@@ -37670,19 +37667,11 @@ mod tests {
                                     // **§1.0e**: trim があっても貼り先は物理ピクセル境界に乗ったまま。
                                     // 端数で動かすとテクセルが画素中心から外れ、Lanczos の結果へ
                                     // 二度目の線形補間が掛かる (Codex Sol の指摘 1)。
+                                    // **倍率で除外しない** (§1.161)。
                                     for (side, transform, offset) in [
                                         ("left", &left, left_offset),
                                         ("right", &right, right_offset),
                                     ] {
-                                        if matches!(
-                                            crate::displayed_image_transform::rect_snap_mode(
-                                                transform.total_scale,
-                                                pixels_per_point
-                                            ),
-                                            crate::displayed_image_transform::RectSnapMode::None
-                                        ) {
-                                            continue;
-                                        }
                                         let offset_px = offset.x * pixels_per_point;
                                         if (offset_px - offset_px.round()).abs() >= 1e-3 {
                                             failures.push(format!(
@@ -41434,12 +41423,15 @@ mod tests {
             (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
                 <= 2.0 * HALF_PIXEL
         );
+        // **完全一致では縛れない** (§1.161): 貼り先はどの倍率でも整数テクセルへ寄るので、
+        // 軸ごとの丸めで縦横比が最大 1 出力画素ぶん動く。捕まえたいのは「レイアウトの
+        // 縦横比がテクスチャの倍率へ漏れる」退行で、そちらは 2 割規模で出る。
         let texture_ratio = 300.0 / 450.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
-        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
         let scale_x = pass.full_image_rect.width() / 300.0;
         let scale_y = pass.full_image_rect.height() / 450.0;
-        assert!((scale_x - scale_y).abs() < 1.0e-4);
+        assert!((paint_ratio - texture_ratio).abs() < 1.0 / 300.0);
+        assert!((scale_x - scale_y).abs() < 1.0 / 300.0);
     }
 
     #[test]
@@ -41473,10 +41465,12 @@ mod tests {
         let texture_ratio = texture_size.x / texture_size.y;
         let scale_x = transform.full_image_rect.width() / texture_size.x;
         let scale_y = transform.full_image_rect.height() / texture_size.y;
-        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
-        assert!((scale_x - scale_y).abs() < 1.0e-4);
-        assert!((transform.full_image_rect.center().x - viewport_rect.center().x).abs() < 1.0e-4);
-        assert!((transform.full_image_rect.center().y - viewport_rect.center().y).abs() < 1.0e-4);
+        assert!((paint_ratio - texture_ratio).abs() < 1.0 / texture_size.x);
+        assert!((scale_x - scale_y).abs() < 1.0 / texture_size.x);
+        // 中心は viewport の中心から**最大 1 物理ピクセル**。原点を画素境界へ寄せるので
+        // 完全一致にはならない (§1.0e / §1.161。ppp = 1 なので 1px = 1point)。
+        assert!((transform.full_image_rect.center().x - viewport_rect.center().x).abs() <= 1.0);
+        assert!((transform.full_image_rect.center().y - viewport_rect.center().y).abs() <= 1.0);
     }
 
     #[test]
@@ -41532,12 +41526,13 @@ mod tests {
             (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs()
                 <= 2.0 * HALF_PIXEL
         );
+        // 縦横比の許容は 1 出力画素ぶん (§1.161、上の pass-through テストと同じ理由)。
         let texture_ratio = 327.0 / 473.0;
         let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
-        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
         let scale_x = pass.full_image_rect.width() / 327.0;
         let scale_y = pass.full_image_rect.height() / 473.0;
-        assert!((scale_x - scale_y).abs() < 1.0e-4);
+        assert!((paint_ratio - texture_ratio).abs() < 1.0 / 327.0);
+        assert!((scale_x - scale_y).abs() < 1.0 / 327.0);
     }
 
     #[test]
@@ -43016,8 +43011,11 @@ mod tests {
         );
         let visible = centered.visible_source_uv_rect(host).unwrap();
 
-        assert!((visible.center().x - target_uv.x).abs() < 1.0e-4);
-        assert!((visible.center().y - target_uv.y).abs() < 1.0e-4);
+        // 許容は貼り先 1 画素ぶんの UV。貼り先の原点は画素境界へ寄るので (§1.161)、
+        // 中心も最大 0.5 画素動く。完全一致で縛ると寄せを戻せという要求になる。
+        let one_pixel_uv = 1.0 / centered.full_image_rect.width();
+        assert!((visible.center().x - target_uv.x).abs() < one_pixel_uv);
+        assert!((visible.center().y - target_uv.y).abs() < one_pixel_uv);
     }
 
     #[test]

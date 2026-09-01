@@ -1198,6 +1198,14 @@ yaw の継ぎ目では隣接点の U 差が 0.5 を超える線分を分割す�
 - 1.0 超かつ CRT / レトロ / セピア等の効果 post-filter: 元 `TextureId` を直接 paint し、
   従来の LINEAR を維持。拡大方式と効果は独立選択にしない。
 
+貼り先とリサンプラの出力テクセル数は**同じ所有者が対で決める**。`full_image_rect` は倍率で
+分岐せず必ず物理ピクセルへ寄せ (原点・辺の両方)、表示 trim と可視領域はその格子へ量子化する。
+可視領域の出力テクセル数は `DisplayedImageTransform::visible_region_request` が貼り先と同時に
+返し、`gpu_lanczos` 側では倍率から計算し直さない。倍率はスカラなので、全体を W 物理 px へ
+寄せた端数を部分矩形へ配分できず、再計算すると最大 1px 食い違って二度目の Linear が掛かる
+(backlog §1.0e / §1.161)。transform を通らない keep-alive backstop も、自分が組んだ矩形から
+テクセル数を出して同じ対を渡す。
+
 拡大出力は一辺 8192px、総画素 4096×4096 相当までとし、いずれかを超える場合は
 resampler texture を生成せず従来の LINEAR 表示へ戻す。フォールバックは同じ source generation
 と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、4 種の拡大は

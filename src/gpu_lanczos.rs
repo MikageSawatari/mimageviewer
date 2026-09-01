@@ -14,7 +14,9 @@ use wgpu::util::DeviceExt as _;
 
 use crate::{
     adjustment::PostFilter,
-    displayed_image_transform::{physical_pixel_extent, physical_scale_is_near_integer},
+    displayed_image_transform::{
+        VisibleRegionRequest, physical_pixel_extent, physical_scale_is_near_integer,
+    },
 };
 use crate::{
     gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
@@ -371,7 +373,7 @@ impl GpuLanczosCache {
         resource: &FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
-        visible_source_uv_rect: Option<egui::Rect>,
+        visible_region: Option<VisibleRegionRequest>,
         post_filter: PostFilter,
         smoothing_percent: u32,
         anime_source_limit: AnimeUpscaleSourceLimit,
@@ -394,7 +396,7 @@ impl GpuLanczosCache {
             source_size,
             physical_scale,
             scale_branch,
-            visible_source_uv_rect,
+            visible_region,
         ) else {
             return (resource.original_resampleable(), None);
         };
@@ -1116,11 +1118,18 @@ fn quantized_target_size(source_size: [u32; 2], scale: f32, quantum: u32) -> [u3
     [quantize(source_size[0]), quantize(source_size[1])]
 }
 
+/// 出力テクセル数と、リサンプラが読む範囲。
+///
+/// **縮小 (全体) は倍率から、拡大 (可視領域) は要求から**決める。全体を寄せるときは
+/// 貼り先も [`physical_pixel_extent`] を同じ長さ・同じ倍率で通るので、ここで倍率から
+/// 出し直しても一致する。部分矩形はそうならないので、貼り先を決めた側が持ってきた
+/// テクセル数をそのまま使う (理由は
+/// [`DisplayedImageTransform::visible_region_request`] の doc、backlog §1.161)。
 fn target_and_source_region_for_branch(
     source_size: [u32; 2],
     physical_scale: f32,
     scale_branch: FullscreenPaintScaleBranch,
-    visible_source_uv_rect: Option<egui::Rect>,
+    visible_region: Option<VisibleRegionRequest>,
 ) -> Option<([u32; 2], LanczosSourceRegionKey)> {
     match scale_branch {
         FullscreenPaintScaleBranch::DownscaleLanczos => Some((
@@ -1131,13 +1140,11 @@ fn target_and_source_region_for_branch(
         | FullscreenPaintScaleBranch::UpscaleNis
         | FullscreenPaintScaleBranch::UpscaleAnime
         | FullscreenPaintScaleBranch::UpscalePixelArt => {
-            let visible = sanitize_visible_source_rect(visible_source_uv_rect?)?;
-            let source_region_px = source_region_pixels(source_size, visible).ok()?;
-            let target_size = [
-                stable_visible_target_len(source_region_px[2], physical_scale),
-                stable_visible_target_len(source_region_px[3], physical_scale),
-            ];
-            Some((
+            let request = visible_region?;
+            let visible = sanitize_visible_source_rect(request.source_uv_rect)?;
+            source_region_pixels(source_size, visible).ok()?;
+            let target_size = request.target_size;
+            (target_size[0] > 0 && target_size[1] > 0).then_some((
                 target_size,
                 LanczosSourceRegionKey::from_visible_rect(visible),
             ))
@@ -1145,12 +1152,6 @@ fn target_and_source_region_for_branch(
         FullscreenPaintScaleBranch::OriginalOneToOne
         | FullscreenPaintScaleBranch::OriginalUpscale => None,
     }
-}
-
-/// 拡大時の可視領域も、縮小時の全体と同じ 1 つの規則でサイズを決める
-/// ([`physical_pixel_extent`])。
-fn stable_visible_target_len(source_len: f32, physical_scale: f32) -> u32 {
-    physical_pixel_extent(source_len, physical_scale)
 }
 
 fn sanitize_visible_source_rect(rect: egui::Rect) -> Option<egui::Rect> {
@@ -2285,8 +2286,30 @@ mod tests {
         );
     }
 
+    /// 貼り先を決めた側が持ってきたテクセル数を、この経路は**曲げない**。
+    fn region_request(uv: egui::Rect, target_size: [u32; 2]) -> VisibleRegionRequest {
+        VisibleRegionRequest {
+            source_uv_rect: uv,
+            target_size,
+        }
+    }
+
+    /// 全面表示の要求。貼り先は寄せた全体矩形そのものなので、軸ごとに
+    /// [`physical_pixel_extent`] を通った値になる。
+    fn full_region_request(source: [u32; 2], physical_scale: f32) -> VisibleRegionRequest {
+        VisibleRegionRequest::full([
+            physical_pixel_extent(source[0] as f32, physical_scale),
+            physical_pixel_extent(source[1] as f32, physical_scale),
+        ])
+    }
+
+    /// 可視領域の出力テクセル数は**要求から**来る。倍率から出し直さない。
+    ///
+    /// 以前はここで「元領域の長さ × 倍率」を計算していたが、部分矩形ではそれが貼り先と
+    /// 最大 1px 食い違う。倍率はスカラなので、全体矩形を画素へ寄せた端数を持てない
+    /// (backlog §1.161)。倍率が 2 でも 4 でも、要求が同じなら答えは同じになる。
     #[test]
-    fn visible_upscale_target_is_bounded_by_the_visible_region() {
+    fn the_visible_upscale_target_comes_from_the_request_not_the_scale() {
         let source = [5184, 3888];
         let at_two = egui::Rect::from_min_size(
             egui::pos2(0.10, 0.20),
@@ -2300,14 +2323,14 @@ mod tests {
             source,
             2.0,
             FullscreenPaintScaleBranch::UpscaleLanczos,
-            Some(at_two),
+            Some(region_request(at_two, [3840, 2160])),
         )
         .unwrap();
         let (target_four, region_four) = target_and_source_region_for_branch(
             source,
             4.0,
             FullscreenPaintScaleBranch::UpscaleLanczos,
-            Some(at_four),
+            Some(region_request(at_four, [3840, 2160])),
         )
         .unwrap();
         assert_eq!(target_two, [3840, 2160]);
@@ -2319,6 +2342,7 @@ mod tests {
     fn selected_upscalers_share_lanczos_target_and_source_region() {
         let source = [5184, 3888];
         let visible = egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.625, 0.75));
+        let visible = region_request(visible, [6480, 4860]);
         let lanczos = target_and_source_region_for_branch(
             source,
             2.5,
@@ -2399,9 +2423,10 @@ mod tests {
             [2480, 3508],
             0.41,
             FullscreenPaintScaleBranch::DownscaleLanczos,
-            Some(egui::Rect::from_min_max(
-                egui::pos2(0.2, 0.3),
-                egui::pos2(0.4, 0.5),
+            // 要求は縮小では読まれない。読んでいれば 1x1 が漏れて落ちる。
+            Some(region_request(
+                egui::Rect::from_min_max(egui::pos2(0.2, 0.3), egui::pos2(0.4, 0.5)),
+                [1, 1],
             )),
         )
         .unwrap();
@@ -2419,10 +2444,7 @@ mod tests {
             source,
             1.125,
             FullscreenPaintScaleBranch::UpscaleLanczos,
-            Some(egui::Rect::from_min_max(
-                egui::pos2(0.0, 0.0),
-                egui::pos2(1.0, 1.0),
-            )),
+            Some(full_region_request(source, 1.125)),
         )
         .unwrap();
         assert_eq!(
@@ -2438,20 +2460,14 @@ mod tests {
             [1200, 1800],
             0.75,
             FullscreenPaintScaleBranch::DownscaleLanczos,
-            Some(egui::Rect::from_min_max(
-                egui::pos2(0.0, 0.0),
-                egui::pos2(1.0, 1.0),
-            )),
+            Some(full_region_request([1200, 1800], 0.75)),
         )
         .unwrap();
         let right = target_and_source_region_for_branch(
             [1000, 1600],
             1.125,
             FullscreenPaintScaleBranch::UpscaleLanczos,
-            Some(egui::Rect::from_min_max(
-                egui::pos2(0.0, 0.0),
-                egui::pos2(1.0, 1.0),
-            )),
+            Some(full_region_request([1000, 1600], 1.125)),
         )
         .unwrap();
         assert_eq!(left.0, [900, 1350]);

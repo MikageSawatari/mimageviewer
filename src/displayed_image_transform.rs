@@ -124,6 +124,12 @@ pub(crate) struct DisplayedImageTransform {
     pub(crate) placement: ResolvedDisplayPlacement,
     /// texture の回転後表示ピクセル 1px あたりの画面スケール。
     pub(crate) total_scale: f32,
+    /// 構築時の `pixels_per_point`。**部分矩形を渡すときに呼び出し側から受け取らない。**
+    /// 矩形を寄せた格子と、後から可視領域を寄せる格子が同じ値から出ることが不変条件で、
+    /// 引数で受け取ると別の pass の ppp を渡せてしまう (寄せた意味が消える)。
+    pub(crate) pixels_per_point: f32,
+    /// 構築時の [`RectPixelFit`]。可視領域を格子へ寄せるかどうかもこれで決まる。
+    pub(crate) pixel_fit: RectPixelFit,
 }
 
 impl DisplayedImageTransform {
@@ -230,7 +236,6 @@ impl DisplayedImageTransform {
                     RectPixelFit::Texels => quantize_display_bbox_to_paint_pixels(
                         display_bbox,
                         full_image_rect,
-                        total_scale,
                         input.pixels_per_point,
                     ),
                     RectPixelFit::Proportional => display_bbox,
@@ -263,6 +268,8 @@ impl DisplayedImageTransform {
             fit_scale_limits: input.fit_scale_limits,
             placement: input.placement,
             total_scale,
+            pixels_per_point: input.pixels_per_point,
+            pixel_fit: input.pixel_fit,
         })
     }
 
@@ -406,6 +413,48 @@ impl DisplayedImageTransform {
         rect_is_valid(visible).then_some(visible)
     }
 
+    /// 可視領域だけをリサンプルして貼るときの、**読む範囲と出力テクセル数の対**。
+    ///
+    /// **2 つで 1 つの答え。** 出力テクセル数をリサンプラ側で「元画像の長さ × 倍率」から
+    /// 出し直すと、貼り先と最大 1px 食い違う。倍率はスカラなので、全体矩形を画素へ
+    /// 寄せたときの端数を持てないためである。全体が `W` 物理 px に寄っていて部分が `k` px
+    /// のとき、再計算は `k × (D·s / W)` になり、`D·s` と `W` の差 (最大 0.5px) が `k/W` 倍
+    /// されて効く。`k` が `W` に近いほど 0.5px 側へ寄り、`physical_pixel_extent` の
+    /// floor に落ちて `k-1` になる。だから**貼り先を決めたここが、そのまま出力テクセル数も
+    /// 返す** (backlog §1.161)。
+    ///
+    /// 範囲は `full_image_rect` と同じ格子へ寄せる。寄せないと clip 由来の辺だけが
+    /// 小数のまま残り、整数サイズの出力を小数位置へ貼ることになる。
+    pub(crate) fn visible_region_request(
+        &self,
+        clip_rect: egui::Rect,
+    ) -> Option<VisibleRegionRequest> {
+        let visible = self.visible_source_uv_rect(clip_rect)?;
+        let display = rotate_bbox_to_display(visible, self.rotation);
+        let display = match self.pixel_fit {
+            RectPixelFit::Texels => quantize_display_bbox_to_paint_pixels(
+                display,
+                self.full_image_rect,
+                self.pixels_per_point,
+            ),
+            RectPixelFit::Proportional => display,
+        };
+        let pixels_per_point = normalized_pixels_per_point(self.pixels_per_point);
+        let extent = |fraction: f32, full_len: f32| {
+            let px = (fraction * full_len * pixels_per_point).round();
+            px.is_finite().then(|| (px.max(1.0)) as u32)
+        };
+        let target_display = [
+            extent(display.width(), self.full_image_rect.width())?,
+            extent(display.height(), self.full_image_rect.height())?,
+        ];
+        Some(VisibleRegionRequest {
+            source_uv_rect: rotate_bbox_to_source(display, self.rotation),
+            // リサンプラは元テクスチャの軸で数える。表示は回転後の軸なので戻す。
+            target_size: unrotated_size_px(target_display, self.rotation),
+        })
+    }
+
     pub(crate) fn paint_texture(
         &self,
         painter: &egui::Painter,
@@ -462,6 +511,37 @@ impl DisplayedImageTransform {
             full_uv_rect(),
             tint,
         );
+    }
+}
+
+/// 可視領域リサンプルの要求。**片方だけ取り出して使わない。**
+///
+/// 由来は [`DisplayedImageTransform::visible_region_request`]。読む範囲と出力テクセル数を
+/// 別々の所有者が決めると、整数サイズのテクスチャが小数サイズの貼り先へ載って
+/// egui/wgpu がもう一度 Linear を掛ける (backlog §1.0e / §1.161)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VisibleRegionRequest {
+    /// リサンプラが読む元画像の範囲 (0..1、元画像空間)。
+    pub(crate) source_uv_rect: egui::Rect,
+    /// その範囲の出力テクセル数 (元テクスチャの軸)。**貼り先の物理ピクセル数と同じ。**
+    pub(crate) target_size: [u32; 2],
+}
+
+impl VisibleRegionRequest {
+    /// 全体をそのまま貼る場所 (transform を通らない detached の backstop など) 用。
+    pub(crate) fn full(target_size: [u32; 2]) -> Self {
+        Self {
+            source_uv_rect: full_uv_rect(),
+            target_size,
+        }
+    }
+}
+
+/// [`rotated_size`] の逆。回転後の表示軸で数えた寸法を、元テクスチャの軸へ戻す。
+fn unrotated_size_px(size: [u32; 2], rotation: Rotation) -> [u32; 2] {
+    match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => [size[1], size[0]],
+        Rotation::None | Rotation::Cw180 => size,
     }
 }
 
@@ -852,47 +932,34 @@ fn normalized_pixels_per_point(pixels_per_point: f32) -> f32 {
     }
 }
 
-/// 描画矩形を物理ピクセルへ寄せる。
+/// 描画矩形を物理ピクセルへ寄せる。**原点もサイズも、倍率で分岐せず必ず寄せる。**
 ///
-/// 整数倍拡大では従来どおり原点だけ寄せる (サイズは元から整数)。**縮小では原点に加えて
-/// サイズも寄せる。** リサンプラは整数サイズのテクスチャを作るので、貼り先が小数サイズの
-/// ままだと egui/wgpu がもう一度バイリニアを掛け、Lanczos の結果がボケる
-/// (backlog §1.0e)。サイズは [`physical_pixel_extent`] で決める — リサンプラの出力サイズと
-/// **同じ関数**なので、2 か所で丸めが割れることがない。
+/// リサンプラは整数サイズのテクスチャを作るので、貼り先が小数サイズのままだと
+/// egui/wgpu がもう一度バイリニアを掛け、Lanczos の結果がボケる (backlog §1.0e)。
+/// サイズは [`physical_pixel_extent`] で決める — リサンプラの出力サイズと**同じ関数**なので、
+/// 2 か所で丸めが割れることがない。
 ///
-/// 端数のある拡大には触らない。そちらの出力サイズは画像全体ではなく可視領域から
-/// 決まるので、ここで全体矩形を寄せても一致しない。
+/// **かつては倍率で 3 分岐していた** (縮小=原点とサイズ / 整数倍拡大=原点だけ /
+/// 端数の拡大=何もしない)。どちらの例外も成り立っていなかった:
+///
+/// - 端数の拡大を素通ししていたのは「出力サイズが可視領域から決まるので全体矩形を
+///   寄せても一致しない」ため。だが一致しない理由は寄せが**害だから**ではなく
+///   **足りないから**で、素通しでは全面表示 (可視領域 = 画像全体) すら合わない。
+///   ppp 1.25 の論理 0.9 倍は物理 1.125 倍なので、ウィンドウよりわずかに小さい画像を
+///   出すだけでここへ来る (backlog §1.161)。
+/// - 整数倍拡大で「サイズは元から整数」としていたのも近似でしかない。整数判定は
+///   相対 1e-4 の許容を持つので、大きな画像では辺が 1px 以上ずれたまま素通りする。
+///
+/// 足りない分 — 可視領域の出力テクセル数 — は
+/// [`DisplayedImageTransform::visible_region_request`] が対で持つ。
 ///
 /// 通常は [`DisplayedImageTransform`] 側 (`RectPixelFit`) が呼ぶ。手で矩形を組んで
 /// リサンプラ出力を貼る場所 (detached の keepalive backstop など) は transform を
 /// 持たないので、そこだけがこの関数を直接呼ぶ。
-/// [`snap_rect_to_physical_pixels`] がその倍率で何をするか。
 ///
-/// **分岐をここ 1 か所だけに置く。** 「寄せた後だから整数に揃っているはず」と前提する側が
-/// 別に同じ 3 分岐を書くと、揃っていない矩形を揃っている前提で動かして壊す
+/// **倍率での分岐を戻さないこと。** 「寄せた後だから整数に揃っているはず」と前提する側が
+/// 別に同じ分岐を書くと、揃っていない矩形を揃っている前提で動かして壊す
 /// (§1.154 の 1 度目の修正が実際にそれで、端数のある拡大の見開きで間隔を崩した)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RectSnapMode {
-    /// 何もしない。端数のある拡大。出力サイズは画像全体ではなく可視領域から決まるので、
-    /// 全体矩形を寄せても一致しない。**矩形は小数のまま。**
-    None,
-    /// 原点だけ寄せる。整数倍拡大はサイズが元から整数。
-    Origin,
-    /// 原点とサイズの両方を寄せる。縮小。リサンプラの整数出力と貼り先を一致させる。
-    OriginAndSize,
-}
-
-pub(crate) fn rect_snap_mode(logical_scale: f32, pixels_per_point: f32) -> RectSnapMode {
-    if physical_scale_is_near_integer(logical_scale, pixels_per_point) {
-        return RectSnapMode::Origin;
-    }
-    let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
-    if physical_scale.is_finite() && physical_scale > 0.0 && physical_scale < 1.0 {
-        RectSnapMode::OriginAndSize
-    } else {
-        RectSnapMode::None
-    }
-}
 
 pub(crate) fn snap_rect_to_physical_pixels(
     rect: egui::Rect,
@@ -900,8 +967,10 @@ pub(crate) fn snap_rect_to_physical_pixels(
     logical_scale: f32,
     pixels_per_point: f32,
 ) -> egui::Rect {
-    let mode = rect_snap_mode(logical_scale, pixels_per_point);
-    if matches!(mode, RectSnapMode::None) {
+    let physical_scale = logical_scale * normalized_pixels_per_point(pixels_per_point);
+    // 倍率が壊れているときは触らない。ここで寄せると `physical_pixel_extent` が
+    // 下限の 1px を返し、矩形を潰す。
+    if !(physical_scale.is_finite() && physical_scale > 0.0) {
         return rect;
     }
     let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
@@ -909,16 +978,10 @@ pub(crate) fn snap_rect_to_physical_pixels(
         quantize_points_to_physical_pixels(rect.min.x, pixels_per_point),
         quantize_points_to_physical_pixels(rect.min.y, pixels_per_point),
     );
-    let size = match mode {
-        RectSnapMode::Origin | RectSnapMode::None => rect.size(),
-        RectSnapMode::OriginAndSize => {
-            let physical_scale = logical_scale * pixels_per_point;
-            egui::vec2(
-                physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
-                physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
-            )
-        }
-    };
+    let size = egui::vec2(
+        physical_pixel_extent(display_size.x, physical_scale) as f32 / pixels_per_point,
+        physical_pixel_extent(display_size.y, physical_scale) as f32 / pixels_per_point,
+    );
     egui::Rect::from_min_size(snapped_min, size)
 }
 
@@ -1018,20 +1081,15 @@ pub(crate) fn effective_bbox(
 /// どちらも「trim の端が画素境界に無い」ことが根で、両立させるには端を寄せるしかない。
 /// 寄せる量は 1 出力画素未満なので、切り取り位置としては見えない。
 ///
-/// 寄せないのは、そもそも矩形を寄せていないとき (端数のある拡大)。そこには守るべき位相が
-/// 無く、寄せると trim だけが動く。
+/// **倍率で分岐しない。** `full_image_rect` は [`snap_rect_to_physical_pixels`] が必ず
+/// 画素境界へ乗せてから渡ってくるので、寄せ先の格子はどの倍率でも存在する。かつて
+/// 端数のある拡大だけ素通ししていたが、それは全体矩形が寄っていなかった時代の条件で、
+/// 残すと trim 時だけ辺が小数に戻る (backlog §1.161)。
 fn quantize_display_bbox_to_paint_pixels(
     bbox: egui::Rect,
     full_image_rect: egui::Rect,
-    total_scale: f32,
     pixels_per_point: f32,
 ) -> egui::Rect {
-    if matches!(
-        rect_snap_mode(total_scale, pixels_per_point),
-        RectSnapMode::None
-    ) {
-        return bbox;
-    }
     let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
     let width_px = full_image_rect.width() * pixels_per_point;
     let height_px = full_image_rect.height() * pixels_per_point;
@@ -2043,8 +2101,14 @@ mod tests {
         );
     }
 
+    /// 端数のある拡大も、原点とサイズが物理ピクセルへ乗る。
+    ///
+    /// **以前はここが「寄せないこと」を仕様として固定していた**
+    /// (`non_integer_physical_scale_keeps_unsnapped_origin`)。物理倍率 1.3 の貼り先が
+    /// 小数のままなら、可視領域リサンプラの整数出力へ二度目の Linear が掛かる
+    /// (backlog §1.161)。直っていない挙動を固定していた側を入れ替えた。
     #[test]
-    fn non_integer_physical_scale_keeps_unsnapped_origin() {
+    fn a_fractional_upscale_snaps_the_paint_rect_like_every_other_scale() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.25, 0.75), egui::vec2(130.0, 130.0));
         let transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -2068,6 +2132,161 @@ mod tests {
         )
         .unwrap();
 
-        rect_close(transform.full_image_rect, rect);
+        // 原点は画素境界へ、辺は `physical_pixel_extent` の整数へ。
+        rect_close(
+            transform.full_image_rect,
+            egui::Rect::from_min_size(egui::pos2(0.0, 1.0), egui::vec2(130.0, 130.0)),
+        );
+    }
+
+    /// 貼り先の物理ピクセル数と、可視領域の出力テクセル数が**必ず**一致する。
+    ///
+    /// 端数倍率の拡大でここが割れていた (backlog §1.161)。ppp 1.25 の論理 0.9 倍は物理
+    /// 1.125 倍なので、ウィンドウよりわずかに小さい画像を出すだけで踏む。倍率・DPI・
+    /// トリム・回転・可視範囲を掛けて走査し、**倍率で除外しない**。
+    ///
+    /// 貼り先は [`paint_source_region_texture`] と同じ式で組む。あちらは `full_image_rect`
+    /// を線形に割って貼るので、ここも同じ割り方でなければ測る場所が変わる。
+    #[test]
+    fn every_visible_region_paints_an_integer_number_of_output_texels() {
+        fn region_dest_rect(
+            transform: &DisplayedImageTransform,
+            source_uv_rect: egui::Rect,
+        ) -> egui::Rect {
+            let full = transform.full_image_rect;
+            let display = rotate_bbox_to_display(source_uv_rect, transform.rotation);
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    full.left() + display.min.x * full.width(),
+                    full.top() + display.min.y * full.height(),
+                ),
+                egui::pos2(
+                    full.left() + display.max.x * full.width(),
+                    full.top() + display.max.y * full.height(),
+                ),
+            )
+        }
+
+        let mut failures = Vec::new();
+        let trim = egui::Rect::from_min_max(egui::pos2(0.0937, 0.1231), egui::pos2(0.8974, 0.9011));
+        for &(tex_w, tex_h) in &[
+            (1000.0_f32, 1600.0_f32),
+            (1071.0, 1439.0),
+            (5184.0, 3888.0),
+            (101.0, 99.0),
+        ] {
+            for &pixels_per_point in &[1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+                for &zoom in &[0.5_f32, 0.9, 1.0, 1.13, 2.0, 3.7] {
+                    for content_bbox in [None, Some(trim)] {
+                        for rotation in [
+                            Rotation::None,
+                            Rotation::Cw90,
+                            Rotation::Cw180,
+                            Rotation::Cw270,
+                        ] {
+                            for &clip_fraction in &[1.0_f32, 0.61] {
+                                let viewport = egui::Rect::from_min_size(
+                                    egui::pos2(3.5, 7.25),
+                                    egui::vec2(1706.0, 959.0),
+                                );
+                                let texture_size = egui::vec2(tex_w, tex_h);
+                                let Some(transform) = DisplayedImageTransform::resolve(
+                                    DisplayedImageTransformInput {
+                                        pixel_fit: RectPixelFit::Texels,
+                                        page_idx: 0,
+                                        viewport_rect: viewport,
+                                        source_size: texture_size,
+                                        texture_size,
+                                        rotation,
+                                        free_rotation_rad: 0.0,
+                                        content_bbox,
+                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_scale_limits: FullscreenFitScaleLimits {
+                                            pixels_per_point,
+                                            ..FullscreenFitScaleLimits::default()
+                                        },
+                                        pixels_per_point,
+                                        placement: ResolvedDisplayPlacement::Normal {
+                                            zoom_pan: Some((zoom, egui::Vec2::ZERO)),
+                                        },
+                                    },
+                                ) else {
+                                    continue;
+                                };
+                                let physical = transform.total_scale * pixels_per_point;
+                                let case = format!(
+                                    "{tex_w}x{tex_h} ppp={pixels_per_point} zoom={zoom} trim={} rot={rotation:?} clip={clip_fraction} physical={physical}",
+                                    content_bbox.is_some()
+                                );
+                                let on_grid = |value: f32| {
+                                    let px = value * pixels_per_point;
+                                    (px - px.round()).abs() < 1e-2
+                                };
+                                if !on_grid(transform.full_image_rect.min.x)
+                                    || !on_grid(transform.full_image_rect.min.y)
+                                {
+                                    failures.push(format!(
+                                        "{case}: 全体矩形の原点が画素境界に無い ({:?})",
+                                        transform.full_image_rect.min
+                                    ));
+                                }
+                                if !on_grid(transform.full_image_rect.width())
+                                    || !on_grid(transform.full_image_rect.height())
+                                {
+                                    failures.push(format!(
+                                        "{case}: 全体矩形の辺が整数テクセルでない ({:?})",
+                                        transform.full_image_rect.size()
+                                    ));
+                                }
+                                let clip = egui::Rect::from_center_size(
+                                    viewport.center(),
+                                    viewport.size() * clip_fraction,
+                                );
+                                let Some(request) = transform.visible_region_request(clip) else {
+                                    continue;
+                                };
+                                let dest = region_dest_rect(&transform, request.source_uv_rect);
+                                if !on_grid(dest.min.x) || !on_grid(dest.min.y) {
+                                    failures.push(format!(
+                                        "{case}: 可視領域の貼り先原点が画素境界に無い ({:?})",
+                                        dest.min
+                                    ));
+                                }
+                                // 出力は元テクスチャの軸で数える。表示軸へ戻して突き合わせる。
+                                let target = rotated_size(
+                                    egui::vec2(
+                                        request.target_size[0] as f32,
+                                        request.target_size[1] as f32,
+                                    ),
+                                    rotation,
+                                );
+                                let drawn = egui::vec2(
+                                    dest.width() * pixels_per_point,
+                                    dest.height() * pixels_per_point,
+                                );
+                                if (drawn.x - target.x).abs() >= 1e-2
+                                    || (drawn.y - target.y).abs() >= 1e-2
+                                {
+                                    failures.push(format!(
+                                        "{case}: 貼り先 {drawn:?} px に対し出力 {target:?} テクセル"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} 件失敗:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }

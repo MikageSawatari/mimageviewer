@@ -41387,7 +41387,7 @@ impl App {
                 image_rect_norm.max.y * snapshot_rect.height(),
             ),
         );
-        let visible_source_uv_rect =
+        let visible_region =
             crate::displayed_image_transform::DisplayedImageTransform::from_resolved_rect(
                 crate::displayed_image_transform::DisplayedImageTransformInput {
                     // 貼り先ではなく **UV を取るためだけ**の transform。渡す矩形は layout が
@@ -41411,13 +41411,13 @@ impl App {
                 },
                 image_rect,
             )
-            .and_then(|transform| transform.visible_source_uv_rect(snapshot_rect));
+            .and_then(|transform| transform.visible_region_request(snapshot_rect));
         let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
         let texture = self.prepare_fullscreen_paint_resource(
             &texture,
             logical_scale,
             pixels_per_point,
-            visible_source_uv_rect,
+            visible_region,
         );
         let frozen_continuous_pages = ctx
             .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
