@@ -494,9 +494,11 @@ fn draw_sns_split_preview(
 }
 
 fn sns_split_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
-    // 見出し / 投稿先 / 説明 / 枚数 / プレビュー / 寸法 / 書き出しボタンが縦に並ぶ。
-    // 上限が本文より低いと、実機で書き出しボタンがスクロールの外へ出た (2026-09-01)。
-    (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(240.0, 430.0)
+    // 隠蔽加工・消しゴムと同じく、ウィンドウ下端まで伸ばす。上限を置くと、本文が
+    // それより高い環境で「分割して書き出す」がスクロールの外に出る (実機報告
+    // 2026-09-01: 430px 上限でボタンが見えなかった)。下限は、極端に低いウィンドウでも
+    // ヘッダーと本文の先頭が読める高さ。
+    (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).max(240.0)
 }
 
 fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
@@ -1253,6 +1255,30 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_reaches_the_bottom_of_every_window_it_is_given() {
+        // 実機報告 (2026-09-01): 上限 430px のせいで「分割して書き出す」がスクロールの
+        // 外にあり、押すまでに一度スクロールが要った。隠蔽加工・消しゴムと同じく、
+        // 使える高さを全部使う。
+        for window_height in [720.0_f32, 1080.0, 1440.0, 2160.0] {
+            let full_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, window_height));
+            let panel_pos =
+                egui::pos2(full_rect.left() + PANEL_MARGIN, full_rect.top() + PANEL_TOP);
+            let height = sns_split_panel_outer_height(full_rect, panel_pos);
+            let bottom = panel_pos.y + height;
+            assert!(
+                (full_rect.bottom() - bottom - PANEL_MARGIN).abs() < 0.5,
+                "{window_height}px の窓で下端まで伸びていない: 底 {bottom}",
+            );
+        }
+
+        // 下端まで伸ばしても、極端に低い窓ではヘッダーと本文の先頭を残す。
+        let squat = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, 200.0));
+        let panel_pos = egui::pos2(squat.left() + PANEL_MARGIN, squat.top() + PANEL_TOP);
+        assert_eq!(sns_split_panel_outer_height(squat, panel_pos), 240.0);
+    }
 
     #[test]
     fn rotation_disabled_reason_covers_every_saved_and_free_rotation() {
