@@ -4,10 +4,10 @@ use crate::export_crop::{CropHandle, CropRect};
 use crate::keymap::KeyAction;
 use crate::sns_split::{MAX_COUNT, MIN_COUNT, SnsSplitLayout, SnsTarget};
 
-const PANEL_W: f32 = 240.0;
+const PANEL_W: f32 = 264.0;
 const PANEL_MARGIN: f32 = 14.0;
 const PANEL_TOP: f32 = 72.0;
-const PREVIEW_H: f32 = 84.0;
+const PREVIEW_H: f32 = 96.0;
 const MIN_PREVIEW_SEAM: f32 = 1.0;
 
 pub(crate) const SNS_SPLIT_ROTATION_DISABLED_REASON: &str =
@@ -203,7 +203,9 @@ fn draw_sns_split_preview(
 }
 
 fn sns_split_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
-    (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(220.0, 360.0)
+    // 見出し / 投稿先 / 説明 / 枚数 / プレビュー / 寸法 / 書き出しボタンが縦に並ぶ。
+    // 上限が本文より低いと、実機で書き出しボタンがスクロールの外へ出た (2026-09-01)。
+    (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(240.0, 430.0)
 }
 
 fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
