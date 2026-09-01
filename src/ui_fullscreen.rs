@@ -33544,7 +33544,11 @@ impl App {
                     page.transform.full_image_rect,
                     source_size,
                     self.get_rotation(idx),
-                    page.transform.content_bbox,
+                    // **描いたときに寄せた後の trim を渡す。** `content_bbox` は要求された
+                    // ままの未量子化の矩形なので、そちらを渡すと選択できる端が実際に描いた
+                    // 端と最大 0.5 画面 px ずれる (縮小時は元画像で数 px。Codex Sol の指摘 4)。
+                    // `uv_rect` は寄せた表示矩形を元画像空間へ戻したもので、描いた端そのもの。
+                    page.transform.content_bbox.map(|_| page.transform.uv_rect),
                     ctx.pixels_per_point(),
                 )
                 .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
@@ -48423,6 +48427,66 @@ mod tests {
                 max_y: 200.0,
             },
         );
+    }
+
+    /// 範囲コピーの境界は、**描いたときに寄せた後の trim** と一致する (Codex Sol の指摘 4)。
+    ///
+    /// `content_bbox` は要求されたままの未量子化の矩形。描画は出力テクセル境界へ寄せた
+    /// 矩形を使うので、キャプチャへ生の bbox を渡すと選択できる端が最大 0.5 画面 px、
+    /// 縮小時は元画像で数 px ずれる。テクセル境界に乗らない比率で確かめる。
+    #[test]
+    fn capture_region_spread_target_uses_the_trim_the_draw_quantized() {
+        let pixels_per_point = 1.0_f32;
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+        let page = egui::vec2(1249.0, 2000.0);
+        // わざとテクセル境界に乗らない比率。
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0173, 0.0), egui::pos2(0.9411, 1.0));
+        let layout_rect = egui::Rect::from_min_size(egui::pos2(300.0, 40.0), page * 0.6);
+        let drawn = resolve_fs_transform_in_layout_rect(
+            DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: page,
+                texture_size: page,
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: Some(bbox),
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..FullscreenFitScaleLimits::default()
+                },
+                pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            layout_rect,
+        )
+        .expect("drawn transform");
+        assert_ne!(
+            drawn.uv_rect.min.x, bbox.min.x,
+            "この比率では寄せが起きないので、テストが前提を満たしていない"
+        );
+
+        let captured = crate::app::App::capture_region_spread_transform_for_source(
+            0,
+            drawn.full_image_rect,
+            [page.x as usize, page.y as usize],
+            crate::rotation_db::Rotation::None,
+            drawn.content_bbox.map(|_| drawn.uv_rect),
+            pixels_per_point,
+        )
+        .expect("capture transform");
+
+        for (label, drawn_edge, captured_edge) in [
+            ("左端", drawn.paint_rect.min.x, captured.paint_rect.min.x),
+            ("右端", drawn.paint_rect.max.x, captured.paint_rect.max.x),
+        ] {
+            assert!(
+                (drawn_edge - captured_edge).abs() < 1e-3,
+                "{label}が描いた位置 {drawn_edge} と違う: {captured_edge}"
+            );
+        }
     }
 
     /// 見開きの範囲コピーは、**見えている範囲を越えて選べない** (§1.156)。
