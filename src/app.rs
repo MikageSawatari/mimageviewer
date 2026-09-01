@@ -50537,6 +50537,7 @@ impl App {
                             self.settings.video_scale_filter,
                             self.settings.video_downscale_smoothing_percent,
                             self.settings.video_anime4k_budget,
+                            self.native_bar_lock_state(),
                             // 動画経路: 常に映像フレームを持つ。
                             false,
                         )
@@ -70825,6 +70826,10 @@ fn native_video_presenter_config(
     scale_filter: crate::settings::VideoScaleFilter,
     downscale_smoothing_percent: u32,
     anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    // presenter が生まれた瞬間から使う上下バー固定状態。App の毎フレーム sync
+    // (`sync_native_video_metadata`) より前に 1 枚目が出るため、ここで渡さないと
+    // 固定なしの全域表示が一瞬見えてから縮む。
+    bar_lock: crate::video::NativeBarLockState,
     // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
     // (§5.9 / Inc 6 ②-1)。動画経路は false。
     audio_only: bool,
@@ -70855,6 +70860,7 @@ fn native_video_presenter_config(
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
         video_grade,
+        bar_lock: bar_lock.clamped(),
         scale_filter,
         downscale_smoothing_percent,
         anime4k_variant: None,

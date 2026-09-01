@@ -3470,7 +3470,37 @@ clip は旧 `rects` 由来のまま残るので、最終的な可視間隔を he
   最大ほぼ 1 物理 px 変わる。今回の合わせは unit 内の横方向だけ。
 - frozen 経路 2 種は既知の P2 のまま。**出荷するなら「live のみ修正済み」と明示する。**
 
-### 1.158 端数倍率の拡大で、貼り先と出力テクセル数が合わずボケる — §1.0e の未解決部分
+### 1.162 HUD ロック中でも、動画を開いた直後だけ全域に描いてから縮む — **対応済み** (2026-09-01)
+
+- **症状**: 上下 HUD を固定表示にしていても、ホイールで前後の項目へ移動して動画に入ると、
+  一瞬ロックされていない全域表示で出てから HUD に合わせて縮む。静止画では起きない
+  (静止画は egui 側で描くので、native presenter を作り直さない)。
+- **原因**: native presenter は「固定なし」で生まれ、固定状態は生成後に
+  `SetBarLockState` コマンドで届いていた。送っているのは App の毎フレーム同期
+  (`app.rs` の `sync_native_video_metadata`) だけで、**動画を開く経路には同期呼び出しが無い**。
+  presenter スレッドは独立に走るので、App の次フレームより先に 1 枚目を present できる。
+  そのあいだ `video_top_bar_locked=false` / `video_bottom_lock=None` のまま
+  `update_video_visual_transform` が全域を指すので、全域 → 縮小の 2 段になる。
+  動画→動画の送りは presenter を持ち回る (`attach_native_output`) 経路が同期を呼ぶので出ない。
+- **修正**: 固定状態を presenter の**生成時の入力**にした。
+  - `crate::video::NativeBarLockState` (top / bottom / 隙間 px) を追加し、隙間の上限クランプを
+    この型の `clamped()` に集約。初期値も後からの変更も同じ規則を通る。
+  - `NativeVideoOutputConfig` → `NativeRenderConfig` → presenter フィールドへ渡し、
+    egui overlay へも**最初の `render_once` の前に**入れる (HUD 自体が 1 回ずれて描かれるのを防ぐ)。
+  - 設定を読む場所は `App::native_bar_lock_state()` の 1 つだけにして、config へ渡す値と
+    生成後の同期が送る値がずれないようにした。
+  - presenter を作り直す F12 の placement 切替でも `cur_bar_lock` で現在値を持ち越す
+    (open 時の config 値のまま作ると、切替のたびに同じ 1 枚が出る)。
+- **テスト**: `app::tests::native_bar_lock_reaches_the_presenter_at_birth` の 3 本
+  (config が要求した固定を運ぶ / 隙間の上限が初期値にも効く / 設定を読む場所が 1 つ)。
+  `bar_lock` を `Default::default()` に差し替えると前 2 本が落ちることを確認済み。
+- **残**: シークストリップの固定 (`BarAndStrip`) では、ストリップの素材が用意できるまで
+  `seek_strip_visible=false` のため下側の確保が 104pt 分小さく、素材が届いた時点でもう一段
+  縮む。これは今回の修正とは別の経路 (`set_overlay_seek_strip` の layout 変化) で、
+  HUD 側のレイアウトも同じ条件で動くため「常に確保する」だけでは直らない (素材が無い動画で
+  空きが残る)。実機で残るようなら別項目として起票する。
+
+### 1.161 端数倍率の拡大で、貼り先と出力テクセル数が合わずボケる — §1.0e の未解決部分
 
 - 出典: Codex Sol の 2 度目のレビュー (2026-09-01) 指摘 2。
   生の回答は [sol-spread-round2-review.txt](review-v3.3.0/sol-spread-round2-review.txt)。

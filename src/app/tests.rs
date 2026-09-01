@@ -65884,3 +65884,90 @@ mod sns_split_p2_transition_tests {
         assert_eq!(app.fullscreen_idx, Some(1));
     }
 }
+
+#[cfg(windows)]
+mod native_bar_lock_reaches_the_presenter_at_birth {
+    use crate::app::tests::phase_c_support::setup_app;
+
+    fn config_for(
+        bar_lock: crate::video::NativeBarLockState,
+    ) -> crate::video::NativeVideoOutputConfig {
+        super::super::native_video_presenter_config(
+            0,
+            windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            crate::video::NativeVideoPlacement::FullscreenBorderless,
+            false,
+            true,
+            "test.mp4".to_string(),
+            false,
+            false,
+            false,
+            false,
+            1.0,
+            crate::settings::TextContrast::Standard,
+            crate::settings::UiFontSettings::default(),
+            crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
+            None,
+            0,
+            crate::creative_lut::VideoGradeSnapshot::default(),
+            crate::settings::VideoScaleFilter::OsDefault,
+            0,
+            crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            bar_lock,
+            false,
+        )
+        .expect("presenter config")
+    }
+
+    /// presenter は生成時点で固定状態を知っている必要がある。App の毎フレーム
+    /// `sync_native_video_metadata` は 1 枚目の present より後になり得るので、
+    /// config で渡さないと固定なしの全域表示が一瞬出てから縮む。
+    #[test]
+    fn the_presenter_config_carries_the_requested_lock() {
+        let requested = crate::video::NativeBarLockState {
+            top_locked: true,
+            bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
+            fixed_bar_gap_px: 12,
+        };
+        assert_eq!(config_for(requested).bar_lock, requested);
+    }
+
+    /// 隙間 px の上限は初期値にも後からの変更にも同じ規則で効く。
+    #[test]
+    fn the_gap_is_clamped_the_same_way_it_is_after_a_later_change() {
+        let requested = crate::video::NativeBarLockState {
+            top_locked: false,
+            bottom_lock: crate::settings::VideoBottomLock::BarOnly,
+            fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
+        };
+        assert_eq!(
+            config_for(requested).bar_lock.fixed_bar_gap_px,
+            crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX
+        );
+        assert_eq!(requested.clamped(), config_for(requested).bar_lock);
+    }
+
+    /// 設定を読む場所は 1 つ。config へ渡す値と、生成後の同期が送る値がずれない。
+    #[test]
+    fn the_lock_the_app_hands_out_is_the_one_in_settings() {
+        let mut app = setup_app();
+        app.settings.video_top_bar_locked = true;
+        app.settings
+            .set_video_bottom_lock(crate::settings::VideoBottomLock::BarAndStrip);
+        app.settings.fullscreen_fixed_bar_gap_px = 6;
+
+        let state = app.native_bar_lock_state();
+
+        assert!(state.top_locked);
+        assert_eq!(
+            state.bottom_lock,
+            crate::settings::VideoBottomLock::BarAndStrip
+        );
+        assert_eq!(state.fixed_bar_gap_px, 6);
+    }
+}

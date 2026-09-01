@@ -6800,6 +6800,17 @@ impl App {
     }
 
     #[cfg(windows)]
+    /// 上下バーの固定状態を設定から読む唯一の場所。presenter の生成時 (config) と
+    /// 生成後の同期 (`SetBarLockState`) が同じ値を見ることを、この 1 か所で保証する。
+    #[cfg(windows)]
+    pub(crate) fn native_bar_lock_state(&self) -> crate::video::NativeBarLockState {
+        crate::video::NativeBarLockState {
+            top_locked: self.settings.video_top_bar_locked,
+            bottom_lock: self.settings.video_bottom_lock(),
+            fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
+        }
+    }
+
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
         self.sync_native_video_panorama_state(fs_idx);
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -6820,9 +6831,10 @@ impl App {
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
-        let top_bar_locked = self.settings.video_top_bar_locked;
-        let bottom_lock = self.settings.video_bottom_lock();
-        let fixed_bar_gap_px = self.settings.fullscreen_fixed_bar_gap_px;
+        let bar_lock = self.native_bar_lock_state();
+        let top_bar_locked = bar_lock.top_locked;
+        let bottom_lock = bar_lock.bottom_lock;
+        let fixed_bar_gap_px = bar_lock.fixed_bar_gap_px;
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -10399,6 +10411,7 @@ impl App {
             self.settings.video_scale_filter,
             self.settings.video_downscale_smoothing_percent,
             self.settings.video_anime4k_budget,
+            self.native_bar_lock_state(),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -11007,6 +11020,7 @@ impl App {
                 self.settings.video_scale_filter,
                 self.settings.video_downscale_smoothing_percent,
                 self.settings.video_anime4k_budget,
+                self.native_bar_lock_state(),
                 false,
             )
         });

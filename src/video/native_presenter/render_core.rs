@@ -978,6 +978,9 @@ pub struct NativeRenderConfig {
     pub anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     pub anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
     pub anime4k_status: NativeVideoAnime4kStatus,
+    /// 生成時点の上下バー固定状態。presenter はこれを最初の transform から使う
+    /// (後から `SetBarLockState` が届くまで固定なしで描かない)。
+    pub bar_lock: crate::video::NativeBarLockState,
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     pub(crate) window_epoch: u64,
 }
@@ -2926,6 +2929,9 @@ impl NativeRenderCore {
     ) -> Result<(Self, HostWindowTopology, Vec<NativeWindowIntent>), String> {
         let health = Arc::clone(&config.health);
         let window_epoch = config.window_epoch;
+        // 上限クランプは `NativeBarLockState::clamped` が所有する
+        // (`set_overlay_bar_lock_state` と同じ規則を初期値にも通す)。
+        let initial_bar_lock = config.bar_lock.clamped();
         let _attach_operation = health.begin_render_operation(
             crate::video::native_window_health::NativeRenderOperation::Attach,
             window_epoch,
@@ -3127,6 +3133,12 @@ impl NativeRenderCore {
                     overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
                     match overlay_result {
                         Ok(mut overlay) => {
+                            // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
+                            // 1 回「固定なし」で描かれてから固定表示へ動く。
+                            overlay.set_bar_lock_state(
+                                initial_bar_lock.top_locked,
+                                initial_bar_lock.bottom_lock,
+                            );
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -3192,6 +3204,12 @@ impl NativeRenderCore {
                     overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
                     match overlay_result {
                         Ok(mut overlay) => {
+                            // 最初の render の前に固定状態を入れる。ここを飛ばすと HUD が
+                            // 1 回「固定なし」で描かれてから固定表示へ動く。
+                            overlay.set_bar_lock_state(
+                                initial_bar_lock.top_locked,
+                                initial_bar_lock.bottom_lock,
+                            );
                             let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
@@ -3374,9 +3392,9 @@ impl NativeRenderCore {
                     .is_some(),
                 last_pixel_probe: None,
                 video_compact: false,
-                video_top_bar_locked: false,
-                video_bottom_lock: VideoBottomLock::None,
-                fullscreen_fixed_bar_gap_px: 0,
+                video_top_bar_locked: initial_bar_lock.top_locked,
+                video_bottom_lock: initial_bar_lock.bottom_lock,
+                fullscreen_fixed_bar_gap_px: initial_bar_lock.fixed_bar_gap_px,
                 sar_num: 1,
                 sar_den: 1,
                 orientation: VideoOrientation::IDENTITY,
@@ -5875,16 +5893,20 @@ impl NativeRenderCore {
         bottom_lock: VideoBottomLock,
         fixed_bar_gap_px: u32,
     ) -> Result<(), String> {
-        let fixed_bar_gap_px =
-            fixed_bar_gap_px.min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX);
-        let layout_changed = self.video_top_bar_locked != top_locked
-            || self.video_bottom_lock != bottom_lock
-            || self.fullscreen_fixed_bar_gap_px != fixed_bar_gap_px;
-        self.video_top_bar_locked = top_locked;
-        self.video_bottom_lock = bottom_lock;
-        self.fullscreen_fixed_bar_gap_px = fixed_bar_gap_px;
+        let requested = crate::video::NativeBarLockState {
+            top_locked,
+            bottom_lock,
+            fixed_bar_gap_px,
+        }
+        .clamped();
+        let layout_changed = self.video_top_bar_locked != requested.top_locked
+            || self.video_bottom_lock != requested.bottom_lock
+            || self.fullscreen_fixed_bar_gap_px != requested.fixed_bar_gap_px;
+        self.video_top_bar_locked = requested.top_locked;
+        self.video_bottom_lock = requested.bottom_lock;
+        self.fullscreen_fixed_bar_gap_px = requested.fixed_bar_gap_px;
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_bar_lock_state(top_locked, bottom_lock);
+            overlay.set_bar_lock_state(requested.top_locked, requested.bottom_lock);
         }
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
