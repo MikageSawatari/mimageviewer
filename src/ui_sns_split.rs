@@ -1181,7 +1181,13 @@ mod tests {
         assert!(app.sns_split_spread_ctx.is_none());
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
         let state = app.export_dialog.take().expect("export dialog should open");
-        assert_eq!(state.scale, crate::export_dialog::ExportScale::Full);
+        // 分割の書き出しは投稿用なので、既定で長辺を抑える (通常書き出しの既定は不変)。
+        assert_eq!(
+            state.scale,
+            crate::export_dialog::ExportScale::LongEdge(
+                crate::export_dialog::ExportScale::DEFAULT_LONG_EDGE
+            )
+        );
         assert_eq!(state.sns_split_frames, expected_frames);
         assert_eq!(state.selection, original_selection);
         match state.pixels {

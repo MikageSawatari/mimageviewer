@@ -34697,7 +34697,14 @@ impl App {
                 self.settings.export_fallback_format,
             ),
             scale: if sns_split_export {
-                crate::export_dialog::ExportScale::Full
+                // 分割の書き出しは投稿用なので、既定で長辺を抑える。表示 pixels には
+                // AI 拡大が焼き込まれることがあり、実測で 1 枚 5.6MB と X の PNG 上限
+                // (5MB) 際まで膨らんだ。長辺指定は**元が小さければ何もしない**ので、
+                // AI 拡大を使っていない画像は等倍のまま出る。
+                // 通常書き出しの既定 (export_default_scale) は書き換えない。
+                crate::export_dialog::ExportScale::LongEdge(
+                    crate::export_dialog::ExportScale::DEFAULT_LONG_EDGE,
+                )
             } else {
                 self.settings.export_default_scale
             },
