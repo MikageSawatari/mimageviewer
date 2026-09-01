@@ -3360,7 +3360,6 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::Sort => "ソート",
         TS::Rating => "レーティング (★)",
         TS::Favorites => "お気に入り",
-        TS::ExternalTools => "外部ツール",
         TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
         TS::Unknown => "",
@@ -3498,7 +3497,6 @@ fn set_toolbar_section_visible(
         TS::Sort => settings.show_toolbar_sort = visible,
         TS::Rating => settings.show_toolbar_rating = visible,
         TS::Favorites => settings.show_toolbar_favorites = visible,
-        TS::ExternalTools => settings.show_toolbar_external_tools = visible,
         TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
         TS::Unknown => {}
@@ -5015,90 +5013,6 @@ mod details_column_context_menu_layout_tests {
     }
 }
 
-fn external_tool_launch_entries(
-    tools: &[crate::external_tool::ExternalTool],
-) -> Vec<(crate::external_tool::ExternalToolId, String)> {
-    tools
-        .iter()
-        .map(|tool| (tool.id, tool.display_name()))
-        .collect()
-}
-
-fn draw_external_tools_submenu(
-    ui: &mut egui::Ui,
-    entries: &[(crate::external_tool::ExternalToolId, String)],
-    selected: &mut Option<crate::external_tool::ExternalToolId>,
-) {
-    const MAX_HEIGHT: f32 = 480.0;
-    const SCREEN_MARGIN: f32 = 64.0;
-
-    let response = ui.menu_button("外部ツール", |ui| {
-        if entries.is_empty() {
-            ui.add_enabled(false, egui::Button::new("(未登録)"));
-            return;
-        }
-        let max_height = (ui.ctx().content_rect().height() - SCREEN_MARGIN)
-            .min(MAX_HEIGHT)
-            .max(1.0);
-        egui::ScrollArea::vertical()
-            .id_salt("file_external_tools_scroll")
-            .max_height(max_height)
-            .auto_shrink([true, true])
-            .show(ui, |ui| {
-                for (tool_id, label) in entries {
-                    if ui.button(label).clicked() {
-                        *selected = Some(*tool_id);
-                        ui.close();
-                    }
-                }
-            });
-    });
-    // `Ui::menu_button` はメニュー内では `SubMenuButton` になり、通常の popup ID を
-    // Memory に登録しない。戻り値で開状態を判定して背面 Grid への wheel を止める。
-    if response.inner.is_some() {
-        consume_wheel_input(ui.ctx());
-    }
-}
-
-#[cfg(test)]
-mod external_tool_menu_tests {
-    use super::{external_tool_launch_entries, set_toolbar_section_visible};
-    use crate::external_tool::{ExternalTool, ExternalToolId};
-    use crate::settings::{Settings, ToolbarSectionId};
-
-    #[test]
-    fn menu_entries_include_every_tool_in_registration_order() {
-        let mut context_hidden = ExternalTool::defaults_for_viewing();
-        context_hidden.id = ExternalToolId(7);
-        context_hidden.name = "右クリック非表示".to_string();
-        context_hidden.show_in_context_menu = false;
-
-        let mut context_visible = ExternalTool::defaults_for_viewing();
-        context_visible.id = ExternalToolId(3);
-        context_visible.name = "右クリック表示".to_string();
-
-        assert_eq!(
-            external_tool_launch_entries(&[context_hidden, context_visible]),
-            vec![
-                (ExternalToolId(7), "右クリック非表示".to_string()),
-                (ExternalToolId(3), "右クリック表示".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn external_tools_toolbar_visibility_uses_its_own_default_off_flag() {
-        let mut settings = Settings::default();
-        assert!(!settings.show_toolbar_external_tools);
-
-        set_toolbar_section_visible(&mut settings, ToolbarSectionId::ExternalTools, true);
-        assert!(settings.show_toolbar_external_tools);
-
-        set_toolbar_section_visible(&mut settings, ToolbarSectionId::ExternalTools, false);
-        assert!(!settings.show_toolbar_external_tools);
-    }
-}
-
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -5108,8 +5022,6 @@ impl App {
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
-        let mut external_tool_launch = None;
-        let external_tool_entries = external_tool_launch_entries(&self.settings.external_tools);
         let book_sort_locked = self.page_order_locked_for_current_view();
         let rating_counts = self.rating_counts();
         let selected_video_path =
@@ -5249,7 +5161,6 @@ impl App {
                             let file_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::File.label(), |ui| {
                                 let mut rating_menu_drawn = false;
-                                let mut external_tools_menu_drawn = false;
                                 for &command in file_menu_commands {
                                     match command {
                                         MenuCommandId::FileOpenFolder => {
@@ -5297,14 +5208,6 @@ impl App {
                                                 self.reload_top_level_grid(ctx);
                                                 ui.close();
                                             }
-                                            if !external_tools_menu_drawn {
-                                                draw_external_tools_submenu(
-                                                    ui,
-                                                    &external_tool_entries,
-                                                    &mut external_tool_launch,
-                                                );
-                                                external_tools_menu_drawn = true;
-                                            }
                                         }
                                         MenuCommandId::FileMetadataExport => {
                                             let response = ui.add_enabled(
@@ -5346,14 +5249,6 @@ impl App {
                                             }
                                         }
                                         MenuCommandId::FileQuit => {
-                                            if !external_tools_menu_drawn {
-                                                draw_external_tools_submenu(
-                                                    ui,
-                                                    &external_tool_entries,
-                                                    &mut external_tool_launch,
-                                                );
-                                                external_tools_menu_drawn = true;
-                                            }
                                             ui.separator();
                                             if ui.button(&quit_menu_label).clicked() {
                                                 self.request_application_quit(ctx);
@@ -5374,13 +5269,6 @@ impl App {
                                             }
                                         }
                                     });
-                                }
-                                if !external_tools_menu_drawn {
-                                    draw_external_tools_submenu(
-                                        ui,
-                                        &external_tool_entries,
-                                        &mut external_tool_launch,
-                                    );
                                 }
                             });
                             top_menu_responses.push(response.response);
@@ -6213,10 +6101,6 @@ impl App {
                 switch_menubar_popup_on_hover(ui.ctx(), &top_menu_responses);
             });
         });
-
-        if let Some(tool_id) = external_tool_launch {
-            self.launch_grid_external_tool_by_id(tool_id);
-        }
 
         if settings_changed {
             self.settings.save();
@@ -7599,7 +7483,6 @@ impl App {
         let show_aspect = self.settings.show_toolbar_aspect && !details_mode;
         let show_sort = self.settings.show_toolbar_sort;
         let show_favs = self.settings.show_toolbar_favorites;
-        let show_external_tools = self.settings.show_toolbar_external_tools;
         let show_smart_folders = smart_folder_toolbar_visible(
             self.settings.show_toolbar_smart_folders,
             self.settings.smart_folders.len(),
@@ -7616,7 +7499,6 @@ impl App {
         let toolbar_book_rows = self.book_list_cache.clone();
         let toolbar_pinned_books = self.settings.pinned_books.clone();
         let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
-        let toolbar_external_tools = self.settings.external_tools.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let has_rating_selection = has_book_add_target;
         let toolbar_section_order = crate::settings::ToolbarSectionId::ordered_with_fallback(
@@ -7632,7 +7514,6 @@ impl App {
             || show_aspect
             || show_sort
             || show_favs
-            || show_external_tools
             || show_smart_folders
             || show_rating
             || show_tags;
@@ -7657,7 +7538,6 @@ impl App {
         let mut toolbar_tag_container: Option<String> = None;
         let mut toolbar_tag_apply = false;
         let mut toolbar_tag_view_open = false;
-        let mut toolbar_external_tool_launch = None;
         let mut toolbar_combo_popup_open = false;
         // ドラッグ並べ替え: 前フレームの可視セクション矩形を奪って drop 計算に使い、
         // 今フレーム描いた矩形を集めて次フレーム用に格納する。
@@ -7803,7 +7683,6 @@ impl App {
                         TS::Sort => show_sort,
                         TS::Rating => show_rating,
                         TS::Favorites => show_favs,
-                        TS::ExternalTools => show_external_tools,
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
                         TS::Unknown => false,
@@ -8557,77 +8436,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 }
-                TS::ExternalTools => {
-                    let lead = toolbar_label(ui, "外部ツール:", 84.0, drag_enabled)
-                        .hover_tip(lead_hint);
-                    self.finish_toolbar_section_lead(
-                        ui,
-                        lead,
-                        TS::ExternalTools,
-                        &mut current_section_anchors,
-                        &last_section_anchors,
-                    );
-                    let mode = self.settings.toolbar_external_tools_display;
-                    let (show_inline, new_collapsed) = toolbar_section_fold_toggle(
-                        ui,
-                        mode,
-                        self.settings.toolbar_external_tools_collapsed,
-                    );
-                    if let Some(collapsed) = new_collapsed {
-                        self.settings.toolbar_external_tools_collapsed = collapsed;
-                        self.settings.save();
-                    }
-                    if toolbar_external_tools.is_empty() {
-                        if show_inline
-                            || mode == crate::settings::ToolbarSectionDisplay::Dropdown
-                        {
-                            ui.label(egui::RichText::new("(未登録)").weak());
-                        }
-                    } else if mode == crate::settings::ToolbarSectionDisplay::Dropdown {
-                        let selected_text = "選択";
-                        let frame_w = toolbar_combo_width(ui, 180.0, selected_text);
-                        let combo = ui
-                            .allocate_ui_with_layout(
-                                egui::vec2(frame_w, ui.spacing().interact_size.y),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    egui::ComboBox::from_id_salt("toolbar_external_tools_combo")
-                                        .width(180.0)
-                                        .selected_text(selected_text)
-                                        .show_ui(ui, |ui| {
-                                            apply_toolbar_style(ui);
-                                            for tool in &toolbar_external_tools {
-                                                if ui
-                                                    .selectable_label(false, tool.display_name())
-                                                    .on_hover_text(tool.launch_description())
-                                                    .clicked()
-                                                {
-                                                    toolbar_external_tool_launch = Some(tool.id);
-                                                    ui.close();
-                                                }
-                                            }
-                                        })
-                                },
-                            )
-                            .inner;
-                        toolbar_combo_popup_open |=
-                            egui::ComboBox::is_open(ctx, combo.response.id);
-                    } else if show_inline {
-                        for tool in &toolbar_external_tools {
-                            if ui
-                                .button(tool.display_name())
-                                .hover_tip(format!(
-                                    "{}で開く\n{}",
-                                    tool.display_name(),
-                                    tool.launch_description()
-                                ))
-                                .clicked()
-                            {
-                                toolbar_external_tool_launch = Some(tool.id);
-                            }
-                        }
-                    }
-                }
                 TS::SmartFolders => {
                     let lead = toolbar_label(ui, "スマート:", 60.0, drag_enabled)
                         .hover_tip(lead_hint);
@@ -8869,10 +8677,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             consume_wheel_input(ctx);
         }
 
-        if let Some(tool_id) = toolbar_external_tool_launch {
-            self.launch_grid_external_tool_by_id(tool_id);
-        }
-
         if let Some(name) = toolbar_book_target_name {
             self.settings.active_book_name = name.clone();
             self.settings.save();
@@ -9014,9 +8818,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .on_hover_text("登録が1件以上あるときだけツールバーに表示されます")
             .changed();
         changed |= ui.checkbox(&mut s.show_toolbar_tags, "タグ").changed();
-        changed |= ui
-            .checkbox(&mut s.show_toolbar_external_tools, "外部ツール")
-            .changed();
         ui.separator();
         changed |= ui
             .checkbox(
@@ -9121,7 +8922,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_toolbar_sort = true;
         s.show_toolbar_rating = true;
         s.show_toolbar_favorites = true;
-        s.show_toolbar_external_tools = false;
         s.show_toolbar_smart_folders = true;
         s.show_toolbar_tags = true;
         s.show_toolbar_facet_filter = true;
@@ -9154,12 +8954,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
         s.toolbar_favorites_display = ToolbarSectionDisplay::default();
-        s.toolbar_external_tools_display = ToolbarSectionDisplay::default();
         s.toolbar_smart_folders_display = ToolbarSectionDisplay::default();
         s.toolbar_tags_display = ToolbarSectionDisplay::default();
         s.toolbar_bookshelf_display = ToolbarSectionDisplay::default();
         s.toolbar_favorites_collapsed = false;
-        s.toolbar_external_tools_collapsed = false;
         s.toolbar_smart_folders_collapsed = false;
         s.toolbar_tags_collapsed = false;
         s.toolbar_bookshelf_collapsed = false;
@@ -9311,21 +9109,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.separator();
                 if ui.button("お気に入りを編集…").clicked() {
                     self.show_favorites_editor = true;
-                    ui.close();
-                }
-            }
-            TS::ExternalTools => {
-                display_radio(
-                    ui,
-                    &mut self.settings.toolbar_external_tools_display,
-                    TD::all_with_collapsible(),
-                    &mut changed,
-                );
-                ui.separator();
-                if ui.button("外部ツールを管理…").clicked() {
-                    self.open_preferences_page(
-                        crate::ui_dialogs::preferences::PreferencesPage::ExternalTools,
-                    );
                     ui.close();
                 }
             }

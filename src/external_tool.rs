@@ -8,8 +8,10 @@ use std::sync::{Arc, mpsc};
 use eframe::egui;
 
 pub const DEFAULT_PDF_RENDER_LONG_EDGE: u32 = 4096;
-const CONTEXT_MENU_DEFAULT_ON_THRESHOLD: usize = 10;
-const EACH_LAUNCH_CONFIRM_THRESHOLD: usize = 20;
+pub const DEFAULT_CONFIRMATION_THRESHOLD: u32 = 5;
+pub const DEFAULT_MAX_TARGETS: u32 = 10;
+#[cfg(windows)]
+const CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS: usize = 32_767;
 const ASSOCIATED_APP_DISPLAY_NAME: &str = "関連付けアプリ";
 pub(crate) const VIRTUAL_EDITING_DISABLED_REASON: &str = "圧縮ファイル内のページは編集用ツールで開けません。書き出してから編集してください (フルスクリーンで Ctrl+E)";
 #[cfg(windows)]
@@ -112,8 +114,8 @@ pub enum SpreadPolicy {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionPolicy {
-    #[default]
     Single,
+    #[default]
     Each,
     Batch,
 }
@@ -129,9 +131,10 @@ pub struct ExternalTool {
     pub video: VideoPolicy,
     pub spread: SpreadPolicy,
     pub selection: SelectionPolicy,
+    pub confirmation_threshold: u32,
+    pub max_targets: u32,
     pub pdf_render_long_edge: u32,
     pub for_editing: bool,
-    pub show_in_context_menu: bool,
     pub keep_temp: bool,
 }
 
@@ -363,13 +366,19 @@ pub(crate) struct ExternalLaunchOperation {
     tool_name: String,
     requests: Vec<ExternalLaunchRequest>,
     target_count: usize,
+    target_count_decision: TargetCountDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetCountDecision {
+    Proceed,
+    Confirm { target_count: usize },
 }
 
 #[derive(Debug)]
 pub(crate) struct ExternalLaunchConfirmation {
     operation: ExternalLaunchOperation,
     network_executable: Option<PathBuf>,
-    many_launch_count: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -521,10 +530,11 @@ impl ExternalTool {
             payload: PayloadPolicy::AsDisplayed,
             video: VideoPolicy::File,
             spread: SpreadPolicy::Merged,
-            selection: SelectionPolicy::Single,
+            selection: SelectionPolicy::Each,
+            confirmation_threshold: DEFAULT_CONFIRMATION_THRESHOLD,
+            max_targets: DEFAULT_MAX_TARGETS,
             pdf_render_long_edge: DEFAULT_PDF_RENDER_LONG_EDGE,
             for_editing: false,
-            show_in_context_menu: true,
             keep_temp: false,
         }
     }
@@ -555,17 +565,6 @@ pub fn next_id(existing: &[ExternalTool]) -> ExternalToolId {
     ExternalToolId(free)
 }
 
-/// 設定ページから新規登録するとき、右クリック表示を既定 ON にするかを返す。
-///
-/// 利用者指定どおり、既存の ON が 10 件なら新規も ON、10 件を超えている場合だけ OFF にする。
-pub(crate) fn show_in_context_menu_by_default(existing: &[ExternalTool]) -> bool {
-    existing
-        .iter()
-        .filter(|tool| tool.show_in_context_menu)
-        .count()
-        <= CONTEXT_MENU_DEFAULT_ON_THRESHOLD
-}
-
 /// 外部ツールの右クリック項目を登録順に組み立てる。
 ///
 /// ファイル存在確認や補正 DB 参照は行わず、項目種別とツール定義だけで判定する。
@@ -575,7 +574,6 @@ pub(crate) fn external_tool_menu_items(
 ) -> Vec<ExternalToolMenuItem> {
     tools
         .iter()
-        .filter(|tool| tool.show_in_context_menu)
         .filter_map(|tool| match target {
             ExternalToolMenuTarget::RealFile => Some(ExternalToolMenuItem {
                 tool_id: tool.id,
@@ -886,6 +884,88 @@ fn real_files_from_targets(targets: &[LaunchTarget]) -> Result<Vec<PathBuf>, Str
         .collect())
 }
 
+/// 対象件数に対する起動可否と確認要否を決める。
+///
+/// `Single` は件数設定を使わない。1 件専用という policy 自体が上限なので、2 件以上を
+/// 黙って先頭 1 件へ縮めず拒否する。`Each` / `Batch` は上限を先に適用し、確認閾値は
+/// その範囲内にだけ適用する。
+fn evaluate_target_count(
+    selection: SelectionPolicy,
+    target_count: usize,
+    confirmation_threshold: u32,
+    max_targets: u32,
+) -> Result<TargetCountDecision, String> {
+    if selection == SelectionPolicy::Single {
+        return if target_count >= 2 {
+            Err(format!(
+                "複数選択の設定が「1 件」のため、{target_count} 件は起動できません"
+            ))
+        } else {
+            Ok(TargetCountDecision::Proceed)
+        };
+    }
+
+    if target_count > max_targets as usize {
+        return Err(format!(
+            "対象は {target_count} 件ですが、このツールの上限は {max_targets} 件です。環境設定の「起動と連携」→「外部ツール」で上限を変更できます"
+        ));
+    }
+    if target_count > confirmation_threshold as usize {
+        Ok(TargetCountDecision::Confirm { target_count })
+    } else {
+        Ok(TargetCountDecision::Proceed)
+    }
+}
+
+#[cfg(windows)]
+fn windows_regular_argument_utf16_len(argument: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    let units: Vec<u16> = argument.encode_wide().collect();
+    let quoted = units.is_empty()
+        || units
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16);
+    let mut length = units.len().saturating_add(usize::from(quoted) * 2);
+    let mut preceding_backslashes = 0usize;
+    for unit in &units {
+        if *unit == b'\\' as u16 {
+            preceding_backslashes = preceding_backslashes.saturating_add(1);
+        } else {
+            if *unit == b'"' as u16 {
+                // `Command::args` は quote の直前にある n 個の backslash を 2n+1 個へ
+                // するので、元の文字列に n+1 個ぶんが加わる。
+                length = length.saturating_add(preceding_backslashes.saturating_add(1));
+            }
+            preceding_backslashes = 0;
+        }
+    }
+    if quoted {
+        // 引用された引数末尾の n 個は、閉じ quote の前で 2n 個になる。
+        length = length.saturating_add(preceding_backslashes);
+    }
+    length
+}
+
+/// Rust の `Command::args` が `CreateProcessW` へ渡す command line の UTF-16 長。
+///
+/// argv[0] の常時引用、引数間の空白、通常引数の引用・escape、終端 NUL をすべて含む。
+#[cfg(windows)]
+fn windows_create_process_command_line_utf16_len(
+    executable: &OsStr,
+    arguments: &[OsString],
+) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut length = executable.encode_wide().count().saturating_add(2); // quoted argv[0]
+    for argument in arguments {
+        length = length
+            .saturating_add(1) // separator
+            .saturating_add(windows_regular_argument_utf16_len(argument));
+    }
+    length.saturating_add(1) // terminating NUL
+}
+
 fn build_request_for_files(
     tool: &ExternalTool,
     files: Vec<PathBuf>,
@@ -908,6 +988,16 @@ fn build_request_for_files(
     } else {
         Vec::new()
     };
+    #[cfg(windows)]
+    if tool.selection == SelectionPolicy::Batch
+        && let ExternalToolLaunch::Executable(executable) = &tool.launch
+        && windows_create_process_command_line_utf16_len(executable.as_os_str(), &arguments)
+            > CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS
+    {
+        return Err(format!(
+            "対象ファイルが多すぎるため起動できません。コマンドラインが Windows の上限（{CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS} 文字）を超えます"
+        ));
+    }
     Ok(ExternalLaunchRequest {
         tool_name: tool.display_name(),
         launch: tool.launch.clone(),
@@ -926,8 +1016,15 @@ pub(crate) fn build_launch_operation(
     targets: &[LaunchTarget],
 ) -> Result<ExternalLaunchOperation, String> {
     let files = real_files_from_targets(targets)?;
+    let target_count = files.len();
+    let target_count_decision = evaluate_target_count(
+        tool.selection,
+        target_count,
+        tool.confirmation_threshold,
+        tool.max_targets,
+    )?;
     let requests = match tool.selection {
-        SelectionPolicy::Single => vec![build_request_for_files(tool, vec![files[0].clone()])?],
+        SelectionPolicy::Single => vec![build_request_for_files(tool, files)?],
         SelectionPolicy::Each => files
             .into_iter()
             .map(|file| build_request_for_files(tool, vec![file]))
@@ -943,10 +1040,6 @@ pub(crate) fn build_launch_operation(
                 .collect::<Result<Vec<_>, _>>()?,
         },
     };
-    let target_count = requests
-        .iter()
-        .map(|request| request.files.len())
-        .sum::<usize>();
     // 起動計画をログに残す。Single / Each / Batch の違いは、起動したプロセス数と
     // 1 プロセスへ渡したファイル数にしか出ないので、外から確かめる手段がこれしかない
     // (2026-09-01 利用者要望)。
@@ -970,6 +1063,7 @@ pub(crate) fn build_launch_operation(
         tool_name: tool.display_name(),
         requests,
         target_count,
+        target_count_decision,
     })
 }
 
@@ -1009,15 +1103,14 @@ fn launch_confirmation(
         .find(|request| executable_requires_confirmation(request))
         .and_then(|request| request.launch.executable())
         .map(Path::to_path_buf);
-    let many_launch_count = (operation.requests.len() > EACH_LAUNCH_CONFIRM_THRESHOLD)
-        .then_some(operation.requests.len());
-    if network_executable.is_none() && many_launch_count.is_none() {
+    if network_executable.is_none()
+        && operation.target_count_decision == TargetCountDecision::Proceed
+    {
         Ok(operation)
     } else {
         Err(ExternalLaunchConfirmation {
             operation,
             network_executable,
-            many_launch_count,
         })
     }
 }
@@ -1270,27 +1363,12 @@ impl crate::app::App {
     }
 
     pub(crate) fn launch_grid_external_tool_slot(&mut self, slot: usize) {
-        let tool_id = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
-            Ok(tool) => tool.id,
+        let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
+            Ok(tool) => tool.clone(),
             Err(error) => {
                 self.show_feedback_toast(error);
                 return;
             }
-        };
-        self.launch_grid_external_tool_by_id(tool_id);
-    }
-
-    /// メニュー / ツールバー / 固定キースロットから、同じ Grid 対象解決で直接起動する。
-    pub(crate) fn launch_grid_external_tool_by_id(&mut self, tool_id: ExternalToolId) {
-        let Some(tool) = self
-            .settings
-            .external_tools
-            .iter()
-            .find(|tool| tool.id == tool_id)
-            .cloned()
-        else {
-            self.show_feedback_toast("外部ツールが見つかりません".to_string());
-            return;
         };
         let targets = self.external_tool_grid_key_targets();
         self.queue_external_tool_launch_targets(&tool, &targets);
@@ -1335,6 +1413,7 @@ impl crate::app::App {
             tool_name: display_name,
             target_count: request.files.len(),
             requests: vec![request],
+            target_count_decision: TargetCountDecision::Proceed,
         };
         match launch_confirmation(operation) {
             Ok(operation) => self.start_external_launch_operation(operation),
@@ -1403,21 +1482,24 @@ impl crate::app::App {
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let many_launch_count = confirmation.many_launch_count;
+        let confirmation_target_count = match confirmation.operation.target_count_decision {
+            TargetCountDecision::Proceed => None,
+            TargetCountDecision::Confirm { target_count } => Some(target_count),
+        };
         let mut launch = false;
         let mut cancel = false;
         let response =
             egui::Modal::new(egui::Id::new("external_tool_launch_confirmation")).show(ctx, |ui| {
                 ui.set_min_width(440.0);
-                if many_launch_count.is_some() {
-                    ui.heading("外部ツールを複数起動しますか？");
+                if confirmation_target_count.is_some() {
+                    ui.heading("複数の対象を外部ツールで開きますか？");
                 } else {
                     ui.heading("ネットワーク上のツールを起動しますか？");
                 }
                 ui.add_space(8.0);
                 ui.label(format!("ツール: {tool_name}"));
-                if let Some(count) = many_launch_count {
-                    ui.label(format!("{count} 件を 1 件ずつ起動します。"));
+                if let Some(count) = confirmation_target_count {
+                    ui.label(format!("{count} 件を外部ツールへ渡します。"));
                 }
                 if !executable.is_empty() {
                     ui.label(format!("実行ファイル: {executable}"));
@@ -1426,7 +1508,9 @@ impl crate::app::App {
                 if !executable.is_empty() {
                     ui.label("信頼できる場所であることを確認してから起動してください。");
                 } else {
-                    ui.label("多数のアプリケーションウィンドウが開く可能性があります。");
+                    ui.label(
+                        "多数の対象を渡すため、外部ツールの動作に時間がかかる可能性があります。",
+                    );
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1571,15 +1655,16 @@ mod tests {
     }
 
     #[test]
-    fn viewing_defaults_use_displayed_single_file_policy() {
+    fn viewing_defaults_use_displayed_each_file_policy_and_count_limits() {
         let tool = ExternalTool::defaults_for_viewing();
         assert_eq!(tool.payload, PayloadPolicy::AsDisplayed);
         assert_eq!(tool.video, VideoPolicy::File);
         assert_eq!(tool.spread, SpreadPolicy::Merged);
-        assert_eq!(tool.selection, SelectionPolicy::Single);
+        assert_eq!(tool.selection, SelectionPolicy::Each);
+        assert_eq!(tool.confirmation_threshold, DEFAULT_CONFIRMATION_THRESHOLD);
+        assert_eq!(tool.max_targets, DEFAULT_MAX_TARGETS);
         assert_eq!(tool.launch, ExternalToolLaunch::OsDefault);
         assert!(!tool.for_editing);
-        assert!(tool.show_in_context_menu);
         assert!(!tool.keep_temp);
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
@@ -1618,38 +1703,21 @@ mod tests {
         assert_eq!(next_id(&tools), ExternalToolId(2));
     }
 
-    fn menu_tool(id: u32, name: &str, for_editing: bool, shown: bool) -> ExternalTool {
+    fn menu_tool(id: u32, name: &str, for_editing: bool) -> ExternalTool {
         ExternalTool {
             id: ExternalToolId(id),
             name: name.to_string(),
             launch: ExternalToolLaunch::Executable(PathBuf::from(format!(r"C:\Tools\{name}.exe"))),
             for_editing,
-            show_in_context_menu: shown,
             ..ExternalTool::defaults_for_viewing()
         }
     }
 
     #[test]
-    fn context_menu_default_turns_off_only_after_more_than_ten_are_on() {
-        let ten_on: Vec<_> = (0..10)
-            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false, true))
+    fn real_file_menu_keeps_every_registered_tool_in_order_without_a_cap() {
+        let tools: Vec<_> = (0..12)
+            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false))
             .collect();
-        assert!(show_in_context_menu_by_default(&ten_on));
-
-        let mut eleven_on = ten_on.clone();
-        eleven_on.push(menu_tool(11, "tool-10", false, true));
-        assert!(!show_in_context_menu_by_default(&eleven_on));
-
-        eleven_on.extend((12..30).map(|id| menu_tool(id, &format!("hidden-{id}"), false, false)));
-        assert!(!show_in_context_menu_by_default(&eleven_on));
-    }
-
-    #[test]
-    fn real_file_menu_keeps_registration_order_and_does_not_cap_visible_tools() {
-        let mut tools: Vec<_> = (0..12)
-            .map(|index| menu_tool(index + 1, &format!("tool-{index}"), false, true))
-            .collect();
-        tools.insert(4, menu_tool(99, "hidden", false, false));
 
         let items = external_tool_menu_items(&tools, ExternalToolMenuTarget::RealFile);
 
@@ -1682,21 +1750,29 @@ mod tests {
     #[test]
     fn virtual_page_menu_keeps_only_disabled_editing_tools_with_reason() {
         let tools = vec![
-            menu_tool(1, "viewer", false, true),
-            menu_tool(2, "editor", true, true),
-            menu_tool(3, "hidden-editor", true, false),
+            menu_tool(1, "viewer", false),
+            menu_tool(2, "editor", true),
+            menu_tool(3, "second-editor", true),
         ];
 
         let items = external_tool_menu_items(&tools, ExternalToolMenuTarget::VirtualPage);
 
         assert_eq!(
             items,
-            vec![ExternalToolMenuItem {
-                tool_id: ExternalToolId(2),
-                label: "editorで開く".to_string(),
-                enabled: false,
-                disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
-            }]
+            vec![
+                ExternalToolMenuItem {
+                    tool_id: ExternalToolId(2),
+                    label: "editorで開く".to_string(),
+                    enabled: false,
+                    disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
+                },
+                ExternalToolMenuItem {
+                    tool_id: ExternalToolId(3),
+                    label: "second-editorで開く".to_string(),
+                    enabled: false,
+                    disabled_reason: Some(VIRTUAL_EDITING_DISABLED_REASON),
+                },
+            ]
         );
         assert!(external_tool_menu_items(&tools, ExternalToolMenuTarget::Unsupported).is_empty());
     }
@@ -2087,12 +2163,16 @@ mod tests {
         let mut tool = ExternalTool::defaults_for_viewing();
         tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
 
-        let single = build_launch_operation(&tool, &targets).unwrap();
+        tool.selection = SelectionPolicy::Single;
+        let single = build_launch_operation(&tool, &targets[..1]).unwrap();
         assert_eq!(single.requests.len(), 1);
         assert_eq!(
             single.requests[0].files,
             [PathBuf::from(r"C:\Images\0.png")]
         );
+        let single_error = build_launch_operation(&tool, &targets).unwrap_err();
+        assert!(single_error.contains("3 件"));
+        assert!(single_error.contains("起動できません"));
 
         tool.selection = SelectionPolicy::Each;
         let each = build_launch_operation(&tool, &targets).unwrap();
@@ -2166,7 +2246,8 @@ mod tests {
 
     #[test]
     fn virtual_targets_reject_the_whole_set_before_single_policy() {
-        let tool = ExternalTool::defaults_for_viewing();
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Single;
         for refusal in [
             crate::grid_item::FileOperationRefusal::VirtualPage,
             crate::grid_item::FileOperationRefusal::ArchiveDirectory,
@@ -2181,31 +2262,171 @@ mod tests {
     }
 
     #[test]
-    fn each_confirmation_starts_after_twenty_and_os_default_batch_shares_the_limit() {
+    fn target_count_decision_applies_single_then_limit_then_confirmation() {
+        assert_eq!(
+            evaluate_target_count(SelectionPolicy::Single, 1, 0, 0).unwrap(),
+            TargetCountDecision::Proceed
+        );
+        assert!(evaluate_target_count(SelectionPolicy::Single, 2, 100, 100).is_err());
+
+        assert_eq!(
+            evaluate_target_count(SelectionPolicy::Each, 5, 5, 10).unwrap(),
+            TargetCountDecision::Proceed
+        );
+        assert_eq!(
+            evaluate_target_count(SelectionPolicy::Each, 6, 5, 10).unwrap(),
+            TargetCountDecision::Confirm { target_count: 6 }
+        );
+        assert!(evaluate_target_count(SelectionPolicy::Each, 11, 5, 10).is_err());
+
+        assert_eq!(
+            evaluate_target_count(SelectionPolicy::Batch, 6, 5, 10).unwrap(),
+            TargetCountDecision::Confirm { target_count: 6 }
+        );
+        assert!(evaluate_target_count(SelectionPolicy::Batch, 11, 5, 10).is_err());
+    }
+
+    #[test]
+    fn single_rejects_two_targets_and_ignores_count_settings_for_one() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Single;
+        tool.confirmation_threshold = 0;
+        tool.max_targets = 0;
+
+        let one = build_launch_operation(&tool, &real_targets(1)).unwrap();
+        assert_eq!(one.target_count_decision, TargetCountDecision::Proceed);
+        assert!(launch_confirmation(one).is_ok());
+
+        let error = build_launch_operation(&tool, &real_targets(2)).unwrap_err();
+        assert!(error.contains("2 件"));
+        assert!(error.contains("起動できません"));
+    }
+
+    #[test]
+    fn each_uses_per_tool_confirmation_and_upper_limit() {
         let mut each = ExternalTool::defaults_for_viewing();
         each.selection = SelectionPolicy::Each;
+        each.confirmation_threshold = 5;
+        each.max_targets = 10;
+
         assert!(
-            launch_confirmation(build_launch_operation(&each, &real_targets(20)).unwrap()).is_ok()
+            launch_confirmation(build_launch_operation(&each, &real_targets(5)).unwrap()).is_ok()
         );
         let confirmation =
-            launch_confirmation(build_launch_operation(&each, &real_targets(21)).unwrap())
+            launch_confirmation(build_launch_operation(&each, &real_targets(6)).unwrap())
                 .unwrap_err();
-        assert_eq!(confirmation.many_launch_count, Some(21));
-
-        let mut batch_default = each;
-        batch_default.selection = SelectionPolicy::Batch;
-        assert!(
-            launch_confirmation(build_launch_operation(&batch_default, &real_targets(21)).unwrap())
-                .is_err()
+        assert_eq!(
+            confirmation.operation.target_count_decision,
+            TargetCountDecision::Confirm { target_count: 6 }
         );
 
-        batch_default.launch = ExternalToolLaunch::Association {
+        let error = build_launch_operation(&each, &real_targets(11)).unwrap_err();
+        assert!(error.contains("対象は 11 件"));
+        assert!(error.contains("上限は 10 件"));
+        assert!(error.contains("起動と連携"));
+    }
+
+    #[test]
+    fn batch_confirmation_counts_targets_for_executable_and_association() {
+        let targets = real_targets(6);
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Batch;
+        tool.confirmation_threshold = 5;
+        tool.max_targets = 10;
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        tool.arguments = "{files}".to_string();
+
+        let executable_confirmation =
+            launch_confirmation(build_launch_operation(&tool, &targets).unwrap()).unwrap_err();
+        assert_eq!(executable_confirmation.operation.requests.len(), 1);
+        assert_eq!(
+            executable_confirmation.operation.target_count_decision,
+            TargetCountDecision::Confirm { target_count: 6 }
+        );
+
+        tool.launch = ExternalToolLaunch::Association {
             handler_id: "Photos.App".to_string(),
         };
-        assert!(
-            launch_confirmation(build_launch_operation(&batch_default, &real_targets(21)).unwrap())
-                .is_ok()
+        let association_confirmation =
+            launch_confirmation(build_launch_operation(&tool, &targets).unwrap()).unwrap_err();
+        assert_eq!(association_confirmation.operation.requests.len(), 1);
+        assert_eq!(
+            association_confirmation.operation.target_count_decision,
+            TargetCountDecision::Confirm { target_count: 6 }
         );
+    }
+
+    #[test]
+    fn os_default_batch_uses_target_count_for_the_upper_limit() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Batch;
+        tool.confirmation_threshold = 5;
+        tool.max_targets = 10;
+        tool.launch = ExternalToolLaunch::OsDefault;
+
+        let error = build_launch_operation(&tool, &real_targets(11)).unwrap_err();
+        assert!(error.contains("対象は 11 件"));
+        assert!(error.contains("上限は 10 件"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_length_matches_rust_regular_argument_quoting() {
+        use std::os::windows::ffi::OsStrExt;
+
+        assert_eq!(windows_regular_argument_utf16_len(OsStr::new("plain")), 5);
+        assert_eq!(
+            windows_regular_argument_utf16_len(OsStr::new("two words")),
+            "two words".encode_utf16().count() + 2
+        );
+        let trailing_backslash = OsStr::new("C:\\two words\\");
+        assert_eq!(
+            windows_regular_argument_utf16_len(trailing_backslash),
+            trailing_backslash.encode_wide().count() + 3
+        );
+        assert_eq!(windows_regular_argument_utf16_len(OsStr::new("a\"b")), 4);
+        assert_eq!(windows_regular_argument_utf16_len(OsStr::new("😀")), 2);
+
+        assert_eq!(
+            windows_create_process_command_line_utf16_len(OsStr::new("x"), &[]),
+            4 // "x" + NUL
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_length_accepts_the_exact_limit_and_rejects_one_more() {
+        // `"x"` + separator + argument + NUL = argument length + 5.
+        let exact = OsString::from("a".repeat(CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS - 5));
+        let over = OsString::from("a".repeat(CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS - 4));
+        assert_eq!(
+            windows_create_process_command_line_utf16_len(OsStr::new("x"), &[exact]),
+            CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS
+        );
+        assert_eq!(
+            windows_create_process_command_line_utf16_len(OsStr::new("x"), &[over]),
+            CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS + 1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_batch_rejects_an_overlong_command_line_but_association_does_not() {
+        let long_path = PathBuf::from("a".repeat(CREATE_PROCESS_COMMAND_LINE_MAX_UTF16_UNITS - 4));
+        let targets = [LaunchTarget::RealFile(long_path)];
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Batch;
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from("x"));
+        tool.arguments = "{files}".to_string();
+
+        let error = build_launch_operation(&tool, &targets).unwrap_err();
+        assert!(error.contains("対象ファイルが多すぎる"));
+        assert!(error.contains("32767"));
+
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "Photos.App".to_string(),
+        };
+        assert!(build_launch_operation(&tool, &targets).is_ok());
     }
 
     #[test]

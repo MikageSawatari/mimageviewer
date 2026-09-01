@@ -343,9 +343,10 @@ CREATE TABLE external_tools (
     video                TEXT NOT NULL,
     spread               TEXT NOT NULL,
     selection            TEXT NOT NULL,
+    confirmation_threshold INTEGER NOT NULL,
+    max_targets          INTEGER NOT NULL,
     pdf_render_long_edge INTEGER NOT NULL,
     for_editing          INTEGER NOT NULL,
-    show_in_context_menu INTEGER NOT NULL,
     keep_temp            INTEGER NOT NULL,
     sort_index           INTEGER NOT NULL
 );
@@ -364,8 +365,10 @@ marker が失われても `external_tools` に行があれば追加移行せず�
 `Association` とし、更新と marker を同じ transaction で commit する。marker が失われても
 非 NULL の行は再分類しないため、後から同名パスが作られても起動種別は変わらない。
 
-`external_tools` は P1c 時点で未出荷だったため、旧 `executable` schema からのデータ移行は行わず
-テーブルを新 schema へ作り直す。released source の `custom_open_with_apps` は残っているため、
+`external_tools` は P2c 時点でも未出荷だったため、旧 `executable` schema や
+`show_in_context_menu` 列を持つ P2b schema からのデータ移行は行わず、テーブルを新 schema へ
+作り直す。P2c schema は `show_in_context_menu` を持たず、`confirmation_threshold = 5` と
+`max_targets = 10` をツールごとに保存する。released source の `custom_open_with_apps` は残っているため、
 既存の一度きり移行を再実行して `Executable` として登録し直す。
 
 ### 4.1 PRAGMA 設定 (open 時)

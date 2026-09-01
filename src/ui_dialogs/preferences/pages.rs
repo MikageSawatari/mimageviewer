@@ -793,6 +793,42 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             );
             ui.end_row();
 
+            match tool.selection {
+                crate::external_tool::SelectionPolicy::Single => {
+                    ui.label("");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "1 件だけ渡します。2 件以上選ばれているときは起動しません。",
+                            )
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                    ui.end_row();
+                }
+                crate::external_tool::SelectionPolicy::Each
+                | crate::external_tool::SelectionPolicy::Batch => {
+                    ui.label("確認なしで起動する上限");
+                    ui.add(
+                        egui::DragValue::new(&mut tool.confirmation_threshold)
+                            .speed(1.0)
+                            .suffix(" 件"),
+                    )
+                    .on_hover_text("対象件数がこの値を超えると、起動前に確認します");
+                    ui.end_row();
+
+                    ui.label("起動する対象件数の上限");
+                    ui.add(
+                        egui::DragValue::new(&mut tool.max_targets)
+                            .speed(1.0)
+                            .suffix(" 件"),
+                    )
+                    .on_hover_text("対象件数がこの値を超えると、起動しません");
+                    ui.end_row();
+                }
+            }
+
             if let Some(note) = external_tool_batch_behavior_note(&tool) {
                 ui.label("");
                 ui.add(
@@ -819,7 +855,6 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut tool.for_editing, "編集に使う");
-        ui.checkbox(&mut tool.show_in_context_menu, "右クリックメニューに表示");
         ui.checkbox(&mut tool.keep_temp, "一時ファイルを残す");
     });
 

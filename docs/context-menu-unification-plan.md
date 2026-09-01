@@ -199,6 +199,11 @@ Phase B 着手時に確認した件数表示の食い違いは、Phase A の共�
 
 ## 5. 棚卸し
 
+> **2026-09-01 追記:** この節は統一前後を検証した 2026-08-30 時点の棚卸し記録として残す。
+> 表と §5.6 に出る `show_in_context_menu` は当時の仕様で、P2c で設定ごと撤去した。
+> 現在は登録済みの全外部ツールを右クリックへ平坦に出す。現行仕様は
+> [external-tool-launch-plan.md](external-tool-launch-plan.md) §4.9 を正とする。
+
 ### 5.1 調査範囲と読み方
 
 ここでいう A は `native_grid_context_menu_items` が作る **mIV 項目だけ**であり、後から

@@ -2786,7 +2786,7 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn native_menu_appends_all_visible_external_tools_after_one_separator() {
+    fn native_menu_appends_all_registered_external_tools_after_one_separator() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.external_tools = (0..12)
             .map(|index| {
@@ -2796,11 +2796,10 @@ mod delete_confirm_tests {
                 tool
             })
             .collect();
-        let mut hidden = crate::external_tool::ExternalTool::defaults_for_viewing();
-        hidden.id = crate::external_tool::ExternalToolId(99);
-        hidden.name = "hidden".to_string();
-        hidden.show_in_context_menu = false;
-        app.settings.external_tools.insert(4, hidden);
+        let mut inserted = crate::external_tool::ExternalTool::defaults_for_viewing();
+        inserted.id = crate::external_tool::ExternalToolId(99);
+        inserted.name = "inserted".to_string();
+        app.settings.external_tools.insert(4, inserted);
 
         let target = NativeGridContextMenuTarget {
             // Shell paths と外部ツール対象集合は別 ownership。P2a は checked 全件を保持する。
@@ -2832,10 +2831,10 @@ mod delete_confirm_tests {
             })
             .collect();
 
-        assert_eq!(external.len(), 12, "表示時に 10 件で打ち切らない");
+        assert_eq!(external.len(), 13, "登録ツールを表示時に打ち切らない");
         assert_eq!(
             external.iter().map(|id| id.0).collect::<Vec<_>>(),
-            (1..=12).collect::<Vec<_>>()
+            vec![1, 2, 3, 4, 99, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         let first_external = items.iter().position(|node| {
             matches!(

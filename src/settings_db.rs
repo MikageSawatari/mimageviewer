@@ -1538,9 +1538,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             video                TEXT NOT NULL,
             spread               TEXT NOT NULL,
             selection            TEXT NOT NULL,
+            confirmation_threshold INTEGER NOT NULL,
+            max_targets          INTEGER NOT NULL,
             pdf_render_long_edge INTEGER NOT NULL,
             for_editing          INTEGER NOT NULL,
-            show_in_context_menu INTEGER NOT NULL,
             keep_temp            INTEGER NOT NULL,
             sort_index           INTEGER NOT NULL
          );
@@ -1574,11 +1575,15 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// P0/P1/P1b の `external_tools` は未出荷なので、旧 `executable` schema はその場で
-/// 作り直す。released source の `custom_open_with_apps` と migration marker は残っている
-/// ため、marker を外して通常の一度きり移行を再実行すれば登録元は失われない。
+/// `external_tools` は未出荷なので、開発中の旧 schema はその場で作り直す。
+/// released source の `custom_open_with_apps` と migration marker は残っているため、
+/// marker を外して通常の一度きり移行を再実行すれば登録元は失われない。
 fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqlite::Result<()> {
-    if table_has_column(conn, "external_tools", "launch_kind")? {
+    let current_schema = table_has_column(conn, "external_tools", "launch_kind")?
+        && table_has_column(conn, "external_tools", "confirmation_threshold")?
+        && table_has_column(conn, "external_tools", "max_targets")?
+        && !table_has_column(conn, "external_tools", "show_in_context_menu")?;
+    if current_schema {
         return Ok(());
     }
     let tx = conn.unchecked_transaction()?;
@@ -1595,9 +1600,10 @@ fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqli
             video                TEXT NOT NULL,
             spread               TEXT NOT NULL,
             selection            TEXT NOT NULL,
+            confirmation_threshold INTEGER NOT NULL,
+            max_targets          INTEGER NOT NULL,
             pdf_render_long_edge INTEGER NOT NULL,
             for_editing          INTEGER NOT NULL,
-            show_in_context_menu INTEGER NOT NULL,
             keep_temp            INTEGER NOT NULL,
             sort_index           INTEGER NOT NULL
          );
@@ -2396,9 +2402,9 @@ fn write_external_tools(
     let mut stmt = tx.prepare(
         "INSERT INTO external_tools (
             id, name, launch_kind, launch_value, arguments, working_directory,
-            payload, video, spread, selection, pdf_render_long_edge,
-            for_editing, show_in_context_menu, keep_temp, sort_index
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            payload, video, spread, selection, confirmation_threshold, max_targets,
+            pdf_render_long_edge, for_editing, keep_temp, sort_index
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )?;
     // パスは既存の recent/custom テーブルと同じく TEXT (UTF-8) で持つ。Windows の
     // ファイルダイアログが返すパスは有効な UTF-16 なので、ここで lossy になるのは
@@ -2421,9 +2427,10 @@ fn write_external_tools(
             video_policy_text(tool.video),
             spread_policy_text(tool.spread),
             selection_policy_text(tool.selection),
+            i64::from(tool.confirmation_threshold),
+            i64::from(tool.max_targets),
             i64::from(tool.pdf_render_long_edge),
             i64::from(tool.for_editing),
-            i64::from(tool.show_in_context_menu),
             i64::from(tool.keep_temp),
             sort_index as i64,
         ])?;
@@ -2442,9 +2449,10 @@ struct ExternalToolRow {
     video: String,
     spread: String,
     selection: String,
+    confirmation_threshold: i64,
+    max_targets: i64,
     pdf_render_long_edge: i64,
     for_editing: i64,
-    show_in_context_menu: i64,
     keep_temp: i64,
 }
 
@@ -2458,8 +2466,8 @@ where
 fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsDbError> {
     let mut stmt = conn.prepare(
         "SELECT id, name, launch_kind, launch_value, arguments, working_directory,
-                payload, video, spread, selection, pdf_render_long_edge,
-                for_editing, show_in_context_menu, keep_temp
+                payload, video, spread, selection, confirmation_threshold, max_targets,
+                pdf_render_long_edge, for_editing, keep_temp
          FROM external_tools
          ORDER BY sort_index ASC",
     )?;
@@ -2475,10 +2483,11 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             video: row.get(7)?,
             spread: row.get(8)?,
             selection: row.get(9)?,
-            pdf_render_long_edge: row.get(10)?,
-            for_editing: row.get(11)?,
-            show_in_context_menu: row.get(12)?,
-            keep_temp: row.get(13)?,
+            confirmation_threshold: row.get(10)?,
+            max_targets: row.get(11)?,
+            pdf_render_long_edge: row.get(12)?,
+            for_editing: row.get(13)?,
+            keep_temp: row.get(14)?,
         })
     })?;
     let mut tools = Vec::new();
@@ -2493,6 +2502,18 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
                 row.pdf_render_long_edge
             ))
         })?;
+        let confirmation_threshold = u32::try_from(row.confirmation_threshold).map_err(|_| {
+            SettingsDbError::Corrupted(format!(
+                "external_tools.confirmation_threshold out of range: {}",
+                row.confirmation_threshold
+            ))
+        })?;
+        let max_targets = u32::try_from(row.max_targets).map_err(|_| {
+            SettingsDbError::Corrupted(format!(
+                "external_tools.max_targets out of range: {}",
+                row.max_targets
+            ))
+        })?;
         tools.push(ExternalTool {
             id: ExternalToolId(id),
             name: row.name,
@@ -2503,9 +2524,10 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             video: parse_external_tool_enum(row.video)?,
             spread: parse_external_tool_enum(row.spread)?,
             selection: parse_external_tool_enum(row.selection)?,
+            confirmation_threshold,
+            max_targets,
             pdf_render_long_edge,
             for_editing: row.for_editing != 0,
-            show_in_context_menu: row.show_in_context_menu != 0,
             keep_temp: row.keep_temp != 0,
         });
     }
@@ -4001,9 +4023,10 @@ mod tests {
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::BothPages,
                 selection: SelectionPolicy::Each,
+                confirmation_threshold: 3,
+                max_targets: 8,
                 pdf_render_long_edge: 2048,
                 for_editing: true,
-                show_in_context_menu: false,
                 keep_temp: true,
             },
             ExternalTool {
@@ -4018,9 +4041,10 @@ mod tests {
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::MainPageOnly,
                 selection: SelectionPolicy::Batch,
+                confirmation_threshold: 17,
+                max_targets: 40,
                 pdf_render_long_edge: 8192,
                 for_editing: false,
-                show_in_context_menu: true,
                 keep_temp: false,
             },
             ExternalTool {
@@ -4033,9 +4057,10 @@ mod tests {
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::BothPages,
                 selection: SelectionPolicy::Each,
+                confirmation_threshold: 0,
+                max_targets: 1,
                 pdf_render_long_edge: 1024,
                 for_editing: false,
-                show_in_context_menu: false,
                 keep_temp: true,
             },
         ]
@@ -4299,7 +4324,7 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_recreates_the_unreleased_external_tools_table() {
+    fn init_schema_recreates_the_unreleased_p2b_external_tools_table() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -4308,7 +4333,8 @@ mod tests {
              CREATE TABLE external_tools (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
-                executable TEXT,
+                launch_kind TEXT NOT NULL,
+                launch_value TEXT,
                 arguments TEXT NOT NULL,
                 working_directory TEXT,
                 payload TEXT NOT NULL,
@@ -4322,7 +4348,7 @@ mod tests {
                 sort_index INTEGER NOT NULL
              );
              INSERT INTO external_tools
-               VALUES (1, 'Unreleased', 'C:\\old.exe', '{file}', NULL,
+               VALUES (1, 'Unreleased', 'Executable', 'C:\\old.exe', '{file}', NULL,
                        'AsDisplayed', 'File', 'Merged', 'Single', 4096, 0, 1, 0, 0);",
         )
         .unwrap();
@@ -4331,6 +4357,9 @@ mod tests {
 
         assert!(table_has_column(&conn, "external_tools", "launch_kind").unwrap());
         assert!(table_has_column(&conn, "external_tools", "launch_value").unwrap());
+        assert!(table_has_column(&conn, "external_tools", "confirmation_threshold").unwrap());
+        assert!(table_has_column(&conn, "external_tools", "max_targets").unwrap());
+        assert!(!table_has_column(&conn, "external_tools", "show_in_context_menu").unwrap());
         assert!(!table_has_column(&conn, "external_tools", "executable").unwrap());
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))
@@ -4552,7 +4581,8 @@ mod tests {
         assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
         assert_eq!(loaded.external_tools[1].name, "Second");
         assert_eq!(loaded.external_tools[1].payload, PayloadPolicy::AsDisplayed);
-        assert!(loaded.external_tools[1].show_in_context_menu);
+        assert_eq!(loaded.external_tools[1].confirmation_threshold, 5);
+        assert_eq!(loaded.external_tools[1].max_targets, 10);
         assert!(!loaded.external_tools[1].for_editing);
         assert!(external_tools_migration_marker_present(&db));
 

@@ -2,7 +2,7 @@
 
 ## 調査条件
 
-- 基礎調査対象は commit `a94b6b1b` のコードで、§4 の外部ツールだけ P2b-1 実装まで追補した。列はブリーフ指定どおり、
+- 基礎調査対象は commit `a94b6b1b` のコードで、§4 の外部ツールだけ P2c 実装まで追補した。列はブリーフ指定どおり、
   `GridItem` の `Image` / `Video` / `Audio`、`Folder`、`ZipFile` / `PdfFile`、
   `ZipImage`、`PdfPage`、`Stack`、`ZipDir` をまとめた
   (`src/grid_item.rs:33-98`)。`ConvertibleArchive` と `SearchContainer` も enum にはあるが、
@@ -118,19 +118,22 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 | ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **拒否 (P3 まで)**。単独では viewing tool を非表示、editing tool を理由付き disabled にする。実ファイルとの混在時は選択全体を起動前に拒否し、部分起動しない。 | **拒否 (P3 まで)**。`ZipImage` と同じ仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | **拒否 (P3 まで)**。仮想対象として選択全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。mIV は実 path を process / association / OS default へ渡すだけで対象 file を変更しない。外部 process が行う変更は mIV 管理外。 |
 | ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P2a では 1 件のままで、`SpreadPolicy` は P4 まで適用しない。ただし spawn 成功前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身でなく子ページが viewer target になるため、親へ fallback しない。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否 (P3 まで)**。グリッドと同じ仮想対象判定。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ `settings.db` の tool 定義を読む。mIV は file を書き換えず、外部 process の動作は管理外。 |
 
-`SelectionPolicy::Single` は上記対象集合の先頭 1 件、`Each` は 1 件ずつ、`Batch` は全件を 1 回で渡す。
+`SelectionPolicy::Single` は対象が 1 件のときだけ渡し、2 件以上なら全体を拒否する。既定の `Each` は
+1 件ずつ、`Batch` は全件を 1 回で渡す。
 `Executable::Batch` の `{files}` は path ごとに独立した引数へ展開し、`Association::Batch` は全 path を
-1 つの `IDataObject` に載せる。`OsDefault::Batch` は `Each` と同じで、21 件以上の個別起動は
-確認ダイアログを挟む。複数試行の結果は 1 利用者操作として成功 / 失敗件数を集約して通知する。
+1 つの `IDataObject` に載せる。`OsDefault::Batch` は `Each` と同じ。`Each` / `Batch` はどの起動型でも
+対象件数 N にツール別の確認件数 (既定 5) と上限 (既定 10) を適用し、前者を超えたら確認、後者を
+超えたら起動を拒否する。`Executable::Batch` は Windows のコマンドライン長上限も起動前に検査する。
+複数試行の結果は 1 利用者操作として成功 / 失敗件数を集約して通知する。
 
 P2b-1 の `ExternalToolPicker` / `ExternalTool1` .. `ExternalTool10` /
 `ExternalToolForContainer` は main-window の Grid 専用で、既定キーは設定しない。前二者はページ対象、
 最後は現在の `effective_folder()` からフォルダー / 本 1 件を解決する。変換アーカイブでは変換 cache ZIP
 でなく元アーカイブを渡し、検索・タグ・履歴・snapshot 等の集約ビュー背景では単一の現在地を決めず
-拒否する。右クリックは従来どおり `show_in_context_menu` のツールを平坦に並べ、フォルダー背景と
+拒否する。右クリックは登録済みの全ツールを平坦に並べ、フォルダー背景と
 コンテナー項目だけ対象をコンテナー 1 件へ切り替える。これらの入口を追加しても、ページ対象に含まれる
-仮想ページの P3 までの全体拒否は変わらない。ツールバー / メニューバー / `OsDefault + Batch` の
-設定 UI 説明は P2b-2 であり未実装。
+仮想ページの P3 までの全体拒否は変わらない。P2b-2 で一度追加したツールバー / メニューバーの
+直接起動は P2c で撤去し、導線は右クリックと固定キースロットに絞った。
 
 ## 5. スマートフォルダと検索
 
