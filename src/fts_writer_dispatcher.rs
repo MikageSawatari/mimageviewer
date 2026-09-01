@@ -83,6 +83,18 @@ enum WriterJob {
 struct Queue {
     interactive: VecDeque<WriterJob>,
     background: VecDeque<WriterJob>,
+    /// Drop が立てる停止要求。**キューと同じ Mutex の内側に置く。**
+    ///
+    /// 以前は `Arc<AtomicBool>` を Mutex の外で立てていたため、dispatcher が
+    /// 「述語を確認したが、まだ `wait` に入っていない」瞬間に Drop が `notify_all`
+    /// すると起床通知が誰にも届かず、dispatcher は永久に眠り、Drop の `join` も
+    /// 返らなかった (2026-09-01、リリースの test gate が
+    /// `ingest_worker::tests::cancel_mid_ingest_flushes_partial_and_returns_cancelled`
+    /// でハング。cdb で両スレッドのスタックを採取して確定)。
+    ///
+    /// 述語を守っている Mutex の内側へ置けば、この窓は構造的に消える。job の投入
+    /// (`submit`) が最初からこの形だったのと同じ規則になる。
+    stop_requested: bool,
 }
 
 /// ログ prefix (検索しやすさのため固定文字列を一箇所に)。
@@ -92,7 +104,6 @@ const LOG_PREFIX: &str = "[fts-dispatcher]";
 /// 利用者は `upsert` / `delete` / `commit` / `batch` ヘルパ経由で同期的に処理を依頼する。
 pub struct FtsWriterDispatcher {
     queue: Arc<(Mutex<Queue>, Condvar)>,
-    shutdown: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -101,16 +112,13 @@ impl FtsWriterDispatcher {
     /// `fts` は commit 後の reader reload で使う (dispatcher スレッド内に move される)。
     pub fn start(writer: IndexWriter, fts: Arc<FtsIndex>) -> Arc<Self> {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
         let q_clone = Arc::clone(&queue);
-        let sd_clone = Arc::clone(&shutdown);
         let thread = std::thread::Builder::new()
             .name("fts-writer-dispatcher".into())
-            .spawn(move || run_dispatcher(q_clone, writer, fts, sd_clone))
+            .spawn(move || run_dispatcher(q_clone, writer, fts))
             .expect("fts-writer-dispatcher spawn");
         Arc::new(Self {
             queue,
-            shutdown,
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -257,8 +265,14 @@ impl FtsWriterDispatcher {
 
 impl Drop for FtsWriterDispatcher {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let (_, cv) = &*self.queue;
+        let (mtx, cv) = &*self.queue;
+        {
+            // 停止要求は必ず Mutex の内側で立てる。外で立てると、dispatcher が
+            // 述語を見てから `wait` へ入るまでの間に notify が飛び、失われる。
+            // poison は無視する (どこかで panic しても停止要求は届かせる)。
+            let mut q = mtx.lock().unwrap_or_else(|e| e.into_inner());
+            q.stop_requested = true;
+        }
         cv.notify_all();
         if let Some(t) = self.thread.lock().ok().and_then(|mut g| g.take()) {
             let _ = t.join();
@@ -272,7 +286,6 @@ fn run_dispatcher(
     queue: Arc<(Mutex<Queue>, Condvar)>,
     mut writer: IndexWriter,
     fts: Arc<FtsIndex>,
-    shutdown: Arc<AtomicBool>,
 ) {
     crate::logger::log(format!("{LOG_PREFIX} started"));
     loop {
@@ -280,10 +293,7 @@ fn run_dispatcher(
             let (mtx, cv) = &*queue;
             let mut q = mtx.lock().unwrap();
             loop {
-                if shutdown.load(Ordering::Relaxed)
-                    && q.interactive.is_empty()
-                    && q.background.is_empty()
-                {
+                if q.stop_requested && q.interactive.is_empty() && q.background.is_empty() {
                     crate::logger::log(format!("{LOG_PREFIX} shutdown clean"));
                     return;
                 }
@@ -396,6 +406,42 @@ mod tests {
         (tmp, fts, disp)
     }
 
+    /// Drop は「停止要求 → 起床 → join」で必ず戻る。
+    ///
+    /// 以前は停止要求を Mutex の外で立てていたため、dispatcher が述語を見てから
+    /// `wait` へ入るまでの窓で notify が失われ、Drop の join が永久に返らなかった
+    /// (2026-09-01、リリースの test gate がハング)。
+    ///
+    /// その窓を狙って踏む: 1 件処理させ、**完了通知を受け取った直後**に drop する。
+    /// その瞬間 dispatcher は返信を送り終えてループ先頭へ戻る途中、つまり
+    /// 「lock → 述語確認 → wait」のまさに手前にいる。
+    ///
+    /// **ハングではなく失敗させる**ため、drop を別スレッドで回して時間で打ち切る。
+    /// 打ち切ったスレッドは join しない (ハングしている以上返らない)。
+    #[test]
+    fn dropping_the_dispatcher_always_returns() {
+        const ROUNDS: usize = 300;
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let (_tmp, _fts, disp) = setup();
+                let (mark_tx, mark_rx) = mpsc::channel();
+                disp.submit_test_mark("warm", mark_tx, WriterPriority::Interactive);
+                assert_eq!(mark_rx.recv().unwrap(), "warm");
+                drop(disp);
+                if done_tx.send(round).is_err() {
+                    return;
+                }
+            }
+        });
+
+        for round in 0..ROUNDS {
+            match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(seen) => assert_eq!(seen, round),
+                Err(_) => panic!("{round} 回目の drop が 30 秒返らなかった"),
+            }
+        }
+    }
     fn sample_doc(path: &str, fav: Uuid, text: &str) -> IndexDoc {
         let key = normalize_path(&PathBuf::from(path));
         IndexDoc {
