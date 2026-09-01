@@ -5951,18 +5951,18 @@ impl NativeRenderCore {
         seek_strip: Option<NativeOverlaySeekStrip>,
         material_availability: crate::video::seek_strip::SeekStripMaterialAvailability,
     ) -> Result<bool, String> {
-        let was_visible = self
+        let was_reserved = self
             .egui_overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.seek_strip.is_some());
+            .is_some_and(|overlay| overlay.seek_strip_reserves_space());
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_seek_strip(seek_strip, material_availability);
         }
-        let is_visible = self
+        let is_reserved = self
             .egui_overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.seek_strip.is_some());
-        let layout_changed = was_visible != is_visible && self.video_bottom_lock.strip_locked();
+            .is_some_and(|overlay| overlay.seek_strip_reserves_space());
+        let layout_changed = was_reserved != is_reserved && self.video_bottom_lock.strip_locked();
         if layout_changed {
             self.update_video_visual_transform(self.width, self.height)?;
         }
@@ -6306,7 +6306,7 @@ impl NativeRenderCore {
             seek_strip_visible: self
                 .egui_overlay
                 .as_ref()
-                .is_some_and(|overlay| overlay.seek_strip.is_some()),
+                .is_some_and(|overlay| overlay.seek_strip_reserves_space()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
         }
     }
@@ -8141,6 +8141,19 @@ impl NativeEguiOverlay {
         self.seek_strip = seek_strip;
         self.seek_strip_material_availability = material_availability;
         self.dirty = true;
+    }
+
+    /// ストリップが場所を占めるか。**描くか**とは別の問い。
+    ///
+    /// 固定表示 (ピン) を選んでいる間は、素材がまだ用意できていない段階でも場所を
+    /// 確保する。ここを「いまスナップショットがあるか」だけで決めると、動画を
+    /// 切り替えるたびに確保が外れて映像が 104pt 分広がり、素材が届いた瞬間に縮む
+    /// (backlog §1.162)。素材が無いと判明した (`Unavailable`) 時点で確保をやめる。
+    fn seek_strip_reserves_space(&self) -> bool {
+        seek_strip_reserves_space(
+            self.seek_strip.is_some(),
+            self.seek_strip_material_availability,
+        )
     }
 
     fn clear_seek_preview(&mut self) {
@@ -12203,6 +12216,22 @@ impl From<bool> for VideoVisualLayout {
     }
 }
 
+/// ストリップが場所を占めるか。**描くか**とは別の問い。
+///
+/// 固定表示 (ピン) を選んでいる間は、素材がまだ用意できていない段階でも場所を確保する。
+/// 「いまスナップショットがあるか」だけで決めると、動画を切り替えるたびに確保が外れて
+/// 映像が 104pt 分広がり、素材が届いた瞬間に縮む (backlog §1.162)。
+pub(super) fn seek_strip_reserves_space(
+    has_strip: bool,
+    availability: crate::video::seek_strip::SeekStripMaterialAvailability,
+) -> bool {
+    has_strip
+        || matches!(
+            availability,
+            crate::video::seek_strip::SeekStripMaterialAvailability::Unknown
+        )
+}
+
 pub(super) fn compute_video_visual_target_rect(
     win_w: u32,
     win_h: u32,
@@ -12485,7 +12514,7 @@ mod tests {
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, panorama_takes_the_wheel, pointer_region_owns_wheel,
-        sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        sample_cpu_rgba_pixel, seek_strip_reserves_space, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
@@ -14622,6 +14651,73 @@ mod tests {
         // SAR=0.5 → display_w=480, display_h=540, ratio M11/M22 = 0.5
         let ratio = m11 / m22;
         assert!((ratio - 0.5).abs() < 1e-4);
+    }
+
+    /// 動画を切り替えると、新しい動画のストリップ素材が用意できるまでスナップショットは
+    /// 無い。確保をスナップショットの有無で決めると、そのあいだだけ映像が広がって
+    /// 素材が届いた瞬間に縮む。ピンしている間は確保を保つ。
+    #[test]
+    fn a_pinned_strip_keeps_its_space_while_the_next_video_is_still_preparing() {
+        use crate::video::seek_strip::{SeekStripMaterialAvailability, StripAxisUnavailableReason};
+
+        let rect = |has_strip, availability| {
+            compute_video_visual_target_rect(
+                1920,
+                1080,
+                VideoVisualLayout {
+                    compact: false,
+                    pixels_per_point: 1.0,
+                    top_bar_locked: true,
+                    bottom_lock: VideoBottomLock::BarAndStrip,
+                    seek_strip_visible: seek_strip_reserves_space(has_strip, availability),
+                    fixed_bar_gap_px: 0,
+                },
+            )
+        };
+
+        let showing = rect(true, SeekStripMaterialAvailability::Available);
+        let switching = rect(false, SeekStripMaterialAvailability::Unknown);
+        assert_eq!(
+            switching, showing,
+            "切替中に確保が外れると、映像が広がってから縮む"
+        );
+
+        // 素材が無いと判明したら確保をやめる。空きを抱えたままにしない。
+        let unavailable = rect(
+            false,
+            SeekStripMaterialAvailability::Unavailable(
+                StripAxisUnavailableReason::KeyframesTooSparse,
+            ),
+        );
+        assert_eq!(unavailable.height, showing.height + SEEK_STRIP_HEIGHT);
+    }
+
+    /// 確保は「場所を占めるか」であって「描くか」ではない。素材が判明していない
+    /// あいだも占め、判明して無ければ空ける。
+    #[test]
+    fn the_strip_reserve_follows_the_pin_until_the_material_is_known() {
+        use crate::video::seek_strip::{SeekStripMaterialAvailability, StripAxisUnavailableReason};
+
+        assert!(seek_strip_reserves_space(
+            true,
+            SeekStripMaterialAvailability::Available
+        ));
+        assert!(seek_strip_reserves_space(
+            false,
+            SeekStripMaterialAvailability::Unknown
+        ));
+        assert!(seek_strip_reserves_space(
+            true,
+            SeekStripMaterialAvailability::Unavailable(
+                StripAxisUnavailableReason::KeyframesTooSparse
+            )
+        ));
+        assert!(!seek_strip_reserves_space(
+            false,
+            SeekStripMaterialAvailability::Unavailable(
+                StripAxisUnavailableReason::KeyframesTooSparse
+            )
+        ));
     }
 
     #[test]
