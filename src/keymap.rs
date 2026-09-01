@@ -5673,7 +5673,7 @@ impl KeyAction {
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
-            SnsSplitExecute => ChordList::one(Chord::ctrl(E)),
+            SnsSplitExecute => ChordList::EMPTY,
             TextConfirm => ChordList::one(Chord::ctrl(T)),
             TextRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             TextUndo => ChordList::one(Chord::ctrl(Z)),
@@ -10386,10 +10386,7 @@ mod tests {
 
         assert_eq!(KeyAction::SnsSplitExecute.context(), KeyContext::SnsSplit);
         assert_eq!(KeyAction::SnsSplitExecute.trigger(), KeyTrigger::Press);
-        assert_eq!(
-            KeyAction::SnsSplitExecute.default_chords().iter().next(),
-            Some(Chord::ctrl(KeyName::E))
-        );
+        assert!(KeyAction::SnsSplitExecute.default_chords().is_empty());
         assert_eq!(KeyContext::parse("SnsSplit"), Some(KeyContext::SnsSplit));
     }
 

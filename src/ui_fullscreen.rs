@@ -4883,6 +4883,13 @@ pub(crate) const CONTINUOUS_READING_EDIT_TOOLS_DISABLED_REASON: &str =
     "ページ単位表示でのみ使用できます";
 
 const SNS_SPLIT_ACTIVE_SCOPES: &[CommandScope] = &[KeyContext::Global, KeyContext::SnsSplit];
+// メイン viewport で受けた入力を SNS handler へ渡すための probe。SNS モード中も
+// 通常の FsExport だけは guard の案内へ流すので、FsImage scope をここだけ含める。
+const SNS_SPLIT_ROOT_INPUT_PROBE_SCOPES: &[CommandScope] = &[
+    KeyContext::Global,
+    KeyContext::SnsSplit,
+    KeyContext::FsImage,
+];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsContinuousReadingUnavailableFeature {
@@ -15720,7 +15727,13 @@ impl App {
                                 .and_then(|_| {
                                     navigator_texture_sources.texture_for_page(fs_idx, None)
                                 });
-                            self.draw_sns_split_panel(ctx, full_rect, image_size, preview_texture);
+                            self.draw_sns_split_panel(
+                                ctx,
+                                fs_idx,
+                                full_rect,
+                                image_size,
+                                preview_texture,
+                            );
                         } else if self.export_crop_mode
                             && !compare_wipe_active
                             && !panorama_mode_active_now
@@ -18842,7 +18855,7 @@ impl App {
         }
         // 音声 (映像なし動画) は動画スコープの Video* アクションを共有するので動画スコープで probe。
         let active_scopes = if self.sns_split.is_some() {
-            SNS_SPLIT_ACTIVE_SCOPES
+            SNS_SPLIT_ROOT_INPUT_PROBE_SCOPES
         } else if matches!(
             self.items.get(fs_idx),
             Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
@@ -34607,7 +34620,12 @@ impl App {
             || self.adjustment_mode.is_open()
             || self.analysis_mode
         {
-            self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
+            let message = if !sns_split_export && self.sns_split.is_some() {
+                crate::ui_sns_split::SNS_SPLIT_EXPORT_BUTTON_GUIDANCE
+            } else {
+                "編集モードを閉じてからエクスポートしてください"
+            };
+            self.show_feedback_toast(message.to_string());
             return false;
         }
         let target = match if sns_split_export {
@@ -36862,6 +36880,27 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn sns_split_root_input_probe_forwards_normal_export_chord() {
+        let keymap = Keymap::empty();
+
+        assert!(keymap_fullscreen_probe_matches(
+            &keymap,
+            SNS_SPLIT_ROOT_INPUT_PROBE_SCOPES,
+            egui::Key::E,
+            egui::Modifiers::CTRL,
+        ));
+        assert!(
+            !keymap_fullscreen_probe_matches(
+                &keymap,
+                SNS_SPLIT_ACTIVE_SCOPES,
+                egui::Key::E,
+                egui::Modifiers::CTRL,
+            ),
+            "SNS 専用 scope だけでは通常の FsExport を root viewport から転送できない"
+        );
+    }
 
     #[test]
     fn sns_split_frames_scale_from_source_coordinates_to_export_pixels() {

@@ -1459,6 +1459,30 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-01 SNS 分割 P6 で、通常 `FsExport` を root viewport から既存の
+export guard へ配送する (ClaudeCode の P6 ブリーフが通常 `Ctrl+E` の ownership を
+`FsExport` に残す不変条件を指定し、Codex が §2 に照らして配送境界を確認):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`SNS_SPLIT_ROOT_INPUT_PROBE_SCOPES` と root input probe の回帰テスト、および
+[src/ui_sns_split.rs](../src/ui_sns_split.rs) の SNS mode handler。
+detached / switching predicate、viewport ID / 登録 / recreate、runtime / host ownership、
+placement / focus / window lifecycle は変更しない。
+
+**不変条件と所有境界**: `SnsSplitExecute` は利用者割り当てを保ち、SNS handler が最初に
+消費する。専用 action が消費しなかったキーだけを通常の `FsExport` として同じ handler が
+`open_export_dialog_for_current` へ渡す。main/root に届いた effective `FsExport` chord でも
+同じ owner を起動できるよう、root の入力有無 probe に `FsImage` scope を含める。
+固定の `E` キー特例は足さず、`FsExport` の利用者割り当て変更にも追従する。実 handler は
+`SnsSplitExecute` / `FsExport` だけを消費し、他の `FsImage` action は SNS mode 中に実行しない。
+
+**なぜ症状パッチではないか**: P6 の要求は SNS 専用 `Ctrl+E` を残すことではなく、
+通常 `FsExport` の既存 guard を唯一の owner として再利用することにある。root と fullscreen の
+どちらへ key event が届いても effective keymap → 同じ handler → 同じ guard という既存の
+配送構造へ揃え、新規 state、detached 分岐、固定キー判定、時間窓、retry、repaint、fallback を
+追加しない。通常 `Ctrl+E` が `FsImage` scope を含むときだけ root probe を通ることを純ロジック
+テストで固定するため、症状別の viewport workaround ではなく入力 ownership 境界の整合である。
+
 **2026-09-01 SNS 分割 P2 の transient editor lifecycle を既存の foreground cleanup owner
 へ追加する (ClaudeCode の P2 ブリーフが同型の構造的追加を指定し、Codex が §2 に照らして
 ownership 境界を確認):**

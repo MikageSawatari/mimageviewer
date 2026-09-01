@@ -11,6 +11,8 @@ const PREVIEW_H: f32 = 84.0;
 
 pub(crate) const SNS_SPLIT_ROTATION_DISABLED_REASON: &str =
     "回転しているページでは使えません。回転をリセットしてから実行してください";
+pub(crate) const SNS_SPLIT_EXPORT_BUTTON_GUIDANCE: &str =
+    "SNS 分割の書き出しはパネルの「分割して書き出す」から実行してください";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnsSplitEntryError {
@@ -415,6 +417,11 @@ impl App {
         }
         if self.keymap.consume_action(ctx, KeyAction::SnsSplitExecute) {
             self.execute_sns_split_export(ctx, fs_idx);
+        } else if self.keymap.consume_action(ctx, KeyAction::FsExport) {
+            // Ctrl+E は通常のエクスポート操作のままにし、open_export_dialog の
+            // 編集モード guard からパネルボタンを案内する。利用者が専用操作へ
+            // 同じキーを割り当てた場合は、上の SnsSplitExecute を優先する。
+            self.open_export_dialog_for_current(ctx, fs_idx);
         }
         action
     }
@@ -453,6 +460,7 @@ impl App {
     pub(crate) fn draw_sns_split_panel(
         &mut self,
         ctx: &egui::Context,
+        fs_idx: usize,
         full_rect: egui::Rect,
         image_size: Option<[usize; 2]>,
         preview_texture: Option<&egui::TextureHandle>,
@@ -464,6 +472,7 @@ impl App {
         let panel_pos = panel_rect.min;
         let panel_height = panel_rect.height();
         let mut close = false;
+        let mut export_requested = false;
 
         egui::Area::new(egui::Id::new("sns_split_panel"))
             .order(egui::Order::Foreground)
@@ -546,9 +555,19 @@ impl App {
                                             if let Some(layout) = self.sns_split {
                                                 draw_sns_split_preview(ui, layout, [1, 1], None);
                                             }
+                                            ui.add_space(8.0);
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new("分割して書き出す").min_size(
+                                                    egui::vec2(ui.available_width(), 34.0),
+                                                ),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "ページの寸法をまだ取得できていません",
+                                            );
                                             return;
                                         };
-                                        self.draw_sns_split_controls(
+                                        export_requested = self.draw_sns_split_controls(
                                             ui,
                                             image_size,
                                             preview_texture,
@@ -561,6 +580,8 @@ impl App {
 
         if close {
             self.reset_sns_split_mode();
+        } else if export_requested {
+            self.execute_sns_split_export(ctx, fs_idx);
         }
     }
 
@@ -569,9 +590,9 @@ impl App {
         ui: &mut egui::Ui,
         image_size: [usize; 2],
         preview_texture: Option<&egui::TextureHandle>,
-    ) {
+    ) -> bool {
         let Some(mut layout) = self.sns_split else {
-            return;
+            return false;
         };
 
         ui.label("投稿先");
@@ -619,6 +640,18 @@ impl App {
             ui.add_space(4.0);
             ui.colored_label(egui::Color32::from_rgb(255, 180, 90), warning);
         }
+
+        ui.add_space(8.0);
+        let response = ui.add_enabled(
+            summary.warning.is_none(),
+            egui::Button::new("分割して書き出す").min_size(egui::vec2(ui.available_width(), 34.0)),
+        );
+        let response = if let Some(reason) = summary.warning {
+            response.on_disabled_hover_text(reason)
+        } else {
+            response
+        };
+        response.clicked()
     }
 
     pub(crate) fn draw_sns_split_overlay(
@@ -910,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_shortcut_keeps_mode_and_skips_dialog_when_frames_do_not_fit() {
+    fn default_ctrl_e_uses_normal_export_guard_and_guides_to_panel_button() {
         let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
@@ -941,12 +974,30 @@ mod tests {
         app.keyboard_owner_for_pass(&ctx);
         let _ = app.handle_sns_split_keys(&ctx, 0);
         assert!(
-            !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
-            "SNS 分割の Ctrl+E は handler が消費する"
+            !app.keymap.consume_action(&ctx, KeyAction::FsExport),
+            "通常の Ctrl+E は SNS handler が export guard へ渡す"
         );
         let _ = ctx.end_pass();
 
         assert_eq!(app.sns_split, Some(layout));
+        assert!(app.export_dialog.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(SNS_SPLIT_EXPORT_BUTTON_GUIDANCE)
+        );
+    }
+
+    #[test]
+    fn non_sns_export_guard_keeps_the_existing_edit_mode_message() {
+        let mut app = crate::app::setup_app_for_test();
+        app.export_crop_mode = true;
+
+        app.open_export_dialog_for_current(&egui::Context::default(), 0);
+
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("編集モードを閉じてからエクスポートしてください")
+        );
         assert!(app.export_dialog.is_none());
     }
 
@@ -991,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_shortcut_opens_numbered_single_page_export_from_spread() {
+    fn custom_execute_shortcut_opens_numbered_single_page_export_from_spread() {
         let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
@@ -1036,6 +1087,7 @@ mod tests {
         app.settings.sns_split_count = 3;
         let original_selection = [false, true, false, true, false];
         app.settings.export_batch_selection = original_selection;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[SnsSplit]\nSnsSplitExecute = F13\n");
 
         assert!(app.enter_sns_split_mode(0).is_ok());
         let expected_frames = app.sns_split.expect("SNS 分割が開始していない").frames();
@@ -1043,11 +1095,11 @@ mod tests {
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
         assert!(app.sns_split_spread_ctx.is_some());
 
-        let modifiers = egui::Modifiers::CTRL;
+        let modifiers = egui::Modifiers::NONE;
         ctx.begin_pass(egui::RawInput {
             modifiers,
             events: vec![egui::Event::Key {
-                key: egui::Key::E,
+                key: egui::Key::F13,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
@@ -1059,7 +1111,7 @@ mod tests {
         let _ = app.handle_sns_split_keys(&ctx, 0);
         assert!(
             !app.keymap.consume_action(&ctx, KeyAction::SnsSplitExecute),
-            "SNS 分割の Ctrl+E は handler が消費する"
+            "利用者が割り当てた SNS 分割実行キーは handler が消費する"
         );
         let _ = ctx.end_pass();
 
