@@ -1656,7 +1656,7 @@ impl ToolbarSectionDisplay {
     pub fn all() -> &'static [Self] {
         &[Self::Buttons, Self::Dropdown]
     }
-    /// お気に入り / タグ用 (展開 / 折りたたみ / プルダウンの 3 択)。
+    /// お気に入り / 外部ツール / タグ用 (展開 / 折りたたみ / プルダウンの 3 択)。
     pub fn all_with_collapsible() -> &'static [Self] {
         &[Self::Buttons, Self::Collapsible, Self::Dropdown]
     }
@@ -1693,6 +1693,7 @@ pub enum ToolbarSectionId {
     Favorites,
     SmartFolders,
     Tags,
+    ExternalTools,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1714,6 +1715,7 @@ impl ToolbarSectionId {
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
+            Self::ExternalTools,
         ]
     }
 
@@ -3872,6 +3874,9 @@ pub struct Settings {
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
+    /// ツールバーに「外部ツール」セクションを表示する。既定は OFF。
+    #[serde(default)]
+    pub show_toolbar_external_tools: bool,
     /// スマートフォルダセクションのユーザー表示設定。定義 0 件時は実効非表示。
     #[serde(default = "default_true")]
     pub show_toolbar_smart_folders: bool,
@@ -4305,9 +4310,11 @@ pub struct Settings {
     /// ツールバー「ソート」セクションの表示形式 (展開 / プルダウン)。
     #[serde(default)]
     pub toolbar_sort_display: ToolbarSectionDisplay,
-    /// お気に入り / タグ / 本棚セクションの表示形式 (展開 / 折りたたみ / プルダウン)。v2.0.0。
+    /// 動的項目セクションの表示形式 (展開 / 折りたたみ / プルダウン)。
     #[serde(default)]
     pub toolbar_favorites_display: ToolbarSectionDisplay,
+    #[serde(default)]
+    pub toolbar_external_tools_display: ToolbarSectionDisplay,
     #[serde(default)]
     pub toolbar_smart_folders_display: ToolbarSectionDisplay,
     #[serde(default)]
@@ -4317,6 +4324,8 @@ pub struct Settings {
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_external_tools_collapsed: bool,
     #[serde(default)]
     pub toolbar_smart_folders_collapsed: bool,
     #[serde(default)]
@@ -5976,6 +5985,7 @@ impl Default for Settings {
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
             show_toolbar_favorites: true,
+            show_toolbar_external_tools: false,
             show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
             folder_tree_pane_visible: false,
@@ -6023,10 +6033,12 @@ impl Default for Settings {
             toolbar_aspect_display: ToolbarSectionDisplay::Dropdown,
             toolbar_sort_display: ToolbarSectionDisplay::Dropdown,
             toolbar_favorites_display: ToolbarSectionDisplay::default(),
+            toolbar_external_tools_display: ToolbarSectionDisplay::default(),
             toolbar_smart_folders_display: ToolbarSectionDisplay::default(),
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
             toolbar_favorites_collapsed: false,
+            toolbar_external_tools_collapsed: false,
             toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
@@ -7978,6 +7990,7 @@ impl Settings {
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
+        self.show_toolbar_external_tools = src.show_toolbar_external_tools;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
         self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
@@ -7988,10 +8001,12 @@ impl Settings {
         self.toolbar_aspect_display = src.toolbar_aspect_display;
         self.toolbar_sort_display = src.toolbar_sort_display;
         self.toolbar_favorites_display = src.toolbar_favorites_display;
+        self.toolbar_external_tools_display = src.toolbar_external_tools_display;
         self.toolbar_smart_folders_display = src.toolbar_smart_folders_display;
         self.toolbar_tags_display = src.toolbar_tags_display;
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
+        self.toolbar_external_tools_collapsed = src.toolbar_external_tools_collapsed;
         self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
@@ -8837,6 +8852,26 @@ mod tests {
                 && s.show_location_drive_roots,
             "場所メニュー項目は旧 settings 欠落時に全表示"
         );
+    }
+
+    #[test]
+    fn external_tools_toolbar_settings_are_backward_compatible_and_default_off() {
+        let fresh = Settings::default();
+        assert!(!fresh.show_toolbar_external_tools);
+        assert_eq!(
+            fresh.toolbar_external_tools_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert!(!fresh.toolbar_external_tools_collapsed);
+
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.show_toolbar_external_tools);
+        assert_eq!(
+            loaded.toolbar_external_tools_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert!(!loaded.toolbar_external_tools_collapsed);
+        assert!(ToolbarSectionId::default_order().contains(&ToolbarSectionId::ExternalTools));
     }
 
     #[test]
@@ -10583,6 +10618,28 @@ mod tests {
     }
 
     #[test]
+    fn preferences_ok_keeps_live_external_tools_toolbar_customization() {
+        let mut edited = Settings::default();
+        edited.show_toolbar_external_tools = true;
+        edited.toolbar_external_tools_display = ToolbarSectionDisplay::Dropdown;
+        edited.toolbar_external_tools_collapsed = true;
+
+        let mut live = Settings::default();
+        live.show_toolbar_external_tools = false;
+        live.toolbar_external_tools_display = ToolbarSectionDisplay::Collapsible;
+        live.toolbar_external_tools_collapsed = false;
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert!(!edited.show_toolbar_external_tools);
+        assert_eq!(
+            edited.toolbar_external_tools_display,
+            ToolbarSectionDisplay::Collapsible
+        );
+        assert!(!edited.toolbar_external_tools_collapsed);
+    }
+
+    #[test]
     fn legacy_json_open_with_shapes_deserialize_with_context_specific_rules() {
         let dir = tempfile::TempDir::new().unwrap();
         let existing = dir.path().join("editor.exe");
@@ -10748,6 +10805,7 @@ mod tests {
         assert!(!s.auto_fullscreen_zip_pdf);
         assert!(!s.auto_fullscreen_image_folders);
         assert!(s.show_toolbar_favorites);
+        assert!(!s.show_toolbar_external_tools);
         assert!(s.show_toolbar_tags);
         assert!(!s.folder_tree_pane_visible);
         assert_eq!(
@@ -13611,11 +13669,14 @@ mod tests {
             s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_favorites_display = ToolbarSectionDisplay::Collapsible;
+            s.toolbar_external_tools_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_tags_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_bookshelf_display = ToolbarSectionDisplay::Collapsible;
             s.toolbar_favorites_collapsed = true;
+            s.toolbar_external_tools_collapsed = true;
             s.toolbar_tags_collapsed = true;
             s.toolbar_bookshelf_collapsed = true;
+            s.show_toolbar_external_tools = true;
             s.toolbar_facet_filter_items =
                 vec![ToolbarFacetFilterItem::Kind, ToolbarFacetFilterItem::Ext];
             s.pinned_books = vec!["テスト本".to_string()];
@@ -13857,6 +13918,15 @@ mod tests {
                 "toolbar_favorites_display should survive roundtrip"
             );
             assert_eq!(
+                loaded.toolbar_external_tools_display,
+                ToolbarSectionDisplay::Dropdown,
+                "toolbar_external_tools_display should survive roundtrip"
+            );
+            assert!(
+                loaded.show_toolbar_external_tools,
+                "show_toolbar_external_tools should survive roundtrip"
+            );
+            assert_eq!(
                 loaded.toolbar_tags_display,
                 ToolbarSectionDisplay::Dropdown,
                 "toolbar_tags_display should survive roundtrip"
@@ -13868,6 +13938,7 @@ mod tests {
             );
             assert!(
                 loaded.toolbar_favorites_collapsed
+                    && loaded.toolbar_external_tools_collapsed
                     && loaded.toolbar_tags_collapsed
                     && loaded.toolbar_bookshelf_collapsed,
                 "toolbar *_collapsed flags should survive roundtrip"

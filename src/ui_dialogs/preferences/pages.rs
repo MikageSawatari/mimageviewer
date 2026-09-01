@@ -494,6 +494,16 @@ pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+fn external_tool_batch_behavior_note(
+    tool: &crate::external_tool::ExternalTool,
+) -> Option<&'static str> {
+    (matches!(
+        &tool.launch,
+        crate::external_tool::ExternalToolLaunch::OsDefault
+    ) && tool.selection == crate::external_tool::SelectionPolicy::Batch)
+        .then_some("OS の関連付けでは「まとめて渡す」を選んでも、対象ごとに 1 件ずつ起動します。")
+}
+
 pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesState) {
     state.ensure_external_tool_editor_loaded();
 
@@ -782,6 +792,15 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ],
             );
             ui.end_row();
+
+            if let Some(note) = external_tool_batch_behavior_note(&tool) {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(egui::RichText::new(note).color(ui.visuals().warn_fg_color))
+                        .wrap(),
+                );
+                ui.end_row();
+            }
 
             ui.label("PDF レンダリング長辺");
             enum_combo(
@@ -8723,9 +8742,10 @@ mod tests {
         OperationAssignmentTarget, PreferencesState, apply_command_editor,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
         compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
-        external_tool_key_slot_label, keyboard_picker_cell_width, keyboard_picker_label_width,
-        keyboard_picker_main_rows, modifier_hold_editor_choice, natural_operation_label_cmp,
-        open_operation_assignment_editor, ring_bindings_for_key_action,
+        external_tool_batch_behavior_note, external_tool_key_slot_label,
+        keyboard_picker_cell_width, keyboard_picker_label_width, keyboard_picker_main_rows,
+        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
+        ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, KeyName, ModKind};
@@ -8737,6 +8757,24 @@ mod tests {
         assert_eq!(external_tool_key_slot_label(9), "10");
         assert_eq!(external_tool_key_slot_label(10), "なし（対象外）");
         assert_eq!(external_tool_key_slot_label(usize::MAX), "なし（対象外）");
+    }
+
+    #[test]
+    fn external_tool_batch_note_is_only_for_os_default_batch() {
+        use crate::external_tool::{ExternalTool, ExternalToolLaunch, SelectionPolicy};
+
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Batch;
+        assert!(external_tool_batch_behavior_note(&tool).is_some());
+
+        tool.selection = SelectionPolicy::Each;
+        assert_eq!(external_tool_batch_behavior_note(&tool), None);
+
+        tool.selection = SelectionPolicy::Batch;
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "handler".to_string(),
+        };
+        assert_eq!(external_tool_batch_behavior_note(&tool), None);
     }
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。

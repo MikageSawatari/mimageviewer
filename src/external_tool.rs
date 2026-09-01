@@ -1270,12 +1270,27 @@ impl crate::app::App {
     }
 
     pub(crate) fn launch_grid_external_tool_slot(&mut self, slot: usize) {
-        let tool = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
-            Ok(tool) => tool.clone(),
+        let tool_id = match resolve_external_tool_slot(&self.settings.external_tools, slot) {
+            Ok(tool) => tool.id,
             Err(error) => {
                 self.show_feedback_toast(error);
                 return;
             }
+        };
+        self.launch_grid_external_tool_by_id(tool_id);
+    }
+
+    /// メニュー / ツールバー / 固定キースロットから、同じ Grid 対象解決で直接起動する。
+    pub(crate) fn launch_grid_external_tool_by_id(&mut self, tool_id: ExternalToolId) {
+        let Some(tool) = self
+            .settings
+            .external_tools
+            .iter()
+            .find(|tool| tool.id == tool_id)
+            .cloned()
+        else {
+            self.show_feedback_toast("外部ツールが見つかりません".to_string());
+            return;
         };
         let targets = self.external_tool_grid_key_targets();
         self.queue_external_tool_launch_targets(&tool, &targets);
