@@ -33346,6 +33346,47 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// **「表示中のページの昇格だけ生かす」規則の綴りは 1 つだけ。**
+    ///
+    /// この規則は 8 か所に散っており、2 度に分けて直そうとして 2 度とも取りこぼした
+    /// (§1.157)。`current_idx` / `fullscreen_idx` と直接比べている書き方が新しく生えたら、
+    /// また同じことが起きる。**共有述語を経由していない綴りをここで禁止する。**
+    #[test]
+    fn promotion_only_asks_one_predicate_whether_a_page_is_displayed() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for relative in ["src/app.rs", "src/ui_fullscreen.rs"] {
+            let source = std::fs::read_to_string(manifest_dir.join(relative))
+                .expect("read Rust source as UTF-8");
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("promotion_started_at_for") {
+                    continue;
+                }
+                // 判定は前後 3 行に収まる範囲で書かれている。
+                let from = index.saturating_sub(3);
+                let to = (index + 4).min(lines.len());
+                let window = lines[from..to].join(" ");
+                let compares_directly = window.contains("!= current_idx")
+                    || window.contains("== current_idx")
+                    || window.contains("!= Some(key)")
+                    || window.contains("== Some(key)");
+                if compares_directly && !window.contains("page_is_displayed") {
+                    offenders.push(format!("{relative}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "昇格の可視判定を共有述語 (`page_is_displayed`) を通さずに綴っている箇所:
+{}",
+            offenders.join(
+                "
+"
+            )
+        );
+    }
+
     #[test]
     fn fullscreen_load_spawns_current_with_full_frames_and_prefetch_with_first_frame_only() {
         let mut app = setup_app();

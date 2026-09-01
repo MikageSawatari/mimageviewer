@@ -27229,12 +27229,16 @@ impl App {
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
+        // 連結読みも見開き構成なら相方が一緒に出ている。**昇格を止めるのは画面から
+        // 外れたページだけ** (§1.157: この判定が 8 か所に散っていた)。
+        let displayed_partner = self.displayed_spread_partner(current_idx);
         let stale_promotions = self
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
-                    .then_some(idx)
+                (!Self::page_is_displayed(idx, current_idx, displayed_partner)
+                    && pending.purpose.promotion_started_at_for(idx).is_some())
+                .then_some(idx)
             })
             .collect::<Vec<_>>();
         for idx in stale_promotions {
@@ -27246,7 +27250,8 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         self.fs_upload_backlog.retain(|entry| {
-            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+            entry.purpose.promotion_started_at_for(entry.idx).is_none()
+                || Self::page_is_displayed(entry.idx, current_idx, displayed_partner)
         });
         let current_loading = keep_set.contains(&current_idx)
             && self.fs_page_load_state(current_idx).waiting_for_display();

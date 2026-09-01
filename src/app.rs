@@ -57189,7 +57189,7 @@ impl App {
     }
 
     /// `current` と一緒に画面へ出ている相方。単ページなら `None`。
-    fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
+    pub(crate) fn displayed_spread_partner(&mut self, current: usize) -> Option<usize> {
         match self.resolve_spread_pair(current) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => {
                 Some(if left == current { right } else { left })
@@ -57205,11 +57205,11 @@ impl App {
     /// stale 昇格のキャンセル / pending の一括キャンセル)。相方はどこかで必ず「表示中でない」
     /// 側に落ちるので、毎フレーム開始しては即キャンセルされ、永久に昇格しなかった (§1.157)。
     /// **判定はこの 1 つだけを使う。**
-    fn page_is_displayed(idx: usize, current: usize, partner: Option<usize>) -> bool {
+    pub(crate) fn page_is_displayed(idx: usize, current: usize, partner: Option<usize>) -> bool {
         idx == current || Some(idx) == partner
     }
 
-    fn page_is_displayed_now(&mut self, idx: usize) -> bool {
+    pub(crate) fn page_is_displayed_now(&mut self, idx: usize) -> bool {
         let Some(current) = self.fullscreen_idx else {
             return false;
         };
@@ -64196,7 +64196,13 @@ impl App {
             self.fs_pending.remove(&key);
             self.fs_early_dims.remove(&key);
             if purpose.promotion_started_at_for(key).is_some() {
-                self.mark_animation_promotion_failed(key);
+                // **こちらが止めたものを「失敗」にしない。** `PromotionFailed` は再試行を
+                // しない終端状態なので、画面から外れて cancel した昇格をここへ落とすと、
+                // 戻ってきても二度と動かない (§1.157: 見開きの相方が止まったままになる)。
+                // 表示中のまま送信側が消えたときだけ、本当の失敗として扱う。
+                if self.page_is_displayed_now(key) {
+                    self.mark_animation_promotion_failed(key);
+                }
             }
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
@@ -64301,7 +64307,9 @@ impl App {
                 continue;
             }
             if purpose.promotion_started_at_for(key).is_some() {
-                if self.fullscreen_idx != Some(key) {
+                // 見開きでは相方も表示中。ここで捨てると、昇格が完了しても
+                // 第 1 フレームのままになる (§1.157)。
+                if !self.page_is_displayed_now(key) {
                     continue;
                 }
                 if !matches!(result, FsLoadResult::Animated(_)) {
