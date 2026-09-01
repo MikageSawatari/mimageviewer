@@ -175,6 +175,11 @@ mod tests {
 
     #[test]
     fn book_resume_set_get_remove() {
+        // data_dir の test override を自分で張る。張らないと、たまたま生きている他
+        // テストのガードへ相乗りして同じ DB を共有する。同型の相乗りは rotation_db で
+        // 実際に CannotOpen を起こした (2026-09-01、リリースの test gate)。こちらは
+        // open() が親ディレクトリを作り直すぶん落ちにくいだけで、分離できていない点は同じ。
+        let _guard = crate::data_dir::TestDataDirGuard::new();
         let db = BookResumeDb::open().unwrap();
         let p = Path::new("C:/manga/book.zip");
 
