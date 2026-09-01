@@ -926,6 +926,18 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         ui.add_space(6.0);
         ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
         ui.label("{file}  {files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、\
+                     {page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。\
+                     対象が持っていない値は、そのトークンごと引数から取り除きます。",
+                )
+                .weak(),
+            )
+            .wrap(),
+        );
     }
 
     ui.add_space(6.0);
