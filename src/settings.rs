@@ -4063,6 +4063,20 @@ pub struct Settings {
     /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
+    /// グリッド選択の一括エクスポートの保存先。単ページの `export_last_directory` とは
+    /// 別に持つ (一括は「送信用」など決まったフォルダへ繰り返し出す使い方が主で、
+    /// 単ページの直前保存先で上書きされると毎回選び直しになる)。
+    #[serde(default)]
+    pub export_batch_directory: Option<PathBuf>,
+    /// 一括エクスポートのファイル名テンプレート (`<filename>` / `<dirname>` / `<num>`)。
+    #[serde(default = "default_export_batch_template")]
+    pub export_batch_template: String,
+    /// 一括エクスポートの出力形式。
+    #[serde(default)]
+    pub export_batch_format: crate::capture::CaptureFormat,
+    /// 一括エクスポートの出力サイズ。
+    #[serde(default)]
+    pub export_batch_scale: crate::export_dialog::ExportScale,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -5692,6 +5706,11 @@ pub fn default_rating_filter() -> [bool; 6] {
 
 /// `Ctrl+E` ダイアログのバリエーションチェック初期値。
 /// `[現在の設定, プリセット 1, 2, 3, 4]` → 現在の設定だけ ON。
+/// 既定のテンプレート。単ページ `Ctrl+E` の既定ファイル名 (`<元の名前>_edited`) に揃える。
+pub fn default_export_batch_template() -> String {
+    "<filename>_edited".to_string()
+}
+
 pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
@@ -6116,6 +6135,10 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            export_batch_directory: None,
+            export_batch_template: default_export_batch_template(),
+            export_batch_format: crate::capture::CaptureFormat::default(),
+            export_batch_scale: crate::export_dialog::ExportScale::default(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
         }
