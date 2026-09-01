@@ -9759,7 +9759,20 @@ pub struct App {
     pub(crate) pending_grid_scroll: Option<GridScrollIntent>,
 
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
+    ///
+    /// **これは「元に戻すときの矩形」であって「いまどこに居るか」ではない。**
+    /// 現在位置を聞きたい側は [`Self::last_window_rect`] を読むこと。
     pub(crate) last_outer_rect: Option<egui::Rect>,
+    /// 直近フレームに OS が報告したウィンドウ矩形。**最大化・最小化中も更新する。**
+    ///
+    /// 「いまどのモニターに居るか」を聞く側のための値。`last_outer_rect` は復元先
+    /// なので最大化中は更新されず、最大化で起動して一度も元のサイズへ戻していない
+    /// 間はずっと `None` になる。それを現在位置として読んでいたため、F11 の全画面が
+    /// モニター全体ではなく既定値の (0,0) 1280x720 で出ていた
+    /// (2026-09-02 利用者報告。v3.3.0 で復元先ゲートを入れて以降)。
+    ///
+    /// 1 つの値で両方の問いに答えないこと。用途が違えばフィールドを分ける。
+    pub(crate) last_window_rect: Option<egui::Rect>,
     /// ウィンドウ状態保存用：最後に確認した inner_size（クライアント領域）。
     /// 現在の UI 表示倍率込み viewport points なので、settings.window_size へ書くときは
     /// OS DPI only の論理 geometry に戻す。inner を優先することで、outer を inner として
@@ -13584,6 +13597,7 @@ impl App {
             scroll_to_selected: false,
             pending_grid_scroll: None,
             last_outer_rect: None,
+            last_window_rect: None,
             last_inner_size: None,
             last_window_maximized: false,
             last_window_title: None,
@@ -36584,7 +36598,13 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
     }
 
-    /// ウィンドウ位置を記録する（最小化・最大化中は更新しない）。
+    /// ウィンドウの矩形を記録する。**2 つの値を別々に持つ。**
+    ///
+    /// - [`Self::last_window_rect`] = いま居る場所。最大化・最小化中も更新する
+    /// - [`Self::last_outer_rect`] = 元に戻すときの場所。最大化・最小化中は更新しない
+    ///
+    /// 畳み込むと、最大化で起動して一度も戻していない間ずっと「いま居る場所」が
+    /// 分からなくなる (2026-09-02: F11 の全画面が既定値サイズで左上に出た)。
     fn track_window_rect(&mut self, ctx: &egui::Context) {
         let (outer_rect, inner_rect, pixels_per_point, minimized, reported_maximized) =
             ctx.input(|i| {
@@ -36613,6 +36633,12 @@ impl App {
 
         let best_rect = outer_rect.or(inner_rect);
         self.last_pixels_per_point = pixels_per_point;
+
+        // 現在位置は状態に関係なく記録する。下の `rect_is_restorable` ゲートは
+        // 「戻る先」を守るためのもので、「いまどのモニターに居るか」には掛けない。
+        if let Some(rect) = best_rect {
+            self.last_window_rect = Some(rect);
+        }
 
         // One resolved answer for both consumers. `maximized: None` means the platform
         // has not reported yet, which is not the same as "not maximized" — reading it
@@ -42624,8 +42650,10 @@ impl App {
     fn default_detached_viewer_window_placement(
         &self,
     ) -> crate::settings::DetachedViewerWindowPlacement {
+        // 現在位置の隣に出したいので `last_window_rect` を読む。`last_outer_rect` だと
+        // 最大化中はいつも (80,80) になる。
         let (x, y) = self
-            .last_outer_rect
+            .last_window_rect
             .map(|rect| (rect.min.x + 48.0, rect.min.y + 48.0))
             .unwrap_or((80.0, 80.0));
         crate::settings::DetachedViewerWindowPlacement {

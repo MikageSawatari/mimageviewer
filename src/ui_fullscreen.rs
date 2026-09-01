@@ -1469,6 +1469,45 @@ fn window_geometry_size_to_viewport(size: egui::Vec2, ui_scale: f32) -> egui::Ve
     )
 }
 
+/// 全画面 viewport の位置とサイズを決める。
+///
+/// `window_rect` は**いまウィンドウが居る矩形**で、最大化中も値が入っている
+/// (`App::last_window_rect`)。復元先の `last_outer_rect` を渡すと、最大化で起動して
+/// 一度も戻していない間 `None` になり、最後の分岐へ落ちて画面の左上へ小さく出る
+/// (2026-09-02 利用者報告)。
+///
+/// `monitor_at` はモニター矩形の解決 (物理ピクセル座標 → 論理矩形)。テストから
+/// 差し替えられるように引数で受ける。
+fn fullscreen_viewport_geometry(
+    window_rect: Option<egui::Rect>,
+    pixels_per_point: f32,
+    ui_scale: f32,
+    monitor_at: impl Fn(f32, f32) -> Option<egui::Rect>,
+) -> (egui::Pos2, egui::Vec2) {
+    let monitor_rect = window_rect
+        .map(|r| r.center())
+        .and_then(|c| monitor_at(c.x * pixels_per_point, c.y * pixels_per_point))
+        // 現在位置が分からないときでも全画面にはする。原点はどのモニターにも
+        // 属さないことがあるが、解決は MONITOR_DEFAULTTONEAREST なので必ず
+        // どこかのモニターが返る。固定の 1280x720 は画面の一部しか覆わない。
+        .or_else(|| monitor_at(0.0, 0.0));
+
+    if let Some(rect) = monitor_rect {
+        return (
+            window_geometry_pos_to_viewport(rect.min, ui_scale),
+            window_geometry_size_to_viewport(rect.size(), ui_scale),
+        );
+    }
+    if let Some(rect) = window_rect {
+        // `window_rect` は現在の viewport points で報告されているので変換しない。
+        return (rect.min, rect.size());
+    }
+    (
+        window_geometry_pos_to_viewport(egui::pos2(0.0, 0.0), ui_scale),
+        window_geometry_size_to_viewport(egui::vec2(1280.0, 720.0), ui_scale),
+    )
+}
+
 #[cfg(windows)]
 fn viewport_rect_to_window_geometry(rect: egui::Rect, ui_scale: f32) -> egui::Rect {
     egui::Rect::from_min_max(
@@ -18447,7 +18486,8 @@ impl App {
 
     #[cfg(windows)]
     fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
-        let center = self.last_outer_rect.map(|r| r.center())?;
+        // 背景の黒幕も「いま居るモニター」を覆うものなので現在位置を読む。
+        let center = self.last_window_rect.map(|r| r.center())?;
         let effective_ppp = self.last_pixels_per_point;
         let native_ppp = crate::settings::native_pixels_per_point_from_effective(
             effective_ppp,
@@ -18477,32 +18517,12 @@ impl App {
         transparent: bool,
         taskbar: bool,
     ) -> egui::ViewportBuilder {
-        let center = self.last_outer_rect.map(|r| r.center());
-        let ppp = self.last_pixels_per_point;
-
-        let monitor_rect =
-            center.and_then(|c| crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp));
-
-        let (position, inner_size) = if let Some(rect) = monitor_rect {
-            (
-                window_geometry_pos_to_viewport(rect.min, self.settings.ui_scale_factor),
-                window_geometry_size_to_viewport(rect.size(), self.settings.ui_scale_factor),
-            )
-        } else if let Some(rect) = self.last_outer_rect {
-            // `last_outer_rect` is already reported in current viewport points.
-            (rect.min, rect.size())
-        } else {
-            (
-                window_geometry_pos_to_viewport(
-                    egui::pos2(0.0, 0.0),
-                    self.settings.ui_scale_factor,
-                ),
-                window_geometry_size_to_viewport(
-                    egui::vec2(1280.0, 720.0),
-                    self.settings.ui_scale_factor,
-                ),
-            )
-        };
+        let (position, inner_size) = fullscreen_viewport_geometry(
+            self.last_window_rect,
+            self.last_pixels_per_point,
+            self.settings.ui_scale_factor,
+            crate::monitor::get_monitor_logical_rect_at,
+        );
 
         egui::ViewportBuilder::default()
             .with_decorations(false)
@@ -36896,6 +36916,78 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全画面まわりで「いま居る場所」を聞く側が、復元先の矩形を読んでいないこと。
+    ///
+    /// **挙動で確かめられない**ので綴りを見る。`fullscreen_viewport_geometry` には
+    /// 「現在位置が無ければ原点のモニターへ落ちる」保険が入っているため、単一モニター
+    /// 環境では復元先を渡しても同じ答えになってしまい、差が出るのは「最大化した窓が
+    /// 副モニターに居る」ときだけ。それを実機構成に依存せず組めない (§1.136 と同じ罠)。
+    #[test]
+    fn the_places_that_ask_where_the_window_is_do_not_read_the_restore_rect() {
+        let source = include_str!("ui_fullscreen.rs");
+        for (needle, what) in [
+            (
+                "fn build_fullscreen_viewport_builder_with_transparency_and_taskbar",
+                "全画面 viewport のビルダー",
+            ),
+            ("fn fullscreen_backdrop_physical_rect", "全画面の背景矩形"),
+        ] {
+            let at = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} が見つからない"));
+            // 文字境界で切るため、バイト数ではなく文字数で窓を取る。
+            let window: String = source[at..].chars().take(400).collect();
+            assert!(
+                !window.contains("self.last_outer_rect"),
+                "{what} は復元先ではなく self.last_window_rect を読むこと (last_outer_rect は最大化中に更新されない)"
+            );
+        }
+    }
+    /// 全画面 viewport はモニター全体を覆う。
+    ///
+    /// 「いま居る矩形」が分からないときに固定の 1280x720 を返していたため、最大化で
+    /// 起動して一度も戻していない環境で、F11 の全画面が画面左上に小さく出た
+    /// (2026-09-02 利用者報告)。現在位置が無くてもモニターへ落とす。
+    #[test]
+    fn the_fullscreen_viewport_covers_a_monitor_even_without_a_known_window_rect() {
+        let primary = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, 1440.0));
+        let secondary =
+            egui::Rect::from_min_size(egui::pos2(2560.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let monitors = |x: f32, _y: f32| -> Option<egui::Rect> {
+            if x >= 2560.0 {
+                Some(secondary)
+            } else {
+                Some(primary)
+            }
+        };
+
+        // 利用者が踏んだ形: 現在位置が不明。既定サイズではなくモニターを覆う。
+        let (pos, size) = fullscreen_viewport_geometry(None, 1.5, 1.0, monitors);
+        assert_eq!(pos, primary.min);
+        assert_eq!(size, primary.size());
+
+        // 現在位置が分かっていれば、その中心のモニターを覆う。
+        let on_secondary =
+            egui::Rect::from_min_size(egui::pos2(1800.0, 100.0), egui::vec2(600.0, 400.0));
+        let (pos, size) = fullscreen_viewport_geometry(Some(on_secondary), 1.5, 1.0, monitors);
+        assert_eq!(
+            pos, secondary.min,
+            "中心 (2100,300) x ppp 1.5 は 2 台目に入る"
+        );
+        assert_eq!(size, secondary.size());
+
+        // モニターが 1 つも解決できない環境では、いま居る矩形をそのまま使う。
+        let none = |_x: f32, _y: f32| -> Option<egui::Rect> { None };
+        let (pos, size) = fullscreen_viewport_geometry(Some(on_secondary), 1.5, 1.0, none);
+        assert_eq!(pos, on_secondary.min);
+        assert_eq!(size, on_secondary.size());
+
+        // どちらも無いときだけ、最後の既定値へ落ちる。
+        let (pos, size) = fullscreen_viewport_geometry(None, 1.5, 1.0, none);
+        assert_eq!(pos, egui::Pos2::ZERO);
+        assert_eq!(size, egui::vec2(1280.0, 720.0));
+    }
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
