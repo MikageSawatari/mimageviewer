@@ -48833,6 +48833,83 @@ mod still_window_mode_key_tests {
         }
     }
 
+    /// 凍結した連結読みが、**表示トリムを保つ** (backlog §1.154 と同じ契約変更)。
+    ///
+    /// この経路は transform を `content_bbox: None` で組み、clip をページ矩形そのものに
+    /// していたので、切り離しウィンドウが非アクティブになった瞬間にトリムが解けて全体が
+    /// 見えていた。`content_bbox` を transform へ渡す形にすると `paint_rect` が可視帯に
+    /// なり、clip もそこから出る。**分割 (`PageSlice`) も同じ経路を通る**ので、ここが
+    /// 落ちると分割も解ける。
+    #[test]
+    fn the_frozen_continuous_snapshot_keeps_the_view_trim() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.detached_viewer_window_id = Some(76);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.spread_separate = false;
+        app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
+            left: 0.10,
+            top: 0.15,
+            right: 0.10,
+            bottom: 0.05,
+        };
+        // **窓より内側に収まる縦長ページ**にする。窓幅いっぱいのページだと、clip が狭いのは
+        // viewport との交差のせいなのかトリムのせいなのか区別できない (最初これで空振りした)。
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
+        let first = push_image(&mut app, r"C:\pics\cont-trim-a.png");
+        let second = push_image(&mut app, r"C:\pics\cont-trim-b.png");
+        for (idx, label) in [(first, "cont_trim_a"), (second, "cont_trim_b")] {
+            let pixels = egui::ColorImage::new([300, 900], vec![egui::Color32::WHITE; 300 * 900]);
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([300, 900]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(first);
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .expect("continuous detached viewer should build a snapshot");
+
+        assert!(!snapshot.frozen_continuous_pages.is_empty());
+        for page in &snapshot.frozen_continuous_pages {
+            // 左右 10% ずつ、上 15% / 下 5% 落とすので、見える幅はフル矩形の 8 割、
+            // 高さは同じく 8 割になる (量子化ぶんの余裕)。「狭い」だけを見ると、viewport
+            // との交差で狭くなった場合と区別できない。
+            let ratio = page.clip_rect_norm.width() / page.paint_rect_norm.width();
+            let vertical_ratio = page.clip_rect_norm.height() / page.paint_rect_norm.height();
+            assert!(
+                (ratio - 0.8).abs() < 0.01 && (vertical_ratio - 0.8).abs() < 0.01,
+                "トリムが落ちている: clip {:?} / paint {:?} (比 {ratio} / {vertical_ratio})",
+                page.clip_rect_norm,
+                page.paint_rect_norm
+            );
+            assert!(page.clip_rect_norm.left() >= page.paint_rect_norm.left() - 0.001);
+            assert!(page.clip_rect_norm.right() <= page.paint_rect_norm.right() + 0.001);
+        }
+    }
+
     #[test]
     fn paused_spread_detached_window_keeps_both_visible_pages() {
         let mut app = setup_app();
@@ -49058,6 +49135,80 @@ mod still_window_mode_key_tests {
                 && right_page.clip_rect_norm.width() < right_page.paint_rect_norm.width(),
             "trimmed spread pages must preserve full paint rects but clip hidden side margins"
         );
+    }
+
+    /// 凍結した見開きの**見える継ぎ目**が、設定した間隔ちょうどになる (backlog §1.154)。
+    ///
+    /// live 経路は v3.4.0 で直ったが、凍結 snapshot だけは残っていた。あちらは transform を
+    /// `content_bbox: None` で組み、可視範囲を**寄せる前**のレイアウト矩形から作った clip で
+    /// 表していたので、見える端を clip が・絵の位置を寄せた transform が決めていた。
+    /// 端数倍率と正の間隔を通し、`clip_rect_norm` の内側の距離で測る — 利用者に見えるのは
+    /// そこだからである。既存の
+    /// `detached_spread_snapshot_preserves_trim_uv_and_background` は gap=0 で重なりの
+    /// 有無しか見ておらず、この距離を固定していない。
+    #[test]
+    fn the_frozen_spread_seam_is_the_configured_width_at_fractional_scales() {
+        for gap in [0_u32, 1, 3] {
+            for (window_w, window_h) in [(960.0_f32, 720.0_f32), (953.0, 719.0)] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                let placement = crate::settings::DetachedViewerWindowPlacement {
+                    x: 80.0,
+                    y: 80.0,
+                    w: window_w,
+                    h: window_h,
+                    maximized: false,
+                };
+                app.settings.detached_viewer_open_images_in_window = true;
+                app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+                app.settings.spread_page_gap_px = gap;
+                app.settings.detached_viewer_window_placement = Some(placement);
+                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.detached_viewer_independent_active = true;
+                app.detached_viewer_window_id = Some(74);
+                app.spread_mode = crate::settings::SpreadMode::Ltr;
+                let left = push_image(&mut app, r"C:\pics\seam-left.png");
+                let right = push_image(&mut app, r"C:\pics\seam-right.png");
+                // 端数の出る寸法。左右で 1px 違えて、片側だけ丸めが倒れる並びにする。
+                for (idx, label, dims) in [
+                    (left, "seam_left", [617_usize, 881_usize]),
+                    (right, "seam_right", [613, 883]),
+                ] {
+                    let pixels = egui::ColorImage::new(
+                        [dims[0], dims[1]],
+                        vec![egui::Color32::WHITE; dims[0] * dims[1]],
+                    );
+                    let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+                    app.fs_cache.insert(
+                        idx,
+                        FsCacheEntry::Static {
+                            tex,
+                            pixels: std::sync::Arc::new(pixels),
+                            source_dims: Some(dims),
+                            load_seq: 0,
+                            animation: crate::fs_animation::StaticAnimationState::Still,
+                        },
+                    );
+                }
+                app.fullscreen_idx = Some(left);
+
+                let snapshot = app
+                    .build_active_detached_image_window_snapshot(Some(&ctx))
+                    .expect("spread detached viewer should build a snapshot");
+
+                assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
+                let pixels_per_point = ctx.pixels_per_point();
+                // 正規化を実寸へ戻して測る。凍結ページはウィンドウ比で持ち出される。
+                let to_px = |value: f32| value * window_w * pixels_per_point;
+                let seam = to_px(snapshot.frozen_continuous_pages[1].clip_rect_norm.left())
+                    - to_px(snapshot.frozen_continuous_pages[0].clip_rect_norm.right());
+                let want = (gap as f32 * pixels_per_point).round();
+                assert!(
+                    (seam - want).abs() < 0.01,
+                    "gap={gap} window={window_w}x{window_h}: 継ぎ目 {seam}px (設定 {want}px)"
+                );
+            }
+        }
     }
 
     #[test]

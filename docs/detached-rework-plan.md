@@ -1459,6 +1459,48 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-01 §1.154 で、凍結 snapshot の clip / UV 導出を配置と同じ所有者へ寄せる
+(ClaudeCode が案を起票し、Codex が §2 に照らして「症状パッチではなく構造的修正」と同意。
+Codex の補正 5 点を反映):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`detached_spread_frozen_pages_for_snapshot` と
+`detached_continuous_frozen_pages_for_snapshot`、および不要になった
+`spread_page_horizontal_visible_clip` とその単体テストの削除。
+[src/app/tests.rs](../src/app/tests.rs) に凍結見開きの継ぎ目幅と凍結連結のトリム保持を固定する
+回帰テストを追加。detached / switching predicate、viewport ID / 登録 / recreate、
+runtime / host ownership、placement / focus / window lifecycle は変更しない。
+
+**不変条件と所有境界**: 凍結ページの「見える端」「絵の位置」「出力テクセル数」を 1 つの
+`DisplayedImageTransform` から出す。トリム / 分割は `content_bbox` として transform へ渡し、
+`paint_rect` が量子化済みの可視帯になる。`paint_rect_norm` は領域リサンプル出力の貼り付けが
+`full_image_rect` 基準であるためフル矩形のまま、`clip_rect_norm` は
+`paint_rect ∩ viewport_rect` (viewport との交差だけが別責務の最終 scissor)、`uv_rect` は
+従来どおり全体。左右の間隔は live と同じ `align_spread_pages_for_gap` で合わせ、
+`translated_by` が貼り先と可視帯を一緒に動かす。解決は live と同じ
+`resolve_fs_spread_page_transform` を通し、レイアウト寸法とテクスチャの縦横比が違う経路
+(PDF / passthrough) をここだけ別式で解かない。
+
+**なぜ症状パッチではないか**: 以前は可視範囲を**寄せる前**のレイアウト矩形から作った clip で
+表しており、見える端を clip が・絵の位置を寄せた transform が決める二重所有だった。§1.154 が
+求めているのはこの契約変更そのもので、guard / delay / retry / 追加 repaint / 一括 reset /
+silent fallback は追加していない。むしろ transform を組めなかったときにレイアウト矩形と自前の
+倍率へ落ちていた fallback を**外し**、他の早期 return と同じく凍結見開きを作らず単ページ
+snapshot へ渡す形にして、transform 以外の geometry 所有者を無くした。
+
+**既存テストの扱い**: `detached_spread_snapshot_preserves_trim_uv_and_background` は
+書き換えていない (フル矩形は寄せた全体矩形のままで clip だけが量子化済み可視帯になるため、
+4 条件はそのまま成立する)。削除したのは
+`spread_page_horizontal_visible_clip_keeps_vertical_page_pixels` で、これは「凍結の clip は
+横だけ切る」という旧契約を固定していた。live と同じくトリムは両軸に効くのが正しいので、
+helper ごと撤去した (死んだ契約のテストを残すと次の読み手を誤誘導する)。ClaudeCode の判断、
+Codex も「削除・置換するなら明示合意が必要」として同じ選択肢を挙げている。
+
+**残る限界 (Codex 指摘、この変更では解かない)**: 凍結 DTO は正規化矩形を描画時の
+`full_rect` へ比例復元するので、凍結後にウィンドウサイズや DPI が変わると物理 px の間隔も
+比例して伸縮する。凍結背景はフル矩形へ描かれ live は `paint_rect` へ描くため、市松模様の
+位相がトリム時に一致しない (単色背景には影響しない)。どちらも R2 以降の DTO 設計で扱う。
+
 **2026-09-01 SNS 分割 P6 で、通常 `FsExport` を root viewport から既存の
 export guard へ配送する (ClaudeCode の P6 ブリーフが通常 `Ctrl+E` の ownership を
 `FsExport` に残す不変条件を指定し、Codex が §2 に照らして配送境界を確認):**

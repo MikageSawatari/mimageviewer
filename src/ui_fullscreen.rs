@@ -10777,14 +10777,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn spread_page_horizontal_visible_clip(rect: egui::Rect, bbox: egui::Rect) -> egui::Rect {
-        egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + bbox.min.x * rect.width(), rect.min.y),
-            egui::pos2(rect.min.x + bbox.max.x * rect.width(), rect.max.y),
-        )
-    }
-
-    #[cfg(windows)]
     fn detached_frozen_debug_rect(rect: egui::Rect) -> String {
         format!(
             "({:.2},{:.2})-({:.2},{:.2})/{:.2}x{:.2}",
@@ -10905,48 +10897,63 @@ impl App {
         };
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let pixels_per_point = ctx.pixels_per_point();
-
-        pages
-            .into_iter()
-            .enumerate()
-            .filter_map(|page| {
-                let (page_ord, page) = page;
+        // **貼るテクスチャを先に確定する。** 間隔合わせと焼き込みが別のテクスチャで解くと、
+        // 出した移動量が描いた矩形に合わない (live 側で同じ罠を踏んでいる)。
+        let page_textures = pages
+            .iter()
+            .map(|page| {
                 let source_texture = if self.analysis_mode {
                     self.resolve_original_preview_tex(page.idx)
                 } else {
                     self.vertical_reading_cached_processed_texture(page.idx)
                         .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                 }?;
-                let resource = self.fullscreen_paint_resource_for_texture(page.idx, source_texture);
-                let transform = DisplayedImageTransform::from_resolved_rect(
-                    DisplayedImageTransformInput {
-                        pixel_fit: RectPixelFit::Texels,
-                        page_idx: page.idx,
-                        viewport_rect: full_rect,
-                        source_size: resource.size_vec2(),
-                        texture_size: resource.size_vec2(),
-                        rotation: self.get_rotation(page.idx),
-                        free_rotation_rad: 0.0,
-                        content_bbox: None,
-                        fit_mode: FullscreenFitMode::Page,
-                        fit_scale_limits: FullscreenFitScaleLimits::default(),
-                        pixels_per_point,
-                        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                    },
+                Some(self.fullscreen_paint_resource_for_texture(page.idx, source_texture))
+            })
+            .collect::<Vec<_>>();
+        // 見開き unit の左右は live と同じ helper で合わせる (§1.154)。
+        let gap_offsets =
+            self.continuous_spread_gap_offsets(&pages, &page_textures, image_rect, ctx);
+
+        pages
+            .iter()
+            .enumerate()
+            .filter_map(|(page_ord, page)| {
+                let resource = page_textures.get(page_ord)?.clone()?;
+                let rotation = self.get_rotation(page.idx);
+                let source_size = self
+                    .source_dims_for_idx(page.idx)
+                    .map(|(w, h)| egui::vec2(w, h));
+                // 解決は live と同じ入口。トリム / 分割は `content_bbox` として transform へ
+                // 渡す — 以前は落としていたので、凍結すると分割やトリムが解けて見えた。
+                let transform = self.resolve_fs_spread_page_transform(
+                    &resource,
+                    image_rect,
                     page.rect,
+                    page.idx,
+                    source_size,
+                    FsPageLayoutSource::CurrentItem,
+                    rotation,
+                    page.content_bbox,
+                    pixels_per_point,
+                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
                 )?;
+                let transform = transform
+                    .translated_by(gap_offsets.get(&page.idx).copied().unwrap_or_default());
                 // リサンプラと貼り先は **transform が持つ 1 つの答え** を共有する。
                 // 対で受け取るので、片方だけ自前の min() で綴ることができない (§1.0e)。
                 let (bake_rect, bake_scale) = transform.paint_geometry();
+                // 見える端も同じ transform から。viewport との交差だけが別責務。
+                let clip_rect = transform.paint_rect.intersect(image_rect);
                 let texture = self.prepare_fullscreen_paint_resource(
                     &resource,
                     bake_scale,
                     pixels_per_point,
-                    transform.visible_region_request(full_rect),
+                    transform.visible_region_request(clip_rect),
                 );
                 let rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
                 let uv_rect = Self::full_uv_rect();
-                let clip_rect_norm = rect_norm;
+                let clip_rect_norm = Self::normalize_rect_to_full_rect(clip_rect, full_rect);
                 self.log_detached_frozen_page_bake_debug(
                     "continuous",
                     window_id,
@@ -10954,7 +10961,7 @@ impl App {
                     page_ord,
                     page.rect,
                     uv_rect,
-                    page.rect,
+                    transform.paint_rect,
                     full_rect,
                     image_rect,
                     rect_norm,
@@ -10968,7 +10975,7 @@ impl App {
                     paint_rect_norm: rect_norm,
                     uv_rect,
                     clip_rect_norm,
-                    rotation: self.get_rotation(page.idx),
+                    rotation,
                     background: background.clone(),
                 })
             })
@@ -11139,69 +11146,79 @@ impl App {
             right_bbox,
             content_active,
         );
-        let left_clip_rect = Self::spread_page_horizontal_visible_clip(rects.left_rect, left_bbox)
-            .intersect(image_rect);
-        let right_clip_rect =
-            Self::spread_page_horizontal_visible_clip(rects.right_rect, right_bbox)
-                .intersect(image_rect);
-        let left_transform = DisplayedImageTransform::from_resolved_rect(
-            DisplayedImageTransformInput {
-                pixel_fit: RectPixelFit::Texels,
-                page_idx: left,
-                viewport_rect: image_rect,
-                source_size: left_texture.size_vec2(),
-                texture_size: left_texture.size_vec2(),
-                rotation: left_rot,
-                free_rotation_rad: 0.0,
-                content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
-                fit_scale_limits: FullscreenFitScaleLimits::default(),
-                pixels_per_point,
-                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-            },
-            rects.left_rect,
-        );
-        let right_transform = DisplayedImageTransform::from_resolved_rect(
-            DisplayedImageTransformInput {
-                pixel_fit: RectPixelFit::Texels,
-                page_idx: right,
-                viewport_rect: image_rect,
-                source_size: right_texture.size_vec2(),
-                texture_size: right_texture.size_vec2(),
-                rotation: right_rot,
-                free_rotation_rad: 0.0,
-                content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
-                fit_scale_limits: FullscreenFitScaleLimits::default(),
-                pixels_per_point,
-                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
-            },
-            rects.right_rect,
-        );
-        // 連結読みと同じく、リサンプラと貼り先は transform の 1 つの答えを共有する。
-        // transform が組めなかったときだけ、従来どおり layout の矩形と自前の倍率へ落ちる。
-        // fallback も対で綴るので、片側だけ transform 由来になることがない。
-        let (left_bake_rect, left_bake_scale) = left_transform.map_or(
-            (rects.left_rect, total_scale * geometry.left.scale_factor),
-            |transform| transform.paint_geometry(),
-        );
-        let (right_bake_rect, right_bake_scale) = right_transform.map_or(
-            (rects.right_rect, total_scale * geometry.right.scale_factor),
-            |transform| transform.paint_geometry(),
-        );
+        // **見える端・貼り先・出力テクセル数を 1 つの transform から出す** (§1.154)。
+        //
+        // 以前はここで transform を `content_bbox: None` で組み、可視範囲だけレイアウトの
+        // **寄せる前**の矩形から別に clip を作っていた。見える端は clip が、絵の位置は寄せた
+        // transform が決めるので所有者が 2 人に割れ、live で直した二段丸めが凍結側にだけ
+        // 残っていた。トリムを transform へ渡せば `paint_rect` がそのまま量子化済みの
+        // 可視帯になり、live と同じ helper で間隔を合わせられる。
         let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
+        let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
+        let left_source_size = self
+            .source_dims_for_idx(left)
+            .map(|(w, h)| egui::vec2(w, h));
+        let right_source_size = self
+            .source_dims_for_idx(right)
+            .map(|(w, h)| egui::vec2(w, h));
+        // 解決は live と同じ入口を通す。レイアウト寸法とテクスチャの縦横比が違う経路
+        // (PDF / passthrough) をここだけ別式で解かないため。
+        let left_transform = self.resolve_fs_spread_page_transform(
+            &left_resource,
+            image_rect,
+            rects.left_rect,
+            left,
+            left_source_size,
+            FsPageLayoutSource::CurrentItem,
+            left_rot,
+            content_left,
+            pixels_per_point,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        let right_transform = self.resolve_fs_spread_page_transform(
+            &right_resource,
+            image_rect,
+            rects.right_rect,
+            right,
+            right_source_size,
+            FsPageLayoutSource::CurrentItem,
+            right_rot,
+            content_right,
+            pixels_per_point,
+            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        );
+        // **片側だけ別由来にしない。** 以前はここでレイアウト矩形と自前の倍率へ落ちていたが、
+        // それは transform 以外の geometry 所有者を 1 つ残すことになる。組めないなら凍結
+        // 見開きを作らず、呼び出し側の単ページ snapshot へ渡す (他の早期 return と同じ形)。
+        let (Some(left_transform), Some(right_transform)) = (left_transform, right_transform)
+        else {
+            self.log_detached_image_window_debug(format!(
+                "detached_spread_frozen_fallback reason=no_transform idx={idx} left={left} \
+                 right={right}"
+            ));
+            return Vec::new();
+        };
+        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+        let (left_offset, right_offset) =
+            align_spread_pages_for_gap(&left_transform, &right_transform, gap_px, pixels_per_point);
+        let left_transform = left_transform.translated_by(left_offset);
+        let right_transform = right_transform.translated_by(right_offset);
+        // clip は寄せ終わった transform から。viewport との交差だけが別責務の最終 scissor。
+        let left_clip_rect = left_transform.paint_rect.intersect(image_rect);
+        let right_clip_rect = right_transform.paint_rect.intersect(image_rect);
+        let (left_bake_rect, left_bake_scale) = left_transform.paint_geometry();
+        let (right_bake_rect, right_bake_scale) = right_transform.paint_geometry();
         let left_texture = self.prepare_fullscreen_paint_resource(
             &left_resource,
             left_bake_scale,
             pixels_per_point,
-            left_transform.and_then(|transform| transform.visible_region_request(left_clip_rect)),
+            left_transform.visible_region_request(left_clip_rect),
         );
-        let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
         let right_texture = self.prepare_fullscreen_paint_resource(
             &right_resource,
             right_bake_scale,
             pixels_per_point,
-            right_transform.and_then(|transform| transform.visible_region_request(right_clip_rect)),
+            right_transform.visible_region_request(right_clip_rect),
         );
         let background = self.detached_frozen_background_for_snapshot(ctx);
         let left_rect_norm = Self::normalize_rect_to_full_rect(left_bake_rect, full_rect);
@@ -48505,19 +48522,6 @@ mod tests {
         );
         assert!(rects.left_rect.right() > rects.left_hit_rect.right());
         assert!(rects.right_rect.left() < rects.right_hit_rect.left());
-    }
-
-    #[test]
-    fn spread_page_horizontal_visible_clip_keeps_vertical_page_pixels() {
-        let rect = egui::Rect::from_min_max(egui::pos2(10.0, -30.0), egui::pos2(210.0, 270.0));
-        let bbox = egui::Rect::from_min_max(egui::pos2(0.20, 0.15), egui::pos2(0.85, 0.70));
-
-        let clip = App::spread_page_horizontal_visible_clip(rect, bbox);
-
-        assert_f32_close(clip.left(), 50.0);
-        assert_f32_close(clip.right(), 180.0);
-        assert_f32_close(clip.top(), -30.0);
-        assert_f32_close(clip.bottom(), 270.0);
     }
 
     #[test]
