@@ -930,10 +930,13 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
             Ok(false)
         }
         BookPageSource::Composited { source, edits, .. } => {
-            let image = decode_composite_source(&source)?;
-            let result = compose_book_page(image, &edits)?;
-            write_composited_color_image(dest, &result.image, edits.format, edits.jpeg_matte)?;
-            Ok(result.used_diffusion_fallback)
+            // 本ページは原寸で焼く。上限サイズを持たせるならここへ渡す段が既にある。
+            write_composited_page(
+                &source,
+                &edits,
+                dest,
+                crate::export_dialog::ExportScale::Full,
+            )
         }
         BookPageSource::Rendered {
             work,
@@ -1172,6 +1175,28 @@ fn compose_book_page(
         image,
         used_diffusion_fallback,
     })
+}
+
+/// 1 ページぶんの「デコード → 合成 → 縮小 → エンコード → 書き出し」。
+///
+/// 製本の Composited ページと Ctrl+E の一括エクスポートが共有する唯一の実体で、
+/// 戻り値は消しゴム補完が diffusion フォールバックしたか。本固有の事情 (ページ採番、
+/// `MAX_BOOK_PAGES`、無編集時の byte copy、`restore_declines`、コピー集計) は
+/// `append_pages_at` 側に残し、ここは 1 件だけを見る。
+pub fn write_composited_page(
+    source: &CompositeSource,
+    edits: &BakedEditSnapshot,
+    dest: &Path,
+    scale: crate::export_dialog::ExportScale,
+) -> Result<bool, String> {
+    let image = decode_composite_source(source)?;
+    let result = compose_book_page(image, edits)?;
+    let image = crate::export_dialog::scale_export_pixels(
+        std::borrow::Cow::Borrowed(&result.image),
+        scale,
+    )?;
+    write_composited_color_image(dest, image.as_ref(), edits.format, edits.jpeg_matte)?;
+    Ok(result.used_diffusion_fallback)
 }
 
 /// 注釈 (comic) を合成済み画像へ焼き込む。

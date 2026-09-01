@@ -74,6 +74,7 @@ pub mod editing_addon_download;
 pub mod egui_focus_policy;
 pub mod exif_reader;
 pub mod explorer_integration;
+pub mod export_batch;
 pub mod export_crop;
 pub mod export_dialog;
 pub mod external_links;

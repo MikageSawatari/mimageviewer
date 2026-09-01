@@ -17,6 +17,7 @@ pub mod content_restore;
 pub(crate) mod context_menu;
 mod context_shortcuts;
 pub(crate) mod editing_addon;
+pub(crate) mod export_batch;
 mod fav_add;
 pub(crate) mod favorites_editor;
 mod first_setup;

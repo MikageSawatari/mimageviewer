@@ -734,7 +734,9 @@ fn render_export_page_pixels<'a>(
     Ok(rendered)
 }
 
-fn scale_export_pixels<'a>(
+/// 書き出し直前の縮小段。Ctrl+E の単ページ / 見開きと、一括エクスポート・製本が通る
+/// `books::write_composited_page` が同じ 1 段を共有する。
+pub(crate) fn scale_export_pixels<'a>(
     pixels: Cow<'a, egui::ColorImage>,
     scale: ExportScale,
 ) -> Result<Cow<'a, egui::ColorImage>, String> {

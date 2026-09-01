@@ -42,6 +42,9 @@ impl JpegMatte {
 }
 
 impl CaptureFormat {
+    /// UI の選択肢を 1 か所から列挙する (キャプチャ設定と一括エクスポート)。
+    pub const ALL: [Self; 4] = [Self::Png, Self::Jpeg95, Self::Jpeg85, Self::Jpeg75];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Png => "PNG",

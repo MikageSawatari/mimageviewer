@@ -10488,7 +10488,9 @@ pub struct App {
         Option<crate::pipeline_debug::PipelineDebugExportPending>,
     /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
     pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
-    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
+    /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
+    pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
+    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
     pub(crate) export_folder_refresh_pending: Option<PathBuf>,
@@ -13844,6 +13846,7 @@ impl App {
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
+            export_batch_dialog: None,
             export_pending: None,
             export_folder_refresh_pending: None,
             pinned_compare_slot: None,
@@ -15942,6 +15945,7 @@ impl App {
             self.slot_save_dialog.is_some() => "slot_save",
             self.favorite_default_clear_confirm.is_some() => "favorite_default_clear_confirm",
             self.export_dialog.is_some() => "export_dialog",
+            self.export_batch_dialog.is_some() => "export_batch_dialog",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
@@ -68000,6 +68004,7 @@ impl eframe::App for App {
         self.show_tray_enabled_notice_dialog(ctx);
         if self.main_window_should_draw_export_dialogs() {
             self.draw_export_dialog(ctx);
+            self.draw_export_batch_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
         }
         self.poll_pdf_enumerate();
@@ -68151,6 +68156,17 @@ impl eframe::App for App {
                 .consume_action(ctx, KeyAction::GridAddToActiveBook)
             {
                 self.add_grid_selection_to_active_book(ctx);
+            }
+            // グリッドの Ctrl+E = 選択の一括エクスポート。フルスクリーンの Ctrl+E
+            // (単ページ書き出し) と同じ割り当てを共有するので、フルスクリーン表示中は
+            // ここで拾わない。
+            //
+            // ⚠ 本来は専用の `KeyAction::GridExportSelection` を keymap へ足して、
+            // 操作カスタマイズ画面に「グリッド」の項目として出すべき。いま keymap.rs は
+            // 別ブランチが全面改修中なので、着地後に action を追加してここを差し替える。
+            if self.fullscreen_idx.is_none() && self.keymap.consume_action(ctx, KeyAction::FsExport)
+            {
+                self.open_export_batch_dialog(ctx);
             }
         }
 

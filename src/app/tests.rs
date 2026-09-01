@@ -25455,6 +25455,63 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(state.output_dir_text, source_dir.display().to_string());
     }
 
+    /// 一括エクスポートは選択の中から書き出せる物だけを取り、残りを件数で返す。
+    /// 黙って落とすとユーザーは「N 件選んだのに M 件しか出ない」で理由を失う。
+    #[test]
+    fn batch_export_items_take_only_exportable_selection_and_count_the_rest() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "c:/trip/clip.mp4",
+        )));
+        app.items
+            .push(GridItem::Folder(std::path::PathBuf::from("c:/trip/sub")));
+        app.visible_indices = vec![0, 1, 2];
+        for _ in 0..3 {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.checked = [0usize, 1, 2].into_iter().collect();
+
+        let (items, skipped) = app.grid_batch_export_items(&ctx);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(skipped, 2);
+        assert_eq!(items[0].filename, "a");
+        assert_eq!(items[0].dirname, "trip");
+    }
+
+    /// チェックが無ければカーソル選択を使う。本への追加と同じ規則。
+    #[test]
+    fn batch_export_items_fall_back_to_the_cursor_selection() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/b.jpg")));
+        app.visible_indices = vec![0, 1];
+        for _ in 0..2 {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.checked.clear();
+        app.selected = Some(1);
+
+        let (items, skipped) = app.grid_batch_export_items(&ctx);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| i.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
     /// PDF ページでは「元の場所」が PDF ファイルのあるディレクトリを指す。
     #[test]
     fn export_dialog_source_dir_for_pdf_page_is_pdf_parent() {
