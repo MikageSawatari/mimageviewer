@@ -353,9 +353,13 @@ pub fn classify_name_index_kind(
     // (docs/search-container-item-redesign.md §4.2)。動画はアイテム索引 (Ctrl+G)
     // で扱う。`IndexKind::VideoFile` variant 自体は stale 行の読み取り用に残すが、
     // 書き込み経路 (= ここ) では生成しない。
-    if ext.eq_ignore_ascii_case("zip") {
+    // 拡張子の綴りは仮想フォルダ判定と共有する。ここで `zip` を直接書いていた頃は
+    // `.cbz` が索引に入らず、他の全経路がネイティブ ZIP として開けるコンテナなのに
+    // Ctrl+S だけヒットしなかった (docs/item-kind-capability-matrix.md §6-12)。
+    let ext = ext.to_ascii_lowercase();
+    if crate::folder_tree::is_zip_extension(&ext) {
         Some(IndexKind::ZipFile)
-    } else if ext.eq_ignore_ascii_case("pdf") {
+    } else if crate::folder_tree::is_pdf_extension(&ext) {
         Some(IndexKind::PdfFile)
     } else {
         None
@@ -425,6 +429,27 @@ mod tests {
         // DB に登録されたエントリを count で確認 (root に 4 件入るはず)
         let count = db.count_for_favorite(&root).unwrap();
         assert_eq!(count, 4);
+    }
+
+    /// `.cbz` は他の全経路でネイティブ ZIP として開けるコンテナなのに、名前索引の
+    /// 分類だけが拡張子 `zip` の厳密一致だったため Ctrl+S に出てこなかった
+    /// (docs/item-kind-capability-matrix.md §6-12)。大文字混じりも同じに扱う。
+    #[test]
+    fn bulk_indexes_cbz_like_any_other_zip() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        touch(&root.join("a.cbz"));
+        touch(&root.join("b.CBZ"));
+        touch(&root.join("c.zip"));
+        touch(&root.join("d.PDF"));
+
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+
+        assert_eq!(summary.entries_written, 4);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 4);
     }
 
     #[test]

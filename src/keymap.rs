@@ -1471,6 +1471,18 @@ pub enum KeyAction {
     GridTogglePinnedTag18,
     GridTogglePinnedTag19,
     GridTogglePinnedTag20,
+    ExternalToolPicker,
+    ExternalTool1,
+    ExternalTool2,
+    ExternalTool3,
+    ExternalTool4,
+    ExternalTool5,
+    ExternalTool6,
+    ExternalTool7,
+    ExternalTool8,
+    ExternalTool9,
+    ExternalTool10,
+    ExternalToolForContainer,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -1945,6 +1957,18 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridTogglePinnedTag18,
     KeyAction::GridTogglePinnedTag19,
     KeyAction::GridTogglePinnedTag20,
+    KeyAction::ExternalToolPicker,
+    KeyAction::ExternalTool1,
+    KeyAction::ExternalTool2,
+    KeyAction::ExternalTool3,
+    KeyAction::ExternalTool4,
+    KeyAction::ExternalTool5,
+    KeyAction::ExternalTool6,
+    KeyAction::ExternalTool7,
+    KeyAction::ExternalTool8,
+    KeyAction::ExternalTool9,
+    KeyAction::ExternalTool10,
+    KeyAction::ExternalToolForContainer,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -3072,6 +3096,21 @@ const PINNED_TAG_ACTIONS_ARRAY: [KeyAction; 20] = [
 
 pub const PINNED_TAG_ACTIONS: &[KeyAction] = &PINNED_TAG_ACTIONS_ARRAY;
 
+const EXTERNAL_TOOL_ACTIONS_ARRAY: [KeyAction; 10] = [
+    KeyAction::ExternalTool1,
+    KeyAction::ExternalTool2,
+    KeyAction::ExternalTool3,
+    KeyAction::ExternalTool4,
+    KeyAction::ExternalTool5,
+    KeyAction::ExternalTool6,
+    KeyAction::ExternalTool7,
+    KeyAction::ExternalTool8,
+    KeyAction::ExternalTool9,
+    KeyAction::ExternalTool10,
+];
+
+pub const EXTERNAL_TOOL_ACTIONS: &[KeyAction] = &EXTERNAL_TOOL_ACTIONS_ARRAY;
+
 pub const LOCATION_NAVIGATION_ACTIONS: &[KeyAction] = &[
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -3243,6 +3282,19 @@ impl KeyAction {
             .map(|idx| idx + 1)
     }
 
+    pub fn external_tool_slot_action(slot: usize) -> Option<Self> {
+        EXTERNAL_TOOL_ACTIONS_ARRAY
+            .get(slot.checked_sub(1)?)
+            .copied()
+    }
+
+    pub fn external_tool_slot_number(self) -> Option<usize> {
+        EXTERNAL_TOOL_ACTIONS_ARRAY
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
     pub fn location_rating_stars(self) -> Option<u8> {
         match self {
             Self::GridOpenLocationRating1 => Some(1),
@@ -3368,6 +3420,21 @@ impl KeyAction {
                 _ => unreachable!("pinned tag slot is constrained to 1..=20"),
             };
         }
+        if let Some(slot) = self.external_tool_slot_number() {
+            return match slot {
+                1 => "ExternalTool1",
+                2 => "ExternalTool2",
+                3 => "ExternalTool3",
+                4 => "ExternalTool4",
+                5 => "ExternalTool5",
+                6 => "ExternalTool6",
+                7 => "ExternalTool7",
+                8 => "ExternalTool8",
+                9 => "ExternalTool9",
+                10 => "ExternalTool10",
+                _ => unreachable!("external tool slot is constrained to 1..=10"),
+            };
+        }
         match self {
             GlobalLocalSearch => "GlobalLocalSearch",
             GlobalFavSearch => "GlobalFavSearch",
@@ -3465,7 +3532,17 @@ impl KeyAction {
             | GridTogglePinnedTag17
             | GridTogglePinnedTag18
             | GridTogglePinnedTag19
-            | GridTogglePinnedTag20 => {
+            | GridTogglePinnedTag20
+            | ExternalTool1
+            | ExternalTool2
+            | ExternalTool3
+            | ExternalTool4
+            | ExternalTool5
+            | ExternalTool6
+            | ExternalTool7
+            | ExternalTool8
+            | ExternalTool9
+            | ExternalTool10 => {
                 unreachable!("handled by compact slot helpers")
             }
             GridOpenLocationDriveList => "GridOpenLocationDriveList",
@@ -3481,6 +3558,8 @@ impl KeyAction {
             GridOpenLocationDownloads => "GridOpenLocationDownloads",
             GridClearRecentFolders => "GridClearRecentFolders",
             GridClearQuickFolderSlots => "GridClearQuickFolderSlots",
+            ExternalToolPicker => "ExternalToolPicker",
+            ExternalToolForContainer => "ExternalToolForContainer",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -3934,6 +4013,21 @@ impl KeyAction {
                 _ => unreachable!("pinned tag slot is constrained to 1..=20"),
             };
         }
+        if let Some(slot) = self.external_tool_slot_number() {
+            return match slot {
+                1 => "外部ツール1を起動する",
+                2 => "外部ツール2を起動する",
+                3 => "外部ツール3を起動する",
+                4 => "外部ツール4を起動する",
+                5 => "外部ツール5を起動する",
+                6 => "外部ツール6を起動する",
+                7 => "外部ツール7を起動する",
+                8 => "外部ツール8を起動する",
+                9 => "外部ツール9を起動する",
+                10 => "外部ツール10を起動する",
+                _ => unreachable!("external tool slot is constrained to 1..=10"),
+            };
+        }
         match self {
             GlobalLocalSearch => "現在地の一覧を絞り込み検索する",
             GlobalFavSearch => "お気に入りフォルダを横断検索する",
@@ -4031,7 +4125,17 @@ impl KeyAction {
             | GridTogglePinnedTag17
             | GridTogglePinnedTag18
             | GridTogglePinnedTag19
-            | GridTogglePinnedTag20 => {
+            | GridTogglePinnedTag20
+            | ExternalTool1
+            | ExternalTool2
+            | ExternalTool3
+            | ExternalTool4
+            | ExternalTool5
+            | ExternalTool6
+            | ExternalTool7
+            | ExternalTool8
+            | ExternalTool9
+            | ExternalTool10 => {
                 unreachable!("handled by compact slot helpers")
             }
             GridOpenLocationDriveList => "ドライブ一覧を開く",
@@ -4047,6 +4151,8 @@ impl KeyAction {
             GridOpenLocationDownloads => "ダウンロードを開く",
             GridClearRecentFolders => "最近開いたフォルダ履歴をクリアする",
             GridClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリアする",
+            ExternalToolPicker => "登録済みの外部ツールを選んで起動する",
+            ExternalToolForContainer => "現在のフォルダー / 本を外部ツールで開く",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -4506,6 +4612,18 @@ impl KeyAction {
             | GridTogglePinnedTag18
             | GridTogglePinnedTag19
             | GridTogglePinnedTag20
+            | ExternalToolPicker
+            | ExternalTool1
+            | ExternalTool2
+            | ExternalTool3
+            | ExternalTool4
+            | ExternalTool5
+            | ExternalTool6
+            | ExternalTool7
+            | ExternalTool8
+            | ExternalTool9
+            | ExternalTool10
+            | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -4909,6 +5027,18 @@ impl KeyAction {
             | GridTogglePinnedTag18
             | GridTogglePinnedTag19
             | GridTogglePinnedTag20
+            | ExternalToolPicker
+            | ExternalTool1
+            | ExternalTool2
+            | ExternalTool3
+            | ExternalTool4
+            | ExternalTool5
+            | ExternalTool6
+            | ExternalTool7
+            | ExternalTool8
+            | ExternalTool9
+            | ExternalTool10
+            | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -5363,6 +5493,21 @@ impl KeyAction {
             | GridTogglePinnedTag18
             | GridTogglePinnedTag19
             | GridTogglePinnedTag20 => ChordList::EMPTY,
+            // Tool registration order is user-defined, and assigning defaults for ten
+            // slots would collide with existing shortcuts. Keep all picker/slot actions
+            // assignable but unbound by default.
+            ExternalToolPicker
+            | ExternalTool1
+            | ExternalTool2
+            | ExternalTool3
+            | ExternalTool4
+            | ExternalTool5
+            | ExternalTool6
+            | ExternalTool7
+            | ExternalTool8
+            | ExternalTool9
+            | ExternalTool10
+            | ExternalToolForContainer => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -10348,6 +10493,89 @@ mod tests {
                 Chord::key(KeyName::U),
                 FS_IMAGE_ACTIVE_SCOPES,
                 PINNED_TAG_ACTIONS,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn external_tool_actions_are_grid_fixed_slots_and_default_unassigned() {
+        assert_eq!(
+            EXTERNAL_TOOL_ACTIONS,
+            &[
+                KeyAction::ExternalTool1,
+                KeyAction::ExternalTool2,
+                KeyAction::ExternalTool3,
+                KeyAction::ExternalTool4,
+                KeyAction::ExternalTool5,
+                KeyAction::ExternalTool6,
+                KeyAction::ExternalTool7,
+                KeyAction::ExternalTool8,
+                KeyAction::ExternalTool9,
+                KeyAction::ExternalTool10,
+            ]
+        );
+        assert_eq!(
+            KeyAction::ExternalTool1.external_tool_slot_number(),
+            Some(1)
+        );
+        assert_eq!(
+            KeyAction::ExternalTool10.external_tool_slot_number(),
+            Some(10)
+        );
+        assert_eq!(
+            KeyAction::external_tool_slot_action(1),
+            Some(KeyAction::ExternalTool1)
+        );
+        assert_eq!(
+            KeyAction::external_tool_slot_action(10),
+            Some(KeyAction::ExternalTool10)
+        );
+        assert_eq!(KeyAction::external_tool_slot_action(0), None);
+        assert_eq!(KeyAction::external_tool_slot_action(11), None);
+        assert_eq!(
+            KeyAction::ExternalToolPicker.external_tool_slot_number(),
+            None
+        );
+        assert_eq!(
+            KeyAction::ExternalToolForContainer.external_tool_slot_number(),
+            None
+        );
+
+        for action in EXTERNAL_TOOL_ACTIONS.iter().copied().chain([
+            KeyAction::ExternalToolPicker,
+            KeyAction::ExternalToolForContainer,
+        ]) {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(action.is_user_facing());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        }
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Grid]
+            ExternalToolPicker = F16
+            ExternalTool5 = F17
+            ExternalToolForContainer = F18
+            "#,
+        );
+        assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::F17),
+                GRID_ACTIVE_SCOPES,
+                EXTERNAL_TOOL_ACTIONS,
+            ),
+            Some(KeyAction::ExternalTool5)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::F17),
+                FS_IMAGE_ACTIVE_SCOPES,
+                EXTERNAL_TOOL_ACTIONS,
             ),
             None
         );

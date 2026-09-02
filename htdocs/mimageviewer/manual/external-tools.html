@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>外部ツール連携 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="表示中の画像やページを、画像編集ソフトなど別のアプリへ渡して開く方法。渡すものの選び方、キー割り当て、引数の書き方を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/external-tools.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/external-tools.html">
+  <meta property="og:title" content="外部ツール連携｜mImageViewer">
+  <meta property="og:description" content="表示中の画像やページを、画像編集ソフトなど別のアプリへ渡して開く方法。渡すものの選び方、キー割り当て、引数の書き方を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="外部ツール連携｜mImageViewer">
+  <meta name="twitter:description" content="表示中の画像やページを、画像編集ソフトなど別のアプリへ渡して開く方法。渡すものの選び方、キー割り当て、引数の書き方を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>外部ツール連携</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html" class="active">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">外部ツール連携</h1>
+    <p class="page-desc">いま見ている画像やページを、画像編集ソフトなど別のアプリへ渡して開きます。</p>
+
+    <h2 id="overview">概要</h2>
+    <p>よく使うアプリを登録しておくと、右クリックメニューやキー 1 つで、選んでいる画像・動画・ページをそのアプリで開けます。</p>
+    <p>圧縮ファイルの中のページや PDF のページも渡せます。これらは中身を取り出した一時ファイルとして渡すため、渡す先のアプリが圧縮ファイルに対応していなくても開けます。</p>
+
+    <h2 id="register">登録する</h2>
+    <p>環境設定の「外部ツール」で登録します。方法は 2 つあります。</p>
+    <ul>
+      <li><strong>実行ファイルを選んで追加:</strong> アプリの実行ファイルを直接選びます。引数や作業フォルダーを自分で決められます。</li>
+      <li><strong>この拡張子の関連付けアプリから追加:</strong> 拡張子を選ぶと、Windows がその形式に対応していると認識しているアプリが一覧に出ます。ストアアプリもここから登録できます。</li>
+    </ul>
+    <p>登録した数に上限はありません。並べ替えると、キー割り当ての番号もその順序になります。</p>
+
+    <h2 id="launch">起動する</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>操作</th><th>渡すもの</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>グリッドで右クリック</td><td>チェックを付けた項目。無ければ右クリックした項目</td></tr>
+          <tr><td>フルスクリーンで右クリック</td><td>いま表示しているページ</td></tr>
+          <tr><td>フォルダーやコンテナーを右クリック</td><td>そのフォルダー / 圧縮ファイル / PDF そのもの</td></tr>
+          <tr><td>キー割り当て</td><td>上と同じ対象。登録順に 10 個までキーを割り当てられます</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>登録したツールは右クリックメニューにすべて並びます。いまの対象に使えないツールは、理由を表示したうえで選べない状態になります。</p>
+
+    <h2 id="payload">渡すものを選ぶ</h2>
+    <p>ツールごとに、何を渡すかを選べます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>設定</th><th>渡すもの</th><th>元のファイル</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>一時ファイル（編集を反映）</td>
+            <td>補正・回転・注釈・消しゴムなど、そのページに加えた編集を反映した PNG</td>
+            <td>変わりません</td>
+          </tr>
+          <tr>
+            <td>一時ファイル（編集前）</td>
+            <td>編集を反映していない、元のデータそのまま。JPEG は JPEG のままで、撮影情報も残ります</td>
+            <td>変わりません</td>
+          </tr>
+          <tr>
+            <td>元のファイル</td>
+            <td>ディスク上のファイルそのもの</td>
+            <td><strong>変わります</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>「元のファイル」は、渡した先で上書き保存すると元のファイルが書き換わります。</strong>画像編集ソフトで直接編集したいときに選んでください。圧縮ファイルの中のページと PDF のページには元のファイルが存在しないため、この設定のツールでは開けません。</p>
+    <p>一時ファイルは <kbd>2</kbd> つのどちらを選んでも、渡した先で上書き保存しても元のファイルは変わりません。編集の有無で形式が変わることはなく、「編集を反映」なら常に PNG、「編集前」なら常に元のデータのままです。</p>
+    <p class="note">カラー化・LUT・ポストフィルタ・スマートシャープ・AI 拡大は表示専用のため、「編集を反映」には含まれません。これらを含めて書き出したいときは<a href="export.html">エクスポート</a>を使ってください。</p>
+
+    <h2 id="video-spread">動画と見開き</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>設定</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>動画 → 動画ファイル</td><td>動画ファイルそのものを渡します。一時ファイルへコピーしません</td></tr>
+          <tr><td>動画 → 表示中のフレーム</td><td>いま表示しているコマを画像として渡します。再生していないときは動画ファイルを渡します</td></tr>
+          <tr><td>見開き → 合成</td><td>見開きの 2 ページを 1 枚に合成して渡します</td></tr>
+          <tr><td>見開き → 両ページ</td><td>2 ページをページ順に渡します</td></tr>
+          <tr><td>見開き → 主ページのみ</td><td>いま基準になっているページだけを渡します</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="selection">複数を選んだとき</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>設定</th><th>動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1 件</td><td>1 件だけ渡します。2 件以上選ばれているときは起動しません</td></tr>
+          <tr><td>1 件ずつ起動</td><td>対象の数だけアプリを起動します</td></tr>
+          <tr><td>まとめて渡す</td><td>1 回の起動で全件を渡します。引数に <code>{files}</code> が必要です</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>ツールごとに「確認なしで起動する上限」と「起動する対象件数の上限」を決められます。重いアプリには小さめの値を入れておくと、うっかり大量に起動するのを防げます。</p>
+
+    <h2 id="arguments">引数を書く</h2>
+    <p>実行ファイルを直接登録したツールでは、引数を自分で書けます。次の記法が使えます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>記法</th><th>展開されるもの</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>{file}</code></td><td>渡すファイルのパス。何も書かないときはこれが 1 つ付きます</td></tr>
+          <tr><td><code>{files}</code></td><td>対象すべて。「まとめて渡す」のときに使います</td></tr>
+          <tr><td><code>{dir}</code> / <code>{name}</code> / <code>{stem}</code> / <code>{ext}</code></td><td>親フォルダー / ファイル名 / 拡張子なしの名前 / 拡張子</td></tr>
+          <tr><td><code>{container}</code></td><td>圧縮ファイル / PDF / 動画そのもののパス。実ファイルならそれ自身</td></tr>
+          <tr><td><code>{entry}</code></td><td>圧縮ファイル内での名前</td></tr>
+          <tr><td><code>{page}</code></td><td>ページ番号（1 から数えます）</td></tr>
+          <tr><td><code>{time}</code> / <code>{time_ms}</code> / <code>{time_hms}</code></td><td>動画の再生位置。秒 / ミリ秒 / <code>00:01:23.456</code></td></tr>
+          <tr><td><code>{uri}</code></td><td><code>{file}</code> を URI 形式にしたもの</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>対象が持っていない値は、その部分を含む引数ごと取り除きます。<code>-page {page}</code> と書いてページ番号のない画像を渡しても、<code>-page</code> だけが残ることはありません。</p>
+    <p>引数に空白を含む値が入っても壊れないので、引用符を自分で書く必要はありません。設定画面には、いまの対象で実際に渡される引数のプレビューが出ます。</p>
+    <p>Windows の関連付けで開くツールでは、引数と作業フォルダーは指定できません。どう開くかは Windows 側が決めるためです。</p>
+
+    <h2 id="temp">一時ファイルの扱い</h2>
+    <p>一時ファイルは一時フォルダーへ書き出し、mImageViewer を終了するときに削除します。前回異常終了などで残ったものも、起動時に見つけて片付けます。渡した先のアプリで作業を続けたい場合は、そのアプリで別の場所へ保存してください。</p>
+    <p>ツールごとに「一時ファイルを残す」を有効にすると、終了時に削除しません。</p>
+    <p class="note">ポータブル版では、一時ファイルもデータフォルダーの中に作ります。</p>
+
+    <h2 id="notes">補足</h2>
+    <ul>
+      <li>同じ対象・同じ設定で続けて起動した場合、一時ファイルは作り直さず再利用します。</li>
+      <li>準備に時間がかかるときは進捗が出ます。途中でキャンセルできます。</li>
+      <li>ネットワーク上の実行ファイルを登録したツールは、起動前に確認します。</li>
+      <li>「まとめて渡す」で対象が多すぎる場合、Windows の制限を超えるため起動を断ります。件数の上限を下げるか、「1 件ずつ起動」に変えてください。</li>
+    </ul>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>

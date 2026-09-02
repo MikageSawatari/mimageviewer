@@ -135,6 +135,50 @@ pub struct ContainerRepresentative {
     pub pdf_page: Option<u32>,
 }
 
+/// ファイル操作を断る理由。文言の持ち主は [`GridItem::file_operation_refusal`]。
+///
+/// 「黙って何もしない」を無くすための型。実パスが取れないことを `None` で表すと、
+/// 呼び出し側は理由を持たないまま早期 return するしかなく、利用者からは
+/// 拒否と無反応の区別が付かなくなる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationRefusal {
+    /// ZIP / PDF の中のページ。ディスク上に単独の実体がない。
+    VirtualPage,
+    /// ZIP の中のフォルダ。
+    ArchiveDirectory,
+    /// ファイル名スタックの集約セル。1 セルが複数ファイルを代表している。
+    Stack,
+    /// 検索結果の集約コンテナ。
+    SearchContainer,
+}
+
+impl FileOperationRefusal {
+    /// `action` は利用者が実行しようとした操作 (例: `"削除"` / `"ドラッグ"` /
+    /// `"コピー / カット"`)。文末は「できません」で揃える。
+    pub fn message(self, action: &str) -> String {
+        match self {
+            Self::VirtualPage => {
+                format!("圧縮ファイル / PDF 内のページは{action}できません")
+            }
+            Self::ArchiveDirectory => format!("圧縮ファイル内のフォルダは{action}できません"),
+            Self::Stack => format!(
+                "スタックのセルは{action}できません。スタック表示をオフにすると個別に選べます"
+            ),
+            Self::SearchContainer => format!("検索結果のまとまりは{action}できません"),
+        }
+    }
+}
+
+/// チェック選択に ZIP / PDF 内ページが混ざったときの共通通知。
+///
+/// チェック可能だが実ファイルとして渡せない項目は現状 `ZipImage` / `PdfPage` だけなので、
+/// ファイル操作と外部ツール起動で同じ理由・解除方法を案内する。
+pub(crate) fn checked_virtual_selection_message(action: &str) -> String {
+    format!(
+        "圧縮ファイル / PDF 内のページが選択に含まれています。ページは{action}できません。ページの選択を外してから実行してください"
+    )
+}
+
 impl GridItem {
     /// 補正プリセット / 消しゴムマスク / タグなど、ページ単位の永続データを持てるアイテムか。
     /// 通常画像 / ZIP 内画像 / PDF ページが対象。フォルダ・動画・ZIP/PDF ファイル本体・
@@ -304,6 +348,29 @@ impl GridItem {
             | Self::PdfFile(p)
             | Self::ConvertibleArchive { path: p, .. } => Some(p),
             _ => None,
+        }
+    }
+
+    /// ファイル操作 (コピー / カット / ドラッグ / 削除) を断る理由。
+    /// [`Self::drag_source_path`] が `None` を返す item だけが `Some` になる。
+    ///
+    /// 断り方 (トースト / メニュー非表示 / 無効化) は呼び出し側が決めてよいが、
+    /// **理由の分類と文言はここが唯一の持ち主**。各所で文言を書いていた頃は、
+    /// `Stack` や `ZipDir` にも「ZIP内の画像やPDFページは…」というページ向けの文が
+    /// 出ていた (docs/item-kind-capability-matrix.md §6-8)。
+    pub fn file_operation_refusal(&self) -> Option<FileOperationRefusal> {
+        match self {
+            Self::Folder(_)
+            | Self::Image(_)
+            | Self::Video(_)
+            | Self::Audio(_)
+            | Self::ZipFile(_)
+            | Self::PdfFile(_)
+            | Self::ConvertibleArchive { .. } => None,
+            Self::ZipImage { .. } | Self::PdfPage { .. } => Some(FileOperationRefusal::VirtualPage),
+            Self::ZipDir { .. } => Some(FileOperationRefusal::ArchiveDirectory),
+            Self::Stack { .. } => Some(FileOperationRefusal::Stack),
+            Self::SearchContainer { .. } => Some(FileOperationRefusal::SearchContainer),
         }
     }
 
