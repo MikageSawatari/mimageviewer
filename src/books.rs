@@ -275,6 +275,26 @@ pub struct BookEraseSnapshot {
     pub run: BookEraseRunner,
 }
 
+pub struct BookAiResult {
+    pub image: egui::ColorImage,
+    /// アップスケールを実際に通したか。**要求した設定ではなく実行結果**を返すこと。
+    /// スマートシャープの「AI 拡大した出力には掛けない」規則の入力になる
+    /// ([`crate::adjustment::AdjustParams::effective_smart_sharpen`])。
+    pub used_upscale: bool,
+}
+
+pub type BookAiRunner =
+    Box<dyn Fn(&egui::ColorImage, &Arc<AtomicBool>) -> Result<BookAiResult, String> + Send>;
+
+/// AI 処理の段。**モデルの選択・背景合成・失敗時の扱いはここに持たない。**
+///
+/// 表示側はアップスケール前に背景色 (透過表示モード由来) へ合成し、デノイズ → アップスケール
+/// の順に走らせる。その規則を知っているのは呼び出し側なので、閉じたランナーとして受け取る。
+/// 消しゴム ([`BookEraseSnapshot`]) と同じ形。
+pub struct BookAiSnapshot {
+    pub run: BookAiRunner,
+}
+
 pub struct BookConcealSnapshot {
     pub mask: BookMaskSnapshot,
     pub preset: crate::conceal::ConcealPreset,
@@ -305,6 +325,8 @@ pub struct BakedEditSnapshot {
     /// 解決済みの Creative LUT と適用量。`stage` が表示用補正まで進むときだけ使う。
     /// 選択 ID から実体を引けるのは登録済み LUT を持つ側だけなので、ここへ解決して渡す。
     pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    /// AI 処理の実行本体。`stage` が AI まで進み、かつモデルが選ばれているときだけ `Some`。
+    pub ai: Option<BookAiSnapshot>,
 }
 
 pub fn page_requires_full_composite(
@@ -1236,7 +1258,15 @@ fn compose_book_page_with_cancel(
     //
     // `used_ai_upscale` は AI 段が入ったら真になる。スマートシャープは AI 拡大した出力へは
     // 掛けない固定規則があるので ([adjustment.rs] `effective_smart_sharpen`)、その入力になる。
-    let used_ai_upscale = false;
+    let mut used_ai_upscale = false;
+    if edits.stage.includes_ai()
+        && let Some(ai) = &edits.ai
+    {
+        let result = (ai.run)(&image, &cancel)?;
+        image = result.image;
+        used_ai_upscale = result.used_upscale;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+    }
     if edits.stage.includes_display_adjust() {
         image = apply_display_adjust(
             image,
@@ -1984,6 +2014,7 @@ mod tests {
             jpeg_matte: crate::capture::JpegMatte::Black,
             stage: crate::bake_stage::BakeStage::default(),
             creative_lut: None,
+            ai: None,
         }
     }
 
@@ -2199,6 +2230,51 @@ mod tests {
             deep.image.pixels,
             crate::post_filter::apply(&base, crate::adjustment::PostFilter::Sepia).pixels,
             "表示側と同じ関数・同じ順序を通っている"
+        );
+    }
+
+    /// AI の段は**実行結果**を返し、そこから表示用補正のシャープが決まる。
+    /// アップスケールを通った出力にはシャープを掛けない固定規則があるため、
+    /// 「AI を通した / 通していない」で同じ設定から違う結果が出る。
+    #[test]
+    fn the_ai_stage_reports_what_it_did_and_that_decides_smart_sharpen() {
+        // 平坦な画像にはシャープが効かないので、コントラストのある市松にする。
+        let base = egui::ColorImage::new(
+            [4, 4],
+            (0..16)
+                .map(|i| {
+                    if (i / 4 + i % 4) % 2 == 0 {
+                        egui::Color32::from_rgb(20, 20, 20)
+                    } else {
+                        egui::Color32::from_rgb(230, 230, 230)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut edits = empty_baked_edits();
+        edits.params.smart_sharpen = 100;
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+
+        // AI が無い段では `used_upscale = false` 扱いなので、シャープが掛かる。
+        let without_ai = compose_book_page(base.clone(), &edits).unwrap();
+        assert_ne!(
+            without_ai.image.pixels, base.pixels,
+            "AI を通していない出力にはシャープが掛かる"
+        );
+
+        // アップスケールしたと報告するランナーを挟むと、シャープは落ちる。
+        edits.ai = Some(crate::books::BookAiSnapshot {
+            run: Box::new(|image, _cancel| {
+                Ok(crate::books::BookAiResult {
+                    image: image.clone(),
+                    used_upscale: true,
+                })
+            }),
+        });
+        let with_upscale = compose_book_page(base.clone(), &edits).unwrap();
+        assert_eq!(
+            with_upscale.image.pixels, base.pixels,
+            "アップスケールした出力にはシャープを掛けない"
         );
     }
 

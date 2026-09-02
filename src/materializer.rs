@@ -778,6 +778,7 @@ impl MaterializeSession {
                 // 段は既定の「編集まで」。呼び出し側が段を選べるようになるまで挙動は変わらない。
                 stage: crate::bake_stage::BakeStage::default(),
                 creative_lut: None,
+                ai: None,
             },
             requires_composite,
             fingerprint,
