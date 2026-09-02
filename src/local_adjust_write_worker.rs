@@ -206,6 +206,21 @@ impl LocalAdjustWriteHandle {
         self.result_rx.try_recv().ok()
     }
 
+    /// UI を止めずに待つ呼び出し側のため、現在の queue 末尾へフェンスを積む。
+    /// ACK より前の completion はすべて result channel へ送信済みになる。
+    pub(crate) fn enqueue_fence(&self) -> Result<Receiver<()>, String> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+        {
+            let mut queue = self.shared.lock();
+            if queue.stopped || !self.shared.alive.load(Ordering::Acquire) {
+                return Err("保存ワーカーが停止しています".to_string());
+            }
+            queue.items.push_back(QueueItem::Fence(ack_tx));
+        }
+        self.shared.ready.notify_one();
+        Ok(ack_rx)
+    }
+
     /// 積んである保存がすべて着地するまで待ち、結果をまとめて返す。**worker は止めない。**
     ///
     /// フェンスを 1 つ積み、その ACK を待つ。worker はキューを順に処理するので、
@@ -400,6 +415,34 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].outcome, EditStoreOutcome::Committed);
         assert_eq!(results[0].layers.as_slice(), document.as_slice());
+        assert_eq!(
+            LocalAdjustDb::open_at(&path)
+                .unwrap()
+                .get_layers("key")
+                .unwrap()
+                .as_slice(),
+            document.as_slice()
+        );
+    }
+
+    #[test]
+    fn edit_bundle_bulk_fence_ack_follows_prior_write_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_adjust.db");
+        let handle = LocalAdjustWriteHandle::spawn(path.clone());
+        let document = doc("before bulk");
+        handle.submit("key".to_string(), document.clone()).unwrap();
+        let fence = handle.enqueue_fence().unwrap();
+
+        fence
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fence must acknowledge after the queued write");
+        let completion = handle
+            .try_recv()
+            .expect("completion must be sent before the fence ACK");
+        assert_eq!(completion.outcome, EditStoreOutcome::Committed);
+        assert_eq!(completion.layers.as_slice(), document.as_slice());
+        let _ = handle.shutdown_and_collect();
         assert_eq!(
             LocalAdjustDb::open_at(&path)
                 .unwrap()

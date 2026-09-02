@@ -37,6 +37,16 @@ impl RatingViewSort {
             Self::RatedAtAsc => "★時刻↑",
         }
     }
+
+    /// カテゴリ再配置 (`grid_display_order`) を通すソートか。
+    ///
+    /// 時刻ソートは「★を付けた順に一列で見る」ことが要求そのものなので通さない。
+    /// 通すとフォルダ / アーカイブが時刻に関係なく先頭へ出て、時刻順が壊れる
+    /// (docs/next-release-backlog.md §1.142)。`Normal` はフォルダを先に見せる期待が
+    /// 残るので従来どおり通す。
+    pub fn arranges_by_category(self) -> bool {
+        matches!(self, Self::Normal(_))
+    }
 }
 
 #[derive(Clone)]
@@ -122,6 +132,26 @@ pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
         }),
         RatingViewSort::Normal(order) => rows.sort_by(|a, b| compare_row_names(a, b, order)),
     }
+}
+
+/// 行をソートし、そのまま grid の items と同位置メタデータへ落とす。
+///
+/// 時刻ソートの間はカテゴリ再配置を通さないので、返る items の順序は [`sort_rows`] の
+/// 結果と一致する (§1.142)。`Normal` のときだけ再配置を通し、`rows` も再配置後の順序へ
+/// 並べ直す。
+pub fn sort_and_materialize_rows(
+    rows: &mut Vec<RatingViewRow>,
+    sort: RatingViewSort,
+    display_order: &crate::settings::GridDisplayOrder,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    sort_rows(rows, sort);
+    crate::grid_item::materialize_view_rows(
+        rows,
+        display_order,
+        sort.arranges_by_category(),
+        |row| &row.item,
+        |row| row.image_meta,
+    )
 }
 
 fn compare_row_names(
@@ -422,6 +452,122 @@ mod tests {
             zipdir_is_archive: None,
             zipdir_representative: None,
         }
+    }
+
+    /// §1.142 用: フォルダ / アーカイブ / 画像を混ぜ、時刻 NULL を 1 件含む行集合。
+    ///
+    /// 既定の `GridDisplayOrder` は 1 行目がフォルダ + アーカイブなので、カテゴリ再配置を
+    /// 通すと時刻の新しい画像より前へフォルダ / アーカイブが繰り上がる。
+    fn mixed_rows() -> Vec<RatingViewRow> {
+        fn view_row(name: &str, item: GridItem, rated_at_ms: Option<i64>) -> RatingViewRow {
+            RatingViewRow {
+                key: name.to_string(),
+                item,
+                image_meta: Some((0, 0)),
+                rated_at_ms,
+            }
+        }
+        vec![
+            view_row(
+                "img-new",
+                GridItem::Image(PathBuf::from(r"C:\x\img-new.jpg")),
+                Some(500),
+            ),
+            view_row(
+                "dir-old",
+                GridItem::Folder(PathBuf::from(r"C:\x\dir-old")),
+                Some(100),
+            ),
+            view_row(
+                "zip-mid",
+                GridItem::ZipFile(PathBuf::from(r"C:\x\zip-mid.zip")),
+                Some(300),
+            ),
+            view_row(
+                "img-old",
+                GridItem::Image(PathBuf::from(r"C:\x\img-old.jpg")),
+                Some(200),
+            ),
+            view_row(
+                "zip-null",
+                GridItem::ZipFile(PathBuf::from(r"C:\x\zip-null.zip")),
+                None,
+            ),
+        ]
+    }
+
+    fn keys(rows: &[RatingViewRow]) -> Vec<String> {
+        rows.iter().map(|row| row.key.clone()).collect()
+    }
+
+    fn item_keys(items: &[GridItem], rows: &[RatingViewRow]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| {
+                rows.iter()
+                    .find(|row| row.item.perf_key() == item.perf_key())
+                    .expect("materialized item must come from a source row")
+                    .key
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// §1.142: ★時刻順の間はカテゴリ再配置を通さず、`sort_rows` の結果がそのまま出る。
+    #[test]
+    fn rated_at_sort_is_not_regrouped_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut expected = mixed_rows();
+        sort_rows(&mut expected, RatingViewSort::RatedAtDesc);
+        assert_eq!(
+            keys(&expected),
+            vec!["img-new", "zip-mid", "img-old", "dir-old", "zip-null"],
+            "前提: 時刻降順・NULL 末尾"
+        );
+
+        let mut rows = mixed_rows();
+        let (items, metas) =
+            sort_and_materialize_rows(&mut rows, RatingViewSort::RatedAtDesc, &display_order);
+
+        assert_eq!(keys(&rows), keys(&expected));
+        assert_eq!(item_keys(&items, &rows), keys(&expected));
+        assert_eq!(metas.len(), items.len());
+    }
+
+    /// 昇順でも同じ。NULL は昇順でも末尾に残る。
+    #[test]
+    fn rated_at_ascending_sort_is_not_regrouped_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut expected = mixed_rows();
+        sort_rows(&mut expected, RatingViewSort::RatedAtAsc);
+        assert_eq!(
+            keys(&expected),
+            vec!["dir-old", "img-old", "zip-mid", "img-new", "zip-null"]
+        );
+
+        let mut rows = mixed_rows();
+        let (items, _) =
+            sort_and_materialize_rows(&mut rows, RatingViewSort::RatedAtAsc, &display_order);
+        assert_eq!(item_keys(&items, &rows), keys(&expected));
+    }
+
+    /// `Normal` は従来どおりカテゴリ順 (1 行目 = フォルダ + アーカイブ)。
+    #[test]
+    fn normal_sort_still_groups_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut rows = mixed_rows();
+        let (items, _) = sort_and_materialize_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::FileName),
+            &display_order,
+        );
+
+        assert_eq!(
+            item_keys(&items, &rows),
+            vec!["dir-old", "zip-mid", "zip-null", "img-new", "img-old"]
+        );
+        // 行も再配置後の順序へ揃っている (idx が items と 1 対 1 で対応する)。
+        assert_eq!(keys(&rows), item_keys(&items, &rows));
     }
 
     fn write_zip_entries(zip_path: &Path, entries: &[&str]) {

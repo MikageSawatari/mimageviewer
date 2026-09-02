@@ -216,6 +216,15 @@ impl BookmarkViewSort {
             Self::CreatedAtAsc => "登録日時↑",
         }
     }
+
+    /// カテゴリ再配置 (`grid_display_order`) を通すソートか。
+    ///
+    /// 登録日時順は「登録した順に一列で見る」ことが要求そのものなので通さない。
+    /// 通すとフォルダ / アーカイブが日時に関係なく先頭へ出て、日時順が壊れる
+    /// (docs/next-release-backlog.md §1.142)。レーティング一覧と同じ規約。
+    pub fn arranges_by_category(self) -> bool {
+        matches!(self, Self::Normal(_))
+    }
 }
 
 impl BookKindFilter {
@@ -449,6 +458,26 @@ pub fn sort_rows(rows: &mut [BookmarkBrowserRow], sort: BookmarkViewSort) {
                 .then_with(|| a.stable_key().cmp(&b.stable_key()))
         }),
     }
+}
+
+/// 行をソートし、そのまま grid の items と同位置メタデータへ落とす。
+///
+/// 登録日時順の間はカテゴリ再配置を通さないので、返る items の順序は [`sort_rows`] の
+/// 結果と一致する (§1.142)。`Normal` のときだけ再配置を通し、`rows` も再配置後の順序へ
+/// 並べ直す。
+pub fn sort_and_materialize_rows(
+    rows: &mut Vec<BookmarkBrowserRow>,
+    sort: BookmarkViewSort,
+    display_order: &crate::settings::GridDisplayOrder,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    sort_rows(rows, sort);
+    crate::grid_item::materialize_view_rows(
+        rows,
+        display_order,
+        sort.arranges_by_category(),
+        |row| &row.item,
+        |row| row.image_meta,
+    )
 }
 
 pub struct BookmarkBrowserPending {
@@ -1002,6 +1031,130 @@ mod tests {
             created_at_ms,
             missing: false,
         }
+    }
+
+    /// §1.142 用: フォルダ / アーカイブ / 画像を混ぜた行集合。
+    ///
+    /// `created_at_ms` は非 Option なのでレーティング一覧のような NULL は無い。代わりに
+    /// 同時刻の 2 件を入れて `stable_key` のタイブレークも一緒に固定する。
+    fn mixed_rows() -> Vec<BookmarkBrowserRow> {
+        fn row(id: i64, created_at_ms: i64, name: &str, item: GridItem) -> BookmarkBrowserRow {
+            BookmarkBrowserRow {
+                source: BookmarkRowSource::Media {
+                    id,
+                    path: PathBuf::from(format!(r"C:\media\{name}.mp4")),
+                    pts_secs: 0.0,
+                    title: Some(name.to_string()),
+                    is_audio: false,
+                },
+                item,
+                relative_page_provenance: None,
+                image_meta: Some((0, 0)),
+                marker_thumbnail: None,
+                created_at_ms,
+                missing: false,
+            }
+        }
+        vec![
+            row(
+                1,
+                500,
+                "img-new",
+                GridItem::Image(PathBuf::from(r"C:\x\img-new.jpg")),
+            ),
+            row(
+                2,
+                100,
+                "dir-old",
+                GridItem::Folder(PathBuf::from(r"C:\x\dir-old")),
+            ),
+            row(
+                3,
+                300,
+                "zip-mid",
+                GridItem::ZipFile(PathBuf::from(r"C:\x\zip-mid.zip")),
+            ),
+            row(
+                4,
+                200,
+                "img-old",
+                GridItem::Image(PathBuf::from(r"C:\x\img-old.jpg")),
+            ),
+            row(
+                5,
+                300,
+                "zip-tie",
+                GridItem::ZipFile(PathBuf::from(r"C:\x\zip-tie.zip")),
+            ),
+        ]
+    }
+
+    fn ids(rows: &[BookmarkBrowserRow]) -> Vec<i64> {
+        rows.iter().map(|row| row.stable_key().1).collect()
+    }
+
+    fn item_ids(items: &[GridItem], rows: &[BookmarkBrowserRow]) -> Vec<i64> {
+        items
+            .iter()
+            .map(|item| {
+                rows.iter()
+                    .find(|row| row.item.perf_key() == item.perf_key())
+                    .expect("materialized item must come from a source row")
+                    .stable_key()
+                    .1
+            })
+            .collect()
+    }
+
+    /// §1.142: 登録日時順の間はカテゴリ再配置を通さず、`sort_rows` の結果がそのまま出る。
+    #[test]
+    fn created_at_sort_is_not_regrouped_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut expected = mixed_rows();
+        sort_rows(&mut expected, BookmarkViewSort::CreatedAtDesc);
+        assert_eq!(
+            ids(&expected),
+            vec![1, 3, 5, 4, 2],
+            "前提: 日時降順・同時刻は stable_key 昇順"
+        );
+
+        let mut rows = mixed_rows();
+        let (items, metas) =
+            sort_and_materialize_rows(&mut rows, BookmarkViewSort::CreatedAtDesc, &display_order);
+
+        assert_eq!(ids(&rows), ids(&expected));
+        assert_eq!(item_ids(&items, &rows), ids(&expected));
+        assert_eq!(metas.len(), items.len());
+    }
+
+    /// 昇順でも同じ。
+    #[test]
+    fn created_at_ascending_sort_is_not_regrouped_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut expected = mixed_rows();
+        sort_rows(&mut expected, BookmarkViewSort::CreatedAtAsc);
+        assert_eq!(ids(&expected), vec![2, 4, 3, 5, 1]);
+
+        let mut rows = mixed_rows();
+        let (items, _) =
+            sort_and_materialize_rows(&mut rows, BookmarkViewSort::CreatedAtAsc, &display_order);
+        assert_eq!(item_ids(&items, &rows), ids(&expected));
+    }
+
+    /// `Normal` は従来どおりカテゴリ順 (1 行目 = フォルダ + アーカイブ)。
+    #[test]
+    fn normal_sort_still_groups_by_category() {
+        let display_order = crate::settings::GridDisplayOrder::default();
+        let mut rows = mixed_rows();
+        let (items, _) = sort_and_materialize_rows(
+            &mut rows,
+            BookmarkViewSort::Normal(crate::settings::SortOrder::FileName),
+            &display_order,
+        );
+
+        assert_eq!(item_ids(&items, &rows), vec![2, 3, 5, 1, 4]);
+        // 行も再配置後の順序へ揃っている (idx が items と 1 対 1 で対応する)。
+        assert_eq!(ids(&rows), item_ids(&items, &rows));
     }
 
     #[test]

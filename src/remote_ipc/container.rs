@@ -3988,6 +3988,7 @@ impl ContainerEngine {
                 prepared.settings.ai_feature_mode,
                 prepared.settings.ai_upscale_limit,
                 prepared.settings.ai_denoise_limit,
+                None,
             )
             .ok_or_else(|| RemoteAiRunError::NotApplicable {
                 code: RemoteAiTerminalCode::SizeGate,

@@ -114,6 +114,7 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
+pub(crate) use metadata_ops::probe_image_dims_from_bytes;
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
@@ -6419,7 +6420,7 @@ pub(crate) struct AiJob {
     _local_activity: LocalAiActivityLease,
 }
 
-pub(crate) struct LocalAiActivityLease {
+pub struct LocalAiActivityLease {
     active: Arc<AtomicUsize>,
 }
 
@@ -7984,6 +7985,43 @@ impl PageOrderViewKind {
             Self::Synthetic
         } else {
             Self::Physical
+        }
+    }
+}
+
+/// 一覧のソート選択 UI を無効化する理由。
+///
+/// ツールバーとメニューは同じ理由を見て、同じ文面を出す。理由ごとに文面をその場で
+/// 書き足していたため、無効化条件も文面も入口ごとにずれていた (§1.143(a))。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GridSortLockReason {
+    /// 本として表示中 / 閲覧履歴。ページ順そのものが固定されている。
+    PageOrderFixed,
+    /// 詳細一覧の列ヘッダが並びを所有している。
+    DetailsHeaderSort,
+}
+
+impl GridSortLockReason {
+    /// 無効化中に現状を示す短い表示 (ツールバーのコンボ / メニュー項目)。
+    ///
+    /// 無効なまま選べないソート名を出すと、実際の並びと食い違ったまま黙って残る。
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::PageOrderFixed => "固定",
+            Self::DetailsHeaderSort => "列ヘッダ",
+        }
+    }
+
+    /// 無効化の理由。無効ウィジェットは通常の hover を sense しないので、
+    /// 呼び出し側は disabled 専用ツールチップで出す。
+    pub(crate) fn tooltip(self) -> &'static str {
+        match self {
+            Self::PageOrderFixed => {
+                "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
+            }
+            Self::DetailsHeaderSort => {
+                "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
+            }
         }
     }
 }
@@ -10467,6 +10505,8 @@ pub struct App {
     pub(crate) edit_bundle_paste_pending: Option<crate::edit_bundle::EditBundlePasteRequest>,
     /// 異サイズ変換 + 6 DB transaction の worker。
     pub(crate) edit_bundle_apply_pending: Option<crate::edit_bundle::EditBundleApplyPending>,
+    /// 複数ページの貼り付け / リセット。確認・実行・キャンセルを1つの型で所有する。
+    pub(crate) edit_bundle_bulk_pending: Option<crate::edit_bundle_bulk::BulkPageEditPending>,
     /// 削除対象のファイル / フォルダパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
@@ -10518,7 +10558,9 @@ pub struct App {
         Option<crate::pipeline_debug::PipelineDebugExportPending>,
     /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
     pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
-    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
+    /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
+    pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
+    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
     pub(crate) export_folder_refresh_pending: Option<PathBuf>,
@@ -13871,6 +13913,7 @@ impl App {
             edit_bundle_copy_pending: None,
             edit_bundle_paste_pending: None,
             edit_bundle_apply_pending: None,
+            edit_bundle_bulk_pending: None,
             delete_targets: Vec::new(),
             delete_confirm_label: None,
             pending_reload: false,
@@ -13892,6 +13935,7 @@ impl App {
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
+            export_batch_dialog: None,
             export_pending: None,
             export_folder_refresh_pending: None,
             pinned_compare_slot: None,
@@ -15993,6 +16037,7 @@ impl App {
             self.show_delete_confirm => "delete_confirm",
             self.edit_bundle_paste_pending.is_some() => "edit_bundle_paste_pending",
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
+            self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
             self.show_pdf_password_dialog => "pdf_password",
             self.show_about_dialog => "about",
@@ -16001,6 +16046,7 @@ impl App {
             self.slot_save_dialog.is_some() => "slot_save",
             self.favorite_default_clear_confirm.is_some() => "favorite_default_clear_confirm",
             self.export_dialog.is_some() => "export_dialog",
+            self.export_batch_dialog.is_some() => "export_batch_dialog",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
@@ -21076,6 +21122,9 @@ impl App {
         }
         self.rating_view_stars = stars;
         self.rating_view_sort = crate::rating_view::RatingViewSort::default();
+        // ビューの既定ソートを入れ直すのと同じ場所で、詳細表示の列ソートの所有権も
+        // 戻す。別フォルダの列ソートが持ち込まれて★時刻順を上書きしないように (§1.143)。
+        self.reset_details_sort_to_toolbar();
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
@@ -21347,44 +21396,14 @@ impl App {
     fn install_rating_view_rows(&mut self) {
         let previous_selected = self.selected;
         let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
-        crate::rating_view::sort_rows(&mut self.rating_view_rows, self.rating_view_sort);
-        let mut items: Vec<GridItem> = self
-            .rating_view_rows
-            .iter()
-            .map(|row| row.item.clone())
-            .collect();
-        let mut image_metas: Vec<Option<(i64, i64)>> = self
-            .rating_view_rows
-            .iter()
-            .map(|row| row.image_meta)
-            .collect();
-        // ★設定時刻順を含む rating view 固有の行内順序は維持し、カテゴリ行だけを共通
-        // helper で組み替える。Normal sort も直前の sort_rows で既に確定済み。
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
+        // ★時刻順のときはカテゴリ再配置を通さない (§1.142)。通すとフォルダ / アーカイブが
+        // 時刻に関係なく先頭へ出て、「★を付けた順に一列で見る」という要求が壊れる。
+        // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
+        let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
+            &mut self.rating_view_rows,
+            self.rating_view_sort,
             &self.settings.grid_display_order,
-            None,
         );
-        let mut rows_by_item: std::collections::HashMap<
-            String,
-            std::collections::VecDeque<crate::rating_view::RatingViewRow>,
-        > = std::collections::HashMap::new();
-        for row in self.rating_view_rows.drain(..) {
-            rows_by_item
-                .entry(row.item.perf_key())
-                .or_default()
-                .push_back(row);
-        }
-        self.rating_view_rows = items
-            .iter()
-            .map(|item| {
-                rows_by_item
-                    .get_mut(&item.perf_key())
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .expect("arranged rating item must retain its source row")
-            })
-            .collect();
         let video_items: Vec<(usize, PathBuf, u64)> = items
             .iter()
             .enumerate()
@@ -30118,6 +30137,9 @@ impl App {
         self.clear_bookmark_view_return_state();
         self.record_folder_nav_transition(&bookmark_view_synthetic_path());
         self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
+        // レーティング一覧と同じ規約 (§1.143): ビューの既定ソートを入れ直す場所で、
+        // 詳細表示の列ソートの所有権も戻す。
+        self.reset_details_sort_to_toolbar();
         self.enter_bookmark_view();
     }
 
@@ -30224,45 +30246,12 @@ impl App {
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
         let return_grid = self.take_bookmark_restore_grid();
-        crate::bookmark_browser::sort_rows(
+        // 登録日時順のときはカテゴリ再配置を通さない (§1.142、レーティング一覧と同じ規約)。
+        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
             &mut self.bookmark_browser_rows,
             self.bookmark_view_sort,
-        );
-        let mut items: Vec<GridItem> = self
-            .bookmark_browser_rows
-            .iter()
-            .map(|row| row.item.clone())
-            .collect();
-        let mut image_metas: Vec<Option<(i64, i64)>> = self
-            .bookmark_browser_rows
-            .iter()
-            .map(|row| row.image_meta)
-            .collect();
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
             &self.settings.grid_display_order,
-            None,
         );
-        let mut rows_by_item: std::collections::HashMap<
-            String,
-            std::collections::VecDeque<crate::bookmark_browser::BookmarkBrowserRow>,
-        > = std::collections::HashMap::new();
-        for row in self.bookmark_browser_rows.drain(..) {
-            rows_by_item
-                .entry(row.item.perf_key())
-                .or_default()
-                .push_back(row);
-        }
-        self.bookmark_browser_rows = items
-            .iter()
-            .map(|item| {
-                rows_by_item
-                    .get_mut(&item.perf_key())
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .expect("arranged bookmark item must retain its source row")
-            })
-            .collect();
         let installed_keys: Vec<_> = self
             .bookmark_browser_rows
             .iter()
@@ -47035,6 +47024,39 @@ impl App {
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
     }
 
+    /// 一覧のソート選択 UI を無効化する理由。無ければ選べる。
+    ///
+    /// ツールバーもメニューも必ずこの 1 つの述語を見る。片方だけが見ていると、選べるのに
+    /// 何も起きない入口が残る (§1.143(a): メニューの「ソート順」は列ヘッダ並べ替え中でも
+    /// 選べてしまい、選んでも表示は変わらなかった)。
+    pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        if self.page_order_locked_for_current_view() {
+            Some(GridSortLockReason::PageOrderFixed)
+        } else if self.details_header_sort_active() {
+            Some(GridSortLockReason::DetailsHeaderSort)
+        } else {
+            None
+        }
+    }
+
+    /// 詳細表示の列ソートの所有権を、ビュー側のソート (ツールバー / メニュー) へ戻す。
+    ///
+    /// `settings.details_sort_key` は全フォルダ共通の永続設定なので、別のフォルダで列
+    /// ヘッダを押した状態がそのままレーティング / ブックマーク一覧へ持ち込まれ、ビュー
+    /// 固有の時刻順を黙って上書きする (§1.143(a))。ビューの既定ソートを入れ直すのと同じ
+    /// 場所で戻し、以後その一覧で列ヘッダを押したときだけ列ソートが所有権を取る。
+    pub(crate) fn reset_details_sort_to_toolbar(&mut self) {
+        if self.settings.details_sort_key == crate::settings::DetailsSortKey::Toolbar
+            && self.settings.details_sort_ascending
+        {
+            return;
+        }
+        self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+        self.settings.details_sort_ascending = true;
+        self.rebuild_details_order();
+        self.settings.save();
+    }
+
     pub(crate) fn reset_details_sort_if_hidden(&mut self) {
         if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
@@ -47129,14 +47151,12 @@ impl App {
         self.details_order_revision = self.details_order_revision.wrapping_add(1);
         self.cached_nav_indices = None;
         self.cached_fs_seek_info = None;
-        let mut key = self.settings.details_sort_key;
-        let mut ascending = self.settings.details_sort_ascending;
-        if !self.details_sort_key_visible(key) {
+        if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
             self.settings.details_sort_ascending = true;
-            key = self.settings.details_sort_key;
-            ascending = self.settings.details_sort_ascending;
         }
+        let key = self.settings.details_sort_key;
+        let ascending = self.settings.details_sort_ascending;
         if key == crate::settings::DetailsSortKey::PageCount
             && !self.details_image_dims_state.is_ready()
         {
@@ -47145,10 +47165,10 @@ impl App {
             self.details_order = self.visible_indices.clone();
             return;
         }
-        if key == crate::settings::DetailsSortKey::Toolbar
-            || self.current_folder_is_book_folder()
-            || self.items_are_reading_history_view
-        {
+        // 列ヘッダが並びを所有していない状態 (ソートなし / 本のページ順 / 閲覧履歴 /
+        // そもそも詳細表示でない) では、ツールバー順をそのまま使う。所有権の判定は
+        // `details_header_sort_active` が唯一の所有者で、UI の無効化もそこから導く。
+        if !self.details_header_sort_active() {
             self.details_order = self.visible_indices.clone();
             return;
         }
@@ -47805,7 +47825,8 @@ impl App {
         }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_cw();
-        self.apply_rotation(idx, new_rot);
+        // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+        let _ = self.apply_rotation(idx, new_rot);
     }
 
     /// 指定 idx の画像を反時計回りに 90° 回転する。
@@ -47816,7 +47837,8 @@ impl App {
         }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_ccw();
-        self.apply_rotation(idx, new_rot);
+        // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+        let _ = self.apply_rotation(idx, new_rot);
     }
 
     /// 指定 idx の画像を選択された絶対角度へ設定する。
@@ -47824,24 +47846,33 @@ impl App {
         &mut self,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
-    ) {
+    ) -> Result<(), String> {
         if self.idx_is_compiled_book_page(idx) {
             self.show_feedback_toast("本のページは回転できません".to_string());
-            return;
+            return Err("本のページは回転できません".to_string());
         }
-        self.apply_rotation(idx, rotation);
+        self.apply_rotation(idx, rotation)
     }
 
-    fn apply_rotation(&mut self, idx: usize, rot: crate::rotation_db::Rotation) {
+    fn apply_rotation(
+        &mut self,
+        idx: usize,
+        rot: crate::rotation_db::Rotation,
+    ) -> Result<(), String> {
         let Some(key) = self.rotation_key_for_idx(idx) else {
-            return;
+            return Err("回転対象のページキーを取得できませんでした".to_string());
         };
         let exit_sns_split =
             self.sns_split.is_some() && self.fullscreen_idx == Some(idx) && !rot.is_none();
+        let persist_result = self
+            .rotation_db
+            .as_ref()
+            .ok_or_else(|| "回転DBを利用できません".to_string())
+            .and_then(|db| {
+                db.set_key(&key, rot)
+                    .map_err(|error| format!("回転を保存できませんでした: {error}"))
+            });
         self.rotation_cache.insert(idx, rot);
-        if let Some(ref db) = self.rotation_db {
-            let _ = db.set_key(&key, rot);
-        }
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
@@ -47856,6 +47887,7 @@ impl App {
                 crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON.to_string(),
             );
         }
+        persist_result
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -56867,7 +56899,7 @@ impl App {
             .and_then(|(_, entry)| entry.texture.clone())
     }
 
-    fn final_ai_key_for_pixels(
+    pub(crate) fn final_ai_key_for_pixels(
         &self,
         edit_key: EditResultKey,
         size: [usize; 2],
@@ -59379,7 +59411,7 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
@@ -68003,6 +68035,7 @@ impl eframe::App for App {
         let context_nav = self.show_context_menu(ctx);
         self.show_delete_confirm_dialog(ctx);
         self.show_edit_bundle_paste_confirm_dialog(ctx);
+        self.show_bulk_page_edit_dialog(ctx);
         self.show_delete_progress_dialog(ctx);
         self.show_batch_convert_progress_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
@@ -68017,6 +68050,7 @@ impl eframe::App for App {
         self.show_tray_enabled_notice_dialog(ctx);
         if self.main_window_should_draw_export_dialogs() {
             self.draw_export_dialog(ctx);
+            self.draw_export_batch_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
         }
         self.poll_pdf_enumerate();
@@ -68168,6 +68202,19 @@ impl eframe::App for App {
                 .consume_action(ctx, KeyAction::GridAddToActiveBook)
             {
                 self.add_grid_selection_to_active_book(ctx);
+            }
+            // グリッドの Ctrl+E = 選択の一括エクスポート。既定キーはフルスクリーンの
+            // `FsExport` と同じだが action は別で、割り当ても別々に変えられる。
+            //
+            // `consume_action` は chord しか見ず `KeyContext` を強制しないので、既定の
+            // まま使うとフルスクリーン中の Ctrl+E もここで拾えてしまう。Grid の action
+            // であることをこの述語で明示する。
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridExportSelection)
+            {
+                self.open_export_batch_dialog(ctx);
             }
         }
 
