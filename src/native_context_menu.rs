@@ -198,7 +198,7 @@ mod windows_impl {
         MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOSIZE, SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
         WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
-        WS_EX_TOPMOST, WS_POPUP,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
 
@@ -1460,7 +1460,15 @@ mod windows_impl {
     }
 
     struct TrackedMenuTooltip {
-        owner: HWND,
+        /// `TTTOOLINFOW.hwnd` に載せる「どの窓のツールか」。
+        ///
+        /// **この窓を `CreateWindowExW` のオーナーにはしない。** owned window は常に owner の
+        /// 上に置かれるため、`WS_EX_TOPMOST` の tooltip を main window の owned として作ると
+        /// **main が Z 順で引き上げられる**。F12 で切り離した窓や専用フルスクリーン窓の上で
+        /// 右クリックすると、メニューを出す前にメインが手前へ出ていた (backlog §1.162、
+        /// 実測で確定 2026-09-02)。tooltip は自分で位置を決めて出し入れし、Drop で壊すので、
+        /// owner 関係を持つ必要が無い。
+        tool_window: HWND,
         hwnd: HWND,
         reasons: std::collections::HashMap<u32, String>,
         text: Vec<u16>,
@@ -1469,7 +1477,7 @@ mod windows_impl {
 
     impl TrackedMenuTooltip {
         fn new(
-            owner: HWND,
+            tool_window: HWND,
             reasons: std::collections::HashMap<u32, String>,
         ) -> Result<Self, String> {
             let common_controls = INITCOMMONCONTROLSEX {
@@ -1484,7 +1492,8 @@ mod windows_impl {
             }
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_TOPMOST,
+                    // `WS_EX_TOOLWINDOW`: owner を持たない popup がタスクバーへ出ないように。
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                     TOOLTIPS_CLASSW,
                     PCWSTR::null(),
                     WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
@@ -1492,7 +1501,8 @@ mod windows_impl {
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
-                    Some(owner),
+                    // owner を渡さない。理由は `tool_window` の doc comment を参照。
+                    None,
                     None,
                     None,
                     None,
@@ -1512,7 +1522,7 @@ mod windows_impl {
             };
             unsafe { SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(500))) };
             Ok(Self {
-                owner,
+                tool_window,
                 hwnd,
                 reasons,
                 text: Vec::new(),
@@ -1524,7 +1534,7 @@ mod windows_impl {
             TTTOOLINFOW {
                 cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
                 uFlags: TTF_TRACK | TTF_ABSOLUTE,
-                hwnd: self.owner,
+                hwnd: self.tool_window,
                 uId: 1,
                 lpszText: PWSTR(self.text.as_mut_ptr()),
                 ..Default::default()
