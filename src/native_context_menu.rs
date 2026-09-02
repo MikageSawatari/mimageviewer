@@ -194,10 +194,10 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DeleteMenu, DestroyMenu,
-        DestroyWindow, GetCursorPos, GetForegroundWindow, HMENU, HWND_TOPMOST, MF_BYPOSITION,
-        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-        WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
+        DestroyWindow, GetCursorPos, HMENU, HWND_TOPMOST, MF_BYPOSITION, MF_GRAYED, MF_POPUP,
+        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_STYLE,
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
@@ -347,35 +347,9 @@ mod windows_impl {
         }
     }
 
-    /// 診断: このスレッドの top-level 窓を Z 順 (手前から) に並べて返す。
-    ///
-    /// 前面窓 (`GetForegroundWindow`) は変わっていないのに「メインが手前に来る」と
-    /// 見えているので、**動いているのは activation ではなく Z 順**という仮説を確かめる
-    /// (backlog §1.162)。原因が確定したら消す。
-    fn diagnostic_z_order() -> String {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GW_HWNDNEXT, GetDesktopWindow, GetTopWindow, GetWindow, GetWindowThreadProcessId,
-            IsWindowVisible,
-        };
-        let mut out = Vec::new();
-        unsafe {
-            let mut hwnd = GetTopWindow(Some(GetDesktopWindow())).unwrap_or_default();
-            let own_tid = windows::Win32::System::Threading::GetCurrentThreadId();
-            while !hwnd.is_invalid() && out.len() < 8 {
-                let tid = GetWindowThreadProcessId(hwnd, None);
-                if tid == own_tid && IsWindowVisible(hwnd).as_bool() {
-                    out.push(format!("0x{:x}", hwnd.0 as usize as u64));
-                }
-                hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
-            }
-        }
-        out.join(">")
-    }
-
     pub(super) fn show_native_context_menu(
         request: NativeContextMenuRequest,
     ) -> NativeContextMenuResult {
-        let z_at_entry = diagnostic_z_order();
         if request.hwnd == 0 {
             return NativeContextMenuResult::Fallback {
                 reason: "main HWND is not available".to_string(),
@@ -410,7 +384,6 @@ mod windows_impl {
             miv_count,
             &[],
         );
-        let z_com_init = diagnostic_z_order();
 
         let stage_t0 = Instant::now();
         let menu = match unsafe { CreatePopupMenu() } {
@@ -429,7 +402,6 @@ mod windows_impl {
             miv_count,
             &[],
         );
-        let z_create_popup = diagnostic_z_order();
 
         let stage_t0 = Instant::now();
         let mut leaf_index = 0;
@@ -450,7 +422,6 @@ mod windows_impl {
             miv_count,
             &[],
         );
-        let z_append_miv = diagnostic_z_order();
 
         let hwnd = HWND(request.hwnd as *mut core::ffi::c_void);
         let shell_menu = if let Some(folder) = request.background_folder.as_ref() {
@@ -531,13 +502,10 @@ mod windows_impl {
             }
         }
 
-        let z_shell_built = diagnostic_z_order();
         let stage_t0 = Instant::now();
         let shell_forwarder = shell_menu
             .as_ref()
             .map(|menu| ContextMenuMessageForwarder::new(menu, lazy_shell_submenu));
-        let z_forwarder = diagnostic_z_order();
-        let disabled_reason_count = disabled_reasons.len();
         let tooltip = if disabled_reasons.is_empty() {
             None
         } else {
@@ -551,7 +519,6 @@ mod windows_impl {
                 }
             }
         };
-        let z_tooltip = diagnostic_z_order();
         let message_state = MenuMessageState {
             shell: shell_forwarder,
             tooltip,
@@ -568,7 +535,6 @@ mod windows_impl {
             miv_count,
             &[],
         );
-        let z_subclass = diagnostic_z_order();
 
         let (screen_x, screen_y) = cursor_screen_pos().unwrap_or(request.screen_pos);
         let pre_track_ms = elapsed_ms(total_t0);
@@ -588,11 +554,6 @@ mod windows_impl {
             miv_count,
         );
         let track_t0 = Instant::now();
-        // 診断: どの窓をオーナーにしてメニューを出し、その前後で前面窓が変わるか。
-        // 「F12 の別窓で右クリックするとメインが前に出る」の機構を推測でなく実測で決めるため
-        // (backlog §1.162)。原因が確定したら消す。
-        let foreground_before = unsafe { GetForegroundWindow().0 as usize as u64 };
-        let z_before_track = diagnostic_z_order();
         let selected = unsafe {
             TrackPopupMenuEx(
                 menu.handle(),
@@ -604,16 +565,6 @@ mod windows_impl {
             )
             .0 as u32
         };
-        {
-            let foreground_after = unsafe { GetForegroundWindow().0 as usize as u64 };
-            let owner = hwnd.0 as usize as u64;
-            crate::logger::log(format!(
-                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_com={z_com_init} z_popup={z_create_popup} z_miv={z_append_miv} z_shell={z_shell_built} z_fwd={z_forwarder} z_tip={z_tooltip} disabled_reasons={disabled_reason_count} z_subclass={z_subclass} z_pre_track={z_before_track} z_after={}",
-                foreground_before == owner,
-                foreground_before != foreground_after,
-                diagnostic_z_order(),
-            ));
-        }
         message_state.hide_tooltip();
         emit_native_menu_timing(
             "show_track_popup_block",
@@ -1473,8 +1424,6 @@ mod windows_impl {
         reasons: std::collections::HashMap<u32, String>,
         text: Vec<u16>,
         active_id: Option<u32>,
-        /// 診断: ログを出した回数 (出しっぱなしにしない)。
-        probes: u32,
     }
 
     impl TrackedMenuTooltip {
@@ -1529,7 +1478,6 @@ mod windows_impl {
                 reasons,
                 text: Vec::new(),
                 active_id: None,
-                probes: 0,
             })
         }
 
@@ -1557,18 +1505,6 @@ mod windows_impl {
 
         fn handle_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) {
             let selection = menu_tooltip_selection(wparam.0, lparam.0);
-            if self.probes < 24 {
-                self.probes += 1;
-                let known: Vec<String> = self.reasons.keys().map(|id| format!("{id}")).collect();
-                crate::logger::log(format!(
-                    "menu_tooltip: select flags=0x{:04x} id={} decision={:?} has_reason={} known=[{}]",
-                    (wparam.0 >> 16) & 0xffff,
-                    wparam.0 & 0xffff,
-                    selection,
-                    matches!(selection, MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id)),
-                    known.join(","),
-                ));
-            }
             match selection {
                 MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id) => self.show(id),
                 MenuTooltipSelection::Hide | MenuTooltipSelection::Show(_) => self.hide(),
@@ -1615,18 +1551,6 @@ mod windows_impl {
                     Some(WPARAM(1)),
                     Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
                 );
-            }
-            if self.probes < 24 {
-                self.probes += 1;
-                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
-                crate::logger::log(format!(
-                    "menu_tooltip: shown id={id} added={} cursor=({},{}) visible={} tip_hwnd=0x{:x}",
-                    added.0,
-                    cursor.x,
-                    cursor.y,
-                    unsafe { IsWindowVisible(self.hwnd) }.as_bool(),
-                    self.hwnd.0 as usize as u64,
-                ));
             }
             self.active_id = Some(id);
         }
