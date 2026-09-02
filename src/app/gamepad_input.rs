@@ -2280,7 +2280,9 @@ impl App {
     /// 呼ぶ (2026-08-29 レビュー R-02)。
     pub(crate) fn sample_gamepad_input(&mut self, ctx: &egui::Context) -> GamepadFrameBatch {
         let now = Instant::now();
-        let events = self.gamepad.drain(ctx);
+        // 無効なら読まない。runtime 側が読み取りスレッドごと止めるので、
+        // 「反応しないのに UI だけ起き続ける」状態にはならない。
+        let events = self.gamepad.drain(ctx, self.settings.gamepad_enabled);
         let mut actions = Vec::new();
         let mut saw_input_event = false;
 
@@ -7730,6 +7732,33 @@ mod tests {
         update_mouse_middle_click_state,
     };
     use crate::adjustment::PostFilter;
+
+    /// 「ゲームパッドの操作を受け付ける」を切ったら、本当に届かない。
+    ///
+    /// `GamepadRuntime` 側の停止契約とは別に、**App がその設定を渡しているか**を見る。
+    /// 設定を無視して常に読む形へ戻すと落ちる。
+    #[test]
+    fn turning_the_pad_off_keeps_its_input_out_of_the_frame() {
+        use crate::gamepad::PadEvent;
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+
+        app.settings.gamepad_enabled = false;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(
+            batch.actions.is_empty(),
+            "無効のあいだはボタンを押しても操作にならない"
+        );
+
+        app.settings.gamepad_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::South));
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(!batch.actions.is_empty(), "有効に戻したら届く");
+    }
     use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};
     use crate::ring_shortcut::{

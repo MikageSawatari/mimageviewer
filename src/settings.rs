@@ -4113,6 +4113,20 @@ pub struct Settings {
     /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
+    /// グリッド選択の一括エクスポートの保存先。単ページの `export_last_directory` とは
+    /// 別に持つ (一括は「送信用」など決まったフォルダへ繰り返し出す使い方が主で、
+    /// 単ページの直前保存先で上書きされると毎回選び直しになる)。
+    #[serde(default)]
+    pub export_batch_directory: Option<PathBuf>,
+    /// 一括エクスポートのファイル名テンプレート (`<filename>` / `<dirname>` / `<num>`)。
+    #[serde(default = "default_export_batch_template")]
+    pub export_batch_template: String,
+    /// 一括エクスポートの出力形式。
+    #[serde(default)]
+    pub export_batch_format: crate::capture::CaptureFormat,
+    /// 一括エクスポートの出力サイズ。
+    #[serde(default)]
+    pub export_batch_scale: crate::export_dialog::ExportScale,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -4251,6 +4265,13 @@ pub struct Settings {
     /// 連結読みの左スティック最大入力時スクロール速度 (画面サイズ比 %/秒)。
     #[serde(default = "default_continuous_reading_gamepad_scroll_percent_per_sec")]
     pub continuous_reading_gamepad_scroll_percent_per_sec: u32,
+    /// ゲームパッドからの操作を受け付けるか。false のときは**デバイスを読む
+    /// スレッドごと止める** (`GamepadRuntime::drain`)。読み捨てるだけだと、
+    /// スティックのずれで UI が起き続ける。
+    ///
+    /// 対象はゲームパッドだけで、マウスジェスチャ・リングフリックは含まない。
+    #[serde(default = "default_gamepad_enabled")]
+    pub gamepad_enabled: bool,
 
     /// ZIP/PDF/対応アーカイブを一覧や起動引数/SendTo から明示的に開いたとき、
     /// ページ一覧を経由せずページを即フルスクリーンで開く。ON のときフルスクリーン中の
@@ -4642,6 +4663,17 @@ pub struct Settings {
     /// どうかを表す state ではなく、明示的な復元先だけを所有する。
     #[serde(default, alias = "video_seek_strip_mode")]
     pub video_seek_strip_last_choice: VideoSeekStripMode,
+    /// ストリップが動画のどこを写すか (周辺 / 全体)。表示内容と直交するので、
+    /// 場面と波形を行き来しても選択を保つ。
+    #[serde(default)]
+    pub video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan,
+    /// ストリップの高さ (大 / 中 / 小 / 最小)。
+    #[serde(default)]
+    pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// `Shift+S` の巡回に含める表示。**機能自体の非表示ではない** — 外した表示も
+    /// 右下のメニューからは選べる。全解除は `sanitize` が既定へ戻す。
+    #[serde(default)]
+    pub video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -5722,6 +5754,10 @@ fn default_continuous_reading_wheel_scroll_percent() -> u32 {
 fn default_continuous_reading_key_scroll_percent() -> u32 {
     16
 }
+fn default_gamepad_enabled() -> bool {
+    true
+}
+
 fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
     130
 }
@@ -5752,6 +5788,11 @@ pub fn default_rating_filter() -> [bool; 6] {
 
 /// `Ctrl+E` ダイアログのバリエーションチェック初期値。
 /// `[現在の設定, プリセット 1, 2, 3, 4]` → 現在の設定だけ ON。
+/// 既定のテンプレート。単ページ `Ctrl+E` の既定ファイル名 (`<元の名前>_edited`) に揃える。
+pub fn default_export_batch_template() -> String {
+    "<filename>_edited".to_string()
+}
+
 pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
@@ -5999,6 +6040,7 @@ impl Default for Settings {
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
             continuous_reading_gamepad_scroll_percent_per_sec:
                 default_continuous_reading_gamepad_scroll_percent_per_sec(),
+            gamepad_enabled: default_gamepad_enabled(),
             auto_fullscreen_zip_pdf: false,
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
@@ -6127,6 +6169,9 @@ impl Default for Settings {
             video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
             video_seek_strip_state: VideoSeekStripState::default(),
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
+            video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
+            video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_seek_strip_locked: false,
@@ -6190,6 +6235,10 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            export_batch_directory: None,
+            export_batch_template: default_export_batch_template(),
+            export_batch_format: crate::capture::CaptureFormat::default(),
+            export_batch_scale: crate::export_dialog::ExportScale::default(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -7665,6 +7714,8 @@ impl Settings {
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
             .last_choice(self.video_seek_strip_last_choice);
+        // 巡回対象を全部外した設定は `Shift+S` を無反応にする。読み込み時に既定へ戻す。
+        self.video_seek_strip_cycle = self.video_seek_strip_cycle.normalized();
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -8333,6 +8384,25 @@ impl Settings {
 mod tests {
     use super::*;
 
+    /// ゲームパッドの有効/無効は既定 true。設定を知らない頃のファイルを読んでも、
+    /// 既存利用者のパッドを黙って切らない。
+    #[test]
+    fn the_gamepad_stays_enabled_unless_it_was_turned_off_on_purpose() {
+        assert!(Settings::default().gamepad_enabled);
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            missing.gamepad_enabled,
+            "この設定を知らない頃のファイルでも、パッドは有効のまま"
+        );
+
+        let turned_off: Settings = serde_json::from_str(r#"{"gamepad_enabled":false}"#).unwrap();
+        assert!(!turned_off.gamepad_enabled);
+        let round_tripped: Settings =
+            serde_json::from_str(&serde_json::to_string(&turned_off).unwrap()).unwrap();
+        assert!(!round_tripped.gamepad_enabled, "切った状態は次回も残る");
+    }
+
     #[test]
     fn sns_split_settings_have_stable_defaults() {
         let defaults = Settings::default();
@@ -8508,6 +8578,63 @@ mod tests {
             loaded.video_seek_strip_last_choice,
             VideoSeekStripMode::Waveform
         );
+    }
+
+    /// 表示範囲・高さ・巡回対象は保存され、既定は従来の見え方のまま。
+    #[test]
+    fn video_seek_strip_span_height_and_cycle_round_trip_with_the_shipped_defaults() {
+        use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripSpan};
+
+        // 既定は出荷済みの見え方 (周辺表示・大) で、更新しても見た目が変わらない。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Window);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Large);
+        assert_eq!(
+            loaded.video_seek_strip_cycle,
+            crate::video::seek_strip_layout::SeekStripCycleSet::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_span = SeekStripSpan::Whole;
+        settings.video_seek_strip_height = SeekStripHeight::Smallest;
+        settings.video_seek_strip_cycle.waveform_whole = false;
+        let stored = serde_json::to_value(settings).unwrap();
+        assert_eq!(stored["video_seek_strip_span"], "whole");
+        assert_eq!(stored["video_seek_strip_height"], "smallest");
+        assert_eq!(stored["video_seek_strip_cycle"]["waveform_whole"], false);
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Whole);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Smallest);
+        assert!(!loaded.video_seek_strip_cycle.waveform_whole);
+        assert!(loaded.video_seek_strip_cycle.thumbnails_window);
+    }
+
+    /// 巡回対象を全部外した設定は読み込みで既定へ戻す。そのままだと `Shift+S` が
+    /// 「非表示 → 非表示」になり、キーが無反応になる。
+    #[test]
+    fn sanitize_restores_a_seek_strip_cycle_that_has_nothing_left_in_it() {
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: false,
+        };
+        settings.sanitize();
+        assert!(settings.video_seek_strip_cycle.thumbnails_window);
+
+        // 1 つでも残っていれば、その選択をそのまま尊重する。
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: true,
+        };
+        settings.sanitize();
+        assert!(!settings.video_seek_strip_cycle.thumbnails_window);
+        assert!(settings.video_seek_strip_cycle.waveform_whole);
     }
 
     #[test]

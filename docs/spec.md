@@ -859,14 +859,23 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   左右パネル表示に応じて必要なバーを表示する。固定解除後はその自動表示へ直ちに戻る。
 - 動画シークバーはトラック下側に秒 / 分 / 時間の目盛りを描き、幅に応じて許可系列から間引く。
   描画順は進捗塗り → 目盛り → chapter / bookmark / pin とし、既存マーカーを前面に保つ。
-- 動画シークストリップの保存状態は `Settings.video_seek_strip_state` の
-  `none / thumbnails / waveform` の 3 値ひとつとし、開閉 bool と mode を分けない。
-  `VideoSeekStripCycle` (既定 `Shift+S`) は「なし → サムネイル → 波形 → なし」を巡回する。
+- 動画シークストリップの表示状態は、非表示を含む 5 値 (表示内容 `none / thumbnails / waveform`
+  × 表示範囲 `window / whole`) ひとつとし、開閉 bool と内容と範囲を分けない。内容は
+  `Settings.video_seek_strip_state`、範囲は `Settings.video_seek_strip_span` が持ち、
+  合わせるのは `App::video_seek_strip_view()` の 1 か所だけ。
+  `VideoSeekStripCycle` (既定 `Shift+S`) は「なし → 場面 (周辺) → 場面 (全体) → 波形 (周辺) →
+  波形 (全体) → なし」を巡回し、`Settings.video_seek_strip_cycle` で外した表示は飛ばす。
+  全解除は読み込み時に「場面 (周辺)」だけ有効へ正規化する。
   既定 chord なしの `VideoSeekStripToggle` は表示 / 非表示を切り替えて、再表示時は最後の
   non-none 選択を復元する。`VideoSeekStripNone` / `VideoSeekStripThumbnails` /
-  `VideoSeekStripWaveform` は指定状態へ直接移る。
+  `VideoSeekStripWaveform` は表示範囲を保ったまま指定内容へ直接移る。
   シークバーから上へドラッグした場合は、明示保存した最後の non-none 選択へ戻す。
-  下部ロックボタンの左にベクター描画のフィルムアイコンを置き、1 クリックで同じ順に巡回する。
+  全体表示では帯の中身を動かさず、赤線を `再生位置 / 尺` へ写す。中心位置は状態ではなく
+  導出値とし、ポインタが指した時刻へ 1 回 seek する。範囲の段階値もホイールも持たない。
+  帯の高さは `Settings.video_seek_strip_height` (大 104 / 中 72 / 小 48 / 最小 36pt) の 1 か所で
+  解決し、描画・入力・映像の予約・波形ラスタの要求が同じ値を見る。
+  下部ロックボタンの左にベクター描画のフィルムアイコンを置き、クリックで非表示・4 表示・
+  3 段の高さを直接選ぶメニューを開く (巡回から外した表示にもここから届く)。
   OFF は非アクティブ表示、波形はフィルム上にベクター描画の音符を重ねる。ストリップ本体は全域を
   ドラッグ面とし、モード切替 UI は置かない。
 - ストリップ上のホイールは上回転で範囲を 1 段狭く、下回転で 1 段広くし、その設定を即時保存する。
@@ -1871,6 +1880,9 @@ Ctrl+C / Ctrl+X / Ctrl+V も同じ Shell verb ヘルパーを使い、コピー 
 | `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
 | `video_top_bar_locked` | bool | false | 動画の上部情報バーを固定表示する。ON のときは上端のバー領域と共通余白を映像フィット範囲から除外する。静止画設定とは独立 |
 | `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
+| `video_seek_strip_span` | enum | `window` | シークストリップが動画のどこを写すか。`window` = 再生位置の周辺、`whole` = 動画全体を帯の横幅へ収める。表示内容 (場面 / 波形) と直交し、行き来しても保つ |
+| `video_seek_strip_height` | enum | `large` | シークストリップの高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt。低いほど全体表示で一度に並ぶ枚数が増える |
+| `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
@@ -2229,9 +2241,21 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
 - 出力サイズは「そのまま」「1/2 サイズ」「1/4 サイズ」から選ぶ。crop / 見開き / 隠蔽プリセット合成後の画像を基準に Lanczos3 で縮小し、既定値は `Settings::export_default_scale` に保存する。
 - JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。JPEG の Orientation は表示で回転済みの画素と一致するよう正規化する。
-- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。
+- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。一覧からの一括エクスポートは別系統の設定を持つ (下記)。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
 - 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
+- 隠蔽プリセット出力 (`_1`〜`_4`) は表示スナップショットへマスクを重ねるのではなく、**隠蔽適用前の段 (`raw → 消しゴム → 補正レイヤー`) から表示と同じ順で合成し直す**。`隠蔽 → 色補正 / final AI → シャープ → カラー化 → LUT → post filter → 注釈` を `export_dialog::compose_conceal_variant` が再実行し、final AI もプリセットごとに掛け直す。`_0` は表示スナップショットをそのまま書き出す。段を落とすと `_0` と寸法から食い違うため、製本の「表示専用段を飛ばす」規則はここへ持ち込まない。詳細は [display-pipeline.md](display-pipeline.md) §3.0。
+
+### 一覧からの一括エクスポート
+
+- サムネイル一覧で複数選択 (チェック優先、無ければカーソル選択) して `Ctrl+E` を押すと、一括エクスポートダイアログを開く。選択の解釈は「本へ追加」と同じ `grid_selection_indices` を使う。
+- 対象は `Image` / `ZipImage` / `PdfPage` とファイル名スタックのメンバー。フォルダ / 動画 / 音声 / 書庫そのものは除外し、**件数をダイアログに表示する** (黙って落とさない)。
+- 1 件ぶんの「デコード → 合成 → 縮小 → エンコード → 書き出し」は製本と同じ `books::write_composited_page` を通る。編集の有無にかかわらず必ず合成経路を使う (出力形式とサイズを選ぶので無編集の byte copy では要求を満たせない)。`append_pages_at` は経由しない (ページ採番 / 上限 / `restore_declines` など本固有の処理が付いてくるため)。
+- 出力名はテンプレート。置換子は `<filename>` (`capture_basename_for_idx` と同じ自己識別名) / `<dirname>` (元があったフォルダ名) / `<num>` (4 桁連番)。未知の `<...>` は展開せず残す。禁止文字は `_` へ置換する。同名は上書きせず末尾に連番を付ける (既存ファイルと、その実行で既に書いた名前の両方を避ける)。
+- 出力形式は `CaptureFormat` (PNG / JPEG 95 / 85 / 75)。`BakedEditSnapshot::format` を書き出し直前に上書きする。メタデータ転記は行わない (製本ページと同じく新しい完成画像として扱う)。
+- 進捗とキャンセルは単ページと同じ `ExportEvent` / `ExportPending` / `poll_export_pending` を共有する。
+- 永続化設定は `Settings::export_batch_directory` / `export_batch_template` / `export_batch_format` / `export_batch_scale`。保存先は単ページの `export_last_directory` とは別に持つ (一括は決まったフォルダへ繰り返し出す使い方が主なため)。
+- キーは `KeyContext::Grid` の `KeyAction::GridExportSelection` (既定 `Ctrl+E`)。フルスクリーンの `FsExport` と既定キーは同じだが action は別に持つ。1 つへまとめると、利用者が保存済みの keymap 上書き (action 名がキー) の意味が黙って変わるため。`consume_action` は `KeyContext` を強制しないので、呼び出し側でフルスクリーン表示中を除外する。
 
 ### SNS 分割書き出し
 

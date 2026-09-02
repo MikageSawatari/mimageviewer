@@ -6420,7 +6420,7 @@ pub(crate) struct AiJob {
     _local_activity: LocalAiActivityLease,
 }
 
-pub(crate) struct LocalAiActivityLease {
+pub struct LocalAiActivityLease {
     active: Arc<AtomicUsize>,
 }
 
@@ -7665,6 +7665,19 @@ pub(crate) enum ActionSurface {
     MainWindow,
     /// ビューア面 (メイン fullscreen / detached viewer / native 動画 overlay)。
     Viewer,
+}
+
+/// `check_external_folder_changes` を呼ぶ理由。
+///
+/// フォルダーの mtime を安いふるいとして使ってよいかが、これで決まる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalChangeCheck {
+    /// フォルダー監視が変化を通知してきた。**ふるいを通さない** — ファイルの中身だけが
+    /// 書き換わった場合、フォルダーの mtime は動かないため。
+    Notified,
+    /// フォーカス復帰やトレイからの復帰。契機が「戻ってきた」だけなので、毎回 read_dir
+    /// しないようフォルダーの mtime でふるう。
+    Resumed,
 }
 
 /// タグ操作の保留 Undo entry を集計するためのバッファ。
@@ -10545,7 +10558,9 @@ pub struct App {
         Option<crate::pipeline_debug::PipelineDebugExportPending>,
     /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
     pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
-    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
+    /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
+    pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
+    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
     pub(crate) export_folder_refresh_pending: Option<PathBuf>,
@@ -13920,6 +13935,7 @@ impl App {
             book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
+            export_batch_dialog: None,
             export_pending: None,
             export_folder_refresh_pending: None,
             pinned_compare_slot: None,
@@ -16030,6 +16046,7 @@ impl App {
             self.slot_save_dialog.is_some() => "slot_save",
             self.favorite_default_clear_confirm.is_some() => "favorite_default_clear_confirm",
             self.export_dialog.is_some() => "export_dialog",
+            self.export_batch_dialog.is_some() => "export_batch_dialog",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
@@ -17667,7 +17684,7 @@ impl App {
             ctx.request_repaint_after(delay);
         }
         if should_check {
-            self.check_external_folder_changes();
+            self.check_external_folder_changes(ExternalChangeCheck::Notified);
         }
     }
 
@@ -17821,7 +17838,7 @@ impl App {
     ///
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
     /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
-    pub(crate) fn check_external_folder_changes(&mut self) {
+    pub(crate) fn check_external_folder_changes(&mut self, reason: ExternalChangeCheck) {
         if self.global_search.active || self.tag_view.active {
             return;
         }
@@ -17836,9 +17853,6 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
-        let Some(prev_mtime) = self.current_folder_last_mtime else {
-            return;
-        };
         let Ok(meta) = folder.metadata() else {
             return;
         };
@@ -17848,8 +17862,20 @@ impl App {
         let Ok(new_mtime) = meta.modified() else {
             return;
         };
-        if new_mtime == prev_mtime {
-            return;
+        // フォルダーの mtime は**安いふるい**であって、変化の有無そのものではない。
+        // NTFS では、フォルダーの mtime が動くのは項目の追加 / 削除 / 改名のときだけで、
+        // **中のファイルが上書きされても動かない** (実測 2026-09-02)。外部ツールへ渡した
+        // 実ファイルが編集ソフトで保存し直された場合がこれに当たる。
+        //
+        // なので、監視が「変わった」と言ってきたときはふるいを通さない。ふるいが要るのは
+        // 契機が「戻ってきた」だけで、毎回 read_dir すると重い経路だけ。
+        if reason == ExternalChangeCheck::Resumed {
+            let Some(prev_mtime) = self.current_folder_last_mtime else {
+                return;
+            };
+            if new_mtime == prev_mtime {
+                return;
+            }
         }
         // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
         // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
@@ -56873,7 +56899,7 @@ impl App {
             .and_then(|(_, entry)| entry.texture.clone())
     }
 
-    fn final_ai_key_for_pixels(
+    pub(crate) fn final_ai_key_for_pixels(
         &self,
         edit_key: EditResultKey,
         size: [usize; 2],
@@ -59385,7 +59411,7 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
@@ -66873,7 +66899,7 @@ impl eframe::App for App {
         // 全ユーザで動かす。
         let main_focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if main_focused_now && !self.last_main_focused && self.window_visible {
-            self.check_external_folder_changes();
+            self.check_external_folder_changes(ExternalChangeCheck::Resumed);
         }
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
@@ -68024,6 +68050,7 @@ impl eframe::App for App {
         self.show_tray_enabled_notice_dialog(ctx);
         if self.main_window_should_draw_export_dialogs() {
             self.draw_export_dialog(ctx);
+            self.draw_export_batch_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
         }
         self.poll_pdf_enumerate();
@@ -68175,6 +68202,19 @@ impl eframe::App for App {
                 .consume_action(ctx, KeyAction::GridAddToActiveBook)
             {
                 self.add_grid_selection_to_active_book(ctx);
+            }
+            // グリッドの Ctrl+E = 選択の一括エクスポート。既定キーはフルスクリーンの
+            // `FsExport` と同じだが action は別で、割り当ても別々に変えられる。
+            //
+            // `consume_action` は chord しか見ず `KeyContext` を強制しないので、既定の
+            // まま使うとフルスクリーン中の Ctrl+E もここで拾えてしまう。Grid の action
+            // であることをこの述語で明示する。
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridExportSelection)
+            {
+                self.open_export_batch_dialog(ctx);
             }
         }
 
