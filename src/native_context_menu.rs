@@ -347,9 +347,35 @@ mod windows_impl {
         }
     }
 
+    /// 診断: このスレッドの top-level 窓を Z 順 (手前から) に並べて返す。
+    ///
+    /// 前面窓 (`GetForegroundWindow`) は変わっていないのに「メインが手前に来る」と
+    /// 見えているので、**動いているのは activation ではなく Z 順**という仮説を確かめる
+    /// (backlog §1.162)。原因が確定したら消す。
+    fn diagnostic_z_order() -> String {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GW_HWNDNEXT, GetDesktopWindow, GetTopWindow, GetWindow, GetWindowThreadProcessId,
+            IsWindowVisible,
+        };
+        let mut out = Vec::new();
+        unsafe {
+            let mut hwnd = GetTopWindow(Some(GetDesktopWindow())).unwrap_or_default();
+            let own_tid = windows::Win32::System::Threading::GetCurrentThreadId();
+            while !hwnd.is_invalid() && out.len() < 8 {
+                let tid = GetWindowThreadProcessId(hwnd, None);
+                if tid == own_tid && IsWindowVisible(hwnd).as_bool() {
+                    out.push(format!("0x{:x}", hwnd.0 as usize as u64));
+                }
+                hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+            }
+        }
+        out.join(">")
+    }
+
     pub(super) fn show_native_context_menu(
         request: NativeContextMenuRequest,
     ) -> NativeContextMenuResult {
+        let z_at_entry = diagnostic_z_order();
         if request.hwnd == 0 {
             return NativeContextMenuResult::Fallback {
                 reason: "main HWND is not available".to_string(),
@@ -558,6 +584,7 @@ mod windows_impl {
         // 「F12 の別窓で右クリックするとメインが前に出る」の機構を推測でなく実測で決めるため
         // (backlog §1.162)。原因が確定したら消す。
         let foreground_before = unsafe { GetForegroundWindow().0 as usize as u64 };
+        let z_before_track = diagnostic_z_order();
         let selected = unsafe {
             TrackPopupMenuEx(
                 menu.handle(),
@@ -573,9 +600,10 @@ mod windows_impl {
             let foreground_after = unsafe { GetForegroundWindow().0 as usize as u64 };
             let owner = hwnd.0 as usize as u64;
             crate::logger::log(format!(
-                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind}",
+                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_pre_track={z_before_track} z_after={}",
                 foreground_before == owner,
                 foreground_before != foreground_after,
+                diagnostic_z_order(),
             ));
         }
         message_state.hide_tooltip();
