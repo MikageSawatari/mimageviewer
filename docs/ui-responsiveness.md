@@ -27,6 +27,7 @@ UI スレッドをブロックしないための設計方針と、2026-04 の Ct
 | `std::fs::read_dir` + **`Path::is_dir()` / `Path::is_file()`** per-entry | Windows では per-entry で `GetFileAttributes` syscall。500 ファイルで 500-1000ms | `DirEntry::file_type()` を使う (`FindFirstFile` のキャッシュ再利用) |
 | DFS フォルダ走査 (`navigate_folder_with_skip`) | HDD で 20-300ms、最悪 1s+ | 常に別スレッド (`spawn_folder_nav`) |
 | SQLite の `search()` (FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| Windows Shell の `IContextMenu::QueryContextMenu` | シェル拡張が多い環境で 1.2〜1.4 秒 | 右クリック直後には呼ばず、既定では「Windows のメニュー」の `WM_INITMENUPOPUP` まで遅延する。同階層へ併記する設定では従来どおり同期コストを受け入れる |
 
 ### 1.1 Windows 固有: `Path::is_dir` は syscall、`DirEntry::file_type` はキャッシュ
 
@@ -140,6 +141,20 @@ prefix preview、CPU 完成済み `edit_result` の lazy texture 化も含む。
 
 各イベントは対象 `key` / `seq` と `ms` も持つ。`upload` だけが UI thread stage であり、
 DB / decode / raster / compose の長さと分けて追跡する。
+
+### 2.1.1 外部受け渡し実体化 worker
+
+外部ツールへ ZIP / PDF page や加工済み画像を渡す P3 materializer も同じ境界を使う。
+UI は対象、payload policy、ページ key、補正の軽量 snapshot、items generation だけを要求へ詰め、
+ファイル metadata、補正 DB の read-only open / SELECT、ZIP read、decode、合成、encode、外部起動は
+`external-tool-materialize` worker に閉じる。UI は atomic progress と completion channel を poll し、
+cancel、新要求、対象移動では token / materializer generation を進めて古い結果を起動境界へ通さない。
+worker は実体化後、UI が同じ frame の進捗 modal の Cancel / Esc と、その後の items mutation を
+先に処理し、frame tail で items generation と起動元 viewer target を再検証して launch ACK を
+返すまで待つ。進捗表示後に積まれた新要求は次 frame の UI checkpoint まで ACK しない。
+ACK 後はキャンセル操作を表示しない。
+この handshake により、navigation が completion poll より先に起きても古い対象を spawn / Invoke しない。
+一時 directory の起動時孤児回収と終了時削除も専用 worker で行い、UI から `read_dir` / 再帰削除を呼ばない。
 
 ### 2.2 キャンセルの置き場所
 

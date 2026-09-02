@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 
@@ -1048,15 +1048,35 @@ fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage
 }
 
 fn decode_composite_source(source: &CompositeSource) -> Result<egui::ColorImage, String> {
+    decode_composite_source_for_materialization(source, 4096, Arc::new(AtomicBool::new(false)))
+}
+
+/// Worker 側の外部ツール実体化用 decode。
+///
+/// PDF の長辺上限と同じ cancel token を後続の合成まで持ち回れるよう、
+/// 本追加用の固定値・非キャンセル wrapper から分離している。
+pub(crate) fn decode_composite_source_for_materialization(
+    source: &CompositeSource,
+    pdf_long_edge: u32,
+    cancel: Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
     match source {
-        CompositeSource::File { path } => decode_file_color_image(path),
+        CompositeSource::File { path } => {
+            let image = decode_file_color_image(path)?;
+            ensure_materialization_not_cancelled(cancel.as_ref())?;
+            Ok(image)
+        }
         CompositeSource::ZipEntry {
             zip_path,
             entry_name,
         } => {
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
                 .map_err(|e| format!("ZIP 内画像を読み取れません: {entry_name}: {e}"))?;
-            decode_bytes_color_image(entry_name, &bytes)
+            ensure_materialization_not_cancelled(cancel.as_ref())?;
+            let image = decode_bytes_color_image(entry_name, &bytes)?;
+            ensure_materialization_not_cancelled(cancel.as_ref())?;
+            Ok(image)
         }
         CompositeSource::PdfPage {
             pdf_path,
@@ -1066,14 +1086,15 @@ fn decode_composite_source(source: &CompositeSource) -> Result<egui::ColorImage,
             let result = crate::pdf_loader::render_page(
                 pdf_path,
                 *page_num,
-                4096,
+                pdf_long_edge,
                 password.as_deref(),
-                None,
+                Some(Arc::clone(&cancel)),
                 crate::pdf_loader::JobPriority::Critical,
                 0,
                 crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             )
             .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
+            ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(dynamic_image_to_color_image(&result.image))
         }
     }
@@ -1087,10 +1108,27 @@ struct BookCompositeResult {
 /// 表示の source 解像度 edit chain を headless に再構成する。
 /// global AI upscale / denoise だけを除外し、それ以外は Ctrl+E と同じ順で適用する。
 fn compose_book_page(
-    mut image: egui::ColorImage,
+    image: egui::ColorImage,
     edits: &BakedEditSnapshot,
 ) -> Result<BookCompositeResult, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
+    compose_book_page_with_cancel(image, edits, Arc::new(AtomicBool::new(false)))
+}
+
+/// Worker 側の外部ツール実体化用 headless 合成。
+pub(crate) fn compose_book_page_for_materialization(
+    image: egui::ColorImage,
+    edits: &BakedEditSnapshot,
+    cancel: Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    Ok(compose_book_page_with_cancel(image, edits, cancel)?.image)
+}
+
+fn compose_book_page_with_cancel(
+    mut image: egui::ColorImage,
+    edits: &BakedEditSnapshot,
+    cancel: Arc<AtomicBool>,
+) -> Result<BookCompositeResult, String> {
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
     let mut used_diffusion_fallback = false;
 
     if let Some(erase) = &edits.erase {
@@ -1098,6 +1136,7 @@ fn compose_book_page(
         let result = (erase.run)(&image, &mask.bitmap, &mask.shapes, &cancel)?;
         image = result.image;
         used_diffusion_fallback = result.used_diffusion_fallback;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
     if let Some(layers) = &edits.local_adjust {
@@ -1123,25 +1162,40 @@ fn compose_book_page(
             [rendered.width, rendered.height],
             &rendered.pixels,
         );
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
     if let Some(conceal) = &edits.conceal {
         let mut mask = resize_book_mask(&conceal.mask, image.size)?;
-        crate::mask_db::rasterize_shapes_into(
+        if !crate::mask_db::rasterize_shapes_into_cancel(
             &mut mask.bitmap,
             &mask.shapes,
             image.size[0],
             image.size[1],
-        );
-        image = crate::conceal_compose::compose_with_preset(&image, &mask.bitmap, &conceal.preset);
+            cancel.as_ref(),
+        ) {
+            return Err(materialization_cancelled_error());
+        }
+        image = crate::conceal_compose::compose_with_preset_cancel(
+            &image,
+            &mask.bitmap,
+            &conceal.preset,
+            cancel.as_ref(),
+        )
+        .ok_or_else(materialization_cancelled_error)?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
     image = crate::adjustment::apply_adjustments_fast(&image, &edits.params);
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     if let Some(comic) = &edits.comic {
-        image = bake_comic_annotations(&image, comic, edits.comic_source_dims, cancel.as_ref());
+        image = bake_comic_annotations(&image, comic, edits.comic_source_dims, cancel.as_ref())?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
     let crop = edits.export_crop.map(|crop| {
         let was_legacy = crop.valid_source_size().is_none();
         let resolved = crop.with_legacy_source_size(image.size);
@@ -1166,10 +1220,13 @@ fn compose_book_page(
     });
     if !edits.rotation.is_none() {
         image = crate::capture::rotate_color_image(&image, edits.rotation);
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
     if let Some(crop) = crop {
         image = crate::export_crop::crop_color_image(&image, crop)?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     Ok(BookCompositeResult {
         image,
@@ -1209,7 +1266,7 @@ pub(crate) fn bake_comic_annotations(
     comic: &BookComicSnapshot,
     source_dims: Option<[usize; 2]>,
     cancel: &AtomicBool,
-) -> egui::ColorImage {
+) -> Result<egui::ColorImage, String> {
     let scaled_objects = source_dims.and_then(|[source_w, source_h]| {
         let s_bake = image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
         ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
@@ -1221,6 +1278,7 @@ pub(crate) fn bake_comic_annotations(
         &mut stamp_cache,
         cancel,
     );
+    ensure_materialization_not_cancelled(cancel)?;
     let layers = comic_core::bake_annotation_layers(
         objects,
         image.size[0],
@@ -1228,7 +1286,22 @@ pub(crate) fn bake_comic_annotations(
         &comic.fonts,
         &stamps,
     );
-    crate::comic_overlay::composite_annotation_layers(image, &layers)
+    ensure_materialization_not_cancelled(cancel)?;
+    Ok(crate::comic_overlay::composite_annotation_layers(
+        image, &layers,
+    ))
+}
+
+fn ensure_materialization_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(materialization_cancelled_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn materialization_cancelled_error() -> String {
+    "画像の実体化をキャンセルしました".to_string()
 }
 
 fn crop_after_rotation(
@@ -1803,6 +1876,10 @@ fn final_reorder_name(page_no: usize, original: &Path) -> String {
     format!("{page_no:04}_{}", sanitize_filename(suffix, "page"))
 }
 
+pub(crate) fn sanitize_materialized_basename(input: &str, fallback: &str) -> String {
+    sanitize_filename(input, fallback)
+}
+
 fn sanitize_filename(input: &str, fallback: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -1847,6 +1924,64 @@ mod tests {
             format: crate::capture::CaptureFormat::Png,
             jpeg_matte: crate::capture::JpegMatte::Black,
         }
+    }
+
+    #[test]
+    fn materialization_decode_stops_before_io_when_already_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = CompositeSource::File {
+            path: dir.path().join("missing.png"),
+        };
+
+        let error = decode_composite_source_for_materialization(
+            &source,
+            2048,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, materialization_cancelled_error());
+    }
+
+    #[test]
+    fn materialization_composite_stops_when_already_cancelled() {
+        let base = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+
+        let error = compose_book_page_for_materialization(
+            base,
+            &empty_baked_edits(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, materialization_cancelled_error());
+    }
+
+    #[test]
+    fn materialization_composite_passes_the_shared_cancel_to_erase() {
+        let base = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let erase_cancel = Arc::clone(&cancel);
+        let mut edits = empty_baked_edits();
+        edits.erase = Some(BookEraseSnapshot {
+            mask: BookMaskSnapshot {
+                bitmap: vec![true],
+                shapes: Vec::new(),
+                size: [1, 1],
+            },
+            run: Box::new(move |image, _, _, received_cancel| {
+                assert!(Arc::ptr_eq(received_cancel, &erase_cancel));
+                erase_cancel.store(true, Ordering::Relaxed);
+                Ok(BookEraseResult {
+                    image: image.clone(),
+                    used_diffusion_fallback: false,
+                })
+            }),
+        });
+
+        let error = compose_book_page_for_materialization(base, &edits, cancel).unwrap_err();
+
+        assert_eq!(error, materialization_cancelled_error());
     }
 
     #[test]
@@ -2267,6 +2402,15 @@ mod tests {
     fn sanitize_book_name_preserves_japanese_and_replaces_windows_invalids() {
         assert_eq!(normalize_book_name("  名前:なし?  "), "名前_なし_");
         assert_eq!(normalize_book_name("..."), DEFAULT_BOOK_NAME);
+    }
+
+    #[test]
+    fn materialized_basename_reuses_book_filename_sanitization() {
+        assert_eq!(
+            sanitize_materialized_basename("  表紙:?.png. ", "image"),
+            "表紙__.png"
+        );
+        assert_eq!(sanitize_materialized_basename(" ... ", "image"), "image");
     }
 
     #[test]

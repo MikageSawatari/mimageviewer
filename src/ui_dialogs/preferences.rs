@@ -5,6 +5,9 @@
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 use crate::app::App;
 use crate::ring_shortcut::{
@@ -108,6 +111,7 @@ pub(crate) enum PreferencesPage {
     General,
     Font,
     Startup,
+    ExternalTools,
     ExplorerIntegration,
     Thumbnail,
     Slideshow,
@@ -154,6 +158,7 @@ impl PreferencesPage {
         Self::General,
         Self::Font,
         Self::Startup,
+        Self::ExternalTools,
         Self::ExplorerIntegration,
         Self::Thumbnail,
         Self::Slideshow,
@@ -187,6 +192,7 @@ impl PreferencesPage {
             Self::General => "全体設定",
             Self::Font => "フォント",
             Self::Startup => "起動時の動作",
+            Self::ExternalTools => "外部ツール",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
@@ -408,6 +414,7 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::Startup,
+            PreferencesPage::ExternalTools,
             PreferencesPage::ExplorerIntegration,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
@@ -533,6 +540,85 @@ impl Drop for CreativeLutTransaction {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExternalToolAddSource {
+    Executable,
+    Associated,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ExternalToolPathStatus {
+    Unchecked,
+    Checking,
+    Valid,
+    Invalid,
+    Error(String),
+}
+
+pub(super) struct ExternalToolHandlersPending {
+    cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<Vec<crate::open_with::AppHandler>>,
+}
+
+impl Drop for ExternalToolHandlersPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExternalToolLaunchCandidate {
+    pub display_name: String,
+    pub launch: crate::external_tool::ExternalToolLaunch,
+    /// Windows が「おすすめ」に分類しているか。見出しを入れる位置を決めるだけ。
+    pub is_recommended: bool,
+}
+
+fn external_tool_launch_candidates(
+    handlers: &[crate::open_with::AppHandler],
+) -> Vec<ExternalToolLaunchCandidate> {
+    // Windows と同じく、おすすめを先に、その他を後に並べる。**絞り込みはしない**
+    // (絞ると OS に出るアプリが mIV に出ないことになる)。
+    let mut candidates: Vec<ExternalToolLaunchCandidate> = Vec::new();
+    let mut handlers: Vec<&crate::open_with::AppHandler> = handlers.iter().collect();
+    // `sort_by_key` は安定なので、各グループ内は列挙順のまま。
+    handlers.sort_by_key(|handler| !handler.is_recommended);
+    for handler in handlers {
+        let launch = crate::external_tool::ExternalToolLaunch::Association {
+            handler_id: handler.handler_id.clone(),
+        };
+        if candidates
+            .iter()
+            .any(|candidate| candidate.launch.same_target(&launch))
+        {
+            continue;
+        }
+        candidates.push(ExternalToolLaunchCandidate {
+            display_name: handler.display_name.clone(),
+            launch,
+            is_recommended: handler.is_recommended,
+        });
+    }
+    candidates
+}
+
+pub(super) struct ExternalToolPathCheckResult {
+    pub tool_id: crate::external_tool::ExternalToolId,
+    pub executable: Option<Result<bool, String>>,
+    pub working_directory: Option<Result<bool, String>>,
+}
+
+pub(super) struct ExternalToolPathCheckPending {
+    cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<ExternalToolPathCheckResult>,
+}
+
+impl Drop for ExternalToolPathCheckPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
@@ -551,6 +637,37 @@ pub(crate) struct PreferencesState {
     pub highlight: Option<(&'static str, f64)>,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
+
+    // ── 外部ツールページ ────────────────────────────────────────
+    /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
+    external_tool_target: crate::external_tool::LaunchTarget,
+    /// 関連付けアプリを列挙する対象の拡張子 (小文字、先頭 `.` なし)。
+    ///
+    /// 以前はメインウィンドウで選択中のファイルから採っていたが、環境設定で
+    /// 出来ることが裏の一覧の選択で変わるのは他のどのページとも違う挙動で、
+    /// 分かりづらいという指摘を受けた (2026-08-31)。環境設定の中だけで選ぶ。
+    external_tool_association_ext: String,
+    external_tool_selected: Option<crate::external_tool::ExternalToolId>,
+    external_tool_editor_loaded_for: Option<crate::external_tool::ExternalToolId>,
+    external_tool_executable_input: String,
+    external_tool_working_directory_input: String,
+    external_tool_add_source: Option<ExternalToolAddSource>,
+    external_tool_candidates: Vec<ExternalToolLaunchCandidate>,
+    external_tool_handlers_pending: Option<ExternalToolHandlersPending>,
+    external_tool_path_check_pending: Option<ExternalToolPathCheckPending>,
+    external_tool_path_check_due: Option<(
+        std::time::Instant,
+        crate::external_tool::ExternalToolId,
+        Option<PathBuf>,
+        Option<PathBuf>,
+    )>,
+    external_tool_executable_status: ExternalToolPathStatus,
+    external_tool_working_directory_status: ExternalToolPathStatus,
+    external_tool_message: Option<String>,
+    external_tool_launch_requested: Option<(
+        crate::external_tool::ExternalTool,
+        crate::external_tool::LaunchTarget,
+    )>,
 
     // ── UI フォント設定 ──────────────────────────────────────────
     /// システムフォント列挙結果。走査は Font ページ初回表示時に worker で開始する。
@@ -730,14 +847,261 @@ pub(crate) struct PreferencesState {
 }
 
 impl PreferencesState {
+    pub(super) fn select_external_tool(
+        &mut self,
+        selected: Option<crate::external_tool::ExternalToolId>,
+    ) {
+        self.external_tool_selected = selected;
+        self.external_tool_editor_loaded_for = None;
+        self.external_tool_message = None;
+    }
+
+    pub(super) fn add_external_tool(&mut self, mut tool: crate::external_tool::ExternalTool) {
+        tool.id = crate::external_tool::next_id(&self.settings.external_tools);
+        let id = tool.id;
+        self.settings.external_tools.push(tool);
+        self.select_external_tool(Some(id));
+    }
+
+    pub(super) fn ensure_external_tool_editor_loaded(&mut self) {
+        let Some(id) = self.external_tool_selected else {
+            self.external_tool_editor_loaded_for = None;
+            return;
+        };
+        if self.external_tool_editor_loaded_for == Some(id) {
+            return;
+        }
+        let Some(tool) = self
+            .settings
+            .external_tools
+            .iter()
+            .find(|tool| tool.id == id)
+        else {
+            self.select_external_tool(None);
+            return;
+        };
+        self.external_tool_executable_input = tool
+            .launch
+            .executable()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.external_tool_working_directory_input = tool
+            .working_directory
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.external_tool_editor_loaded_for = Some(id);
+        self.schedule_external_tool_path_check(std::time::Duration::ZERO);
+    }
+
+    pub(super) fn schedule_external_tool_path_check(&mut self, delay: std::time::Duration) {
+        let Some(id) = self.external_tool_selected else {
+            return;
+        };
+        let Some(tool) = self
+            .settings
+            .external_tools
+            .iter()
+            .find(|tool| tool.id == id)
+        else {
+            return;
+        };
+        self.external_tool_path_check_due = Some((
+            std::time::Instant::now() + delay,
+            id,
+            tool.launch.executable().map(Path::to_path_buf),
+            tool.launch
+                .uses_process_options()
+                .then(|| tool.working_directory.clone())
+                .flatten(),
+        ));
+        self.external_tool_executable_status = if tool.launch.uses_process_options() {
+            ExternalToolPathStatus::Checking
+        } else {
+            ExternalToolPathStatus::Unchecked
+        };
+        self.external_tool_working_directory_status =
+            if tool.launch.uses_process_options() && tool.working_directory.is_some() {
+                ExternalToolPathStatus::Checking
+            } else {
+                ExternalToolPathStatus::Unchecked
+            };
+    }
+
+    pub(super) fn start_external_tool_handler_enumeration(&mut self, ctx: &egui::Context) {
+        self.external_tool_handlers_pending = None;
+        self.external_tool_candidates.clear();
+        let extension = format!(".{}", self.external_tool_association_ext);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        match std::thread::Builder::new()
+            .name("external-tool-handlers".to_string())
+            .spawn(move || {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let handlers = crate::open_with::enumerate_handlers(&extension);
+                if !cancel_worker.load(Ordering::Relaxed) {
+                    let _ = tx.send(handlers);
+                    repaint.request_repaint();
+                }
+            }) {
+            Ok(_) => {
+                self.external_tool_handlers_pending =
+                    Some(ExternalToolHandlersPending { cancel, rx });
+                self.external_tool_message = None;
+            }
+            Err(error) => {
+                self.external_tool_message =
+                    Some(format!("関連付けアプリの列挙を開始できません: {error}"));
+            }
+        }
+    }
+
+    fn start_external_tool_path_check(
+        &mut self,
+        tool_id: crate::external_tool::ExternalToolId,
+        executable: Option<PathBuf>,
+        working_directory: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        self.external_tool_path_check_pending = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        match std::thread::Builder::new()
+            .name("external-tool-path-check".to_string())
+            .spawn(move || {
+                fn check(path: &std::path::Path, expected_file: bool) -> Result<bool, String> {
+                    match std::fs::metadata(path) {
+                        Ok(metadata) => Ok(if expected_file {
+                            metadata.is_file()
+                        } else {
+                            metadata.is_dir()
+                        }),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let executable = executable.as_deref().map(|path| check(path, true));
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                let working_directory = working_directory.as_deref().map(|path| check(path, false));
+                if !cancel_worker.load(Ordering::Relaxed) {
+                    let _ = tx.send(ExternalToolPathCheckResult {
+                        tool_id,
+                        executable,
+                        working_directory,
+                    });
+                    repaint.request_repaint();
+                }
+            }) {
+            Ok(_) => {
+                self.external_tool_path_check_pending =
+                    Some(ExternalToolPathCheckPending { cancel, rx });
+            }
+            Err(error) => {
+                self.external_tool_executable_status = ExternalToolPathStatus::Error(format!(
+                    "パス確認 worker を開始できません: {error}"
+                ));
+                self.external_tool_working_directory_status =
+                    self.external_tool_executable_status.clone();
+            }
+        }
+    }
+
+    pub(super) fn poll_external_tool_workers(&mut self, ctx: &egui::Context) {
+        if self
+            .external_tool_path_check_due
+            .as_ref()
+            .is_some_and(|(due, ..)| std::time::Instant::now() >= *due)
+        {
+            let (_, id, executable, directory) = self.external_tool_path_check_due.take().unwrap();
+            self.start_external_tool_path_check(id, executable, directory, ctx);
+        }
+
+        let handlers_result = self
+            .external_tool_handlers_pending
+            .as_ref()
+            .and_then(|pending| match pending.rx.try_recv() {
+                Ok(handlers) => Some(Some(handlers)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = handlers_result {
+            self.external_tool_handlers_pending = None;
+            match result {
+                Some(handlers) => {
+                    self.external_tool_candidates = external_tool_launch_candidates(&handlers);
+                    if self.external_tool_candidates.is_empty() {
+                        self.external_tool_message =
+                            Some("関連付けアプリが見つかりませんでした".to_string());
+                    }
+                }
+                // worker が結果を送らずに終わった経路。以前はここで黙って pending を
+                // 捨てていたので、利用者からは「押しても何も起きない」に見えた
+                // (2026-08-31 利用者報告)。
+                None => {
+                    self.external_tool_message =
+                        Some("関連付けアプリを調べられませんでした".to_string());
+                }
+            }
+        }
+
+        let path_result = self
+            .external_tool_path_check_pending
+            .as_ref()
+            .and_then(|pending| match pending.rx.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = path_result {
+            self.external_tool_path_check_pending = None;
+            if let Some(result) = result
+                && self.external_tool_selected == Some(result.tool_id)
+            {
+                self.external_tool_executable_status = path_status(result.executable);
+                self.external_tool_working_directory_status = path_status(result.working_directory);
+            }
+        }
+
+        if self.external_tool_handlers_pending.is_some()
+            || self.external_tool_path_check_pending.is_some()
+            || self.external_tool_path_check_due.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     pub(crate) fn from_settings(
         s: &Settings,
+        external_tool_target: crate::external_tool::LaunchTarget,
         ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
         audio_normalize_db_available: bool,
         audio_normalize_entry_count: usize,
         book_resume_entry_count: usize,
         reading_history_entry_count: usize,
     ) -> Self {
+        // 開いた時点の選択があればその拡張子から始める (よくある出発点なので)。
+        // 無くても既定で動くことが要件で、選択の有無で機能が消えてはいけない。
+        let external_tool_association_ext = external_tool_target
+            .real_file()
+            .ok()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .filter(|extension| pages::association_extension_is_known(extension))
+            .unwrap_or_else(|| "jpg".to_string());
+
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
             Parallelism::Auto => s.parallelism.thread_count(),
@@ -799,6 +1163,21 @@ impl PreferencesState {
             pending_anchor: None,
             highlight: None,
             expanded,
+            external_tool_target,
+            external_tool_association_ext,
+            external_tool_selected: s.external_tools.first().map(|tool| tool.id),
+            external_tool_editor_loaded_for: None,
+            external_tool_executable_input: String::new(),
+            external_tool_working_directory_input: String::new(),
+            external_tool_add_source: None,
+            external_tool_candidates: Vec::new(),
+            external_tool_handlers_pending: None,
+            external_tool_path_check_pending: None,
+            external_tool_path_check_due: None,
+            external_tool_executable_status: ExternalToolPathStatus::Unchecked,
+            external_tool_working_directory_status: ExternalToolPathStatus::Unchecked,
+            external_tool_message: None,
+            external_tool_launch_requested: None,
             ui_font_catalog: Vec::new(),
             ui_font_filter: String::new(),
             ui_font_catalog_rx: None,
@@ -1193,6 +1572,15 @@ impl PreferencesState {
     }
 }
 
+fn path_status(result: Option<Result<bool, String>>) -> ExternalToolPathStatus {
+    match result {
+        None => ExternalToolPathStatus::Unchecked,
+        Some(Ok(true)) => ExternalToolPathStatus::Valid,
+        Some(Ok(false)) => ExternalToolPathStatus::Invalid,
+        Some(Err(error)) => ExternalToolPathStatus::Error(error),
+    }
+}
+
 fn ui_font_settings_key(settings: &crate::settings::UiFontSettings) -> String {
     serde_json::to_string(settings).unwrap_or_else(|_| format!("{settings:?}"))
 }
@@ -1497,9 +1885,15 @@ impl App {
 
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
+            let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
+                self.fullscreen_idx
+                    .or(self.selected)
+                    .and_then(|index| self.items.get(index)),
+            );
             #[cfg_attr(not(windows), allow(unused_mut))]
             let mut new_state = PreferencesState::from_settings(
                 &self.settings,
+                external_tool_target,
                 self.ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
@@ -1579,6 +1973,7 @@ impl App {
             .default_size([720.0, 520.0])
             .show(ctx, |ui| {
                 let state = self.pref_state.as_mut().unwrap();
+                state.poll_external_tool_workers(ctx);
                 if state.ui_font_catalog_started {
                     state.poll_ui_font_tasks(ctx);
                 }
@@ -1710,6 +2105,13 @@ impl App {
 
         if let Some(state) = self.pref_state.as_ref() {
             self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
+        }
+        let external_launch = self
+            .pref_state
+            .as_mut()
+            .and_then(|state| state.external_tool_launch_requested.take());
+        if let Some((tool, target)) = external_launch {
+            self.queue_external_tool_launch(ctx, &tool, &target);
         }
 
         let mut close_requested_this_frame = false;
@@ -2206,6 +2608,7 @@ impl App {
         if self.operation_customize_state.is_none() {
             let mut state = PreferencesState::from_settings(
                 &self.settings,
+                crate::external_tool::LaunchTarget::None,
                 self.ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
@@ -2697,6 +3100,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::General => page_general(ui, state),
         PreferencesPage::Font => page_font(ui, state),
         PreferencesPage::Startup => page_startup(ui, state),
+        PreferencesPage::ExternalTools => page_external_tools(ui, state),
         PreferencesPage::ExplorerIntegration => page_explorer_integration(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
@@ -2733,6 +3137,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn associated_app_candidates_come_only_from_current_handlers() {
+        let handlers = vec![
+            crate::open_with::AppHandler {
+                display_name: "Photos".to_string(),
+                handler_id: "photos.app".to_string(),
+                is_recommended: false,
+            },
+            crate::open_with::AppHandler {
+                display_name: "Same legacy target".to_string(),
+                handler_id: r"c:\tools\VIEWER.exe".to_string(),
+                is_recommended: false,
+            },
+            crate::open_with::AppHandler {
+                display_name: "Paint".to_string(),
+                handler_id: "Paint.App".to_string(),
+                is_recommended: false,
+            },
+        ];
+
+        let candidates = external_tool_launch_candidates(&handlers);
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].display_name, "Photos");
+        assert_eq!(candidates[1].display_name, "Same legacy target");
+        assert_eq!(
+            candidates[2],
+            ExternalToolLaunchCandidate {
+                display_name: "Paint".to_string(),
+                launch: crate::external_tool::ExternalToolLaunch::Association {
+                    handler_id: "Paint.App".to_string(),
+                },
+                is_recommended: false,
+            }
+        );
+        assert!(external_tool_launch_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn settings_page_add_keeps_tools_beyond_the_ten_key_slots() {
+        let mut settings = crate::settings::Settings::default();
+        settings.external_tools = (1..=10)
+            .map(|id| {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.id = crate::external_tool::ExternalToolId(id);
+                tool
+            })
+            .collect();
+        let mut state = PreferencesState::from_settings(
+            &settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        let duplicate = crate::external_tool::ExternalTool::defaults_for_viewing();
+
+        state.add_external_tool(duplicate.clone());
+        state.add_external_tool(duplicate);
+
+        assert_eq!(state.settings.external_tools.len(), 12);
+        assert_eq!(
+            state.settings.external_tools[10].id,
+            crate::external_tool::ExternalToolId(11)
+        );
+        assert_eq!(
+            state.settings.external_tools[11].id,
+            crate::external_tool::ExternalToolId(12)
+        );
+    }
+
+    #[test]
     fn preferences_search_results_snapshot() {
         use egui_kittest::Harness;
 
@@ -2762,6 +3239,7 @@ mod tests {
 
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
             None,
             false,
             0,
@@ -2819,6 +3297,7 @@ mod tests {
 
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
             None,
             false,
             0,
@@ -2853,6 +3332,7 @@ mod tests {
 
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
             None,
             false,
             0,

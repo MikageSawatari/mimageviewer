@@ -494,20 +494,683 @@ pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+fn external_tool_batch_behavior_note(
+    tool: &crate::external_tool::ExternalTool,
+) -> Option<&'static str> {
+    (matches!(
+        &tool.launch,
+        crate::external_tool::ExternalToolLaunch::OsDefault
+    ) && tool.selection == crate::external_tool::SelectionPolicy::Batch)
+        .then_some("OS の関連付けでは「まとめて渡す」を選んでも、対象ごとに 1 件ずつ起動します。")
+}
+
+pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    state.ensure_external_tool_editor_loaded();
+
+    anchored(ui, state, "external-tools/list", |ui, state| {
+        ui.label(egui::RichText::new("登録した外部ツール").strong());
+        ui.label(
+            egui::RichText::new(
+                "登録と設定はこの画面だけで完結します。下の「現在の実ファイルで起動して確認」
+だけは、環境設定を開いた時点で選んでいた実ファイル 1 件を使います。",
+            )
+            .weak(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "一覧の上から 10 件が固定キースロット 1〜10 です。「上へ」「下へ」で並べ替えると、対応するスロットも変わります。11 件目以降は固定キーの対象外です。",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        // 一覧はフルパスと引数を出さない。出すと横幅がダイアログを突き抜け、
+        // 広げないと右端が読めなくなる (2026-08-31 利用者報告)。どちらも下の
+        // 「選択したツールの設定」に出ているので、ここは選ぶための最小限にする。
+        egui::Grid::new("external_tools_table")
+            .num_columns(3)
+            .striped(true)
+            .min_col_width(120.0)
+            .show(ui, |ui| {
+                ui.strong("固定キースロット");
+                ui.strong("名前");
+                ui.strong("起動方法");
+                ui.end_row();
+                for (index, tool) in state
+                    .settings
+                    .external_tools
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let selected = state.external_tool_selected == Some(tool.id);
+                    ui.label(external_tool_key_slot_label(index));
+                    if ui.selectable_label(selected, tool.display_name()).clicked() {
+                        state.select_external_tool(Some(tool.id));
+                    }
+                    ui.add(egui::Label::new(tool.launch_summary()).truncate());
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(6.0);
+        // 関連付けの列挙は拡張子ごとなので、その拡張子をここで選ぶ。以前は
+        // メインウィンドウで選択中のファイルから採っていたが、環境設定で出来ることが
+        // 裏の一覧の選択で変わるのは他のどのページとも違い、分かりづらい
+        // (2026-08-31 利用者報告)。環境設定の中だけで完結させる。
+        ui.horizontal_wrapped(|ui| {
+            ui.label("拡張子");
+            egui::ComboBox::from_id_salt("external_tool_association_ext")
+                .selected_text(format!(".{}", state.external_tool_association_ext))
+                .show_ui(ui, |ui| {
+                    for (group, extensions) in association_extension_groups() {
+                        ui.label(egui::RichText::new(group).weak());
+                        for extension in extensions {
+                            ui.selectable_value(
+                                &mut state.external_tool_association_ext,
+                                (*extension).to_string(),
+                                format!(".{extension}"),
+                            );
+                        }
+                    }
+                });
+            if ui.button("この拡張子の関連付けアプリから追加").clicked() {
+                state.external_tool_add_source = Some(ExternalToolAddSource::Associated);
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("実行ファイルを選んで追加").clicked() {
+                state.external_tool_add_source = Some(ExternalToolAddSource::Executable);
+            }
+            let selected_index = state.external_tool_selected.and_then(|id| {
+                state
+                    .settings
+                    .external_tools
+                    .iter()
+                    .position(|tool| tool.id == id)
+            });
+            if ui
+                .add_enabled(selected_index.is_some(), egui::Button::new("複製"))
+                .clicked()
+                && let Some(index) = selected_index
+            {
+                let duplicate = state.settings.external_tools[index].clone();
+                state.add_external_tool(duplicate);
+            }
+            if ui
+                .add_enabled(
+                    selected_index.is_some_and(|index| index > 0),
+                    egui::Button::new("上へ"),
+                )
+                .clicked()
+                && let Some(index) = selected_index
+            {
+                state.settings.external_tools.swap(index, index - 1);
+            }
+            if ui
+                .add_enabled(
+                    selected_index
+                        .is_some_and(|index| index + 1 < state.settings.external_tools.len()),
+                    egui::Button::new("下へ"),
+                )
+                .clicked()
+                && let Some(index) = selected_index
+            {
+                state.settings.external_tools.swap(index, index + 1);
+            }
+            if ui
+                .add_enabled(selected_index.is_some(), egui::Button::new("削除"))
+                .clicked()
+                && let Some(index) = selected_index
+            {
+                state.settings.external_tools.remove(index);
+                let next = index.min(state.settings.external_tools.len().saturating_sub(1));
+                let selected = state.settings.external_tools.get(next).map(|tool| tool.id);
+                state.select_external_tool(selected);
+            }
+        });
+    });
+
+    drive_external_tool_add(ui.ctx(), state);
+    // 列挙の結果と失敗理由は、それを起こしたボタンの隣に出す。以前は選択中ツールの
+    // 詳細のいちばん下 (= ダイアログを広げないと見えない位置) に薄い文字で出ていた
+    // ため、押しても何も起きないように見えた (2026-08-31 利用者報告)。
+    if let Some(message) = &state.external_tool_message {
+        ui.label(egui::RichText::new(message).color(ui.visuals().warn_fg_color));
+    }
+    draw_external_tool_handler_choices(ui, state);
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    let Some(id) = state.external_tool_selected else {
+        ui.label("外部ツールを追加すると、ここで設定を編集できます。");
+        return;
+    };
+    let Some(index) = state
+        .settings
+        .external_tools
+        .iter()
+        .position(|tool| tool.id == id)
+    else {
+        return;
+    };
+    let mut tool = state.settings.external_tools[index].clone();
+
+    ui.label(egui::RichText::new("選択したツールの設定").strong());
+    ui.add_space(4.0);
+    egui::Grid::new("external_tool_editor")
+        .num_columns(2)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("名前");
+            crate::ime_focus::add_singleline(ui, &mut tool.name, None, |edit| {
+                edit.desired_width(360.0)
+            });
+            ui.end_row();
+
+            ui.label("実行ファイル");
+            if tool.launch.uses_process_options() {
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut state.external_tool_executable_input,
+                    None,
+                    |edit| edit.desired_width(360.0),
+                );
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut state.external_tool_executable_input,
+                );
+                if output.response.changed() || menu_changed {
+                    tool.launch = crate::external_tool::ExternalToolLaunch::Executable(
+                        PathBuf::from(&state.external_tool_executable_input),
+                    );
+                    state.external_tool_executable_status = ExternalToolPathStatus::Checking;
+                }
+            } else {
+                ui.add_enabled(false, egui::Label::new(tool.launch_description()));
+            }
+            ui.end_row();
+
+            ui.label("引数");
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
+                crate::ime_focus::add_singleline(ui, &mut tool.arguments, None, |edit| {
+                    edit.desired_width(360.0)
+                });
+            });
+            ui.end_row();
+
+            ui.label("作業フォルダー");
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
+                let mut output = crate::ime_focus::show_singleline(
+                    ui,
+                    &mut state.external_tool_working_directory_input,
+                    None,
+                    |edit| edit.desired_width(360.0),
+                );
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut state.external_tool_working_directory_input,
+                );
+                if output.response.changed() || menu_changed {
+                    let input = state.external_tool_working_directory_input.trim();
+                    tool.working_directory = if input.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(input))
+                    };
+                    state.external_tool_working_directory_status = ExternalToolPathStatus::Checking;
+                }
+            });
+            ui.end_row();
+
+            ui.label("渡すもの");
+            enum_combo(
+                ui,
+                "external_tool_payload",
+                &mut tool.payload,
+                &[
+                    (
+                        crate::external_tool::PayloadPolicy::TempEdited,
+                        "一時ファイル (編集を反映)",
+                    ),
+                    (
+                        crate::external_tool::PayloadPolicy::TempOriginal,
+                        "一時ファイル (編集前)",
+                    ),
+                    (
+                        crate::external_tool::PayloadPolicy::OriginalFile,
+                        "元のファイル",
+                    ),
+                ],
+            );
+            ui.end_row();
+
+            let passes_real_file =
+                tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(match tool.payload {
+                        crate::external_tool::PayloadPolicy::TempEdited => concat!(
+                            "補正・回転・注釈・消しゴムなど、このページに加えた編集を反映した ",
+                            "PNG を一時ファイルへ書き出します。元のファイルは変わりません。",
+                            "カラー化・LUT・ポストフィルタ・スマートシャープ・AI 拡大は表示専用のため、",
+                            "製本と同じく反映しません。",
+                        ),
+                        crate::external_tool::PayloadPolicy::TempOriginal => concat!(
+                            "編集を反映せず、元のデータをそのまま一時ファイルへ書き出します。",
+                            "JPEG は JPEG のまま、EXIF や生成メタデータも残ります。",
+                            "元のファイルは変わりません。",
+                        ),
+                        crate::external_tool::PayloadPolicy::OriginalFile => concat!(
+                            "ディスク上のファイルそのものを渡します。",
+                            "ツールで上書き保存すると元のファイルが変わり、mIV が読み直します。",
+                            "圧縮ファイル内のページと PDF のページには元のファイルが無いため、",
+                            "起動できません。",
+                        ),
+                    })
+                    .weak(),
+                )
+                .wrap(),
+            );
+            ui.end_row();
+
+            ui.label("動画");
+            ui.add_enabled_ui(!passes_real_file, |ui| {
+                enum_combo(
+                    ui,
+                    "external_tool_video",
+                    &mut tool.video,
+                    &[
+                        (crate::external_tool::VideoPolicy::File, "動画ファイル"),
+                        (
+                            crate::external_tool::VideoPolicy::CurrentFrame,
+                            "表示中のフレーム",
+                        ),
+                    ],
+                );
+            })
+            .response
+            .on_disabled_hover_text(
+                "「元のファイル」を渡すツールでは、動画も動画ファイルそのものを渡します",
+            );
+            ui.end_row();
+
+            if !passes_real_file
+                && tool.video == crate::external_tool::VideoPolicy::File
+            {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "動画は一時ファイルへコピーせず、動画ファイルそのものを渡します (数 GB になるため)。",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
+
+            ui.label("見開き");
+            enum_combo(
+                ui,
+                "external_tool_spread",
+                &mut tool.spread,
+                if passes_real_file {
+                    // 合成した見開きに対応する元ファイルは存在しない。
+                    &[
+                        (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
+                        (
+                            crate::external_tool::SpreadPolicy::MainPageOnly,
+                            "主ページのみ",
+                        ),
+                    ][..]
+                } else {
+                    &[
+                        (crate::external_tool::SpreadPolicy::Merged, "合成"),
+                        (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
+                        (
+                            crate::external_tool::SpreadPolicy::MainPageOnly,
+                            "主ページのみ",
+                        ),
+                    ][..]
+                },
+            );
+            ui.end_row();
+
+            ui.label("複数選択");
+            enum_combo(
+                ui,
+                "external_tool_selection",
+                &mut tool.selection,
+                &[
+                    (crate::external_tool::SelectionPolicy::Single, "1 件"),
+                    (crate::external_tool::SelectionPolicy::Each, "1 件ずつ起動"),
+                    (crate::external_tool::SelectionPolicy::Batch, "まとめて渡す"),
+                ],
+            );
+            ui.end_row();
+
+            match tool.selection {
+                crate::external_tool::SelectionPolicy::Single => {
+                    ui.label("");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "1 件だけ渡します。2 件以上選ばれているときは起動しません。",
+                            )
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                    ui.end_row();
+                }
+                crate::external_tool::SelectionPolicy::Each
+                | crate::external_tool::SelectionPolicy::Batch => {
+                    ui.label("確認なしで起動する上限");
+                    ui.add(
+                        egui::DragValue::new(&mut tool.confirmation_threshold)
+                            .speed(1.0)
+                            .suffix(" 件"),
+                    )
+                    .on_hover_text("対象件数がこの値を超えると、起動前に確認します");
+                    ui.end_row();
+
+                    ui.label("起動する対象件数の上限");
+                    ui.add(
+                        egui::DragValue::new(&mut tool.max_targets)
+                            .speed(1.0)
+                            .suffix(" 件"),
+                    )
+                    .on_hover_text("対象件数がこの値を超えると、起動しません");
+                    ui.end_row();
+                }
+            }
+
+            if tool.selection == crate::external_tool::SelectionPolicy::Single
+                && tool.spread == crate::external_tool::SpreadPolicy::BothPages
+            {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "見開き表示中は 2 件になるため、この組み合わせでは起動しません。",
+                        )
+                        .color(ui.visuals().warn_fg_color),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
+
+            if let Some(note) = external_tool_batch_behavior_note(&tool) {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(egui::RichText::new(note).color(ui.visuals().warn_fg_color))
+                        .wrap(),
+                );
+                ui.end_row();
+            }
+
+            ui.label("PDF レンダリング長辺");
+            enum_combo(
+                ui,
+                "external_tool_pdf_edge",
+                &mut tool.pdf_render_long_edge,
+                &[(2048, "2048"), (4096, "4096"), (8192, "8192")],
+            );
+            ui.end_row();
+        });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut tool.keep_temp, "一時ファイルを残す");
+    });
+
+    // payload と両立しない下位設定を、保存前にここで揃える。設定画面に「効かない選択」を
+    // 残さない (`normalize_for_payload` の doc comment を参照)。
+    tool.normalize_for_payload();
+
+    let launch_changed = tool.launch != state.settings.external_tools[index].launch;
+    let working_directory_changed =
+        tool.working_directory != state.settings.external_tools[index].working_directory;
+    state.settings.external_tools[index] = tool.clone();
+    if launch_changed || working_directory_changed {
+        state.schedule_external_tool_path_check(std::time::Duration::from_millis(300));
+    }
+
+    draw_external_tool_path_status(ui, "実行ファイル", &state.external_tool_executable_status);
+    draw_external_tool_path_status(
+        ui,
+        "作業フォルダー",
+        &state.external_tool_working_directory_status,
+    );
+
+    if tool.launch.uses_process_options() {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
+        ui.label("{file}  {files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(concat!(
+                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
+                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。",
+                    "対象が持っていない値は、そのトークンごと引数から取り除きます。",
+                ))
+                .weak(),
+            )
+            .wrap(),
+        );
+    }
+
+    ui.add_space(6.0);
+    // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
+    // (環境設定を開いているだけで plan 行が毎フレーム流れ、実際の起動が埋もれる)。
+    match crate::external_tool::build_launch_request_for_preview(&tool, &state.external_tool_target)
+    {
+        Ok(request) => {
+            ui.label(egui::RichText::new("現在の対象での引数プレビュー").strong());
+            match &request.launch {
+                crate::external_tool::ExternalToolLaunch::Association { .. } => {
+                    ui.label(format!("{}でファイルを開きます", tool.launch_description()));
+                }
+                crate::external_tool::ExternalToolLaunch::OsDefault => {
+                    ui.label("OS の関連付けでファイルを開きます");
+                }
+                crate::external_tool::ExternalToolLaunch::Executable(_) => {
+                    if request.arguments.is_empty() {
+                        ui.label("(引数なし)");
+                    } else {
+                        for (position, argument) in request.arguments.iter().enumerate() {
+                            ui.monospace(format!(
+                                "{}: {}",
+                                position + 1,
+                                argument.to_string_lossy()
+                            ));
+                        }
+                    }
+                }
+            }
+            if ui.button("現在の実ファイルで起動して確認").clicked() {
+                state.external_tool_launch_requested =
+                    Some((tool.clone(), state.external_tool_target.clone()));
+            }
+        }
+        Err(error) => {
+            ui.label(egui::RichText::new(error).weak());
+            ui.add_enabled(false, egui::Button::new("現在の実ファイルで起動して確認"));
+        }
+    }
+}
+
+fn enum_combo<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    value: &mut T,
+    options: &[(T, &'static str)],
+) {
+    let selected = options
+        .iter()
+        .find_map(|(candidate, label)| (*candidate == *value).then_some(*label))
+        .unwrap_or("不明");
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (candidate, label) in options {
+                ui.selectable_value(value, *candidate, *label);
+            }
+        });
+}
+
+fn external_tool_key_slot_label(index: usize) -> String {
+    if index < 10 {
+        (index + 1).to_string()
+    } else {
+        "なし（対象外）".to_owned()
+    }
+}
+
+/// 「追加」を押した直後の処理。**用途 (表示用 / 編集用) は聞かない。**
+///
+/// 以前は追加の前に 2 択のモーダルを挟み、`payload` と `spread` の既定を出し分けていた。
+/// その 2 択は `for_editing` フラグと組で意味を持っていたもので、フラグを
+/// `PayloadPolicy::OriginalFile` へ畳んだ時点で「渡すもの」の 1 項目に過ぎなくなった。
+/// アプリを選ぶ前に用途を決めさせる理由はもう無いので、表示用の既定で追加して、
+/// 必要なら編集欄の「渡すもの」で変えてもらう (説明文もそこに出る)。
+fn drive_external_tool_add(ctx: &egui::Context, state: &mut PreferencesState) {
+    let Some(source) = state.external_tool_add_source.take() else {
+        return;
+    };
+    match source {
+        ExternalToolAddSource::Executable => {
+            if let Some(handler) = crate::open_with::pick_exe_dialog() {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.name = handler.display_name;
+                tool.launch =
+                    crate::external_tool::ExternalToolLaunch::Executable(handler.executable);
+                state.add_external_tool(tool);
+            }
+        }
+        ExternalToolAddSource::Associated => {
+            state.start_external_tool_handler_enumeration(ctx);
+        }
+    }
+}
+
+/// 関連付けアプリを調べる対象として選べる拡張子。**一覧は増やさず、mIV が実際に
+/// 開ける拡張子の正本 (`folder_tree` の定数) をそのまま並べ替えて出す。**
+pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'static str]); 4] {
+    [
+        ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
+        ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
+        ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
+        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+    ]
+}
+
+/// 環境設定を開いた時点の選択から初期値を採るときに使う。一覧に無い拡張子
+/// (Susie プラグイン任せの形式など) は候補に出せないので既定へ落とす。
+pub(super) fn association_extension_is_known(extension: &str) -> bool {
+    association_extension_groups()
+        .iter()
+        .any(|(_, extensions)| extensions.contains(&extension))
+}
+
+fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    if state.external_tool_handlers_pending.is_some() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("関連付けアプリを調べています…");
+        });
+        return;
+    }
+    if state.external_tool_candidates.is_empty() {
+        return;
+    }
+    ui.group(|ui| {
+        ui.label(egui::RichText::new("追加する関連付けアプリ").strong());
+        if ui.button("OS の既定の関連付け").clicked() {
+            let tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+            state.add_external_tool(tool);
+            state.external_tool_candidates.clear();
+        }
+        // Windows の「プログラムから開く」と同じく、おすすめとその他を見出しで分ける。
+        // 一覧そのものは絞らない (2026-09-01 利用者指摘)。
+        let candidates = state.external_tool_candidates.clone();
+        let mut previous_recommended: Option<bool> = None;
+        for candidate in candidates {
+            if previous_recommended != Some(candidate.is_recommended) {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(if candidate.is_recommended {
+                        "おすすめのアプリ"
+                    } else {
+                        "その他のアプリ"
+                    })
+                    .weak(),
+                );
+            }
+            previous_recommended = Some(candidate.is_recommended);
+            if ui.button(&candidate.display_name).clicked() {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.name = candidate.display_name;
+                tool.launch = candidate.launch;
+                state.add_external_tool(tool);
+                state.external_tool_candidates.clear();
+                break;
+            }
+        }
+    });
+}
+
+fn draw_external_tool_path_status(ui: &mut egui::Ui, label: &str, status: &ExternalToolPathStatus) {
+    let text = match status {
+        ExternalToolPathStatus::Unchecked => return,
+        ExternalToolPathStatus::Checking => format!("{label}: 確認中…"),
+        ExternalToolPathStatus::Valid => format!("{label}: 確認済み"),
+        ExternalToolPathStatus::Invalid => format!("{label}: 見つからないか、種類が一致しません"),
+        ExternalToolPathStatus::Error(error) => format!("{label}: 確認できませんでした ({error})"),
+    };
+    ui.label(egui::RichText::new(text).weak());
+}
+
 pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut PreferencesState) {
     refresh_send_to_status_if_needed(state);
 
-    anchored(ui, state, "explorer/context-menu", |ui, state| {
-        ui.label(egui::RichText::new("右クリックメニュー").strong());
+    anchored(ui, state, "explorer/context-menu-inline", |ui, state| {
+        // 見出しで「mIV の」と言い切る。同じページの下にある SendTo は
+        // **エクスプローラー側**の右クリックの話なので、区別が要る (2026-08-30 利用者指摘)。
+        ui.label(egui::RichText::new("mIV の右クリックメニュー").strong());
         ui.add_space(4.0);
-        ui.checkbox(
-        &mut state.settings.use_native_shell_context_menu,
-        "実ファイル/実フォルダでは Windows 標準の右クリックメニューを使う",
-    )
-    .on_hover_text(
-        "右クリック時の表示だけを切り替えます。ZIP/PDF 内ページなど仮想アイテムは mIV 独自メニューを使います。\
-         Ctrl+C/X/V のファイル操作は、この設定に関わらず Windows 標準の動作を使います。",
-    );
+        // チェックボックスをやめてラジオにする。ON/OFF のどちらが何なのかが読めず、
+        // しかも一番使われる既定 (= サブメニュー) 側が文言に出てこなかった。
+        let mut inline = state.settings.show_windows_context_menu_inline;
+        ui.radio_value(&mut inline, false, "Windows のメニューをサブメニューにする");
+        ui.radio_value(
+            &mut inline,
+            true,
+            "Windows のメニューを mIV のメニューと一緒に表示する",
+        );
+        state.settings.show_windows_context_menu_inline = inline;
+        ui.add_space(4.0);
+        // 説明はホバーではなく常時見せる。意味が読めなかった原因がホバー任せだったため。
+        // 設定検索から直接この項目へ飛ぶと見出しが視界に入らないことがあるので、
+        // 1 行目でどちらの右クリックの話かを明示する。
+        ui.label(
+            egui::RichText::new(
+                "mIV でファイルやフォルダを右クリックしたときに出る Windows の項目の並べ方です。\n\
+                 Windows のメニューは表示に少し時間がかかることがあるため、サブメニューにすると\n\
+                 最初の表示が速くなります。",
+            )
+            .weak(),
+        );
     });
     ui.add_space(10.0);
 
@@ -8178,6 +8841,7 @@ mod tests {
         OperationAssignmentTarget, PreferencesState, apply_command_editor,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
         compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
+        external_tool_batch_behavior_note, external_tool_key_slot_label,
         keyboard_picker_cell_width, keyboard_picker_label_width, keyboard_picker_main_rows,
         modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
         ring_bindings_for_key_action,
@@ -8185,6 +8849,32 @@ mod tests {
     use crate::app::MAX_TEXTURE_DIM;
     use crate::keymap::{KeyAction, KeyName, ModKind};
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+
+    #[test]
+    fn external_tool_key_slot_labels_mark_the_ten_slot_boundary() {
+        assert_eq!(external_tool_key_slot_label(0), "1");
+        assert_eq!(external_tool_key_slot_label(9), "10");
+        assert_eq!(external_tool_key_slot_label(10), "なし（対象外）");
+        assert_eq!(external_tool_key_slot_label(usize::MAX), "なし（対象外）");
+    }
+
+    #[test]
+    fn external_tool_batch_note_is_only_for_os_default_batch() {
+        use crate::external_tool::{ExternalTool, ExternalToolLaunch, SelectionPolicy};
+
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.selection = SelectionPolicy::Batch;
+        assert!(external_tool_batch_behavior_note(&tool).is_some());
+
+        tool.selection = SelectionPolicy::Each;
+        assert_eq!(external_tool_batch_behavior_note(&tool), None);
+
+        tool.selection = SelectionPolicy::Batch;
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "handler".to_string(),
+        };
+        assert_eq!(external_tool_batch_behavior_note(&tool), None);
+    }
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
     /// render-to-target 後も最終 AI / composite は `MAX_TEXTURE_DIM` 以下に保つ。
@@ -8384,6 +9074,7 @@ mod tests {
     fn opening_key_assignment_editor_preserves_overview_context_filter() {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
             None,
             false,
             0,

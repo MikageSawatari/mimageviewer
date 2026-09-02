@@ -157,6 +157,58 @@ pub(crate) fn shell_data_object_for_paths(
     Ok((data, failed_paths))
 }
 
+/// `shell_data_object_for_paths` と同じ材料から `IShellItemArray` の方を返す。
+///
+/// パッケージ (Store) アプリの起動 (`IApplicationActivationManager::ActivateForFile`) は
+/// `IDataObject` ではなく `IShellItemArray` を取る。PIDL 解決を 2 度書かないよう分ける。
+#[cfg(windows)]
+pub(crate) fn shell_item_array_for_paths(
+    paths: &[PathBuf],
+) -> Result<(windows::Win32::UI::Shell::IShellItemArray, usize), (usize, FileDragError)> {
+    use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{SHCreateShellItemArrayFromIDLists, SHParseDisplayName};
+    use windows::core::PCWSTR;
+
+    let mut pidls: Vec<*const ITEMIDLIST> = Vec::with_capacity(paths.len());
+    let mut failed_paths = 0usize;
+    for path in paths {
+        let wide = shell_parse_wide_path(path);
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let parsed = unsafe {
+            SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None)
+        };
+        if parsed.is_ok() && !pidl.is_null() {
+            pidls.push(pidl as *const ITEMIDLIST);
+        } else {
+            failed_paths += 1;
+            if !pidl.is_null() {
+                unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
+            }
+        }
+    }
+    let free_pidls = |pidls: &[*const ITEMIDLIST]| {
+        for &pidl in pidls {
+            unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
+        }
+    };
+    if pidls.is_empty() {
+        return Err((failed_paths, FileDragError::AllPathsUnresolved));
+    }
+    let array = match unsafe { SHCreateShellItemArrayFromIDLists(&pidls) } {
+        Ok(array) => array,
+        Err(error) => {
+            free_pidls(&pidls);
+            return Err((
+                failed_paths,
+                FileDragError::ShellArrayCreate(error.code().0),
+            ));
+        }
+    };
+    free_pidls(&pidls);
+    Ok((array, failed_paths))
+}
+
 /// 指定パス群の OLE ドラッグ＆ドロップ (コピー) を開始する。
 ///
 /// `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) までブロックする。

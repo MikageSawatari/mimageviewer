@@ -672,7 +672,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
 
 /// 1 エントリぶんの描画で起きうる終わり方。cancel を失敗として報告しないために分ける。
 #[derive(Debug)]
-enum ExportRenderError {
+pub(crate) enum ExportRenderError {
     Cancelled,
     Failed(String),
 }
@@ -683,7 +683,16 @@ impl From<String> for ExportRenderError {
     }
 }
 
-fn render_export_pixels<'a>(
+impl std::fmt::Display for ExportRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("書き出しをキャンセルしました"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+pub(crate) fn render_export_pixels<'a>(
     pixels: &'a ExportPixels,
     preset: Option<&ConcealPreset>,
     entry_crop: Option<crate::export_crop::CropRect>,
@@ -860,12 +869,25 @@ fn compose_conceal_variant(
     };
 
     Ok(match &variant.comic {
-        Some(comic) => crate::books::bake_comic_annotations(
-            &composed,
-            &comic.snapshot,
-            comic.source_dims,
-            cancel,
-        ),
+        Some(comic) => {
+            match crate::books::bake_comic_annotations(
+                &composed,
+                &comic.snapshot,
+                comic.source_dims,
+                cancel,
+            ) {
+                Ok(image) => image,
+                // 注釈の焼き込みは cancel でしか失敗しないが、将来別の失敗が増えても
+                // 取り違えないよう、フラグを見てどちらかを決める。
+                Err(message) => {
+                    return Err(if cancel.load(Ordering::Relaxed) {
+                        ExportRenderError::Cancelled
+                    } else {
+                        ExportRenderError::Failed(message)
+                    });
+                }
+            }
+        }
         None => Arc::try_unwrap(composed).unwrap_or_else(|shared| (*shared).clone()),
     })
 }

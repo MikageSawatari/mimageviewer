@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use crate::context_menu_model::{MenuCommand, MenuNode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellClipboardVerb {
     Copy,
@@ -35,46 +37,26 @@ fn preferred_drop_effect_for_file_verb(verb: ShellClipboardVerb) -> Option<u32> 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeMivCommand {
-    NewFolder,
-    Paste,
-    Rename,
-    CopyPath,
-    CopyFileName,
-    CopyImageToClipboard,
-    CopyEditBundle,
-    PasteEditBundle,
-    JumpToFolder,
-    OpenContainerAsPage,
-    OpenContainerAsList,
-    RotateLeft,
-    RotateRight,
-    ToggleRepresentativeThumb,
-    SetCurrentVideoFrameThumbnail,
-    OpenFolderInExplorer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeMivMenuItem {
-    pub command: NativeMivCommand,
-    pub label: String,
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct NativeContextMenuRequest {
     pub hwnd: isize,
     pub screen_pos: (i32, i32),
     pub background_folder: Option<PathBuf>,
     pub paths: Vec<PathBuf>,
-    pub miv_items: Vec<NativeMivMenuItem>,
+    pub miv_items: Vec<MenuNode>,
+    pub shell_menu_placement: ShellMenuPlacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMenuPlacement {
+    Submenu,
+    Inline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeContextMenuResult {
     Canceled,
-    MivCommand(NativeMivCommand),
+    MivCommand(MenuCommand),
     ShellCommandInvoked,
     Fallback { reason: String },
 }
@@ -92,8 +74,37 @@ fn miv_command_index(command_id: u32, len: usize) -> Option<usize> {
     (index < len).then_some(index)
 }
 
+fn leaf_commands(nodes: &[MenuNode]) -> Vec<&MenuCommand> {
+    fn visit<'a>(nodes: &'a [MenuNode], out: &mut Vec<&'a MenuCommand>) {
+        for node in nodes {
+            match node {
+                MenuNode::Item { command, .. } => out.push(command),
+                MenuNode::Submenu { children, .. } => visit(children, out),
+                MenuNode::Separator => {}
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    visit(nodes, &mut commands);
+    commands
+}
+
+fn shell_menu_insert_position(placement: ShellMenuPlacement, nodes: &[MenuNode]) -> Option<u32> {
+    match placement {
+        ShellMenuPlacement::Submenu => Some(0),
+        ShellMenuPlacement::Inline => {
+            let top_level_positions = u32::try_from(nodes.len()).ok()?;
+            top_level_positions.checked_add(u32::from(!nodes.is_empty()))
+        }
+    }
+}
+
 fn shell_verb_offset(command_id: u32) -> Option<u32> {
     command_id.checked_sub(SHELL_ID_FIRST)
+}
+
+fn can_keep_miv_menu_after_shell_failure(miv_count: usize) -> bool {
+    miv_count > 0
 }
 
 #[cfg(windows)]
@@ -150,6 +161,7 @@ pub fn invoke_shell_folder_background_verb(
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::ffi::CString;
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
@@ -168,6 +180,11 @@ mod windows_impl {
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::{OleSetClipboard, ReleaseStgMedium};
+    use windows::Win32::UI::Controls::{
+        ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_ABSOLUTE,
+        TTF_TRACK, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
+        TTM_TRACKPOSITION, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+    };
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
         BHID_SFUIObject, CFSTR_PREFERREDDROPEFFECT, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
@@ -176,11 +193,14 @@ mod windows_impl {
         SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_GRAYED, MF_SEPARATOR,
-        MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM,
-        WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+        AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DeleteMenu, DestroyMenu,
+        DestroyWindow, GetCursorPos, HMENU, HWND_TOPMOST, MF_BYPOSITION, MF_GRAYED, MF_POPUP,
+        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_STYLE,
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT, WS_EX_TOPMOST,
+        WS_POPUP,
     };
-    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, Ref};
+    use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
 
     const SUBCLASS_ID: usize = 0x6d69_7643; // "mivC"
     const SLOW_NATIVE_MENU_STAGE_LOG_MS: f64 = 120.0;
@@ -349,7 +369,7 @@ mod windows_impl {
         } else {
             request.paths.len()
         };
-        let miv_count = request.miv_items.len();
+        let miv_count = leaf_commands(&request.miv_items).len();
 
         let stage_t0 = Instant::now();
         let _com = match ComStaGuard::new() {
@@ -384,17 +404,15 @@ mod windows_impl {
         );
 
         let stage_t0 = Instant::now();
-        for (index, item) in request.miv_items.iter().enumerate() {
-            let Some(id) = miv_command_id(index) else {
-                return NativeContextMenuResult::Fallback {
-                    reason: "too many mIV context menu commands".to_string(),
-                };
-            };
-            if let Err(e) = append_menu_string(menu.handle(), id, &item.label, item.enabled) {
-                return NativeContextMenuResult::Fallback {
-                    reason: format!("AppendMenuW(mIV) failed: {e}"),
-                };
-            }
+        let mut leaf_index = 0;
+        let mut disabled_reasons = std::collections::HashMap::new();
+        if let Err(reason) = append_miv_menu_nodes(
+            menu.handle(),
+            &request.miv_items,
+            &mut leaf_index,
+            &mut disabled_reasons,
+        ) {
+            return NativeContextMenuResult::Fallback { reason };
         }
         emit_native_menu_timing(
             "show_append_miv",
@@ -407,15 +425,7 @@ mod windows_impl {
 
         let hwnd = HWND(request.hwnd as *mut core::ffi::c_void);
         let shell_menu = if let Some(folder) = request.background_folder.as_ref() {
-            if !request.miv_items.is_empty()
-                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
-            {
-                return NativeContextMenuResult::Fallback {
-                    reason: "AppendMenuW(separator) failed".to_string(),
-                };
-            }
-
-            let shell_menu = match shell_context_menu_for_folder_background_timed(
+            match shell_context_menu_for_folder_background_timed(
                 hwnd,
                 folder,
                 target_kind,
@@ -423,65 +433,100 @@ mod windows_impl {
                 miv_count,
             ) {
                 Ok(menu) => Some(menu),
-                Err(reason) => return NativeContextMenuResult::Fallback { reason },
-            };
-            if let Some(shell_menu) = shell_menu.as_ref() {
-                let insert_at =
-                    request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
-                if let Err(reason) = query_shell_context_menu_timed(
-                    shell_menu,
-                    menu.handle(),
-                    insert_at,
-                    target_kind,
-                    path_count,
-                    miv_count,
-                ) {
-                    return NativeContextMenuResult::Fallback { reason };
+                Err(reason) if can_keep_miv_menu_after_shell_failure(miv_count) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: Windows menu unavailable; showing mIV-only menu: {reason}"
+                    ));
+                    None
                 }
+                Err(reason) => return NativeContextMenuResult::Fallback { reason },
             }
-            shell_menu
         } else if request.paths.is_empty() {
             None
         } else {
-            if !request.miv_items.is_empty()
-                && unsafe { AppendMenuW(menu.handle(), MF_SEPARATOR, 0, PCWSTR::null()) }.is_err()
-            {
-                return NativeContextMenuResult::Fallback {
-                    reason: "AppendMenuW(separator) failed".to_string(),
-                };
-            }
-
-            let shell_menu = match shell_context_menu_for_paths_timed(
+            match shell_context_menu_for_paths_timed(
                 &request.paths,
                 target_kind,
                 path_count,
                 miv_count,
             ) {
-                Ok(menu) => menu,
+                Ok(menu) => Some(menu),
+                Err(reason) if can_keep_miv_menu_after_shell_failure(miv_count) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: Windows menu unavailable; showing mIV-only menu: {reason}"
+                    ));
+                    None
+                }
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
-            };
-            let insert_at =
-                request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
-            if let Err(reason) = query_shell_context_menu_timed(
-                &shell_menu,
-                menu.handle(),
-                insert_at,
-                target_kind,
-                path_count,
-                miv_count,
-            ) {
-                return NativeContextMenuResult::Fallback { reason };
             }
-            Some(shell_menu)
         };
 
+        let mut lazy_shell_submenu = None;
+        if let Some(shell_menu) = shell_menu.as_ref() {
+            if let Err(reason) = append_root_separator(menu.handle(), !request.miv_items.is_empty())
+            {
+                return NativeContextMenuResult::Fallback { reason };
+            }
+            match request.shell_menu_placement {
+                ShellMenuPlacement::Inline => {
+                    let Some(insert_at) =
+                        shell_menu_insert_position(ShellMenuPlacement::Inline, &request.miv_items)
+                    else {
+                        return NativeContextMenuResult::Fallback {
+                            reason: "too many mIV context menu positions".to_string(),
+                        };
+                    };
+                    if let Err(reason) = query_shell_context_menu_timed(
+                        shell_menu,
+                        menu.handle(),
+                        insert_at,
+                        target_kind,
+                        path_count,
+                        miv_count,
+                    ) {
+                        return NativeContextMenuResult::Fallback { reason };
+                    }
+                }
+                ShellMenuPlacement::Submenu => {
+                    let submenu = match append_lazy_shell_submenu(menu.handle()) {
+                        Ok(submenu) => submenu,
+                        Err(reason) => return NativeContextMenuResult::Fallback { reason },
+                    };
+                    lazy_shell_submenu = Some(LazyShellSubmenu::new(
+                        submenu,
+                        target_kind,
+                        path_count,
+                        miv_count,
+                    ));
+                }
+            }
+        }
+
         let stage_t0 = Instant::now();
-        let forwarder = shell_menu
+        let shell_forwarder = shell_menu
             .as_ref()
-            .map(ContextMenuMessageForwarder::from_context_menu);
-        let _subclass_guard = forwarder
-            .as_ref()
-            .and_then(|forwarder| MenuSubclassGuard::install(hwnd, forwarder));
+            .map(|menu| ContextMenuMessageForwarder::new(menu, lazy_shell_submenu));
+        let tooltip = if disabled_reasons.is_empty() {
+            None
+        } else {
+            match TrackedMenuTooltip::new(hwnd, disabled_reasons) {
+                Ok(tooltip) => Some(RefCell::new(tooltip)),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native_context_menu: disabled reason tooltip unavailable: {error}"
+                    ));
+                    None
+                }
+            }
+        };
+        let message_state = MenuMessageState {
+            shell: shell_forwarder,
+            tooltip,
+        };
+        let _subclass_guard = match MenuSubclassGuard::install(hwnd, &message_state) {
+            Ok(guard) => guard,
+            Err(reason) => return NativeContextMenuResult::Fallback { reason },
+        };
         emit_native_menu_timing(
             "show_subclass",
             Some(target_kind),
@@ -520,6 +565,7 @@ mod windows_impl {
             )
             .0 as u32
         };
+        message_state.hide_tooltip();
         emit_native_menu_timing(
             "show_track_popup_block",
             Some(target_kind),
@@ -529,11 +575,19 @@ mod windows_impl {
             &[("selected_id", Value::from(selected as u64))],
         );
         if selected == 0 {
+            if let Some(reason) = message_state
+                .shell
+                .as_ref()
+                .and_then(ContextMenuMessageForwarder::lazy_query_error)
+            {
+                return NativeContextMenuResult::Fallback { reason };
+            }
             return NativeContextMenuResult::Canceled;
         }
 
-        if let Some(index) = miv_command_index(selected, request.miv_items.len()) {
-            return NativeContextMenuResult::MivCommand(request.miv_items[index].command);
+        let commands = leaf_commands(&request.miv_items);
+        if let Some(index) = miv_command_index(selected, commands.len()) {
+            return NativeContextMenuResult::MivCommand(commands[index].clone());
         }
 
         let Some(shell_menu) = shell_menu else {
@@ -888,13 +942,114 @@ mod windows_impl {
         result
     }
 
+    fn append_root_separator(menu: HMENU, needed: bool) -> Result<(), String> {
+        if !needed {
+            return Ok(());
+        }
+        unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
+            .map_err(|error| format!("AppendMenuW(separator) failed: {error}"))
+    }
+
+    fn append_lazy_shell_submenu(menu: HMENU) -> Result<HMENU, String> {
+        let mut submenu = MenuGuard::new(
+            unsafe { CreatePopupMenu() }
+                .map_err(|error| format!("CreatePopupMenu(Windows submenu) failed: {error}"))?,
+        );
+        append_menu_string(submenu.handle(), 0, "読み込み中…", false)
+            .map_err(|error| format!("AppendMenuW(Windows placeholder) failed: {error}"))?;
+        let label = wide_null("Windows のメニュー");
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_POPUP | MF_STRING,
+                submenu.handle().0 as usize,
+                PCWSTR(label.as_ptr()),
+            )
+        }
+        .map_err(|error| format!("AppendMenuW(Windows submenu) failed: {error}"))?;
+        let handle = submenu.handle();
+        // root menu が子 HMENU を再帰所有する。
+        submenu.release();
+        Ok(handle)
+    }
+
+    fn append_miv_menu_nodes(
+        menu: HMENU,
+        nodes: &[MenuNode],
+        leaf_index: &mut usize,
+        disabled_reasons: &mut std::collections::HashMap<u32, String>,
+    ) -> Result<(), String> {
+        for node in nodes {
+            match node {
+                MenuNode::Separator => {
+                    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
+                        .map_err(|error| format!("AppendMenuW(mIV separator) failed: {error}"))?;
+                }
+                MenuNode::Item {
+                    label,
+                    enabled,
+                    disabled_reason,
+                    ..
+                } => {
+                    let id = miv_command_id(*leaf_index)
+                        .ok_or_else(|| "too many mIV context menu commands".to_string())?;
+                    append_menu_string(menu, id, label, *enabled)
+                        .map_err(|error| format!("AppendMenuW(mIV) failed: {error}"))?;
+                    record_disabled_reason(
+                        disabled_reasons,
+                        id,
+                        *enabled,
+                        disabled_reason.as_deref(),
+                    );
+                    *leaf_index += 1;
+                }
+                MenuNode::Submenu { label, children } => {
+                    let mut child =
+                        MenuGuard::new(unsafe { CreatePopupMenu() }.map_err(|error| {
+                            format!("CreatePopupMenu(submenu) failed: {error}")
+                        })?);
+                    append_miv_menu_nodes(child.handle(), children, leaf_index, disabled_reasons)?;
+                    let escaped = label.replace('&', "&&");
+                    let wide = wide_null(&escaped);
+                    unsafe {
+                        AppendMenuW(
+                            menu,
+                            MF_POPUP | MF_STRING,
+                            child.handle().0 as usize,
+                            PCWSTR(wide.as_ptr()),
+                        )
+                    }
+                    .map_err(|error| format!("AppendMenuW(mIV submenu) failed: {error}"))?;
+                    // Once attached, the root menu owns the child recursively.
+                    child.release();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_disabled_reason(
+        reasons: &mut std::collections::HashMap<u32, String>,
+        command_id: u32,
+        enabled: bool,
+        reason: Option<&str>,
+    ) {
+        if !enabled
+            && let Some(reason) = reason
+            && !reason.is_empty()
+        {
+            reasons.insert(command_id, reason.to_string());
+        }
+    }
+
     fn append_menu_string(
         menu: HMENU,
         id: u32,
         label: &str,
         enabled: bool,
     ) -> windows::core::Result<()> {
-        let wide = wide_null(label);
+        let escaped = label.replace('&', "&&");
+        let wide = wide_null(&escaped);
         let flags = if enabled {
             MF_STRING
         } else {
@@ -1049,21 +1204,27 @@ mod windows_impl {
             .then_some((point.x, point.y))
     }
 
-    struct MenuGuard(HMENU);
+    struct MenuGuard(Option<HMENU>);
 
     impl MenuGuard {
         fn new(menu: HMENU) -> Self {
-            Self(menu)
+            Self(Some(menu))
         }
 
         fn handle(&self) -> HMENU {
-            self.0
+            self.0.expect("menu guard must own a handle")
+        }
+
+        fn release(&mut self) {
+            self.0 = None;
         }
     }
 
     impl Drop for MenuGuard {
         fn drop(&mut self) {
-            let _ = unsafe { DestroyMenu(self.0) };
+            if let Some(menu) = self.0.take() {
+                let _ = unsafe { DestroyMenu(menu) };
+            }
         }
     }
 
@@ -1094,20 +1255,111 @@ mod windows_impl {
         }
     }
 
-    struct ContextMenuMessageForwarder {
-        menu2: Option<IContextMenu2>,
-        menu3: Option<IContextMenu3>,
+    struct LazyShellSubmenu {
+        handle: HMENU,
+        initialized: Cell<bool>,
+        query_error: RefCell<Option<String>>,
+        target_kind: &'static str,
+        path_count: usize,
+        miv_count: usize,
     }
 
-    impl ContextMenuMessageForwarder {
-        fn from_context_menu(menu: &IContextMenu) -> Self {
+    impl LazyShellSubmenu {
+        fn new(
+            handle: HMENU,
+            target_kind: &'static str,
+            path_count: usize,
+            miv_count: usize,
+        ) -> Self {
             Self {
-                menu2: menu.cast::<IContextMenu2>().ok(),
-                menu3: menu.cast::<IContextMenu3>().ok(),
+                handle,
+                initialized: Cell::new(false),
+                query_error: RefCell::new(None),
+                target_kind,
+                path_count,
+                miv_count,
             }
         }
 
+        fn initialize(&self, shell_menu: &IContextMenu) {
+            if self.initialized.replace(true) {
+                return;
+            }
+            let result = (|| {
+                unsafe { DeleteMenu(self.handle, 0, MF_BYPOSITION) }
+                    .map_err(|error| format!("DeleteMenu(Windows placeholder) failed: {error}"))?;
+                let insert_at = shell_menu_insert_position(ShellMenuPlacement::Submenu, &[])
+                    .expect("submenu insertion position is always zero");
+                query_shell_context_menu_timed(
+                    shell_menu,
+                    self.handle,
+                    insert_at,
+                    self.target_kind,
+                    self.path_count,
+                    self.miv_count,
+                )
+            })();
+            if let Err(reason) = result {
+                crate::logger::log(format!(
+                    "native_context_menu: lazy Windows submenu failed: {reason}"
+                ));
+                let _ = append_menu_string(
+                    self.handle,
+                    0,
+                    "Windows のメニューを読み込めませんでした",
+                    false,
+                );
+                *self.query_error.borrow_mut() = Some(reason);
+            }
+        }
+    }
+
+    struct ContextMenuMessageForwarder {
+        shell_menu: IContextMenu,
+        menu2: Option<IContextMenu2>,
+        menu3: Option<IContextMenu3>,
+        lazy_shell_submenu: Option<LazyShellSubmenu>,
+    }
+
+    impl ContextMenuMessageForwarder {
+        fn new(menu: &IContextMenu, lazy_shell_submenu: Option<LazyShellSubmenu>) -> Self {
+            Self {
+                shell_menu: menu.clone(),
+                menu2: menu.cast::<IContextMenu2>().ok(),
+                menu3: menu.cast::<IContextMenu3>().ok(),
+                lazy_shell_submenu,
+            }
+        }
+
+        fn needs_subclass(&self) -> bool {
+            self.lazy_shell_submenu.is_some() || self.menu2.is_some() || self.menu3.is_some()
+        }
+
+        fn lazy_query_error(&self) -> Option<String> {
+            self.lazy_shell_submenu
+                .as_ref()
+                .and_then(|submenu| submenu.query_error.borrow().clone())
+        }
+
+        fn shell_messages_are_ready(&self) -> bool {
+            self.lazy_shell_submenu.as_ref().is_none_or(|submenu| {
+                submenu.initialized.get() && submenu.query_error.borrow().is_none()
+            })
+        }
+
         unsafe fn forward(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+            if msg == WM_INITMENUPOPUP
+                && let Some(submenu) = &self.lazy_shell_submenu
+                && submenu.handle.0 as usize == wparam.0
+            {
+                submenu.initialize(&self.shell_menu);
+            }
+            // 遅延 submenu をまだ開いていない間は QueryContextMenu 前なので、Shell
+            // extension へ root 側の menu message を渡さない。Query 後にだけ、Shell が
+            // 作った owner-draw / nested submenu の message を従来どおり転送する。
+            if !self.shell_messages_are_ready() {
+                return None;
+            }
             if !matches!(
                 msg,
                 WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
@@ -1133,29 +1385,237 @@ mod windows_impl {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MenuTooltipSelection {
+        Hide,
+        Show(u32),
+    }
+
+    fn menu_tooltip_selection(wparam: usize, lparam: isize) -> MenuTooltipSelection {
+        let command_id = (wparam & 0xffff) as u32;
+        let flags = ((wparam >> 16) & 0xffff) as u32;
+        if (flags == 0xffff && lparam == 0)
+            || flags & MF_POPUP.0 != 0
+            || flags & MF_SEPARATOR.0 != 0
+        {
+            MenuTooltipSelection::Hide
+        } else {
+            MenuTooltipSelection::Show(command_id)
+        }
+    }
+
+    fn pack_track_position(x: i32, y: i32) -> isize {
+        let x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        let y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        (x | (y << 16)) as isize
+    }
+
+    struct TrackedMenuTooltip {
+        owner: HWND,
+        hwnd: HWND,
+        reasons: std::collections::HashMap<u32, String>,
+        text: Vec<u16>,
+        active_id: Option<u32>,
+    }
+
+    impl TrackedMenuTooltip {
+        fn new(
+            owner: HWND,
+            reasons: std::collections::HashMap<u32, String>,
+        ) -> Result<Self, String> {
+            let common_controls = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_BAR_CLASSES,
+            };
+            if !unsafe { InitCommonControlsEx(&common_controls) }.as_bool() {
+                return Err(format!(
+                    "InitCommonControlsEx(tooltip) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOPMOST,
+                    TOOLTIPS_CLASSW,
+                    PCWSTR::null(),
+                    WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    Some(owner),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|error| format!("CreateWindowExW(tooltip) failed: {error}"))?;
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+            unsafe { SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(500))) };
+            Ok(Self {
+                owner,
+                hwnd,
+                reasons,
+                text: Vec::new(),
+                active_id: None,
+            })
+        }
+
+        fn tool_info(&mut self) -> TTTOOLINFOW {
+            TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                hwnd: self.owner,
+                uId: 1,
+                lpszText: PWSTR(self.text.as_mut_ptr()),
+                ..Default::default()
+            }
+        }
+
+        fn handle_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) {
+            match menu_tooltip_selection(wparam.0, lparam.0) {
+                MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id) => self.show(id),
+                MenuTooltipSelection::Hide | MenuTooltipSelection::Show(_) => self.hide(),
+            }
+        }
+
+        fn show(&mut self, id: u32) {
+            if self.active_id == Some(id) {
+                return;
+            }
+            self.hide();
+            let Some(reason) = self.reasons.get(&id).cloned() else {
+                return;
+            };
+            self.text = wide_null(&reason);
+            let tool_info = self.tool_info();
+            let added = unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_ADDTOOLW,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                )
+            };
+            if added.0 == 0 {
+                self.text.clear();
+                return;
+            }
+            let mut cursor = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut cursor) };
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKPOSITION,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(pack_track_position(cursor.x + 12, cursor.y + 20))),
+                );
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKACTIVATE,
+                    Some(WPARAM(1)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+            }
+            self.active_id = Some(id);
+        }
+
+        fn hide(&mut self) {
+            if self.active_id.is_none() {
+                return;
+            }
+            let tool_info = self.tool_info();
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    TTM_TRACKACTIVATE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+                SendMessageW(
+                    self.hwnd,
+                    TTM_DELTOOLW,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
+                );
+            }
+            self.active_id = None;
+            self.text.clear();
+        }
+    }
+
+    impl Drop for TrackedMenuTooltip {
+        fn drop(&mut self) {
+            self.hide();
+            let _ = unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+
+    struct MenuMessageState {
+        shell: Option<ContextMenuMessageForwarder>,
+        tooltip: Option<RefCell<TrackedMenuTooltip>>,
+    }
+
+    impl MenuMessageState {
+        fn needs_subclass(&self) -> bool {
+            self.tooltip.is_some()
+                || self
+                    .shell
+                    .as_ref()
+                    .is_some_and(ContextMenuMessageForwarder::needs_subclass)
+        }
+
+        fn hide_tooltip(&self) {
+            if let Some(tooltip) = &self.tooltip {
+                tooltip.borrow_mut().hide();
+            }
+        }
+
+        unsafe fn forward(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+            if msg == WM_MENUSELECT
+                && let Some(tooltip) = &self.tooltip
+            {
+                tooltip.borrow_mut().handle_menu_select(wparam, lparam);
+            }
+            self.shell
+                .as_ref()
+                .and_then(|shell| unsafe { shell.forward(msg, wparam, lparam) })
+        }
+    }
+
     struct MenuSubclassGuard {
         hwnd: HWND,
         installed: bool,
     }
 
     impl MenuSubclassGuard {
-        fn install(hwnd: HWND, forwarder: &ContextMenuMessageForwarder) -> Option<Self> {
-            if forwarder.menu2.is_none() && forwarder.menu3.is_none() {
-                return None;
+        fn install(hwnd: HWND, state: &MenuMessageState) -> Result<Option<Self>, String> {
+            if !state.needs_subclass() {
+                return Ok(None);
             }
             let installed = unsafe {
                 SetWindowSubclass(
                     hwnd,
                     Some(context_menu_subclass_proc),
                     SUBCLASS_ID,
-                    forwarder as *const ContextMenuMessageForwarder as usize,
+                    state as *const MenuMessageState as usize,
                 )
                 .as_bool()
             };
             if !installed {
-                crate::logger::log("native_context_menu: SetWindowSubclass failed");
+                return Err("SetWindowSubclass failed".to_string());
             }
-            Some(Self { hwnd, installed })
+            Ok(Some(Self { hwnd, installed }))
         }
     }
 
@@ -1178,8 +1638,8 @@ mod windows_impl {
         ref_data: usize,
     ) -> LRESULT {
         if ref_data != 0 {
-            let forwarder = unsafe { &*(ref_data as *const ContextMenuMessageForwarder) };
-            if let Some(result) = unsafe { forwarder.forward(msg, wparam, lparam) } {
+            let state = unsafe { &*(ref_data as *const MenuMessageState) };
+            if let Some(result) = unsafe { state.forward(msg, wparam, lparam) } {
                 return result;
             }
         }
@@ -1189,6 +1649,47 @@ mod windows_impl {
     #[cfg(test)]
     mod data_object_smoke_test {
         use super::*;
+
+        #[test]
+        fn disabled_reason_map_records_only_disabled_nonempty_leaf_reasons() {
+            let mut reasons = std::collections::HashMap::new();
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST, false, Some("reason"));
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 1, true, Some("enabled"));
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 2, false, None);
+            record_disabled_reason(&mut reasons, MIV_ID_FIRST + 3, false, Some(""));
+            assert_eq!(
+                reasons,
+                std::collections::HashMap::from([(MIV_ID_FIRST, "reason".to_string())])
+            );
+        }
+
+        #[test]
+        fn menu_selection_shows_only_plain_command_ids_and_hides_menu_metadata() {
+            let pack = |id: u32, flags: u32| (id as usize) | ((flags as usize) << 16);
+            assert_eq!(
+                menu_tooltip_selection(pack(MIV_ID_FIRST, 0), 1),
+                MenuTooltipSelection::Show(MIV_ID_FIRST)
+            );
+            assert_eq!(
+                menu_tooltip_selection(pack(2, MF_POPUP.0), 1),
+                MenuTooltipSelection::Hide
+            );
+            assert_eq!(
+                menu_tooltip_selection(pack(0, MF_SEPARATOR.0), 1),
+                MenuTooltipSelection::Hide
+            );
+            assert_eq!(
+                menu_tooltip_selection(0xffff_0000, 0),
+                MenuTooltipSelection::Hide
+            );
+        }
+
+        #[test]
+        fn tooltip_track_position_preserves_signed_screen_coordinates() {
+            let packed = pack_track_position(-12, 345);
+            assert_eq!((packed as u32 & 0xffff) as u16 as i16, -12);
+            assert_eq!(((packed as u32 >> 16) & 0xffff) as u16 as i16, 345);
+        }
 
         #[test]
         fn cross_folder_clipboard_data_object_exposes_preferred_move_effect() {
@@ -1236,6 +1737,103 @@ mod tests {
         assert_eq!(miv_command_id(0), Some(MIV_ID_FIRST));
         assert_eq!(miv_command_index(MIV_ID_FIRST, 1), Some(0));
         assert_eq!(miv_command_index(MIV_ID_FIRST + 2, 2), None);
+    }
+
+    #[test]
+    fn inline_shell_insert_position_counts_only_top_level_nodes() {
+        let item = |command, label: &str| MenuNode::Item {
+            command,
+            label: label.to_string(),
+            enabled: true,
+            disabled_reason: None,
+        };
+        let nodes = vec![
+            item(MenuCommand::CopyPath, "copy"),
+            MenuNode::Separator,
+            MenuNode::Submenu {
+                label: "apps".to_string(),
+                children: vec![
+                    item(
+                        MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
+                        "tool",
+                    ),
+                    MenuNode::Separator,
+                    item(MenuCommand::OpenExternalToolSettings, "settings"),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Inline, &nodes),
+            Some(4)
+        );
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Inline, &[]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn shell_submenu_queries_from_its_own_first_position() {
+        let nodes = vec![
+            MenuNode::Separator,
+            MenuNode::Submenu {
+                label: "mIV submenu".to_string(),
+                children: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::Submenu, &nodes),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn leaf_command_order_matches_preorder_id_assignment() {
+        let leaf = |command, label: &str| MenuNode::Item {
+            command,
+            label: label.to_string(),
+            enabled: true,
+            disabled_reason: None,
+        };
+        let nodes = vec![
+            leaf(MenuCommand::CopyPath, "copy"),
+            MenuNode::Submenu {
+                label: "apps".to_string(),
+                children: vec![
+                    leaf(
+                        MenuCommand::OpenWithAssociation {
+                            display_name: "Viewer".to_string(),
+                            handler_id: "viewer.id".to_string(),
+                        },
+                        "Viewer",
+                    ),
+                    leaf(MenuCommand::OpenExternalToolSettings, "settings"),
+                ],
+            },
+            leaf(MenuCommand::Deselect, "deselect"),
+        ];
+        let commands = leaf_commands(&nodes);
+        assert_eq!(commands.len(), 4);
+        for (index, expected) in commands.iter().enumerate() {
+            let id = miv_command_id(index).unwrap();
+            let reverse = miv_command_index(id, commands.len()).unwrap();
+            assert_eq!(commands[reverse], *expected);
+        }
+        assert!(matches!(commands[0], MenuCommand::CopyPath));
+        assert!(matches!(
+            commands[1],
+            MenuCommand::OpenWithAssociation { .. }
+        ));
+        assert!(matches!(commands[2], MenuCommand::OpenExternalToolSettings));
+        assert!(matches!(commands[3], MenuCommand::Deselect));
+    }
+
+    #[test]
+    fn shell_acquisition_failure_keeps_miv_items_available() {
+        assert!(can_keep_miv_menu_after_shell_failure(1));
+        assert!(can_keep_miv_menu_after_shell_failure(12));
+        assert!(!can_keep_miv_menu_after_shell_failure(0));
     }
 
     #[test]

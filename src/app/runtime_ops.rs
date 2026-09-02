@@ -356,6 +356,9 @@ impl App {
         // transaction 境界まで、export は原子的 publish 前までで止まり、その後の終了時
         // DB flush と競合しない。
         drop(self.metadata_transfer.take());
+        // 仮想ページの展開要求を止めて worker を回収した後、process 単位 temp を掃除する。
+        // 先に temp を消すと、終了と競合した worker が同じパスへ書き戻して孤児を残す。
+        self.shutdown_external_tool_materializer();
         // VST3 プラグイン内部状態 (= EQ カーブ / chunk) と GUI ウィンドウ位置 / サイズを
         // bridge から snapshot して settings.json に永続化する。終了前に取らないと再起動時に
         // 全部 default に戻る。bridge teardown は eframe の Drop で走るので、ここで先に
@@ -375,9 +378,6 @@ impl App {
         // legacy タグ worker は detach thread なので、終了時はキャンセルを立てて
         // ファイル境界で止める (特に ImportAndRemove はユーザーファイルを書き換える)。
         if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
-            pending.cancel();
-        }
-        if let Some(pending) = self.tag_legacy_xmp_pending.as_ref() {
             pending.cancel();
         }
         self.cancel_smart_folder_pending();

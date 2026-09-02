@@ -252,7 +252,6 @@ impl App {
         Ok(context_or_tag_writer_busy
             || self.rename_migration_writers_busy()
             || self.tag_maintenance_rx.is_some()
-            || self.tag_legacy_xmp_pending.is_some()
             || self.rename_migration_in_flight.is_some()
             || !self.rename_migration_queue.is_empty()
             || self.metadata_cleanup_pending.is_some()
