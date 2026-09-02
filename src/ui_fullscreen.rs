@@ -1469,6 +1469,45 @@ fn window_geometry_size_to_viewport(size: egui::Vec2, ui_scale: f32) -> egui::Ve
     )
 }
 
+/// 全画面 viewport の位置とサイズを決める。
+///
+/// `window_rect` は**いまウィンドウが居る矩形**で、最大化中も値が入っている
+/// (`App::last_window_rect`)。復元先の `last_outer_rect` を渡すと、最大化で起動して
+/// 一度も戻していない間 `None` になり、最後の分岐へ落ちて画面の左上へ小さく出る
+/// (2026-09-02 利用者報告)。
+///
+/// `monitor_at` はモニター矩形の解決 (物理ピクセル座標 → 論理矩形)。テストから
+/// 差し替えられるように引数で受ける。
+fn fullscreen_viewport_geometry(
+    window_rect: Option<egui::Rect>,
+    pixels_per_point: f32,
+    ui_scale: f32,
+    monitor_at: impl Fn(f32, f32) -> Option<egui::Rect>,
+) -> (egui::Pos2, egui::Vec2) {
+    let monitor_rect = window_rect
+        .map(|r| r.center())
+        .and_then(|c| monitor_at(c.x * pixels_per_point, c.y * pixels_per_point))
+        // 現在位置が分からないときでも全画面にはする。原点はどのモニターにも
+        // 属さないことがあるが、解決は MONITOR_DEFAULTTONEAREST なので必ず
+        // どこかのモニターが返る。固定の 1280x720 は画面の一部しか覆わない。
+        .or_else(|| monitor_at(0.0, 0.0));
+
+    if let Some(rect) = monitor_rect {
+        return (
+            window_geometry_pos_to_viewport(rect.min, ui_scale),
+            window_geometry_size_to_viewport(rect.size(), ui_scale),
+        );
+    }
+    if let Some(rect) = window_rect {
+        // `window_rect` は現在の viewport points で報告されているので変換しない。
+        return (rect.min, rect.size());
+    }
+    (
+        window_geometry_pos_to_viewport(egui::pos2(0.0, 0.0), ui_scale),
+        window_geometry_size_to_viewport(egui::vec2(1280.0, 720.0), ui_scale),
+    )
+}
+
 #[cfg(windows)]
 fn viewport_rect_to_window_geometry(rect: egui::Rect, ui_scale: f32) -> egui::Rect {
     egui::Rect::from_min_max(
@@ -3363,13 +3402,13 @@ fn compare_source_size_matches_canonical(
     (lhs - rhs).abs() <= scale * 0.005
 }
 
-struct ExportDialogTarget {
+pub(crate) struct ExportDialogTarget {
     source: crate::export_dialog::ExportSource,
     source_label: String,
     original_format: crate::save_with_metadata::SrcFormat,
     source_dir: std::path::PathBuf,
-    basename: String,
-    pixels: crate::export_dialog::ExportPixels,
+    pub(crate) basename: String,
+    pub(crate) pixels: crate::export_dialog::ExportPixels,
 }
 
 fn scale_sns_split_frames_to_export_pixels(
@@ -4705,8 +4744,56 @@ fn format_duration_mm_ss(secs: f64) -> String {
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
-/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
 pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+const FEEDBACK_TOAST_BASE_CHARS: usize = 20;
+/// 1 文字あたりの加算秒。**日本語の読字速度は毎秒 8 文字程度**なので、その逆数を取る。
+/// 0.06 (= 毎秒 17 文字) では読み切る前に消えた (2026-08-30、混在選択の拒否文で実測報告)。
+const FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR: f32 = 0.12;
+/// 上限。長すぎるトーストは邪魔になるが、拒否理由と対処を書いた長文案内にも
+/// 5 秒以上を確保する。既存の長文ヒント (`NO_IMAGE_FOLDER_HINT_DURATION` = 4.0) より長い。
+const FEEDBACK_TOAST_MAX_DURATION: f32 = 5.5;
+
+/// 短文は従来の 1.2 秒を維持し、20 文字を超えた分だけ表示時間を延ばす。
+/// 日本語を 1 文字として扱うため、byte 長ではなく Unicode scalar value 数で計算する。
+pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
+    let extra_chars = text
+        .chars()
+        .count()
+        .saturating_sub(FEEDBACK_TOAST_BASE_CHARS);
+    (FEEDBACK_TOAST_DURATION + extra_chars as f32 * FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR)
+        .min(FEEDBACK_TOAST_MAX_DURATION)
+}
+
+fn feedback_toast_layer_id(drawing_surface: crate::app::ActionSurface) -> egui::LayerId {
+    let id = match drawing_surface {
+        crate::app::ActionSurface::MainWindow => "feedback_toast_main_window",
+        crate::app::ActionSurface::Viewer => "feedback_toast_viewer",
+    };
+    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new(id))
+}
+
+fn feedback_toast_rect(
+    full_rect: egui::Rect,
+    toast_size: egui::Vec2,
+    avoid_rect: Option<egui::Rect>,
+) -> egui::Rect {
+    let mut toast_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            full_rect.max.x - toast_size.x - 20.0,
+            full_rect.min.y + 60.0,
+        ),
+        toast_size,
+    );
+    if let Some(avoid_rect) = avoid_rect
+        && toast_rect.intersects(avoid_rect)
+    {
+        toast_rect = toast_rect.translate(egui::vec2(
+            0.0,
+            avoid_rect.bottom() + 8.0 - toast_rect.top(),
+        ));
+    }
+    toast_rect
+}
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -16379,6 +16466,23 @@ impl App {
                     self.show_remote_session_dialog(ctx);
                 }
 
+                // 外部ツールへ渡すファイルの準備進捗も、押された viewport 上に出す。
+                //
+                // **メイン update の tail はフルスクリーン中 early return で飛ぶ**ので
+                // (`app.rs` の「会計はここで出す」コメント参照)、ここで描かないと進捗が
+                // 見えないだけでなく、**spawn 境界の ACK を返す `authorize_...` も走らない**。
+                // その結果 worker が起動許可を待ったまま止まり、進捗 modal が入力を掴んだ
+                // まま解放されず、クリックが効かなくなる (実機 2026-09-02)。
+                // 上の編集用追加パックと同じ理由・同じ対処。
+                // **`embedded` でも呼ぶ。** 上の remote session modal が `!embedded` に
+                // しているのは「embedded なら main update の終端で描かれる」という前提だが、
+                // **その前提はここでは成り立たない**。フルスクリーン中は main update が
+                // tail の手前で early return するので (app.rs の「会計はここで出す」参照)、
+                // embedded でも tail は走らない。実機では embedded=true のまま
+                // 進捗 modal が入力を掴んで固まった (2026-09-02)。
+                self.show_external_tool_materialize_progress(ctx);
+                self.authorize_external_tool_launch_boundaries_after_ui();
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
                 fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
@@ -18449,7 +18553,8 @@ impl App {
 
     #[cfg(windows)]
     fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
-        let center = self.last_outer_rect.map(|r| r.center())?;
+        // 背景の黒幕も「いま居るモニター」を覆うものなので現在位置を読む。
+        let center = self.last_window_rect.map(|r| r.center())?;
         let effective_ppp = self.last_pixels_per_point;
         let native_ppp = crate::settings::native_pixels_per_point_from_effective(
             effective_ppp,
@@ -18479,32 +18584,12 @@ impl App {
         transparent: bool,
         taskbar: bool,
     ) -> egui::ViewportBuilder {
-        let center = self.last_outer_rect.map(|r| r.center());
-        let ppp = self.last_pixels_per_point;
-
-        let monitor_rect =
-            center.and_then(|c| crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp));
-
-        let (position, inner_size) = if let Some(rect) = monitor_rect {
-            (
-                window_geometry_pos_to_viewport(rect.min, self.settings.ui_scale_factor),
-                window_geometry_size_to_viewport(rect.size(), self.settings.ui_scale_factor),
-            )
-        } else if let Some(rect) = self.last_outer_rect {
-            // `last_outer_rect` is already reported in current viewport points.
-            (rect.min, rect.size())
-        } else {
-            (
-                window_geometry_pos_to_viewport(
-                    egui::pos2(0.0, 0.0),
-                    self.settings.ui_scale_factor,
-                ),
-                window_geometry_size_to_viewport(
-                    egui::vec2(1280.0, 720.0),
-                    self.settings.ui_scale_factor,
-                ),
-            )
-        };
+        let (position, inner_size) = fullscreen_viewport_geometry(
+            self.last_window_rect,
+            self.last_pixels_per_point,
+            self.settings.ui_scale_factor,
+            crate::monitor::get_monitor_logical_rect_at,
+        );
 
         egui::ViewportBuilder::default()
             .with_decorations(false)
@@ -32769,28 +32854,42 @@ impl App {
         };
         let alpha_u8 = (alpha * 220.0) as u8;
 
+        // Foreground のチェック件数パネルより上で描画し、クリック判定も同じ層へ置く。
+        let toast_layer_id = feedback_toast_layer_id(drawing_surface);
+        let toast_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(toast_layer_id)
+                .max_rect(full_rect),
+        );
         let font = egui::FontId::proportional(18.0);
-        let galley = ui
-            .painter()
-            .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let galley =
+            toast_ui
+                .painter()
+                .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
         let text_size = galley.size();
         let padding = egui::vec2(16.0, 10.0);
         let toast_size = text_size + padding * 2.0;
 
-        let toast_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                full_rect.max.x - toast_size.x - 20.0,
-                full_rect.min.y + 60.0,
-            ),
-            toast_size,
-        );
+        // 一覧では実測したチェック件数パネルの下へ逃がし、「選択解除」を覆わない。
+        // フルスクリーン、ダイアログ中などパネルが出ない場面は従来位置を維持する。
+        let checked_overlay_rect = (drawing_surface == crate::app::ActionSurface::MainWindow
+            && !self.checked.is_empty()
+            && !self.viewer_session_blocks_main_window()
+            && !self.any_dialog_open())
+        .then(|| {
+            ctx.memory(|memory| {
+                memory.area_rect(egui::Id::new(crate::ui_main::CHECKED_SELECTION_OVERLAY_ID))
+            })
+        })
+        .flatten();
+        let toast_rect = feedback_toast_rect(full_rect, toast_size, checked_overlay_rect);
 
-        ui.painter().rect_filled(
+        toast_ui.painter().rect_filled(
             toast_rect,
             8.0,
             egui::Color32::from_rgba_unmultiplied(30, 30, 30, alpha_u8),
         );
-        ui.painter().text(
+        toast_ui.painter().text(
             toast_rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
@@ -32799,7 +32898,7 @@ impl App {
         );
 
         if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
-            let resp = ui
+            let resp = toast_ui
                 .interact(
                     toast_rect,
                     egui::Id::new("feedback_toast_reveal_capture"),
@@ -34772,7 +34871,7 @@ impl App {
         })
     }
 
-    fn prepare_spread_export_dialog_target(
+    pub(crate) fn prepare_spread_export_dialog_target(
         &mut self,
         ctx: &egui::Context,
         left_idx: usize,
@@ -36898,6 +36997,78 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全画面まわりで「いま居る場所」を聞く側が、復元先の矩形を読んでいないこと。
+    ///
+    /// **挙動で確かめられない**ので綴りを見る。`fullscreen_viewport_geometry` には
+    /// 「現在位置が無ければ原点のモニターへ落ちる」保険が入っているため、単一モニター
+    /// 環境では復元先を渡しても同じ答えになってしまい、差が出るのは「最大化した窓が
+    /// 副モニターに居る」ときだけ。それを実機構成に依存せず組めない (§1.136 と同じ罠)。
+    #[test]
+    fn the_places_that_ask_where_the_window_is_do_not_read_the_restore_rect() {
+        let source = include_str!("ui_fullscreen.rs");
+        for (needle, what) in [
+            (
+                "fn build_fullscreen_viewport_builder_with_transparency_and_taskbar",
+                "全画面 viewport のビルダー",
+            ),
+            ("fn fullscreen_backdrop_physical_rect", "全画面の背景矩形"),
+        ] {
+            let at = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} が見つからない"));
+            // 文字境界で切るため、バイト数ではなく文字数で窓を取る。
+            let window: String = source[at..].chars().take(400).collect();
+            assert!(
+                !window.contains("self.last_outer_rect"),
+                "{what} は復元先ではなく self.last_window_rect を読むこと (last_outer_rect は最大化中に更新されない)"
+            );
+        }
+    }
+    /// 全画面 viewport はモニター全体を覆う。
+    ///
+    /// 「いま居る矩形」が分からないときに固定の 1280x720 を返していたため、最大化で
+    /// 起動して一度も戻していない環境で、F11 の全画面が画面左上に小さく出た
+    /// (2026-09-02 利用者報告)。現在位置が無くてもモニターへ落とす。
+    #[test]
+    fn the_fullscreen_viewport_covers_a_monitor_even_without_a_known_window_rect() {
+        let primary = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, 1440.0));
+        let secondary =
+            egui::Rect::from_min_size(egui::pos2(2560.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let monitors = |x: f32, _y: f32| -> Option<egui::Rect> {
+            if x >= 2560.0 {
+                Some(secondary)
+            } else {
+                Some(primary)
+            }
+        };
+
+        // 利用者が踏んだ形: 現在位置が不明。既定サイズではなくモニターを覆う。
+        let (pos, size) = fullscreen_viewport_geometry(None, 1.5, 1.0, monitors);
+        assert_eq!(pos, primary.min);
+        assert_eq!(size, primary.size());
+
+        // 現在位置が分かっていれば、その中心のモニターを覆う。
+        let on_secondary =
+            egui::Rect::from_min_size(egui::pos2(1800.0, 100.0), egui::vec2(600.0, 400.0));
+        let (pos, size) = fullscreen_viewport_geometry(Some(on_secondary), 1.5, 1.0, monitors);
+        assert_eq!(
+            pos, secondary.min,
+            "中心 (2100,300) x ppp 1.5 は 2 台目に入る"
+        );
+        assert_eq!(size, secondary.size());
+
+        // モニターが 1 つも解決できない環境では、いま居る矩形をそのまま使う。
+        let none = |_x: f32, _y: f32| -> Option<egui::Rect> { None };
+        let (pos, size) = fullscreen_viewport_geometry(Some(on_secondary), 1.5, 1.0, none);
+        assert_eq!(pos, on_secondary.min);
+        assert_eq!(size, on_secondary.size());
+
+        // どちらも無いときだけ、最後の既定値へ落ちる。
+        let (pos, size) = fullscreen_viewport_geometry(None, 1.5, 1.0, none);
+        assert_eq!(pos, egui::Pos2::ZERO);
+        assert_eq!(size, egui::vec2(1280.0, 720.0));
+    }
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
@@ -37754,6 +37925,62 @@ mod tests {
 "
             )
         );
+    }
+
+    #[test]
+    fn feedback_toast_short_text_keeps_default_duration() {
+        assert_eq!(
+            feedback_toast_duration("短い確認メッセージ"),
+            FEEDBACK_TOAST_DURATION
+        );
+    }
+
+    #[test]
+    fn feedback_toast_long_japanese_text_extends_by_character_count() {
+        let text = "あ".repeat(FEEDBACK_TOAST_BASE_CHARS + 1);
+        let expected = FEEDBACK_TOAST_DURATION + FEEDBACK_TOAST_SECS_PER_EXTRA_CHAR;
+        assert!((feedback_toast_duration(&text) - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn feedback_toast_duration_is_capped() {
+        assert_eq!(
+            feedback_toast_duration(&"長".repeat(10_000)),
+            FEEDBACK_TOAST_MAX_DURATION
+        );
+    }
+
+    #[test]
+    fn feedback_toast_layer_is_above_checked_selection_overlay() {
+        assert_eq!(
+            feedback_toast_layer_id(crate::app::ActionSurface::MainWindow).order,
+            egui::Order::Tooltip
+        );
+        assert!(egui::Order::Tooltip > egui::Order::Foreground);
+    }
+
+    #[test]
+    fn feedback_toast_moves_below_overlapping_checked_selection_overlay() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let overlay_rect =
+            egui::Rect::from_min_size(egui::pos2(690.0, 20.0), egui::vec2(100.0, 120.0));
+
+        let toast_rect =
+            feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), Some(overlay_rect));
+
+        assert!(!toast_rect.intersects(overlay_rect));
+        assert_eq!(toast_rect.top(), overlay_rect.bottom() + 8.0);
+        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
+    }
+
+    #[test]
+    fn feedback_toast_keeps_default_position_without_checked_selection_overlay() {
+        let full_rect = egui::Rect::from_min_size(egui::pos2(10.0, 30.0), egui::vec2(800.0, 600.0));
+
+        let toast_rect = feedback_toast_rect(full_rect, egui::vec2(320.0, 44.0), None);
+
+        assert_eq!(toast_rect.right(), full_rect.right() - 20.0);
+        assert_eq!(toast_rect.top(), full_rect.top() + 60.0);
     }
 
     #[test]

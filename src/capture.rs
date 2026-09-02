@@ -416,10 +416,36 @@ pub fn save_rgba_exact_with_matte(
         .open(path)
         .map_err(|e| format!("保存ファイルを作成できません: {}: {e}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    encode_rgba(&mut writer, format, jpeg_matte, width, height, rgba)?;
+    write_rgba_with_matte(&mut writer, format, jpeg_matte, width, height, rgba)?;
     writer
         .flush()
         .map_err(|e| format!("保存ファイルを flush できません: {}: {e}", path.display()))
+}
+
+/// 呼び出し側が安全に確保済みの出力先へ RGBA を書き込む。
+///
+/// 外部ツール用 materializer は `create_new` した request-owned handle をこの関数へ
+/// 渡し、予約と書き込みの間に path を開き直さない。
+pub(crate) fn write_rgba_with_matte<W: Write>(
+    writer: &mut W,
+    format: CaptureFormat,
+    jpeg_matte: JpegMatte,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("capture size is zero".to_string());
+    }
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return Err(format!(
+            "invalid RGBA buffer length: got {}, expected {}",
+            rgba.len(),
+            expected_len
+        ));
+    }
+    encode_rgba(writer, format, jpeg_matte, width, height, rgba)
 }
 
 pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {

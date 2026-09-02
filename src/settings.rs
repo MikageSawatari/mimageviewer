@@ -3155,10 +3155,56 @@ impl FullscreenJumpMode {
 // RecentApp (アプリケーションで開く 履歴)
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RecentApp {
     pub display_name: String,
+    pub launch: crate::external_tool::ExternalToolLaunch,
+}
+
+/// リリース済み `custom_open_with_apps` の読み取り専用キャリア。
+///
+/// このリストは利用者が明示的に選んだ EXE だけなので、現在そのファイルが存在するかに
+/// 関係なく `ExternalToolLaunch::Executable` へ移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LegacyOpenWithApp {
+    pub display_name: String,
     pub exe_path: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RecentAppSerde {
+    Current(RecentApp),
+    Legacy {
+        display_name: String,
+        exe_path: String,
+    },
+}
+
+fn deserialize_recent_open_with_apps<'de, D>(deserializer: D) -> Result<Vec<RecentApp>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = <Vec<RecentAppSerde> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|app| match app {
+            RecentAppSerde::Current(app) => app,
+            RecentAppSerde::Legacy {
+                display_name,
+                exe_path,
+            } => {
+                let is_existing_file = Path::new(&exe_path).is_file();
+                RecentApp {
+                    display_name,
+                    launch: crate::external_tool::classify_legacy_recent_launch(
+                        &exe_path,
+                        is_existing_file,
+                    ),
+                }
+            }
+        })
+        .collect())
 }
 
 // -----------------------------------------------------------------------
@@ -3920,10 +3966,14 @@ pub struct Settings {
     pub show_location_drive_roots: bool,
 
     // ── エクスプローラ連携 ────────────────────────────────────
-    /// 実ファイル / 実フォルダの右クリックに Windows Shell の標準メニューを使う。
-    /// ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューにフォールバックする。
+    /// リリース済み設定との読み書き互換だけのために残す旧フィールド。
+    /// 現在は値にかかわらず Windows Shell 項目を常に含め、この値は動作に影響しない。
     #[serde(default = "default_true")]
     pub use_native_shell_context_menu: bool,
+    /// Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の
+    /// 「Windows のメニュー」サブメニューへまとめる。
+    #[serde(default)]
+    pub show_windows_context_menu_inline: bool,
     /// mIV の事前判定でごみ箱へ移せる対象は、種類に関係なく mIV 側の削除確認を省略する。
     /// 完全削除候補は常に確認を残す。
     #[serde(default)]
@@ -4269,7 +4319,7 @@ pub struct Settings {
     /// ツールバー「ソート」セクションの表示形式 (展開 / プルダウン)。
     #[serde(default)]
     pub toolbar_sort_display: ToolbarSectionDisplay,
-    /// お気に入り / タグ / 本棚セクションの表示形式 (展開 / 折りたたみ / プルダウン)。v2.0.0。
+    /// 動的項目セクションの表示形式 (展開 / 折りたたみ / プルダウン)。
     #[serde(default)]
     pub toolbar_favorites_display: ToolbarSectionDisplay,
     #[serde(default)]
@@ -4352,12 +4402,16 @@ pub struct Settings {
     pub folder_thumb_depth: u32,
 
     // ── アプリケーションで開く ──────────────────────────────────
-    /// 最近使ったアプリケーション（最大3件、最新が先頭）
-    #[serde(default)]
+    /// 未使用。リリース済みデータの読み取り互換キャリアとして残し、次の版で削除を検討する。
+    #[serde(default, deserialize_with = "deserialize_recent_open_with_apps")]
     pub recent_open_with_apps: Vec<RecentApp>,
-    /// ユーザーが手動で追加したアプリケーション
+    /// ユーザーが手動で追加した legacy アプリケーション。
+    /// `external_tools` への移行元として読むだけで、以後は書かない。次リリース後に削除予定。
     #[serde(default)]
-    pub custom_open_with_apps: Vec<RecentApp>,
+    pub custom_open_with_apps: Vec<LegacyOpenWithApp>,
+    /// 安定 ID 付きの外部ツール登録。表示順は Vec の順序。
+    #[serde(default)]
+    pub external_tools: Vec<crate::external_tool::ExternalTool>,
 
     // ── AI セッション設定 ────────────────────────────────────
     /// AI アップスケール: フルスクリーン表示時に有効にするか（デフォルト: false）
@@ -5985,6 +6039,7 @@ impl Default for Settings {
             show_location_downloads: true,
             show_location_drive_roots: true,
             use_native_shell_context_menu: true,
+            show_windows_context_menu_inline: false,
             skip_recycle_bin_delete_confirmation: false,
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
@@ -6027,6 +6082,7 @@ impl Default for Settings {
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),
             custom_open_with_apps: Vec::new(),
+            external_tools: Vec::new(),
             ai_upscale_enabled: false,
             ai_upscale_model_override: None,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
@@ -8084,6 +8140,7 @@ impl Settings {
         // ── 「アプリケーションで開く」履歴 ──
         self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
         self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);
+        // `external_tools` は環境設定ページが正本なので、編集中の値を維持する。
         // ── AI アップスケール runtime 選択 ──
         self.ai_upscale_enabled = src.ai_upscale_enabled;
         self.ai_upscale_model_override = src.ai_upscale_model_override.take();
@@ -8265,22 +8322,6 @@ impl Settings {
     /// 追加された場合 true を返す。UUID は自動発行、index フラグは全 false。
     pub fn add_favorite(&mut self, name: String, path: PathBuf) -> bool {
         self.try_add_favorite(name, path).is_ok()
-    }
-
-    /// 「アプリケーションで開く」で使用したアプリを履歴に記録する。
-    /// 同じ exe_path が既にあれば先頭に移動。最大3件。
-    pub fn record_recent_open_with(&mut self, display_name: String, exe_path: String) {
-        const MAX_RECENT_OPEN_WITH: usize = 3;
-        self.recent_open_with_apps
-            .retain(|a| !a.exe_path.eq_ignore_ascii_case(&exe_path));
-        self.recent_open_with_apps.insert(
-            0,
-            RecentApp {
-                display_name,
-                exe_path,
-            },
-        );
-        self.recent_open_with_apps.truncate(MAX_RECENT_OPEN_WITH);
     }
 }
 
@@ -8542,6 +8583,19 @@ mod tests {
         let loaded: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(loaded.skip_recycle_bin_delete_confirmation);
+    }
+
+    #[test]
+    fn windows_context_menu_inline_defaults_off_and_round_trips() {
+        assert!(!Settings::default().show_windows_context_menu_inline);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.show_windows_context_menu_inline);
+
+        let mut settings = Settings::default();
+        settings.show_windows_context_menu_inline = true;
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(loaded.show_windows_context_menu_inline);
     }
 
     #[test]
@@ -8908,6 +8962,10 @@ mod tests {
                 ToolbarSectionId::Tags,
             ]
         );
+        // P2c で未出荷の外部ツールセクションを撤去した後も、開発中に保存された順序は
+        // 設定全体を読めなくせず、通常の未知セクションと同じく描画前に除外する。
+        let removed: ToolbarSectionId = serde_json::from_str(r#""ExternalTools""#).unwrap();
+        assert_eq!(removed, ToolbarSectionId::Unknown);
     }
 
     #[test]
@@ -10660,6 +10718,81 @@ mod tests {
     }
 
     #[test]
+    fn preferences_ok_keeps_edited_external_tools() {
+        let mut edited = Settings::default();
+        edited.external_tools = vec![crate::external_tool::ExternalTool {
+            id: crate::external_tool::ExternalToolId(23),
+            name: "Edited Tool".to_string(),
+            ..crate::external_tool::ExternalTool::defaults_for_viewing()
+        }];
+        let mut live = Settings::default();
+        live.external_tools = vec![crate::external_tool::ExternalTool {
+            id: crate::external_tool::ExternalToolId(17),
+            name: "Live Tool".to_string(),
+            ..crate::external_tool::ExternalTool::defaults_for_editing()
+        }];
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.external_tools.len(), 1);
+        assert_eq!(
+            edited.external_tools[0].id,
+            crate::external_tool::ExternalToolId(23)
+        );
+        assert_eq!(edited.external_tools[0].name, "Edited Tool");
+    }
+
+    #[test]
+    fn legacy_json_open_with_shapes_deserialize_with_context_specific_rules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let existing = dir.path().join("editor.exe");
+        std::fs::write(&existing, b"test").unwrap();
+        let missing_custom = dir.path().join("missing-custom.exe");
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let map = value.as_object_mut().unwrap();
+        map.insert(
+            "recent_open_with_apps".to_string(),
+            serde_json::json!([
+                {
+                    "display_name": "Editor",
+                    "exe_path": existing.to_string_lossy()
+                },
+                {
+                    "display_name": "フォト",
+                    "exe_path": "フォト"
+                }
+            ]),
+        );
+        map.insert(
+            "custom_open_with_apps".to_string(),
+            serde_json::json!([{
+                "display_name": "Missing custom editor",
+                "exe_path": missing_custom.to_string_lossy()
+            }]),
+        );
+
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            loaded.recent_open_with_apps[0].launch,
+            crate::external_tool::ExternalToolLaunch::Executable(existing)
+        );
+        assert_eq!(
+            loaded.recent_open_with_apps[1].launch,
+            crate::external_tool::ExternalToolLaunch::Association {
+                handler_id: "フォト".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.custom_open_with_apps,
+            vec![LegacyOpenWithApp {
+                display_name: "Missing custom editor".to_string(),
+                exe_path: missing_custom.to_string_lossy().into_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -10674,6 +10807,7 @@ mod tests {
             crate::reading_history_db::READING_HISTORY_LIMIT_DEFAULT
         );
         assert!(s.recent_folders.is_empty());
+        assert!(s.external_tools.is_empty());
         assert_eq!(s.quick_folder_slots, [None, None]);
         assert_eq!(
             s.quick_folder_drive_current_dirs,
