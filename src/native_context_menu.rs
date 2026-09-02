@@ -410,6 +410,7 @@ mod windows_impl {
             miv_count,
             &[],
         );
+        let z_com_init = diagnostic_z_order();
 
         let stage_t0 = Instant::now();
         let menu = match unsafe { CreatePopupMenu() } {
@@ -428,6 +429,7 @@ mod windows_impl {
             miv_count,
             &[],
         );
+        let z_create_popup = diagnostic_z_order();
 
         let stage_t0 = Instant::now();
         let mut leaf_index = 0;
@@ -448,6 +450,7 @@ mod windows_impl {
             miv_count,
             &[],
         );
+        let z_append_miv = diagnostic_z_order();
 
         let hwnd = HWND(request.hwnd as *mut core::ffi::c_void);
         let shell_menu = if let Some(folder) = request.background_folder.as_ref() {
@@ -528,6 +531,7 @@ mod windows_impl {
             }
         }
 
+        let z_shell_built = diagnostic_z_order();
         let stage_t0 = Instant::now();
         let shell_forwarder = shell_menu
             .as_ref()
@@ -561,6 +565,7 @@ mod windows_impl {
             miv_count,
             &[],
         );
+        let z_subclass = diagnostic_z_order();
 
         let (screen_x, screen_y) = cursor_screen_pos().unwrap_or(request.screen_pos);
         let pre_track_ms = elapsed_ms(total_t0);
@@ -600,7 +605,7 @@ mod windows_impl {
             let foreground_after = unsafe { GetForegroundWindow().0 as usize as u64 };
             let owner = hwnd.0 as usize as u64;
             crate::logger::log(format!(
-                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_pre_track={z_before_track} z_after={}",
+                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_com={z_com_init} z_popup={z_create_popup} z_miv={z_append_miv} z_shell={z_shell_built} z_subclass={z_subclass} z_pre_track={z_before_track} z_after={}",
                 foreground_before == owner,
                 foreground_before != foreground_after,
                 diagnostic_z_order(),
