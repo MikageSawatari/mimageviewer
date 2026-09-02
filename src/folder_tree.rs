@@ -141,6 +141,13 @@ pub fn is_zip_extension(ext: &str) -> bool {
     ext == "zip" || ext == "cbz"
 }
 
+/// `.pdf` を PDF 仮想フォルダとして扱うかの判定。入力は小文字化済みの拡張子
+/// (`is_zip_extension` と同じ規約)。ZIP 側と対で置くことで、仮想フォルダ判定と
+/// 名前索引の分類が同じ綴りを共有する。
+pub fn is_pdf_extension(ext: &str) -> bool {
+    ext == "pdf"
+}
+
 /// .zip / .cbz / .pdf ファイルを仮想フォルダとして扱うかの判定。
 pub fn is_virtual_folder(path: &Path) -> bool {
     let ext = path
@@ -148,7 +155,7 @@ pub fn is_virtual_folder(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    is_zip_extension(&ext) || ext == "pdf"
+    is_zip_extension(&ext) || is_pdf_extension(&ext)
 }
 
 /// Runtime container predicate for a path already opened as a page list.

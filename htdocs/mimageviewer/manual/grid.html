@@ -57,6 +57,7 @@
         <a href="annotation.html">テキスト注釈</a>
         <a href="export.html">エクスポート</a>
         <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
         <a href="tags.html">タグ機能</a>
         <a href="books.html">製本・本棚</a>
         <a href="search.html">検索機能</a>
@@ -318,16 +319,16 @@
     <p class="note">確認ウィンドウは背景を少し暗くするモーダルです。表示中は背景を操作できません。フルスクリーン表示中は出さず、一覧へ戻ったときに表示します。照合と復元はバックグラウンドで進みます。</p>
 
     <h3>右クリックメニュー</h3>
-    <p>サムネイルを右クリックするとコンテキストメニューが表示されます。実ファイル / 実フォルダでは、環境設定の「Windows 標準の右クリックメニューを使う」が ON の場合、Windows Shell 標準メニューの上部に mImageViewer 独自項目を追加して表示します。フォルダ作成と名前変更は、mImageViewer の先頭項目から行うと作成後・変更後の一覧更新と選択復元まで反映されます。OFF の場合や仮想項目では、ファイルのコピー / カット / ペーストを含まない mImageViewer 独自メニューを表示します。ドライブ一覧では右クリックメニューは表示されません。</p>
+    <p>サムネイルを右クリックすると、実ファイル / 実フォルダと ZIP/PDF 内ページなどの仮想項目のどちらでも Windows と同じ見た目のコンテキストメニューが表示されます。実項目の Windows Shell 項目は既定で末尾の「Windows のメニュー」にまとめられ、このサブメニューを開くまで読み込みません。環境設定で従来どおり同じ階層へ併記できます。フォルダ作成と名前変更は、mImageViewer の先頭項目から行うと作成後・変更後の一覧更新と選択復元まで反映されます。仮想項目ではファイルのコピー / カット / ペーストなどの Windows 項目を表示しません。ドライブ一覧では右クリックメニューは表示されません。</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr><th>主な項目</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>新しいフォルダ...</td><td>実フォルダのアイテムがない場所の右クリックで表示。Windows 標準の入力画面でフォルダ名を指定し、作成後に一覧を更新して新しいフォルダへカーソルを移します</td></tr>
+          <tr><td>新しいフォルダ…</td><td>実フォルダのアイテムがない場所の右クリックで表示。Windows 標準の入力画面でフォルダ名を指定し、作成後に一覧を更新して新しいフォルダへカーソルを移します</td></tr>
           <tr><td>貼り付け</td><td>実フォルダのアイテムがない場所の右クリックで表示。Windows Shell の貼り付けとして実行し、ファイル・フォルダの貼り付け、上書き確認、進捗表示は Windows 側に任せます。貼り付けが終わると、増えた項目が選択されます (下記)</td></tr>
-          <tr><td>名前の変更...</td><td>実ファイル / 実フォルダの右クリックで表示。Windows 標準の入力画面で新しい名前を指定し、Windows のファイル操作として名前を変更します</td></tr>
+          <tr><td>名前の変更…</td><td>実ファイル / 実フォルダの右クリックで表示。Windows 標準の入力画面で新しい名前を指定し、Windows のファイル操作として名前を変更します</td></tr>
           <tr><td>パスをコピー</td><td>ファイルやフォルダのフルパスをクリップボードにコピー</td></tr>
           <tr><td>ファイル名をコピー</td><td>ファイル名のみをコピー</td></tr>
           <tr><td>画像をクリップボードにコピー</td><td>デコードした画像データをコピー（画像のみ）</td></tr>
@@ -335,8 +336,9 @@
           <tr><td>フォルダに移動</td><td>検索結果（<kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd>）でのみ表示。アイテムが入っているフォルダを mImageViewer のグリッドで開きます</td></tr>
           <tr><td>左に回転 (L) / 右に回転 (R)</td><td>mImageViewer の非破壊回転</td></tr>
           <tr><td>📌 代表サムネに固定 / 解除</td><td>そのアイテムを現在のフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネイルに固定します（再クリックで解除）。詳しくは下の「代表サムネイルを手動で指定する」を参照</td></tr>
+          <tr><td>（登録した外部ツール名）</td><td>登録済みの外部ツールがすべて並びます。選んだ項目をそのアプリで開きます。フォルダや ZIP / PDF そのものを右クリックしたときは、そのコンテナーを渡します。詳しくは<a href="external-tools.html">外部ツール連携</a>を参照</td></tr>
           <tr><td>このフォルダをエクスプローラで開く</td><td>mImageViewer 独自項目の一番下に表示。フォルダならそのフォルダ自身、ファイルや ZIP / PDF 内ページなら格納元の実フォルダを Explorer で開きます</td></tr>
-          <tr><td>Windows 標準項目</td><td>コピー / カット / ペースト / 削除 / プロパティ / 送る / 関連付けアプリなどは Windows Shell が表示します。<kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> / <kbd>V</kbd> も同じ Windows 標準動作に合わせています。表示中の実フォルダは監視され、外部変更や貼り付け後の一覧更新も自動反映されます</td></tr>
+          <tr><td>Windows のメニュー</td><td>コピー / カット / ペースト / 削除 / プロパティ / 送る / 関連付けアプリなどをまとめたサブメニューです。開いたときに Windows Shell 項目を読み込みます。環境設定の「Windows のメニューを併記する」を ON にすると同じ階層へ並びます。<kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> / <kbd>V</kbd> も同じ Windows 標準動作に合わせています</td></tr>
         </tbody>
       </table>
     </div>
@@ -346,11 +348,11 @@
       <div class="box-body">
         アイテム種別によって表示される項目が異なります。
         <ul style="margin:0.5em 0 0; padding-left:1.2em;">
-          <li><strong>実ファイル / 実フォルダ：</strong>Windows 標準メニュー + mImageViewer 独自項目を表示</li>
-          <li><strong>何もない場所（アイテムのない背景・空フォルダ）：</strong>実フォルダ表示中は現在フォルダの Windows 背景メニューを表示。ZIP / PDF 内ページ表示中は mImageViewer 独自メニューを表示</li>
-          <li><strong>ZIP 内の画像：</strong>従来の mImageViewer メニューで「パスをコピー」「ファイル名をコピー」「画像をクリップボードにコピー」</li>
-          <li><strong>PDF のページ：</strong>従来の mImageViewer メニューで「パスをコピー」「ページ名をコピー」</li>
-          <li><strong>仮想項目を含む複数チェック：</strong>Windows 標準メニューではなく mImageViewer 独自メニューを表示。ファイルとしてコピー / カットはできません</li>
+          <li><strong>実ファイル / 実フォルダ：</strong>mImageViewer 項目 + 既定では「Windows のメニュー」サブメニューを表示</li>
+          <li><strong>何もない場所（アイテムのない背景・空フォルダ）：</strong>実フォルダ表示中は現在フォルダの Windows 背景項目を含む native メニュー、ZIP / PDF 内ページ表示中は mImageViewer 項目だけの native メニューを表示</li>
+          <li><strong>ZIP 内の画像：</strong>native メニューで「パスをコピー」「ファイル名をコピー」「画像をクリップボードにコピー」</li>
+          <li><strong>PDF のページ：</strong>native メニューで「パスをコピー」「ページ名をコピー」</li>
+          <li><strong>仮想項目を含む複数チェック：</strong>mImageViewer 項目だけの native メニューを表示。実項目との混在時にパスコピー / 削除を押すと、ページ選択を外すよう案内して全体を中止します</li>
         </ul>
       </div>
     </div>

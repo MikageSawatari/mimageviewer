@@ -491,6 +491,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   - GridClearRecentFolders / GridClearQuickFolderSlots も既定未割り当ての Grid 操作。
     フォルダバー設定メニューと同じ共有入口で、状態クリア・設定保存・完了トーストまでを実行する。
     後者は A/B の場所に加えてセッション中の一覧位置を全件消し、現在の一覧も先頭へ戻す。
+  - ExternalToolPicker / ExternalTool1..10 / ExternalToolForContainer も既定未割り当ての
+    Grid 操作 (P)。動的 Action は作らず、固定 10 スロットを登録順のツールへ対応させる。
+    ツールの並べ替えでスロットとの対応が変わるため、設定 UI では番号を明示する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 

@@ -594,7 +594,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
     let _ = tx.send(ExportEvent::AllDone);
 }
 
-fn render_export_pixels<'a>(
+pub(crate) fn render_export_pixels<'a>(
     pixels: &'a ExportPixels,
     preset: Option<&ConcealPreset>,
     entry_crop: Option<crate::export_crop::CropRect>,
