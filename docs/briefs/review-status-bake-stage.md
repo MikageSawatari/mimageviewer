@@ -1,7 +1,13 @@
 ﻿# Codex Sol レビュー指摘の対応状況 (2026-09-02)
 
 対象: 外部ツール連携 + 焼き込み段階の統一 (前半)。
-ブランチ `context-menu-owner-hwnd`、**master へは未マージ**。
+ブランチ `context-menu-owner-hwnd`、**2026-09-02 に master へマージ済み**。
+
+> マージ時点で、外部ツールの引数プレースホルダは **`{files}` 1 つだけ**になっている
+> (利用者判断)。場所の値 (`{container}` / `{page}` 等) とファイル名の部品
+> (`{stem}` / `{ext}` 等) は実装したうえで撤去した。理由は
+> [external-tool-launch-plan.md](../external-tool-launch-plan.md) §4.4。
+> このため #4 / #11 / #12 の一部は**対象そのものが無くなっている**。
 
 指摘の原文は [review-findings-bake-stage-raw.md](review-findings-bake-stage-raw.md)。
 依頼書は [review-bake-stage-and-external-tool.md](review-bake-stage-and-external-tool.md)。
