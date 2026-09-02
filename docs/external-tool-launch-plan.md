@@ -981,34 +981,7 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 
 ### 残りの段
 
-- **P4 の残り**: `VideoPolicy::CurrentFrame` (動画の現在フレームを画像として渡す)。
-  **見た目より大きい。** 着手前に下記を読むこと。
-
-  当初「受け皿の `MaterializeSource::Rendered` に画素を載せるだけ」と見積もったが、
-  **載せる画素を作る経路が無い** (2026-09-02 調査):
-
-  - 動画は native presenter (D3D11 + DComp) が別 HWND へ出しており、フレームは
-    `egui::ColorImage` として本体に来ない。
-  - フルスクリーンの <kbd>Ctrl+S</kbd> キャプチャは**動画では無効**
-    ([ui_fullscreen.rs](../src/ui_fullscreen.rs) の `key_ctrl_s_capture = !is_video_fs`)。
-    つまり既存の「表示中の動画を 1 枚の画像にする」経路は存在しない。
-  - seek strip のサムネイル ([video/seek_strip_thumbs.rs](../src/video/seek_strip_thumbs.rs))
-    は指定時刻のフレームを FFmpeg で decode しているが、**strip 用に縮小して**出す
-    (`DecoderGeometry` の `dst_w/dst_h`)。`StripDecodeMode::FullFrames` は「全フレームを
-    decode する」の意味で、原寸ではない。
-
-  取り得る形は 2 つ。**どちらもワーカー側で decode する** (UI スレッドで presenter から
-  readback しない):
-
-  1. `MaterializeSource::VideoFrame { path, time_secs }` を足し、実体化ワーカーで
-     「その時刻のフレームを原寸で 1 枚 decode」する。seek strip の seek + decode を
-     小さく写して使う。`Rendered` を経由しないので画素を運ぶ必要も無い。**こちらが素直。**
-  2. seek strip のデコーダーへ「原寸 1 枚」モードを足して共有する。共有は増えるが、
-     strip の cell / tolerance / publish 構造に原寸経路を混ぜることになる。
-
-  UI 側で要るのは再生位置だけで、それは `{time}` で既に取れている
-  (`external_tool_video_time_secs`)。実機確認が要る領域なので、利用者が居るときに着手する。
-- P5: round-trip (mtime 監視)
+- **P5**: round-trip (`OriginalFile` で渡した実ファイルの mtime / サイズ監視と読み直し、§4.8)
 
 ### 未確認の実機項目
 
