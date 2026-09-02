@@ -4000,6 +4000,46 @@ mod tests {
             [OsString::from("-flag"), OsString::from("tail")],
             "自分で完結した option が消えても、前の option は巻き添えにしない"
         );
+
+        // 実際の設定でよくある形。`-page={page}` は自分で完結しているので、無関係な
+        // 前の option を道連れにしない。
+        let tokens = split_argument_template("-other-option=X -page={page} tail");
+        assert_eq!(
+            expand_arguments(&tokens, &ctx),
+            [OsString::from("-other-option=X"), OsString::from("tail")]
+        );
+
+        // 値が独立したトークンのときだけ、その値を待っている option を落とす。
+        let tokens = split_argument_template("-other-option X -page {page} tail");
+        assert_eq!(
+            expand_arguments(&tokens, &ctx),
+            [
+                OsString::from("-other-option"),
+                OsString::from("X"),
+                OsString::from("tail")
+            ]
+        );
+    }
+
+    /// **この規則の限界。** 値を取らない単独フラグの直後に `{page}` だけを置くと、
+    /// そのフラグも一緒に消える。`-page` (値を取る) と `-verbose` (取らない) を
+    /// テンプレートから見分ける手段は無いので、直せない。マニュアルには
+    /// 「1 トークンにまとめる」書き方を案内している。
+    ///
+    /// 黙って変わらないよう、現在の挙動として固定しておく。
+    #[test]
+    fn a_valueless_flag_right_before_a_lone_placeholder_is_eaten_too() {
+        let ctx = PlaceholderContext::for_file(r"C:\img");
+
+        let tokens = split_argument_template("-verbose {page} tail");
+        assert_eq!(expand_arguments(&tokens, &ctx), [OsString::from("tail")]);
+
+        // 1 トークンにまとめれば巻き添えにならない。
+        let tokens = split_argument_template("-verbose -page={page} tail");
+        assert_eq!(
+            expand_arguments(&tokens, &ctx),
+            [OsString::from("-verbose"), OsString::from("tail")]
+        );
     }
 
     #[test]
