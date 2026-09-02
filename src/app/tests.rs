@@ -64608,6 +64608,53 @@ fn an_unreported_maximized_frame_does_not_become_the_rect_to_restore_to() {
     }
 }
 
+/// 最大化中も「いま居る矩形」は記録し続ける。
+///
+/// 復元先 (`last_outer_rect`) は最大化中に更新しないのが正しい。問題は、それを
+/// 「いまどのモニターに居るか」の答えとしても使っていたこと。最大化で起動して一度も
+/// 戻していないと `None` のままになり、F11 の全画面がモニター全体ではなく既定値の
+/// (0,0) 1280x720 で出た (2026-09-02 利用者報告)。
+#[test]
+fn the_current_window_rect_is_recorded_even_while_maximized() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let rect = egui::Rect::from_min_size(egui::pos2(2560.0, 0.0), egui::vec2(1920.0, 1080.0));
+
+    let mut input = egui::RawInput::default();
+    let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+    viewport.outer_rect = Some(rect);
+    viewport.inner_rect = Some(rect);
+    viewport.minimized = Some(false);
+    viewport.maximized = Some(true);
+
+    let _ = ctx.run(input, |ctx| {
+        app.track_window_rect(ctx);
+    });
+
+    assert_eq!(
+        app.last_window_rect,
+        Some(rect),
+        "最大化中でも、いま居る矩形は記録し続ける"
+    );
+    assert_eq!(
+        app.last_outer_rect, None,
+        "最大化中の矩形を復元先として記録してはいけない"
+    );
+
+    // 最大化を解いたフレームで、はじめて復元先にも入る。
+    let restored = egui::Rect::from_min_size(egui::pos2(2700.0, 120.0), egui::vec2(1280.0, 800.0));
+    let mut input = egui::RawInput::default();
+    let viewport = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+    viewport.outer_rect = Some(restored);
+    viewport.inner_rect = Some(restored);
+    viewport.minimized = Some(false);
+    viewport.maximized = Some(false);
+    let _ = ctx.run(input, |ctx| {
+        app.track_window_rect(ctx);
+    });
+    assert_eq!(app.last_window_rect, Some(restored));
+    assert_eq!(app.last_outer_rect, Some(restored));
+}
 /// 最大化 flag と復元矩形は別々に保存される。1 つに畳み込むと、最大化して終了した
 /// 次の起動で「解いたときに戻る先」を失う (detached 側の §1.115 と同じ根)。
 #[test]
