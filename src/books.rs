@@ -300,6 +300,11 @@ pub struct BakedEditSnapshot {
     pub crop_legacy_writeback: Option<(PathBuf, String)>,
     pub format: crate::capture::CaptureFormat,
     pub jpeg_matte: crate::capture::JpegMatte,
+    /// どこまで焼くか。既定の `Edits` は製本・外部ツールの現行挙動そのもの。
+    pub stage: crate::bake_stage::BakeStage,
+    /// 解決済みの Creative LUT と適用量。`stage` が表示用補正まで進むときだけ使う。
+    /// 選択 ID から実体を引けるのは登録済み LUT を持つ側だけなので、ここへ解決して渡す。
+    pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
 }
 
 pub fn page_requires_full_composite(
@@ -1123,6 +1128,39 @@ pub(crate) fn compose_book_page_for_materialization(
     Ok(compose_book_page_with_cancel(image, edits, cancel)?.image)
 }
 
+/// 表示用補正の段。
+///
+/// **自前で鎖を組まない。** スマートシャープ → カラー化 → Creative LUT → ポストフィルタの
+/// 順序と、カラー化の適用可否 (`MonochromeOnly` の近モノクロ判定) は
+/// [`crate::final_composite`] が唯一の持ち主で、表示側もそこを通る。ここで書き直すと
+/// **同じ規則が 2 か所になり、表示と書き出しがずれる**。
+///
+/// Creative LUT は選択 ID ではなく**解決済みの LUT** を受け取る。ID から実体を引くのは
+/// 登録済み LUT を持つ側の仕事で、ワーカーからは手が届かない。
+fn apply_display_adjust(
+    image: egui::ColorImage,
+    params: &crate::adjustment::AdjustParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    used_ai_upscale: bool,
+    cancel: &AtomicBool,
+) -> Result<egui::ColorImage, String> {
+    // 色調補正はこの関数へ来る前に済んでいるので `adjust_before_effect` は None にする。
+    let mut plan = crate::final_composite::build_final_composite_plan_after_ai(
+        params,
+        creative_lut,
+        used_ai_upscale,
+    );
+    plan.adjust_before_effect = None;
+    match crate::final_composite::execute_final_composite(Arc::new(image), plan, cancel) {
+        crate::final_composite::FinalCompositeResult::Ready { pixels, .. } => {
+            Ok(egui::ColorImage::clone(&pixels))
+        }
+        crate::final_composite::FinalCompositeResult::Cancelled => {
+            Err(materialization_cancelled_error())
+        }
+    }
+}
+
 fn compose_book_page_with_cancel(
     mut image: egui::ColorImage,
     edits: &BakedEditSnapshot,
@@ -1188,6 +1226,27 @@ fn compose_book_page_with_cancel(
 
     ensure_materialization_not_cancelled(cancel.as_ref())?;
     image = crate::adjustment::apply_adjustments_fast(&image, &edits.params);
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
+
+    // AI と表示用補正は**色調補正の後・注釈の前**。表示側で注釈は最終合成の上に載る
+    // (`ensure_comic_composite_texture` の base が `ensure_final_composite_pixels`) ので、
+    // ここで順序を変えると**注釈にポストフィルタが掛かる**という表示との食い違いになる。
+    //
+    // 回転と切り取りは幾何なので、表示側と同じくこの後に残す。
+    //
+    // `used_ai_upscale` は AI 段が入ったら真になる。スマートシャープは AI 拡大した出力へは
+    // 掛けない固定規則があるので ([adjustment.rs] `effective_smart_sharpen`)、その入力になる。
+    let used_ai_upscale = false;
+    if edits.stage.includes_display_adjust() {
+        image = apply_display_adjust(
+            image,
+            &edits.params,
+            edits.creative_lut.clone(),
+            used_ai_upscale,
+            cancel.as_ref(),
+        )?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+    }
     ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     if let Some(comic) = &edits.comic {
@@ -1923,6 +1982,8 @@ mod tests {
             crop_legacy_writeback: None,
             format: crate::capture::CaptureFormat::Png,
             jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::default(),
+            creative_lut: None,
         }
     }
 
@@ -2113,6 +2174,32 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    /// 「編集まで」の段では表示専用効果を焼かない — が、それは**段の指定によるもの**で、
+    /// 焼けないからではない。`DisplayAdjust` なら同じ入力が変わることを並べて確かめる。
+    #[test]
+    fn the_stage_decides_whether_display_only_effects_are_baked() {
+        let base = egui::ColorImage::new([4, 2], vec![egui::Color32::from_rgb(120, 130, 140); 8]);
+        let mut edits = empty_baked_edits();
+        edits.params.post_filter = crate::adjustment::PostFilter::Sepia;
+
+        edits.stage = crate::bake_stage::BakeStage::Edits;
+        let shallow = compose_book_page(base.clone(), &edits).unwrap();
+
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+        let deep = compose_book_page(base.clone(), &edits).unwrap();
+
+        assert_eq!(
+            shallow.image.pixels, base.pixels,
+            "「編集まで」は表示専用効果を焼かない"
+        );
+        assert_ne!(deep.image.pixels, base.pixels, "「表示用補正まで」は焼く");
+        assert_eq!(
+            deep.image.pixels,
+            crate::post_filter::apply(&base, crate::adjustment::PostFilter::Sepia).pixels,
+            "表示側と同じ関数・同じ順序を通っている"
+        );
     }
 
     #[test]

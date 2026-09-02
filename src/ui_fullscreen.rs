@@ -34535,6 +34535,9 @@ impl App {
             jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                 self.fs_transparent_bg_mode,
             ),
+            // 段は既定の「編集まで」。呼び出し側が段を選べるようになるまで挙動は変わらない。
+            stage: crate::bake_stage::BakeStage::default(),
+            creative_lut: None,
         })
     }
 

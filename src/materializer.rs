@@ -775,6 +775,9 @@ impl MaterializeSession {
                 crop_legacy_writeback: None,
                 format: crate::capture::CaptureFormat::Png,
                 jpeg_matte: crate::capture::JpegMatte::Black,
+                // 段は既定の「編集まで」。呼び出し側が段を選べるようになるまで挙動は変わらない。
+                stage: crate::bake_stage::BakeStage::default(),
+                creative_lut: None,
             },
             requires_composite,
             fingerprint,
