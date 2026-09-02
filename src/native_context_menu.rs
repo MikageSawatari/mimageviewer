@@ -1533,9 +1533,20 @@ mod windows_impl {
             })
         }
 
+        /// `TTTOOLINFOW` のうち、common controls **v5** が受け付ける長さ。
+        ///
+        /// SDK の `TTTOOLINFO_V1_SIZE` と同じで、v6 で足された `lpReserved` を含まない。
+        /// **v6 のマニフェストを持たないプロセスでは、これを送らないと `TTM_ADDTOOLW` が
+        /// 0 を返して失敗する** — common controls は自分が知らない大きさの `cbSize` を
+        /// 拒否する。mIV は `set_manifest` していないので v5 が読み込まれ、
+        /// `size_of::<TTTOOLINFOW>()` (v6 の長さ) では通らない。実装当初からツールチップが
+        /// 一度も出なかった原因がこれ (実測で確定 2026-09-02)。v6 側は短い方も受け付けるので、
+        /// 将来マニフェストを足してもこのままでよい。
+        const TOOL_INFO_V1_SIZE: u32 = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
+
         fn tool_info(&mut self) -> TTTOOLINFOW {
             TTTOOLINFOW {
-                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                cbSize: Self::TOOL_INFO_V1_SIZE,
                 uFlags: TTF_TRACK | TTF_ABSOLUTE,
                 hwnd: self.tool_window,
                 uId: 1,
@@ -1739,6 +1750,25 @@ mod windows_impl {
     #[cfg(test)]
     mod data_object_smoke_test {
         use super::*;
+
+        /// `cbSize` は **v6 の長さではなく v1 の長さ**を送る。common controls v5 は
+        /// 自分が知らない大きさを拒否し、`TTM_ADDTOOLW` が 0 を返す。この不等号が
+        /// 崩れる (= 両者が同じ長さになる) ことは無いが、意図として固定しておく。
+        #[test]
+        fn tooltip_tool_info_size_is_the_one_comctl32_v5_accepts() {
+            use windows::Win32::UI::Controls::TTTOOLINFOW;
+
+            let v1 = std::mem::offset_of!(TTTOOLINFOW, lpReserved);
+            assert!(
+                v1 < std::mem::size_of::<TTTOOLINFOW>(),
+                "v1 サイズは lpReserved を含まないので、構造体全体より短いはず"
+            );
+            assert_eq!(
+                v1,
+                std::mem::offset_of!(TTTOOLINFOW, lParam) + std::mem::size_of::<isize>(),
+                "v1 サイズは lParam までの長さ"
+            );
+        }
 
         #[test]
         fn disabled_reason_map_records_only_disabled_nonempty_leaf_reasons() {
