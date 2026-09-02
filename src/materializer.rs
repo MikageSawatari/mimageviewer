@@ -149,6 +149,9 @@ pub struct PageEditContext {
     pub params: crate::adjustment::AdjustParams,
     /// どこまで焼くか。外部ツールの設定から UI スレッドで確定させて渡す。
     pub stage: crate::bake_stage::BakeStage,
+    /// 解決済みの Creative LUT。選択 ID から実体を引けるのは登録済みライブラリを持つ側
+    /// だけなので、`ai_runtime` と同じく UI スレッドで解決して渡す。
+    pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     pub conceal_preset: crate::conceal::ConcealPreset,
     pub erase_mono_tolerance: u8,
     pub comic_source_dims: Option<[usize; 2]>,
@@ -684,6 +687,7 @@ impl MaterializeSession {
             local_adjust.is_some(),
             comic_objects.is_some(),
             export_crop.is_some(),
+            context.stage,
         );
         let fingerprint = edit_fingerprint(
             &params,
@@ -779,7 +783,7 @@ impl MaterializeSession {
                 format: crate::capture::CaptureFormat::Png,
                 jpeg_matte: crate::capture::JpegMatte::Black,
                 stage: context.stage,
-                creative_lut: None,
+                creative_lut: context.creative_lut.clone(),
                 ai: None,
             },
             requires_composite,

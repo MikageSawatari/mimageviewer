@@ -68005,9 +68005,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
-        self.show_external_tool_picker(ctx);
-        self.show_external_tool_launch_confirmation(ctx);
-        self.show_external_tool_materialize_progress(ctx);
+        self.show_external_tool_modals(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。

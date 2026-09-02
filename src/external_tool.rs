@@ -2183,6 +2183,12 @@ impl crate::app::App {
             PageEditContext {
                 page_key,
                 stage: self.settings.bake_stage_external_tool,
+                creative_lut: self
+                    .settings
+                    .bake_stage_external_tool
+                    .includes_display_adjust()
+                    .then(|| self.resolved_creative_lut(&params))
+                    .flatten(),
                 params,
                 conceal_preset: self.current_conceal_preset_from_settings(),
                 erase_mono_tolerance: self.settings.erase_inpaint_mono_tolerance,
@@ -2735,7 +2741,7 @@ impl crate::app::App {
         }
     }
 
-    pub(crate) fn show_external_tool_launch_confirmation(&mut self, ctx: &egui::Context) {
+    fn show_external_tool_launch_confirmation(&mut self, ctx: &egui::Context) {
         let Some(confirmation) = self.external_tool_launch_confirmation.as_ref() else {
             return;
         };
@@ -2811,7 +2817,7 @@ impl crate::app::App {
             })
     }
 
-    pub(crate) fn show_external_tool_materialize_progress(&mut self, ctx: &egui::Context) {
+    fn show_external_tool_materialize_progress(&mut self, ctx: &egui::Context) {
         let Some(index) = self
             .external_tool_materialize_pending
             .iter()
@@ -2822,13 +2828,6 @@ impl crate::app::App {
         else {
             return;
         };
-        // 専用フルスクリーン viewport では main update の tail が飛ばないので、
-        // fs body と tail の両方がここへ来る。前に来た方 (= 前面の Context) に描かせ、
-        // もう片方は降りる。両方描くと同じ modal が 2 つの window に出る。
-        if self.external_tool_launch_ui_frame == Some(self.frame_counter) {
-            return;
-        }
-        self.external_tool_launch_ui_frame = Some(self.frame_counter);
         let (completed, total, stage) = self.external_tool_materialize_pending[index]
             .progress
             .snapshot();
@@ -2873,7 +2872,27 @@ impl crate::app::App {
         self.external_tool_materializer.shutdown();
     }
 
-    pub(crate) fn show_external_tool_picker(&mut self, ctx: &egui::Context) {
+    /// 外部ツールの modal 面をまとめて描く。**追加するときは必ずここへ足す。**
+    ///
+    /// 3 つとも `modal_dialog_block_reason` の対象なので、**描き漏らすと「ダイアログが
+    /// 無いのに入力だけ止まる」**になる。実際に進捗 modal だけを複製して、ピッカーと
+    /// 起動確認を落としていた (2026-09-02、Codex Sol の指摘)。
+    ///
+    /// 呼ぶ場所が 2 つあるのは、フルスクリーン中は main update の tail が飛ぶため
+    /// (`app.rs` の early return)。専用 viewport では両方通るので、**この frame で先に
+    /// 到達した方が描く**。frame 番号で持つのは、tail ごと飛ぶ frame があり bool では
+    /// clear する場所が無いから。
+    pub(crate) fn show_external_tool_modals(&mut self, ctx: &egui::Context) {
+        if self.external_tool_launch_ui_frame == Some(self.frame_counter) {
+            return;
+        }
+        self.external_tool_launch_ui_frame = Some(self.frame_counter);
+        self.show_external_tool_picker(ctx);
+        self.show_external_tool_launch_confirmation(ctx);
+        self.show_external_tool_materialize_progress(ctx);
+    }
+
+    fn show_external_tool_picker(&mut self, ctx: &egui::Context) {
         let Some(request) = self.external_tool_picker.as_ref() else {
             return;
         };
@@ -3236,6 +3255,43 @@ mod tests {
                 has_unsupported: false,
             },
             "混在でも仮想ページを見失わず、OriginalFile を正しく判定する"
+        );
+    }
+
+    /// 外部ツールの modal は**単一の描き手**からしか描かない。
+    ///
+    /// 個々の `show_*` を別の場所から呼ぶと、その場所は frame 所有権の判定を通らないので
+    /// 二重描画するか、逆にフルスクリーンで描かれず「ダイアログが無いのに入力だけ止まる」
+    /// になる。実際に 3 つのうち 1 つだけ複製して 2 つを落としていた (2026-09-02)。
+    /// 目視のレビューでは 2 度取りこぼしたので、機械で見る。
+    #[test]
+    fn the_external_tool_modals_are_drawn_from_one_place_only() {
+        let source = include_str!("external_tool.rs");
+        let app = include_str!("app.rs");
+        let fullscreen = include_str!("ui_fullscreen.rs");
+
+        for name in [
+            "show_external_tool_picker",
+            "show_external_tool_launch_confirmation",
+            "show_external_tool_materialize_progress",
+        ] {
+            let call = format!("self.{name}(ctx)");
+            let inside_owner = source.matches(&call).count();
+            assert_eq!(
+                inside_owner, 1,
+                "{name} は show_external_tool_modals からの 1 回だけであること"
+            );
+            assert!(
+                !app.contains(&call) && !fullscreen.contains(&call),
+                "{name} が単一の描き手の外から呼ばれている"
+            );
+        }
+
+        let owner = "self.show_external_tool_modals(ctx)";
+        assert_eq!(
+            app.matches(owner).count() + fullscreen.matches(owner).count(),
+            2,
+            "描き手は main update の tail と fullscreen body の 2 か所から呼ぶ              (フルスクリーン中は tail が飛ぶため)"
         );
     }
 

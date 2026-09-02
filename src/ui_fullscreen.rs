@@ -16480,7 +16480,7 @@ impl App {
                 // tail の手前で early return するので (app.rs の「会計はここで出す」参照)、
                 // embedded でも tail は走らない。実機では embedded=true のまま
                 // 進捗 modal が入力を掴んで固まった (2026-09-02)。
-                self.show_external_tool_materialize_progress(ctx);
+                self.show_external_tool_modals(ctx);
                 self.authorize_external_tool_launch_boundaries_after_ui();
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
@@ -34323,6 +34323,7 @@ impl App {
             self.local_adjust_page_keys.contains(&key),
             self.comic_page_keys.contains(&key),
             has_export_crop,
+            self.settings.bake_stage_book,
         );
         if !needs_composite {
             Ok(crate::books::BookPageSource::File {
@@ -34530,6 +34531,11 @@ impl App {
             crate::books::BookEraseSnapshot { mask, run }
         });
 
+        // `params` は下でムーブするので、解決はその前に済ませる。
+        let creative_lut = stage
+            .includes_display_adjust()
+            .then(|| self.resolved_creative_lut(&params))
+            .flatten();
         Ok(crate::books::BakedEditSnapshot {
             params,
             rotation,
@@ -34545,9 +34551,10 @@ impl App {
                 self.fs_transparent_bg_mode,
             ),
             stage,
-            // TODO(段取り 5): 表示用補正まで焼くときは解決済み LUT と AI ランナーを渡す。
-            // いまはどの呼び出し側も「編集まで」なので到達しない。
-            creative_lut: None,
+            // 表示用補正まで焼くときだけ解決する。選択 ID から実体を引けるのは登録済み
+            // ライブラリを持つ側だけなので、ここで解決して渡す (表示側と同じ resolver)。
+            creative_lut,
+            // TODO(段取り 4): AI のモデル決定を表示側から切り出したら、ここでランナーを作る。
             ai: None,
         })
     }
@@ -34591,6 +34598,7 @@ impl App {
             self.local_adjust_page_keys.contains(&key),
             self.comic_page_keys.contains(&key),
             self.export_crop_pages.contains(&idx),
+            self.settings.bake_stage_book,
         );
         match item {
             GridItem::Image(path) => {

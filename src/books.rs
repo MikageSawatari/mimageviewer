@@ -329,6 +329,12 @@ pub struct BakedEditSnapshot {
     pub ai: Option<BookAiSnapshot>,
 }
 
+/// このページを合成に通す必要があるか。**通さないと決めた分は元バイト列のまま複製される**
+/// ので、ここが段より手前の関門になる。
+///
+/// **段も見る。** 焼く段を深くしても、この判定が「編集が無い」と言えば合成自体が飛ぶ。
+/// 「編集なし・Sepia だけ」のページで Sepia が無視され、明るさを少し変えた途端に Sepia も
+/// 適用される、という食い違いになっていた (2026-09-02、Codex Sol の指摘)。
 pub fn page_requires_full_composite(
     params: &crate::adjustment::AdjustParams,
     rotation: crate::rotation_db::Rotation,
@@ -337,14 +343,29 @@ pub fn page_requires_full_composite(
     has_local_adjust: bool,
     has_comic: bool,
     has_export_crop: bool,
+    stage: crate::bake_stage::BakeStage,
 ) -> bool {
     !params.is_color_identity()
+        || (stage.includes_ai() && (params.needs_upscale() || params.needs_denoise()))
+        || (stage.includes_display_adjust() && params_have_display_only_effect(params))
         || !rotation.is_none()
         || has_conceal
         || has_erase
         || has_local_adjust
         || has_comic
         || has_export_crop
+}
+
+/// スマートシャープ / カラー化 / Creative LUT / ポストフィルタのどれかが効いているか。
+///
+/// シャープは `effective_smart_sharpen` ではなく生の値で見る。AI を通したかは合成を
+/// 走らせてみないと分からないので、ここでは**合成する側に倒す** (掛からなければ
+/// 出力は入力と同じで、余分なのは再エンコードだけ)。
+fn params_have_display_only_effect(params: &crate::adjustment::AdjustParams) -> bool {
+    params.smart_sharpen > 0
+        || params.colorize.is_enabled()
+        || !params.creative_lut.is_identity()
+        || params.post_filter != crate::adjustment::PostFilter::None
 }
 
 pub fn default_books_root() -> PathBuf {
@@ -2126,6 +2147,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
 
         let mut color = identity.clone();
@@ -2138,6 +2160,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         let mut smart_sharpen = identity.clone();
         smart_sharpen.smart_sharpen = 1;
@@ -2149,6 +2172,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         let mut post_filter = identity.clone();
         post_filter.post_filter = crate::adjustment::PostFilter::Sepia;
@@ -2160,6 +2184,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         assert!(page_requires_full_composite(
             &identity,
@@ -2169,6 +2194,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         assert!(page_requires_full_composite(
             &identity,
@@ -2178,6 +2204,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         for edit in 1..5 {
             let mut flags = [false; 5];
@@ -2190,6 +2217,7 @@ mod tests {
                 flags[2],
                 flags[3],
                 flags[4],
+                crate::bake_stage::BakeStage::default(),
             ));
         }
 
@@ -2204,6 +2232,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
     }
 
@@ -2276,6 +2305,52 @@ mod tests {
             with_upscale.image.pixels, base.pixels,
             "アップスケールした出力にはシャープを掛けない"
         );
+    }
+
+    /// 段を深くしたら、**表示専用効果しかないページも合成に通す**こと。
+    /// ここが更新されていないと、Sepia だけのページは合成を飛ばされて元バイト列のまま出て、
+    /// 明るさを少し足した途端に Sepia も適用される、という食い違いになる。
+    #[test]
+    fn a_page_with_only_display_effects_still_needs_the_composite_at_a_deeper_stage() {
+        let mut sepia_only = crate::adjustment::AdjustParams::default();
+        sepia_only.post_filter = crate::adjustment::PostFilter::Sepia;
+        let ask = |stage| {
+            page_requires_full_composite(
+                &sepia_only,
+                crate::rotation_db::Rotation::None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                stage,
+            )
+        };
+        assert!(
+            !ask(crate::bake_stage::BakeStage::Edits),
+            "「編集まで」では表示専用効果を焼かないので、合成も要らない"
+        );
+        assert!(
+            ask(crate::bake_stage::BakeStage::DisplayAdjust),
+            "「表示用補正まで」なら合成に通さないと焼けない"
+        );
+
+        let mut upscale_only = crate::adjustment::AdjustParams::default();
+        upscale_only.upscale_model = Some("auto".to_string());
+        let ask_ai = |stage| {
+            page_requires_full_composite(
+                &upscale_only,
+                crate::rotation_db::Rotation::None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                stage,
+            )
+        };
+        assert!(!ask_ai(crate::bake_stage::BakeStage::Edits));
+        assert!(ask_ai(crate::bake_stage::BakeStage::Ai));
     }
 
     #[test]
