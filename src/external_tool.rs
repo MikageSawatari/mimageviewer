@@ -100,10 +100,11 @@ pub(crate) fn classify_legacy_recent_launch(
 /// (無加工のページだけ実ファイルが渡り、利用者が元データを壊す)。加工の有無は
 /// ツール側から見えないので、保存する前に区別する手段が無い。
 pub enum PayloadPolicy {
-    /// 一時ファイル (表示どおり)。加工が無ければ焼き込まず元バイト列をコピーする。
+    /// 一時ファイル (編集を反映)。**常に再エンコードする** — 編集の有無で拡張子や
+    /// EXIF の有無が変わると、受け取る側から区別できない (利用者判断 2026-09-02)。
     #[default]
-    TempAsDisplayed,
-    /// 一時ファイル (加工前)。
+    TempEdited,
+    /// 一時ファイル (編集前)。**常に元バイト列そのまま。**
     TempOriginal,
     /// 元のファイルそのもの。仮想ページでは起動しない (§4.8)。
     OriginalFile,
@@ -824,7 +825,7 @@ impl ExternalTool {
             launch: ExternalToolLaunch::OsDefault,
             arguments: "{file}".to_string(),
             working_directory: None,
-            payload: PayloadPolicy::TempAsDisplayed,
+            payload: PayloadPolicy::TempEdited,
             video: VideoPolicy::File,
             spread: SpreadPolicy::Merged,
             selection: SelectionPolicy::Each,
@@ -1325,7 +1326,7 @@ fn validate_materializable_targets(targets: &[LaunchTarget]) -> Result<(), Strin
 
 fn materialize_policy(payload: PayloadPolicy) -> crate::materializer::MaterializePolicy {
     match payload {
-        PayloadPolicy::TempAsDisplayed => crate::materializer::MaterializePolicy::TempAsDisplayed,
+        PayloadPolicy::TempEdited => crate::materializer::MaterializePolicy::TempEdited,
         PayloadPolicy::TempOriginal => crate::materializer::MaterializePolicy::TempOriginal,
         PayloadPolicy::OriginalFile => crate::materializer::MaterializePolicy::OriginalFile,
     }
@@ -2992,7 +2993,7 @@ mod tests {
     #[test]
     fn viewing_defaults_use_displayed_each_file_policy_and_count_limits() {
         let tool = ExternalTool::defaults_for_viewing();
-        assert_eq!(tool.payload, PayloadPolicy::TempAsDisplayed);
+        assert_eq!(tool.payload, PayloadPolicy::TempEdited);
         assert_eq!(tool.video, VideoPolicy::File);
         assert_eq!(tool.spread, SpreadPolicy::Merged);
         assert_eq!(tool.selection, SelectionPolicy::Each);
@@ -3054,7 +3055,7 @@ mod tests {
                 menu_tool(
                     index + 1,
                     &format!("tool-{index}"),
-                    PayloadPolicy::TempAsDisplayed,
+                    PayloadPolicy::TempEdited,
                 )
             })
             .collect();
@@ -3094,7 +3095,7 @@ mod tests {
 
     #[test]
     fn virtual_page_menu_greys_original_file_tools_with_a_reason_and_keeps_temp_tools() {
-        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempAsDisplayed);
+        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempEdited);
         let pre_edit = menu_tool(2, "pre-edit", PayloadPolicy::TempOriginal);
         let real_file = menu_tool(3, "real-file", PayloadPolicy::OriginalFile);
         let tools = vec![displayed, pre_edit, real_file];
@@ -3140,7 +3141,7 @@ mod tests {
 
     #[test]
     fn virtual_page_picker_filters_and_disables_before_showing() {
-        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempAsDisplayed);
+        let displayed = menu_tool(1, "displayed", PayloadPolicy::TempEdited);
         let pre_edit = menu_tool(2, "pre-edit", PayloadPolicy::TempOriginal);
         let real_file = menu_tool(3, "real-file", PayloadPolicy::OriginalFile);
 

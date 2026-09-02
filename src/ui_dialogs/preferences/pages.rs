@@ -736,12 +736,12 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 &mut tool.payload,
                 &[
                     (
-                        crate::external_tool::PayloadPolicy::TempAsDisplayed,
-                        "一時ファイル (表示どおり)",
+                        crate::external_tool::PayloadPolicy::TempEdited,
+                        "一時ファイル (編集を反映)",
                     ),
                     (
                         crate::external_tool::PayloadPolicy::TempOriginal,
-                        "一時ファイル (加工前)",
+                        "一時ファイル (編集前)",
                     ),
                     (
                         crate::external_tool::PayloadPolicy::OriginalFile,
@@ -756,20 +756,24 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.label("");
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(if passes_real_file {
-                        concat!(
+                    egui::RichText::new(match tool.payload {
+                        crate::external_tool::PayloadPolicy::TempEdited => concat!(
+                            "補正・回転・注釈・消しゴムなど、このページに加えた編集を反映した ",
+                            "PNG を一時ファイルへ書き出します。元のファイルは変わりません。",
+                            "カラー化・LUT・ポストフィルタ・スマートシャープ・AI 拡大は表示専用のため、",
+                            "製本と同じく反映しません。",
+                        ),
+                        crate::external_tool::PayloadPolicy::TempOriginal => concat!(
+                            "編集を反映せず、元のデータをそのまま一時ファイルへ書き出します。",
+                            "JPEG は JPEG のまま、EXIF や生成メタデータも残ります。",
+                            "元のファイルは変わりません。",
+                        ),
+                        crate::external_tool::PayloadPolicy::OriginalFile => concat!(
                             "ディスク上のファイルそのものを渡します。",
                             "ツールで上書き保存すると元のファイルが変わり、mIV が読み直します。",
                             "圧縮ファイル内のページと PDF のページには元のファイルが無いため、",
                             "起動できません。",
-                        )
-                    } else {
-                        concat!(
-                            "一時ファイルへ書き出して渡します。",
-                            "ツールで上書き保存しても元のファイルは変わりません。",
-                            "加工が掛かっていなければ再エンコードせず、",
-                            "元のデータをそのまま書き出します。",
-                        )
+                        ),
                     })
                     .weak(),
                 )

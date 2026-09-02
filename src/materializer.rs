@@ -158,9 +158,9 @@ pub struct PageEditContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MaterializePolicy {
-    /// 一時ファイルへ、表示を再現したデータを書き出す。
-    TempAsDisplayed,
-    /// 一時ファイルへ、加工前のデータを書き出す。
+    /// 一時ファイルへ、ページに加えた編集を反映して書き出す。**常に再エンコードする。**
+    TempEdited,
+    /// 一時ファイルへ、編集前のデータをそのまま書き出す。**常に無劣化。**
     TempOriginal,
     /// ディスク上の実ファイルをそのまま渡す。仮想ページには渡せない。
     OriginalFile,
@@ -203,11 +203,16 @@ pub enum MaterializeDecision {
     RefuseVirtualPage,
 }
 
-/// DB snapshot を読み終えた後の最終出力判断。UI の同期 capability 判定とは分ける。
+/// 出力の形。**編集の有無では変えない。**
+///
+/// 以前は「編集が無ければ焼かずに元バイト列を出す」最適化を入れていたが、やめた
+/// (利用者判断 2026-09-02)。受け取る側から見ると、**同じ設定・同じツールなのに、その
+/// ページに編集が付いているかどうかで拡張子も EXIF の有無も変わる**。編集の有無は
+/// ツール側から見えないので区別しようがない。値ごとに 1 つの振る舞いへ固定する:
+/// `TempEdited` は常に PNG、`TempOriginal` は常に元バイト列。
 pub fn decide_materialization(
     source: MaterializeSourceKind,
     policy: MaterializePolicy,
-    requires_composite: bool,
 ) -> MaterializeDecision {
     match policy {
         MaterializePolicy::OriginalFile => match source {
@@ -227,21 +232,13 @@ pub fn decide_materialization(
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
             MaterializeSourceKind::ImageFile => MaterializeDecision::CopyOriginalFile,
             MaterializeSourceKind::ZipEntry => MaterializeDecision::ExtractOriginal,
-            // 合成も動画フレームも「加工前」に戻せない。見えている画をそのまま書き出す。
+            // 合成・動画フレーム・PDF ページには「編集前のバイト列」が存在しない。
             MaterializeSourceKind::PdfPage
             | MaterializeSourceKind::VideoFrame
             | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
         },
-        // 加工が無ければ焼き込まない。表示と元データが同じなのに再エンコードすると、
-        // JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
-        MaterializePolicy::TempAsDisplayed => match source {
+        MaterializePolicy::TempEdited => match source {
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
-            MaterializeSourceKind::ImageFile if !requires_composite => {
-                MaterializeDecision::CopyOriginalFile
-            }
-            MaterializeSourceKind::ZipEntry if !requires_composite => {
-                MaterializeDecision::ExtractOriginal
-            }
             MaterializeSourceKind::ImageFile
             | MaterializeSourceKind::ZipEntry
             | MaterializeSourceKind::PdfPage
@@ -484,25 +481,17 @@ impl MaterializeSession {
     ) -> Result<PreparedMaterializedFile, String> {
         check_current(&self.inner, cancel, generation)?;
 
-        let loaded_edits = if request.policy == MaterializePolicy::TempAsDisplayed
-            && request.page_edits.is_some()
-        {
-            Some(self.load_page_edits(
-                request.page_edits.as_ref().expect("checked above"),
-                cancel,
-                generation,
-            )?)
-        } else {
-            None
-        };
-        let requires_composite = loaded_edits
-            .as_ref()
-            .is_some_and(|loaded| loaded.requires_composite);
-        let decision = decide_materialization(
-            request.source.source_kind(),
-            request.policy,
-            requires_composite,
-        );
+        let loaded_edits =
+            if request.policy == MaterializePolicy::TempEdited && request.page_edits.is_some() {
+                Some(self.load_page_edits(
+                    request.page_edits.as_ref().expect("checked above"),
+                    cancel,
+                    generation,
+                )?)
+            } else {
+                None
+            };
+        let decision = decide_materialization(request.source.source_kind(), request.policy);
         if decision == MaterializeDecision::RefuseVirtualPage {
             return Err(virtual_page_refusal_message(&request.source));
         }
@@ -1542,56 +1531,59 @@ mod tests {
     /// 一時ポリシーは**実ファイルもコピーする**。渡した先で上書き保存されても元データが
     /// 変わらないことが、この 2 値を分けている理由 (§4.3 の 2026-09-02 決定)。
     #[test]
-    fn temp_policies_copy_even_an_unmodified_real_file() {
-        for policy in [
-            MaterializePolicy::TempAsDisplayed,
-            MaterializePolicy::TempOriginal,
-        ] {
-            assert_eq!(
-                decide_materialization(MaterializeSourceKind::ImageFile, policy, false),
-                MaterializeDecision::CopyOriginalFile,
-                "{policy:?} は実ファイルでもコピーする"
-            );
-        }
+    fn only_the_real_file_policy_hands_over_the_file_itself() {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::ImageFile,
-                MaterializePolicy::OriginalFile,
-                false,
+                MaterializePolicy::TempOriginal,
             ),
-            MaterializeDecision::DirectOriginal,
-            "「元のファイル」だけが実ファイルをそのまま渡す"
-        );
-    }
-
-    /// コピーするが**焼き込みはしない**。表示と元データが同じなのに再エンコードすると、
-    /// JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
-    #[test]
-    fn as_displayed_bakes_only_what_actually_carries_edits() {
-        assert_eq!(
-            decide_materialization(
-                MaterializeSourceKind::ZipEntry,
-                MaterializePolicy::TempAsDisplayed,
-                false,
-            ),
-            MaterializeDecision::ExtractOriginal
+            MaterializeDecision::CopyOriginalFile
         );
         assert_eq!(
             decide_materialization(
-                MaterializeSourceKind::ZipEntry,
-                MaterializePolicy::TempAsDisplayed,
-                true,
+                MaterializeSourceKind::ImageFile,
+                MaterializePolicy::TempEdited
             ),
             MaterializeDecision::RenderPng
         );
         assert_eq!(
             decide_materialization(
+                MaterializeSourceKind::ImageFile,
+                MaterializePolicy::OriginalFile,
+            ),
+            MaterializeDecision::DirectOriginal
+        );
+    }
+
+    /// **出力の形は編集の有無で変えない。** 同じ設定・同じツールなのにページ次第で
+    /// 拡張子や EXIF の有無が変わると、受け取る側から区別できない (2026-09-02 決定)。
+    #[test]
+    fn the_output_shape_does_not_depend_on_whether_the_page_carries_edits() {
+        for source in [
+            MaterializeSourceKind::ImageFile,
+            MaterializeSourceKind::ZipEntry,
+        ] {
+            assert_eq!(
+                decide_materialization(source, MaterializePolicy::TempEdited),
+                MaterializeDecision::RenderPng,
+                "{source:?}: 「編集を反映」は常に焼く"
+            );
+        }
+        assert_eq!(
+            decide_materialization(
                 MaterializeSourceKind::ZipEntry,
                 MaterializePolicy::TempOriginal,
-                true,
             ),
             MaterializeDecision::ExtractOriginal,
-            "「加工前」は加工が掛かっていても焼き込まない"
+            "「編集前」は常に元バイト列"
+        );
+        assert_eq!(
+            decide_materialization(
+                MaterializeSourceKind::ImageFile,
+                MaterializePolicy::TempOriginal,
+            ),
+            MaterializeDecision::CopyOriginalFile,
+            "「編集前」は常に元バイト列"
         );
     }
 
@@ -1600,12 +1592,12 @@ mod tests {
     #[test]
     fn video_and_audio_are_never_copied_into_the_temp_directory() {
         for policy in [
-            MaterializePolicy::TempAsDisplayed,
+            MaterializePolicy::TempEdited,
             MaterializePolicy::TempOriginal,
             MaterializePolicy::OriginalFile,
         ] {
             assert_eq!(
-                decide_materialization(MaterializeSourceKind::OtherFile, policy, false),
+                decide_materialization(MaterializeSourceKind::OtherFile, policy),
                 MaterializeDecision::DirectOriginal,
                 "{policy:?}"
             );
@@ -1617,16 +1609,14 @@ mod tests {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::PdfPage,
-                MaterializePolicy::TempOriginal,
-                false,
+                MaterializePolicy::TempOriginal
             ),
             MaterializeDecision::RenderPng
         );
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::PdfPage,
-                MaterializePolicy::TempAsDisplayed,
-                false,
+                MaterializePolicy::TempEdited
             ),
             MaterializeDecision::RenderPng
         );
@@ -1639,7 +1629,7 @@ mod tests {
             MaterializeSourceKind::PdfPage,
         ] {
             assert_eq!(
-                decide_materialization(source, MaterializePolicy::OriginalFile, false),
+                decide_materialization(source, MaterializePolicy::OriginalFile),
                 MaterializeDecision::RefuseVirtualPage
             );
         }
@@ -1650,11 +1640,11 @@ mod tests {
     #[test]
     fn rendered_pixels_encode_under_temp_policies_and_refuse_the_real_file_policy() {
         for policy in [
-            MaterializePolicy::TempAsDisplayed,
+            MaterializePolicy::TempEdited,
             MaterializePolicy::TempOriginal,
         ] {
             assert_eq!(
-                decide_materialization(MaterializeSourceKind::Rendered, policy, false),
+                decide_materialization(MaterializeSourceKind::Rendered, policy),
                 MaterializeDecision::RenderPng,
                 "{policy:?}"
             );
@@ -1662,8 +1652,7 @@ mod tests {
         assert_eq!(
             decide_materialization(
                 MaterializeSourceKind::Rendered,
-                MaterializePolicy::OriginalFile,
-                false,
+                MaterializePolicy::OriginalFile
             ),
             MaterializeDecision::RefuseVirtualPage
         );
@@ -1682,7 +1671,7 @@ mod tests {
                 label: "spread".to_string(),
                 fingerprint: [7; 32],
             },
-            policy: MaterializePolicy::TempAsDisplayed,
+            policy: MaterializePolicy::TempEdited,
             page_edits: None,
             pdf_render_long_edge: 4096,
             rendered_pixels: None,
@@ -1707,7 +1696,7 @@ mod tests {
                 label: "page04_page05".to_string(),
                 fingerprint: [1; 32],
             },
-            policy: MaterializePolicy::TempAsDisplayed,
+            policy: MaterializePolicy::TempEdited,
             page_edits: None,
             pdf_render_long_edge: 4096,
             rendered_pixels: Some(Arc::new(image)),
@@ -2031,7 +2020,7 @@ mod tests {
                 path: temp.path().join("source.png"),
                 image_page: true,
             },
-            policy: MaterializePolicy::TempAsDisplayed,
+            policy: MaterializePolicy::TempEdited,
             pdf_render_long_edge: 4096,
             edit_fingerprint: [0; 32],
         };
@@ -2060,7 +2049,7 @@ mod tests {
                 path: temp.path().join("source.png"),
                 image_page: true,
             },
-            policy: MaterializePolicy::TempAsDisplayed,
+            policy: MaterializePolicy::TempEdited,
             pdf_render_long_edge: 4096,
             edit_fingerprint: [0; 32],
         };

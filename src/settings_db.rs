@@ -45,6 +45,14 @@ use crate::settings::{
 
 const SCHEMA_VERSION: &str = "1";
 const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
+/// 未リリースの `external_tools` の**形**の版。列だけでなく**列に入る値の綴り**も含む。
+///
+/// 列の有無だけを見ていると、`payload` の値名を変えたときに検出できない。古い綴りが
+/// 残った DB は読み込みで `Incompatible` になり、**設定全体が保存されなくなる**
+/// (`classify_settings_deserialization_error`)。形か綴りを変えたらこの版を上げる。
+/// 出荷済みの版にこのテーブルは存在しないので、作り直してよい。
+const EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY: &str = "external_tools_unreleased_shape";
+const EXTERNAL_TOOLS_UNRELEASED_SHAPE: &str = "2026-09-02-temp-edited";
 const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_launch_classified";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
@@ -1578,14 +1586,14 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// released source の `custom_open_with_apps` と migration marker は残っているため、
 /// marker を外して通常の一度きり移行を再実行すれば登録元は失われない。
 fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqlite::Result<()> {
-    let current_schema = table_has_column(conn, "external_tools", "launch_kind")?
-        && table_has_column(conn, "external_tools", "confirmation_threshold")?
-        && table_has_column(conn, "external_tools", "max_targets")?
-        && !table_has_column(conn, "external_tools", "show_in_context_menu")?
-        // `for_editing` は `payload` の値 (`OriginalFile`) へ統合して廃止した
-        // (§4.8 の 2026-09-02 決定)。列が残っている DB は旧形式なので作り直す。
-        && !table_has_column(conn, "external_tools", "for_editing")?;
-    if current_schema {
+    let stored_shape: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            params![EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored_shape.as_deref() == Some(EXTERNAL_TOOLS_UNRELEASED_SHAPE) {
         return Ok(());
     }
     let tx = conn.unchecked_transaction()?;
@@ -1613,6 +1621,14 @@ fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqli
     tx.execute(
         "DELETE FROM schema_meta WHERE key = ?1",
         params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+    )?;
+    tx.execute(
+        "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![
+            EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY,
+            EXTERNAL_TOOLS_UNRELEASED_SHAPE
+        ],
     )?;
     tx.commit()
 }
@@ -2325,7 +2341,7 @@ fn read_legacy_open_with_apps(
 
 fn payload_policy_text(value: PayloadPolicy) -> &'static str {
     match value {
-        PayloadPolicy::TempAsDisplayed => "TempAsDisplayed",
+        PayloadPolicy::TempEdited => "TempEdited",
         PayloadPolicy::TempOriginal => "TempOriginal",
         PayloadPolicy::OriginalFile => "OriginalFile",
     }
@@ -4052,7 +4068,7 @@ mod tests {
                 launch: ExternalToolLaunch::OsDefault,
                 arguments: "{file} --readonly".to_string(),
                 working_directory: Some(PathBuf::from(r"D:\Viewer")),
-                payload: PayloadPolicy::TempAsDisplayed,
+                payload: PayloadPolicy::TempEdited,
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::BothPages,
                 selection: SelectionPolicy::Each,
@@ -4597,10 +4613,7 @@ mod tests {
         assert_eq!(loaded.external_tools[0].arguments, "{file}");
         assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
         assert_eq!(loaded.external_tools[1].name, "Second");
-        assert_eq!(
-            loaded.external_tools[1].payload,
-            PayloadPolicy::TempAsDisplayed
-        );
+        assert_eq!(loaded.external_tools[1].payload, PayloadPolicy::TempEdited);
         assert_eq!(loaded.external_tools[1].confirmation_threshold, 5);
         assert_eq!(loaded.external_tools[1].max_targets, 10);
         assert!(external_tools_migration_marker_present(&db));
