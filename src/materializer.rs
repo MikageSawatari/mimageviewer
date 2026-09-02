@@ -28,7 +28,17 @@ pub enum MaterializeSource {
         page_num: u32,
         password: Option<String>,
     },
-    /// UI スレッドで既に組み上がった画素。見開きの合成と動画のフレームがここへ来る。
+    /// 動画の 1 フレーム。**ワーカーで decode する** — `video::screenshot::capture_frame`
+    /// がクリップボードコピー / <kbd>Ctrl+S</kbd> と同じ経路で原寸 RGBA を返す。
+    ///
+    /// 時刻をミリ秒の整数で持つのは cache key に入れるため (`f64` は `Hash` ではない)。
+    /// UI 側は `VideoPlayer::screenshot_target_secs()` — 最後に提示したフレームの PTS —
+    /// を渡す。クロックの現在値ではないので、一時停止中でも見えている絵と一致する。
+    VideoFrame {
+        path: PathBuf,
+        target_millis: u64,
+    },
+    /// UI スレッドで既に組み上がった画素。見開きの合成がここへ来る。
     ///
     /// **ディスク上のどのファイルでもない。** 画素は `MaterializeRequest::rendered_pixels`
     /// が運ぶ (`Arc<ColorImage>` は Hash にできないので cache key には入れられない)。
@@ -52,6 +62,14 @@ impl MaterializeSource {
             Self::PdfPage {
                 pdf_path, page_num, ..
             } => format!("{} / {} ページ", pdf_path.display(), page_num + 1),
+            Self::VideoFrame {
+                path,
+                target_millis,
+            } => format!(
+                "{} / {:.3} 秒",
+                path.display(),
+                *target_millis as f64 / 1000.0
+            ),
             Self::Rendered { label, .. } => label.clone(),
         }
     }
@@ -66,6 +84,8 @@ impl MaterializeSource {
             Self::File { path, .. } => Some(path),
             Self::ZipEntry { zip_path, .. } => Some(zip_path),
             Self::PdfPage { pdf_path, .. } => Some(pdf_path),
+            // 動画ファイルは実在するので stamp が採れる。同じ位置での再起動は cache に当たる。
+            Self::VideoFrame { path, .. } => Some(path),
             Self::Rendered { .. } => None,
         }
     }
@@ -80,6 +100,7 @@ impl MaterializeSource {
             } => MaterializeSourceKind::OtherFile,
             Self::ZipEntry { .. } => MaterializeSourceKind::ZipEntry,
             Self::PdfPage { .. } => MaterializeSourceKind::PdfPage,
+            Self::VideoFrame { .. } => MaterializeSourceKind::VideoFrame,
             Self::Rendered { .. } => MaterializeSourceKind::Rendered,
         }
     }
@@ -105,6 +126,17 @@ impl MaterializeSource {
                     .filter(|stem| !stem.is_empty())
                     .unwrap_or_else(|| "document".to_string());
                 format!("{stem}-page-{}.png", page_num + 1)
+            }
+            Self::VideoFrame {
+                path,
+                target_millis,
+            } => {
+                let stem = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .filter(|stem| !stem.is_empty())
+                    .unwrap_or_else(|| "video".to_string());
+                format!("{stem}-{:.3}s.png", *target_millis as f64 / 1000.0)
             }
             Self::Rendered { label, .. } => format!("{label}.png"),
         }
@@ -151,7 +183,9 @@ pub enum MaterializeSourceKind {
     ImageFile,
     OtherFile,
     ZipEntry,
-    /// 既に組み上がった画素 (見開き合成 / 動画フレーム)。
+    /// 動画の 1 フレーム。ワーカーで decode する。
+    VideoFrame,
+    /// 既に組み上がった画素 (見開き合成)。
     Rendered,
     PdfPage,
 }
@@ -183,6 +217,7 @@ pub fn decide_materialization(
             // 合成した見開きにも動画のフレームにも、対応する元ファイルは存在しない。
             MaterializeSourceKind::ZipEntry
             | MaterializeSourceKind::PdfPage
+            | MaterializeSourceKind::VideoFrame
             | MaterializeSourceKind::Rendered => MaterializeDecision::RefuseVirtualPage,
         },
         // 動画・音声 (`OtherFile`) はどちらの一時ポリシーでも実ファイルを渡す。
@@ -192,10 +227,10 @@ pub fn decide_materialization(
             MaterializeSourceKind::OtherFile => MaterializeDecision::DirectOriginal,
             MaterializeSourceKind::ImageFile => MaterializeDecision::CopyOriginalFile,
             MaterializeSourceKind::ZipEntry => MaterializeDecision::ExtractOriginal,
-            // 合成も動画フレームも「加工前」に戻せない。組み上がった画素を書き出す。
-            MaterializeSourceKind::PdfPage | MaterializeSourceKind::Rendered => {
-                MaterializeDecision::RenderPng
-            }
+            // 合成も動画フレームも「加工前」に戻せない。見えている画をそのまま書き出す。
+            MaterializeSourceKind::PdfPage
+            | MaterializeSourceKind::VideoFrame
+            | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
         },
         // 加工が無ければ焼き込まない。表示と元データが同じなのに再エンコードすると、
         // JPEG が PNG に化けて EXIF / 生成メタデータ / 拡張子を落とすだけになる。
@@ -210,6 +245,7 @@ pub fn decide_materialization(
             MaterializeSourceKind::ImageFile
             | MaterializeSourceKind::ZipEntry
             | MaterializeSourceKind::PdfPage
+            | MaterializeSourceKind::VideoFrame
             | MaterializeSourceKind::Rendered => MaterializeDecision::RenderPng,
         },
     }
@@ -538,6 +574,12 @@ impl MaterializeSession {
                             .as_ref()
                             .ok_or_else(|| "組み上げた画素が渡されていません".to_string())?;
                         egui::ColorImage::clone(pixels)
+                    } else if let MaterializeSource::VideoFrame {
+                        path,
+                        target_millis,
+                    } = &request.source
+                    {
+                        decode_video_frame(path, *target_millis)?
                     } else {
                         let source = composite_source(&request.source)?;
                         let image = crate::books::decode_composite_source_for_materialization(
@@ -756,10 +798,28 @@ fn virtual_page_refusal_message(source: &MaterializeSource) -> String {
         MaterializeSource::ZipEntry { .. } => "圧縮ファイル内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::PdfPage { .. } => "PDF 内のページには元のファイルがありません。書き出してから編集してください (フルスクリーンで Ctrl+E)".to_string(),
         MaterializeSource::File { .. } => "元のファイルを渡せません".to_string(),
-        MaterializeSource::Rendered { .. } => {
+        MaterializeSource::VideoFrame { .. } | MaterializeSource::Rendered { .. } => {
             "見開きの合成と動画のフレームには元のファイルがありません。「一時ファイル」を渡す設定にしてください".to_string()
         }
     }
+}
+
+/// 動画の 1 フレームを原寸で decode する。
+///
+/// クリップボードコピーと <kbd>Ctrl+S</kbd> が使うのと**同じ helper**
+/// ([`crate::video::screenshot::capture_frame`])。再生用デコーダとは別の FFmpeg input を
+/// 開き、向き情報も適用済みの RGBA を返す。ここは実体化ワーカーなので UI を止めない。
+fn decode_video_frame(path: &Path, target_millis: u64) -> Result<egui::ColorImage, String> {
+    let frame = crate::video::screenshot::capture_frame(path, target_millis as f64 / 1000.0)?;
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    if width == 0 || height == 0 || frame.rgba.len() != width * height * 4 {
+        return Err("動画フレームのサイズが不正です".to_string());
+    }
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &frame.rgba,
+    ))
 }
 
 /// 元ファイルの中身を一時ファイルへ流す。**全部読んでから書かない**。
@@ -829,8 +889,8 @@ fn composite_source(source: &MaterializeSource) -> Result<crate::books::Composit
         MaterializeSource::File {
             image_page: false, ..
         } => return Err("この実ファイルは画像として実体化できません".to_string()),
-        MaterializeSource::Rendered { .. } => {
-            return Err("組み上げた画素は decode 経路へ渡せません".to_string());
+        MaterializeSource::VideoFrame { .. } | MaterializeSource::Rendered { .. } => {
+            return Err("この対象は画像 decode 経路へ渡せません".to_string());
         }
     })
 }

@@ -654,7 +654,6 @@ pub(crate) struct PreferencesState {
     external_tool_add_source: Option<ExternalToolAddSource>,
     external_tool_candidates: Vec<ExternalToolLaunchCandidate>,
     external_tool_handlers_pending: Option<ExternalToolHandlersPending>,
-    external_tool_handlers_for_editing: bool,
     external_tool_path_check_pending: Option<ExternalToolPathCheckPending>,
     external_tool_path_check_due: Option<(
         std::time::Instant,
@@ -929,14 +928,9 @@ impl PreferencesState {
             };
     }
 
-    pub(super) fn start_external_tool_handler_enumeration(
-        &mut self,
-        for_editing: bool,
-        ctx: &egui::Context,
-    ) {
+    pub(super) fn start_external_tool_handler_enumeration(&mut self, ctx: &egui::Context) {
         self.external_tool_handlers_pending = None;
         self.external_tool_candidates.clear();
-        self.external_tool_handlers_for_editing = for_editing;
         let extension = format!(".{}", self.external_tool_association_ext);
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1178,7 +1172,6 @@ impl PreferencesState {
             external_tool_add_source: None,
             external_tool_candidates: Vec::new(),
             external_tool_handlers_pending: None,
-            external_tool_handlers_for_editing: false,
             external_tool_path_check_pending: None,
             external_tool_path_check_due: None,
             external_tool_executable_status: ExternalToolPathStatus::Unchecked,

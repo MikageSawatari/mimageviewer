@@ -633,7 +633,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         });
     });
 
-    draw_external_tool_add_purpose(ui.ctx(), state);
+    drive_external_tool_add(ui.ctx(), state);
     // 列挙の結果と失敗理由は、それを起こしたボタンの隣に出す。以前は選択中ツールの
     // 詳細のいちばん下 (= ダイアログを広げないと見えない位置) に薄い文字で出ていた
     // ため、押しても何も起きないように見えた (2026-08-31 利用者報告)。
@@ -757,9 +757,19 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(if passes_real_file {
-                        "ディスク上のファイルそのものを渡します。ツールで上書き保存すると                         元のファイルが変わり、mIV が読み直します。圧縮ファイル内のページと                          PDF のページには元のファイルが無いため、起動できません。"
+                        concat!(
+                            "ディスク上のファイルそのものを渡します。",
+                            "ツールで上書き保存すると元のファイルが変わり、mIV が読み直します。",
+                            "圧縮ファイル内のページと PDF のページには元のファイルが無いため、",
+                            "起動できません。",
+                        )
                     } else {
-                        "一時ファイルへ書き出して渡します。ツールで上書き保存しても元の                         ファイルは変わりません。加工が掛かっていなければ再エンコードせず、                         元のデータをそのまま書き出します。"
+                        concat!(
+                            "一時ファイルへ書き出して渡します。",
+                            "ツールで上書き保存しても元のファイルは変わりません。",
+                            "加工が掛かっていなければ再エンコードせず、",
+                            "元のデータをそのまま書き出します。",
+                        )
                     })
                     .weak(),
                 )
@@ -795,7 +805,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(
-                            "動画は一時ファイルへコピーせず、動画ファイルそのものを渡します                              (数 GB になるため)。",
+                            "動画は一時ファイルへコピーせず、動画ファイルそのものを渡します (数 GB になるため)。",
                         )
                         .weak(),
                     )
@@ -945,11 +955,11 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
         ui.add(
             egui::Label::new(
-                egui::RichText::new(
-                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、\
-                     {page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。\
-                     対象が持っていない値は、そのトークンごと引数から取り除きます。",
-                )
+                egui::RichText::new(concat!(
+                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
+                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。",
+                    "対象が持っていない値は、そのトークンごと引数から取り除きます。",
+                ))
                 .weak(),
             )
             .wrap(),
@@ -1023,52 +1033,30 @@ fn external_tool_key_slot_label(index: usize) -> String {
     }
 }
 
-fn draw_external_tool_add_purpose(ctx: &egui::Context, state: &mut PreferencesState) {
-    let Some(source) = state.external_tool_add_source else {
+/// 「追加」を押した直後の処理。**用途 (表示用 / 編集用) は聞かない。**
+///
+/// 以前は追加の前に 2 択のモーダルを挟み、`payload` と `spread` の既定を出し分けていた。
+/// その 2 択は `for_editing` フラグと組で意味を持っていたもので、フラグを
+/// `PayloadPolicy::OriginalFile` へ畳んだ時点で「渡すもの」の 1 項目に過ぎなくなった。
+/// アプリを選ぶ前に用途を決めさせる理由はもう無いので、表示用の既定で追加して、
+/// 必要なら編集欄の「渡すもの」で変えてもらう (説明文もそこに出る)。
+fn drive_external_tool_add(ctx: &egui::Context, state: &mut PreferencesState) {
+    let Some(source) = state.external_tool_add_source.take() else {
         return;
     };
-    let mut choice = None;
-    let mut cancel = false;
-    let response = egui::Modal::new(egui::Id::new("external_tool_add_purpose")).show(ctx, |ui| {
-        ui.set_min_width(360.0);
-        ui.heading("外部ツールの用途");
-        ui.label("用途に合わせて安全な既定値を設定します。");
-        ui.add_space(8.0);
-        if ui.button("表示に使う").clicked() {
-            choice = Some(false);
-        }
-        if ui.button("編集に使う").clicked() {
-            choice = Some(true);
-        }
-        if ui.button("キャンセル").clicked() {
-            cancel = true;
-        }
-    });
-    if response.should_close() {
-        cancel = true;
-    }
-    if let Some(for_editing) = choice {
-        state.external_tool_add_source = None;
-        match source {
-            ExternalToolAddSource::Executable => {
-                if let Some(handler) = crate::open_with::pick_exe_dialog() {
-                    let mut tool = if for_editing {
-                        crate::external_tool::ExternalTool::defaults_for_editing()
-                    } else {
-                        crate::external_tool::ExternalTool::defaults_for_viewing()
-                    };
-                    tool.name = handler.display_name;
-                    tool.launch =
-                        crate::external_tool::ExternalToolLaunch::Executable(handler.executable);
-                    state.add_external_tool(tool);
-                }
-            }
-            ExternalToolAddSource::Associated => {
-                state.start_external_tool_handler_enumeration(for_editing, ctx);
+    match source {
+        ExternalToolAddSource::Executable => {
+            if let Some(handler) = crate::open_with::pick_exe_dialog() {
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
+                tool.name = handler.display_name;
+                tool.launch =
+                    crate::external_tool::ExternalToolLaunch::Executable(handler.executable);
+                state.add_external_tool(tool);
             }
         }
-    } else if cancel {
-        state.external_tool_add_source = None;
+        ExternalToolAddSource::Associated => {
+            state.start_external_tool_handler_enumeration(ctx);
+        }
     }
 }
 
@@ -1105,11 +1093,7 @@ fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut Preferences
     ui.group(|ui| {
         ui.label(egui::RichText::new("追加する関連付けアプリ").strong());
         if ui.button("OS の既定の関連付け").clicked() {
-            let tool = if state.external_tool_handlers_for_editing {
-                crate::external_tool::ExternalTool::defaults_for_editing()
-            } else {
-                crate::external_tool::ExternalTool::defaults_for_viewing()
-            };
+            let tool = crate::external_tool::ExternalTool::defaults_for_viewing();
             state.add_external_tool(tool);
             state.external_tool_candidates.clear();
         }
@@ -1131,11 +1115,7 @@ fn draw_external_tool_handler_choices(ui: &mut egui::Ui, state: &mut Preferences
             }
             previous_recommended = Some(candidate.is_recommended);
             if ui.button(&candidate.display_name).clicked() {
-                let mut tool = if state.external_tool_handlers_for_editing {
-                    crate::external_tool::ExternalTool::defaults_for_editing()
-                } else {
-                    crate::external_tool::ExternalTool::defaults_for_viewing()
-                };
+                let mut tool = crate::external_tool::ExternalTool::defaults_for_viewing();
                 tool.name = candidate.display_name;
                 tool.launch = candidate.launch;
                 state.add_external_tool(tool);

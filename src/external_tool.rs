@@ -2101,6 +2101,24 @@ impl crate::app::App {
         let index = self.launch_target_item_index(target);
         let facts = self.placeholder_facts_for_target(target, index);
         let (source, page_key, fallback_path) = match target {
+            // 再生中の動画に「表示中のフレーム」が設定されているときだけ、動画ファイル
+            // ではなくフレームを渡す。再生していなければ従来どおり動画ファイル
+            // (§4.3 の `VideoPolicy::CurrentFrame` は「再生中でなければ `File` に落ちる」)。
+            LaunchTarget::RealFile(path)
+                if tool.video == VideoPolicy::CurrentFrame
+                    && self.external_tool_video_frame_millis(path).is_some() =>
+            {
+                (
+                    MaterializeSource::VideoFrame {
+                        path: path.clone(),
+                        target_millis: self
+                            .external_tool_video_frame_millis(path)
+                            .expect("checked in the guard"),
+                    },
+                    None,
+                    None,
+                )
+            }
             LaunchTarget::RealFile(path) => (
                 MaterializeSource::File {
                     path: path.clone(),
@@ -2345,10 +2363,33 @@ impl crate::app::App {
     }
 
     /// この対象がいま再生中の動画そのものなら、その再生位置 (秒)。
+    ///
+    /// `{time}` 用。**別プレイヤーへ「ここから再生して」と伝える値**なので、提示済み
+    /// フレームの PTS ではなく再生クロックの現在値を返す。
     fn external_tool_video_time_secs(&self, path: &Path) -> Option<f64> {
         let fs_idx = self.fullscreen_idx?;
         let player = self.fs_video_player(fs_idx)?;
         crate::folder_tree::path_eq(player.path(), path).then(|| player.position_secs())
+    }
+
+    /// この対象がいま再生中の動画そのもので、フレームを切り出せるなら、その時刻 (ミリ秒)。
+    ///
+    /// **`{time}` とは別の値を使う。** こちらは「見えている絵」を切り出す用で、
+    /// クリップボードコピー / <kbd>Ctrl+S</kbd> と同じ `screenshot_target_secs()`
+    /// (最後に提示したフレームの PTS) を採る。一時停止中でも画面と一致させるため。
+    fn external_tool_video_frame_millis(&self, path: &Path) -> Option<u64> {
+        let fs_idx = self.fullscreen_idx?;
+        let player = self.fs_video_player(fs_idx)?;
+        if !crate::folder_tree::path_eq(player.path(), path) {
+            return None;
+        }
+        // クリップボードコピーと同じ「まだ開けていない / 壊れている」判定。
+        if player.error().is_some() || player.info().is_none() {
+            return None;
+        }
+        let secs = player.screenshot_target_secs();
+        secs.is_finite()
+            .then(|| (secs.max(0.0) * 1000.0).round() as u64)
     }
 
     fn build_materialize_operation(
