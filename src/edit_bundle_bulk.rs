@@ -923,6 +923,33 @@ impl App {
     }
 }
 
+/// 終了トーストの文面。件数の意味が変わる唯一の場所。
+///
+/// 少数選択の一括処理は数フレームで終わり、実機ではキャンセルを押せないことがある。
+/// その経路を言葉にするのはここだけなので、キャンセル時の「未処理 N 件」と
+/// 「適用済みは残る」はこの関数のテストで固定する。
+fn bulk_summary_text(run: &BulkPageEditRun, cancelled: bool) -> String {
+    let unprocessed = run.total.saturating_sub(run.completed);
+    let mut summary = if run.failed == 0 {
+        format!("成功 {} 件", run.succeeded)
+    } else {
+        format!("成功 {} 件 / 失敗 {} 件", run.succeeded, run.failed)
+    };
+    if run.dropped_non_targets > 0 {
+        summary.push_str(&format!(" / 対象外 {} 件", run.dropped_non_targets));
+    }
+    if cancelled {
+        if unprocessed > 0 {
+            summary.push_str(&format!(" / 未処理 {unprocessed} 件"));
+        }
+        summary.push_str("（キャンセルしました。適用済みの内容は保持されます）");
+    }
+    if let Some(first_failure) = &run.first_failure {
+        summary.push_str(&format!("\n最初の失敗: {first_failure}"));
+    }
+    summary
+}
+
 enum BulkPollAction {
     Worker(BulkWorkerEvent),
     RotationOnly(BulkPageEditTarget),
@@ -1034,25 +1061,7 @@ impl App {
         else {
             return;
         };
-        let unprocessed = run.total.saturating_sub(run.completed);
-        let mut summary = if run.failed == 0 {
-            format!("成功 {} 件", run.succeeded)
-        } else {
-            format!("成功 {} 件 / 失敗 {} 件", run.succeeded, run.failed)
-        };
-        if run.dropped_non_targets > 0 {
-            summary.push_str(&format!(" / 対象外 {} 件", run.dropped_non_targets));
-        }
-        if cancelled {
-            if unprocessed > 0 {
-                summary.push_str(&format!(" / 未処理 {unprocessed} 件"));
-            }
-            summary.push_str("（キャンセルしました。適用済みの内容は保持されます）");
-        }
-        if let Some(first_failure) = run.first_failure {
-            summary.push_str(&format!("\n最初の失敗: {first_failure}"));
-        }
-        self.show_feedback_toast(summary);
+        self.show_feedback_toast(bulk_summary_text(&run, cancelled));
     }
 
     fn poll_bulk_page_edit(&mut self, ctx: &egui::Context) {
@@ -1709,6 +1718,120 @@ mod tests {
                 .unwrap()
                 .get_page_params(&key),
             Some(newer_memory_adjustment)
+        );
+    }
+
+    fn run_for_summary(
+        total: usize,
+        completed: usize,
+        succeeded: usize,
+        failed: usize,
+        dropped_non_targets: usize,
+    ) -> BulkPageEditRun {
+        BulkPageEditRun {
+            driver: BulkRunDriver::RotationOnly {
+                remaining: VecDeque::new(),
+            },
+            effect: BulkRunEffect::Paste,
+            source_label: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            total,
+            completed,
+            succeeded,
+            failed,
+            dropped_non_targets,
+            first_failure: None,
+        }
+    }
+
+    /// 少数を選んだ一括処理は数フレームで終わるので、実機ではキャンセルを押せない。
+    /// キャンセル時の文面はここでしか作られないため、この経路はテストで押さえる。
+    #[test]
+    fn a_cancelled_run_reports_what_was_left_and_says_the_applied_part_stays() {
+        let run = run_for_summary(10, 4, 4, 0, 0);
+        assert_eq!(
+            bulk_summary_text(&run, true),
+            "成功 4 件 / 未処理 6 件（キャンセルしました。適用済みの内容は保持されます）"
+        );
+
+        // 最後の 1 件を処理し終えた直後のキャンセルは、残りが無いので件数を出さない。
+        // それでも「適用済みは残る」は言う: 押した側は中止できたかを知りたい。
+        let finished = run_for_summary(3, 3, 3, 0, 0);
+        assert_eq!(
+            bulk_summary_text(&finished, true),
+            "成功 3 件（キャンセルしました。適用済みの内容は保持されます）"
+        );
+
+        // キャンセルしなければ、未処理もキャンセル文言も出ない。
+        assert_eq!(
+            bulk_summary_text(&run_for_summary(2, 2, 2, 0, 0), false),
+            "成功 2 件"
+        );
+    }
+
+    /// 失敗と対象外は、キャンセルしたかどうかと独立に出る。
+    #[test]
+    fn failures_and_dropped_non_targets_are_reported_alongside_a_cancel() {
+        let mut run = run_for_summary(9, 5, 3, 2, 4);
+        run.first_failure = Some("b.jpg: 画像サイズを取得できませんでした".to_string());
+        assert_eq!(
+            bulk_summary_text(&run, true),
+            "成功 3 件 / 失敗 2 件 / 対象外 4 件 / 未処理 4 件（キャンセルしました。\
+適用済みの内容は保持されます）\n最初の失敗: b.jpg: 画像サイズを取得できませんでした"
+        );
+    }
+
+    /// キャンセルは「次の対象を始めない」であって「進行中を捨てる」ではない。捨てると
+    /// DB へ commit 済みの結果が runtime / sidecar へ反映されないまま乖離する。
+    ///
+    /// 実際の worker を回す。bounded channel (容量 1) のおかげで、受信を始める前に
+    /// cancel を立てれば 3 件目の判定は必ず cancel を見る: worker は 1 件目を buffer へ
+    /// 置き、2 件目の send で待たされるので、こちらが 2 件受け取るまで 3 件目へ進めない。
+    /// 各 item の適用自体は失敗してよい。ここで見るのは「届くか」と「止まるか」だけ。
+    #[test]
+    fn cancelling_stops_before_the_next_target_and_still_delivers_the_ones_in_flight() {
+        let _app = crate::app::setup_app_for_test();
+        let targets: Vec<BulkPageEditTarget> = ["a.png", "b.png", "c.png"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, name)| BulkPageEditTarget {
+                idx,
+                page_key: name.to_string(),
+                display_label: name.to_string(),
+                item: image(name),
+                sidecar_coords: None,
+                known_size: Some([1, 1]),
+                kept_runtime_overrides: KeptRuntimeOverrides::default(),
+            })
+            .collect();
+
+        let (cancel, rx, thread) = spawn_bulk_worker(
+            targets,
+            BulkPageEditOp::Reset {
+                kinds: ResetKinds::all(),
+            },
+        )
+        .expect("worker starts");
+        // 1 件も受け取らないうちに押す = 進捗ウィンドウのキャンセル相当。
+        cancel.store(true, Ordering::Relaxed);
+
+        let mut delivered = Vec::new();
+        let cancelled = drain_bulk_worker_events(&rx, |target, _result| {
+            delivered.push(target.page_key);
+        })
+        .expect("worker reports how it ended");
+        thread.join().unwrap();
+
+        assert!(cancelled, "キャンセルとして終わったことを UI へ伝える");
+        assert!(
+            !delivered.contains(&"c.png".to_string()),
+            "cancel 後の対象は始めない: {delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .all(|key| ["a.png", "b.png"].contains(&key.as_str())),
+            "届くのは cancel より前に着手した分だけ: {delivered:?}"
         );
     }
 
