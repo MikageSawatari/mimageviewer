@@ -1025,6 +1025,34 @@ pub(crate) fn arguments_pass_the_materialized_file(tool: &ExternalTool) -> bool 
         })
 }
 
+/// 対象の**場所**を伝えるプレースホルダ。実体化した一時ファイルとは無関係で、
+/// ツールに元の書庫 / PDF / 動画を直接開かせるために使う。
+const LOCATION_PLACEHOLDERS: &[&str] = &[
+    "{container}",
+    "{entry}",
+    "{page}",
+    "{time}",
+    "{time_ms}",
+    "{time_hms}",
+];
+
+/// 引数が「渡すファイル」と「元の場所」の両方を使っているか。
+///
+/// この組み合わせだけは、ツールがどちらを開くかで**編集が反映されたりされなかったり**
+/// する。設定画面で注意を出すために判定する (2026-09-02 利用者指摘)。
+pub(crate) fn arguments_mix_the_file_and_the_location(tool: &ExternalTool) -> bool {
+    if !tool.launch.uses_process_options() {
+        return false;
+    }
+    let tokens = split_argument_template_for_selection(&tool.arguments, tool.selection);
+    let uses = |set: &[&str]| {
+        tokens
+            .iter()
+            .any(|token| set.iter().any(|placeholder| token.contains(placeholder)))
+    };
+    uses(FILE_DERIVED_PLACEHOLDERS) && uses(LOCATION_PLACEHOLDERS)
+}
+
 fn external_tool_capability(
     tool: &ExternalTool,
     target: ExternalToolMenuTarget,
@@ -3374,6 +3402,32 @@ mod tests {
         tool.arguments = r#""{container}""#.to_string();
         tool.launch = ExternalToolLaunch::OsDefault;
         assert!(arguments_pass_the_materialized_file(&tool));
+    }
+
+    /// 渡すファイルと元の場所を**両方**使う引数は、注意を出す対象。
+    ///
+    /// ツールがどちらを開くかで編集が反映されたりされなかったりするので、
+    /// 黙って通さない (2026-09-02 利用者指摘)。
+    #[test]
+    fn using_both_the_file_and_the_location_is_the_case_that_needs_a_warning() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\v.exe"));
+
+        tool.arguments = r#"{files} -page {page} "{container}""#.to_string();
+        assert!(arguments_mix_the_file_and_the_location(&tool));
+
+        for template in [r#"-page {page} "{container}""#, "{files}", "--flag {stem}"] {
+            tool.arguments = template.to_string();
+            assert!(
+                !arguments_mix_the_file_and_the_location(&tool),
+                "{template} は片方しか使っていない"
+            );
+        }
+
+        // 引数を持たない起動方法では、そもそも混ざりようがない。
+        tool.arguments = r#"{files} "{container}""#.to_string();
+        tool.launch = ExternalToolLaunch::OsDefault;
+        assert!(!arguments_mix_the_file_and_the_location(&tool));
     }
 
     /// その使い方では「元のファイル」の約束も関係ないので、仮想ページでも起動できる。

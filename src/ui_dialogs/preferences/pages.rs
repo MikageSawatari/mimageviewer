@@ -758,7 +758,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     egui::Label::new(
                         egui::RichText::new(concat!(
                             "引数が渡すファイルを使っていないので、一時ファイルは作りません。",
-                            "ツールには {container} や {page} など、対象の場所を表す値だけが渡ります。",
+                            "ツールには {container} や {page} など、対象の場所を表す値だけが渡り、",
+                            "ツールは元のファイルを開きます。編集・補正は反映されません。",
                         ))
                         .weak(),
                     )
@@ -992,13 +993,37 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
-        ui.label("{files}  {dir}  {name}  {stem}  {ext}  {uri}");
-        ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
+        ui.add_space(2.0);
+        ui.label("mIV が渡すファイル: {files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(concat!(
+                    "一時ファイルを作って渡します。「渡すもの」の設定に従い、",
+                    "編集を反映したものにできます。",
+                ))
+                .weak(),
+            )
+            .wrap(),
+        );
+        ui.add_space(4.0);
+        ui.label("対象の場所: {container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
         ui.add(
             egui::Label::new(
                 egui::RichText::new(concat!(
                     "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
-                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。",
+                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒)。",
+                    "ツールに元のファイルを直接開かせるための値なので、",
+                    "これだけを使うと mIV は一時ファイルを作らず、",
+                    "編集・補正は反映されません。",
+                ))
+                .weak(),
+            )
+            .wrap(),
+        );
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(concat!(
                     "対象が持っていない値は、そのトークンごと引数から取り除きます",
                     "(その値を待っている直前の option も一緒に取り除きます)。",
                 ))
@@ -1006,6 +1031,18 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             )
             .wrap(),
         );
+        if crate::external_tool::arguments_mix_the_file_and_the_location(&tool) {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(concat!(
+                        "この引数は、渡すファイルと元の場所の両方をツールへ渡しています。",
+                        "ツールがどちらを開くかで、編集が反映されたりされなかったりします。",
+                    ))
+                    .color(ui.visuals().warn_fg_color),
+                )
+                .wrap(),
+            );
+        }
 
         // 起動側と同じ facts を出す。ここが実際の値と違うと、プレビューを見て
         // 引数を組み立てた利用者が必ず外す。
