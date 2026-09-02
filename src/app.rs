@@ -53557,13 +53557,7 @@ impl App {
                 continue;
             }
             let params = self.effective_params(idx).clone();
-            let creative_lut = (!params.creative_lut.is_identity())
-                .then(|| {
-                    self.creative_lut_library
-                        .get(params.creative_lut.id)
-                        .map(|lut| (lut, params.creative_lut.strength))
-                })
-                .flatten();
+            let creative_lut = self.resolved_creative_lut(&params);
             if !params.colorize.is_enabled() && creative_lut.is_none() {
                 continue;
             }
@@ -58832,6 +58826,23 @@ impl App {
         };
         let _ = self.spawn_final_effect_job(ctx, key, source, plan, output_complete, false);
         existing_texture
+    }
+
+    /// 選択されている Creative LUT を実体へ解決する。
+    ///
+    /// **選択 ID から実体を引けるのは登録済みライブラリを持つ側だけ。** 表示側も焼き込み側も
+    /// ここを通し、同じ「未選択なら None」の判定を 2 か所に書かない。
+    pub(crate) fn resolved_creative_lut(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<(crate::creative_lut::SharedCreativeLut, f32)> {
+        (!params.creative_lut.is_identity())
+            .then(|| {
+                self.creative_lut_library
+                    .get(params.creative_lut.id)
+                    .map(|lut| (lut, params.creative_lut.strength))
+            })
+            .flatten()
     }
 
     pub(crate) fn creative_lut_requires_final_effect(
