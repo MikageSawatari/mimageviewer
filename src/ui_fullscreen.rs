@@ -27212,6 +27212,13 @@ impl App {
         // 描画側の寄せとの差が unit ごとに残り、見える間隔が最大 1 物理 px ばらつく。
         // `width` / `height` は unit 矩形の寸法としては使われず、連結の並び (スクロール軸の
         // 長さ・スクロール範囲・可視判定) だけがこれを読む。
+        //
+        // **等間隔をレイアウトの不動性より優先する** (2026-09-02 利用者判断)。長さは表示中の
+        // テクスチャの縦横比から出るので、サムネイル代替から本解像度・加工済みへ差し替わる
+        // 瞬間に以降の段が最大 1 物理 px まとめて動く。テクスチャに依らない正規寸法から取れば
+        // 動かなくなるが、縦横比の違うページで間隔が揃わなくなる。0px と 1px、1px と 2px の
+        // 違いは知覚しやすく、解像度が変わったときの再配置は理解されやすい。
+        // 詳細は [display-pipeline.md](../docs/display-pipeline.md) の連結読みの節。
         let span = continuous_unit_drawn_span(&base, pixels_per_point);
         base.width = span.x_len;
         base.height = (span.y_max - span.y_min).max(1.0);
