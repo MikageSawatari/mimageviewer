@@ -67,7 +67,7 @@ v3.3.0 の変更を機能単位で把握したうえで、次を静的レビュ�
 | R-20 | P1 | ✅ 修正 | `51b882ad` 復号済みセルに 128 MiB 上限。窓は pin、遠い順に超過分だけ落とす |
 | R-24 | P2 | ✅ 修正 | `7a198b07` bundle 破棄前に terminal effects を完遂 |
 | R-26 | P1 | ✅ 修正 | `709397b1` 保存失敗を成功として公開しない。**後半 (import の世代比較) は不要と判断** — import の「中央が authoritative」はフォルダ移動からの復旧という目的に対して正しく、sidecar が先行する唯一の道が前半だった |
-| R-08/09/10/11/12/13/16/18/19/21/22/23/25 | P2/P3 | ❌ **未着手** | R-19 (360 roll) は実在を確認済み。R-25 は v3.2.0 にも同一コードがあり既存 |
+| R-08/09/10/11/12/13/16/18/19/21/22/23/25 | P2/P3 | ❌ **未着手** | R-19 (360 roll) は実在を確認済みだが、2026-09-02 に利用者判断で保留 (要望ではなくレビュー由来 + 検証素材が無い)。R-25 は v3.2.0 にも同一コードがあり既存 |
 
 **Codex が追加で見つけ、台帳に無かったもの** (すべて対応済み):
 
@@ -163,7 +163,7 @@ R-14 で `Arc` 共有にしたので、worker へ渡す時点の複製はもう�
 | R-16 | P3 | sidecar import | 確認済み（既知残存） | 初回・外部変更・旧形式移行時の巨大 sidecar read/parse/import が UI thread 上に残る |
 | R-17 | P1 | native command queue | 確認済み | transition 待機が drain 済み lossless batch の後半 command を破棄する |
 | R-18 | P2 | Remote / ZIP split | 確認済み | catalog 未生成 ZIP の寸法 probe が有効 JPEG を固定 64 KiB で打ち切る |
-| R-19 | P2 | 360 度動画 | 確認済み | AVSphericalMapping の roll を parse するが描画 pipeline へ渡さない |
+| R-19 | P2 | 360 度動画 | 確認済み・**保留 (2026-09-02)** | AVSphericalMapping の roll を parse するが描画 pipeline へ渡さない。利用者判断で保留 — これはレビュー由来であって要望ではなく、roll を持つ 360 動画が手元に無いので shader 配線を実機検証できない。実際の要望が出てから着手する |
 | R-20 | P1 | シークサムネイル | 確認済み | decoded cell cache が無制限で、UI poll が全履歴 BTreeMap を clone する |
 | R-21 | P2 | シーク波形 | 確認済み | 波形→サムネイル切替後も不可視の coarse 全尺解析が継続する |
 | R-22 | P3 | シーク波形 | 確認済み | 可変 bin が foreground request の preemption 単位を 60 秒から最大 1,800 秒へ伸ばす |
