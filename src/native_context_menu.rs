@@ -1473,6 +1473,8 @@ mod windows_impl {
         reasons: std::collections::HashMap<u32, String>,
         text: Vec<u16>,
         active_id: Option<u32>,
+        /// 診断: ログを出した回数 (出しっぱなしにしない)。
+        probes: u32,
     }
 
     impl TrackedMenuTooltip {
@@ -1527,6 +1529,7 @@ mod windows_impl {
                 reasons,
                 text: Vec::new(),
                 active_id: None,
+                probes: 0,
             })
         }
 
@@ -1542,7 +1545,20 @@ mod windows_impl {
         }
 
         fn handle_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) {
-            match menu_tooltip_selection(wparam.0, lparam.0) {
+            let selection = menu_tooltip_selection(wparam.0, lparam.0);
+            if self.probes < 24 {
+                self.probes += 1;
+                let known: Vec<String> = self.reasons.keys().map(|id| format!("{id}")).collect();
+                crate::logger::log(format!(
+                    "menu_tooltip: select flags=0x{:04x} id={} decision={:?} has_reason={} known=[{}]",
+                    (wparam.0 >> 16) & 0xffff,
+                    wparam.0 & 0xffff,
+                    selection,
+                    matches!(selection, MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id)),
+                    known.join(","),
+                ));
+            }
+            match selection {
                 MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id) => self.show(id),
                 MenuTooltipSelection::Hide | MenuTooltipSelection::Show(_) => self.hide(),
             }
@@ -1567,6 +1583,9 @@ mod windows_impl {
                 )
             };
             if added.0 == 0 {
+                crate::logger::log(
+                    "menu_tooltip: TTM_ADDTOOLW failed; no tooltip will be shown".to_string(),
+                );
                 self.text.clear();
                 return;
             }
@@ -1585,6 +1604,18 @@ mod windows_impl {
                     Some(WPARAM(1)),
                     Some(LPARAM((&tool_info as *const TTTOOLINFOW) as isize)),
                 );
+            }
+            if self.probes < 24 {
+                self.probes += 1;
+                use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+                crate::logger::log(format!(
+                    "menu_tooltip: shown id={id} added={} cursor=({},{}) visible={} tip_hwnd=0x{:x}",
+                    added.0,
+                    cursor.x,
+                    cursor.y,
+                    unsafe { IsWindowVisible(self.hwnd) }.as_bool(),
+                    self.hwnd.0 as usize as u64,
+                ));
             }
             self.active_id = Some(id);
         }
