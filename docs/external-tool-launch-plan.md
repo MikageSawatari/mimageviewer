@@ -503,6 +503,18 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 | `File` (既定) | 動画ファイル自体を渡す (= 現在の Shift+Enter 相当) |
 | `CurrentFrame` | **現在フレームを画像へ実体化して渡す。** 再生中でなければ `File` に落ちる |
 
+`CurrentFrame` が実際にフレームを作るのは、**映像トラックのあるファイルを開いていて、
+提示済みのフレームがある**ときだけ。音声ファイルは `File` に落ちる (`has_video`)。
+
+**切り出しはクリップボードコピー / <kbd>Ctrl+S</kbd> と同じ `capture_frame` を通す。**
+そのため出荷済みのこの 2 つと同じ制限をそのまま持つ (2026-09-02、Codex Sol 指摘 #12)。
+外部ツール側だけ別扱いにはしない — 同じ絵を 2 通りに作る方が悪い。
+
+- **SAR (アナモルフィック) を反映しない。** coded の縦横で出るので、表示と縦横比が
+  違う動画がある。直すなら 3 経路まとめて直す (= 出荷済みの出力が変わる)
+- **source の差し替え直後の一瞬だけ、旧 source の PTS が残る**
+  (`last_displayed_pts_secs` の doc)。新 source の最初の present で上書きされる
+
 **`File` は動画の実ファイルをそのまま渡す。一時ファイルへコピーしない。** 画像と違って
 数 GB になるので、コピーの代償が安全側の利益に見合わない。UI でも「動画ファイル」と書き、
 一時ファイルでないことが読めるようにする。
@@ -656,8 +668,11 @@ SumatraPDF で同上:                       -page {page} "{container}"
 | `BothPages` | 左右 2 件を読み順で渡す (`SelectionPolicy` に従って Each / Batch) |
 | `MainPageOnly` | 主ページ 1 件 |
 
-- `PayloadPolicy::OriginalFile` と `Merged` は両立しない (合成物に元ファイルは無い)。
-  `OriginalFile` のツールでは `Merged` を選択肢から外し、`BothPages` / `MainPageOnly` だけにする。
+- **元のバイト列を渡す設定と `Merged` は両立しない** (合成物に対応する元のデータは無い)。
+  `OriginalFile` **と `TempOriginal`** のツールでは `Merged` を選択肢から外し、
+  `BothPages` / `MainPageOnly` だけにする。規則は `ExternalTool::effective_spread` が
+  1 か所で持ち、設定 UI の書き戻しと実行時の展開が同じものを読む
+  (2026-09-02、Codex Sol 指摘 #4。当初 `OriginalFile` しか外していなかった)。
   `BothPages` は無加工なら実ファイル 2 件なので成立する。既定は `MainPageOnly`。
 - **`SpreadPolicy` は 3 値まとめて入れた** (2026-08-31 決定 / P4 で実装)。既定が `Merged` で、その合成が
   P4 にある以上、`BothPages` / `MainPageOnly` だけ先に入れると**既定値だけが設定どおりに動かない**版が
@@ -675,6 +690,11 @@ SumatraPDF で同上:                       -page {page} "{container}"
   `render_export_pixels`)。見えているものと渡るものが食い違わないよう、判断を二重に持たない。
   結果は `MaterializeSource::Rendered` として実体化ワーカーへ渡り、encode だけされる
   (画素は既に補正・注釈込みなので、そこから焼き込むものが無い)。
+- **`Merged` にだけ「書き出しの焼き込み」の段が効かない** (表示画素をそのまま使うため)。
+  設定画面にその旨を出している。**レンダーと全画素 hash も UI スレッドで走る。**
+  どちらも、[焼き込み段階の統一](bake-stage-unification-plan.md) の段取り 6 で画像
+  <kbd>Ctrl+E</kbd> をワーカー経路へ移すときに一緒に解消する — 合成もその経路に乗る
+  (2026-09-02、Codex Sol 指摘 #4 / #8)。
 - `SelectionPolicy::Single` + `BothPages` は見開き中に 2 件になるので起動しない。設定画面で
   その旨を警告色で出す (**黙って片方だけ渡さない**)。
 

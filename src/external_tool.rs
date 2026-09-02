@@ -110,6 +110,16 @@ pub enum PayloadPolicy {
     OriginalFile,
 }
 
+impl PayloadPolicy {
+    /// 元のバイト列をそのまま渡す約束か。
+    ///
+    /// **合成した見開きとは両立しない** — 2 ページを 1 枚にしたものに対応する「元の
+    /// データ」はどこにも無い。`ExternalTool::effective_spread` がこの規則を持つ。
+    pub fn passes_original_bytes(self) -> bool {
+        matches!(self, Self::TempOriginal | Self::OriginalFile)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VideoPolicy {
     #[default]
@@ -765,6 +775,21 @@ impl Drop for ExternalLaunchPending {
 }
 
 impl ExternalTool {
+    /// 実際に使う見開きの扱い。
+    ///
+    /// **元バイト列を渡す設定では合成しない。** 合成した 1 枚に対応する元のデータは
+    /// 無いので、`TempOriginal` / `OriginalFile` と `Merged` は同時に成り立たない。
+    /// 設定 UI はこの値を書き戻すので、通常は `spread` と一致する。保存済みの設定に
+    /// 矛盾が残っていても、実行時に合成が起きないことをここで保証する
+    /// (Codex Sol 指摘 #4)。
+    pub fn effective_spread(&self) -> SpreadPolicy {
+        if self.payload.passes_original_bytes() && self.spread == SpreadPolicy::Merged {
+            SpreadPolicy::MainPageOnly
+        } else {
+            self.spread
+        }
+    }
+
     /// 右クリックメニューに出す文言。
     ///
     /// 名前だけだと項目として認識されにくい (利用者が区切り線の下の項目を見落とした,
@@ -2261,7 +2286,7 @@ impl crate::app::App {
         else {
             return Ok(None);
         };
-        match tool.spread {
+        match tool.effective_spread() {
             // 現在ページ 1 件。呼び出し側の従来経路をそのまま使う。
             SpreadPolicy::MainPageOnly => Ok(None),
             SpreadPolicy::BothPages => {
@@ -2448,7 +2473,14 @@ impl crate::app::App {
             return None;
         }
         // クリップボードコピーと同じ「まだ開けていない / 壊れている」判定。
-        if player.error().is_some() || player.info().is_none() {
+        // **映像トラックの有無まで見る。** `RealFile` は音声ファイルも通るので、
+        // ここを緩めると音声を切り出そうとして "video stream not found" で失敗する。
+        // 音声はフレームを持たないので、従来どおりファイルそのものを渡すのが正しい
+        // (Codex Sol 指摘 #12)。
+        if player.error().is_some() {
+            return None;
+        }
+        if !player.info().is_some_and(|info| info.has_video) {
             return None;
         }
         let secs = player.screenshot_target_secs();
@@ -3141,6 +3173,28 @@ mod tests {
             payload,
             ..ExternalTool::defaults_for_viewing()
         }
+    }
+
+    /// 「元のデータをそのまま」と「見開きを 1 枚に合成」は同時に成り立たない。
+    ///
+    /// 合成した 1 枚に対応する元のデータはどこにも無い。設定 UI は合成を出さないが、
+    /// 保存済みの設定に残っていても実行時に合成しないことを、同じ 1 つの規則で保証する
+    /// (Codex Sol 指摘 #4)。
+    #[test]
+    fn passing_the_original_bytes_rules_out_a_merged_spread() {
+        for payload in [PayloadPolicy::TempOriginal, PayloadPolicy::OriginalFile] {
+            let mut tool = menu_tool(1, "merge", payload);
+            tool.spread = SpreadPolicy::Merged;
+            assert_eq!(
+                tool.effective_spread(),
+                SpreadPolicy::MainPageOnly,
+                "{payload:?} で合成した PNG を作ってはいけない"
+            );
+        }
+
+        let mut tool = menu_tool(2, "merge", PayloadPolicy::TempEdited);
+        tool.spread = SpreadPolicy::Merged;
+        assert_eq!(tool.effective_spread(), SpreadPolicy::Merged);
     }
 
     #[test]

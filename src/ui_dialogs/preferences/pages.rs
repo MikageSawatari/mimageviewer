@@ -753,6 +753,12 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
             let passes_real_file =
                 tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;
+            // 合成した見開きに対応する「元のデータ」は存在しない。元バイト列を渡す
+            // 2 つでは合成を選べない。既に選ばれていたら**書き戻して**落とす —
+            // 残すと UI に無い値が保存されたままになり、実行時だけ合成が起きる
+            // (Codex Sol 指摘 #4)。
+            let passes_original_bytes = tool.payload.passes_original_bytes();
+            tool.spread = tool.effective_spread();
             ui.label("");
             ui.add(
                 egui::Label::new(
@@ -760,8 +766,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                         crate::external_tool::PayloadPolicy::TempEdited => concat!(
                             "補正・回転・注釈・消しゴムなど、このページに加えた編集を反映した ",
                             "PNG を一時ファイルへ書き出します。元のファイルは変わりません。",
-                            "カラー化・LUT・ポストフィルタ・スマートシャープ・AI 拡大は表示専用のため、",
-                            "製本と同じく反映しません。",
+                            "AI 処理・カラー化・LUT・ポストフィルタ・スマートシャープを",
+                            "どこまで焼き込むかは「書き出しの焼き込み」で選べます (既定は編集まで)。",
                         ),
                         crate::external_tool::PayloadPolicy::TempOriginal => concat!(
                             "編集を反映せず、元のデータをそのまま一時ファイルへ書き出します。",
@@ -823,8 +829,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui,
                 "external_tool_spread",
                 &mut tool.spread,
-                if passes_real_file {
-                    // 合成した見開きに対応する元ファイルは存在しない。
+                if passes_original_bytes {
+                    // 合成した見開きに対応する元のデータは存在しない。
                     &[
                         (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
                         (
@@ -844,6 +850,21 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 },
             );
             ui.end_row();
+
+            if tool.spread == crate::external_tool::SpreadPolicy::Merged {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(concat!(
+                            "合成は、画面に見えている見開きをそのまま 1 枚の PNG にします。",
+                            "「書き出しの焼き込み」の段はこの 1 枚には適用されません。",
+                        ))
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
 
             ui.label("複数選択");
             enum_combo(
