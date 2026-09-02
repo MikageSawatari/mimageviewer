@@ -17,21 +17,14 @@ pub(crate) const VIRTUAL_ORIGINAL_FILE_DISABLED_REASON: &str = "圧縮ファイ�
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const IMPLEMENTED_PLACEHOLDERS: &[&str] = &[
-    "{file}",
-    "{files}",
-    "{dir}",
-    "{name}",
-    "{stem}",
-    "{ext}",
-    "{uri}",
-    "{container}",
-    "{entry}",
-    "{page}",
-    "{time}",
-    "{time_ms}",
-    "{time_hms}",
-];
+/// 引数テンプレートで使える記法。**`{files}` 1 つだけ** (2026-09-02 利用者判断)。
+///
+/// 対象の場所 (`{container}` / `{page}` など) も、ファイル名の部品 (`{stem}` /
+/// `{ext}` など) も持たない。前者は対象の種類ごとに値の有無が変わり、後者は
+/// 「まとめて渡す」でどのファイルの値か決まらない。**どちらも「書いたのに入らない」
+/// 場合を作り、その先で何が起きるか利用者が予測できない。** 1 つに絞れば、
+/// 引数は常に書いたとおりに渡る。
+const IMPLEMENTED_PLACEHOLDERS: &[&str] = &["{files}"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolId(pub u32);
@@ -108,6 +101,16 @@ pub enum PayloadPolicy {
     TempOriginal,
     /// 元のファイルそのもの。仮想ページでは起動しない (§4.8)。
     OriginalFile,
+}
+
+impl PayloadPolicy {
+    /// 元のバイト列をそのまま渡す約束か。
+    ///
+    /// **合成した見開きとは両立しない** — 2 ページを 1 枚にしたものに対応する「元の
+    /// データ」はどこにも無い。`ExternalTool::effective_spread` がこの規則を持つ。
+    pub fn passes_original_bytes(self) -> bool {
+        matches!(self, Self::TempOriginal | Self::OriginalFile)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -378,64 +381,6 @@ pub(crate) fn resolve_external_tool_slot(
         .ok_or_else(|| format!("外部ツールスロット {slot} にはツールが登録されていません"))
 }
 
-#[derive(Clone, Debug)]
-pub struct PlaceholderContext {
-    file: PathBuf,
-    facts: PlaceholderFacts,
-}
-
-impl PlaceholderContext {
-    pub fn for_file(file: impl Into<PathBuf>) -> Self {
-        Self {
-            file: file.into(),
-            facts: PlaceholderFacts::default(),
-        }
-    }
-
-    pub fn with_facts(file: impl Into<PathBuf>, facts: PlaceholderFacts) -> Self {
-        Self {
-            file: file.into(),
-            facts,
-        }
-    }
-
-    pub fn file(&self) -> &Path {
-        &self.file
-    }
-}
-
-/// ツールへ伝える「対象が何だったか」。
-///
-/// **実体化した一時ファイルのパスからは復元できない。** 一時ファイルは書庫の外に置かれ、
-/// ページ番号も再生位置も持たない。対象を解決した UI スレッドの時点で確定させ、
-/// 実体化を挟んだ後の引数組み立てまで持ち回る。
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PlaceholderFacts {
-    /// 利用者から見た書庫 / PDF / 動画本体。実ファイルならそれ自身。
-    /// 変換アーカイブでは cache ZIP ではなく元の RAR / 7z / LZH を指す。
-    pub container: Option<PathBuf>,
-    /// 書庫内エントリ名。
-    pub entry: Option<String>,
-    /// 1 始まりのページ番号。
-    pub page: Option<u32>,
-    /// 動画の再生位置 (秒)。
-    pub time_secs: Option<f64>,
-}
-
-/// `{time_hms}` の書式。`00:01:23.456`。
-fn format_hms(secs: f64) -> String {
-    let secs = secs.max(0.0);
-    let total_ms = (secs * 1000.0).round() as u64;
-    let ms = total_ms % 1000;
-    let total_seconds = total_ms / 1000;
-    format!(
-        "{:02}:{:02}:{:02}.{ms:03}",
-        total_seconds / 3600,
-        (total_seconds / 60) % 60,
-        total_seconds % 60
-    )
-}
-
 #[derive(Debug)]
 pub(crate) struct ExternalLaunchRequest {
     pub tool_name: String,
@@ -453,18 +398,9 @@ pub(crate) struct ExternalLaunchOperation {
     target_count_decision: TargetCountDecision,
 }
 
-/// 1 対象ぶんの「何を作るか」と「ツールへ何と伝えるか」。
-///
-/// **並列 Vec にしない。** 実体化の結果と placeholder の値は index で突き合わせるので、
-/// 別々の Vec にすると片方だけ長さが変わったときに黙ってずれる。
-struct ExternalMaterializeTarget {
-    request: crate::materializer::MaterializeRequest,
-    facts: PlaceholderFacts,
-}
-
 struct ExternalMaterializeOperation {
     tool: ExternalTool,
-    targets: Vec<ExternalMaterializeTarget>,
+    targets: Vec<crate::materializer::MaterializeRequest>,
     target_count_decision: TargetCountDecision,
 }
 
@@ -765,6 +701,21 @@ impl Drop for ExternalLaunchPending {
 }
 
 impl ExternalTool {
+    /// 実際に使う見開きの扱い。
+    ///
+    /// **元バイト列を渡す設定では合成しない。** 合成した 1 枚に対応する元のデータは
+    /// 無いので、`TempOriginal` / `OriginalFile` と `Merged` は同時に成り立たない。
+    /// 設定 UI はこの値を書き戻すので、通常は `spread` と一致する。保存済みの設定に
+    /// 矛盾が残っていても、実行時に合成が起きないことをここで保証する
+    /// (Codex Sol 指摘 #4)。
+    pub fn effective_spread(&self) -> SpreadPolicy {
+        if self.payload.passes_original_bytes() && self.spread == SpreadPolicy::Merged {
+            SpreadPolicy::MainPageOnly
+        } else {
+            self.spread
+        }
+    }
+
     /// 右クリックメニューに出す文言。
     ///
     /// 名前だけだと項目として認識されにくい (利用者が区切り線の下の項目を見落とした,
@@ -823,7 +774,7 @@ impl ExternalTool {
             id: ExternalToolId(1),
             name: String::new(),
             launch: ExternalToolLaunch::OsDefault,
-            arguments: "{file}".to_string(),
+            arguments: "{files}".to_string(),
             working_directory: None,
             payload: PayloadPolicy::TempEdited,
             video: VideoPolicy::File,
@@ -912,6 +863,23 @@ fn spread_reading_order(left: usize, right: usize) -> (usize, usize) {
     }
 }
 
+/// この viewport が外部ツールの modal を描くか。
+///
+/// **所有者は「利用者がその操作をした窓」**で、先着ではない。viewer の viewport は
+/// main の tail より前に描くので、先着にすると背面の F12 窓が main 由来の modal を
+/// 攫い、前面の main は「ダイアログが無いのに入力だけ止まる」になる。
+///
+/// 所有 viewport は消えることがある (フルスクリーンを閉じる context menu からの起動、
+/// native 動画の早期 return)。その frame は main が肩代わりする。main の tail は全 viewer
+/// viewport より後に走るので、`owner_drawn_this_frame` はその時点で確定している。
+fn external_tool_modal_viewport_draws(
+    viewport: egui::ViewportId,
+    owner: egui::ViewportId,
+    owner_drawn_this_frame: bool,
+) -> bool {
+    viewport == owner || (viewport == egui::ViewportId::ROOT && !owner_drawn_this_frame)
+}
+
 fn external_tool_capability(
     tool: &ExternalTool,
     target: ExternalToolMenuTarget,
@@ -952,10 +920,13 @@ fn external_tool_picker_items(
 
 /// Windows の `CommandLineToArgvW` と同じ引用符・バックスラッシュ規則で、
 /// 引数テンプレートを先にトークンへ分割する。
-fn split_argument_template_with_default(
-    template: &str,
-    default_placeholder: &'static str,
-) -> Vec<String> {
+fn split_argument_template_with_default(template: &str) -> Vec<String> {
+    // 渡すファイルの綴りは `{files}` 1 つ。**`{file}` は同義として受けるだけで、
+    // 設定画面にも文書にも出さない。** 複数選択を「1 件ずつ」と「まとめて渡す」で
+    // 切り替えるたびに引数を書き直すのは不便で、2 つの綴りを持つ理由が無い
+    // (2026-09-02 利用者判断)。開発中に書いた古いテンプレートが literal `{file}` を
+    // ツールへ渡してしまわないよう、ここで 1 つに揃える。
+    let template = &template.replace("{file}", "{files}");
     let mut result = Vec::new();
     let chars: Vec<char> = template.chars().collect();
     let mut index = 0;
@@ -1021,25 +992,22 @@ fn split_argument_template_with_default(
     }
 
     if !contains_known_placeholder(template) {
-        result.push(default_placeholder.to_string());
+        result.push("{files}".to_string());
     }
     result
 }
 
 pub fn split_argument_template(template: &str) -> Vec<String> {
-    split_argument_template_with_default(template, "{file}")
+    split_argument_template_with_default(template)
 }
 
+/// `{files}` は「1 件ずつ」なら 1 引数、「まとめて渡す」なら対象数ぶんの引数へ広がる。
+/// 綴りが 1 つなので、複数選択を切り替えても引数テンプレートは書き直さなくてよい。
 fn split_argument_template_for_selection(
     template: &str,
-    selection: SelectionPolicy,
+    _selection: SelectionPolicy,
 ) -> Vec<String> {
-    let default_placeholder = if selection == SelectionPolicy::Batch {
-        "{files}"
-    } else {
-        "{file}"
-    };
-    split_argument_template_with_default(template, default_placeholder)
+    split_argument_template_with_default(template)
 }
 
 fn contains_known_placeholder(template: &str) -> bool {
@@ -1048,101 +1016,12 @@ fn contains_known_placeholder(template: &str) -> bool {
         .any(|placeholder| template.contains(placeholder))
 }
 
-/// 空文字を返した placeholder は、そのトークンごと引数列から落ちる (`expand_token`)。
-/// 「対象が持っていない情報」と「値が空文字」を区別しない — `-page {page}` に対して
-/// `-page` だけを残さないことが要件なので、どちらも同じ扱いでよい。
-fn placeholder_value(placeholder: &str, ctx: &PlaceholderContext) -> Option<OsString> {
-    let facts = &ctx.facts;
-    match placeholder {
-        "{file}" => Some(ctx.file.as_os_str().to_os_string()),
-        "{dir}" => Some(
-            ctx.file
-                .parent()
-                .map(Path::as_os_str)
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{name}" => Some(
-            ctx.file
-                .file_name()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{stem}" => Some(
-            ctx.file
-                .file_stem()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{ext}" => Some(
-            ctx.file
-                .extension()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{container}" => Some(
-            facts
-                .container
-                .as_ref()
-                .map(|path| path.as_os_str().to_os_string())
-                .unwrap_or_default(),
-        ),
-        "{entry}" => Some(OsString::from(facts.entry.clone().unwrap_or_default())),
-        "{page}" => Some(OsString::from(
-            facts.page.map(|page| page.to_string()).unwrap_or_default(),
-        )),
-        "{time}" => Some(OsString::from(
-            facts
-                .time_secs
-                .map(|secs| format!("{:.3}", secs.max(0.0)))
-                .unwrap_or_default(),
-        )),
-        "{time_ms}" => Some(OsString::from(
-            facts
-                .time_secs
-                .map(|secs| ((secs.max(0.0) * 1000.0).round() as u64).to_string())
-                .unwrap_or_default(),
-        )),
-        "{time_hms}" => Some(OsString::from(
-            facts.time_secs.map(format_hms).unwrap_or_default(),
-        )),
-        _ => None,
-    }
-}
-
-fn file_uri(path: &Path) -> OsString {
-    let encoded = path.as_os_str().as_encoded_bytes();
-    let is_unc = encoded.starts_with(b"\\\\");
-    let mut uri = if is_unc {
-        String::from("file:")
-    } else {
-        String::from("file:///")
-    };
-    for &byte in encoded {
-        match byte {
-            b'\\' => uri.push('/'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                uri.push(byte as char)
-            }
-            _ => {
-                const HEX: &[u8; 16] = b"0123456789ABCDEF";
-                uri.push('%');
-                uri.push(HEX[(byte >> 4) as usize] as char);
-                uri.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    OsString::from(uri)
-}
-
-fn expand_token(
-    token: &str,
-    ctx: &PlaceholderContext,
-    files_value: Option<&OsStr>,
-) -> Option<OsString> {
+/// 1 トークン内の `{files}` を置き換える。
+///
+/// 知らない記法は文字どおり残す。利用者が書いたものを黙って変えない。
+fn expand_token(token: &str, files_value: &OsStr) -> OsString {
     let mut expanded = OsString::new();
     let mut remainder = token;
-    let mut had_empty_placeholder = false;
 
     while let Some(open) = remainder.find('{') {
         expanded.push(&remainder[..open]);
@@ -1155,72 +1034,35 @@ fn expand_token(
         let close = relative_close + 1;
         let placeholder = &after_open[..close];
         if placeholder == "{files}" {
-            if let Some(value) = files_value.filter(|value| !value.is_empty()) {
-                expanded.push(value);
-            } else {
-                had_empty_placeholder = true;
-            }
-        } else if placeholder == "{uri}" {
-            expanded.push(file_uri(&ctx.file));
-        } else if let Some(value) = placeholder_value(placeholder, ctx) {
-            if value.is_empty() {
-                had_empty_placeholder = true;
-            } else {
-                expanded.push(value);
-            }
+            expanded.push(files_value);
         } else {
             expanded.push(placeholder);
         }
         remainder = &after_open[close..];
     }
     expanded.push(remainder);
-
-    if had_empty_placeholder || expanded.is_empty() {
-        None
-    } else {
-        Some(expanded)
-    }
+    expanded
 }
-
-/// 分割済みトークン内だけでプレースホルダを置換する。
+/// 分割済みトークン内だけで `{files}` を置換する。
 ///
-/// 空のプレースホルダで単独の値トークンが消えた場合、直前の option トークンも除く。
-/// これにより `-page {page}` が `-page` だけになることを防ぐ。
-pub fn expand_arguments(tokens: &[String], ctx: &PlaceholderContext) -> Vec<OsString> {
-    expand_arguments_for_files(tokens, std::slice::from_ref(ctx))
+/// **引数は必ず書いたとおりに渡る。** 記法が 1 つしかないので、値が入らない場合が無い。
+pub fn expand_arguments(tokens: &[String], file: &Path) -> Vec<OsString> {
+    expand_arguments_for_files(tokens, std::slice::from_ref(&file.to_path_buf()))
 }
 
 /// `{files}` を含む 1 トークンを対象数ぶんの引数へ展開する。
 ///
 /// パスを空白連結した文字列にはせず、各パスを独立した `OsString` として返す。
-pub fn expand_arguments_for_files(
-    tokens: &[String],
-    contexts: &[PlaceholderContext],
-) -> Vec<OsString> {
-    let Some(primary) = contexts.first() else {
-        return Vec::new();
-    };
+pub fn expand_arguments_for_files(tokens: &[String], files: &[PathBuf]) -> Vec<OsString> {
     let mut result: Vec<OsString> = Vec::new();
     for token in tokens {
-        let before = result.len();
         if token.contains("{files}") {
-            result.extend(contexts.iter().filter_map(|ctx| {
-                // `{file}` などの scalar は Batch でも先頭対象を指す。
-                // N 件へ変化させるのは `{files}` の値だけにする。
-                expand_token(token, primary, Some(ctx.file.as_os_str()))
-            }));
-        } else if let Some(expanded) = expand_token(token, primary, None) {
-            result.push(expanded);
-        }
-        if result.len() == before {
-            let placeholder_only = token.starts_with('{') && token.ends_with('}');
-            if placeholder_only
-                && result
-                    .last()
-                    .is_some_and(|previous| previous.as_encoded_bytes().starts_with(b"-"))
-            {
-                result.pop();
+            // 1 トークンが対象数ぶんの引数へ広がる。空白連結した 1 文字列にはしない。
+            for file in files {
+                result.push(expand_token(token, file.as_os_str()));
             }
+        } else {
+            result.push(expand_token(token, OsStr::new("")));
         }
     }
     result
@@ -1417,26 +1259,17 @@ fn windows_create_process_command_line_utf16_len(
 fn build_request_for_files(
     tool: &ExternalTool,
     files: Vec<PathBuf>,
-    facts: Vec<PlaceholderFacts>,
 ) -> Result<ExternalLaunchRequest, String> {
-    // 対象ごとの facts が揃っていない呼び出しでも、パスの数だけ context を作る
-    // (足りない分は既定 = 何も分からない)。placeholder は空へ展開され、そのトークンは落ちる。
-    let mut facts = facts.into_iter();
-    let contexts: Vec<_> = files
-        .iter()
-        .cloned()
-        .map(|file| PlaceholderContext::with_facts(file, facts.next().unwrap_or_default()))
-        .collect();
     let arguments = if tool.launch.uses_process_options() {
         let tokens = split_argument_template_for_selection(&tool.arguments, tool.selection);
-        if tool.selection == SelectionPolicy::Batch
-            && !tokens.iter().any(|token| token.contains("{files}"))
-        {
-            return Err(
-                "まとめて渡すには引数テンプレートに {files} を指定してください".to_string(),
-            );
+        if tool.selection == SelectionPolicy::Batch {
+            if !tokens.iter().any(|token| token.contains("{files}")) {
+                return Err(
+                    "まとめて渡すには引数テンプレートに {files} を指定してください".to_string(),
+                );
+            }
         }
-        expand_arguments_for_files(&tokens, &contexts)
+        expand_arguments_for_files(&tokens, &files)
     } else {
         Vec::new()
     };
@@ -1483,41 +1316,20 @@ fn build_launch_operation_inner(
         tool.confirmation_threshold,
         tool.max_targets,
     )?;
-    // この経路は実ファイルしか扱わない (`real_files_from_targets`)。実ファイルの
-    // `{container}` は自分自身で、ページ番号もエントリ名も再生位置も持たない。
-    let facts = |files: &[PathBuf]| -> Vec<PlaceholderFacts> {
-        files
-            .iter()
-            .map(|file| PlaceholderFacts {
-                container: Some(file.clone()),
-                ..PlaceholderFacts::default()
-            })
-            .collect()
-    };
     let requests = match tool.selection {
-        SelectionPolicy::Single => {
-            let facts = facts(&files);
-            vec![build_request_for_files(tool, files, facts)?]
-        }
+        SelectionPolicy::Single => vec![build_request_for_files(tool, files)?],
         SelectionPolicy::Each => files
             .into_iter()
-            .map(|file| {
-                let facts = facts(std::slice::from_ref(&file));
-                build_request_for_files(tool, vec![file], facts)
-            })
+            .map(|file| build_request_for_files(tool, vec![file]))
             .collect::<Result<Vec<_>, _>>()?,
         SelectionPolicy::Batch => match &tool.launch {
             ExternalToolLaunch::Executable(_) | ExternalToolLaunch::Association { .. } => {
-                let facts = facts(&files);
-                vec![build_request_for_files(tool, files, facts)?]
+                vec![build_request_for_files(tool, files)?]
             }
             // OS 既定アプリへ複数パスをまとめて渡す API はないため Each と同じ。
             ExternalToolLaunch::OsDefault => files
                 .into_iter()
-                .map(|file| {
-                    let facts = facts(std::slice::from_ref(&file));
-                    build_request_for_files(tool, vec![file], facts)
-                })
+                .map(|file| build_request_for_files(tool, vec![file]))
                 .collect::<Result<Vec<_>, _>>()?,
         },
     };
@@ -1707,8 +1519,8 @@ fn run_materialize_launch_operation(
             index,
             format!("{} / {} 件目を準備しています", index + 1, target_count),
         );
-        let label = target.request.source.display_label();
-        match session.materialize(&target.request, cancel, generation) {
+        let label = target.source.display_label();
+        match session.materialize(target, cancel, generation) {
             Ok(file) => prepared.push(Some(file)),
             Err(error) => {
                 failures.push(format!("{label}: {error}"));
@@ -1790,7 +1602,7 @@ fn run_materialize_launch_operation(
 
     match tool.selection {
         SelectionPolicy::Single | SelectionPolicy::Each => {
-            for (index, file) in prepared.iter_mut().enumerate() {
+            for file in prepared.iter_mut() {
                 let Some(file) = file else { continue };
                 if session.ensure_current(cancel.as_ref(), generation).is_err() {
                     failures.push("ページが移動したため、古い起動要求を破棄しました".to_string());
@@ -1798,8 +1610,7 @@ fn run_materialize_launch_operation(
                 }
                 let path = file.path().to_path_buf();
                 let label = path.display().to_string();
-                let facts = vec![targets[index].facts.clone()];
-                match build_request_for_files(&tool, vec![path], facts)
+                match build_request_for_files(&tool, vec![path])
                     .and_then(|request| launch_request(request, owner_hwnd))
                 {
                     Ok(refresh) => {
@@ -1816,7 +1627,7 @@ fn run_materialize_launch_operation(
         SelectionPolicy::Batch => match &tool.launch {
             ExternalToolLaunch::OsDefault => {
                 // OS 既定アプリへ複数パスを一括で渡す API はないため、従来どおり Each 相当。
-                for (index, file) in prepared.iter_mut().enumerate() {
+                for file in prepared.iter_mut() {
                     let Some(file) = file else { continue };
                     if session.ensure_current(cancel.as_ref(), generation).is_err() {
                         failures
@@ -1825,8 +1636,7 @@ fn run_materialize_launch_operation(
                     }
                     let path = file.path().to_path_buf();
                     let label = path.display().to_string();
-                    let facts = vec![targets[index].facts.clone()];
-                    match build_request_for_files(&tool, vec![path], facts)
+                    match build_request_for_files(&tool, vec![path])
                         .and_then(|request| launch_request(request, owner_hwnd))
                     {
                         Ok(refresh) => {
@@ -1842,16 +1652,13 @@ fn run_materialize_launch_operation(
             }
             ExternalToolLaunch::Executable(_) | ExternalToolLaunch::Association { .. } => {
                 if session.ensure_current(cancel.as_ref(), generation).is_ok() {
-                    let (files, facts): (Vec<_>, Vec<_>) = prepared
+                    let files: Vec<_> = prepared
                         .iter()
-                        .enumerate()
-                        .filter_map(|(index, file)| {
-                            let file = file.as_ref()?;
-                            Some((file.path().to_path_buf(), targets[index].facts.clone()))
-                        })
-                        .unzip();
+                        .flatten()
+                        .map(|file| file.path().to_path_buf())
+                        .collect();
                     let prepared_count = files.len();
-                    match build_request_for_files(&tool, files, facts)
+                    match build_request_for_files(&tool, files)
                         .and_then(|request| launch_request(request, owner_hwnd))
                     {
                         Ok(refresh) => {
@@ -2088,19 +1895,15 @@ impl crate::app::App {
             .unwrap_or_else(|| self.settings.global_preset.clone())
     }
 
-    /// 対象 1 件を「何を作るか」と「ツールへ何と伝えるか」の組へ落とす。
-    ///
-    /// facts はここでしか作れない。**書庫の元アーカイブも、ページ番号も、動画の再生位置も、
-    /// 実体化後の一時ファイルからは復元できない。**
+    /// 対象 1 件を「何を作るか」へ落とす。
     fn materialize_target(
         &self,
         tool: &ExternalTool,
         target: &LaunchTarget,
-    ) -> Result<ExternalMaterializeTarget, String> {
+    ) -> Result<crate::materializer::MaterializeRequest, String> {
         use crate::materializer::{MaterializeRequest, MaterializeSource, PageEditContext};
 
         let index = self.launch_target_item_index(target);
-        let facts = self.placeholder_facts_for_target(target, index);
         let (source, page_key, fallback_path) = match target {
             // 再生中の動画に「表示中のフレーム」が設定されているときだけ、動画ファイル
             // ではなくフレームを渡す。再生していなければ従来どおり動画ファイル
@@ -2151,7 +1954,7 @@ impl crate::app::App {
                 MaterializeSource::PdfPage {
                     pdf_path: pdf_path.clone(),
                     page_num: *page_num,
-                    password: self.pdf_current_password.clone(),
+                    password: self.pdf_open_password(pdf_path),
                 },
                 Some(crate::adjustment_db::zip_entry_key(
                     pdf_path,
@@ -2182,6 +1985,13 @@ impl crate::app::App {
             };
             PageEditContext {
                 page_key,
+                stage: self.settings.bake_stage_external_tool,
+                creative_lut: self
+                    .settings
+                    .bake_stage_external_tool
+                    .includes_display_adjust()
+                    .then(|| self.resolved_creative_lut(&params))
+                    .flatten(),
                 params,
                 conceal_preset: self.current_conceal_preset_from_settings(),
                 erase_mono_tolerance: self.settings.erase_inpaint_mono_tolerance,
@@ -2194,19 +2004,16 @@ impl crate::app::App {
                 load_page_params_from_db,
             }
         });
-        Ok(ExternalMaterializeTarget {
-            request: MaterializeRequest {
-                source,
-                policy: materialize_policy(tool.payload),
-                page_edits,
-                pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
-                    DEFAULT_PDF_RENDER_LONG_EDGE
-                } else {
-                    tool.pdf_render_long_edge
-                },
-                rendered_pixels: None,
+        Ok(MaterializeRequest {
+            source,
+            policy: materialize_policy(tool.payload),
+            page_edits,
+            pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
+                DEFAULT_PDF_RENDER_LONG_EDGE
+            } else {
+                tool.pdf_render_long_edge
             },
-            facts,
+            rendered_pixels: None,
         })
     }
 
@@ -2220,7 +2027,7 @@ impl crate::app::App {
         ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
-    ) -> Result<Option<Vec<ExternalMaterializeTarget>>, String> {
+    ) -> Result<Option<Vec<crate::materializer::MaterializeRequest>>, String> {
         if targets.len() != 1 {
             return Ok(None);
         }
@@ -2237,7 +2044,7 @@ impl crate::app::App {
         else {
             return Ok(None);
         };
-        match tool.spread {
+        match tool.effective_spread() {
             // 現在ページ 1 件。呼び出し側の従来経路をそのまま使う。
             SpreadPolicy::MainPageOnly => Ok(None),
             SpreadPolicy::BothPages => {
@@ -2266,7 +2073,7 @@ impl crate::app::App {
         tool: &ExternalTool,
         left: usize,
         right: usize,
-    ) -> Result<ExternalMaterializeTarget, String> {
+    ) -> Result<crate::materializer::MaterializeRequest, String> {
         use sha2::Digest as _;
 
         let export = self.prepare_spread_export_dialog_target(ctx, left, right)?;
@@ -2288,98 +2095,21 @@ impl crate::app::App {
         }
         let fingerprint: [u8; 32] = digest.finalize().into();
 
-        Ok(ExternalMaterializeTarget {
-            request: crate::materializer::MaterializeRequest {
-                source: crate::materializer::MaterializeSource::Rendered {
-                    label: export.basename.clone(),
-                    fingerprint,
-                },
-                policy: materialize_policy(tool.payload),
-                // 表示画素は補正も注釈も反映済み。ここから更に焼き込むものは無い。
-                page_edits: None,
-                pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
-                    DEFAULT_PDF_RENDER_LONG_EDGE
-                } else {
-                    tool.pdf_render_long_edge
-                },
-                rendered_pixels: Some(Arc::new(image.into_owned())),
+        Ok(crate::materializer::MaterializeRequest {
+            source: crate::materializer::MaterializeSource::Rendered {
+                label: export.basename.clone(),
+                fingerprint,
             },
-            // 合成物に固有のページ番号もエントリ名も無い。`{container}` は 2 ページが
-            // 属するもの — 左ページの側から取る。
-            facts: PlaceholderFacts {
-                container: self
-                    .placeholder_facts_for_target(
-                        &LaunchTarget::from_grid_item(self.items.get(left)),
-                        Some(left),
-                    )
-                    .container,
-                ..PlaceholderFacts::default()
+            policy: materialize_policy(tool.payload),
+            // 表示画素は補正も注釈も反映済み。ここから更に焼き込むものは無い。
+            page_edits: None,
+            pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
+                DEFAULT_PDF_RENDER_LONG_EDGE
+            } else {
+                tool.pdf_render_long_edge
             },
+            rendered_pixels: Some(Arc::new(image.into_owned())),
         })
-    }
-
-    fn placeholder_facts_for_target(
-        &self,
-        target: &LaunchTarget,
-        index: Option<usize>,
-    ) -> PlaceholderFacts {
-        match target {
-            LaunchTarget::RealFile(path) | LaunchTarget::ImagePage(path) => PlaceholderFacts {
-                container: Some(path.clone()),
-                // 実ファイルの動画を渡すとき、再生中ならその位置を伝える。
-                time_secs: self.external_tool_video_time_secs(path),
-                ..PlaceholderFacts::default()
-            },
-            LaunchTarget::ZipPage {
-                zip_path,
-                entry_name,
-            } => PlaceholderFacts {
-                container: Some(self.external_tool_visible_container(zip_path)),
-                entry: Some(entry_name.clone()),
-                // 書庫内の「ページ番号」は、その書庫を開いて見ているときの並び順でしか
-                // 意味を持たない。別フォルダーの検索結果などから渡した場合は付けない。
-                page: self
-                    .current_folder
-                    .as_deref()
-                    .filter(|current| crate::folder_tree::path_eq(zip_path, current))
-                    .and(index)
-                    .map(|index| index as u32 + 1),
-                time_secs: None,
-            },
-            LaunchTarget::PdfPage { pdf_path, page_num } => PlaceholderFacts {
-                container: Some(pdf_path.clone()),
-                entry: None,
-                page: Some(page_num.saturating_add(1)),
-                time_secs: None,
-            },
-            LaunchTarget::Stack(_)
-            | LaunchTarget::Virtual(_)
-            | LaunchTarget::Unsupported
-            | LaunchTarget::None => PlaceholderFacts::default(),
-        }
-    }
-
-    /// 利用者から見た書庫本体。変換アーカイブでは cache ZIP ではなく元の RAR / 7z / LZH。
-    fn external_tool_visible_container(&self, zip_path: &Path) -> PathBuf {
-        self.archive_source_override
-            .as_ref()
-            .filter(|_| {
-                self.current_folder
-                    .as_deref()
-                    .is_some_and(|current| crate::folder_tree::path_eq(zip_path, current))
-            })
-            .cloned()
-            .unwrap_or_else(|| zip_path.to_path_buf())
-    }
-
-    /// この対象がいま再生中の動画そのものなら、その再生位置 (秒)。
-    ///
-    /// `{time}` 用。**別プレイヤーへ「ここから再生して」と伝える値**なので、提示済み
-    /// フレームの PTS ではなく再生クロックの現在値を返す。
-    fn external_tool_video_time_secs(&self, path: &Path) -> Option<f64> {
-        let fs_idx = self.fullscreen_idx?;
-        let player = self.fs_video_player(fs_idx)?;
-        crate::folder_tree::path_eq(player.path(), path).then(|| player.position_secs())
     }
 
     /// この対象がいま再生中の動画そのもので、フレームを切り出せるなら、その時刻 (ミリ秒)。
@@ -2394,7 +2124,14 @@ impl crate::app::App {
             return None;
         }
         // クリップボードコピーと同じ「まだ開けていない / 壊れている」判定。
-        if player.error().is_some() || player.info().is_none() {
+        // **映像トラックの有無まで見る。** `RealFile` は音声ファイルも通るので、
+        // ここを緩めると音声を切り出そうとして "video stream not found" で失敗する。
+        // 音声はフレームを持たないので、従来どおりファイルそのものを渡すのが正しい
+        // (Codex Sol 指摘 #12)。
+        if player.error().is_some() {
+            return None;
+        }
+        if !player.info().is_some_and(|info| info.has_video) {
             return None;
         }
         let secs = player.screenshot_target_secs();
@@ -2485,6 +2222,8 @@ impl crate::app::App {
             );
             return;
         }
+        // ピッカーはグリッドのキー操作からしか開かない (= main の窓)。
+        self.external_tool_modal_viewport = egui::ViewportId::ROOT;
         self.external_tool_picker = Some(ExternalToolPickerRequest {
             targets,
             target_kind,
@@ -2559,6 +2298,8 @@ impl crate::app::App {
         targets: &[LaunchTarget],
         origin: MaterializeOperationOrigin,
     ) {
+        // 進捗 / 確認 modal は、利用者がこの操作をした窓が所有する。
+        self.external_tool_modal_viewport = ctx.viewport_id();
         let operation = match self.build_materialize_operation(ctx, tool, targets, origin) {
             Ok(operation) => operation,
             Err(error) => {
@@ -2576,10 +2317,13 @@ impl crate::app::App {
 
     pub(crate) fn start_open_with(
         &mut self,
+        ctx: &egui::Context,
         display_name: String,
         launch: ExternalToolLaunch,
         file: PathBuf,
     ) {
+        // ネットワーク EXE の確認 modal も、操作した窓が所有する。
+        self.external_tool_modal_viewport = ctx.viewport_id();
         let request = build_open_with_launch_request(display_name.clone(), launch, file);
         let operation = ExternalLaunchOperation {
             tool_name: display_name,
@@ -2734,7 +2478,7 @@ impl crate::app::App {
         }
     }
 
-    pub(crate) fn show_external_tool_launch_confirmation(&mut self, ctx: &egui::Context) {
+    fn show_external_tool_launch_confirmation(&mut self, ctx: &egui::Context) {
         let Some(confirmation) = self.external_tool_launch_confirmation.as_ref() else {
             return;
         };
@@ -2810,7 +2554,7 @@ impl crate::app::App {
             })
     }
 
-    pub(crate) fn show_external_tool_materialize_progress(&mut self, ctx: &egui::Context) {
+    fn show_external_tool_materialize_progress(&mut self, ctx: &egui::Context) {
         let Some(index) = self
             .external_tool_materialize_pending
             .iter()
@@ -2821,13 +2565,6 @@ impl crate::app::App {
         else {
             return;
         };
-        // 専用フルスクリーン viewport では main update の tail が飛ばないので、
-        // fs body と tail の両方がここへ来る。前に来た方 (= 前面の Context) に描かせ、
-        // もう片方は降りる。両方描くと同じ modal が 2 つの window に出る。
-        if self.external_tool_launch_ui_frame == Some(self.frame_counter) {
-            return;
-        }
-        self.external_tool_launch_ui_frame = Some(self.frame_counter);
         let (completed, total, stage) = self.external_tool_materialize_pending[index]
             .progress
             .snapshot();
@@ -2872,7 +2609,39 @@ impl crate::app::App {
         self.external_tool_materializer.shutdown();
     }
 
-    pub(crate) fn show_external_tool_picker(&mut self, ctx: &egui::Context) {
+    /// 外部ツールの modal 面をまとめて描く。**追加するときは必ずここへ足す。**
+    ///
+    /// 3 つとも `modal_dialog_block_reason` の対象なので、**描き漏らすと「ダイアログが
+    /// 無いのに入力だけ止まる」**になる。実際に進捗 modal だけを複製して、ピッカーと
+    /// 起動確認を落としていた (2026-09-02、Codex Sol の指摘)。
+    ///
+    /// 呼ぶ場所が 2 つあるのは、フルスクリーン中は main update の tail が飛ぶため
+    /// (`app.rs` の early return)。専用 viewport では両方通るので、**この frame で先に
+    /// 到達した方が描く**。frame 番号で持つのは、tail ごと飛ぶ frame があり bool では
+    /// clear する場所が無いから。
+    pub(crate) fn show_external_tool_modals(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.viewport_id();
+        if self.external_tool_launch_ui_frame == Some((viewport, self.frame_counter)) {
+            return;
+        }
+        self.external_tool_launch_ui_frame = Some((viewport, self.frame_counter));
+        let owner = self.external_tool_modal_viewport;
+        if viewport == owner {
+            self.external_tool_modal_owner_drawn_frame = Some(self.frame_counter);
+        }
+        if !external_tool_modal_viewport_draws(
+            viewport,
+            owner,
+            self.external_tool_modal_owner_drawn_frame == Some(self.frame_counter),
+        ) {
+            return;
+        }
+        self.show_external_tool_picker(ctx);
+        self.show_external_tool_launch_confirmation(ctx);
+        self.show_external_tool_materialize_progress(ctx);
+    }
+
+    fn show_external_tool_picker(&mut self, ctx: &egui::Context) {
         let Some(request) = self.external_tool_picker.as_ref() else {
             return;
         };
@@ -2995,7 +2764,7 @@ mod tests {
         let tool = ExternalTool::defaults_for_editing();
         assert_eq!(tool.payload, PayloadPolicy::OriginalFile);
         assert_eq!(tool.spread, SpreadPolicy::MainPageOnly);
-        assert_eq!(tool.arguments, "{file}");
+        assert_eq!(tool.arguments, "{files}");
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
 
@@ -3055,6 +2824,28 @@ mod tests {
             payload,
             ..ExternalTool::defaults_for_viewing()
         }
+    }
+
+    /// 「元のデータをそのまま」と「見開きを 1 枚に合成」は同時に成り立たない。
+    ///
+    /// 合成した 1 枚に対応する元のデータはどこにも無い。設定 UI は合成を出さないが、
+    /// 保存済みの設定に残っていても実行時に合成しないことを、同じ 1 つの規則で保証する
+    /// (Codex Sol 指摘 #4)。
+    #[test]
+    fn passing_the_original_bytes_rules_out_a_merged_spread() {
+        for payload in [PayloadPolicy::TempOriginal, PayloadPolicy::OriginalFile] {
+            let mut tool = menu_tool(1, "merge", payload);
+            tool.spread = SpreadPolicy::Merged;
+            assert_eq!(
+                tool.effective_spread(),
+                SpreadPolicy::MainPageOnly,
+                "{payload:?} で合成した PNG を作ってはいけない"
+            );
+        }
+
+        let mut tool = menu_tool(2, "merge", PayloadPolicy::TempEdited);
+        tool.spread = SpreadPolicy::Merged;
+        assert_eq!(tool.effective_spread(), SpreadPolicy::Merged);
     }
 
     #[test]
@@ -3238,10 +3029,110 @@ mod tests {
         );
     }
 
+    /// 外部ツールの modal は**単一の描き手**からしか描かない。
+    ///
+    /// 個々の `show_*` を別の場所から呼ぶと、その場所は frame 所有権の判定を通らないので
+    /// 二重描画するか、逆にフルスクリーンで描かれず「ダイアログが無いのに入力だけ止まる」
+    /// になる。実際に 3 つのうち 1 つだけ複製して 2 つを落としていた (2026-09-02)。
+    /// 目視のレビューでは 2 度取りこぼしたので、機械で見る。
+    #[test]
+    fn the_external_tool_modals_are_drawn_from_one_place_only() {
+        let source = include_str!("external_tool.rs");
+        let app = include_str!("app.rs");
+        let fullscreen = include_str!("ui_fullscreen.rs");
+
+        for name in [
+            "show_external_tool_picker",
+            "show_external_tool_launch_confirmation",
+            "show_external_tool_materialize_progress",
+        ] {
+            let call = format!("self.{name}(ctx)");
+            let inside_owner = source.matches(&call).count();
+            assert_eq!(
+                inside_owner, 1,
+                "{name} は show_external_tool_modals からの 1 回だけであること"
+            );
+            assert!(
+                !app.contains(&call) && !fullscreen.contains(&call),
+                "{name} が単一の描き手の外から呼ばれている"
+            );
+        }
+
+        let owner = "self.show_external_tool_modals(ctx)";
+        assert_eq!(
+            app.matches(owner).count() + fullscreen.matches(owner).count(),
+            3,
+            concat!(
+                "描き手は update_frame の tail / fullscreen body / ",
+                "`eframe::App::update` の取りこぼし拾いの 3 か所"
+            )
+        );
+    }
+
+    /// modal は「利用者がその操作をした窓」が描く。先着では決めない。
+    ///
+    /// viewer の viewport は main の tail より前に描くので、先着にすると背面の F12 窓が
+    /// main 由来の modal を攫い、前面の main は「ダイアログが無いのに入力だけ止まる」に
+    /// なる (Codex Sol 指摘 #3)。
+    #[test]
+    fn the_window_the_user_acted_in_owns_the_modal() {
+        let root = egui::ViewportId::ROOT;
+        let detached = egui::ViewportId::from_hash_of("detached-viewer");
+        let fullscreen = egui::ViewportId::from_hash_of("fullscreen");
+
+        // main 由来の要求: 先に描く背面 F12 窓は描かず、main が描く。
+        assert!(!external_tool_modal_viewport_draws(detached, root, false));
+        assert!(external_tool_modal_viewport_draws(root, root, false));
+
+        // F12 窓由来の要求: その窓が描き、main は肩代わりしない。
+        assert!(external_tool_modal_viewport_draws(
+            detached, detached, false
+        ));
+        assert!(!external_tool_modal_viewport_draws(root, detached, true));
+
+        // 所有 viewport が消えた frame (フルスクリーンを閉じる起動 / native 動画の早期
+        // return) は main が肩代わりする。しないと ACK が来ず、起動が永久に始まらない。
+        assert!(external_tool_modal_viewport_draws(root, fullscreen, false));
+        assert!(!external_tool_modal_viewport_draws(
+            detached, fullscreen, false
+        ));
+    }
+
+    /// `update_frame` が早期 return した frame でも、modal の描画と spawn 境界の ACK は
+    /// 落ちない。
+    ///
+    /// native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の 3 経路は、tail まで
+    /// 到達しない。フルスクリーンで動画へ移動しただけで準備中の要求が ACK されなくなり、
+    /// 動画を閉じるまで外部ツールが起動しない状態になっていた (Codex Sol 指摘 #2)。
+    #[test]
+    fn the_launch_boundary_is_acked_even_when_the_frame_body_returns_early() {
+        let app = include_str!("app.rs");
+        let wrapper = app
+            .split_once("self.update_frame(ctx, frame);")
+            .expect("`eframe::App::update` は本体を update_frame へ委譲すること")
+            .1;
+        let tail: String = wrapper.lines().take(20).collect::<Vec<_>>().join(
+            "
+",
+        );
+        assert!(
+            tail.contains("self.show_external_tool_modals(ctx);"),
+            "早期 return を飛び越える tail で modal を描いていない"
+        );
+        assert!(
+            tail.contains("self.authorize_external_tool_launch_boundaries_after_ui();"),
+            "早期 return を飛び越える tail で spawn 境界を ACK していない"
+        );
+    }
+
     /// supersede 済みの要求は進捗 modal に出ない。**入力ブロックも同じ述語から導く**ので、
     /// 「ダイアログが無いのにクリックが効かない」状態を作らない。
     ///
     /// この 2 つを別々の条件で書いていたのが実機の固着の一部だった (2026-09-02)。
+    ///
+    /// 前半 (準備中は入力が止まる) は、**世代をツールごとに分けない**根拠でもある。
+    /// 準備中に利用者が別のツールを起動する経路が無いので、準備中の要求は常に高々
+    /// 1 つ。ツール別の世代を持っても表せる状態は増えない (Codex Sol 指摘 #9)。
     #[test]
     fn a_superseded_materialize_request_blocks_no_input_because_it_draws_no_dialog() {
         let mut app = crate::app::setup_app_for_test();
@@ -3586,79 +3477,6 @@ mod tests {
         );
     }
 
-    fn facts_for_pdf_page(container: &str, page: u32) -> PlaceholderFacts {
-        PlaceholderFacts {
-            container: Some(PathBuf::from(container)),
-            entry: None,
-            page: Some(page),
-            time_secs: None,
-        }
-    }
-
-    /// Acrobat / SumatraPDF に「PDF 本体 + ページ番号」を渡す形。**一時 PNG のパスでは
-    /// ない**ので、実体化後のパスからは復元できない値になる。
-    #[test]
-    fn container_and_page_describe_the_source_not_the_materialized_file() {
-        let tokens = split_argument_template(r#"-page {page} "{container}" {file}"#);
-        let ctx = PlaceholderContext::with_facts(
-            PathBuf::from(r"C:\Temp\ext-1\page_003.png"),
-            facts_for_pdf_page(r"C:\Books\manual.pdf", 3),
-        );
-
-        assert_eq!(
-            expand_arguments(&tokens, &ctx),
-            vec![
-                OsString::from("-page"),
-                OsString::from("3"),
-                OsString::from(r"C:\Books\manual.pdf"),
-                OsString::from(r"C:\Temp\ext-1\page_003.png"),
-            ]
-        );
-    }
-
-    /// 対象が持っていない値は**そのトークンごと落ちる**。`-page` だけが残ると、受け取った
-    /// 側は引数の解釈に失敗する。
-    #[test]
-    fn a_target_without_a_page_drops_the_option_and_its_value_together() {
-        let tokens = split_argument_template(r#"-page {page} --at {time} "{file}""#);
-        let ctx = PlaceholderContext::with_facts(
-            PathBuf::from(r"C:\Images\photo.jpg"),
-            PlaceholderFacts {
-                container: Some(PathBuf::from(r"C:\Images\photo.jpg")),
-                ..PlaceholderFacts::default()
-            },
-        );
-
-        assert_eq!(
-            expand_arguments(&tokens, &ctx),
-            vec![OsString::from(r"C:\Images\photo.jpg")]
-        );
-    }
-
-    #[test]
-    fn zip_entry_name_and_video_time_reach_the_argument_list() {
-        let tokens = split_argument_template("{entry} {time} {time_ms} {time_hms}");
-        let ctx = PlaceholderContext::with_facts(
-            PathBuf::from(r"C:\Temp\ext-1\page.jpg"),
-            PlaceholderFacts {
-                container: Some(PathBuf::from(r"C:\Books\comic.zip")),
-                entry: Some("chapter1/page03.jpg".to_string()),
-                page: None,
-                time_secs: Some(83.4567),
-            },
-        );
-
-        assert_eq!(
-            expand_arguments(&tokens, &ctx),
-            vec![
-                OsString::from("chapter1/page03.jpg"),
-                OsString::from("83.457"),
-                OsString::from("83457"),
-                OsString::from("00:01:23.457"),
-            ]
-        );
-    }
-
     /// 右綴じ (画面の右が先のページ) でも、ツールが受け取る順は読み順。
     #[test]
     fn a_spread_is_handed_over_in_reading_order_not_screen_order() {
@@ -3668,76 +3486,48 @@ mod tests {
     }
 
     #[test]
-    fn hms_carries_into_hours_and_never_goes_negative() {
-        assert_eq!(format_hms(0.0), "00:00:00.000");
-        assert_eq!(format_hms(-5.0), "00:00:00.000");
-        assert_eq!(format_hms(59.9995), "00:01:00.000");
-        assert_eq!(format_hms(3661.5), "01:01:01.500");
-    }
-
-    #[test]
     fn split_argument_template_handles_whitespace_quotes_and_escapes() {
         assert_eq!(
             split_argument_template(r#"  --mode edit   "two words" tail  "#),
-            ["--mode", "edit", "two words", "tail", "{file}"]
+            ["--mode", "edit", "two words", "tail", "{files}"]
         );
         assert_eq!(
             split_argument_template(r#""a""b" "c\\\"d" "#),
-            ["a\"b", "c\\\"d", "{file}"]
+            ["a\"b", "c\\\"d", "{files}"]
         );
-        assert_eq!(split_argument_template(r#""""#), ["", "{file}"]);
+        assert_eq!(split_argument_template(r#""""#), ["", "{files}"]);
         assert_eq!(
             split_argument_template(r#""unterminated value"#),
-            ["unterminated value", "{file}"]
+            ["unterminated value", "{files}"]
         );
     }
 
+    /// `{files}` が既にあれば足さない。無ければ足す。
+    ///
+    /// 知らない記法は「使える値」ではないので、あっても `{files}` を足す。
+    /// これが無いと、書き間違えたテンプレートがファイルを渡さないまま起動する。
     #[test]
-    fn split_does_not_append_file_when_a_known_keyword_exists() {
+    fn the_file_is_appended_unless_the_template_already_asks_for_it() {
+        // `{file}` は読み込み時点で `{files}` へ揃える (綴りは 1 つ)。
         assert_eq!(
             split_argument_template("--input={file}"),
-            ["--input={file}"]
+            ["--input={files}"]
         );
-        assert_eq!(split_argument_template("-page {page}"), ["-page", "{page}"]);
-    }
-
-    #[test]
-    fn expand_arguments_supports_every_p1_placeholder_without_loss_of_boundaries() {
-        let ctx = PlaceholderContext::for_file(r"C:\My Images\photo.final.JPG");
-        let tokens = vec![
-            "{file}".into(),
-            "{dir}".into(),
-            "{name}".into(),
-            "{stem}".into(),
-            "{ext}".into(),
-            "{uri}".into(),
-        ];
         assert_eq!(
-            expand_arguments(&tokens, &ctx),
-            vec![
-                OsString::from(r"C:\My Images\photo.final.JPG"),
-                OsString::from(r"C:\My Images"),
-                OsString::from("photo.final.JPG"),
-                OsString::from("photo.final"),
-                OsString::from("JPG"),
-                OsString::from("file:///C:/My%20Images/photo.final.JPG"),
-            ]
+            split_argument_template("--input={files}"),
+            ["--input={files}"]
+        );
+        assert_eq!(
+            split_argument_template("--out {stem}.png"),
+            ["--out", "{stem}.png", "{files}"]
         );
     }
-
-    #[test]
-    fn expand_drops_empty_placeholder_tokens_and_their_option() {
-        let ctx = PlaceholderContext::for_file(r"C:\image");
-        let tokens = split_argument_template("-page {page} --entry={entry} literal");
-        assert_eq!(expand_arguments(&tokens, &ctx), [OsString::from("literal")]);
-    }
-
     #[test]
     fn expand_preserves_unknown_braces_and_adds_file_when_no_keyword_exists() {
-        let ctx = PlaceholderContext::for_file(r"C:\space dir\image.png");
+        let file = Path::new(r"C:\space dir\image.png");
         let tokens = split_argument_template("--pattern={unknown}");
         assert_eq!(
-            expand_arguments(&tokens, &ctx),
+            expand_arguments(&tokens, file),
             [
                 OsString::from("--pattern={unknown}"),
                 OsString::from(r"C:\space dir\image.png")
@@ -3747,40 +3537,25 @@ mod tests {
 
     #[test]
     fn replacement_with_spaces_remains_one_argument() {
-        let ctx = PlaceholderContext::for_file(r"C:\space dir\image.png");
-        let tokens = split_argument_template("--input={file}");
+        let file = Path::new(r"C:\space dir\image.png");
+        let tokens = split_argument_template("--input={files}");
         assert_eq!(
-            expand_arguments(&tokens, &ctx),
+            expand_arguments(&tokens, file),
             [OsString::from(r"--input=C:\space dir\image.png")]
         );
     }
 
     #[test]
     fn files_placeholder_expands_one_token_to_distinct_os_arguments() {
-        let contexts = [
-            PlaceholderContext::for_file(r"C:\space dir\one.png"),
-            PlaceholderContext::for_file(r"D:\other dir\two.png"),
+        let files = [
+            PathBuf::from(r"C:\space dir\one.png"),
+            PathBuf::from(r"D:\other dir\two.png"),
         ];
         assert_eq!(
-            expand_arguments_for_files(&["--input={files}".to_string()], &contexts),
+            expand_arguments_for_files(&["--input={files}".to_string()], &files),
             [
                 OsString::from(r"--input=C:\space dir\one.png"),
                 OsString::from(r"--input=D:\other dir\two.png"),
-            ]
-        );
-    }
-
-    #[test]
-    fn files_placeholder_keeps_other_placeholders_on_the_primary_target() {
-        let contexts = [
-            PlaceholderContext::for_file(r"C:\images\first one.jpg"),
-            PlaceholderContext::for_file(r"D:\other\second.png"),
-        ];
-        assert_eq!(
-            expand_arguments_for_files(&["--pair={file}:{files}".to_string()], &contexts),
-            [
-                OsString::from(r"--pair=C:\images\first one.jpg:C:\images\first one.jpg"),
-                OsString::from(r"--pair=C:\images\first one.jpg:D:\other\second.png"),
             ]
         );
     }
@@ -3910,11 +3685,61 @@ mod tests {
             ]
         );
 
+        // 綴りは 1 つなので、`{file}` と書いても「まとめて渡す」で動く。
         tool.arguments = "--input {file}".to_string();
-        assert!(
-            build_launch_operation(&tool, &targets)
-                .unwrap_err()
-                .contains("{files}")
+        let spelled_singular = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(
+            spelled_singular.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png"),
+                OsString::from(r"C:\Images\1.png"),
+            ]
+        );
+    }
+
+    /// 渡すファイルの綴りは `{files}` 1 つ。**複数選択を切り替えても引数は書き直さない。**
+    ///
+    /// 以前は「1 件ずつ」= `{file}` /「まとめて渡す」= `{files}` と綴りが分かれており、
+    /// 切り替えるたびに引数テンプレートを直す必要があった (2026-09-02 利用者判断で統合)。
+    #[test]
+    fn the_same_template_serves_one_at_a_time_and_all_at_once() {
+        let targets = [
+            LaunchTarget::RealFile(PathBuf::from(r"C:\Images\0.png")),
+            LaunchTarget::RealFile(PathBuf::from(r"C:\Images\1.png")),
+        ];
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        tool.arguments = "--input {files}".to_string();
+
+        tool.selection = SelectionPolicy::Each;
+        let each = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(each.requests.len(), 2);
+        assert_eq!(
+            each.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png")
+            ]
+        );
+        assert_eq!(
+            each.requests[1].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\1.png")
+            ]
+        );
+
+        tool.selection = SelectionPolicy::Batch;
+        let batch = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(batch.requests.len(), 1);
+        assert_eq!(
+            batch.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png"),
+                OsString::from(r"C:\Images\1.png"),
+            ]
         );
     }
 
@@ -4212,10 +4037,7 @@ mod tests {
             b'p' as u16,
         ];
         let path = PathBuf::from(OsString::from_wide(&raw));
-        let arguments = expand_arguments(
-            &["{file}".to_string()],
-            &PlaceholderContext::for_file(&path),
-        );
+        let arguments = expand_arguments(&["{files}".to_string()], &path);
         assert_eq!(arguments[0].encode_wide().collect::<Vec<_>>(), raw.to_vec());
     }
 }

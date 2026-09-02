@@ -11776,13 +11776,25 @@ pub struct App {
     pub(crate) external_tool_materializer: crate::materializer::Materializer,
     pub(crate) external_tool_materialize_pending:
         Vec<crate::external_tool::ExternalMaterializePending>,
-    /// 準備進捗 modal を**この frame で既に描いた** frame 番号。
+    /// 外部ツールの modal を**この frame で既に描いた** (viewport, frame 番号)。
     ///
-    /// 描き手は 1 人でよいが、その 1 人は frame ごとに変わる。フルスクリーン中は
-    /// `render_fs_body` が前面の Context へ描き、そうでなければ main update の tail が描く。
+    /// 同じ viewport の二度描きだけを止める。別 viewport からの呼び出しは
+    /// `external_tool_modal_viewport` の所有権で弾くので、ここでは弾かない。
     /// `bool` では持てない: embedded フルスクリーンの frame は tail ごと飛ぶので
     /// (`app.rs` の early return)、clear する場所が無い frame ができて次の frame へ残る。
-    pub(crate) external_tool_launch_ui_frame: Option<u64>,
+    pub(crate) external_tool_launch_ui_frame: Option<(egui::ViewportId, u64)>,
+    /// 外部ツールの modal を**所有する viewport** = 利用者がその操作をした窓。
+    ///
+    /// frame 番号だけで先着を決めると、背面の F12 窓が main 由来の modal を先取りし、
+    /// 前面の main は「ダイアログが無いのに入力だけ止まる」になる (Codex Sol 指摘 #3)。
+    /// viewer の viewport は main の tail より前に描くので、先着では必ず負ける。
+    pub(crate) external_tool_modal_viewport: egui::ViewportId,
+    /// 所有 viewport が実際に描いた frame 番号。
+    ///
+    /// 所有 viewport は消えることがある (フルスクリーンを閉じる context menu 起動、
+    /// native 動画の早期 return)。その frame は main が肩代わりして描く。main の tail は
+    /// 全 viewer viewport より後なので、この 1 個で「所有者が描かなかった」が判る。
+    pub(crate) external_tool_modal_owner_drawn_frame: Option<u64>,
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_launch_confirmation:
         Option<crate::external_tool::ExternalLaunchConfirmation>,
@@ -14369,6 +14381,8 @@ impl App {
             external_tool_materializer: crate::materializer::Materializer::new(),
             external_tool_materialize_pending: Vec::new(),
             external_tool_launch_ui_frame: None,
+            external_tool_modal_viewport: egui::ViewportId::ROOT,
+            external_tool_modal_owner_drawn_frame: None,
             external_tool_launch_confirmation: None,
             external_tool_picker: None,
             cached_nav_indices: None,
@@ -22501,6 +22515,18 @@ impl App {
     /// ワーカーにページ列挙リクエストを送り、即座に return する。
     /// 結果は `poll_pdf_enumerate` が次フレーム以降にポーリングして処理する。
     /// パスワード付き PDF の場合はダイアログで入力を求める。
+    /// この PDF を開くためのパスワード。**保存済み優先、無ければセッション値。**
+    ///
+    /// セッション値 (`pdf_current_password`) をそのまま使うと、いま開いている PDF の
+    /// パスワードを別の PDF へ渡すことになる。逆にセッション値を捨てると、利用者が
+    /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
+    /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
+    pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
+        self.pdf_passwords
+            .get(pdf_path)
+            .or_else(|| self.pdf_current_password.clone())
+    }
+
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -22560,9 +22586,7 @@ impl App {
         // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
         // しないため)。
         let saved_password: Option<String> = self.pdf_passwords.get(&pdf_path);
-        let password: Option<String> = saved_password
-            .clone()
-            .or_else(|| self.pdf_current_password.clone());
+        let password: Option<String> = self.pdf_open_password(&pdf_path);
         if previous_pdf_enumerate
             .as_ref()
             .is_some_and(|(_, previous_password, _)| previous_password != &password)
@@ -53645,13 +53669,7 @@ impl App {
                 continue;
             }
             let params = self.effective_params(idx).clone();
-            let creative_lut = (!params.creative_lut.is_identity())
-                .then(|| {
-                    self.creative_lut_library
-                        .get(params.creative_lut.id)
-                        .map(|lut| (lut, params.creative_lut.strength))
-                })
-                .flatten();
+            let creative_lut = self.resolved_creative_lut(&params);
             if !params.colorize.is_enabled() && creative_lut.is_none() {
                 continue;
             }
@@ -58920,6 +58938,23 @@ impl App {
         };
         let _ = self.spawn_final_effect_job(ctx, key, source, plan, output_complete, false);
         existing_texture
+    }
+
+    /// 選択されている Creative LUT を実体へ解決する。
+    ///
+    /// **選択 ID から実体を引けるのは登録済みライブラリを持つ側だけ。** 表示側も焼き込み側も
+    /// ここを通し、同じ「未選択なら None」の判定を 2 か所に書かない。
+    pub(crate) fn resolved_creative_lut(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<(crate::creative_lut::SharedCreativeLut, f32)> {
+        (!params.creative_lut.is_identity())
+            .then(|| {
+                self.creative_lut_library
+                    .get(params.creative_lut.id)
+                    .map(|lut| (lut, params.creative_lut.strength))
+            })
+            .flatten()
     }
 
     pub(crate) fn creative_lut_requires_final_effect(
@@ -66841,25 +66876,12 @@ impl App {
 // eframe::App 実装
 // -----------------------------------------------------------------------
 
-impl eframe::App for App {
-    /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
+impl App {
+    /// [`eframe::App::update`] の本体。
     ///
-    /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。
-    /// 通常フレームはパネルが全面を覆うので不可視だが、detached top-level HWND の close /
-    /// DWM 再合成や fullscreen navigation の描画 gap ではこのクリア色が見える。near-black 固定だと
-    /// ダークテーマでは地 (panel_fill) と馴染むが、**ライトテーマでは「一瞬黒」が目立つ**
-    /// (例: PDF を auto-fullscreen で開いて Esc → 親フォルダ再読込で 1 フレーム blank)。
-    ///
-    /// テーマのパネル背景 (= メニューバー背景) に合わせると、ライト/ダークどちらでも
-    /// 地と馴染んでちらつきが目立たなくなる。top-level HWND teardown の再合成自体は
-    /// 消さない表示緩和であり、font atlas の正しさとは独立している。
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        // eframe 既定の alpha=180 は transparent() 有効時用なので踏襲せず、不透明の
-        // パネル背景色を返す (純ロジックは free fn 化して unit test で回帰ガード)。
-        main_window_clear_color(visuals)
-    }
-
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
+    /// 呼び出し側 (`update`) へ置く。
+    fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
@@ -68163,9 +68185,7 @@ impl eframe::App for App {
         self.show_first_setup_dialog(ctx);
         self.show_mouse_nav_migration_prompt_dialog(ctx);
         self.show_preferences_dialog(ctx);
-        self.show_external_tool_picker(ctx);
-        self.show_external_tool_launch_confirmation(ctx);
-        self.show_external_tool_materialize_progress(ctx);
+        self.show_external_tool_modals(ctx);
         self.show_operation_customize_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
@@ -69349,13 +69369,46 @@ impl eframe::App for App {
         // UI checkpoint 未通過なので次 frame まで ACK されない。
         self.authorize_external_tool_launch_boundaries_after_ui();
     }
+}
+
+impl eframe::App for App {
+    /// メインウィンドウ surface のクリア色 (= egui が何も描かなかったフレームで見える色)。
+    ///
+    /// eframe 既定は near-black `(12,12,12, a=180)` 固定 ([eframe epi.rs] `clear_color`)。
+    /// 通常フレームはパネルが全面を覆うので不可視だが、detached top-level HWND の close /
+    /// DWM 再合成や fullscreen navigation の描画 gap ではこのクリア色が見える。near-black 固定だと
+    /// ダークテーマでは地 (panel_fill) と馴染むが、**ライトテーマでは「一瞬黒」が目立つ**
+    /// (例: PDF を auto-fullscreen で開いて Esc → 親フォルダ再読込で 1 フレーム blank)。
+    ///
+    /// テーマのパネル背景 (= メニューバー背景) に合わせると、ライト/ダークどちらでも
+    /// 地と馴染んでちらつきが目立たなくなる。top-level HWND teardown の再合成自体は
+    /// 消さない表示緩和であり、font atlas の正しさとは独立している。
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // eframe 既定の alpha=180 は transparent() 有効時用なので踏襲せず、不透明の
+        // パネル背景色を返す (純ロジックは free fn 化して unit test で回帰ガード)。
+        main_window_clear_color(visuals)
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.update_frame(ctx, frame);
+        // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
+        // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
+        // ACK も落ちるので、**早期 return では飛ばせないここ**で拾う。
+        //
+        // 落とすと、準備中の要求を抱えたままフルスクリーンで動画へ移動した利用者は、
+        // 動画を閉じるまで外部ツールが起動しない (Codex Sol 指摘 #2)。
+        if self.external_tool_launch_ui_frame != Some((egui::ViewportId::ROOT, self.frame_counter))
+        {
+            self.show_external_tool_modals(ctx);
+            self.authorize_external_tool_launch_boundaries_after_ui();
+        }
+    }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::on_app_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
-        // ここで helper メソッド群を逃がす都合上 update と on_exit の間に
-        // `impl App` ブロックを開く)。
+        // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         self.on_exit_inner();
     }
 }

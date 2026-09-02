@@ -63873,6 +63873,33 @@ fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
     assert_eq!(target.pdf_password_revision, Some(1));
 }
 
+/// 開く経路と外部ツールの実体化は、**同じ順序**でパスワードを解決する。
+///
+/// 実体化はセッション値だけを見ていた。保存済みパスワードのある別の PDF を選ぶと、
+/// アプリでは開けるのに実体化だけ失敗するか、別 PDF のパスワードを試していた
+/// (Codex Sol 指摘 #10)。
+#[test]
+#[cfg(windows)]
+fn the_saved_password_wins_over_the_password_of_the_pdf_that_happens_to_be_open() {
+    let mut app = phase_c_support::setup_app();
+    app.pdf_passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+    let open_pdf = std::path::PathBuf::from(r"C:\books\open.pdf");
+    let other_pdf = std::path::PathBuf::from(r"C:\books\other.pdf");
+    app.pdf_current_password = Some("session-of-open".to_string());
+    app.pdf_passwords.set(&other_pdf, "saved-of-other");
+
+    assert_eq!(
+        app.pdf_open_password(&other_pdf).as_deref(),
+        Some("saved-of-other"),
+        "別 PDF には、いま開いている PDF のセッションパスワードではなく保存済みを使う"
+    );
+    assert_eq!(
+        app.pdf_open_password(&open_pdf).as_deref(),
+        Some("session-of-open"),
+        "保存していない PDF は、セッション値で開けなくならない"
+    );
+}
+
 #[test]
 fn page_count_only_target_is_staged_unless_explicitly_allowed() {
     let mut app = phase_c_support::setup_app();

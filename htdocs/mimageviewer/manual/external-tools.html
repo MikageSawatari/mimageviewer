@@ -168,25 +168,18 @@
     <p>ツールごとに「確認なしで起動する上限」と「起動する対象件数の上限」を決められます。重いアプリには小さめの値を入れておくと、うっかり大量に起動するのを防げます。</p>
 
     <h2 id="arguments">引数を書く</h2>
-    <p>実行ファイルを直接登録したツールでは、引数を自分で書けます。次の記法が使えます。</p>
+    <p>実行ファイルを直接登録したツールでは、引数を自分で書けます。</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr><th>記法</th><th>展開されるもの</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>{file}</code></td><td>渡すファイルのパス。何も書かないときはこれが 1 つ付きます</td></tr>
-          <tr><td><code>{files}</code></td><td>対象すべて。「まとめて渡す」のときに使います</td></tr>
-          <tr><td><code>{dir}</code> / <code>{name}</code> / <code>{stem}</code> / <code>{ext}</code></td><td>親フォルダー / ファイル名 / 拡張子なしの名前 / 拡張子</td></tr>
-          <tr><td><code>{container}</code></td><td>圧縮ファイル / PDF / 動画そのもののパス。実ファイルならそれ自身</td></tr>
-          <tr><td><code>{entry}</code></td><td>圧縮ファイル内での名前</td></tr>
-          <tr><td><code>{page}</code></td><td>ページ番号（1 から数えます）</td></tr>
-          <tr><td><code>{time}</code> / <code>{time_ms}</code> / <code>{time_hms}</code></td><td>動画の再生位置。秒 / ミリ秒 / <code>00:01:23.456</code></td></tr>
-          <tr><td><code>{uri}</code></td><td><code>{file}</code> を URI 形式にしたもの</td></tr>
+          <tr><td><code>{files}</code></td><td>渡すファイルのパス。「1 件ずつ」なら 1 つ、「まとめて渡す」なら選んだ数だけ並びます。何も書かないときはこれが 1 つ付きます</td></tr>
         </tbody>
       </table>
     </div>
-    <p>対象が持っていない値は、その部分を含む引数ごと取り除きます。<code>-page {page}</code> と書いてページ番号のない画像を渡しても、<code>-page</code> だけが残ることはありません。</p>
+    <p>引数は書いたとおりに渡ります。<code>{}</code> で囲んだ文字のうち、上の表にないものはそのまま残ります。</p>
     <p>引数に空白を含む値が入っても壊れないので、引用符を自分で書く必要はありません。設定画面には、いまの対象で実際に渡される引数のプレビューが出ます。</p>
     <p>Windows の関連付けで開くツールでは、引数と作業フォルダーは指定できません。どう開くかは Windows 側が決めるためです。</p>
 

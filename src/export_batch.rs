@@ -187,6 +187,9 @@ mod tests {
                 crop_legacy_writeback: None,
                 format: crate::capture::CaptureFormat::Png,
                 jpeg_matte: crate::capture::JpegMatte::Black,
+                stage: crate::bake_stage::BakeStage::default(),
+                creative_lut: None,
+                ai: None,
             },
         }
     }

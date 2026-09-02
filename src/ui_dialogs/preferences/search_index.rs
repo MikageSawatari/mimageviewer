@@ -253,6 +253,22 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["保存場所", "出力先", "directory", "capture"]
     ),
     entry!(
+        "bake-stage/matrix",
+        BakeStage,
+        "書き出しの焼き込み",
+        [
+            "製本",
+            "エクスポート",
+            "外部ツール",
+            "AI アップスケール",
+            "カラー化",
+            "ポストフィルタ",
+            "スマートシャープ",
+            "LUT",
+            "どこまで"
+        ]
+    ),
+    entry!(
         "lut/manage",
         CreativeLut,
         ".cube LUTを追加…",

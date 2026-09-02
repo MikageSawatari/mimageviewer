@@ -3314,7 +3314,7 @@ mod local_adjust_fold_audit {
 
     /// キー編集セッションの無操作判定は、**グリッド描画より前**で回る。
     ///
-    /// `App::update` は in-window フルスクリーンのとき `embedded_fs_active` gate で
+    /// `App::update_frame` は in-window フルスクリーンのとき `embedded_fs_active` gate で
     /// 無条件に return する。そこより後ろに置くと、補正を編集している最中は一度も
     /// 走らない — つまり本番のいちばん普通の経路で効かない (2026-08-31 Codex P1)。
     /// 到達可能性は実行時テストでは見えないので、位置をソースで固定する。
@@ -3322,15 +3322,15 @@ mod local_adjust_fold_audit {
     fn the_key_run_settle_runs_before_the_embedded_fullscreen_early_return() {
         let source = std::fs::read_to_string("src/app.rs").unwrap();
         let update = source
-            .split("fn update(&mut self, ctx: &egui::Context")
+            .split("fn update_frame(&mut self, ctx: &egui::Context")
             .nth(1)
-            .expect("App::update が見つからない");
+            .expect("App::update_frame が見つからない");
         let settle = update
             .find("self.settle_local_adjust_shape_key_edit()")
-            .expect("無操作判定が `App::update` から呼ばれていない");
+            .expect("無操作判定が `App::update_frame` から呼ばれていない");
         let poll = update
             .find("self.poll_local_adjust_write_results()")
-            .expect("保存結果の回収が `App::update` から呼ばれていない");
+            .expect("保存結果の回収が `App::update_frame` から呼ばれていない");
         let gate = update
             .find("if embedded_fs_active || embedded_fs_pending {")
             .expect("in-window フルスクリーンの gate が見つからない");

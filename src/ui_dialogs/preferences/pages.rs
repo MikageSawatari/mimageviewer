@@ -730,29 +730,31 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             ui.end_row();
 
             ui.label("渡すもの");
-            enum_combo(
-                ui,
-                "external_tool_payload",
-                &mut tool.payload,
-                &[
-                    (
-                        crate::external_tool::PayloadPolicy::TempEdited,
-                        "一時ファイル (編集を反映)",
-                    ),
-                    (
-                        crate::external_tool::PayloadPolicy::TempOriginal,
-                        "一時ファイル (編集前)",
-                    ),
-                    (
-                        crate::external_tool::PayloadPolicy::OriginalFile,
-                        "元のファイル",
-                    ),
-                ],
-            );
+            let payload_options = [
+                (
+                    crate::external_tool::PayloadPolicy::TempEdited,
+                    "一時ファイル (編集を反映)",
+                ),
+                (
+                    crate::external_tool::PayloadPolicy::TempOriginal,
+                    "一時ファイル (編集前)",
+                ),
+                (
+                    crate::external_tool::PayloadPolicy::OriginalFile,
+                    "元のファイル",
+                ),
+            ];
+            enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options);
             ui.end_row();
 
             let passes_real_file =
                 tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;
+            // 合成した見開きに対応する「元のデータ」は存在しない。元バイト列を渡す
+            // 2 つでは合成を選べない。既に選ばれていたら**書き戻して**落とす —
+            // 残すと UI に無い値が保存されたままになり、実行時だけ合成が起きる
+            // (Codex Sol 指摘 #4)。
+            let passes_original_bytes = tool.payload.passes_original_bytes();
+            tool.spread = tool.effective_spread();
             ui.label("");
             ui.add(
                 egui::Label::new(
@@ -760,8 +762,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                         crate::external_tool::PayloadPolicy::TempEdited => concat!(
                             "補正・回転・注釈・消しゴムなど、このページに加えた編集を反映した ",
                             "PNG を一時ファイルへ書き出します。元のファイルは変わりません。",
-                            "カラー化・LUT・ポストフィルタ・スマートシャープ・AI 拡大は表示専用のため、",
-                            "製本と同じく反映しません。",
+                            "AI 処理・カラー化・LUT・ポストフィルタ・スマートシャープを",
+                            "どこまで焼き込むかは「書き出しの焼き込み」で選べます (既定は編集まで)。",
                         ),
                         crate::external_tool::PayloadPolicy::TempOriginal => concat!(
                             "編集を反映せず、元のデータをそのまま一時ファイルへ書き出します。",
@@ -823,8 +825,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui,
                 "external_tool_spread",
                 &mut tool.spread,
-                if passes_real_file {
-                    // 合成した見開きに対応する元ファイルは存在しない。
+                if passes_original_bytes {
+                    // 合成した見開きに対応する元のデータは存在しない。
                     &[
                         (crate::external_tool::SpreadPolicy::BothPages, "両ページ"),
                         (
@@ -844,6 +846,21 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 },
             );
             ui.end_row();
+
+            if tool.spread == crate::external_tool::SpreadPolicy::Merged {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(concat!(
+                            "合成は、画面に見えている見開きをそのまま 1 枚の PNG にします。",
+                            "「書き出しの焼き込み」の段はこの 1 枚には適用されません。",
+                        ))
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
 
             ui.label("複数選択");
             enum_combo(
@@ -954,22 +971,19 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
-        ui.label("{file}  {files}  {dir}  {name}  {stem}  {ext}  {uri}");
-        ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
+        ui.label(egui::RichText::new("{files}").strong());
         ui.add(
             egui::Label::new(
                 egui::RichText::new(concat!(
-                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
-                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。",
-                    "対象が持っていない値は、そのトークンごと引数から取り除きます。",
+                    "渡すファイルのパスに置き換わります。「1 件ずつ」なら 1 つ、",
+                    "「まとめて渡す」なら選んだ数だけ並びます。",
+                    "何も書かないときは {files} が 1 つ付きます。",
                 ))
                 .weak(),
             )
             .wrap(),
         );
     }
-
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
     // (環境設定を開いているだけで plan 行が毎フレーム流れ、実際の起動が埋もれる)。
@@ -1576,6 +1590,104 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .color(hint),
         );
     });
+}
+
+/// 出力ごとに「どこまで焼くか」を選ぶ表。
+///
+/// **1 か所にまとめて置く。** この設定の値は「製本と Ctrl+E で何が違うか」が見えることに
+/// あるので、各機能のページへ散らすと比べられなくなる。
+///
+/// 行ごとに 1 つだけ選ぶ (radio)。段は積み上げなので、**選んだ段までが塗られる**見せ方に
+/// する。チェックボックスの表にすると「AI だけ入れて編集は外す」を作ろうとさせてしまう。
+pub(super) fn page_bake_stage(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "bake-stage/matrix", page_bake_stage_body);
+}
+
+fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::bake_stage::BakeStage;
+
+    ui.heading("書き出しの焼き込み");
+    ui.add(
+        egui::Label::new(concat!(
+            "画像をファイルへ出すとき、どこまで反映するかを出力ごとに選びます。",
+            "右の段ほど多くを焼き込みます。",
+        ))
+        .wrap(),
+    );
+    ui.add_space(8.0);
+
+    let rows: [(
+        &str,
+        fn(&mut crate::settings::Settings) -> &mut BakeStage,
+        &str,
+    ); 4] = [
+        ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
+        (
+            "エクスポート (1 枚)",
+            |s| &mut s.bake_stage_export,
+            "フルスクリーンの Ctrl+E",
+        ),
+        (
+            "エクスポート (まとめて)",
+            |s| &mut s.bake_stage_export_batch,
+            "一覧で選んでの Ctrl+E",
+        ),
+        (
+            "外部ツール",
+            |s| &mut s.bake_stage_external_tool,
+            "別のアプリへ渡す一時ファイル",
+        ),
+    ];
+
+    egui::Grid::new("bake_stage_matrix")
+        .num_columns(4)
+        .spacing([18.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("");
+            for stage in BakeStage::ALL {
+                ui.label(egui::RichText::new(stage.label()).strong());
+            }
+            ui.end_row();
+
+            for (name, field, hint) in rows {
+                ui.label(name).on_hover_text(hint);
+                let current = *field(&mut state.settings);
+                for stage in BakeStage::ALL {
+                    // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
+                    let included = stage <= current;
+                    let mut selected = included;
+                    if ui.checkbox(&mut selected, "").clicked() {
+                        *field(&mut state.settings) = stage;
+                    }
+                }
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(concat!(
+                "編集 = 補正・回転・注釈・消しゴム・隠蔽・切り取り。",
+                "AI 処理 = AI アップスケールとノイズ除去。",
+                "表示用補正 = スマートシャープ・カラー化・LUT・ポストフィルタ。",
+            ))
+            .weak(),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(concat!(
+                "後から別のソフトで加工するなら、浅い段のほうが扱いやすくなります。",
+                "そのまま見せる画像を作るなら、深い段が画面に近くなります。",
+            ))
+            .weak(),
+        )
+        .wrap(),
+    );
 }
 
 pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {

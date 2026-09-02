@@ -16683,7 +16683,7 @@ impl App {
                 // tail の手前で early return するので (app.rs の「会計はここで出す」参照)、
                 // embedded でも tail は走らない。実機では embedded=true のまま
                 // 進捗 modal が入力を掴んで固まった (2026-09-02)。
-                self.show_external_tool_materialize_progress(ctx);
+                self.show_external_tool_modals(ctx);
                 self.authorize_external_tool_launch_boundaries_after_ui();
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
@@ -34552,6 +34552,7 @@ impl App {
             self.local_adjust_page_keys.contains(&key),
             self.comic_page_keys.contains(&key),
             has_export_crop,
+            self.settings.bake_stage_book,
         );
         if !needs_composite {
             Ok(crate::books::BookPageSource::File {
@@ -34559,7 +34560,13 @@ impl App {
                 original_name,
             })
         } else {
-            let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+            let edits = self.book_baked_edit_snapshot(
+                &key,
+                None,
+                params,
+                rotation,
+                self.settings.bake_stage_book,
+            )?;
             let basename = std::path::Path::new(&original_name)
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -34612,12 +34619,15 @@ impl App {
         }
     }
 
+    /// `stage` は**呼び出し側が渡す**。同じ builder を製本と一括エクスポートが共有しており、
+    /// 出力ごとに欲しい段が違うため (製本 = 編集まで / Ctrl+E = 表示用補正まで が既定)。
     fn book_baked_edit_snapshot(
         &mut self,
         key: &str,
         idx: Option<usize>,
         params: crate::adjustment::AdjustParams,
         rotation: crate::rotation_db::Rotation,
+        stage: crate::bake_stage::BakeStage,
     ) -> Result<crate::books::BakedEditSnapshot, String> {
         let has_conceal = self.conceal_page_keys.contains(key);
         let has_erase = self.mask_page_keys.contains(key);
@@ -34750,6 +34760,11 @@ impl App {
             crate::books::BookEraseSnapshot { mask, run }
         });
 
+        // `params` は下でムーブするので、解決はその前に済ませる。
+        let creative_lut = stage
+            .includes_display_adjust()
+            .then(|| self.resolved_creative_lut(&params))
+            .flatten();
         Ok(crate::books::BakedEditSnapshot {
             params,
             rotation,
@@ -34764,6 +34779,12 @@ impl App {
             jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                 self.fs_transparent_bg_mode,
             ),
+            stage,
+            // 表示用補正まで焼くときだけ解決する。選択 ID から実体を引けるのは登録済み
+            // ライブラリを持つ側だけなので、ここで解決して渡す (表示側と同じ resolver)。
+            creative_lut,
+            // TODO(段取り 4): AI のモデル決定を表示側から切り出したら、ここでランナーを作る。
+            ai: None,
         })
     }
 
@@ -34806,6 +34827,7 @@ impl App {
             self.local_adjust_page_keys.contains(&key),
             self.comic_page_keys.contains(&key),
             self.export_crop_pages.contains(&idx),
+            self.settings.bake_stage_book,
         );
         match item {
             GridItem::Image(path) => {
@@ -34825,7 +34847,13 @@ impl App {
                         .and_then(|stem| stem.to_str())
                         .unwrap_or("page")
                         .to_string();
-                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    let edits = self.book_baked_edit_snapshot(
+                        &key,
+                        Some(idx),
+                        params,
+                        rotation,
+                        self.settings.bake_stage_book,
+                    )?;
                     Ok(crate::books::BookPageSource::Composited {
                         source: crate::books::CompositeSource::File { path },
                         basename,
@@ -34850,7 +34878,13 @@ impl App {
                         .and_then(|stem| stem.to_str())
                         .unwrap_or("page")
                         .to_string();
-                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    let edits = self.book_baked_edit_snapshot(
+                        &key,
+                        Some(idx),
+                        params,
+                        rotation,
+                        self.settings.bake_stage_book,
+                    )?;
                     Ok(crate::books::BookPageSource::Composited {
                         source: crate::books::CompositeSource::ZipEntry {
                             zip_path,
@@ -34864,7 +34898,13 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => {
-                let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                let edits = self.book_baked_edit_snapshot(
+                    &key,
+                    Some(idx),
+                    params,
+                    rotation,
+                    self.settings.bake_stage_book,
+                )?;
                 Ok(crate::books::BookPageSource::Composited {
                     source: crate::books::CompositeSource::PdfPage {
                         pdf_path,
@@ -34958,7 +34998,13 @@ impl App {
             .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
         let params = self.effective_params(idx).clone();
         let rotation = self.get_rotation(idx);
-        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+        let edits = self.book_baked_edit_snapshot(
+            &key,
+            Some(idx),
+            params,
+            rotation,
+            self.settings.bake_stage_export_batch,
+        )?;
         Ok(Some(crate::export_batch::BatchExportItem {
             filename,
             dirname,
@@ -34980,7 +35026,13 @@ impl App {
             .and_then(|db| db.get_key(&key))
             .unwrap_or(crate::rotation_db::Rotation::None);
         let params = self.stack_member_effective_params(path, &key);
-        let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+        let edits = self.book_baked_edit_snapshot(
+            &key,
+            None,
+            params,
+            rotation,
+            self.settings.bake_stage_export_batch,
+        )?;
         Ok(crate::export_batch::BatchExportItem {
             filename: crate::capture::basename_for_path(path),
             dirname: Self::batch_export_dirname_for_path(path),

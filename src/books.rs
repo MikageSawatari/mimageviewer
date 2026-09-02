@@ -275,6 +275,26 @@ pub struct BookEraseSnapshot {
     pub run: BookEraseRunner,
 }
 
+pub struct BookAiResult {
+    pub image: egui::ColorImage,
+    /// アップスケールを実際に通したか。**要求した設定ではなく実行結果**を返すこと。
+    /// スマートシャープの「AI 拡大した出力には掛けない」規則の入力になる
+    /// ([`crate::adjustment::AdjustParams::effective_smart_sharpen`])。
+    pub used_upscale: bool,
+}
+
+pub type BookAiRunner =
+    Box<dyn Fn(&egui::ColorImage, &Arc<AtomicBool>) -> Result<BookAiResult, String> + Send>;
+
+/// AI 処理の段。**モデルの選択・背景合成・失敗時の扱いはここに持たない。**
+///
+/// 表示側はアップスケール前に背景色 (透過表示モード由来) へ合成し、デノイズ → アップスケール
+/// の順に走らせる。その規則を知っているのは呼び出し側なので、閉じたランナーとして受け取る。
+/// 消しゴム ([`BookEraseSnapshot`]) と同じ形。
+pub struct BookAiSnapshot {
+    pub run: BookAiRunner,
+}
+
 pub struct BookConcealSnapshot {
     pub mask: BookMaskSnapshot,
     pub preset: crate::conceal::ConcealPreset,
@@ -300,8 +320,21 @@ pub struct BakedEditSnapshot {
     pub crop_legacy_writeback: Option<(PathBuf, String)>,
     pub format: crate::capture::CaptureFormat,
     pub jpeg_matte: crate::capture::JpegMatte,
+    /// どこまで焼くか。既定の `Edits` は製本・外部ツールの現行挙動そのもの。
+    pub stage: crate::bake_stage::BakeStage,
+    /// 解決済みの Creative LUT と適用量。`stage` が表示用補正まで進むときだけ使う。
+    /// 選択 ID から実体を引けるのは登録済み LUT を持つ側だけなので、ここへ解決して渡す。
+    pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    /// AI 処理の実行本体。`stage` が AI まで進み、かつモデルが選ばれているときだけ `Some`。
+    pub ai: Option<BookAiSnapshot>,
 }
 
+/// このページを合成に通す必要があるか。**通さないと決めた分は元バイト列のまま複製される**
+/// ので、ここが段より手前の関門になる。
+///
+/// **段も見る。** 焼く段を深くしても、この判定が「編集が無い」と言えば合成自体が飛ぶ。
+/// 「編集なし・Sepia だけ」のページで Sepia が無視され、明るさを少し変えた途端に Sepia も
+/// 適用される、という食い違いになっていた (2026-09-02、Codex Sol の指摘)。
 pub fn page_requires_full_composite(
     params: &crate::adjustment::AdjustParams,
     rotation: crate::rotation_db::Rotation,
@@ -310,14 +343,29 @@ pub fn page_requires_full_composite(
     has_local_adjust: bool,
     has_comic: bool,
     has_export_crop: bool,
+    stage: crate::bake_stage::BakeStage,
 ) -> bool {
     !params.is_color_identity()
+        || (stage.includes_ai() && (params.needs_upscale() || params.needs_denoise()))
+        || (stage.includes_display_adjust() && params_have_display_only_effect(params))
         || !rotation.is_none()
         || has_conceal
         || has_erase
         || has_local_adjust
         || has_comic
         || has_export_crop
+}
+
+/// スマートシャープ / カラー化 / Creative LUT / ポストフィルタのどれかが効いているか。
+///
+/// シャープは `effective_smart_sharpen` ではなく生の値で見る。AI を通したかは合成を
+/// 走らせてみないと分からないので、ここでは**合成する側に倒す** (掛からなければ
+/// 出力は入力と同じで、余分なのは再エンコードだけ)。
+fn params_have_display_only_effect(params: &crate::adjustment::AdjustParams) -> bool {
+    params.smart_sharpen > 0
+        || params.colorize.is_enabled()
+        || !params.creative_lut.is_identity()
+        || params.post_filter != crate::adjustment::PostFilter::None
 }
 
 pub fn default_books_root() -> PathBuf {
@@ -1123,6 +1171,39 @@ pub(crate) fn compose_book_page_for_materialization(
     Ok(compose_book_page_with_cancel(image, edits, cancel)?.image)
 }
 
+/// 表示用補正の段。
+///
+/// **自前で鎖を組まない。** スマートシャープ → カラー化 → Creative LUT → ポストフィルタの
+/// 順序と、カラー化の適用可否 (`MonochromeOnly` の近モノクロ判定) は
+/// [`crate::final_composite`] が唯一の持ち主で、表示側もそこを通る。ここで書き直すと
+/// **同じ規則が 2 か所になり、表示と書き出しがずれる**。
+///
+/// Creative LUT は選択 ID ではなく**解決済みの LUT** を受け取る。ID から実体を引くのは
+/// 登録済み LUT を持つ側の仕事で、ワーカーからは手が届かない。
+fn apply_display_adjust(
+    image: egui::ColorImage,
+    params: &crate::adjustment::AdjustParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    used_ai_upscale: bool,
+    cancel: &AtomicBool,
+) -> Result<egui::ColorImage, String> {
+    // 色調補正はこの関数へ来る前に済んでいるので `adjust_before_effect` は None にする。
+    let mut plan = crate::final_composite::build_final_composite_plan_after_ai(
+        params,
+        creative_lut,
+        used_ai_upscale,
+    );
+    plan.adjust_before_effect = None;
+    match crate::final_composite::execute_final_composite(Arc::new(image), plan, cancel) {
+        crate::final_composite::FinalCompositeResult::Ready { pixels, .. } => {
+            Ok(egui::ColorImage::clone(&pixels))
+        }
+        crate::final_composite::FinalCompositeResult::Cancelled => {
+            Err(materialization_cancelled_error())
+        }
+    }
+}
+
 fn compose_book_page_with_cancel(
     mut image: egui::ColorImage,
     edits: &BakedEditSnapshot,
@@ -1188,6 +1269,35 @@ fn compose_book_page_with_cancel(
 
     ensure_materialization_not_cancelled(cancel.as_ref())?;
     image = crate::adjustment::apply_adjustments_fast(&image, &edits.params);
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
+
+    // AI と表示用補正は**色調補正の後・注釈の前**。表示側で注釈は最終合成の上に載る
+    // (`ensure_comic_composite_texture` の base が `ensure_final_composite_pixels`) ので、
+    // ここで順序を変えると**注釈にポストフィルタが掛かる**という表示との食い違いになる。
+    //
+    // 回転と切り取りは幾何なので、表示側と同じくこの後に残す。
+    //
+    // `used_ai_upscale` は AI 段が入ったら真になる。スマートシャープは AI 拡大した出力へは
+    // 掛けない固定規則があるので ([adjustment.rs] `effective_smart_sharpen`)、その入力になる。
+    let mut used_ai_upscale = false;
+    if edits.stage.includes_ai()
+        && let Some(ai) = &edits.ai
+    {
+        let result = (ai.run)(&image, &cancel)?;
+        image = result.image;
+        used_ai_upscale = result.used_upscale;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+    }
+    if edits.stage.includes_display_adjust() {
+        image = apply_display_adjust(
+            image,
+            &edits.params,
+            edits.creative_lut.clone(),
+            used_ai_upscale,
+            cancel.as_ref(),
+        )?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+    }
     ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     if let Some(comic) = &edits.comic {
@@ -1923,6 +2033,9 @@ mod tests {
             crop_legacy_writeback: None,
             format: crate::capture::CaptureFormat::Png,
             jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::default(),
+            creative_lut: None,
+            ai: None,
         }
     }
 
@@ -2034,6 +2147,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
 
         let mut color = identity.clone();
@@ -2046,6 +2160,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         let mut smart_sharpen = identity.clone();
         smart_sharpen.smart_sharpen = 1;
@@ -2057,6 +2172,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         let mut post_filter = identity.clone();
         post_filter.post_filter = crate::adjustment::PostFilter::Sepia;
@@ -2068,6 +2184,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         assert!(page_requires_full_composite(
             &identity,
@@ -2077,6 +2194,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         assert!(page_requires_full_composite(
             &identity,
@@ -2086,6 +2204,7 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
         for edit in 1..5 {
             let mut flags = [false; 5];
@@ -2098,6 +2217,7 @@ mod tests {
                 flags[2],
                 flags[3],
                 flags[4],
+                crate::bake_stage::BakeStage::default(),
             ));
         }
 
@@ -2112,7 +2232,125 @@ mod tests {
             false,
             false,
             false,
+            crate::bake_stage::BakeStage::default(),
         ));
+    }
+
+    /// 「編集まで」の段では表示専用効果を焼かない — が、それは**段の指定によるもの**で、
+    /// 焼けないからではない。`DisplayAdjust` なら同じ入力が変わることを並べて確かめる。
+    #[test]
+    fn the_stage_decides_whether_display_only_effects_are_baked() {
+        let base = egui::ColorImage::new([4, 2], vec![egui::Color32::from_rgb(120, 130, 140); 8]);
+        let mut edits = empty_baked_edits();
+        edits.params.post_filter = crate::adjustment::PostFilter::Sepia;
+
+        edits.stage = crate::bake_stage::BakeStage::Edits;
+        let shallow = compose_book_page(base.clone(), &edits).unwrap();
+
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+        let deep = compose_book_page(base.clone(), &edits).unwrap();
+
+        assert_eq!(
+            shallow.image.pixels, base.pixels,
+            "「編集まで」は表示専用効果を焼かない"
+        );
+        assert_ne!(deep.image.pixels, base.pixels, "「表示用補正まで」は焼く");
+        assert_eq!(
+            deep.image.pixels,
+            crate::post_filter::apply(&base, crate::adjustment::PostFilter::Sepia).pixels,
+            "表示側と同じ関数・同じ順序を通っている"
+        );
+    }
+
+    /// AI の段は**実行結果**を返し、そこから表示用補正のシャープが決まる。
+    /// アップスケールを通った出力にはシャープを掛けない固定規則があるため、
+    /// 「AI を通した / 通していない」で同じ設定から違う結果が出る。
+    #[test]
+    fn the_ai_stage_reports_what_it_did_and_that_decides_smart_sharpen() {
+        // 平坦な画像にはシャープが効かないので、コントラストのある市松にする。
+        let base = egui::ColorImage::new(
+            [4, 4],
+            (0..16)
+                .map(|i| {
+                    if (i / 4 + i % 4) % 2 == 0 {
+                        egui::Color32::from_rgb(20, 20, 20)
+                    } else {
+                        egui::Color32::from_rgb(230, 230, 230)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut edits = empty_baked_edits();
+        edits.params.smart_sharpen = 100;
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+
+        // AI が無い段では `used_upscale = false` 扱いなので、シャープが掛かる。
+        let without_ai = compose_book_page(base.clone(), &edits).unwrap();
+        assert_ne!(
+            without_ai.image.pixels, base.pixels,
+            "AI を通していない出力にはシャープが掛かる"
+        );
+
+        // アップスケールしたと報告するランナーを挟むと、シャープは落ちる。
+        edits.ai = Some(crate::books::BookAiSnapshot {
+            run: Box::new(|image, _cancel| {
+                Ok(crate::books::BookAiResult {
+                    image: image.clone(),
+                    used_upscale: true,
+                })
+            }),
+        });
+        let with_upscale = compose_book_page(base.clone(), &edits).unwrap();
+        assert_eq!(
+            with_upscale.image.pixels, base.pixels,
+            "アップスケールした出力にはシャープを掛けない"
+        );
+    }
+
+    /// 段を深くしたら、**表示専用効果しかないページも合成に通す**こと。
+    /// ここが更新されていないと、Sepia だけのページは合成を飛ばされて元バイト列のまま出て、
+    /// 明るさを少し足した途端に Sepia も適用される、という食い違いになる。
+    #[test]
+    fn a_page_with_only_display_effects_still_needs_the_composite_at_a_deeper_stage() {
+        let mut sepia_only = crate::adjustment::AdjustParams::default();
+        sepia_only.post_filter = crate::adjustment::PostFilter::Sepia;
+        let ask = |stage| {
+            page_requires_full_composite(
+                &sepia_only,
+                crate::rotation_db::Rotation::None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                stage,
+            )
+        };
+        assert!(
+            !ask(crate::bake_stage::BakeStage::Edits),
+            "「編集まで」では表示専用効果を焼かないので、合成も要らない"
+        );
+        assert!(
+            ask(crate::bake_stage::BakeStage::DisplayAdjust),
+            "「表示用補正まで」なら合成に通さないと焼けない"
+        );
+
+        let mut upscale_only = crate::adjustment::AdjustParams::default();
+        upscale_only.upscale_model = Some("auto".to_string());
+        let ask_ai = |stage| {
+            page_requires_full_composite(
+                &upscale_only,
+                crate::rotation_db::Rotation::None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                stage,
+            )
+        };
+        assert!(!ask_ai(crate::bake_stage::BakeStage::Edits));
+        assert!(ask_ai(crate::bake_stage::BakeStage::Ai));
     }
 
     #[test]
