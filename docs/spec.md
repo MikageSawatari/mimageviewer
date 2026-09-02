@@ -2243,7 +2243,7 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - 出力形式は `CaptureFormat` (PNG / JPEG 95 / 85 / 75)。`BakedEditSnapshot::format` を書き出し直前に上書きする。メタデータ転記は行わない (製本ページと同じく新しい完成画像として扱う)。
 - 進捗とキャンセルは単ページと同じ `ExportEvent` / `ExportPending` / `poll_export_pending` を共有する。
 - 永続化設定は `Settings::export_batch_directory` / `export_batch_template` / `export_batch_format` / `export_batch_scale`。保存先は単ページの `export_last_directory` とは別に持つ (一括は決まったフォルダへ繰り返し出す使い方が主なため)。
-- ⚠️ キー割り当ては暫定的に `KeyAction::FsExport` を共有している。専用の grid コンテキスト action を keymap へ追加して差し替える予定。
+- キーは `KeyContext::Grid` の `KeyAction::GridExportSelection` (既定 `Ctrl+E`)。フルスクリーンの `FsExport` と既定キーは同じだが action は別に持つ。1 つへまとめると、利用者が保存済みの keymap 上書き (action 名がキー) の意味が黙って変わるため。`consume_action` は `KeyContext` を強制しないので、呼び出し側でフルスクリーン表示中を除外する。
 
 ### SNS 分割書き出し
 

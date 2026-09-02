@@ -68181,14 +68181,16 @@ impl eframe::App for App {
             {
                 self.add_grid_selection_to_active_book(ctx);
             }
-            // グリッドの Ctrl+E = 選択の一括エクスポート。フルスクリーンの Ctrl+E
-            // (単ページ書き出し) と同じ割り当てを共有するので、フルスクリーン表示中は
-            // ここで拾わない。
+            // グリッドの Ctrl+E = 選択の一括エクスポート。既定キーはフルスクリーンの
+            // `FsExport` と同じだが action は別で、割り当ても別々に変えられる。
             //
-            // ⚠ 本来は専用の `KeyAction::GridExportSelection` を keymap へ足して、
-            // 操作カスタマイズ画面に「グリッド」の項目として出すべき。keymap.rs の
-            // 全面改修を避けて共有にしてある状態で、差し替えは未実施。
-            if self.fullscreen_idx.is_none() && self.keymap.consume_action(ctx, KeyAction::FsExport)
+            // `consume_action` は chord しか見ず `KeyContext` を強制しないので、既定の
+            // まま使うとフルスクリーン中の Ctrl+E もここで拾えてしまう。Grid の action
+            // であることをこの述語で明示する。
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridExportSelection)
             {
                 self.open_export_batch_dialog(ctx);
             }

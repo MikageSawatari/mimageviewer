@@ -1514,6 +1514,7 @@ pub enum KeyAction {
     GridPin,
     GridComparePin,
     GridAddToActiveBook,
+    GridExportSelection,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -2000,6 +2001,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridPin,
     KeyAction::GridComparePin,
     KeyAction::GridAddToActiveBook,
+    KeyAction::GridExportSelection,
     KeyAction::GridColumnCount1,
     KeyAction::GridColumnCount2,
     KeyAction::GridColumnCount3,
@@ -3591,6 +3593,7 @@ impl KeyAction {
             GridPin => "GridPin",
             GridComparePin => "GridComparePin",
             GridAddToActiveBook => "GridAddToActiveBook",
+            GridExportSelection => "GridExportSelection",
             GridColumnCount1 => "GridColumnCount1",
             GridColumnCount2 => "GridColumnCount2",
             GridColumnCount3 => "GridColumnCount3",
@@ -4188,6 +4191,7 @@ impl KeyAction {
             GridPin => "選択中の項目を代表サムネイルに固定または解除する",
             GridComparePin => "選択中の画像を比較スロットに固定または解除する",
             GridAddToActiveBook => "選択中またはチェック済みのページを追加先の本へ追加する",
+            GridExportSelection => "選択中またはチェック済みの画像をまとめて書き出す",
             GridColumnCount1 => "サムネイル列数を1列にする",
             GridColumnCount2 => "サムネイル列数を2列にする",
             GridColumnCount3 => "サムネイル列数を3列にする",
@@ -4655,6 +4659,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -5070,6 +5075,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -5537,6 +5543,10 @@ impl KeyAction {
             GridPin => ChordList::one(Chord::key(P)),
             GridComparePin => ChordList::one(Chord::key(X)),
             GridAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            // フルスクリーンの `FsExport` と同じ既定キーだが、別 action として持つ。
+            // 一方へまとめると、利用者が保存済みの上書き (action 名がキー) の意味が
+            // 黙って変わる。
+            GridExportSelection => ChordList::one(Chord::ctrl(E)),
             GridColumnCount1 => alt_digit_pair(Num1, Numpad1),
             GridColumnCount2 => alt_digit_pair(Num2, Numpad2),
             GridColumnCount3 => alt_digit_pair(Num3, Numpad3),
@@ -9368,6 +9378,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 一覧の一括書き出しは、フルスクリーンの書き出しと**別の action** として持つ。
+    ///
+    /// 既定キーが同じなので 1 つへまとめたくなるが、まとめると利用者が保存済みの
+    /// keymap 上書き (action 名がキー) の意味が黙って変わる。`FsExport` を割り当て直して
+    /// いた人の一覧側まで一緒に動いてしまう。
+    #[test]
+    fn grid_and_fullscreen_export_are_separate_actions_that_rebind_independently() {
+        assert_ne!(KeyAction::GridExportSelection, KeyAction::FsExport);
+        assert_eq!(KeyAction::GridExportSelection.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::FsExport.context(), KeyContext::FsImage);
+        // 既定は両方 Ctrl+E。利用者から見た操作は変わらない。
+        let grid_default: Vec<Chord> = KeyAction::GridExportSelection
+            .default_chords()
+            .iter()
+            .collect();
+        let fs_default: Vec<Chord> = KeyAction::FsExport.default_chords().iter().collect();
+        assert_eq!(grid_default, fs_default);
+
+        // 保存済みの上書きで片方を割り当て直しても、もう片方は既定のまま動かない。
+        // これが action を分けている理由そのものなので、保存形式から組み直して確かめる。
+        let rebound = Chord::ctrl_shift(KeyName::E);
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(KeyAction::FsExport, vec![rebound]);
+        let keymap = Keymap::from_settings(&settings);
+        assert_eq!(
+            keymap.effective_chords(KeyAction::GridExportSelection),
+            grid_default
+        );
+        assert_eq!(keymap.effective_chords(KeyAction::FsExport), vec![rebound]);
     }
 
     #[test]
