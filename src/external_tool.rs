@@ -17,12 +17,14 @@ pub(crate) const VIRTUAL_ORIGINAL_FILE_DISABLED_REASON: &str = "圧縮ファイ�
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// テンプレートに 1 つも無ければ `{files}` を自動で足す、その判定に使う一覧。
+/// 引数テンプレートで使える記法。**`{files}` 1 つだけ** (2026-09-02 利用者判断)。
 ///
-/// **すべて「渡すファイル」から採る値**なので、対象の種類によらず必ず値がある。
-/// `{file}` は入れない (読み込み時点で `{files}` へ揃えるため)。
-const IMPLEMENTED_PLACEHOLDERS: &[&str] =
-    &["{files}", "{dir}", "{name}", "{stem}", "{ext}", "{uri}"];
+/// 対象の場所 (`{container}` / `{page}` など) も、ファイル名の部品 (`{stem}` /
+/// `{ext}` など) も持たない。前者は対象の種類ごとに値の有無が変わり、後者は
+/// 「まとめて渡す」でどのファイルの値か決まらない。**どちらも「書いたのに入らない」
+/// 場合を作り、その先で何が起きるか利用者が予測できない。** 1 つに絞れば、
+/// 引数は常に書いたとおりに渡る。
+const IMPLEMENTED_PLACEHOLDERS: &[&str] = &["{files}"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExternalToolId(pub u32);
@@ -377,21 +379,6 @@ pub(crate) fn resolve_external_tool_slot(
     tools
         .get(index)
         .ok_or_else(|| format!("外部ツールスロット {slot} にはツールが登録されていません"))
-}
-
-#[derive(Clone, Debug)]
-pub struct PlaceholderContext {
-    file: PathBuf,
-}
-
-impl PlaceholderContext {
-    pub fn for_file(file: impl Into<PathBuf>) -> Self {
-        Self { file: file.into() }
-    }
-
-    pub fn file(&self) -> &Path {
-        &self.file
-    }
 }
 
 #[derive(Debug)]
@@ -1029,78 +1016,12 @@ fn contains_known_placeholder(template: &str) -> bool {
         .any(|placeholder| template.contains(placeholder))
 }
 
-/// 空文字になった placeholder は起動を止める (`expand_token`)。拡張子の無いファイルに
-/// `{ext}` を書いた、のような場合で、黙って空の引数を渡すより理由を出す方がよい。
-fn placeholder_value(placeholder: &str, ctx: &PlaceholderContext) -> Option<OsString> {
-    match placeholder {
-        "{dir}" => Some(
-            ctx.file
-                .parent()
-                .map(Path::as_os_str)
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{name}" => Some(
-            ctx.file
-                .file_name()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{stem}" => Some(
-            ctx.file
-                .file_stem()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        "{ext}" => Some(
-            ctx.file
-                .extension()
-                .unwrap_or_else(|| OsStr::new(""))
-                .to_os_string(),
-        ),
-        _ => None,
-    }
-}
-
-fn file_uri(path: &Path) -> OsString {
-    let encoded = path.as_os_str().as_encoded_bytes();
-    let is_unc = encoded.starts_with(b"\\\\");
-    let mut uri = if is_unc {
-        String::from("file:")
-    } else {
-        String::from("file:///")
-    };
-    for &byte in encoded {
-        match byte {
-            b'\\' => uri.push('/'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                uri.push(byte as char)
-            }
-            _ => {
-                const HEX: &[u8; 16] = b"0123456789ABCDEF";
-                uri.push('%');
-                uri.push(HEX[(byte >> 4) as usize] as char);
-                uri.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-        }
-    }
-    OsString::from(uri)
-}
-
-/// 1 トークンを展開する。**値の無いプレースホルダがあれば、その名前を返して失敗する。**
+/// 1 トークン内の `{files}` を置き換える。
 ///
-/// 以前はトークンごと (と直前の option ごと) 黙って落としていた。対象の種類ごとに
-/// 持っている値が違うので、同じツールが選んだものによって別の引数列で起動することに
-/// なり、何が起きるか読めなかった。option が消えれば意図した動きになる保証も無い
-/// (2026-09-02 利用者判断で「落とさず、起動しない」へ変更)。
-fn expand_token(
-    token: &str,
-    ctx: &PlaceholderContext,
-    files_value: Option<&OsStr>,
-) -> Result<OsString, String> {
+/// 知らない記法は文字どおり残す。利用者が書いたものを黙って変えない。
+fn expand_token(token: &str, files_value: &OsStr) -> OsString {
     let mut expanded = OsString::new();
     let mut remainder = token;
-    let mut missing: Option<String> = None;
 
     while let Some(open) = remainder.find('{') {
         expanded.push(&remainder[..open]);
@@ -1113,66 +1034,38 @@ fn expand_token(
         let close = relative_close + 1;
         let placeholder = &after_open[..close];
         if placeholder == "{files}" {
-            match files_value.filter(|value| !value.is_empty()) {
-                Some(value) => expanded.push(value),
-                None => missing = Some(placeholder.to_string()),
-            }
-        } else if placeholder == "{uri}" {
-            expanded.push(file_uri(&ctx.file));
-        } else if let Some(value) = placeholder_value(placeholder, ctx) {
-            if value.is_empty() {
-                missing = Some(placeholder.to_string());
-            } else {
-                expanded.push(value);
-            }
+            expanded.push(files_value);
         } else {
-            // 未知の記法は文字どおり渡す (利用者が書いた通りのものを黙って変えない)。
             expanded.push(placeholder);
         }
         remainder = &after_open[close..];
     }
     expanded.push(remainder);
-
-    match missing {
-        Some(placeholder) => Err(placeholder),
-        None => Ok(expanded),
-    }
+    expanded
 }
-
-/// 分割済みトークン内だけでプレースホルダを置換する。
+/// 分割済みトークン内だけで `{files}` を置換する。
 ///
-/// **値が 1 つでも欠けていれば起動しない。** 書いた引数がそのまま渡るか、
-/// 理由を言って止まるかの 2 つしかない。
-pub fn expand_arguments(
-    tokens: &[String],
-    ctx: &PlaceholderContext,
-) -> Result<Vec<OsString>, String> {
-    expand_arguments_for_files(tokens, std::slice::from_ref(ctx))
+/// **引数は必ず書いたとおりに渡る。** 記法が 1 つしかないので、値が入らない場合が無い。
+pub fn expand_arguments(tokens: &[String], file: &Path) -> Vec<OsString> {
+    expand_arguments_for_files(tokens, std::slice::from_ref(&file.to_path_buf()))
 }
 
 /// `{files}` を含む 1 トークンを対象数ぶんの引数へ展開する。
 ///
 /// パスを空白連結した文字列にはせず、各パスを独立した `OsString` として返す。
-pub fn expand_arguments_for_files(
-    tokens: &[String],
-    contexts: &[PlaceholderContext],
-) -> Result<Vec<OsString>, String> {
-    let Some(primary) = contexts.first() else {
-        return Ok(Vec::new());
-    };
+pub fn expand_arguments_for_files(tokens: &[String], files: &[PathBuf]) -> Vec<OsString> {
     let mut result: Vec<OsString> = Vec::new();
     for token in tokens {
         if token.contains("{files}") {
-            for ctx in contexts {
-                // `{stem}` などの scalar は Batch でも先頭対象を指す。
-                // N 件へ変化させるのは `{files}` の値だけにする。
-                result.push(expand_token(token, primary, Some(ctx.file.as_os_str()))?);
+            // 1 トークンが対象数ぶんの引数へ広がる。空白連結した 1 文字列にはしない。
+            for file in files {
+                result.push(expand_token(token, file.as_os_str()));
             }
         } else {
-            result.push(expand_token(token, primary, None)?);
+            result.push(expand_token(token, OsStr::new("")));
         }
     }
-    Ok(result)
+    result
 }
 
 /// 設定画面の引数プレビュー用。**毎フレーム呼ばれる**ので計画をログに出さない。
@@ -1367,22 +1260,16 @@ fn build_request_for_files(
     tool: &ExternalTool,
     files: Vec<PathBuf>,
 ) -> Result<ExternalLaunchRequest, String> {
-    let contexts: Vec<_> = files
-        .iter()
-        .cloned()
-        .map(PlaceholderContext::for_file)
-        .collect();
     let arguments = if tool.launch.uses_process_options() {
         let tokens = split_argument_template_for_selection(&tool.arguments, tool.selection);
-        if tool.selection == SelectionPolicy::Batch
-            && !tokens.iter().any(|token| token.contains("{files}"))
-        {
-            return Err(
-                "まとめて渡すには引数テンプレートに {files} を指定してください".to_string(),
-            );
+        if tool.selection == SelectionPolicy::Batch {
+            if !tokens.iter().any(|token| token.contains("{files}")) {
+                return Err(
+                    "まとめて渡すには引数テンプレートに {files} を指定してください".to_string(),
+                );
+            }
         }
-        expand_arguments_for_files(&tokens, &contexts)
-            .map_err(|placeholder| format!("{placeholder} に入れる値がありません"))?
+        expand_arguments_for_files(&tokens, &files)
     } else {
         Vec::new()
     };
@@ -3615,55 +3502,32 @@ mod tests {
         );
     }
 
+    /// `{files}` が既にあれば足さない。無ければ足す。
+    ///
+    /// 知らない記法は「使える値」ではないので、あっても `{files}` を足す。
+    /// これが無いと、書き間違えたテンプレートがファイルを渡さないまま起動する。
     #[test]
-    fn split_does_not_append_file_when_a_known_keyword_exists() {
+    fn the_file_is_appended_unless_the_template_already_asks_for_it() {
         // `{file}` は読み込み時点で `{files}` へ揃える (綴りは 1 つ)。
         assert_eq!(
             split_argument_template("--input={file}"),
             ["--input={files}"]
         );
         assert_eq!(
+            split_argument_template("--input={files}"),
+            ["--input={files}"]
+        );
+        assert_eq!(
             split_argument_template("--out {stem}.png"),
-            ["--out", "{stem}.png"]
-        );
-        // 知らない記法は文字どおり残す。渡すファイルが要ることは変わらないので、
-        // `{files}` は足す。
-        assert_eq!(
-            split_argument_template("-page {page}"),
-            ["-page", "{page}", "{files}"]
+            ["--out", "{stem}.png", "{files}"]
         );
     }
-
-    #[test]
-    fn expand_arguments_supports_every_p1_placeholder_without_loss_of_boundaries() {
-        let ctx = PlaceholderContext::for_file(r"C:\My Images\photo.final.JPG");
-        let tokens = vec![
-            "{files}".into(),
-            "{dir}".into(),
-            "{name}".into(),
-            "{stem}".into(),
-            "{ext}".into(),
-            "{uri}".into(),
-        ];
-        assert_eq!(
-            expand_arguments(&tokens, &ctx).unwrap(),
-            vec![
-                OsString::from(r"C:\My Images\photo.final.JPG"),
-                OsString::from(r"C:\My Images"),
-                OsString::from("photo.final.JPG"),
-                OsString::from("photo.final"),
-                OsString::from("JPG"),
-                OsString::from("file:///C:/My%20Images/photo.final.JPG"),
-            ]
-        );
-    }
-
     #[test]
     fn expand_preserves_unknown_braces_and_adds_file_when_no_keyword_exists() {
-        let ctx = PlaceholderContext::for_file(r"C:\space dir\image.png");
+        let file = Path::new(r"C:\space dir\image.png");
         let tokens = split_argument_template("--pattern={unknown}");
         assert_eq!(
-            expand_arguments(&tokens, &ctx).unwrap(),
+            expand_arguments(&tokens, file),
             [
                 OsString::from("--pattern={unknown}"),
                 OsString::from(r"C:\space dir\image.png")
@@ -3673,40 +3537,25 @@ mod tests {
 
     #[test]
     fn replacement_with_spaces_remains_one_argument() {
-        let ctx = PlaceholderContext::for_file(r"C:\space dir\image.png");
+        let file = Path::new(r"C:\space dir\image.png");
         let tokens = split_argument_template("--input={files}");
         assert_eq!(
-            expand_arguments(&tokens, &ctx).unwrap(),
+            expand_arguments(&tokens, file),
             [OsString::from(r"--input=C:\space dir\image.png")]
         );
     }
 
     #[test]
     fn files_placeholder_expands_one_token_to_distinct_os_arguments() {
-        let contexts = [
-            PlaceholderContext::for_file(r"C:\space dir\one.png"),
-            PlaceholderContext::for_file(r"D:\other dir\two.png"),
+        let files = [
+            PathBuf::from(r"C:\space dir\one.png"),
+            PathBuf::from(r"D:\other dir\two.png"),
         ];
         assert_eq!(
-            expand_arguments_for_files(&["--input={files}".to_string()], &contexts).unwrap(),
+            expand_arguments_for_files(&["--input={files}".to_string()], &files),
             [
                 OsString::from(r"--input=C:\space dir\one.png"),
                 OsString::from(r"--input=D:\other dir\two.png"),
-            ]
-        );
-    }
-
-    #[test]
-    fn files_placeholder_keeps_other_placeholders_on_the_primary_target() {
-        let contexts = [
-            PlaceholderContext::for_file(r"C:\images\first one.jpg"),
-            PlaceholderContext::for_file(r"D:\other\second.png"),
-        ];
-        assert_eq!(
-            expand_arguments_for_files(&["--pair={stem}:{files}".to_string()], &contexts).unwrap(),
-            [
-                OsString::from(r"--pair=first one:C:\images\first one.jpg"),
-                OsString::from(r"--pair=first one:D:\other\second.png"),
             ]
         );
     }
@@ -4188,11 +4037,7 @@ mod tests {
             b'p' as u16,
         ];
         let path = PathBuf::from(OsString::from_wide(&raw));
-        let arguments = expand_arguments(
-            &["{files}".to_string()],
-            &PlaceholderContext::for_file(&path),
-        )
-        .unwrap();
+        let arguments = expand_arguments(&["{files}".to_string()], &path);
         assert_eq!(arguments[0].encode_wide().collect::<Vec<_>>(), raw.to_vec());
     }
 }

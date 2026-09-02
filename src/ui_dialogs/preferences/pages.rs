@@ -971,14 +971,13 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
-        ui.label("{files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.label(egui::RichText::new("使える記法は {files} だけです").strong());
         ui.add(
             egui::Label::new(
                 egui::RichText::new(concat!(
-                    "{files} は mIV が渡すファイル。「1 件ずつ」なら 1 つ、",
-                    "「まとめて渡す」なら選んだ数だけ並びます。何も書かないときは",
-                    "{files} が 1 つ付きます。他は {files} から採った値です。",
+                    "mIV が渡すファイルに置き換わります。「1 件ずつ」なら 1 つ、",
+                    "「まとめて渡す」なら選んだ数だけ並びます。",
+                    "何も書かないときは {files} が 1 つ付きます。",
                 ))
                 .weak(),
             )
