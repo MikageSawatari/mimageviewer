@@ -41059,6 +41059,10 @@ impl App {
                 }
 
                 if let Some(fs_idx) = app.fullscreen_idx {
+                    // main を mount した本流と同じ位置で突き合わせる。ここを飛ばすと、
+                    // 前面が detached の間だけ 360 が戻らない (再開直後と、動画の
+                    // stream info が後から届く場合)。
+                    app.reconcile_panorama_session_intent(fs_idx);
                     app.sync_upscale_from_preset(fs_idx);
                     let continuous_keep_set = if !app.reading_flow.is_paged()
                         && app.fs_vertical_cache_keep_set.contains(&fs_idx)
@@ -41700,17 +41704,21 @@ impl App {
     fn park_active_detached_image_window(&mut self) -> bool {
         if let Some(fs_idx) = self.fullscreen_idx {
             self.reset_detached_pause_foreground_modes(fs_idx);
-            // **この park だけは 360 の意図も落とす** (backlog §1.145)。窓は静止
-            // スナップショットになり、context 自身は別の窓 / 別の内容へ進む。意図を
-            // 連れて行くと、新しく開いた detached 窓が次のフレームで 360 に戻り、
-            // 「新しい窓は通常表示で始まる (V で入り直せる)」という既存の契約が
-            // 破れる。live context を退避する `pause_current_active_viewer_context`
-            // 側は意図ごと bundle に残す (あちらは同じ viewer が戻ってくる)。
-            self.panorama_intent.on = false;
         }
         let Some(snapshot) = self.build_active_detached_image_window_snapshot(None) else {
             return false;
         };
+        // **この park だけは 360 の意図も落とす** (backlog §1.145)。窓は静止スナップ
+        // ショットになり、context 自身は別の窓 / 別の内容へ進む。意図を連れて行くと、
+        // 新しく開いた detached 窓が次のフレームで 360 に戻り、「新しい窓は通常表示で
+        // 始まる (V で入り直せる)」という既存の契約が破れる。live context を退避する
+        // `pause_current_active_viewer_context` 側は意図ごと bundle に残す (あちらは
+        // 同じ viewer が戻ってくる)。
+        //
+        // 落とすのは **スナップショットが取れてから**。上の失敗経路は退避しなかった
+        // ということなので、viewer はそのまま続く。先に落とすと、失敗しただけで 360 が
+        // 戻らなくなる。
+        self.panorama_intent.on = false;
         let snapshot_id = snapshot.id;
         self.detached_image_windows.push(snapshot);
         self.update_detached_window_runtime_flags(
@@ -63413,10 +63421,33 @@ impl App {
         if !self.panorama_intent.on || self.panorama_state.is_some() {
             return;
         }
+        // 素材判定を先に見るのは、この後の `resolve_spread_pair` が毎フレーム呼ぶには
+        // 重いため (ナビ列を clone する)。360 素材でないものが大半なのでここで落ちる。
         if self.detect_panorama(fs_idx).is_none() {
             return;
         }
+        let is_spread_double = matches!(
+            self.resolve_spread_pair(fs_idx),
+            crate::ui_fullscreen::SpreadPair::Double { .. }
+        );
+        if !self.panorama_entry_allowed(fs_idx, is_spread_double) {
+            return;
+        }
         self.apply_panorama_mode_toggle(fs_idx);
+    }
+
+    /// 360 モードへ入れるか。V キーと復帰が同じ答えを使うための入口
+    /// ([`crate::panorama::entry_allowed`] が判断の本体で、上部バーのボタンも同じ関数を
+    /// 呼ぶ)。`is_spread_double` は呼び出し側が既に解決している値を渡す —
+    /// `resolve_spread_pair` はフレーム冒頭で 1 回だけ解くのが既存の作法。
+    pub(crate) fn panorama_entry_allowed(&self, fs_idx: usize, is_spread_double: bool) -> bool {
+        let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
+        crate::panorama::entry_allowed(
+            self.detect_panorama(fs_idx),
+            is_video,
+            self.reading_flow,
+            is_spread_double,
+        )
     }
 
     /// 「V キーで 360° ビューワー」案内トーストを必要なら出す (Codex P2 第 18 ラウンド)。
@@ -63443,10 +63474,15 @@ impl App {
     /// `false` = 条件未満 or 既に発火済みでスキップ。
     /// `open_fullscreen` でページ補正トーストとの競合回避に使う (Codex P3 第 20 ラウンド)。
     pub(crate) fn try_show_pano_hint_toast_returning_fired(&mut self, fs_idx: usize) -> bool {
-        // 「360 素材と分かった」は 1 つの事実で、答えが 2 つある: 意図が ON なら復帰、
-        // そうでなければ案内。復帰を先にやるので、既に 360 なのに「V キーで 360°
-        // ビューワー」と案内してしまうことがない (下の `is_some()` で落ちる)。
-        self.reconcile_panorama_session_intent(fs_idx);
+        // 意図が ON なら案内しない。案内は機能の存在を知らせるためのもので、自分で
+        // 360 にした人には要らない。**ここで復帰まで済ませてはいけない** —
+        // `open_fullscreen` はこの後もモードを触る (フォルダ跨ぎのスライドショー再開、
+        // 動画タイルの復帰) ので、この時点で 360 に入れると衝突モードを止めた後始末を
+        // 後続が巻き戻し、360 とスライドショーが同時に走る。復帰はフレームの
+        // `reconcile_panorama_session_intent` が、open が終わってから 1 か所で行う。
+        if self.panorama_intent.on {
+            return false;
+        }
         if self.pano_toast_shown_for_current_fs {
             return false;
         }

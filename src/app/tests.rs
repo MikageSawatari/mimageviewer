@@ -31790,6 +31790,94 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// 復帰は V キーと同じ入口条件を通る。連結読みでは V でも入れないので、
+    /// 意図が残っていても勝手に 360 にはしない (Codex 指摘、backlog §1.145)。
+    #[test]
+    fn the_view_does_not_come_back_where_pressing_v_could_not_have_opened_it() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = push_image(&mut app, "C:/pics/pano-flow-a.jpg");
+        insert_pano_static_source(&mut app, &ctx, first, "pano_flow_a", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(first);
+        app.toggle_panorama_mode(first);
+        app.close_fullscreen();
+        assert!(app.panorama_intent.on);
+
+        let second = push_image(&mut app, "C:/pics/pano-flow-b.jpg");
+        insert_pano_static_source(&mut app, &ctx, second, "pano_flow_b", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(second);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.reconcile_panorama_session_intent(second);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "連結読み中に 360 state ができると、描画は連結のままなのに入力と上バーだけが              360 として振る舞う"
+        );
+        assert!(
+            app.panorama_intent.on,
+            "意図は残す。ページ単位に戻せば復帰する"
+        );
+
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.reconcile_panorama_session_intent(second);
+        assert!(app.panorama_state.is_some(), "ページ単位へ戻せば復帰する");
+    }
+
+    /// 復帰は 1 か所 (フレームの reconcile) が行う。`open_fullscreen` の中でやると、
+    /// その後にモードを戻す呼び出し元が後始末を巻き戻す (Codex 指摘、backlog §1.145)。
+    #[test]
+    fn opening_an_item_does_not_restore_the_view_on_the_spot() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-open-timing.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_open_timing",
+            egui::Color32::BLACK,
+        );
+        app.fullscreen_idx = Some(idx);
+        app.panorama_intent.on = true;
+
+        let toast_fired = app.try_show_pano_hint_toast_returning_fired(idx);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "open の途中で 360 に入れない。復帰はフレームの reconcile が行う"
+        );
+        assert!(
+            !toast_fired,
+            "自分で 360 にした人に「V キーで 360° ビューワー」は要らない"
+        );
+    }
+
+    /// 退避が成立しなかったのに意図まで落とすと、失敗しただけで 360 が戻らなくなる
+    /// (Codex 指摘、backlog §1.145)。
+    #[test]
+    #[cfg(windows)]
+    fn a_park_that_did_not_happen_keeps_the_360_intent() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-park-fail.jpg");
+        insert_pano_static_source(&mut app, &ctx, idx, "pano_park_fail", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(idx);
+        app.toggle_panorama_mode(idx);
+        assert!(app.panorama_intent.on);
+        // detached セッションではないので snapshot は作れない = 退避は成立しない。
+        assert!(!app.viewer_session_is_detached());
+
+        assert!(
+            !app.park_active_detached_image_window(),
+            "退避は失敗するはず (このテストの前提)"
+        );
+
+        assert!(
+            app.panorama_intent.on,
+            "退避していないのだから viewer は続く。意図を落としてはいけない"
+        );
+    }
+
     /// 別ウィンドウへ退避するときの 360 OFF は利用者の操作ではないので、意図は残す。
     /// 残さないと、退避した窓へ戻ったときに 360 が消えている。
     #[test]

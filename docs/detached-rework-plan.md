@@ -1459,6 +1459,42 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-02 §1.145 で、360 ビューのセッション意図を `ViewerContextBundle` 所有にし、
+park の 2 経路を区別する (ClaudeCode が起票し、Codex が §2 に照らして
+「構造的修正であり症状パッチではない。2 つの park の区別も恣意的ではなく構造的」と判定):**
+
+**触った範囲**: [src/panorama.rs](../src/panorama.rs) の `PanoramaSessionIntent` と
+`entry_allowed` 新設、[src/app.rs](../src/app.rs) の `panorama_intent` field /
+`reconcile_panorama_session_intent` / `panorama_entry_allowed` / `apply_panorama_mode_toggle`
+分離 / `park_active_detached_image_window` での意図クリア /
+`with_active_viewer_context` 内 mount 済み viewer での reconcile 追加、
+[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の bundle field
+追加 (宣言 / `empty()` / swap / fork 分類)、[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+V キーと上部バーボタンを共有述語へ統一。detached の viewport lifecycle、window binding、
+session 遷移、snapshot DTO には触れていない。
+
+**判断理由**: 型付きの per-viewer state を既存の網羅的 owner (`ViewerContextBundle`) に置き、
+mount / swap / fork の分類をその所有境界に従わせただけで、guard / delay / retry / 追加
+repaint / 一括 reset / silent fallback を足していない。毎フレームの reconcile は非同期に
+判明する素材分類に対する冪等な収束ステップであり、detached 述語の guard ではない。
+
+**2 つの park の区別 (Codex の判定)**:
+
+| park | 意味 | 意図 |
+| --- | --- | --- |
+| `pause_current_active_viewer_context` | 同じ live registry context を後で remount する | **残す** (前面モードの一時的な取り壊しにすぎない) |
+| `park_active_detached_image_window` | 静止 DTO を作り、live context は別の窓へ rebind / 前進する | **落とす** (退避が成立した後で) |
+
+Codex は `ProductionForkSpec::MaterializedStill` について、`panorama_intent` を
+`move_to_parked!` に置いたままにするのが設計どおりであり、新しい OS ウィンドウの identity は
+それだけでは新しい viewer session にはならない、と判定した。
+
+**Codex が指摘して修正した点** (いずれも記載時点で対応済み): ①mount 済み detached viewer の
+update 境界に reconcile が無かった ②復帰が V キーの入口述語を通っていなかった
+③`open_fullscreen` 内での即時復帰が後続の呼び出し元に巻き戻されうる
+④park が snapshot 成立前に意図を落としていた。⑤同型の既知の穴 (保持 state の再アクティブ化が
+後始末を通らない) は本 commit 以前からある挙動として backlog §1.164 へ切り出した。
+
 **2026-09-02 §1.158 で、右情報パネルの表示状態を `ViewerContextBundle` 所有へ移す
 (ClaudeCode が案を起票し、Codex が §2 / BA-7 に照らして「所有先は正解」と判定。ただし
 「lock の bool 追加だけ」は不承認で、以下の条件付き同意):**

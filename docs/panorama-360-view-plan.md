@@ -1709,20 +1709,38 @@ pub struct PanoramaSessionIntent {
 - `projection` は `on` と独立。解除して入れ直したときに既定へ戻らないようにするため。
   `Settings::panorama_projection` は読むだけで書き換えない (§5.3 と同じ理由)。
 - 復帰は `reconcile_panorama_session_intent(fs_idx)`。意図が ON、state が無い、
-  `detect_panorama` が Some の 3 つが揃ったときだけ、利用者が <kbd>V</kbd> を押したのと
+  **入口条件を満たす** の 3 つが揃ったときだけ、利用者が <kbd>V</kbd> を押したのと
   同じ経路で ON にする。相互排他モードの抑止まで同じでないと、復帰したときだけ 360 と
   補正パネルが同時に開く。
+- 入口条件は `panorama::entry_allowed` **1 つ**が持ち、V キー / 上部バーのボタン /
+  復帰の 3 か所が同じ答えを使う。素材判定に加えて、静止画では見開きの 2 ページ表示中と
+  連結読みを弾く (どちらも「1 枚を球面として見る」ことと両立しない)。復帰だけがこれを
+  見ないと、描画は連結のままなのに入力と上バーだけが 360 として振る舞う状態を作れる。
+  統合前は V キー自身が連結読みを見ておらず、ボタンだけが見ていた。
 - **契機を 1 つのイベントに決められない**ので毎フレーム突き合わせる。`detect_panorama` が
   答えを持つ時刻は素材で違う — 静止画は GPano XMP の到着、XMP なしの 2:1 画像は
   `fs_cache` の寸法確定、動画は FFmpeg の stream info が揃った時点。判定は純粋で、
   意図が OFF なら最初の行で戻る。
+- 突き合わせは **mount 済みの viewer ごと**に要る。`App::update` の本流 (main bundle) と、
+  active detached bundle を mount している `with_active_viewer_context` の中と、同じ位置に
+  1 つずつ置く。前者だけだと前面が detached の間 360 が戻らない。
+- **`open_fullscreen` の途中では復帰しない**。あの関数の後で呼び出し元がモードを戻す
+  ことがある (フォルダ跨ぎのスライドショー再開、動画タイルの復帰) ので、その場で 360 に
+  入れると衝突モードを止めた後始末を巻き戻され、360 とスライドショーが同時に走る。
+  案内トースト (`try_show_pano_hint_toast_returning_fired`) は意図が ON なら黙るだけで、
+  復帰そのものはフレームの reconcile に任せる。
 - fork 時は `panorama_state` と同じ側へ動く (`move_to_parked!`)。渡した viewer が 360 を
   続けるので、その viewer がページを移ったときに復帰するのも同じ側。
 - **例外は静止スナップショットへの park** (`park_active_detached_image_window`)。窓は
   スナップショットになり context 自身は別の窓へ進むので、意図も落とす。落とさないと
   「新しい detached 窓は通常表示で始まる」既存の契約が次のフレームで破れる。
   live context の一時退避 (`pause_current_active_viewer_context`) は bundle ごと戻るので
-  意図を保つ。
+  意図を保つ。落とすのは **スナップショットが取れてから** — 失敗経路は退避しなかった
+  ということなので、viewer はそのまま続く。
+- **既知の穴**: フォルダ内の 360 → 通常画像 → 360 は `panorama_state` を保持したまま
+  再アクティブ化する経路で、ここは V キーの入口も後始末も通らない。通常画像の側で
+  補正パネル等を開いていると、360 へ戻ったときに同時に開いたままになる。この commit より
+  前からある挙動で、backlog §1.164 に切り出した。
 
 ### 5.2 入力ハンドリング (Codex P2 反映)
 

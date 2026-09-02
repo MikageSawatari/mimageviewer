@@ -21280,7 +21280,7 @@ impl App {
             self.cycle_panorama_projection();
             ctx.request_repaint();
         }
-        if key_v_panorama && !is_spread_double && self.detect_panorama(fs_idx).is_some() {
+        if key_v_panorama && self.panorama_entry_allowed(fs_idx, is_spread_double) {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_n_navigator {
@@ -31781,7 +31781,7 @@ impl App {
         //   2026-05 ユーザー要望)
         // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
         if !is_video && !panorama_active {
-            let mode_available = !is_spread_double && reading_flow.is_paged();
+            let mode_available = reading_flow.is_paged() && !is_spread_double;
             let tooltip = if !reading_flow.is_paged() {
                 "360° ビューワーはページ単位表示で使えます".to_owned()
             } else if is_spread_double {
@@ -31798,7 +31798,14 @@ impl App {
                     None => "360° 画像ではありません".to_owned(),
                 }
             };
-            let is_enabled = mode_available && panorama_trigger.is_some();
+            // 入れるかの判断は V キー / 復帰と同じ関数が持つ。`mode_available` は
+            // 上の理由文を選ぶためだけに残す。
+            let is_enabled = crate::panorama::entry_allowed(
+                panorama_trigger,
+                is_video,
+                *reading_flow,
+                is_spread_double,
+            );
             let pano_resp = draw_bar_button(
                 ui,
                 next_x,

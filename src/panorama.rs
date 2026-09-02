@@ -272,6 +272,29 @@ pub const SOURCE_KIND_AI: u16 = 2;
 pub const SOURCE_KIND_AI_ADJUST: u16 = 3;
 pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
 
+/// 360 モードへ**入れるか**。素材が 360 かどうか (`PanoramaTrigger`) だけでは足りない。
+///
+/// **V キー / 上部バーのボタン / セッション意図からの復帰は、この 1 つの答えを使う。**
+/// 3 か所が別々に条件を書いていると、片方からは入れて片方からは入れない状態ができる
+/// (実際、V キーは連結読みを見ておらず、ボタンだけが見ていた)。
+///
+/// 静止画の 2 つの制約は、どちらも「1 枚を球面として見る」ことと両立しないから:
+/// - 見開きの 2 ページ表示中 — 2 枚を並べている
+/// - 連結読み (`!reading_flow.is_paged()`) — 縦 / 横に繋げている
+///
+/// 動画にはページの概念が無いので、素材判定だけで決まる。
+pub fn entry_allowed(
+    trigger: Option<PanoramaTrigger>,
+    is_video: bool,
+    reading_flow: crate::settings::ReadingFlow,
+    is_spread_double: bool,
+) -> bool {
+    if trigger.is_none() {
+        return false;
+    }
+    is_video || (reading_flow.is_paged() && !is_spread_double)
+}
+
 /// フルスクリーンを閉じても持ち越す、360 ビューについての **利用者の意図**。
 ///
 /// [`PanoramaState`] とは別物で、あちらは「今この 1 枚をどう見ているか」。画像が
@@ -1791,6 +1814,35 @@ mod tests {
         let info = make_pano_info(Some((10000, 5000)), Some((1, 5000)), Some(0), Some(0));
         // u_scale = 1/10000 = 0.0001 < 0.001 閾値で None
         assert!(PanoUvTransform::from_gpano(&info).is_none());
+    }
+
+    #[test]
+    /// V キー / 上部バーのボタン / セッション意図からの復帰が同じ答えを使う
+    /// (backlog §1.145)。以前は V キーが連結読みを見ておらず、ボタンだけが見ていた。
+    #[test]
+    fn only_a_single_page_of_360_material_may_enter_the_view() {
+        use crate::settings::ReadingFlow;
+        let auto = Some(PanoramaTrigger::Auto);
+
+        assert!(entry_allowed(auto, false, ReadingFlow::Paged, false));
+        assert!(
+            !entry_allowed(None, false, ReadingFlow::Paged, false),
+            "360 素材でなければ入れない"
+        );
+        assert!(
+            !entry_allowed(auto, false, ReadingFlow::Paged, true),
+            "見開きの 2 ページ表示中は 2 枚並べているので入れない"
+        );
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            assert!(
+                !entry_allowed(auto, false, flow, false),
+                "連結読みは繋げて表示しているので入れない: {flow:?}"
+            );
+        }
+        assert!(
+            entry_allowed(auto, true, ReadingFlow::Vertical, true),
+            "動画にページの概念は無いので、静止画側の制約は効かない"
+        );
     }
 
     #[test]
