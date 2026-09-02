@@ -1493,7 +1493,7 @@ Codex は `ProductionForkSpec::MaterializedStill` について、`panorama_inten
 update 境界に reconcile が無かった ②復帰が V キーの入口述語を通っていなかった
 ③`open_fullscreen` 内での即時復帰が後続の呼び出し元に巻き戻されうる
 ④park が snapshot 成立前に意図を落としていた。⑤同型の既知の穴 (保持 state の再アクティブ化が
-後始末を通らない) は本 commit 以前からある挙動として backlog §1.164 へ切り出した。
+後始末を通らない) は本 commit 以前からある挙動として backlog §1.169 へ切り出した。
 
 **2026-09-02 §1.158 で、右情報パネルの表示状態を `ViewerContextBundle` 所有へ移す
 (ClaudeCode が案を起票し、Codex が §2 / BA-7 に照らして「所有先は正解」と判定。ただし

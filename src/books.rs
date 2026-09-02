@@ -930,10 +930,13 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
             Ok(false)
         }
         BookPageSource::Composited { source, edits, .. } => {
-            let image = decode_composite_source(&source)?;
-            let result = compose_book_page(image, &edits)?;
-            write_composited_color_image(dest, &result.image, edits.format, edits.jpeg_matte)?;
-            Ok(result.used_diffusion_fallback)
+            // 本ページは原寸で焼く。上限サイズを持たせるならここへ渡す段が既にある。
+            write_composited_page(
+                &source,
+                &edits,
+                dest,
+                crate::export_dialog::ExportScale::Full,
+            )
         }
         BookPageSource::Rendered {
             work,
@@ -1188,28 +1191,7 @@ fn compose_book_page_with_cancel(
     ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     if let Some(comic) = &edits.comic {
-        let scaled_objects = edits.comic_source_dims.and_then(|[source_w, source_h]| {
-            let s_bake =
-                image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
-            ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
-        });
-        let objects = scaled_objects.as_deref().unwrap_or(&comic.objects);
-        let mut stamp_cache = comic.stamp_cache.clone();
-        let (stamps, _, _) = crate::comic_stamp::build_stamp_images_from_cache_snapshot(
-            objects,
-            &mut stamp_cache,
-            cancel.as_ref(),
-        );
-        ensure_materialization_not_cancelled(cancel.as_ref())?;
-        let layers = comic_core::bake_annotation_layers(
-            objects,
-            image.size[0],
-            image.size[1],
-            &comic.fonts,
-            &stamps,
-        );
-        ensure_materialization_not_cancelled(cancel.as_ref())?;
-        image = crate::comic_overlay::composite_annotation_layers(&image, &layers);
+        image = bake_comic_annotations(&image, comic, edits.comic_source_dims, cancel.as_ref())?;
         ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
@@ -1250,6 +1232,64 @@ fn compose_book_page_with_cancel(
         image,
         used_diffusion_fallback,
     })
+}
+
+/// 1 ページぶんの「デコード → 合成 → 縮小 → エンコード → 書き出し」。
+///
+/// 製本の Composited ページと Ctrl+E の一括エクスポートが共有する唯一の実体で、
+/// 戻り値は消しゴム補完が diffusion フォールバックしたか。本固有の事情 (ページ採番、
+/// `MAX_BOOK_PAGES`、無編集時の byte copy、`restore_declines`、コピー集計) は
+/// `append_pages_at` 側に残し、ここは 1 件だけを見る。
+pub fn write_composited_page(
+    source: &CompositeSource,
+    edits: &BakedEditSnapshot,
+    dest: &Path,
+    scale: crate::export_dialog::ExportScale,
+) -> Result<bool, String> {
+    let image = decode_composite_source(source)?;
+    let result = compose_book_page(image, edits)?;
+    let image = crate::export_dialog::scale_export_pixels(
+        std::borrow::Cow::Borrowed(&result.image),
+        scale,
+    )?;
+    write_composited_color_image(dest, image.as_ref(), edits.format, edits.jpeg_matte)?;
+    Ok(result.used_diffusion_fallback)
+}
+
+/// 注釈 (comic) を合成済み画像へ焼き込む。
+///
+/// 製本の headless compositor と Ctrl+E のプリセット再合成が、注釈のスケール規則と
+/// スタンプ解決を同じ 1 か所から使うための関数。`source_dims` は注釈を作った時点の
+/// source 寸法で、AI 拡大後などサイズが変わった画像へ焼くときの倍率に使う。
+pub(crate) fn bake_comic_annotations(
+    image: &egui::ColorImage,
+    comic: &BookComicSnapshot,
+    source_dims: Option<[usize; 2]>,
+    cancel: &AtomicBool,
+) -> Result<egui::ColorImage, String> {
+    let scaled_objects = source_dims.and_then(|[source_w, source_h]| {
+        let s_bake = image.size[0].max(image.size[1]) as f32 / source_w.max(source_h).max(1) as f32;
+        ((s_bake - 1.0).abs() > 1e-4).then(|| comic_core::scale_scene(&comic.objects, s_bake))
+    });
+    let objects = scaled_objects.as_deref().unwrap_or(&comic.objects);
+    let mut stamp_cache = comic.stamp_cache.clone();
+    let (stamps, _, _) = crate::comic_stamp::build_stamp_images_from_cache_snapshot(
+        objects,
+        &mut stamp_cache,
+        cancel,
+    );
+    ensure_materialization_not_cancelled(cancel)?;
+    let layers = comic_core::bake_annotation_layers(
+        objects,
+        image.size[0],
+        image.size[1],
+        &comic.fonts,
+        &stamps,
+    );
+    ensure_materialization_not_cancelled(cancel)?;
+    Ok(crate::comic_overlay::composite_annotation_layers(
+        image, &layers,
+    ))
 }
 
 fn ensure_materialization_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {

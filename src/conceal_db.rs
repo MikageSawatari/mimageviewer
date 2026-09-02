@@ -95,6 +95,22 @@ impl ConcealDb {
         &self,
         key: &str,
     ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        self.get_full_checked_impl(key, false)
+    }
+
+    /// 未選択のモザイクを一括全置換で保持するため、shape JSON 破損も失敗として返す。
+    pub(crate) fn get_full_strict(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        self.get_full_checked_impl(key, true)
+    }
+
+    fn get_full_checked_impl(
+        &self,
+        key: &str,
+        strict_shapes: bool,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
         use rusqlite::OptionalExtension as _;
         let mut stmt = self
             .conn
@@ -117,6 +133,10 @@ impl ConcealDb {
         let Some((bitmap_data, bitmap_w, bitmap_h, shapes_json)) = row else {
             return Ok(None);
         };
+        if strict_shapes && let Some(json) = shapes_json.as_deref() {
+            crate::mask_db::try_shapes_from_json(json)
+                .map_err(|error| format!("conceal shapes JSON is invalid: {error}"))?;
+        }
         let raw = ConcealRawEntry {
             bitmap_data,
             bitmap_w,
@@ -544,6 +564,19 @@ mod tests {
             loaded,
             std::collections::HashSet::from(["c:/b.jpg".to_string()])
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn edit_bundle_bulk_conceal_strict_reader_rejects_corrupt_shapes() {
+        let (db, p) = tmp_db();
+        let compressed = crate::mask_db::compress_mask(&[true]);
+        db.set_raw("key", &compressed, Some("{invalid"), 1, 1)
+            .unwrap();
+
+        let (_, shapes, _) = db.get_full_checked("key").unwrap().unwrap();
+        assert!(shapes.is_empty(), "通常readerの寛容動作は保つ");
+        assert!(db.get_full_strict("key").is_err());
         let _ = std::fs::remove_file(&p);
     }
 

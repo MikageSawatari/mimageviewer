@@ -64,6 +64,7 @@ pub mod screenshot;
 pub(crate) mod seek_strip;
 #[cfg(feature = "dev-tools")]
 pub mod seek_strip_batch;
+pub mod seek_strip_layout;
 pub(crate) mod seek_strip_thumbs;
 pub(crate) mod seek_strip_wave;
 pub mod spherical_metadata;
@@ -435,11 +436,17 @@ fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_sh
 /// 上下バーの固定表示状態を 1 つの値として扱う。presenter の生成時に渡す初期値と、
 /// 後からの変更 (`SetBarLockState`) の両方が同じ型を通ることで、「生まれたときだけ固定を
 /// 知らない」状態を作らない。
+///
+/// シークストリップの高さも同じ値に含める。**帯が場所を取るかどうかは snapshot の有無で
+/// 変わるが、取るときにいくつ取るかは設定でしか変わらない**ので、snapshot と一緒に運ぶと
+/// 動画の切替中に予約高さだけ消える (§1.162 と同型)。presenter を作り直しても
+/// `cur_bar_lock` として保たれる、この経路が高さの正本になる。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeBarLockState {
     pub top_locked: bool,
     pub bottom_lock: crate::settings::VideoBottomLock,
     pub fixed_bar_gap_px: u32,
+    pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
 }
 
 impl NativeBarLockState {
@@ -717,8 +724,11 @@ pub enum NativeVideoOutputEvent {
         pixel_width: usize,
         pixel_height: usize,
     },
-    SetSeekStripState {
-        state: crate::settings::VideoSeekStripState,
+    SetSeekStripView {
+        view: seek_strip_layout::SeekStripView,
+    },
+    SetSeekStripHeight {
+        height: seek_strip_layout::SeekStripHeight,
     },
     StepSeekStripRange {
         step: seek_strip::SeekStripRangeStep,
@@ -1110,9 +1120,7 @@ enum NativeVideoOutputCommand {
         info_panel_locked: bool,
     },
     SetBarLockState {
-        top_locked: bool,
-        bottom_lock: crate::settings::VideoBottomLock,
-        fixed_bar_gap_px: u32,
+        state: NativeBarLockState,
     },
     ResetSidePanelSession,
     SetLoopEnabled {
@@ -2493,19 +2501,10 @@ impl NativeVideoOutput {
             });
     }
 
-    fn set_bar_lock_state(
-        &self,
-        top_locked: bool,
-        bottom_lock: crate::settings::VideoBottomLock,
-        fixed_bar_gap_px: u32,
-    ) {
+    fn set_bar_lock_state(&self, state: NativeBarLockState) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SetBarLockState {
-                top_locked,
-                bottom_lock,
-                fixed_bar_gap_px,
-            });
+            .send(NativeVideoOutputCommand::SetBarLockState { state });
     }
 
     fn reset_side_panel_session(&self) {
@@ -4015,7 +4014,10 @@ fn send_native_overlay_command(
             pixel_width,
             pixel_height,
         },
-        Command::SetSeekStripState { state } => NativeVideoOutputEvent::SetSeekStripState { state },
+        Command::SetSeekStripView { view } => NativeVideoOutputEvent::SetSeekStripView { view },
+        Command::SetSeekStripHeight { height } => {
+            NativeVideoOutputEvent::SetSeekStripHeight { height }
+        }
         Command::StepSeekStripRange { step } => NativeVideoOutputEvent::StepSeekStripRange { step },
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
@@ -5007,22 +5009,9 @@ fn run_native_video_output(
                         ));
                     }
                 }
-                NativeVideoOutputCommand::SetBarLockState {
-                    top_locked,
-                    bottom_lock,
-                    fixed_bar_gap_px,
-                } => {
-                    cur_bar_lock = NativeBarLockState {
-                        top_locked,
-                        bottom_lock,
-                        fixed_bar_gap_px,
-                    }
-                    .clamped();
-                    if let Err(err) = presenter.set_overlay_bar_lock_state(
-                        top_locked,
-                        bottom_lock,
-                        fixed_bar_gap_px,
-                    ) {
+                NativeVideoOutputCommand::SetBarLockState { state } => {
+                    cur_bar_lock = state.clamped();
+                    if let Err(err) = presenter.set_overlay_bar_lock_state(state) {
                         crate::logger::log(format!(
                             "[native-video] set fixed-bar transform failed: {err}"
                         ));
@@ -6192,11 +6181,18 @@ fn run_native_video_output(
                                     },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripState { state } => {
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::SetSeekStripState { state },
+                                    NativeVideoOutputEvent::SetSeekStripView { view },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripHeight { height },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { step } => {
@@ -9681,14 +9677,9 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub(crate) fn set_native_bar_lock_state(
-        &self,
-        top_locked: bool,
-        bottom_lock: crate::settings::VideoBottomLock,
-        fixed_bar_gap_px: u32,
-    ) {
+    pub(crate) fn set_native_bar_lock_state(&self, state: crate::video::NativeBarLockState) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_bar_lock_state(top_locked, bottom_lock, fixed_bar_gap_px);
+            output.set_bar_lock_state(state);
         }
     }
 

@@ -197,8 +197,8 @@ mod windows_impl {
         DestroyWindow, GetCursorPos, HMENU, HWND_TOPMOST, MF_BYPOSITION, MF_GRAYED, MF_POPUP,
         MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_STYLE,
-        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT, WS_EX_TOPMOST,
-        WS_POPUP,
+        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
 
@@ -1411,7 +1411,15 @@ mod windows_impl {
     }
 
     struct TrackedMenuTooltip {
-        owner: HWND,
+        /// `TTTOOLINFOW.hwnd` に載せる「どの窓のツールか」。
+        ///
+        /// **この窓を `CreateWindowExW` のオーナーにはしない。** owned window は常に owner の
+        /// 上に置かれるため、`WS_EX_TOPMOST` の tooltip を main window の owned として作ると
+        /// **main が Z 順で引き上げられる**。F12 で切り離した窓や専用フルスクリーン窓の上で
+        /// 右クリックすると、メニューを出す前にメインが手前へ出ていた (backlog §1.162、
+        /// 実測で確定 2026-09-02)。tooltip は自分で位置を決めて出し入れし、Drop で壊すので、
+        /// owner 関係を持つ必要が無い。
+        tool_window: HWND,
         hwnd: HWND,
         reasons: std::collections::HashMap<u32, String>,
         text: Vec<u16>,
@@ -1420,7 +1428,7 @@ mod windows_impl {
 
     impl TrackedMenuTooltip {
         fn new(
-            owner: HWND,
+            tool_window: HWND,
             reasons: std::collections::HashMap<u32, String>,
         ) -> Result<Self, String> {
             let common_controls = INITCOMMONCONTROLSEX {
@@ -1435,7 +1443,8 @@ mod windows_impl {
             }
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_TOPMOST,
+                    // `WS_EX_TOOLWINDOW`: owner を持たない popup がタスクバーへ出ないように。
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                     TOOLTIPS_CLASSW,
                     PCWSTR::null(),
                     WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
@@ -1443,7 +1452,8 @@ mod windows_impl {
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
-                    Some(owner),
+                    // owner を渡さない。理由は `tool_window` の doc comment を参照。
+                    None,
                     None,
                     None,
                     None,
@@ -1463,7 +1473,7 @@ mod windows_impl {
             };
             unsafe { SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(500))) };
             Ok(Self {
-                owner,
+                tool_window,
                 hwnd,
                 reasons,
                 text: Vec::new(),
@@ -1471,11 +1481,22 @@ mod windows_impl {
             })
         }
 
+        /// `TTTOOLINFOW` のうち、common controls **v5** が受け付ける長さ。
+        ///
+        /// SDK の `TTTOOLINFO_V1_SIZE` と同じで、v6 で足された `lpReserved` を含まない。
+        /// **v6 のマニフェストを持たないプロセスでは、これを送らないと `TTM_ADDTOOLW` が
+        /// 0 を返して失敗する** — common controls は自分が知らない大きさの `cbSize` を
+        /// 拒否する。mIV は `set_manifest` していないので v5 が読み込まれ、
+        /// `size_of::<TTTOOLINFOW>()` (v6 の長さ) では通らない。実装当初からツールチップが
+        /// 一度も出なかった原因がこれ (実測で確定 2026-09-02)。v6 側は短い方も受け付けるので、
+        /// 将来マニフェストを足してもこのままでよい。
+        const TOOL_INFO_V1_SIZE: u32 = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
+
         fn tool_info(&mut self) -> TTTOOLINFOW {
             TTTOOLINFOW {
-                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                cbSize: Self::TOOL_INFO_V1_SIZE,
                 uFlags: TTF_TRACK | TTF_ABSOLUTE,
-                hwnd: self.owner,
+                hwnd: self.tool_window,
                 uId: 1,
                 lpszText: PWSTR(self.text.as_mut_ptr()),
                 ..Default::default()
@@ -1483,7 +1504,8 @@ mod windows_impl {
         }
 
         fn handle_menu_select(&mut self, wparam: WPARAM, lparam: LPARAM) {
-            match menu_tooltip_selection(wparam.0, lparam.0) {
+            let selection = menu_tooltip_selection(wparam.0, lparam.0);
+            match selection {
                 MenuTooltipSelection::Show(id) if self.reasons.contains_key(&id) => self.show(id),
                 MenuTooltipSelection::Hide | MenuTooltipSelection::Show(_) => self.hide(),
             }
@@ -1508,6 +1530,9 @@ mod windows_impl {
                 )
             };
             if added.0 == 0 {
+                crate::logger::log(
+                    "menu_tooltip: TTM_ADDTOOLW failed; no tooltip will be shown".to_string(),
+                );
                 self.text.clear();
                 return;
             }
@@ -1649,6 +1674,25 @@ mod windows_impl {
     #[cfg(test)]
     mod data_object_smoke_test {
         use super::*;
+
+        /// `cbSize` は **v6 の長さではなく v1 の長さ**を送る。common controls v5 は
+        /// 自分が知らない大きさを拒否し、`TTM_ADDTOOLW` が 0 を返す。この不等号が
+        /// 崩れる (= 両者が同じ長さになる) ことは無いが、意図として固定しておく。
+        #[test]
+        fn tooltip_tool_info_size_is_the_one_comctl32_v5_accepts() {
+            use windows::Win32::UI::Controls::TTTOOLINFOW;
+
+            let v1 = std::mem::offset_of!(TTTOOLINFOW, lpReserved);
+            assert!(
+                v1 < std::mem::size_of::<TTTOOLINFOW>(),
+                "v1 サイズは lpReserved を含まないので、構造体全体より短いはず"
+            );
+            assert_eq!(
+                v1,
+                std::mem::offset_of!(TTTOOLINFOW, lParam) + std::mem::size_of::<isize>(),
+                "v1 サイズは lParam までの長さ"
+            );
+        }
 
         #[test]
         fn disabled_reason_map_records_only_disabled_nonempty_leaf_reasons() {

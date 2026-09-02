@@ -2270,7 +2270,16 @@ impl crate::app::App {
         use sha2::Digest as _;
 
         let export = self.prepare_spread_export_dialog_target(ctx, left, right)?;
-        let image = crate::export_dialog::render_export_pixels(&export.pixels, None, None)?;
+        // preset なしなので隠蔽の再合成は走らず、crop と回転と見開き結合だけ。UI スレッド
+        // から同期で呼ぶ短い処理で中断させる相手がいないため、cancel は立てない。
+        let never_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let image = crate::export_dialog::render_export_pixels(
+            &export.pixels,
+            None,
+            None,
+            &never_cancelled,
+        )
+        .map_err(|error| error.to_string())?;
         let mut digest = sha2::Sha256::new();
         digest.update((image.size[0] as u64).to_le_bytes());
         digest.update((image.size[1] as u64).to_le_bytes());

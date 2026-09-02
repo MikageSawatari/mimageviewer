@@ -214,6 +214,9 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ai/final_pipeline.rs` | fullscreen と remote AI が共有する effective upscale / denoise model 選択、native 寸法 size gate、model load、denoise → upscale 実行順の正本。任意の progress sink を受け、local は no-op、remote は model / tile phase を job progress へ投影する。model load failure 時の既存 fallback と cancel 境界を共有し、本体と remote の適用判定・出力順を分岐させない |
 | `final_composite.rs` | 静止画のページ個別 > 現在地標準 > global 解決、`FinalCompositePlan`、tone → smart sharpen → colorize → Creative LUT → post_filter の共有 CPU executor。元画像・編集結果の materialize、final AI、cache / worker / GPU upload は App / remote adapter 側に残す |
 | `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
+| `edit_bundle.rs` | ページ個別補正、消しゴム、隠蔽加工、補正レイヤー、切り取り、注釈の 6 系統を `PageEditBundle` として snapshot 化し、対象寸法への変換と 6 DB の attached transaction による全置換を担う。空 bundle も同じ経路で各行を DELETE する |
+| `edit_bundle_app.rs` | 単一ページの編集内容コピー / 貼り付けと、DB commit 成功後の sidecar、presence set、表示・比較・編集 preview cache、および置換前の対象ページ編集 Undo の無効化を担う App 接続層 |
+| `edit_bundle_bulk.rs` | チェック優先・カーソル fallback の一括対象解決、貼り付け / 7 種リセットの確認・進捗・キャンセル、および対象ごとに `edit_bundle_app` の runtime commit を再利用する逐次適用を担う。回転だけは bundle 外として UI thread で `set_image_rotation` へ渡す |
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
@@ -336,6 +339,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `Pictures\mimageviewer\books\...` (既定、設定可) | 製本した本の実体。DB ではなく通常フォルダ + `0001_元名.ext` 画像ファイルのみ。`Settings.book_root` で変更でき、Ctrl+S/Ctrl+G の自動索引対象外 | `books.rs` + `ui_main.rs` + `ui_fullscreen.rs` |
 | `Settings.keymap` / `keymap.ini.default` | キーボード割り当て設定。GUI 編集の正本は `settings.db` 内の `Settings.keymap`。旧 `keymap.ini` が残っている環境では初回起動時に読み込み、同じ内容を `Settings.keymap` へ移してから `keymap.ini.imported*.bak` へリネームする。以後 `keymap.ini` は通常読み込み対象外。`keymap.ini.default` は現在バージョンの Action 名と既定キーを確認する参照ファイルとして更新される。競合は拒否せず warning として扱う | `keymap.rs` + `settings.rs` |
 | `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache。ページ数取得は詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元コンテナから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
+| `video_tile_thumbs.db` | 動画タイル / resume サムネイルの WebP と、粗い全尺波形の量子化 chunk。波形 chunk は path、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用し、窓解析と raster は保存しない。サムネイルキャッシュ管理のファイル単位・フォルダ単位・全件削除を共有する | `video/tile_thumb_cache.rs` + `video/seek_strip_wave.rs` |
 | `content_identity.db` | 物理ファイルの size / 先頭 64 KiB hash / 全体 hash と、復元元か検出 cache だけかを表す `has_restorable_content`、復元辞退組を保持する。schema は `PRAGMA user_version` の単一入口で作成 / upgrade し、unversioned A1 行へ列を足す migration の default は復元元を表す `1`。期待 schema を用意できない session は typed `Unusable` とし、空台帳として処理を続けない | `content_identity.rs` + `app/content_identity_detection.rs` |
 | `auto_aspect_cache.db` | Auto サムネイル比率のフォルダ別前回確定値。フォルダ再訪時はこの値を初期 `auto_aspect.current` にして、後続の実統計で必要なら既存ゲート (streak/cooldown 等) に従って補正する。サムネイルキャッシュ管理の削除操作と連動してリセットされる | `auto_aspect_cache.rs` + `app.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |

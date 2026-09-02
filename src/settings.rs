@@ -807,6 +807,7 @@ pub enum DetailsSortKey {
     Toolbar,
     Name,
     Rating,
+    RatedAt,
     Tags,
     Kind,
     PageCount,
@@ -827,6 +828,7 @@ impl DetailsSortKey {
             Self::Toolbar => "ツールバー順",
             Self::Name => "名前",
             Self::Rating => "★",
+            Self::RatedAt => "★設定時刻",
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
@@ -916,6 +918,7 @@ pub enum DetailsColumnId {
     Preview,
     Name,
     Rating,
+    RatedAt,
     Tags,
     Kind,
     PageCount,
@@ -936,6 +939,7 @@ impl DetailsColumnId {
             Self::Preview,
             Self::Name,
             Self::Rating,
+            Self::RatedAt,
             Self::Tags,
             Self::Kind,
             Self::PageCount,
@@ -3508,6 +3512,10 @@ pub struct Settings {
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
     pub details_column_widths: Vec<DetailsColumnWidth>,
+    /// v3.4.0 が知らない `DetailsColumnId::RatedAt` を既存の列幅配列へ保存しないための
+    /// 専用キャリア。追加フィールドは旧版に無視されるので、列幅だけを安全に保持できる。
+    #[serde(default)]
+    pub details_rated_at_width: Option<f32>,
     /// v2.5.0 が知らないページ数列の位置・幅を、旧版が無視できる未知フィールドへ退避する。
     #[serde(default)]
     pub(crate) details_page_count_column_index_stash: Option<usize>,
@@ -3526,6 +3534,8 @@ pub struct Settings {
     pub details_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_show_rated_at: bool,
     #[serde(default = "default_true")]
     pub details_show_tags: bool,
     #[serde(default = "default_true")]
@@ -3566,10 +3576,15 @@ pub struct Settings {
     /// 詳細表示中の下部情報バー専用の列幅。
     #[serde(default)]
     pub details_selection_bar_column_widths: Vec<DetailsColumnWidth>,
+    /// 下部情報バー側の ★設定時刻列幅も、v3.4.0 が読む既存配列から分離して保存する。
+    #[serde(default)]
+    pub details_selection_bar_rated_at_width: Option<f32>,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_rated_at: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_tags: bool,
     #[serde(default = "default_true")]
@@ -4113,6 +4128,20 @@ pub struct Settings {
     /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
+    /// グリッド選択の一括エクスポートの保存先。単ページの `export_last_directory` とは
+    /// 別に持つ (一括は「送信用」など決まったフォルダへ繰り返し出す使い方が主で、
+    /// 単ページの直前保存先で上書きされると毎回選び直しになる)。
+    #[serde(default)]
+    pub export_batch_directory: Option<PathBuf>,
+    /// 一括エクスポートのファイル名テンプレート (`<filename>` / `<dirname>` / `<num>`)。
+    #[serde(default = "default_export_batch_template")]
+    pub export_batch_template: String,
+    /// 一括エクスポートの出力形式。
+    #[serde(default)]
+    pub export_batch_format: crate::capture::CaptureFormat,
+    /// 一括エクスポートの出力サイズ。
+    #[serde(default)]
+    pub export_batch_scale: crate::export_dialog::ExportScale,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -4251,6 +4280,13 @@ pub struct Settings {
     /// 連結読みの左スティック最大入力時スクロール速度 (画面サイズ比 %/秒)。
     #[serde(default = "default_continuous_reading_gamepad_scroll_percent_per_sec")]
     pub continuous_reading_gamepad_scroll_percent_per_sec: u32,
+    /// ゲームパッドからの操作を受け付けるか。false のときは**デバイスを読む
+    /// スレッドごと止める** (`GamepadRuntime::drain`)。読み捨てるだけだと、
+    /// スティックのずれで UI が起き続ける。
+    ///
+    /// 対象はゲームパッドだけで、マウスジェスチャ・リングフリックは含まない。
+    #[serde(default = "default_gamepad_enabled")]
+    pub gamepad_enabled: bool,
 
     /// ZIP/PDF/対応アーカイブを一覧や起動引数/SendTo から明示的に開いたとき、
     /// ページ一覧を経由せずページを即フルスクリーンで開く。ON のときフルスクリーン中の
@@ -4642,6 +4678,17 @@ pub struct Settings {
     /// どうかを表す state ではなく、明示的な復元先だけを所有する。
     #[serde(default, alias = "video_seek_strip_mode")]
     pub video_seek_strip_last_choice: VideoSeekStripMode,
+    /// ストリップが動画のどこを写すか (周辺 / 全体)。表示内容と直交するので、
+    /// 場面と波形を行き来しても選択を保つ。
+    #[serde(default)]
+    pub video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan,
+    /// ストリップの高さ (大 / 中 / 小 / 最小)。
+    #[serde(default)]
+    pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// `Shift+S` の巡回に含める表示。**機能自体の非表示ではない** — 外した表示も
+    /// 右下のメニューからは選べる。全解除は `sanitize` が既定へ戻す。
+    #[serde(default)]
+    pub video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -5722,6 +5769,10 @@ fn default_continuous_reading_wheel_scroll_percent() -> u32 {
 fn default_continuous_reading_key_scroll_percent() -> u32 {
     16
 }
+fn default_gamepad_enabled() -> bool {
+    true
+}
+
 fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
     130
 }
@@ -5752,6 +5803,11 @@ pub fn default_rating_filter() -> [bool; 6] {
 
 /// `Ctrl+E` ダイアログのバリエーションチェック初期値。
 /// `[現在の設定, プリセット 1, 2, 3, 4]` → 現在の設定だけ ON。
+/// 既定のテンプレート。単ページ `Ctrl+E` の既定ファイル名 (`<元の名前>_edited`) に揃える。
+pub fn default_export_batch_template() -> String {
+    "<filename>_edited".to_string()
+}
+
 pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
@@ -5814,6 +5870,12 @@ fn sanitize_details_column_widths(widths: &mut Vec<DetailsColumnWidth>) {
     );
 }
 
+fn sanitize_optional_details_column_width(width: &mut Option<f32>) {
+    *width = width
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(40.0, 800.0));
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -5831,6 +5893,7 @@ impl Default for Settings {
             details_row_style: DetailsRowStyle::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
+            details_rated_at_width: None,
             details_page_count_column_index_stash: None,
             details_page_count_column_width_stash: None,
             details_place_column_index_stash: None,
@@ -5841,6 +5904,7 @@ impl Default for Settings {
             details_name_width: default_details_name_width(),
             details_show_preview: true,
             details_show_rating: true,
+            details_show_rated_at: true,
             details_show_tags: true,
             details_show_kind: true,
             details_show_page_count: true,
@@ -5856,8 +5920,10 @@ impl Default for Settings {
             details_selection_bar_mode: DetailsSelectionBarMode::SameAsDetails,
             details_selection_bar_column_order: Vec::new(),
             details_selection_bar_column_widths: Vec::new(),
+            details_selection_bar_rated_at_width: None,
             details_selection_bar_show_preview: true,
             details_selection_bar_show_rating: true,
+            details_selection_bar_show_rated_at: true,
             details_selection_bar_show_tags: true,
             details_selection_bar_show_kind: true,
             details_selection_bar_show_page_count: true,
@@ -5999,6 +6065,7 @@ impl Default for Settings {
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
             continuous_reading_gamepad_scroll_percent_per_sec:
                 default_continuous_reading_gamepad_scroll_percent_per_sec(),
+            gamepad_enabled: default_gamepad_enabled(),
             auto_fullscreen_zip_pdf: false,
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
@@ -6127,6 +6194,9 @@ impl Default for Settings {
             video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
             video_seek_strip_state: VideoSeekStripState::default(),
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
+            video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
+            video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_seek_strip_locked: false,
@@ -6190,6 +6260,10 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            export_batch_directory: None,
+            export_batch_template: default_export_batch_template(),
+            export_batch_format: crate::capture::CaptureFormat::default(),
+            export_batch_scale: crate::export_dialog::ExportScale::default(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -7402,6 +7476,43 @@ impl Settings {
         }
     }
 
+    /// ★設定時刻列を、この列を知らない v3.4.0 が deserialize できる形へ変換する。
+    ///
+    /// ソートはレーティング一覧内だけの状態なので `Toolbar` に戻し、列順は保存しない。
+    /// 幅だけは旧版が無視できる専用フィールドへ移す。下部情報バーの既存配列にも
+    /// 未知 variant を残せないため、同じ境界で除去する。
+    pub(crate) fn stash_details_rated_at_for_persist(&mut self) {
+        if matches!(self.details_sort_key, DetailsSortKey::RatedAt) {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::RatedAt);
+        if let Some(width) = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::RatedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_rated_at_width = Some(width);
+        }
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::RatedAt);
+
+        self.details_selection_bar_column_order
+            .retain(|column| *column != DetailsColumnId::RatedAt);
+        if let Some(width) = self
+            .details_selection_bar_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::RatedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_selection_bar_rated_at_width = Some(width);
+        }
+        self.details_selection_bar_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::RatedAt);
+    }
+
     /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
     ///
     /// 旧版が読む既存フィールドには既知の variant だけを残し、ページ数列の状態は
@@ -7559,8 +7670,10 @@ impl Settings {
     pub fn copy_details_columns_to_selection_bar(&mut self) {
         self.details_selection_bar_column_order = self.details_column_order.clone();
         self.details_selection_bar_column_widths = self.details_column_widths.clone();
+        self.details_selection_bar_rated_at_width = self.details_rated_at_width;
         self.details_selection_bar_show_preview = self.details_show_preview;
         self.details_selection_bar_show_rating = self.details_show_rating;
+        self.details_selection_bar_show_rated_at = self.details_show_rated_at;
         self.details_selection_bar_show_tags = self.details_show_tags;
         self.details_selection_bar_show_kind = self.details_show_kind;
         self.details_selection_bar_show_page_count = self.details_show_page_count;
@@ -7665,6 +7778,8 @@ impl Settings {
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
             .last_choice(self.video_seek_strip_last_choice);
+        // 巡回対象を全部外した設定は `Shift+S` を無反応にする。読み込み時に既定へ戻す。
+        self.video_seek_strip_cycle = self.video_seek_strip_cycle.normalized();
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -7853,8 +7968,10 @@ impl Settings {
         self.restore_details_place_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
+        sanitize_optional_details_column_width(&mut self.details_rated_at_width);
         sanitize_details_column_order(&mut self.details_selection_bar_column_order);
         sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
+        sanitize_optional_details_column_width(&mut self.details_selection_bar_rated_at_width);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
@@ -7970,10 +8087,12 @@ impl Settings {
         self.details_row_style = src.details_row_style;
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
+        self.details_rated_at_width = src.details_rated_at_width;
         self.details_name_width_auto = src.details_name_width_auto;
         self.details_name_width = src.details_name_width;
         self.details_show_preview = src.details_show_preview;
         self.details_show_rating = src.details_show_rating;
+        self.details_show_rated_at = src.details_show_rated_at;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
         self.details_show_page_count = src.details_show_page_count;
@@ -7988,10 +8107,12 @@ impl Settings {
         self.details_show_video_codec = src.details_show_video_codec;
         self.details_selection_bar_column_order = src.details_selection_bar_column_order.clone();
         self.details_selection_bar_column_widths = src.details_selection_bar_column_widths.clone();
+        self.details_selection_bar_rated_at_width = src.details_selection_bar_rated_at_width;
         self.details_selection_bar_name_width_auto = src.details_selection_bar_name_width_auto;
         self.details_selection_bar_name_width = src.details_selection_bar_name_width;
         self.details_selection_bar_show_preview = src.details_selection_bar_show_preview;
         self.details_selection_bar_show_rating = src.details_selection_bar_show_rating;
+        self.details_selection_bar_show_rated_at = src.details_selection_bar_show_rated_at;
         self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
         self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
         self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
@@ -8333,6 +8454,25 @@ impl Settings {
 mod tests {
     use super::*;
 
+    /// ゲームパッドの有効/無効は既定 true。設定を知らない頃のファイルを読んでも、
+    /// 既存利用者のパッドを黙って切らない。
+    #[test]
+    fn the_gamepad_stays_enabled_unless_it_was_turned_off_on_purpose() {
+        assert!(Settings::default().gamepad_enabled);
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            missing.gamepad_enabled,
+            "この設定を知らない頃のファイルでも、パッドは有効のまま"
+        );
+
+        let turned_off: Settings = serde_json::from_str(r#"{"gamepad_enabled":false}"#).unwrap();
+        assert!(!turned_off.gamepad_enabled);
+        let round_tripped: Settings =
+            serde_json::from_str(&serde_json::to_string(&turned_off).unwrap()).unwrap();
+        assert!(!round_tripped.gamepad_enabled, "切った状態は次回も残る");
+    }
+
     #[test]
     fn sns_split_settings_have_stable_defaults() {
         let defaults = Settings::default();
@@ -8510,6 +8650,63 @@ mod tests {
         );
     }
 
+    /// 表示範囲・高さ・巡回対象は保存され、既定は従来の見え方のまま。
+    #[test]
+    fn video_seek_strip_span_height_and_cycle_round_trip_with_the_shipped_defaults() {
+        use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripSpan};
+
+        // 既定は出荷済みの見え方 (周辺表示・大) で、更新しても見た目が変わらない。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Window);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Large);
+        assert_eq!(
+            loaded.video_seek_strip_cycle,
+            crate::video::seek_strip_layout::SeekStripCycleSet::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_span = SeekStripSpan::Whole;
+        settings.video_seek_strip_height = SeekStripHeight::Smallest;
+        settings.video_seek_strip_cycle.waveform_whole = false;
+        let stored = serde_json::to_value(settings).unwrap();
+        assert_eq!(stored["video_seek_strip_span"], "whole");
+        assert_eq!(stored["video_seek_strip_height"], "smallest");
+        assert_eq!(stored["video_seek_strip_cycle"]["waveform_whole"], false);
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Whole);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Smallest);
+        assert!(!loaded.video_seek_strip_cycle.waveform_whole);
+        assert!(loaded.video_seek_strip_cycle.thumbnails_window);
+    }
+
+    /// 巡回対象を全部外した設定は読み込みで既定へ戻す。そのままだと `Shift+S` が
+    /// 「非表示 → 非表示」になり、キーが無反応になる。
+    #[test]
+    fn sanitize_restores_a_seek_strip_cycle_that_has_nothing_left_in_it() {
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: false,
+        };
+        settings.sanitize();
+        assert!(settings.video_seek_strip_cycle.thumbnails_window);
+
+        // 1 つでも残っていれば、その選択をそのまま尊重する。
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: true,
+        };
+        settings.sanitize();
+        assert!(!settings.video_seek_strip_cycle.thumbnails_window);
+        assert!(settings.video_seek_strip_cycle.waveform_whole);
+    }
+
     #[test]
     fn video_seek_strip_three_state_cycle_and_last_choice_restore_are_pure() {
         assert_eq!(
@@ -8660,12 +8857,20 @@ mod tests {
             settings.details_column_widths
         );
         assert_eq!(
+            settings.details_selection_bar_rated_at_width,
+            settings.details_rated_at_width
+        );
+        assert_eq!(
             settings.details_selection_bar_show_preview,
             settings.details_show_preview
         );
         assert_eq!(
             settings.details_selection_bar_show_rating,
             settings.details_show_rating
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_rated_at,
+            settings.details_show_rated_at
         );
         assert_eq!(
             settings.details_selection_bar_show_tags,
@@ -9192,8 +9397,10 @@ mod tests {
                 width: 234.0,
             },
         ];
+        original.details_selection_bar_rated_at_width = Some(210.0);
         original.details_selection_bar_show_preview = false;
         original.details_selection_bar_show_rating = false;
+        original.details_selection_bar_show_rated_at = false;
         original.details_selection_bar_show_tags = false;
         original.details_selection_bar_show_kind = false;
         original.details_selection_bar_show_page_count = false;
@@ -9223,8 +9430,10 @@ mod tests {
             loaded.details_selection_bar_column_widths,
             original.details_selection_bar_column_widths
         );
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(210.0));
         assert!(!loaded.details_selection_bar_show_preview);
         assert!(!loaded.details_selection_bar_show_rating);
+        assert!(!loaded.details_selection_bar_show_rated_at);
         assert!(!loaded.details_selection_bar_show_tags);
         assert!(!loaded.details_selection_bar_show_kind);
         assert!(!loaded.details_selection_bar_show_page_count);
@@ -9263,6 +9472,7 @@ mod tests {
                 width: 900.0,
             },
         ];
+        loaded.details_selection_bar_rated_at_width = Some(900.0);
         loaded.details_selection_bar_name_width = 900.0;
 
         loaded.sanitize();
@@ -9293,6 +9503,7 @@ mod tests {
             DetailsColumnId::Size
         );
         assert_f32_close(loaded.details_selection_bar_column_widths[0].width, 800.0);
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(800.0));
         assert_f32_close(loaded.details_selection_bar_name_width, 800.0);
     }
 
@@ -9304,8 +9515,10 @@ mod tests {
             column: DetailsColumnId::Size,
             width: 177.0,
         }];
+        settings.details_rated_at_width = Some(166.0);
         settings.details_show_preview = false;
         settings.details_show_rating = false;
+        settings.details_show_rated_at = false;
         settings.details_show_tags = false;
         settings.details_show_kind = false;
         settings.details_show_page_count = false;
@@ -10433,17 +10646,72 @@ mod tests {
     fn extended_details_column_stashes_preserve_relative_order() {
         let mut settings = Settings::default();
         settings.details_column_order = DetailsColumnId::default_order().to_vec();
-        let expected = settings.details_column_order.clone();
+        settings.details_selection_bar_column_order = DetailsColumnId::default_order().to_vec();
+        settings.details_selection_bar_column_order.rotate_left(4);
+        settings.details_sort_key = DetailsSortKey::RatedAt;
+        settings.details_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::RatedAt,
+            width: 154.0,
+        }];
+        settings.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::RatedAt,
+            width: 176.0,
+        }];
+        let expected_details_without_rated_at = settings
+            .details_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        let expected_selection_bar_without_rated_at = settings
+            .details_selection_bar_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
 
         let mut persisted = settings.clone();
-        // sanitize restores PageCount before Place, so persistence removes them in reverse.
+        // save_full と同じ順序。RatedAt は位置を保存せず、Place / PageCount は
+        // 読み込み時の復元順と逆順に退避して、既知列同士の位置を保つ。
+        persisted.stash_details_rated_at_for_persist();
         persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         let json = serde_json::to_string(&persisted).unwrap();
+        assert!(!json.contains("RatedAt"));
 
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
         loaded.sanitize();
-        assert_eq!(loaded.details_column_order, expected);
+        let loaded_details_without_rated_at = loaded
+            .details_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        let loaded_selection_bar_without_rated_at = loaded
+            .details_selection_bar_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            loaded_details_without_rated_at,
+            expected_details_without_rated_at
+        );
+        assert_eq!(
+            loaded_selection_bar_without_rated_at,
+            expected_selection_bar_without_rated_at
+        );
+        assert_eq!(
+            loaded.details_column_order.last(),
+            Some(&DetailsColumnId::RatedAt)
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_order.last(),
+            Some(&DetailsColumnId::RatedAt)
+        );
+        assert_eq!(loaded.details_rated_at_width, Some(154.0));
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(176.0));
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::Toolbar);
     }
 
     #[test]
@@ -11107,6 +11375,8 @@ mod tests {
             column: DetailsColumnId::Kind,
             width: 199.0,
         }];
+        live.details_selection_bar_rated_at_width = Some(188.0);
+        live.details_selection_bar_show_rated_at = false;
         live.details_selection_bar_show_size = false;
         live.details_selection_bar_show_video_codec = true;
         live.details_selection_bar_name_width_auto = false;
@@ -11132,6 +11402,8 @@ mod tests {
                 width: 199.0,
             }]
         );
+        assert_eq!(edited.details_selection_bar_rated_at_width, Some(188.0));
+        assert!(!edited.details_selection_bar_show_rated_at);
         assert!(!edited.details_selection_bar_show_size);
         assert!(edited.details_selection_bar_show_video_codec);
         assert!(!edited.details_selection_bar_name_width_auto);
@@ -13653,8 +13925,10 @@ mod tests {
                     width: 234.0,
                 },
             ];
+            settings.details_selection_bar_rated_at_width = Some(198.0);
             settings.details_selection_bar_show_preview = false;
             settings.details_selection_bar_show_rating = false;
+            settings.details_selection_bar_show_rated_at = false;
             settings.details_selection_bar_show_tags = false;
             settings.details_selection_bar_show_kind = false;
             settings.details_selection_bar_show_page_count = false;
@@ -13668,7 +13942,16 @@ mod tests {
             settings.details_selection_bar_show_video_codec = true;
             settings.details_selection_bar_name_width_auto = false;
             settings.details_selection_bar_name_width = 345.0;
-            let expected_data = selection_bar_data_value(&settings);
+            let mut expected = settings.clone();
+            // RatedAt の位置は v3.4.0 互換のため保存せず、読み込み時に不足列として
+            // 末尾へ補完する。ほかの下部情報バー設定は従来どおり完全に往復する。
+            expected
+                .details_selection_bar_column_order
+                .retain(|column| *column != DetailsColumnId::RatedAt);
+            expected
+                .details_selection_bar_column_order
+                .push(DetailsColumnId::RatedAt);
+            let expected_data = selection_bar_data_value(&expected);
 
             settings.save();
             reset_backup_state_for_test();
@@ -13679,6 +13962,8 @@ mod tests {
                 DetailsSelectionBarMode::Dedicated
             );
             assert_eq!(selection_bar_data_value(&loaded), expected_data);
+            assert_eq!(loaded.details_selection_bar_rated_at_width, Some(198.0));
+            assert!(!loaded.details_selection_bar_show_rated_at);
         }
 
         /// `thumb_aspect_auto` の save→load ラウンドトリップ。

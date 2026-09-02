@@ -34,6 +34,8 @@ pub enum MenuCommand {
     CopyImageToClipboard,
     CopyEditBundle,
     PasteEditBundle,
+    BulkPasteEditBundle,
+    ResetPageEdits,
     JumpToFolder,
     JumpToBookFolder,
     OpenContainerAsPage,
@@ -288,6 +290,27 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 ],
             );
         }
+        if input.surface == ContextMenuSurface::Grid {
+            // 対象外 (動画 / 音声 / フォルダ) が混じっていても出す。回転と同じで、
+            // 選択の中身ではなく操作の有無で決める。実際に何件へ効くかは確認
+            // ダイアログが「対象 N 件 / 対象外 M 件」として出す。
+            push_group(
+                &mut nodes,
+                [
+                    MenuNode::Item {
+                        command: MenuCommand::BulkPasteEditBundle,
+                        label: format!("編集内容をまとめて貼り付け [{}件]", input.checked_count),
+                        enabled: input.can_paste_edit_bundle,
+                        disabled_reason: (!input.can_paste_edit_bundle)
+                            .then(|| "コピーされた編集内容がありません".to_string()),
+                    },
+                    item(
+                        MenuCommand::ResetPageEdits,
+                        format!("編集内容をリセット… [{}件]", input.checked_count),
+                    ),
+                ],
+            );
+        }
         if input.has_explorer_folder {
             push_group(
                 &mut nodes,
@@ -377,6 +400,14 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         });
     }
     push_group(&mut nodes, copy_group);
+
+    if input.kind.supports_page_edits() {
+        // コピー系とは別グループにして、消す操作を並びで見分けられるようにする。
+        push_group(
+            &mut nodes,
+            [item(MenuCommand::ResetPageEdits, "編集内容をリセット…")],
+        );
+    }
 
     if input.surface == ContextMenuSurface::Grid && input.kind.supports_container_open() {
         push_group(
@@ -602,6 +633,7 @@ mod tests {
                     "画像をクリップボードにコピー",
                     "編集内容をコピー",
                     "編集内容を貼り付け",
+                    "編集内容をリセット…",
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
@@ -691,6 +723,7 @@ mod tests {
                     "画像をクリップボードにコピー",
                     "編集内容をコピー",
                     "編集内容を貼り付け",
+                    "編集内容をリセット…",
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
@@ -704,6 +737,7 @@ mod tests {
                     "ページ名をコピー",
                     "編集内容をコピー",
                     "編集内容を貼り付け",
+                    "編集内容をリセット…",
                     "左に回転 (L)",
                     "右に回転 (R)",
                     "アプリケーションで開く…",
@@ -744,6 +778,88 @@ mod tests {
         }
     }
 
+    /// 貼り付け系は単一も一括も「コピー済みの編集内容があるか」だけで決まる。
+    /// 片方だけ理由なしで灰色になると、なぜ押せないのかが入口ごとに変わる。
+    #[test]
+    fn both_paste_entries_share_one_reason_for_being_unavailable() {
+        for (mut case, label) in [
+            (
+                input(ContextMenuItemKind::Image, ContextMenuSurface::Grid),
+                "編集内容を貼り付け",
+            ),
+            (
+                {
+                    let mut checked = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+                    checked.has_checked = true;
+                    checked.checked_count = 3;
+                    checked
+                },
+                "編集内容をまとめて貼り付け [3件]",
+            ),
+        ] {
+            case.can_paste_edit_bundle = false;
+            let node = build_context_menu(&case)
+                .into_iter()
+                .find(|node| matches!(node, MenuNode::Item { label: found, .. } if found == label))
+                .unwrap_or_else(|| panic!("{label} が出ていない"));
+            let MenuNode::Item {
+                enabled,
+                disabled_reason,
+                ..
+            } = node
+            else {
+                panic!("{label} は Item のはず");
+            };
+            assert!(!enabled, "{label}: クリップボードが空なら押せない");
+            assert_eq!(
+                disabled_reason.as_deref(),
+                Some("コピーされた編集内容がありません"),
+                "{label}: 理由は入口によらず同じ"
+            );
+        }
+    }
+
+    /// リセットは単一 (カーソル) でもチェック複数でも同じ入口を通る。ページ編集を
+    /// 持てない種別には出さない。
+    #[test]
+    fn reset_is_offered_for_page_items_on_both_surfaces_and_for_a_checked_set() {
+        for kind in [
+            ContextMenuItemKind::Image,
+            ContextMenuItemKind::ZipImage,
+            ContextMenuItemKind::PdfPage,
+        ] {
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                assert!(
+                    labels(&build_context_menu(&input(kind, surface)))
+                        .contains(&"編集内容をリセット…".to_string()),
+                    "kind={kind:?}, surface={surface:?}"
+                );
+            }
+        }
+        for kind in [
+            ContextMenuItemKind::Video,
+            ContextMenuItemKind::Audio,
+            ContextMenuItemKind::Folder,
+            ContextMenuItemKind::ZipFile,
+            ContextMenuItemKind::PdfFile,
+            ContextMenuItemKind::Stack,
+        ] {
+            assert!(
+                !labels(&build_context_menu(&input(kind, ContextMenuSurface::Grid)))
+                    .contains(&"編集内容をリセット…".to_string()),
+                "kind={kind:?} はページ編集を持たない"
+            );
+        }
+
+        let mut checked = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        checked.has_checked = true;
+        checked.checked_count = 4;
+        assert!(
+            labels(&build_context_menu(&checked))
+                .contains(&"編集内容をリセット… [4件]".to_string())
+        );
+    }
+
     #[test]
     fn checked_virtual_mix_displays_the_full_selection_count() {
         let mut mixed = input(ContextMenuItemKind::ZipImage, ContextMenuSurface::Grid);
@@ -755,6 +871,8 @@ mod tests {
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
+                "編集内容をまとめて貼り付け [5件]",
+                "編集内容をリセット… [5件]",
                 "アプリケーションで開く…",
                 "外部ツールの設定…",
                 "ゴミ箱へ移動 (タグ・評価も整理) [5件]",

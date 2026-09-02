@@ -3660,6 +3660,9 @@ impl App {
         self.items_are_subfolder_expansion_view = false;
         self.items_are_drive_list = false;
         self.items_are_smart_folder_view = true;
+        // prepared grid の復元は start_loading_items を通らないため、Rating 一覧だけで
+        // 有効な ★設定時刻ソートをこの所有境界で解放して Toolbar 順を再構築する。
+        self.reset_details_sort_if_hidden();
         self.current_smart_folder_id = Some(definition_id);
         self.smart_folder_progress = None;
 
@@ -4902,6 +4905,64 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_ext_priority: Vec::new(),
         }
+    }
+
+    #[test]
+    fn prepared_smart_folder_restore_releases_rating_only_details_sort() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = uuid::Uuid::new_v4();
+        let mut definition = crate::settings::SmartFolderDefinition::new("復元テスト");
+        definition.id = definition_id;
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(Vec::new()),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let state = super::super::top_level_grid_view::SmartFolderViewState::root(
+            definition_id,
+            Vec::new(),
+        );
+        app.top_level_grid_view.replace_surface(
+            super::super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
+        );
+        app.top_level_grid_view
+            .install_smart_folder_session(SmartFolderSession::new(
+                snapshot,
+                Arc::new(ReusedSmartFolderMetadata::default()),
+            ));
+
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\Smart\a.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\Smart\b.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Failed, ThumbnailState::Failed];
+        app.image_metas = vec![Some((1, 10)), Some((2, 20))];
+        app.visible_indices = vec![0, 1];
+        app.details_order = vec![1, 0];
+        app.items_are_smart_folder_view = true;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+
+        let child = PathBuf::from(r"C:\Smart\child");
+        assert!(app.authorize_smart_folder_session_open(&child));
+        assert!(app.preserve_smart_folder_session_for_load(&child));
+
+        // Rating 一覧で専用列をソートした後、履歴から prepared root へ戻る経路を再現する。
+        app.items_are_smart_folder_view = false;
+        app.items_are_rating_view = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+        app.settings.details_sort_ascending = false;
+
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert!(!app.items_are_rating_view);
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(app.settings.details_sort_ascending);
+        assert_eq!(app.details_order, vec![0, 1]);
+        assert_eq!(app.grid_sort_lock_reason(), None);
     }
 
     #[test]

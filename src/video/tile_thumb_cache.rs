@@ -1,9 +1,9 @@
-//! 動画タイル モード のサムネイル WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で
-//! key を絶対 PTS 化)。
+//! 動画タイル モードのサムネイル WebP と、動画シークストリップの粗い全尺波形列の
+//! 永続キャッシュ (Phase 6.D-2、Phase 8.C でサムネイル key を絶対 PTS 化、D32 で
+//! 粗い波形列を追加)。
 //!
-//! `%APPDATA%/mimageviewer/video_tile_thumbs.db` に「(動画パス, タイル幅, 絶対 PTS
-//! ms) → WebP バイト列」を保存する。タイルモードを 2 度目以降開いたとき、ffmpeg
-//! seek + decode + swscale を省略して即座に表示できる。
+//! `%APPDATA%/mimageviewer/video_tile_thumbs.db` にサムネイルと粗い波形 chunk を保存する。
+//! タイルモードや波形ストリップを 2 度目以降開いたとき、再度の decode を省略できる。
 //!
 //! ## スキーマ (v3)
 //!
@@ -30,6 +30,20 @@
 //!     video_mtime  INTEGER NOT NULL,
 //!     render_version INTEGER NOT NULL
 //! );
+//!
+//! CREATE TABLE IF NOT EXISTS video_wave_chunks (
+//!     path            TEXT NOT NULL,
+//!     bin_secs_millis INTEGER NOT NULL,
+//!     chunk_index     INTEGER NOT NULL,
+//!     bins            BLOB NOT NULL,
+//!     bin_count       INTEGER NOT NULL,
+//!     video_mtime     INTEGER NOT NULL,
+//!     video_size      INTEGER NOT NULL,
+//!     format_version  INTEGER NOT NULL,
+//!     PRIMARY KEY (path, bin_secs_millis, chunk_index)
+//! );
+//! CREATE INDEX IF NOT EXISTS idx_video_wave_chunks_path
+//!    ON video_wave_chunks(path);
 //! ```
 //! `video_resume_thumbs` はホイール動画ナビゲーション中の静止画プレビュー用で、
 //! 動画 1 本につき最新 resume 位置の 1 行だけを upsert する。`tile_w` は
@@ -61,6 +75,9 @@ use std::sync::Mutex;
 /// v2 rows contain encoded-orientation pixels. v3 materializes display matrix
 /// orientation, so old rows must miss and be regenerated.
 const THUMB_RENDER_VERSION: i64 = 2;
+
+/// Increment when the seven-byte `QuantizedWaveformBin` byte layout changes.
+const WAVE_COLUMN_FORMAT_VERSION: i64 = 1;
 
 pub struct TileThumbCache {
     conn: Mutex<rusqlite::Connection>,
@@ -135,7 +152,8 @@ impl TileThumbCache {
                  CREATE INDEX IF NOT EXISTS idx_video_resume_thumbs_path
                     ON video_resume_thumbs(path);",
             )?;
-            return Self::ensure_render_version_columns(conn);
+            Self::ensure_render_version_columns(conn)?;
+            return Self::init_wave_schema(conn);
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS video_tile_thumbs (
@@ -168,6 +186,25 @@ impl TileThumbCache {
             )
         })
         .and_then(|_| Self::ensure_render_version_columns(conn))
+        .and_then(|_| Self::init_wave_schema(conn))
+    }
+
+    fn init_wave_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS video_wave_chunks (
+                path            TEXT NOT NULL,
+                bin_secs_millis INTEGER NOT NULL,
+                chunk_index     INTEGER NOT NULL,
+                bins            BLOB NOT NULL,
+                bin_count       INTEGER NOT NULL,
+                video_mtime     INTEGER NOT NULL,
+                video_size      INTEGER NOT NULL,
+                format_version  INTEGER NOT NULL,
+                PRIMARY KEY (path, bin_secs_millis, chunk_index)
+             );
+             CREATE INDEX IF NOT EXISTS idx_video_wave_chunks_path
+                ON video_wave_chunks(path);",
+        )
     }
 
     fn ensure_render_version_columns(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -324,6 +361,66 @@ impl TileThumbCache {
         }
     }
 
+    /// 粗い全尺波形列のうち、動画 identity と scale が一致する全 chunk を返す。
+    /// 一致しない同一 path の行は古い列としてその場で削除する。
+    pub fn lookup_wave_chunks(
+        &self,
+        video_path: &Path,
+        video_mtime: i64,
+        video_size: i64,
+        bin_secs_millis: i64,
+        bin_count: i64,
+    ) -> Vec<(i64, Vec<u8>)> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        // 同じ path に古い動画 identity / scale / format の chunk を残すと、動画の
+        // 差し替えや scale 変更のたびに DB が増え続ける。cache lookup は best-effort
+        // なので削除失敗は miss/hit 判定を止めず、下の厳密一致 SELECT は必ず保つ。
+        let _ = conn.execute(
+            "DELETE FROM video_wave_chunks
+             WHERE path = ?1 AND (
+                bin_secs_millis != ?2 OR bin_count != ?3 OR
+                video_mtime != ?4 OR video_size != ?5 OR format_version != ?6
+             )",
+            rusqlite::params![
+                &key,
+                bin_secs_millis,
+                bin_count,
+                video_mtime,
+                video_size,
+                WAVE_COLUMN_FORMAT_VERSION
+            ],
+        );
+
+        let mut stmt = match conn.prepare_cached(
+            "SELECT chunk_index, bins FROM video_wave_chunks
+             WHERE path = ?1 AND bin_secs_millis = ?2 AND bin_count = ?3
+               AND video_mtime = ?4 AND video_size = ?5 AND format_version = ?6
+             ORDER BY chunk_index",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(
+            rusqlite::params![
+                &key,
+                bin_secs_millis,
+                bin_count,
+                video_mtime,
+                video_size,
+                WAVE_COLUMN_FORMAT_VERSION
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        ) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.collect::<Result<Vec<_>, _>>().unwrap_or_default()
+    }
+
     /// 1 タイル分の WebP を保存。同 PRIMARY KEY なら ON CONFLICT で上書き。
     /// 引数順は `lookup_webp` の prefix `(path, tile_w, timestamp_ms, video_mtime)`
     /// に揃え、payload (`tile_h`, `webp`) を末尾に置く。
@@ -396,6 +493,44 @@ impl TileThumbCache {
         Ok(())
     }
 
+    /// 粗い全尺波形列の 1 chunk を保存する。同じ列・chunk は上書きする。
+    pub fn store_wave_chunk(
+        &self,
+        video_path: &Path,
+        video_mtime: i64,
+        video_size: i64,
+        bin_secs_millis: i64,
+        bin_count: i64,
+        chunk_index: i64,
+        bins: &[u8],
+    ) -> Result<(), rusqlite::Error> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
+            "INSERT INTO video_wave_chunks
+                (path, bin_secs_millis, chunk_index, bins, bin_count,
+                 video_mtime, video_size, format_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(path, bin_secs_millis, chunk_index) DO UPDATE SET
+                bins = ?4, bin_count = ?5, video_mtime = ?6, video_size = ?7,
+                format_version = ?8",
+            rusqlite::params![
+                key,
+                bin_secs_millis,
+                chunk_index,
+                bins,
+                bin_count,
+                video_mtime,
+                video_size,
+                WAVE_COLUMN_FORMAT_VERSION
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 動画 1 ファイル分のキャッシュを削除 (= 動画ファイル削除時 cleanup 用、未配線)。
     #[allow(dead_code)]
     pub fn clear_for(&self, video_path: &Path) -> Result<(), rusqlite::Error> {
@@ -406,6 +541,7 @@ impl TileThumbCache {
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute("DELETE FROM video_tile_thumbs WHERE path = ?1", [&key])?;
         conn.execute("DELETE FROM video_resume_thumbs WHERE path = ?1", [&key])?;
+        conn.execute("DELETE FROM video_wave_chunks WHERE path = ?1", [&key])?;
         Ok(())
     }
 
@@ -419,7 +555,8 @@ impl TileThumbCache {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let removed = conn.execute("DELETE FROM video_tile_thumbs", [])?
-            + conn.execute("DELETE FROM video_resume_thumbs", [])?;
+            + conn.execute("DELETE FROM video_resume_thumbs", [])?
+            + conn.execute("DELETE FROM video_wave_chunks", [])?;
         // VACUUM は autocommit 外で実行 (DELETE は execute() の単発なのでこの時点で
         // 既に commit 済み)。VACUUM 失敗は致命的ではないので log だけ残して継続。
         if let Err(e) = conn.execute_batch("VACUUM") {
@@ -451,6 +588,10 @@ impl TileThumbCache {
         )? + conn.execute(
             "DELETE FROM video_resume_thumbs \
              WHERE substr(path, 1, length(?1)) = ?1",
+            rusqlite::params![&prefix],
+        )? + conn.execute(
+            "DELETE FROM video_wave_chunks \
+             WHERE substr(path, 1, length(?1)) = ?1",
             rusqlite::params![prefix],
         )?;
         if removed > 0 {
@@ -461,6 +602,19 @@ impl TileThumbCache {
             }
         }
         Ok(removed)
+    }
+
+    /// スキーマだけ本物の、ディスクに触らない DB。**テスト専用。**
+    ///
+    /// `init_schema` を通すので、テーブルを足したときに呼び出し側のテストが
+    /// 勝手に古い形の DB を組み立てて通ってしまうことがない。
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> TileThumbCache {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        Self::init_schema(&conn).expect("schema");
+        TileThumbCache {
+            conn: Mutex::new(conn),
+        }
     }
 
     /// DB 本体 + WAL + SHM の合計バイト数 (キャッシュ管理ダイアログの表示用)。
@@ -502,11 +656,17 @@ mod tests {
     use rusqlite::Connection;
 
     fn open_in_memory() -> TileThumbCache {
-        let conn = Connection::open_in_memory().expect("memory db");
-        TileThumbCache::init_schema(&conn).expect("schema");
-        TileThumbCache {
-            conn: Mutex::new(conn),
-        }
+        TileThumbCache::open_in_memory()
+    }
+
+    fn wave_row_count(db: &TileThumbCache) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM video_wave_chunks", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 
     #[test]
@@ -529,6 +689,19 @@ mod tests {
     }
 
     #[test]
+    fn wave_store_then_lookup_roundtrip() {
+        let db = open_in_memory();
+        let stored_path = Path::new(r"C:\Videos\V.MP4");
+        db.store_wave_chunk(stored_path, 100, 4_096, 100, 1_200, 1, &[7, 8, 9])
+            .unwrap();
+        db.store_wave_chunk(stored_path, 100, 4_096, 100, 1_200, 0, &[1, 2, 3])
+            .unwrap();
+
+        let got = db.lookup_wave_chunks(Path::new("c:/videos/v.mp4"), 100, 4_096, 100, 1_200);
+        assert_eq!(got, vec![(0, vec![1, 2, 3]), (1, vec![7, 8, 9])]);
+    }
+
+    #[test]
     fn lookup_drops_stale_mtime() {
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
@@ -537,6 +710,75 @@ mod tests {
         assert!(db.lookup_webp(p, 5000, 999, 320).is_none());
         // 削除されたので再度 100 で照会しても見つからない
         assert!(db.lookup_webp(p, 5000, 100, 320).is_none());
+    }
+
+    #[test]
+    fn wave_lookup_mtime_mismatch_deletes_stale_rows() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_wave_chunk(p, 100, 4_096, 100, 600, 0, &[1, 2, 3])
+            .unwrap();
+
+        assert!(db.lookup_wave_chunks(p, 999, 4_096, 100, 600).is_empty());
+        assert!(
+            db.lookup_wave_chunks(p, 100, 4_096, 100, 600).is_empty(),
+            "the stale row must be deleted, not merely filtered"
+        );
+        assert_eq!(wave_row_count(&db), 0);
+    }
+
+    #[test]
+    fn wave_lookup_size_mismatch_misses_and_deletes() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_wave_chunk(p, 100, 4_096, 100, 600, 0, &[1, 2, 3])
+            .unwrap();
+
+        assert!(db.lookup_wave_chunks(p, 100, 8_192, 100, 600).is_empty());
+        assert_eq!(wave_row_count(&db), 0);
+    }
+
+    #[test]
+    fn wave_lookup_bin_secs_mismatch_misses_and_deletes() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_wave_chunk(p, 100, 4_096, 100, 600, 0, &[1, 2, 3])
+            .unwrap();
+
+        assert!(db.lookup_wave_chunks(p, 100, 4_096, 200, 600).is_empty());
+        assert_eq!(wave_row_count(&db), 0);
+    }
+
+    #[test]
+    fn wave_lookup_bin_count_mismatch_misses_and_deletes() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_wave_chunk(p, 100, 4_096, 100, 600, 0, &[1, 2, 3])
+            .unwrap();
+
+        assert!(db.lookup_wave_chunks(p, 100, 4_096, 100, 601).is_empty());
+        assert_eq!(wave_row_count(&db), 0);
+    }
+
+    #[test]
+    fn wave_lookup_format_version_mismatch_misses_and_deletes() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_wave_chunk(p, 100, 4_096, 100, 600, 0, &[1, 2, 3])
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE video_wave_chunks SET format_version = ?1",
+                    [WAVE_COLUMN_FORMAT_VERSION + 1],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+
+        assert!(db.lookup_wave_chunks(p, 100, 4_096, 100, 600).is_empty());
+        assert_eq!(wave_row_count(&db), 0);
     }
 
     #[test]
@@ -635,6 +877,51 @@ mod tests {
         // 固定抽出幅で抽出し直した行が入れば、要求幅以上の中から最大幅を採用する
         db.store_webp(p, 640, 5000, 100, 360, &[42]).unwrap();
         assert_eq!(db.lookup_webp(p, 5000, 100, 640).unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn clear_for_removes_wave_chunks_for_only_that_path() {
+        let db = open_in_memory();
+        let target = Path::new(r"C:\Movies\Target.mp4");
+        let other = Path::new("c:/movies/other.mp4");
+        db.store_wave_chunk(target, 100, 4_096, 100, 600, 0, &[1])
+            .unwrap();
+        db.store_wave_chunk(other, 100, 4_096, 100, 600, 0, &[2])
+            .unwrap();
+
+        db.clear_for(Path::new("c:/movies/target.mp4")).unwrap();
+
+        assert!(
+            db.lookup_wave_chunks(target, 100, 4_096, 100, 600)
+                .is_empty()
+        );
+        assert_eq!(
+            db.lookup_wave_chunks(other, 100, 4_096, 100, 600),
+            vec![(0, vec![2])]
+        );
+    }
+
+    #[test]
+    fn clear_all_counts_and_removes_wave_chunks() {
+        let db = open_in_memory();
+        let p = Path::new("c:/wave.mp4");
+        db.store_webp(p, 320, 5_000, 100, 180, &[9]).unwrap();
+        db.store_wave_chunk(p, 100, 4_096, 100, 1_200, 0, &[1])
+            .unwrap();
+        db.store_wave_chunk(p, 100, 4_096, 100, 1_200, 1, &[2])
+            .unwrap();
+
+        let removed = db.clear_all().unwrap();
+        assert_eq!(removed, 3);
+        assert!(db.lookup_webp(p, 5_000, 100, 320).is_none());
+        assert!(db.lookup_wave_chunks(p, 100, 4_096, 100, 1_200).is_empty());
+
+        db.store_wave_chunk(p, 100, 4_096, 100, 1_200, 0, &[3])
+            .unwrap();
+        assert_eq!(
+            db.lookup_wave_chunks(p, 100, 4_096, 100, 1_200),
+            vec![(0, vec![3])]
+        );
     }
 
     #[test]
@@ -755,6 +1042,30 @@ mod tests {
         assert_eq!(db.lookup_webp(p1, 5000, 100, 320).unwrap(), vec![3]);
         // p2 は消えたまま
         assert!(db.lookup_webp(p2, 5000, 100, 320).is_none());
+    }
+
+    #[test]
+    fn clear_for_folder_removes_wave_chunks_with_normalized_prefix() {
+        let db = open_in_memory();
+        let target = Path::new(r"C:\Movies\Sub\A.mp4");
+        let similar = Path::new("c:/movies_backup/b.mp4");
+        db.store_wave_chunk(target, 100, 4_096, 100, 1_200, 0, &[1])
+            .unwrap();
+        db.store_wave_chunk(target, 100, 4_096, 100, 1_200, 1, &[2])
+            .unwrap();
+        db.store_wave_chunk(similar, 100, 4_096, 100, 1_200, 0, &[3])
+            .unwrap();
+
+        let removed = db.clear_for_folder(Path::new("c:/MOVIES")).unwrap();
+        assert_eq!(removed, 2);
+        assert!(
+            db.lookup_wave_chunks(target, 100, 4_096, 100, 1_200)
+                .is_empty()
+        );
+        assert_eq!(
+            db.lookup_wave_chunks(similar, 100, 4_096, 100, 1_200),
+            vec![(0, vec![3])]
+        );
     }
 
     #[test]
@@ -880,5 +1191,13 @@ mod tests {
             .unwrap();
         let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100, 320);
         assert_eq!(got.as_deref(), Some(&[43u8][..]));
+
+        // v1 migration の早期 return 経路でも D32 の新規 table が初期化される。
+        db.store_wave_chunk(Path::new("c:/v.mp4"), 100, 4_096, 100, 600, 0, &[7])
+            .unwrap();
+        assert_eq!(
+            db.lookup_wave_chunks(Path::new("c:/v.mp4"), 100, 4_096, 100, 600),
+            vec![(0, vec![7])]
+        );
     }
 }

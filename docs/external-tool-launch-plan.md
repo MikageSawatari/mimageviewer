@@ -983,14 +983,16 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 
 ### 残りの段
 
-- **P5**: round-trip (`OriginalFile` で渡した実ファイルの mtime / サイズ監視と読み直し、§4.8)。
-  **利用者判断により分離** (2026-09-02)。着手時の注意: 既存の `CurrentFolderWatch` は
-  notify のイベント自体は受け取るが、`check_external_folder_changes` が**フォルダーの mtime**
-  で足切りする。ファイルの中身だけ書き換わってもフォルダーの mtime は変わらないので、
-  **この経路では拾えない**。渡したファイルは現在のフォルダー外にあることもある。
-- **右クリックでメインウィンドウが前に出る** — backlog §1.162 へ分離 (2026-09-02、利用者判断)。
-  ネイティブメニューのオーナー窓が常に `main_hwnd` である問題で、master にもある。
-  detached 凍結ルールの手順を踏んでから着手する。
+- **P5 の検出側は実装済み** (2026-09-02)。`check_external_folder_changes` に
+  `ExternalChangeCheck::{Notified, Resumed}` を入れ、監視由来の確認では**フォルダーの mtime で
+  足切りしない**ようにした。NTFS ではフォルダーの mtime は項目の追加 / 削除 / 改名でしか動かず、
+  中のファイルを上書きしても動かない (実測)。復帰契機は従来どおり安い stat でふるう。
+  実機確認済み: 外部ツールで上書き保存するとサムネイルが更新される。
+- **P5 の残り: フルスクリーン表示中の更新** — §7.1 へ切り出した。
+- ~~右クリックでメインウィンドウが前に出る~~ — **解決済み** (backlog §1.162)。原因は
+  無効理由ツールチップをメイン窓の owned window として生成していたことで、外部ツール対応が
+  持ち込んだ退行だった。同じ調査で「ツールチップが一度も表示されていなかった」
+  (`TTM_ADDTOOLW` の `cbSize` が common controls v5 に拒否されていた) も解決した。
 - **焼き込み段階の統一** — §7 へ分離。
 
 ### 未確認の実機項目
@@ -1001,8 +1003,6 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 - **準備中のキャンセル** (実機では ZIP / PDF の展開が速すぎて押せなかった。
   大きい PDF を 8192 で、または多数ページを Batch で渡すと窓が開く)
 - **同じ準備中に別のツールを起動** (上の (2) が出る経路)
-- 「元のファイル」ツールをグレー表示したときの理由ツールチップ (出ないという報告あり。
-  理由は設定されており tooltip 生成の失敗ログも無いので、未再現)
 - 終了後に `%TEMP%\mimageviewer\ext-<pid>` が残らないこと
 
 ### 仕様どおりで不具合ではないもの
@@ -1061,6 +1061,53 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 ### 未決
 
 無し。実装に着手できる状態。実装中に判断が要るものが出たらここへ追記する。
+
+## 7.1 別作業: 外部で中身が変わったとき、フルスクリーンを閉じずに更新する
+
+**現状**: 中身が変わると `load_folder_with_scan` (= 移動用の経路) を通るため、
+[app.rs:18311](../src/app.rs:18311) の `close_fullscreen()` でフルスクリーンが閉じる。
+**追加 / 削除でも以前からこうなる**ので、挙動としては一貫している。
+
+**「変更された項目だけ無効化して一覧を組み直さない」案は採らないこと** (2026-09-02、
+Codex Sol の第二意見で否決)。当初「表示パイプラインに触らず、既存の追い出し手順を
+再利用するだけ」と見積もったが、実際には次が要る。
+
+1. **in-flight worker を失効できない。** `items_generation` を据え置くと、変更前の bytes を
+   読んでいるサムネイル worker の結果が後から着地して、pixels・寸法・catalog・
+   `current_color_cache_map` を古い値へ戻す。worker は UI メッセージと**別に** catalog を
+   書く ([thumb_loader.rs:3025](../src/thumb_loader.rs:3025)) ので、受信側の検証だけでは防げない。
+   per-source revision を request → worker → catalog save → 受信まで通すか、worker 世代ごと
+   交代させるかが要る。後者は「一覧を組み直さない」利点をほぼ失う。
+2. **無効化対象が広い。** `image_metas` / `fs_early_dims` / `PageDimsCache` /
+   `auto_aspect.samples` / `fs_lanczos_cache` / `adjustment_cache` / AI 各種 /
+   `erase_base_cache` / `conceal_base_cache` / retained final AI / retained PDF page /
+   metadata・exif・xmp / panorama / analysis / continuous holdover / details /
+   color filter scope / detached の `trim_bboxes` (bundle 外)。単一の入口は存在しない。
+3. **パスだけの署名では判定できない。** ①mtime 順ソート中はパス集合が同じでも並びが変わる
+   ②同名の file → directory 置換で item 種別が変わる ③stack script は mtime / size を入力に
+   取るのでグルーピングが変わる ④動画のサイドカー画像は一覧から消えて動画項目の依存物になる
+   ⑤ZIP / PDF は外側パスが同じでも内部 topology が変わる。**そもそも 2 つのハッシュの差からは
+   「どのパスが変わったか」を復元できない** — typed な scan snapshot が要る。
+   加えて現行署名の mtime は秒精度なので、同一秒・同サイズの上書きは今でも取りこぼす。
+4. **編集中は保留が要る。** active な消しゴみは入場時に旧 pixels を `erase_base_cache` へ
+   読み込み、以後そちらを優先する ([app.rs:56423](../src/app.rs:56423))。active mask / shapes /
+   undo は旧座標のままで、rescale hook が無い。
+
+**着手するなら順番はこう** (Codex Sol 推奨):
+per-source revision と worker 側の書き込み fencing → 全 context への path routing →
+materialize 済み listing が完全一致し、対象が通常の静止画で、編集中でも media でも
+container でも stack でもない場合だけ source-only refresh。
+
+**訂正**: 「注釈は寸法変更に追従する」と一度書いたが**誤り**。`comic_source_dims` は
+注釈を作った時の寸法ではなく**スナップショット時点の現在寸法**
+([ui_fullscreen.rs:34461](../src/ui_fullscreen.rs:34461)) で、`comic_db` は authored 寸法を
+保存していない。注釈は絶対ピクセル固定であり、画像の寸法が変わっても比例移動しない。
+マスクは追従する (`MaskDb::get_full` が保存時寸法を持ちリスケールする) ので、両者は挙動が違う。
+
+**関連して見つかった別件**: `check_external_folder_changes` には**編集モード中のガードが無い**
+(`global_search` / `tag_view` / `delete_pending` のみ)。消しゴみ等の作業中に外部変更が来ると
+再読込が走る。追加 / 削除でも以前から起き得たが、中身の書き換えでも起きるようになった。
+未確定作業を失うかは未検証。
 
 ## 7. 別作業: 焼き込み段階を製本 / Ctrl+E / 外部ツールで統一する
 

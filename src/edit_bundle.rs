@@ -489,7 +489,7 @@ impl PreparedPageEditBundle {
                 .any(|unsafe_mode| mode.eq_ignore_ascii_case(unsafe_mode))
             {
                 return Err(format!(
-                    "編集DBが{mode}モードのため、安全な一括貼り付けを実行できません"
+                    "編集DBが{mode}モードのため、安全な一括更新を実行できません"
                 ));
             }
         }

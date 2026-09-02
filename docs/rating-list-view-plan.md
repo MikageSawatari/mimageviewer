@@ -57,7 +57,8 @@ Phase 1 として、場所横断の ★1〜★5 レーティング一覧ビュ�
   まず ZIP 階層を 1 段戻り、スタックが空になった時点で保持済み `rating_view_rows` から
   レーティング一覧を再インストールする。再検索・再 stat は行わない。
 
-後続候補: 詳細表示の専用 `★設定時刻` 列。
+Phase 2 の詳細表示専用 `★設定時刻` 列は実装済み。レーティング一覧の行メタをそのまま
+表示・列ソートに使い、通常フォルダへは列と sort key を露出しない (§5.2)。
 
 存在しない行の明示的な整理 UI は v2.3.0 第16弾で実装済み。サムネイルキャッシュ管理の
 「メタデータを整理…」から全 path-keyed ストアをバックグラウンドでスキャンし、ストア別件数を
@@ -350,12 +351,19 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
   通常の `SortOrder` を選ぶと `RatingViewSort::Normal(order)` に戻す。
 - 設定メニュー側の「ソート順」サブメニューにも、レーティングビュー表示中だけ同じ
   「★設定時刻↓ / ★設定時刻↑」を出す。ツールバーと設定メニューで選べる候補を揃える。
-- **詳細表示 MVP**: `DetailsSortKey` は増やさず、「ツールバー順」が
-  `RatingViewSort` 適用後の順序になるようにする。これだけで詳細表示中も
-  ★設定時刻順を使える。
-- **詳細表示 Phase 2**: 明示列が必要なら `DetailsSortKey::RatedAt` (表示名「★設定時刻」)
-  を追加する。ただしレーティングビュー以外では列も sort key も出さず、ビューを抜ける時に
-  選択中なら `Toolbar` へ戻す。グローバル詳細設定に「通常フォルダでは空の列」を残さない。
+- **詳細表示 Phase 2 (実装済み)**: レーティング一覧専用の
+  `DetailsColumnId::RatedAt` / `DetailsSortKey::RatedAt` (表示名「★設定時刻」) を追加する。
+  値は items と 1:1・同順序の `rating_view_rows[idx].rated_at_ms` から読み、遅延列にはしない。
+  `NULL` は空欄で表示し、昇順・降順のどちらでも時刻ありの項目より後ろへ置く。
+  選択情報にも時刻がある場合だけ「★設定時刻」を表示する。
+- ★設定時刻は更新日時とは別の列にする。レーティング一覧でも
+  `RatingViewSort::Normal(SortOrder::DateAsc/DateDesc)` はファイル本来の更新日時を使うため、bookmark / history
+  view のように `image_metas` の mtime slot を別時刻へ差し替えることはできない。
+- レーティングビュー以外では列も sort key も出さず、ビューを抜ける時に選択中なら
+  `Toolbar` へ戻す。グローバル詳細設定に「通常フォルダでは空の列」を残さない。
+- v3.4.0 との settings.db downgrade 互換を守るため、`RatedAt` の enum variant は永続 JSON に
+  書かない。保存時は sort key を `Toolbar` に置き換え、列順と列幅 map から `RatedAt` を除外する。
+  列幅と表示 ON/OFF は旧版が無視できる専用フィールドへ保存する。
 - グローバル `SortOrder` enum・`settings.sort_order` は変更しない (案B の難点回避:
   全フォルダのツールバーに重複項目が出ない / 永続設定の意味が場所で変わらない /
   通常フォルダで `rated_at_ms` をロードしない)。
@@ -396,7 +404,8 @@ stat は数千件規模になり得る (rating.db の ★N 行数ぶん)。**UI 
   `enter_rating_view`
   + `items_are_rating_view` (worker 構築・§4 復元) → 場所▼/ファイル サブメニュー →
   既存 SortOrder で並ぶ + サムネ/詳細の「★設定時刻↓/↑」追加 (既定: 新しい順)。
-- **Phase 2**: 詳細表示の `RatedAt` 列、件数バッジ、除外件数表示、PDF password edge の改善。
+- **Phase 2**: 詳細表示の `RatedAt` 列は実装済み。残りは件数バッジ、除外件数表示、
+  PDF password edge の改善。
 - **Phase 3 (任意)**: 「★N 以上」等の複合フィルタ、葉/コンテナ絞り込み、ショートカット、
   stale 行の掃除導線。
 

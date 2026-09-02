@@ -16416,7 +16416,8 @@ impl App {
 
                         let tail_t0 = std::time::Instant::now();
                         if let Some(rotation) = rotation_choice {
-                            self.set_image_rotation(fs_idx, rotation);
+                            // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+                            let _ = self.set_image_rotation(fs_idx, rotation);
                         }
 
                         // ── フルスクリーン用コンテキストメニュー ──
@@ -16656,6 +16657,7 @@ impl App {
 
                 // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
                 self.show_edit_bundle_paste_confirm_dialog(ctx);
+                self.show_bulk_page_edit_dialog(ctx);
 
                 // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
                 // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
@@ -34343,6 +34345,19 @@ impl App {
 
     /// グリッドの選択 (チェック優先・無ければカーソル) を指定した本へ追加する。
     /// ツールバーのピン留め本ボタンの右クリックから本名指定で呼ぶ。
+    /// グリッドで「今の選択」とみなす idx 列。チェックがあればチェック、無ければ
+    /// カーソル選択。本への追加と一括エクスポートが同じ規則を使う。
+    pub(crate) fn grid_selection_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = if self.checked.is_empty() {
+            self.selected.into_iter().collect()
+        } else {
+            self.checked.iter().copied().collect()
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
     pub(crate) fn add_grid_selection_to_named_book(
         &mut self,
         ctx: &egui::Context,
@@ -34352,13 +34367,7 @@ impl App {
             self.show_feedback_toast("製本処理中です".to_string());
             return;
         }
-        let mut indices: Vec<usize> = if self.checked.is_empty() {
-            self.selected.into_iter().collect()
-        } else {
-            self.checked.iter().copied().collect()
-        };
-        indices.sort_unstable();
-        indices.dedup();
+        let indices = self.grid_selection_indices();
         if indices.is_empty() {
             self.show_feedback_toast("追加する画像・ページを選択してください".to_string());
             return;
@@ -34870,6 +34879,142 @@ impl App {
         }
     }
 
+    /// グリッド選択を一括エクスポートの入力へ変換する。戻り値は
+    /// `(書き出す項目, 対象外だった件数)`。
+    ///
+    /// 製本と違い、編集の有無にかかわらず必ず合成経路を通す。出力形式とサイズを
+    /// ユーザーが選ぶので、無編集の byte copy では要求を満たせない。
+    pub(crate) fn grid_batch_export_items(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> (Vec<crate::export_batch::BatchExportItem>, usize) {
+        let mut items = Vec::new();
+        let mut skipped = 0usize;
+        for idx in self.grid_selection_indices() {
+            // スタックの集約セルは、本への追加と同じくメンバーを 1 枚ずつ展開する
+            // (1 idx = N メンバーなので idx ベースの経路には乗らない)。
+            if let Some(member_paths) = self.stack_member_paths(idx) {
+                for member_path in member_paths {
+                    match self.batch_export_item_for_stack_member(&member_path) {
+                        Ok(item) => items.push(item),
+                        Err(err) => {
+                            skipped += 1;
+                            crate::logger::log(format!(
+                                "batch export skip stack member {}: {err}",
+                                member_path.display()
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            match self.batch_export_item_for_idx(ctx, idx) {
+                Ok(Some(item)) => items.push(item),
+                Ok(None) => skipped += 1,
+                Err(err) => {
+                    skipped += 1;
+                    crate::logger::log(format!("batch export skip idx={idx}: {err}"));
+                }
+            }
+        }
+        (items, skipped)
+    }
+
+    /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
+    fn batch_export_item_for_idx(
+        &mut self,
+        _ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
+        let item = self
+            .items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
+        let source = match &item {
+            GridItem::Image(path) => crate::books::CompositeSource::File { path: path.clone() },
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => crate::books::CompositeSource::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.clone(),
+            },
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => crate::books::CompositeSource::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num: *page_num,
+                password: self.pdf_current_password.clone(),
+            },
+            _ => return Ok(None),
+        };
+        let filename = self
+            .capture_basename_for_idx(idx)
+            .ok_or_else(|| "ファイル名を決められません".to_string())?;
+        let dirname = self.batch_export_dirname_for_idx(idx);
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+        Ok(Some(crate::export_batch::BatchExportItem {
+            filename,
+            dirname,
+            source,
+            edits,
+        }))
+    }
+
+    /// スタックメンバー (集約ビューでは `items` に現れない実ファイル)。idx を持たない
+    /// ので、補正・回転・編集は各 DB をパスキーで直接引く。
+    fn batch_export_item_for_stack_member(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<crate::export_batch::BatchExportItem, String> {
+        let key = crate::adjustment_db::normalize_path(path);
+        let rotation = self
+            .rotation_db
+            .as_ref()
+            .and_then(|db| db.get_key(&key))
+            .unwrap_or(crate::rotation_db::Rotation::None);
+        let params = self.stack_member_effective_params(path, &key);
+        let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+        Ok(crate::export_batch::BatchExportItem {
+            filename: crate::capture::basename_for_path(path),
+            dirname: Self::batch_export_dirname_for_path(path),
+            source: crate::books::CompositeSource::File {
+                path: path.to_path_buf(),
+            },
+            edits,
+        })
+    }
+
+    /// `<dirname>` に入る名前。ZIP 内画像と PDF ページは、書庫そのものではなく
+    /// **書庫が置かれているフォルダ** を指す (複数フォルダを 1 か所へまとめるときの
+    /// 出所を表す置換子なので、`<filename>` 側が既に書庫名を含んでいる)。
+    fn batch_export_dirname_for_idx(&self, idx: usize) -> String {
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => Self::batch_export_dirname_for_path(path),
+            Some(GridItem::ZipImage { zip_path, .. }) => {
+                Self::batch_export_dirname_for_path(zip_path)
+            }
+            Some(GridItem::PdfPage { pdf_path, .. }) => {
+                Self::batch_export_dirname_for_path(pdf_path)
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn batch_export_dirname_for_path(path: &std::path::Path) -> String {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(crate::capture::basename_from_text)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn idx_is_compiled_book_page(&self, idx: usize) -> bool {
         match self.items.get(idx) {
             Some(GridItem::Image(path)) => self.compiled_book_page_folder(path).is_some(),
@@ -35189,23 +35334,120 @@ impl App {
         idx: usize,
     ) -> Result<crate::export_dialog::ExportPagePixels, String> {
         // 注釈 (comic) があれば最終 composite に焼き込んでから export する (最前面 D1)。
-        // 注釈が無ければ素の final composite。フルスクリーン Ctrl+E は conceal_mask=None
-        // なので、ここで焼いた注釈が worker の conceal preset 合成に潰されない (Inc 7)。
+        // 注釈が無ければ素の final composite。ここで得るのは「現在の設定で隠蔽まで
+        // 焼き込み済み」の表示スナップショットで、`_0` はこれをそのまま書き出す。
         let base_pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
             Some(p) => p,
             None => self
                 .ensure_final_composite_pixels(ctx, idx)
                 .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?,
         };
+        // プリセット出力 (_1〜_4) は隠蔽のパラメータだけが違う同じ絵なので、隠蔽の入力
+        // まで戻って再合成する材料を別に持つ。base_pixels へマスクを重ねるだけだと隠蔽が
+        // 二重に掛かる (v1.1.0 の退行はこれを避けようとして conceal_mask=None を固定し、
+        // プリセット出力ごと止めていた)。
+        let conceal_variant = self
+            .export_conceal_variant_for_idx(ctx, idx)
+            .map(std::sync::Arc::new);
         // crop は表示には反映しないので、export の最終段で base_pixels (= final
         // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
         let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
         let rotation = self.get_rotation(idx);
         Ok(crate::export_dialog::ExportPagePixels {
             base_pixels,
-            conceal_mask: None,
+            conceal_variant,
             crop,
             rotation,
+        })
+    }
+
+    /// プリセット出力用の「隠蔽適用前」スナップショット。隠蔽マスクを持たないページは
+    /// `None` = プリセット出力は選べない (本来の条件)。
+    fn export_conceal_variant_for_idx(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::export_dialog::ConcealVariantSource> {
+        // 表示側で隠蔽合成の入力になっているものと同じ段 (raw → 消しゴム → 補正レイヤー)。
+        let (base, _) = self.current_conceal_source_pixels(idx)?;
+        let mask = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])?;
+        let params = self.effective_params(idx).clone();
+        let creative_lut = (!params.creative_lut.is_identity())
+            .then(|| {
+                self.creative_lut_library
+                    .get(params.creative_lut.id)
+                    .map(|lut| (lut, params.creative_lut.strength))
+            })
+            .flatten();
+        let ai = self.export_conceal_variant_ai(ctx, idx, &params);
+        let comic = self.export_conceal_variant_comic(idx);
+        Some(crate::export_dialog::ConcealVariantSource {
+            base,
+            mask: std::sync::Arc::new(mask),
+            params,
+            creative_lut,
+            ai,
+            comic,
+        })
+    }
+
+    /// 表示の final composite が実際に final AI を通っているときだけ、プリセット再合成へ
+    /// 同じ AI 段を持たせる。表示が AI 抜き (機能無効 / サイズ上限外 / 推論失敗) なら
+    /// `None` にして `_0` と絵を揃える。
+    fn export_conceal_variant_ai(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<crate::export_dialog::ConcealVariantAi> {
+        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
+        let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, params)?;
+        // 完成した final composite を掴んだ後にここへ来るので、failed でなければ
+        // 表示は AI 結果を使っている。
+        if self.final_ai_failed.contains(&ai_key) {
+            return None;
+        }
+        self.ensure_ai_runtime();
+        let runtime = self.ai_runtime.clone()?;
+        Some(crate::export_dialog::ConcealVariantAi {
+            runtime,
+            manager: std::sync::Arc::clone(&self.ai_model_manager),
+            feature_mode: self.settings.ai_feature_mode,
+            upscale_limit: self.settings.ai_upscale_limit(),
+            denoise_limit: self.settings.ai_denoise_limit(),
+            // 表示側が分類済みならその答えを渡す。auto upscale のモデル選択が
+            // `_0` と `_1`〜`_4` で食い違わないようにする。
+            category: self.ai_classify_cache.get(&idx).copied(),
+            transparent_bg_mode: self.fs_transparent_bg_mode,
+        })
+    }
+
+    /// プリセット再合成の最後に焼く注釈。`comic_composited_pixels_for_export` と同じ
+    /// 材料を、製本の headless compositor と同じ形 (`BookComicSnapshot`) で渡す。
+    fn export_conceal_variant_comic(
+        &mut self,
+        idx: usize,
+    ) -> Option<crate::export_dialog::ConcealVariantComic> {
+        if !self.comic_has_objects(idx) {
+            return None;
+        }
+        let key = self.page_path_key(idx)?;
+        self.ensure_comic_doc_loaded(&key);
+        let objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if objects.is_empty() {
+            return None; // デモ有効でも永続注釈が無ければ export には焼かない
+        }
+        let fonts = self.ensure_comic_fonts_for(&objects)?;
+        let source_dims = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| [width.round() as usize, height.round() as usize]);
+        Some(crate::export_dialog::ConcealVariantComic {
+            snapshot: crate::books::BookComicSnapshot {
+                objects,
+                fonts,
+                stamp_cache: self.comic_stamp_cache.clone(),
+            },
+            source_dims,
         })
     }
 
@@ -35692,14 +35934,13 @@ impl App {
         // が export される (Codex review CONFIRMED)。
         let pixels = state.pixels.clone();
         let has_conceal_mask = pixels.has_conceal_mask();
+        // プリセット再合成が final AI を回すなら、worker 終端までローカル AI 利用中に見せる。
+        let needs_ai_lease = pixels.conceal_variant_uses_ai();
         let sns_split_export = !state.sns_split_frames.is_empty();
-        let current_conceal_preset = (!sns_split_export && has_conceal_mask)
-            .then(|| self.current_conceal_preset_from_settings());
         let entries = crate::export_dialog::plan_export_entries(
             &state.sns_split_frames,
             &state.selection,
             has_conceal_mask,
-            current_conceal_preset,
             &self.settings.conceal_presets,
         )?;
         if entries.is_empty() {
@@ -35770,6 +36011,7 @@ impl App {
             scale: state.scale,
             entries,
             include_metadata: effective_include_metadata,
+            local_ai_activity: needs_ai_lease.then(|| self.local_ai_activity_lease()),
         };
         let pending = crate::export_dialog::spawn_export_worker(request)?;
         self.export_pending = Some(pending);
@@ -35901,7 +36143,8 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
+    /// ページの隠蔽マスクを `w x h` へ展開してベクタ図形もラスタライズした合成マスク。
+    /// 1 画素も塗られていなければ `None` (= プリセット出力は選べない)。
     fn conceal_composite_mask_for_export(
         &self,
         idx: usize,

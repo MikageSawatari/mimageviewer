@@ -1784,6 +1784,9 @@ pub(crate) enum DetailsColumn {
     Preview,
     Name,
     Rating,
+    /// レーティング一覧は通常の「日付順」でファイル本来の更新日時も使うため、
+    /// `Modified` の表示値を差し替えず、★設定時刻を独立した列として持つ。
+    RatedAt,
     Tags,
     Kind,
     PageCount,
@@ -1971,6 +1974,7 @@ impl DetailsColumn {
             Self::Preview,
             Self::Name,
             Self::Rating,
+            Self::RatedAt,
             Self::Tags,
             Self::Kind,
             Self::PageCount,
@@ -1991,6 +1995,7 @@ impl DetailsColumn {
             Self::Preview => "",
             Self::Name => "名前",
             Self::Rating => "★",
+            Self::RatedAt => "★設定時刻",
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
@@ -2011,6 +2016,7 @@ impl DetailsColumn {
             Self::Preview => DetailsColumnId::Preview,
             Self::Name => DetailsColumnId::Name,
             Self::Rating => DetailsColumnId::Rating,
+            Self::RatedAt => DetailsColumnId::RatedAt,
             Self::Tags => DetailsColumnId::Tags,
             Self::Kind => DetailsColumnId::Kind,
             Self::PageCount => DetailsColumnId::PageCount,
@@ -2031,6 +2037,7 @@ impl DetailsColumn {
             DetailsColumnId::Preview => Self::Preview,
             DetailsColumnId::Name => Self::Name,
             DetailsColumnId::Rating => Self::Rating,
+            DetailsColumnId::RatedAt => Self::RatedAt,
             DetailsColumnId::Tags => Self::Tags,
             DetailsColumnId::Kind => Self::Kind,
             DetailsColumnId::PageCount => Self::PageCount,
@@ -2051,6 +2058,7 @@ impl DetailsColumn {
             Self::Preview => None,
             Self::Name => Some(DetailsSortKey::Name),
             Self::Rating => Some(DetailsSortKey::Rating),
+            Self::RatedAt => Some(DetailsSortKey::RatedAt),
             Self::Tags => Some(DetailsSortKey::Tags),
             Self::Kind => Some(DetailsSortKey::Kind),
             Self::PageCount => Some(DetailsSortKey::PageCount),
@@ -2078,7 +2086,15 @@ impl DetailsColumn {
         )
     }
 
-    fn visible(self, settings: &crate::settings::Settings, column_set: DetailsColumnSet) -> bool {
+    fn available_in_view(self, items_are_rating_view: bool) -> bool {
+        self != Self::RatedAt || items_are_rating_view
+    }
+
+    fn configured_visible(
+        self,
+        settings: &crate::settings::Settings,
+        column_set: DetailsColumnSet,
+    ) -> bool {
         let dedicated = column_set == DetailsColumnSet::DedicatedBar;
         match self {
             Self::Preview => {
@@ -2092,6 +2108,9 @@ impl DetailsColumn {
             Self::Rating => dedicated
                 .then_some(settings.details_selection_bar_show_rating)
                 .unwrap_or(settings.details_show_rating),
+            Self::RatedAt => dedicated
+                .then_some(settings.details_selection_bar_show_rated_at)
+                .unwrap_or(settings.details_show_rated_at),
             Self::Tags => dedicated
                 .then_some(settings.details_selection_bar_show_tags)
                 .unwrap_or(settings.details_show_tags),
@@ -2131,6 +2150,16 @@ impl DetailsColumn {
         }
     }
 
+    fn visible(
+        self,
+        settings: &crate::settings::Settings,
+        column_set: DetailsColumnSet,
+        items_are_rating_view: bool,
+    ) -> bool {
+        self.available_in_view(items_are_rating_view)
+            && self.configured_visible(settings, column_set)
+    }
+
     fn default_width(self) -> f32 {
         // `egui_kittest` で本体の既定フォント (Yu Gothic Medium) を入れ、100% scale の
         // Body text を実測した固定シード幅 + DETAILS_BEST_FIT_HORIZONTAL_PADDING の ceil。
@@ -2140,6 +2169,7 @@ impl DetailsColumn {
             Self::Preview => 34.0,
             Self::Name => 140.0,
             Self::Rating => 79.0,
+            Self::RatedAt => 138.0,
             Self::Tags => 160.0,
             Self::Kind => 96.0,
             Self::PageCount => 80.0,
@@ -2173,11 +2203,15 @@ fn details_ordered_columns(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     include_hidden: bool,
+    items_are_rating_view: bool,
 ) -> Vec<DetailsColumn> {
     details_storage_ordered_columns(settings, column_set)
         .into_iter()
         .filter(|col| {
-            column_set.includes(*col) && (include_hidden || col.visible(settings, column_set))
+            // `include_hidden` は列メニュー用だが、ビュー外の専用列まで出してはならない。
+            column_set.includes(*col)
+                && col.available_in_view(items_are_rating_view)
+                && (include_hidden || col.visible(settings, column_set, items_are_rating_view))
         })
         .collect()
 }
@@ -2210,15 +2244,17 @@ fn details_column_is_visible(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     column: DetailsColumn,
+    items_are_rating_view: bool,
 ) -> bool {
-    column_set.includes(column) && column.visible(settings, column_set)
+    column_set.includes(column) && column.visible(settings, column_set, items_are_rating_view)
 }
 
 fn details_visible_columns(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> Vec<DetailsColumn> {
-    details_ordered_columns(settings, column_set, false)
+    details_ordered_columns(settings, column_set, false, items_are_rating_view)
 }
 
 fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
@@ -2290,6 +2326,7 @@ fn toggle_details_selection_bar_mode_from_menu(settings: &mut crate::settings::S
 pub(crate) fn selection_info_bottom_bar_shows_column(
     settings: &crate::settings::Settings,
     column: DetailsColumn,
+    items_are_rating_view: bool,
 ) -> bool {
     settings.selection_info_display_mode.shows_bottom_bar()
         && !selection_info_bottom_bar_is_hidden(settings)
@@ -2297,6 +2334,7 @@ pub(crate) fn selection_info_bottom_bar_shows_column(
             settings,
             selection_info_bottom_bar_column_set(settings),
             column,
+            items_are_rating_view,
         )
 }
 
@@ -2317,6 +2355,17 @@ fn details_column_width(
     if col == DetailsColumn::Name {
         return col.default_width();
     }
+    // RatedAt の variant を v3.4.0 が読む既存 width 配列へ混ぜない。
+    if col == DetailsColumn::RatedAt {
+        return match column_set {
+            DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+                settings.details_rated_at_width
+            }
+            DetailsColumnSet::DedicatedBar => settings.details_selection_bar_rated_at_width,
+        }
+        .unwrap_or_else(|| col.default_width())
+        .clamp(col.min_width(), 800.0);
+    }
     column_set
         .column_widths(settings)
         .iter()
@@ -2336,6 +2385,20 @@ fn set_details_column_width(
         return false;
     }
     let width = width.clamp(col.min_width(), 800.0);
+    // RatedAt は後方互換用の専用 field だけを更新し、既存 width 配列へは書かない。
+    if col == DetailsColumn::RatedAt {
+        let slot = match column_set {
+            DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+                &mut settings.details_rated_at_width
+            }
+            DetailsColumnSet::DedicatedBar => &mut settings.details_selection_bar_rated_at_width,
+        };
+        if slot.is_some_and(|stored| (stored - width).abs() <= 0.1) {
+            return false;
+        }
+        *slot = Some(width);
+        return true;
+    }
     let widths = match column_set {
         DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
             &mut settings.details_column_widths
@@ -2406,6 +2469,7 @@ fn details_column_visibility_slot(
         (_, DetailsColumn::Name) => return None,
         (false, DetailsColumn::Preview) => &mut settings.details_show_preview,
         (false, DetailsColumn::Rating) => &mut settings.details_show_rating,
+        (false, DetailsColumn::RatedAt) => &mut settings.details_show_rated_at,
         (false, DetailsColumn::Tags) => &mut settings.details_show_tags,
         (false, DetailsColumn::Kind) => &mut settings.details_show_kind,
         (false, DetailsColumn::PageCount) => &mut settings.details_show_page_count,
@@ -2420,6 +2484,7 @@ fn details_column_visibility_slot(
         (false, DetailsColumn::VideoCodec) => &mut settings.details_show_video_codec,
         (true, DetailsColumn::Preview) => &mut settings.details_selection_bar_show_preview,
         (true, DetailsColumn::Rating) => &mut settings.details_selection_bar_show_rating,
+        (true, DetailsColumn::RatedAt) => &mut settings.details_selection_bar_show_rated_at,
         (true, DetailsColumn::Tags) => &mut settings.details_selection_bar_show_tags,
         (true, DetailsColumn::Kind) => &mut settings.details_selection_bar_show_kind,
         (true, DetailsColumn::PageCount) => &mut settings.details_selection_bar_show_page_count,
@@ -2446,6 +2511,7 @@ fn set_details_name_width_auto(
     column_set: DetailsColumnSet,
     enabled: bool,
     current_name_width: f32,
+    items_are_rating_view: bool,
 ) -> bool {
     if column_set.name_width_auto(settings) == enabled {
         return false;
@@ -2463,8 +2529,12 @@ fn set_details_name_width_auto(
         }
         true
     } else {
-        let stored_width =
-            details_stored_name_width_from_effective(settings, column_set, current_name_width);
+        let stored_width = details_stored_name_width_from_effective(
+            settings,
+            column_set,
+            current_name_width,
+            items_are_rating_view,
+        );
         set_details_name_width(settings, column_set, stored_width)
     }
 }
@@ -2474,6 +2544,7 @@ struct DetailsColumnMenuState {
     name_width_auto: bool,
     show_preview: bool,
     show_rating: bool,
+    show_rated_at: bool,
     show_tags: bool,
     show_kind: bool,
     show_page_count: bool,
@@ -2508,20 +2579,26 @@ impl DetailsColumnMenuState {
     fn from_settings(settings: &crate::settings::Settings, column_set: DetailsColumnSet) -> Self {
         Self {
             name_width_auto: column_set.name_width_auto(settings),
-            show_preview: DetailsColumn::Preview.visible(settings, column_set),
-            show_rating: DetailsColumn::Rating.visible(settings, column_set),
-            show_tags: DetailsColumn::Tags.visible(settings, column_set),
-            show_kind: DetailsColumn::Kind.visible(settings, column_set),
-            show_page_count: DetailsColumn::PageCount.visible(settings, column_set),
-            show_place: DetailsColumn::Place.visible(settings, column_set),
-            show_size: DetailsColumn::Size.visible(settings, column_set),
-            show_modified: DetailsColumn::Modified.visible(settings, column_set),
-            show_created: DetailsColumn::Created.visible(settings, column_set),
-            show_state: DetailsColumn::State.visible(settings, column_set),
-            show_image_dimensions: DetailsColumn::ImageDimensions.visible(settings, column_set),
-            show_video_duration: DetailsColumn::VideoDuration.visible(settings, column_set),
-            show_video_dimensions: DetailsColumn::VideoDimensions.visible(settings, column_set),
-            show_video_codec: DetailsColumn::VideoCodec.visible(settings, column_set),
+            // メニューを出さないビューでも RatedAt のセッション設定を変えないため、
+            // view gate 前の設定値を snapshot する。
+            show_preview: DetailsColumn::Preview.configured_visible(settings, column_set),
+            show_rating: DetailsColumn::Rating.configured_visible(settings, column_set),
+            show_rated_at: DetailsColumn::RatedAt.configured_visible(settings, column_set),
+            show_tags: DetailsColumn::Tags.configured_visible(settings, column_set),
+            show_kind: DetailsColumn::Kind.configured_visible(settings, column_set),
+            show_page_count: DetailsColumn::PageCount.configured_visible(settings, column_set),
+            show_place: DetailsColumn::Place.configured_visible(settings, column_set),
+            show_size: DetailsColumn::Size.configured_visible(settings, column_set),
+            show_modified: DetailsColumn::Modified.configured_visible(settings, column_set),
+            show_created: DetailsColumn::Created.configured_visible(settings, column_set),
+            show_state: DetailsColumn::State.configured_visible(settings, column_set),
+            show_image_dimensions: DetailsColumn::ImageDimensions
+                .configured_visible(settings, column_set),
+            show_video_duration: DetailsColumn::VideoDuration
+                .configured_visible(settings, column_set),
+            show_video_dimensions: DetailsColumn::VideoDimensions
+                .configured_visible(settings, column_set),
+            show_video_codec: DetailsColumn::VideoCodec.configured_visible(settings, column_set),
             // 書式はセット C を編集するメニューでもセット A と共有する。
             size_display_mode: settings.details_size_display_mode,
             timestamp_show_seconds: settings.details_timestamp_show_seconds,
@@ -2536,6 +2613,7 @@ impl DetailsColumnMenuState {
         settings: &mut crate::settings::Settings,
         column_set: DetailsColumnSet,
         current_name_width: f32,
+        items_are_rating_view: bool,
     ) -> DetailsColumnMenuChanges {
         let mut changes = DetailsColumnMenuChanges::default();
         changes.columns |= set_details_name_width_auto(
@@ -2543,6 +2621,7 @@ impl DetailsColumnMenuState {
             column_set,
             self.name_width_auto,
             current_name_width,
+            items_are_rating_view,
         );
         apply_details_column_menu_visibility(self, settings, column_set, &mut changes);
         if settings.details_size_display_mode != self.size_display_mode {
@@ -2574,6 +2653,7 @@ fn apply_details_column_menu_visibility(
         &[
             (DetailsColumn::Preview, state.show_preview),
             (DetailsColumn::Rating, state.show_rating),
+            (DetailsColumn::RatedAt, state.show_rated_at),
             (DetailsColumn::Tags, state.show_tags),
             (DetailsColumn::Kind, state.show_kind),
             (DetailsColumn::PageCount, state.show_page_count),
@@ -2898,6 +2978,7 @@ struct DetailsLayoutDebugSample<'a> {
     layout_extent: f32,
     requested_extent: f32,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
     outer_inner_rect: egui::Rect,
     outer_content_size: egui::Vec2,
     outer_state: egui::scroll_area::State,
@@ -2944,7 +3025,11 @@ fn log_details_layout_debug(ctx: &egui::Context, sample: DetailsLayoutDebugSampl
             )
         });
     let outer_delta_x = sample.outer_content_size.x - sample.outer_inner_rect.width();
-    let columns = details_visible_columns(sample.settings, sample.column_set);
+    let columns = details_visible_columns(
+        sample.settings,
+        sample.column_set,
+        sample.items_are_rating_view,
+    );
     let viewport_id = ctx.viewport_id();
     let rounding_slack = details_layout_right_guard(effective_ppp);
     let columns_avail = (sample.horizontal_policy.viewport_capacity - sample.gutter).max(0.0);
@@ -3041,8 +3126,9 @@ impl DetailsRowData {
 fn details_fixed_columns_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> f32 {
-    details_ordered_columns(settings, column_set, false)
+    details_ordered_columns(settings, column_set, false, items_are_rating_view)
         .into_iter()
         .filter(|col| *col != DetailsColumn::Name)
         .map(|col| details_column_width(settings, column_set, col))
@@ -3056,11 +3142,15 @@ fn details_fixed_columns_width(
 fn details_omitted_columns_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> f32 {
     DetailsColumn::all()
         .iter()
         .copied()
-        .filter(|column| !column_set.includes(*column) && column.visible(settings, column_set))
+        .filter(|column| {
+            !column_set.includes(*column)
+                && column.visible(settings, column_set, items_are_rating_view)
+        })
         .map(|column| details_column_width(settings, column_set, column))
         .sum()
 }
@@ -3068,17 +3158,19 @@ fn details_omitted_columns_width(
 fn details_effective_fixed_name_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> f32 {
     details_name_fixed_width(settings, column_set)
-        + details_omitted_columns_width(settings, column_set)
+        + details_omitted_columns_width(settings, column_set, items_are_rating_view)
 }
 
 fn details_stored_name_width_from_effective(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     width: f32,
+    items_are_rating_view: bool,
 ) -> f32 {
-    width - details_omitted_columns_width(settings, column_set)
+    width - details_omitted_columns_width(settings, column_set, items_are_rating_view)
 }
 
 fn details_layout(
@@ -3087,9 +3179,10 @@ fn details_layout(
     pixels_per_point: f32,
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> DetailsLayout {
-    let fixed = details_fixed_columns_width(settings, column_set);
-    let omitted = details_omitted_columns_width(settings, column_set);
+    let fixed = details_fixed_columns_width(settings, column_set, items_are_rating_view);
+    let omitted = details_omitted_columns_width(settings, column_set, items_are_rating_view);
     let columns_avail = (avail_w - gutter).max(0.0);
     let name_width_auto = column_set.name_width_auto(settings);
     let minimum_name_width = DetailsColumn::Name.default_width() + omitted;
@@ -3100,7 +3193,7 @@ fn details_layout(
     } else if name_width_auto {
         minimum_name_width
     } else {
-        details_effective_fixed_name_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set, items_are_rating_view)
     };
     let columns_w = name_w + fixed;
     // Leave one physical pixel of slack when auto-fit has enough room. At UI
@@ -3141,6 +3234,7 @@ fn resolve_details_list_layout(
     natural_h: f32,
     pixels_per_point: f32,
     settings: &crate::settings::Settings,
+    items_are_rating_view: bool,
 ) -> DetailsListLayoutResolution {
     let scroll_style = details_scroll_style();
     let avail_w = source_rect.width().max(1.0);
@@ -3170,6 +3264,7 @@ fn resolve_details_list_layout(
             pixels_per_point,
             settings,
             DetailsColumnSet::Details,
+            items_are_rating_view,
         );
         let horizontal_policy = details_horizontal_scroll_policy(
             source_rect,
@@ -3210,8 +3305,9 @@ fn details_column_rects_for_columns(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
+    items_are_rating_view: bool,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    let columns = details_visible_columns(settings, column_set);
+    let columns = details_visible_columns(settings, column_set, items_are_rating_view);
     let fixed: f32 = columns
         .iter()
         .copied()
@@ -3221,10 +3317,10 @@ fn details_column_rects_for_columns(
     let name_width = if column_set.name_width_auto(settings) {
         (rect.width() - fixed).max(
             DetailsColumn::Name.default_width()
-                + details_omitted_columns_width(settings, column_set),
+                + details_omitted_columns_width(settings, column_set, items_are_rating_view),
         )
     } else {
-        details_effective_fixed_name_width(settings, column_set)
+        details_effective_fixed_name_width(settings, column_set, items_are_rating_view)
     };
     let specs = columns
         .into_iter()
@@ -3254,8 +3350,14 @@ fn details_column_rects_for_columns(
 fn details_column_rects(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
+    items_are_rating_view: bool,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    details_column_rects_for_columns(rect, settings, DetailsColumnSet::Details)
+    details_column_rects_for_columns(
+        rect,
+        settings,
+        DetailsColumnSet::Details,
+        items_are_rating_view,
+    )
 }
 
 fn details_column_at_x(
@@ -3290,11 +3392,12 @@ fn reorder_details_column(
     dragged: DetailsColumn,
     target: DetailsColumn,
     insert_after_target: bool,
+    items_are_rating_view: bool,
 ) -> bool {
     if dragged == target {
         return false;
     }
-    let mut columns = details_ordered_columns(settings, column_set, true);
+    let mut columns = details_ordered_columns(settings, column_set, true, items_are_rating_view);
     let Some(from_pos) = columns.iter().position(|col| *col == dragged) else {
         return false;
     };
@@ -3314,7 +3417,7 @@ fn reorder_details_column(
     let new_order = details_storage_ordered_columns(settings, column_set)
         .into_iter()
         .map(|column| {
-            if column_set.includes(column) {
+            if column_set.includes(column) && column.available_in_view(items_are_rating_view) {
                 reordered.next().unwrap_or(column)
             } else {
                 column
@@ -3336,6 +3439,7 @@ fn finish_details_header_drag(
     columns: &[(DetailsColumn, egui::Rect)],
     drag: DetailsHeaderDrag,
     min_delta_x: f32,
+    items_are_rating_view: bool,
 ) -> bool {
     if (drag.latest.x - drag.start.x).abs() < min_delta_x {
         return false;
@@ -3344,7 +3448,14 @@ fn finish_details_header_drag(
         return false;
     };
     let insert_after = drag.latest.x > target_rect.center().x;
-    reorder_details_column(settings, column_set, drag.column, target, insert_after)
+    reorder_details_column(
+        settings,
+        column_set,
+        drag.column,
+        target,
+        insert_after,
+        items_are_rating_view,
+    )
 }
 
 // ── ツールバー セクション カスタマイズ helper (v2.0.0 Phase 3) ──────────────
@@ -5022,7 +5133,7 @@ impl App {
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let sort_lock = self.grid_sort_lock_reason();
         let rating_counts = self.rating_counts();
         let selected_video_path =
             self.selected
@@ -5770,13 +5881,17 @@ impl App {
                                         }
                                     }
                                 });
-                                if book_sort_locked {
+                                if let Some(reason) = sort_lock {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
-                                    ui.add_enabled(false, egui::Button::new("ソート順: 固定"))
-                                        .on_disabled_hover_text(
-                                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                        );
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Button::new(format!(
+                                            "ソート順: {}",
+                                            reason.short_label()
+                                        )),
+                                    )
+                                    .on_disabled_hover_text(reason.tooltip());
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
                                         for &order in crate::settings::SortOrder::all() {
@@ -7491,7 +7606,7 @@ impl App {
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let sort_lock = self.grid_sort_lock_reason();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
         }
@@ -8010,19 +8125,11 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                     }
                 }
                 TS::Sort => {
-                    let details_sort_disabled = self.details_header_sort_active();
-                    let sort_disabled = details_sort_disabled || book_sort_locked;
+                    let sort_disabled = sort_lock.is_some();
                     let sort_label = toolbar_label(ui, "ソート:", 54.0, drag_enabled);
-                    let sort_label = if book_sort_locked {
-                        sort_label.hover_tip(
-                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                        )
-                    } else if details_sort_disabled {
-                        sort_label.hover_tip(
-                            "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
-                        )
-                    } else {
-                        sort_label.hover_tip(lead_hint)
+                    let sort_label = match sort_lock {
+                        Some(reason) => sort_label.hover_tip(reason.tooltip()),
+                        None => sort_label.hover_tip(lead_hint),
                     };
                     self.finish_toolbar_section_lead(
                         ui,
@@ -8040,7 +8147,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             // `horizontal_wrapped` に直接載せ、幅不足時はツールバー全体の
                             // 次行へ自然に流す。
                             for &order in &tb_sorts {
-                                let selected = if book_sort_locked {
+                                let selected = if sort_disabled {
                                     false
                                 } else if self.items_are_bookmark_view {
                                     self.bookmark_view_sort
@@ -8057,12 +8164,9 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 );
                                 // 固定中はボタンが無効なので、通常 hover ではなく disabled
                                 // 専用ツールチップで固定理由を出す。
-                                let resp = if book_sort_locked {
-                                    resp.hover_tip_disabled(
-                                        "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                    )
-                                } else {
-                                    resp.on_hover_text(order.description())
+                                let resp = match sort_lock {
+                                    Some(reason) => resp.hover_tip_disabled(reason.tooltip()),
+                                    None => resp.on_hover_text(order.description()),
                                 };
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
@@ -8112,8 +8216,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            let current_text = if book_sort_locked {
-                                "固定".to_string()
+                            let current_text = if let Some(reason) = sort_lock {
+                                reason.short_label().to_string()
                             } else if self.items_are_bookmark_view {
                                 self.bookmark_view_sort.short_label().to_string()
                             } else if self.items_are_rating_view {
@@ -8203,10 +8307,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             // 固定中はコンボが無効なので、disabled 専用ツールチップで
                             // 「固定」表示のホバー時に固定理由を出す。
                             let combo_id = combo.response.id;
-                            if book_sort_locked {
-                                combo.response.hover_tip_disabled(
-                                    "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                );
+                            if let Some(reason) = sort_lock {
+                                combo.response.hover_tip_disabled(reason.tooltip());
                             }
                             toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo_id);
                         }
@@ -13324,6 +13426,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            // アイテムメニューを開いた経路を残す。ヘッダ右クリックでこのメニューが
+            // 出る間欠不具合 (§1.168) は再現待ちで、`context_menu_idx` を書くのは
+            // ここを含め 3 か所だけ。次に出たときログだけで経路が決まるようにしておく。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=cell idx={idx} pos={:?} cell_rect={:?} view_mode={:?}",
+                self.context_menu_pos, cell_rect, self.settings.grid_view_mode
+            ));
         }
 
         // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
@@ -13381,6 +13490,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     fn open_current_folder_context_menu_at(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
         if self.current_folder.is_some() {
+            // §1.168 の経路特定用。3 経路すべてに同じ形で残す。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=folder_bg pos={pos:?} view_mode={:?}",
+                self.settings.grid_view_mode
+            ));
             self.context_menu_idx = Some(usize::MAX);
             self.context_menu_pos = pos;
             ctx.request_repaint();
@@ -13524,6 +13638,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = pos;
+            // §1.168 の経路特定用。cell 経路と同じ理由でここにも残す。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=short_tap idx={idx} pos={pos:?} view_mode={:?}",
+                self.settings.grid_view_mode
+            ));
             ctx.request_repaint();
         } else {
             self.open_current_folder_context_menu_at(ctx, pos);
@@ -13576,6 +13695,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             natural_h,
             pixels_per_point,
             &self.settings,
+            self.items_are_rating_view,
         );
         let details_scroll_style = details_scroll_style();
         let content_w = layout.pane_w;
@@ -13747,6 +13867,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 layout_extent: layout.extent,
                 requested_extent: horizontal_policy.scroll_extent,
                 column_set: DetailsColumnSet::Details,
+                items_are_rating_view: self.items_are_rating_view,
                 outer_inner_rect: horizontal_output.inner_rect,
                 outer_content_size: horizontal_output.content_size,
                 outer_state: horizontal_output.state,
@@ -14260,7 +14381,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if let Some(pos) = ui.ctx().input(|input| input.pointer.latest_pos()) {
                     drag.latest = pos;
                 }
-                if finish_details_header_drag(&mut self.settings, column_set, columns, drag, 12.0) {
+                if finish_details_header_drag(
+                    &mut self.settings,
+                    column_set,
+                    columns,
+                    drag,
+                    12.0,
+                    self.items_are_rating_view,
+                ) {
                     crate::logger::log(format!(
                         "details header reorder ({column_set:?}): {:?} -> x {:.1}",
                         drag.column.id(),
@@ -14290,7 +14418,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             [rect.left_bottom(), rect.right_bottom()],
             egui::Stroke::new(1.0, stroke_color),
         );
-        let columns = details_column_rects_for_columns(rect, &self.settings, column_set);
+        let columns = details_column_rects_for_columns(
+            rect,
+            &self.settings,
+            column_set,
+            self.items_are_rating_view,
+        );
         let current_name_width = columns
             .iter()
             .find_map(|(column, rect)| (*column == DetailsColumn::Name).then_some(rect.width()))
@@ -14502,7 +14635,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             return;
         };
 
-        if !details_visible_columns(&self.settings, job.key.column_set).contains(&job.key.column) {
+        if !details_visible_columns(
+            &self.settings,
+            job.key.column_set,
+            self.items_are_rating_view,
+        )
+        .contains(&job.key.column)
+        {
             return;
         }
         let current_key =
@@ -14695,6 +14834,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &self.settings,
                     column_set,
                     effective_width,
+                    self.items_are_rating_view,
                 );
                 set_details_name_width(&mut self.settings, column_set, stored_width)
             } else {
@@ -14728,8 +14868,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             egui::Stroke::new(1.0, stroke_color),
         );
 
-        let columns =
-            details_column_rects_for_columns(rect, &self.settings, DetailsColumnSet::Details);
+        let columns = details_column_rects_for_columns(
+            rect,
+            &self.settings,
+            DetailsColumnSet::Details,
+            self.items_are_rating_view,
+        );
         for (col, col_rect) in columns.iter().copied() {
             let response = self.interact_details_header_drag(
                 ui,
@@ -14886,6 +15030,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                 }
                 ui.checkbox(&mut menu_state.show_rating, "★");
+                if self.items_are_rating_view {
+                    ui.checkbox(&mut menu_state.show_rated_at, "★設定時刻");
+                }
                 ui.checkbox(&mut menu_state.show_tags, "タグ");
                 ui.checkbox(&mut menu_state.show_kind, "種類");
                 ui.checkbox(&mut menu_state.show_page_count, "ページ数")
@@ -14929,7 +15076,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         });
 
-        let changes = menu_state.apply(&mut self.settings, column_set, current_name_width);
+        let changes = menu_state.apply(
+            &mut self.settings,
+            column_set,
+            current_name_width,
+            self.items_are_rating_view,
+        );
         // details_selection_bar_mode は環境設定ダイアログ所有のため、ダイアログを開いたまま
         // ここで切り替えた後に OK を押すと prepare_preferences_settings_for_commit が保持する
         // snapshot 側の値へ戻る。ほかの環境設定所有フィールドと同じ意図した優先順位である。
@@ -14969,6 +15121,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.get_rating(idx)
                 };
                 "★".repeat(rating as usize)
+            }
+            DetailsColumn::RatedAt => {
+                // DB 移行前などの NULL は通常値。セルは空欄にし、ソート時は昇順・降順とも
+                // 末尾へ送る（`compare_details_sort_rows` と同じ表示規約）。
+                self.rating_view_row(idx)
+                    .and_then(|row| row.rated_at_ms)
+                    .map(|rated_at_ms| {
+                        format_details_mtime(
+                            rated_at_ms.div_euclid(1000),
+                            self.settings.details_timestamp_show_seconds,
+                        )
+                    })
+                    .unwrap_or_default()
             }
             DetailsColumn::Tags => self.cell_tag_list(idx).join(" "),
             DetailsColumn::Kind => details_kind_label(
@@ -15054,7 +15219,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if self.items.get(idx).is_none() {
             return None;
         }
-        let column_rects = details_column_rects_for_columns(rect, &self.settings, column_set);
+        let column_rects = details_column_rects_for_columns(
+            rect,
+            &self.settings,
+            column_set,
+            self.items_are_rating_view,
+        );
         let columns = column_rects
             .iter()
             .map(|(column, _)| *column)
@@ -15143,6 +15313,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui,
                     col_rect,
                     &rating_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::RatedAt => draw_details_text(
+                    ui,
+                    col_rect,
+                    row_data.text(DetailsColumn::RatedAt),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
@@ -16179,6 +16357,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 )
             ));
         }
+        if let Some(rated_at_ms) = self.rating_view_row(idx).and_then(|row| row.rated_at_ms) {
+            lines.push(format!(
+                "★設定時刻 {}",
+                format_details_mtime(
+                    rated_at_ms.div_euclid(1000),
+                    self.settings.details_timestamp_show_seconds,
+                )
+            ));
+        }
 
         let mut fields = Vec::new();
         let mut full_location_line = None;
@@ -16361,6 +16548,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         details_natural_h,
                         pixels_per_point,
                         &self.settings,
+                        self.items_are_rating_view,
                     )
                     .gutter
                 } else {
@@ -16376,14 +16564,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     pixels_per_point,
                     &self.settings,
                     column_set,
+                    self.items_are_rating_view,
                 );
                 let content_w = details_content_width_for_column_set(full_layout.pane_w);
                 let avail_h = ui.available_height().max(0.0);
-                let fixed_columns_w: f32 = details_visible_columns(&self.settings, column_set)
-                    .into_iter()
-                    .filter(|column| *column != DetailsColumn::Name)
-                    .map(|column| details_column_width(&self.settings, column_set, column))
-                    .sum();
+                let fixed_columns_w: f32 =
+                    details_visible_columns(&self.settings, column_set, self.items_are_rating_view)
+                        .into_iter()
+                        .filter(|column| *column != DetailsColumn::Name)
+                        .map(|column| details_column_width(&self.settings, column_set, column))
+                        .sum();
                 let horizontal_policy = details_horizontal_scroll_policy(
                     source_rect,
                     full_layout.extent,
@@ -16439,6 +16629,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         layout_extent: full_layout.extent,
                         requested_extent: horizontal_policy.scroll_extent,
                         column_set,
+                        items_are_rating_view: self.items_are_rating_view,
                         outer_inner_rect: output.inner_rect,
                         outer_content_size: output.content_size,
                         outer_state: output.state,
@@ -16852,6 +17043,87 @@ mod details_column_view_title_tests {
 }
 
 #[cfg(test)]
+mod rated_at_details_column_tests {
+    use super::*;
+
+    #[test]
+    fn rated_at_column_and_menu_entry_exist_only_in_rating_view() {
+        let settings = crate::settings::Settings::default();
+
+        assert!(
+            !details_visible_columns(&settings, DetailsColumnSet::Details, false,)
+                .contains(&DetailsColumn::RatedAt)
+        );
+        assert!(
+            !details_ordered_columns(&settings, DetailsColumnSet::Details, true, false,)
+                .contains(&DetailsColumn::RatedAt)
+        );
+
+        assert!(
+            details_visible_columns(&settings, DetailsColumnSet::Details, true,)
+                .contains(&DetailsColumn::RatedAt)
+        );
+        assert!(
+            details_ordered_columns(&settings, DetailsColumnSet::Details, true, true,)
+                .contains(&DetailsColumn::RatedAt)
+        );
+        assert_eq!(
+            DetailsColumn::RatedAt.sort_key(),
+            Some(DetailsSortKey::RatedAt)
+        );
+    }
+
+    #[test]
+    fn rated_at_width_uses_only_backward_compatible_dedicated_fields() {
+        let mut settings = crate::settings::Settings::default();
+
+        assert!(set_details_column_width(
+            &mut settings,
+            DetailsColumnSet::Details,
+            DetailsColumn::RatedAt,
+            177.0,
+        ));
+        assert_eq!(settings.details_rated_at_width, Some(177.0));
+        assert_eq!(
+            details_column_width(
+                &settings,
+                DetailsColumnSet::SharedBar,
+                DetailsColumn::RatedAt,
+            ),
+            177.0
+        );
+        assert!(
+            !settings
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::RatedAt)
+        );
+
+        assert!(set_details_column_width(
+            &mut settings,
+            DetailsColumnSet::DedicatedBar,
+            DetailsColumn::RatedAt,
+            233.0,
+        ));
+        assert_eq!(settings.details_selection_bar_rated_at_width, Some(233.0));
+        assert_eq!(
+            details_column_width(
+                &settings,
+                DetailsColumnSet::DedicatedBar,
+                DetailsColumn::RatedAt,
+            ),
+            233.0
+        );
+        assert!(
+            !settings
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::RatedAt)
+        );
+    }
+}
+
+#[cfg(test)]
 mod selection_info_tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, DetailsLazyMeta, setup_app_for_test};
@@ -16886,6 +17158,43 @@ mod selection_info_tests {
     fn row_text_tooltips_are_disabled_only_in_details_view() {
         assert!(grid_row_text_tooltips_enabled(GridViewMode::Thumbnail));
         assert!(!grid_row_text_tooltips_enabled(GridViewMode::Details));
+    }
+
+    #[test]
+    fn rating_view_selection_info_and_cell_show_only_present_rated_at() {
+        let item = GridItem::Image(PathBuf::from(r"C:\pics\rated.jpg"));
+        let mut app = app_with_item(item.clone(), Some((1_600_000_000, 100)));
+        app.items_are_rating_view = true;
+        app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
+            key: "rated".to_string(),
+            item,
+            image_meta: Some((1_600_000_000, 100)),
+            rated_at_ms: Some(1_700_000_000_000),
+        }];
+
+        let content = app.selection_info_content().unwrap();
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|line| line.starts_with("★設定時刻 "))
+        );
+        assert!(
+            !app.details_row_data(0, &[DetailsColumn::RatedAt])
+                .unwrap()
+                .text(DetailsColumn::RatedAt)
+                .is_empty()
+        );
+
+        app.rating_view_rows[0].rated_at_ms = None;
+        let content = app.selection_info_content().unwrap();
+        assert!(!content.single_line_text().contains("★設定時刻"));
+        assert_eq!(
+            app.details_row_data(0, &[DetailsColumn::RatedAt])
+                .unwrap()
+                .text(DetailsColumn::RatedAt),
+            ""
+        );
     }
 
     #[test]
@@ -18052,7 +18361,7 @@ mod compute_cell_size_tests {
         state.size_display_mode = DetailsSizeDisplayMode::FixedMb;
         state.timestamp_show_seconds = false;
         state.row_style = DetailsRowStyle::Plain;
-        let changes = state.apply(&mut settings, DetailsColumnSet::DedicatedBar, 321.0);
+        let changes = state.apply(&mut settings, DetailsColumnSet::DedicatedBar, 321.0, false);
 
         assert!(changes.columns);
         assert!(changes.lazy_columns);
@@ -18078,7 +18387,7 @@ mod compute_cell_size_tests {
             DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::SharedBar);
         assert!(!shared.show_tags);
         shared.show_tags = true;
-        let shared_changes = shared.apply(&mut settings, DetailsColumnSet::SharedBar, 180.0);
+        let shared_changes = shared.apply(&mut settings, DetailsColumnSet::SharedBar, 180.0, false);
         assert!(shared_changes.columns);
         assert!(settings.details_show_tags);
         assert!(
@@ -18232,7 +18541,7 @@ mod compute_cell_size_tests {
         ));
 
         // avail が狭くても、保存済みの広い列のために pane は名前列既定幅 + その列幅まで広がる。
-        let layout = details_layout(200.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+        let layout = details_layout(200.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
         assert_eq!(layout.pane_w, DetailsColumn::Name.default_width() + 220.0);
         assert_eq!(layout.extent, layout.pane_w, "gutter 0 なら extent == pane");
     }
@@ -18242,7 +18551,14 @@ mod compute_cell_size_tests {
         // 名前列が残り幅を埋める通常ケース。縦バー gutter と丸め余白を引いて収める。
         let settings = minimal_details_settings(); // Name + Size(92)
         let gutter = 10.0;
-        let layout = details_layout(600.0, gutter, 1.0, &settings, DetailsColumnSet::Details);
+        let layout = details_layout(
+            600.0,
+            gutter,
+            1.0,
+            &settings,
+            DetailsColumnSet::Details,
+            false,
+        );
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!(
             (layout.pane_w - (600.0 - gutter - 1.0)).abs() < 0.01,
@@ -18257,7 +18573,7 @@ mod compute_cell_size_tests {
     #[test]
     fn details_layout_without_gutter_leaves_one_physical_pixel() {
         let settings = minimal_details_settings();
-        let layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+        let layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!((layout.pane_w - 599.0).abs() < 0.01);
     }
@@ -18272,6 +18588,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
             );
             let device_pixel_gap = (600.0 - layout.extent) * pixels_per_point;
             let expected_gap = 1.0_f32.max(0.5 * pixels_per_point);
@@ -18297,6 +18614,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
             );
             let policy = details_horizontal_scroll_policy(
                 viewport,
@@ -18374,7 +18692,7 @@ mod compute_cell_size_tests {
                 egui::Rect::from_min_size(egui::pos2(8.0, 0.0), egui::vec2(avail_w, 400.0));
             let mut settings = minimal_details_settings();
             settings.details_name_width_auto = false;
-            let fixed = details_fixed_columns_width(&settings, DetailsColumnSet::Details);
+            let fixed = details_fixed_columns_width(&settings, DetailsColumnSet::Details, false);
             let layout_avail_w =
                 details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
             let fitting_name =
@@ -18387,6 +18705,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
             );
             let fitting_policy = details_horizontal_scroll_policy(
                 viewport,
@@ -18407,6 +18726,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
             );
             let overflow_policy = details_horizontal_scroll_policy(
                 viewport,
@@ -18444,6 +18764,7 @@ mod compute_cell_size_tests {
                                 pixels_per_point,
                                 &settings,
                                 DetailsColumnSet::Details,
+                                false,
                             );
                             let policy = details_horizontal_scroll_policy(
                                 viewport,
@@ -18497,6 +18818,7 @@ mod compute_cell_size_tests {
                         effective_ppp,
                         &settings,
                         DetailsColumnSet::Details,
+                        false,
                     );
                     let policy = details_horizontal_scroll_policy(
                         viewport,
@@ -19211,7 +19533,7 @@ mod compute_cell_size_tests {
         ];
 
         assert_eq!(
-            details_visible_columns(&settings, DetailsColumnSet::SharedBar),
+            details_visible_columns(&settings, DetailsColumnSet::SharedBar, false),
             vec![
                 DetailsColumn::Kind,
                 DetailsColumn::Size,
@@ -19284,6 +19606,7 @@ mod compute_cell_size_tests {
             row_count as f32 * App::DETAILS_ROW_H,
             1.0,
             settings,
+            false,
         )
     }
 
@@ -19299,6 +19622,7 @@ mod compute_cell_size_tests {
             ),
             settings,
             column_set,
+            false,
         )
     }
 
@@ -19320,6 +19644,7 @@ mod compute_cell_size_tests {
             1.0,
             settings,
             DetailsColumnSet::SharedBar,
+            false,
         );
         let list_rects = layout_column_rects(resolved.layout, settings, DetailsColumnSet::Details);
         let bar_rects = layout_column_rects(bar_layout, settings, DetailsColumnSet::SharedBar);
@@ -19363,6 +19688,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
         );
         let long_bar = details_layout(
             600.0,
@@ -19370,6 +19696,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
         );
         let short_list_x = column_rect(
             &layout_column_rects(short.layout, &settings, DetailsColumnSet::Details),
@@ -19417,6 +19744,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
         );
         let long_layout = details_layout(
             600.0,
@@ -19424,6 +19752,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
         );
         assert_eq!(
             layout_column_rects(short_layout, &settings, DetailsColumnSet::SharedBar),
@@ -19447,6 +19776,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::DedicatedBar,
+            false,
         );
 
         assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
@@ -19463,8 +19793,14 @@ mod compute_cell_size_tests {
                 settings.details_selection_bar_mode = DetailsSelectionBarMode::SameAsDetails;
                 settings.details_name_width_auto = name_width_auto;
                 settings.details_show_preview = show_preview;
-                let full_layout =
-                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::SharedBar);
+                let full_layout = details_layout(
+                    600.0,
+                    0.0,
+                    1.0,
+                    &settings,
+                    DetailsColumnSet::SharedBar,
+                    false,
+                );
                 let text_width = details_content_width_for_column_set(full_layout.pane_w);
                 let full_rect = egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -19472,11 +19808,12 @@ mod compute_cell_size_tests {
                 );
                 let text_rect =
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
-                let full = details_column_rects(full_rect, &settings);
+                let full = details_column_rects(full_rect, &settings, false);
                 let text = details_column_rects_for_columns(
                     text_rect,
                     &settings,
                     DetailsColumnSet::SharedBar,
+                    false,
                 );
 
                 for (column, rect) in text {
@@ -19515,7 +19852,7 @@ mod compute_cell_size_tests {
                 settings.grid_view_mode = grid_view_mode;
                 settings.details_selection_bar_mode = selection_bar_mode;
                 let list_layout =
-                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
                 let list_rects = details_column_rects_for_columns(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -19523,15 +19860,17 @@ mod compute_cell_size_tests {
                     ),
                     &settings,
                     DetailsColumnSet::Details,
+                    false,
                 );
                 let column_set = selection_info_bottom_bar_column_set(&settings);
-                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set, false);
                 let content_width = details_content_width_for_column_set(layout.pane_w);
                 assert_eq!(content_width, layout.pane_w);
                 let rects = details_column_rects_for_columns(
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
                     &settings,
                     column_set,
+                    false,
                 );
                 let list_size = list_rects
                     .iter()
@@ -19560,7 +19899,7 @@ mod compute_cell_size_tests {
                 settings.grid_view_mode = grid_view_mode;
                 settings.details_selection_bar_mode = selection_bar_mode;
                 let list_layout =
-                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details);
+                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
                 let list = details_column_rects_for_columns(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -19568,14 +19907,16 @@ mod compute_cell_size_tests {
                     ),
                     &settings,
                     DetailsColumnSet::Details,
+                    false,
                 );
                 let column_set = selection_info_bottom_bar_column_set(&settings);
-                let bar_layout = details_layout(600.0, 0.0, 1.0, &settings, column_set);
+                let bar_layout = details_layout(600.0, 0.0, 1.0, &settings, column_set, false);
                 let content_width = details_content_width_for_column_set(bar_layout.pane_w);
                 let bar = details_column_rects_for_columns(
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
                     &settings,
                     column_set,
+                    false,
                 );
                 assert_eq!(
                     bar, list,
@@ -19612,7 +19953,7 @@ mod compute_cell_size_tests {
         let shared_set = selection_info_bottom_bar_column_set(&settings);
         assert_eq!(shared_set, DetailsColumnSet::SharedBar);
         assert_eq!(
-            details_visible_columns(&settings, shared_set),
+            details_visible_columns(&settings, shared_set, false),
             vec![DetailsColumn::Size, DetailsColumn::Name]
         );
 
@@ -19620,7 +19961,7 @@ mod compute_cell_size_tests {
         let dedicated_set = selection_info_bottom_bar_column_set(&settings);
         assert_eq!(dedicated_set, DetailsColumnSet::DedicatedBar);
         assert_eq!(
-            details_visible_columns(&settings, dedicated_set),
+            details_visible_columns(&settings, dedicated_set, false),
             vec![DetailsColumn::Kind, DetailsColumn::Name]
         );
 
@@ -19672,6 +20013,7 @@ mod compute_cell_size_tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(261.0, 24.0)),
             &settings,
             selection_info_bottom_bar_column_set(&settings),
+            false,
         );
         assert_eq!(
             shared.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
@@ -19685,6 +20027,7 @@ mod compute_cell_size_tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(555.0, 24.0)),
             &settings,
             selection_info_bottom_bar_column_set(&settings),
+            false,
         );
         assert_eq!(
             dedicated
@@ -19708,17 +20051,20 @@ mod compute_cell_size_tests {
 
         assert!(!selection_info_bottom_bar_shows_column(
             &settings,
-            DetailsColumn::Size
+            DetailsColumn::Size,
+            false,
         ));
 
         settings.grid_view_mode = GridViewMode::Thumbnail;
         assert!(selection_info_bottom_bar_shows_column(
             &settings,
-            DetailsColumn::Size
+            DetailsColumn::Size,
+            false,
         ));
         assert!(!selection_info_bottom_bar_shows_column(
             &settings,
-            DetailsColumn::Preview
+            DetailsColumn::Preview,
+            false,
         ));
     }
 
@@ -19727,7 +20073,14 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 500.0;
-        let layout = details_layout(300.0, 10.0, 1.0, &settings, DetailsColumnSet::Details);
+        let layout = details_layout(
+            300.0,
+            10.0,
+            1.0,
+            &settings,
+            DetailsColumnSet::Details,
+            false,
+        );
         assert!((layout.name_w - 500.0).abs() < 0.01, "固定幅を尊重");
         assert!(
             layout.extent > 300.0,
@@ -19740,10 +20093,17 @@ mod compute_cell_size_tests {
         let mut settings = minimal_details_settings();
         settings.details_name_width_auto = false;
         settings.details_name_width = 120.0;
-        let layout = details_layout(600.0, 10.0, 1.0, &settings, DetailsColumnSet::Details);
+        let layout = details_layout(
+            600.0,
+            10.0,
+            1.0,
+            &settings,
+            DetailsColumnSet::Details,
+            false,
+        );
         assert!((layout.name_w - 120.0).abs() < 0.01);
-        let columns_w =
-            layout.name_w + details_fixed_columns_width(&settings, DetailsColumnSet::Details);
+        let columns_w = layout.name_w
+            + details_fixed_columns_width(&settings, DetailsColumnSet::Details, false);
         assert!(
             columns_w < layout.pane_w,
             "固定名前列が pane より狭いと右側に余白が残る"
@@ -19876,13 +20236,15 @@ mod compute_cell_size_tests {
         settings.details_show_preview = true;
         settings.details_name_width_auto = false;
         settings.details_name_width = 210.0;
-        let effective = details_effective_fixed_name_width(&settings, DetailsColumnSet::SharedBar);
+        let effective =
+            details_effective_fixed_name_width(&settings, DetailsColumnSet::SharedBar, false);
         assert_eq!(effective, 244.0);
         assert_eq!(
             details_stored_name_width_from_effective(
                 &settings,
                 DetailsColumnSet::SharedBar,
                 effective,
+                false,
             ),
             210.0
         );
@@ -19896,6 +20258,7 @@ mod compute_cell_size_tests {
         let rects = details_column_rects(
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 24.0)),
             &settings,
+            false,
         );
         let name_rect = rects
             .iter()
@@ -19917,7 +20280,8 @@ mod compute_cell_size_tests {
             DetailsColumnSet::Details,
             DetailsColumn::Size,
             DetailsColumn::Name,
-            false
+            false,
+            false,
         ));
 
         let size_pos = settings
@@ -19934,11 +20298,62 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn details_reorder_outside_rating_view_preserves_rated_at_storage_slot() {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_column_order = DetailsColumnId::default_order().to_vec();
+        let before = settings.details_column_order.clone();
+        let mut expected = before.clone();
+        let rated_at_pos = expected
+            .iter()
+            .position(|id| *id == DetailsColumnId::RatedAt)
+            .unwrap();
+        expected.remove(rated_at_pos);
+        let size_pos = expected
+            .iter()
+            .position(|id| *id == DetailsColumnId::Size)
+            .unwrap();
+        let size = expected.remove(size_pos);
+        let name_pos = expected
+            .iter()
+            .position(|id| *id == DetailsColumnId::Name)
+            .unwrap();
+        expected.insert(name_pos, size);
+        expected.insert(rated_at_pos, DetailsColumnId::RatedAt);
+
+        assert!(reorder_details_column(
+            &mut settings,
+            DetailsColumnSet::Details,
+            DetailsColumn::Size,
+            DetailsColumn::Name,
+            false,
+            false,
+        ));
+
+        assert_eq!(settings.details_column_order, expected);
+        assert_eq!(
+            settings
+                .details_column_order
+                .iter()
+                .position(|id| *id == DetailsColumnId::RatedAt),
+            Some(rated_at_pos)
+        );
+        assert_eq!(
+            settings
+                .details_column_order
+                .iter()
+                .filter(|id| **id == DetailsColumnId::RatedAt)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn details_header_drag_uses_recorded_latest_pos_on_release() {
         let mut settings = crate::settings::Settings::default();
         let columns = details_column_rects(
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1200.0, 24.0)),
             &settings,
+            false,
         );
         let size_rect = columns
             .iter()
@@ -19961,6 +20376,7 @@ mod compute_cell_size_tests {
                 latest: egui::pos2(name_rect.left() + 4.0, name_rect.center().y),
             },
             12.0,
+            false,
         ));
 
         let size_pos = settings
@@ -19992,6 +20408,7 @@ mod compute_cell_size_tests {
             DetailsColumnSet::DedicatedBar,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
         ));
 
@@ -20033,6 +20450,7 @@ mod compute_cell_size_tests {
             DetailsColumnSet::SharedBar,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
         ));
 
@@ -20079,6 +20497,7 @@ mod compute_cell_size_tests {
                 DetailsColumn::Size,
                 DetailsColumn::Size,
                 true,
+                false,
             ));
             assert_eq!(serde_json::to_value(&settings).unwrap(), before);
         }
@@ -21964,5 +22383,107 @@ mod toolbar_wrap_tests {
         let measured = measured[0];
         assert!(measured > 24.0, "前提が崩れている: {measured}");
         assert_eq!(24.0f32.max(measured), measured, "実測を採るはず");
+    }
+}
+
+#[cfg(test)]
+mod details_header_right_click_tests {
+    use super::*;
+    use crate::app::{AppTestEnvForTest, setup_app_for_test};
+    use egui_kittest::Harness;
+
+    struct HeaderState {
+        app: AppTestEnvForTest,
+    }
+
+    /// 詳細一覧をそのまま描く harness。ヘッダも背景右クリックも右ドラッグ短押しも
+    /// `render_details_list` の中にあるので、この 1 本で全経路を通せる。
+    fn details_harness(gesture: bool) -> Harness<'static, HeaderState> {
+        let mut app = setup_app_for_test();
+        app.items = (0..6)
+            .map(|i| GridItem::Image(PathBuf::from(format!(r"C:\details\{i}.jpg"))))
+            .collect();
+        app.thumbnails = (0..app.items.len())
+            .map(|_| crate::grid_item::ThumbnailState::Failed)
+            .collect();
+        app.image_metas = (0..app.items.len()).map(|_| Some((1, 10))).collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.selected = Some(0);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        if gesture {
+            app.settings.ring_shortcuts.set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::MouseGesture,
+            );
+        }
+        Harness::builder()
+            .with_size(egui::vec2(640.0, 400.0))
+            .with_step_dt(0.01)
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = state.app.render_details_list(
+                            ui,
+                            ctx,
+                            false,
+                            None,
+                            false,
+                            GridClickPairingState::default(),
+                        );
+                    });
+                },
+                HeaderState { app },
+            )
+    }
+
+    fn secondary_click(harness: &mut Harness<'static, HeaderState>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.step();
+    }
+
+    /// 列ヘッダの右クリックは列メニューのものである。アイテムメニューを開いてはならない。
+    #[test]
+    fn right_clicking_the_column_header_does_not_open_the_item_menu() {
+        for gesture in [false, true] {
+            let mut harness = details_harness(gesture);
+            harness.step();
+            let header_pos = egui::pos2(120.0, App::DETAILS_HEADER_H * 0.5);
+            secondary_click(&mut harness, header_pos);
+            assert_eq!(
+                harness.state().app.context_menu_idx,
+                None,
+                "gesture={gesture}: ヘッダ右クリックでアイテム/フォルダメニューが開いた"
+            );
+        }
+    }
+
+    /// 行の右クリックは従来どおりアイテムメニューを開く (上の guard が効きすぎていないか)。
+    #[test]
+    fn right_clicking_a_row_still_opens_the_item_menu() {
+        for gesture in [false, true] {
+            let mut harness = details_harness(gesture);
+            harness.step();
+            let row_pos = egui::pos2(120.0, App::DETAILS_HEADER_H + App::DETAILS_ROW_H * 0.5);
+            secondary_click(&mut harness, row_pos);
+            assert!(
+                harness.state().app.context_menu_idx.is_some(),
+                "gesture={gesture}: 行の右クリックでメニューが開かない"
+            );
+        }
     }
 }

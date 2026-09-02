@@ -1262,7 +1262,7 @@ impl ContainerCatalogCache {
     }
 }
 
-fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;

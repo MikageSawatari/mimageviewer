@@ -210,6 +210,7 @@
 # GridPin = P ; 選択中の項目を代表サムネイルに固定または解除する
 # GridComparePin = X ; 選択中の画像を比較スロットに固定または解除する
 # GridAddToActiveBook = Ctrl+B ; 選択中またはチェック済みのページを追加先の本へ追加する
+# GridExportSelection = Ctrl+E ; 選択中またはチェック済みの画像をまとめて書き出す
 # GridColumnCount1.1 = Alt+1 ; サムネイル列数を1列にする
 # GridColumnCount1.2 = Alt+Numpad1 ; サムネイル列数を1列にする
 # GridColumnCount2.1 = Alt+2 ; サムネイル列数を2列にする
@@ -486,7 +487,7 @@
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
 # VideoPerfOverlay = F ; 動画の性能オーバーレイを切り替える
 # VideoTileMode = S ; 動画タイルモードを切り替える
-# VideoSeekStripCycle = Shift+S ; 動画のシークストリップをなし、サムネイル、音声波形の順に切り替える
+# VideoSeekStripCycle = Shift+S ; 動画のシークストリップの表示を順に切り替える（環境設定で通す表示を選べる）
 # VideoSeekStripToggle = none ; 動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）
 # VideoSeekStripNone = none ; 動画のシークストリップを非表示にする
 # VideoSeekStripThumbnails = none ; 動画のシークストリップをサムネイル表示にする
