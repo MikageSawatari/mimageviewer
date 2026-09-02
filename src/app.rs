@@ -37039,7 +37039,7 @@ impl App {
         self.last_reading_history_touch = Some((key, now));
     }
 
-    pub(crate) fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
+    fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
         let mut page_count = 0_i64;
         let mut page_pos = None;
         for &candidate in self.current_grid_order() {

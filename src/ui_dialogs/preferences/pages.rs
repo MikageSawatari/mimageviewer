@@ -729,9 +729,6 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
             ui.end_row();
 
-            // 引数が渡すファイルを 1 つも使っていないなら、一時ファイルは作られない。
-            // 設定が効かないのに選べるのは分かりづらい (2026-09-02 利用者指摘)。
-            let passes_file = crate::external_tool::arguments_pass_the_materialized_file(&tool);
             ui.label("渡すもの");
             let payload_options = [
                 (
@@ -747,26 +744,8 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     "元のファイル",
                 ),
             ];
-            ui.add_enabled_ui(passes_file, |ui| {
-                enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options);
-            });
+            enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options);
             ui.end_row();
-
-            if !passes_file {
-                ui.label("");
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(concat!(
-                            "引数が渡すファイルを使っていないので、一時ファイルは作りません。",
-                            "ツールには {container} や {page} など、対象の場所を表す値だけが渡り、",
-                            "ツールは元のファイルを開きます。編集・補正は反映されません。",
-                        ))
-                        .weak(),
-                    )
-                    .wrap(),
-                );
-                ui.end_row();
-            }
 
             let passes_real_file =
                 tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;
@@ -993,82 +972,19 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
-        ui.add_space(2.0);
-        ui.label("mIV が渡すファイル: {files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.label("{files}  {dir}  {name}  {stem}  {ext}  {uri}");
         ui.add(
             egui::Label::new(
                 egui::RichText::new(concat!(
-                    "一時ファイルを作って渡します。「渡すもの」の設定に従い、",
-                    "編集を反映したものにできます。",
+                    "{files} は mIV が渡すファイル。「1 件ずつ」なら 1 つ、",
+                    "「まとめて渡す」なら選んだ数だけ並びます。何も書かないときは",
+                    "{files} が 1 つ付きます。他は {files} から採った値です。",
                 ))
                 .weak(),
             )
             .wrap(),
         );
-        ui.add_space(4.0);
-        ui.label("対象の場所: {container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
-                    "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒)。",
-                    "ツールに元のファイルを直接開かせるための値なので、",
-                    "これだけを使うと mIV は一時ファイルを作らず、",
-                    "編集・補正は反映されません。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
-        ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "対象が持っていない値は、そのトークンごと引数から取り除きます",
-                    "(その値を待っている直前の option も一緒に取り除きます)。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
-        if crate::external_tool::arguments_mix_the_file_and_the_location(&tool) {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(concat!(
-                        "この引数は、渡すファイルと元の場所の両方をツールへ渡しています。",
-                        "ツールがどちらを開くかで、編集が反映されたりされなかったりします。",
-                    ))
-                    .color(ui.visuals().warn_fg_color),
-                )
-                .wrap(),
-            );
-        }
-
-        // 起動側と同じ facts を出す。ここが実際の値と違うと、プレビューを見て
-        // 引数を組み立てた利用者が必ず外す。
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("現在の対象で入る値").strong());
-        let facts = &state.external_tool_target_facts;
-        for (name, value) in [
-            (
-                "{container}",
-                facts
-                    .container
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-            ),
-            ("{entry}", facts.entry.clone()),
-            ("{page}", facts.page.map(|page| page.to_string())),
-            ("{time}", facts.time_secs.map(|secs| format!("{secs:.3}"))),
-        ] {
-            match value {
-                Some(value) => ui.monospace(format!("{name} = {value}")),
-                None => ui
-                    .label(egui::RichText::new(format!("{name} = (値なし → 引数から削除)")).weak()),
-            };
-        }
     }
-
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
     // (環境設定を開いているだけで plan 行が毎フレーム流れ、実際の起動が埋もれる)。
@@ -9272,7 +9188,6 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
-            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,

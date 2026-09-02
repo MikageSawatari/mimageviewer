@@ -12540,54 +12540,6 @@ mod phase_c_drill_nav_tests {
         );
     }
 
-    /// `{page}` は items 上の位置ではなく、本の中のページ位置。
-    ///
-    /// 入れ子 ZIP のディレクトリ項目が混ざると位置はずれる。ずれた番号を渡すより、
-    /// トークンごと落とす (Codex Sol 指摘 #11)。
-    #[test]
-    fn the_page_placeholder_counts_pages_not_grid_positions() {
-        use crate::grid_item::GridItem;
-        let mut app = setup_app();
-        let zip = std::path::PathBuf::from("c:/books/book.zip");
-        app.current_folder = Some(zip.clone());
-        app.items = vec![
-            GridItem::ZipImage {
-                zip_path: zip.clone(),
-                entry_name: "a.jpg".to_string(),
-            },
-            GridItem::ZipImage {
-                zip_path: zip.clone(),
-                entry_name: "b.jpg".to_string(),
-            },
-        ];
-        app.visible_indices = vec![0, 1];
-        let target = crate::external_tool::LaunchTarget::ZipPage {
-            zip_path: zip.clone(),
-            entry_name: "b.jpg".to_string(),
-        };
-        assert_eq!(
-            app.placeholder_facts_for_target(&target, Some(1)).page,
-            Some(2)
-        );
-
-        // 入れ子 ZIP のディレクトリ項目が入ると、位置とページ番号は一致しない。
-        app.items.insert(
-            0,
-            GridItem::ZipDir {
-                zip_path: zip.clone(),
-                dir_prefix: "sub/".to_string(),
-                is_archive: false,
-                representative: None,
-            },
-        );
-        app.visible_indices = vec![0, 1, 2];
-        assert_eq!(
-            app.placeholder_facts_for_target(&target, Some(2)).page,
-            None,
-            "ページでない項目が混ざる一覧では番号を付けない"
-        );
-    }
-
     #[test]
     fn reading_history_page_position_requires_page_only_order() {
         use crate::grid_item::GridItem;
