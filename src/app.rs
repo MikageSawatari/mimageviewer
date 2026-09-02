@@ -21177,6 +21177,9 @@ impl App {
         self.rating_view_nav_stack.clear();
         self.pending_rating_view_zipdir_open = None;
         self.items_are_rating_view = false;
+        // saved_folder が無い退出でも通常一覧向けの rebuild を待てないため、view-local な
+        // ★設定時刻ソートをこの所有境界で必ず Toolbar へ戻す。
+        self.reset_details_sort_if_hidden();
         let restore_state = self.rating_view_subfolder_restore.take();
         if let Some(saved) = self.rating_view_saved_folder.take() {
             self.suppress_nav_record_for_search_restore = true;
@@ -21317,6 +21320,14 @@ impl App {
         }
     }
 
+    /// 現在のレーティング一覧で、`items` と同じ位置にある行を返す。
+    /// 通常フォルダなどでは同じ index が別の意味を持つため返さない。
+    pub(crate) fn rating_view_row(&self, idx: usize) -> Option<&crate::rating_view::RatingViewRow> {
+        self.items_are_rating_view
+            .then(|| self.rating_view_rows.get(idx))
+            .flatten()
+    }
+
     pub(crate) fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
         if changes.is_empty() {
             self.rebuild_visible_indices();
@@ -21396,6 +21407,9 @@ impl App {
     fn install_rating_view_rows(&mut self) {
         let previous_selected = self.selected;
         let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let retained_details_rated_at_sort = (self.items_are_rating_view
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
+            .then_some(self.settings.details_sort_ascending);
         // ★時刻順のときはカテゴリ再配置を通さない (§1.142)。通すとフォルダ / アーカイブが
         // 時刻に関係なく先頭へ出て、「★を付けた順に一列で見る」という要求が壊れる。
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
@@ -21464,6 +21478,13 @@ impl App {
             None,
         );
         self.items_are_rating_view = true;
+        if let Some(ascending) = retained_details_rated_at_sort {
+            // generic な一覧差し替えは一度 view flag を落として通常ビュー退出を確定する。
+            // ただしこの関数は同じレーティング一覧の再 install 所有者なので、その途中で
+            // visibility guard が Toolbar へ落とした view-local sort だけをここで戻す。
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+            self.settings.details_sort_ascending = ascending;
+        }
         self.top_level_grid_view.replace_surface(
             top_level_grid_view::TopLevelGridSurface::Rating {
                 stars: self.rating_view_stars,
@@ -44824,18 +44845,24 @@ impl App {
         use crate::ui_main::{DetailsColumn, selection_info_bottom_bar_shows_column};
 
         ((self.settings.thumb_tooltip_show_created
-            || selection_info_bottom_bar_shows_column(&self.settings, DetailsColumn::Created))
+            || selection_info_bottom_bar_shows_column(
+                &self.settings,
+                DetailsColumn::Created,
+                self.items_are_rating_view,
+            ))
             && self.details_item_supports_created_at(idx))
             || ((self.settings.thumb_tooltip_show_page_count
                 || selection_info_bottom_bar_shows_column(
                     &self.settings,
                     DetailsColumn::PageCount,
+                    self.items_are_rating_view,
                 ))
                 && self.details_item_supports_page_count(idx))
             || ((self.settings.thumb_tooltip_show_image_dimensions
                 || selection_info_bottom_bar_shows_column(
                     &self.settings,
                     DetailsColumn::ImageDimensions,
+                    self.items_are_rating_view,
                 ))
                 && self.details_item_supports_image_dims(idx))
             || match self.items.get(idx) {
@@ -44844,16 +44871,19 @@ impl App {
                         || selection_info_bottom_bar_shows_column(
                             &self.settings,
                             DetailsColumn::VideoDuration,
+                            self.items_are_rating_view,
                         )
                         || self.settings.thumb_tooltip_show_video_dimensions
                         || selection_info_bottom_bar_shows_column(
                             &self.settings,
                             DetailsColumn::VideoDimensions,
+                            self.items_are_rating_view,
                         )
                         || self.settings.thumb_tooltip_show_video_codec
                         || selection_info_bottom_bar_shows_column(
                             &self.settings,
                             DetailsColumn::VideoCodec,
+                            self.items_are_rating_view,
                         )
                 }
                 Some(GridItem::Audio(_)) => {
@@ -44861,11 +44891,13 @@ impl App {
                         || selection_info_bottom_bar_shows_column(
                             &self.settings,
                             DetailsColumn::VideoDuration,
+                            self.items_are_rating_view,
                         )
                         || self.settings.thumb_tooltip_show_video_codec
                         || selection_info_bottom_bar_shows_column(
                             &self.settings,
                             DetailsColumn::VideoCodec,
+                            self.items_are_rating_view,
                         )
                 }
                 _ => false,
@@ -44885,6 +44917,7 @@ impl App {
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::Created,
+                        self.items_are_rating_view,
                     )
             }
         };
@@ -44904,6 +44937,7 @@ impl App {
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::PageCount,
+                        self.items_are_rating_view,
                     )
             }
         };
@@ -44923,6 +44957,7 @@ impl App {
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::ImageDimensions,
+                        self.items_are_rating_view,
                     )
             }
         };
@@ -44948,16 +44983,19 @@ impl App {
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::VideoDuration,
+                        self.items_are_rating_view,
                     ),
                 self.settings.thumb_tooltip_show_video_dimensions
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::VideoDimensions,
+                        self.items_are_rating_view,
                     ),
                 self.settings.thumb_tooltip_show_video_codec
                     || crate::ui_main::selection_info_bottom_bar_shows_column(
                         &self.settings,
                         crate::ui_main::DetailsColumn::VideoCodec,
+                        self.items_are_rating_view,
                     ),
             ),
         };
@@ -47070,6 +47108,9 @@ impl App {
         match key {
             DetailsSortKey::Toolbar | DetailsSortKey::Name => true,
             DetailsSortKey::Rating => self.settings.details_show_rating,
+            DetailsSortKey::RatedAt => {
+                self.items_are_rating_view && self.settings.details_show_rated_at
+            }
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
             DetailsSortKey::PageCount => self.settings.details_show_page_count,
@@ -47196,6 +47237,9 @@ impl App {
             DetailsSortKey::Toolbar => DetailsSortPrimary::None,
             DetailsSortKey::Name => DetailsSortPrimary::None,
             DetailsSortKey::Rating => DetailsSortPrimary::U8(self.get_rating(idx)),
+            DetailsSortKey::RatedAt => {
+                DetailsSortPrimary::I64(self.rating_view_row(idx).and_then(|row| row.rated_at_ms))
+            }
             DetailsSortKey::Tags => DetailsSortPrimary::Text(self.cell_tag_list(idx).join(" ")),
             DetailsSortKey::Kind => DetailsSortPrimary::Text(self.details_kind_sort_key(idx)),
             DetailsSortKey::PageCount => {
@@ -47248,7 +47292,12 @@ impl App {
         let primary = match key {
             DetailsSortKey::Toolbar => Ordering::Equal,
             DetailsSortKey::Name => Self::compare_details_sort_names(a, b),
-            DetailsSortKey::Size | DetailsSortKey::Modified | DetailsSortKey::Created => {
+            DetailsSortKey::Size
+            | DetailsSortKey::Modified
+            | DetailsSortKey::Created
+            | DetailsSortKey::RatedAt => {
+                // ★設定時刻を含む optional 時刻は、NULL を空欄として扱い、昇順・降順の
+                // どちらでも末尾へ置く。下の反転対象からも外してこの規約を維持する。
                 let DetailsSortPrimary::I64(av) = &a.primary else {
                     return Ordering::Equal;
                 };
@@ -47276,6 +47325,7 @@ impl App {
             DetailsSortKey::Size
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
+            | DetailsSortKey::RatedAt
             | DetailsSortKey::PageCount
             | DetailsSortKey::ImageDimensions
             | DetailsSortKey::VideoDuration
@@ -71061,3 +71111,110 @@ pub(crate) mod tests;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+mod rated_at_details_sort_tests {
+    use super::*;
+
+    fn row(name: &str, rated_at_ms: Option<i64>) -> crate::rating_view::RatingViewRow {
+        let path = PathBuf::from(format!(r"C:\rating-view\{name}"));
+        crate::rating_view::RatingViewRow {
+            key: name.to_string(),
+            item: GridItem::Image(path),
+            image_meta: Some((1_000, 10)),
+            rated_at_ms,
+        }
+    }
+
+    #[test]
+    fn rated_at_details_sort_keeps_null_last_in_both_directions() {
+        let mut app = setup_app_for_test();
+        app.rating_view_rows = vec![
+            row("thirty.jpg", Some(30)),
+            row("none-a.jpg", None),
+            row("ten.jpg", Some(10)),
+            row("none-b.jpg", None),
+        ];
+        app.items = app
+            .rating_view_rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect();
+        app.image_metas = app
+            .rating_view_rows
+            .iter()
+            .map(|row| row.image_meta)
+            .collect();
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.items_are_rating_view = true;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_rated_at = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+
+        app.settings.details_sort_ascending = true;
+        app.rebuild_details_order();
+        assert_eq!(app.details_order, vec![2, 0, 1, 3]);
+
+        app.settings.details_sort_ascending = false;
+        app.rebuild_details_order();
+        assert_eq!(app.details_order, vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn rated_at_sort_is_visible_only_in_rating_view_and_resets_on_close() {
+        let mut app = setup_app_for_test();
+        app.settings.details_show_rated_at = true;
+
+        assert!(!app.details_sort_key_visible(crate::settings::DetailsSortKey::RatedAt));
+        app.items_are_rating_view = true;
+        assert!(app.details_sort_key_visible(crate::settings::DetailsSortKey::RatedAt));
+
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+        app.settings.details_sort_ascending = false;
+        app.close_rating_view();
+
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(app.settings.details_sort_ascending);
+    }
+
+    #[test]
+    fn reinstalling_same_rating_view_keeps_rated_at_sort() {
+        let mut app = setup_app_for_test();
+        app.rating_view_rows = vec![row("page.jpg", Some(10))];
+        app.items_are_rating_view = true;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+        app.settings.details_sort_ascending = false;
+
+        app.install_rating_view_rows();
+
+        assert!(app.items_are_rating_view);
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::RatedAt
+        );
+        assert!(!app.settings.details_sort_ascending);
+    }
+
+    #[test]
+    fn true_rating_view_entry_does_not_restore_a_stale_rated_at_sort() {
+        let mut app = setup_app_for_test();
+        app.rating_view_rows = vec![row("page.jpg", Some(10))];
+        app.items_are_rating_view = false;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+        app.settings.details_sort_ascending = false;
+
+        app.install_rating_view_rows();
+
+        assert!(app.items_are_rating_view);
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(app.settings.details_sort_ascending);
+    }
+}

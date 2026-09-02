@@ -803,6 +803,9 @@ impl SettingsDb {
         let mut persisted = settings.clone();
         persisted.stash_post_filter_variants_for_persist();
         persisted.stash_toolbar_name_filter_for_persist();
+        // RatedAt は位置を復元せず不足列として末尾へ戻すため、先に除去する。
+        // これにより、続く Place / PageCount の位置キャリアは実際に保存される列順を測る。
+        persisted.stash_details_rated_at_for_persist();
         // Column carriers are restored PageCount -> Place during sanitize, so remove them
         // in the reverse order to preserve their relative positions when both are present.
         persisted.stash_details_place_for_persist();
@@ -5785,6 +5788,86 @@ mod tests {
         assert_eq!(read("details_page_count_sort_stash"), "true");
         assert_eq!(read("details_page_count_column_index_stash"), "2");
         assert_eq!(read("details_page_count_column_width_stash"), "96.0");
+    }
+
+    #[test]
+    fn rated_at_details_are_persisted_without_v340_unknown_variants() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = Settings::default();
+        settings.details_sort_key = crate::settings::DetailsSortKey::RatedAt;
+        settings.details_column_order = vec![
+            crate::settings::DetailsColumnId::Preview,
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::RatedAt,
+            crate::settings::DetailsColumnId::Size,
+        ];
+        settings.details_column_widths = vec![
+            crate::settings::DetailsColumnWidth {
+                column: crate::settings::DetailsColumnId::RatedAt,
+                width: 154.0,
+            },
+            crate::settings::DetailsColumnWidth {
+                column: crate::settings::DetailsColumnId::Size,
+                width: 128.0,
+            },
+        ];
+        settings.details_selection_bar_column_order = vec![
+            crate::settings::DetailsColumnId::Name,
+            crate::settings::DetailsColumnId::RatedAt,
+        ];
+        settings.details_selection_bar_column_widths = vec![crate::settings::DetailsColumnWidth {
+            column: crate::settings::DetailsColumnId::RatedAt,
+            width: 176.0,
+        }];
+        settings.details_show_rated_at = false;
+        settings.details_selection_bar_show_rated_at = false;
+
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        let read = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let mut statement = conn.prepare("SELECT value FROM settings_kv").unwrap();
+        let persisted_json = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("|");
+
+        assert!(!persisted_json.contains("RatedAt"));
+        assert_eq!(read("details_sort_key"), r#""Toolbar""#);
+        assert_eq!(read("details_rated_at_width"), "154.0");
+        assert_eq!(read("details_selection_bar_rated_at_width"), "176.0");
+        drop(statement);
+        drop(conn);
+
+        let mut loaded = db.load_into_settings().unwrap();
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(
+            loaded.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(
+            loaded
+                .details_column_order
+                .contains(&crate::settings::DetailsColumnId::RatedAt)
+        );
+        assert!(
+            loaded
+                .details_selection_bar_column_order
+                .contains(&crate::settings::DetailsColumnId::RatedAt)
+        );
+        assert_eq!(loaded.details_rated_at_width, Some(154.0));
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(176.0));
+        assert!(!loaded.details_show_rated_at);
+        assert!(!loaded.details_selection_bar_show_rated_at);
     }
 
     #[test]

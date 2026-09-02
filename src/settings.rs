@@ -807,6 +807,7 @@ pub enum DetailsSortKey {
     Toolbar,
     Name,
     Rating,
+    RatedAt,
     Tags,
     Kind,
     PageCount,
@@ -827,6 +828,7 @@ impl DetailsSortKey {
             Self::Toolbar => "ツールバー順",
             Self::Name => "名前",
             Self::Rating => "★",
+            Self::RatedAt => "★設定時刻",
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
@@ -916,6 +918,7 @@ pub enum DetailsColumnId {
     Preview,
     Name,
     Rating,
+    RatedAt,
     Tags,
     Kind,
     PageCount,
@@ -936,6 +939,7 @@ impl DetailsColumnId {
             Self::Preview,
             Self::Name,
             Self::Rating,
+            Self::RatedAt,
             Self::Tags,
             Self::Kind,
             Self::PageCount,
@@ -3508,6 +3512,10 @@ pub struct Settings {
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
     pub details_column_widths: Vec<DetailsColumnWidth>,
+    /// v3.4.0 が知らない `DetailsColumnId::RatedAt` を既存の列幅配列へ保存しないための
+    /// 専用キャリア。追加フィールドは旧版に無視されるので、列幅だけを安全に保持できる。
+    #[serde(default)]
+    pub details_rated_at_width: Option<f32>,
     /// v2.5.0 が知らないページ数列の位置・幅を、旧版が無視できる未知フィールドへ退避する。
     #[serde(default)]
     pub(crate) details_page_count_column_index_stash: Option<usize>,
@@ -3526,6 +3534,8 @@ pub struct Settings {
     pub details_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_show_rated_at: bool,
     #[serde(default = "default_true")]
     pub details_show_tags: bool,
     #[serde(default = "default_true")]
@@ -3566,10 +3576,15 @@ pub struct Settings {
     /// 詳細表示中の下部情報バー専用の列幅。
     #[serde(default)]
     pub details_selection_bar_column_widths: Vec<DetailsColumnWidth>,
+    /// 下部情報バー側の ★設定時刻列幅も、v3.4.0 が読む既存配列から分離して保存する。
+    #[serde(default)]
+    pub details_selection_bar_rated_at_width: Option<f32>,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_rated_at: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_tags: bool,
     #[serde(default = "default_true")]
@@ -5855,6 +5870,12 @@ fn sanitize_details_column_widths(widths: &mut Vec<DetailsColumnWidth>) {
     );
 }
 
+fn sanitize_optional_details_column_width(width: &mut Option<f32>) {
+    *width = width
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(40.0, 800.0));
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -5872,6 +5893,7 @@ impl Default for Settings {
             details_row_style: DetailsRowStyle::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
+            details_rated_at_width: None,
             details_page_count_column_index_stash: None,
             details_page_count_column_width_stash: None,
             details_place_column_index_stash: None,
@@ -5882,6 +5904,7 @@ impl Default for Settings {
             details_name_width: default_details_name_width(),
             details_show_preview: true,
             details_show_rating: true,
+            details_show_rated_at: true,
             details_show_tags: true,
             details_show_kind: true,
             details_show_page_count: true,
@@ -5897,8 +5920,10 @@ impl Default for Settings {
             details_selection_bar_mode: DetailsSelectionBarMode::SameAsDetails,
             details_selection_bar_column_order: Vec::new(),
             details_selection_bar_column_widths: Vec::new(),
+            details_selection_bar_rated_at_width: None,
             details_selection_bar_show_preview: true,
             details_selection_bar_show_rating: true,
+            details_selection_bar_show_rated_at: true,
             details_selection_bar_show_tags: true,
             details_selection_bar_show_kind: true,
             details_selection_bar_show_page_count: true,
@@ -7451,6 +7476,43 @@ impl Settings {
         }
     }
 
+    /// ★設定時刻列を、この列を知らない v3.4.0 が deserialize できる形へ変換する。
+    ///
+    /// ソートはレーティング一覧内だけの状態なので `Toolbar` に戻し、列順は保存しない。
+    /// 幅だけは旧版が無視できる専用フィールドへ移す。下部情報バーの既存配列にも
+    /// 未知 variant を残せないため、同じ境界で除去する。
+    pub(crate) fn stash_details_rated_at_for_persist(&mut self) {
+        if matches!(self.details_sort_key, DetailsSortKey::RatedAt) {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::RatedAt);
+        if let Some(width) = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::RatedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_rated_at_width = Some(width);
+        }
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::RatedAt);
+
+        self.details_selection_bar_column_order
+            .retain(|column| *column != DetailsColumnId::RatedAt);
+        if let Some(width) = self
+            .details_selection_bar_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::RatedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_selection_bar_rated_at_width = Some(width);
+        }
+        self.details_selection_bar_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::RatedAt);
+    }
+
     /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
     ///
     /// 旧版が読む既存フィールドには既知の variant だけを残し、ページ数列の状態は
@@ -7608,8 +7670,10 @@ impl Settings {
     pub fn copy_details_columns_to_selection_bar(&mut self) {
         self.details_selection_bar_column_order = self.details_column_order.clone();
         self.details_selection_bar_column_widths = self.details_column_widths.clone();
+        self.details_selection_bar_rated_at_width = self.details_rated_at_width;
         self.details_selection_bar_show_preview = self.details_show_preview;
         self.details_selection_bar_show_rating = self.details_show_rating;
+        self.details_selection_bar_show_rated_at = self.details_show_rated_at;
         self.details_selection_bar_show_tags = self.details_show_tags;
         self.details_selection_bar_show_kind = self.details_show_kind;
         self.details_selection_bar_show_page_count = self.details_show_page_count;
@@ -7904,8 +7968,10 @@ impl Settings {
         self.restore_details_place_after_load();
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
+        sanitize_optional_details_column_width(&mut self.details_rated_at_width);
         sanitize_details_column_order(&mut self.details_selection_bar_column_order);
         sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
+        sanitize_optional_details_column_width(&mut self.details_selection_bar_rated_at_width);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
@@ -8021,10 +8087,12 @@ impl Settings {
         self.details_row_style = src.details_row_style;
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
+        self.details_rated_at_width = src.details_rated_at_width;
         self.details_name_width_auto = src.details_name_width_auto;
         self.details_name_width = src.details_name_width;
         self.details_show_preview = src.details_show_preview;
         self.details_show_rating = src.details_show_rating;
+        self.details_show_rated_at = src.details_show_rated_at;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
         self.details_show_page_count = src.details_show_page_count;
@@ -8039,10 +8107,12 @@ impl Settings {
         self.details_show_video_codec = src.details_show_video_codec;
         self.details_selection_bar_column_order = src.details_selection_bar_column_order.clone();
         self.details_selection_bar_column_widths = src.details_selection_bar_column_widths.clone();
+        self.details_selection_bar_rated_at_width = src.details_selection_bar_rated_at_width;
         self.details_selection_bar_name_width_auto = src.details_selection_bar_name_width_auto;
         self.details_selection_bar_name_width = src.details_selection_bar_name_width;
         self.details_selection_bar_show_preview = src.details_selection_bar_show_preview;
         self.details_selection_bar_show_rating = src.details_selection_bar_show_rating;
+        self.details_selection_bar_show_rated_at = src.details_selection_bar_show_rated_at;
         self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
         self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
         self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
@@ -8787,12 +8857,20 @@ mod tests {
             settings.details_column_widths
         );
         assert_eq!(
+            settings.details_selection_bar_rated_at_width,
+            settings.details_rated_at_width
+        );
+        assert_eq!(
             settings.details_selection_bar_show_preview,
             settings.details_show_preview
         );
         assert_eq!(
             settings.details_selection_bar_show_rating,
             settings.details_show_rating
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_rated_at,
+            settings.details_show_rated_at
         );
         assert_eq!(
             settings.details_selection_bar_show_tags,
@@ -9319,8 +9397,10 @@ mod tests {
                 width: 234.0,
             },
         ];
+        original.details_selection_bar_rated_at_width = Some(210.0);
         original.details_selection_bar_show_preview = false;
         original.details_selection_bar_show_rating = false;
+        original.details_selection_bar_show_rated_at = false;
         original.details_selection_bar_show_tags = false;
         original.details_selection_bar_show_kind = false;
         original.details_selection_bar_show_page_count = false;
@@ -9350,8 +9430,10 @@ mod tests {
             loaded.details_selection_bar_column_widths,
             original.details_selection_bar_column_widths
         );
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(210.0));
         assert!(!loaded.details_selection_bar_show_preview);
         assert!(!loaded.details_selection_bar_show_rating);
+        assert!(!loaded.details_selection_bar_show_rated_at);
         assert!(!loaded.details_selection_bar_show_tags);
         assert!(!loaded.details_selection_bar_show_kind);
         assert!(!loaded.details_selection_bar_show_page_count);
@@ -9390,6 +9472,7 @@ mod tests {
                 width: 900.0,
             },
         ];
+        loaded.details_selection_bar_rated_at_width = Some(900.0);
         loaded.details_selection_bar_name_width = 900.0;
 
         loaded.sanitize();
@@ -9420,6 +9503,7 @@ mod tests {
             DetailsColumnId::Size
         );
         assert_f32_close(loaded.details_selection_bar_column_widths[0].width, 800.0);
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(800.0));
         assert_f32_close(loaded.details_selection_bar_name_width, 800.0);
     }
 
@@ -9431,8 +9515,10 @@ mod tests {
             column: DetailsColumnId::Size,
             width: 177.0,
         }];
+        settings.details_rated_at_width = Some(166.0);
         settings.details_show_preview = false;
         settings.details_show_rating = false;
+        settings.details_show_rated_at = false;
         settings.details_show_tags = false;
         settings.details_show_kind = false;
         settings.details_show_page_count = false;
@@ -10560,17 +10646,72 @@ mod tests {
     fn extended_details_column_stashes_preserve_relative_order() {
         let mut settings = Settings::default();
         settings.details_column_order = DetailsColumnId::default_order().to_vec();
-        let expected = settings.details_column_order.clone();
+        settings.details_selection_bar_column_order = DetailsColumnId::default_order().to_vec();
+        settings.details_selection_bar_column_order.rotate_left(4);
+        settings.details_sort_key = DetailsSortKey::RatedAt;
+        settings.details_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::RatedAt,
+            width: 154.0,
+        }];
+        settings.details_selection_bar_column_widths = vec![DetailsColumnWidth {
+            column: DetailsColumnId::RatedAt,
+            width: 176.0,
+        }];
+        let expected_details_without_rated_at = settings
+            .details_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        let expected_selection_bar_without_rated_at = settings
+            .details_selection_bar_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
 
         let mut persisted = settings.clone();
-        // sanitize restores PageCount before Place, so persistence removes them in reverse.
+        // save_full と同じ順序。RatedAt は位置を保存せず、Place / PageCount は
+        // 読み込み時の復元順と逆順に退避して、既知列同士の位置を保つ。
+        persisted.stash_details_rated_at_for_persist();
         persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         let json = serde_json::to_string(&persisted).unwrap();
+        assert!(!json.contains("RatedAt"));
 
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
         loaded.sanitize();
-        assert_eq!(loaded.details_column_order, expected);
+        let loaded_details_without_rated_at = loaded
+            .details_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        let loaded_selection_bar_without_rated_at = loaded
+            .details_selection_bar_column_order
+            .iter()
+            .copied()
+            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            loaded_details_without_rated_at,
+            expected_details_without_rated_at
+        );
+        assert_eq!(
+            loaded_selection_bar_without_rated_at,
+            expected_selection_bar_without_rated_at
+        );
+        assert_eq!(
+            loaded.details_column_order.last(),
+            Some(&DetailsColumnId::RatedAt)
+        );
+        assert_eq!(
+            loaded.details_selection_bar_column_order.last(),
+            Some(&DetailsColumnId::RatedAt)
+        );
+        assert_eq!(loaded.details_rated_at_width, Some(154.0));
+        assert_eq!(loaded.details_selection_bar_rated_at_width, Some(176.0));
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::Toolbar);
     }
 
     #[test]
@@ -11234,6 +11375,8 @@ mod tests {
             column: DetailsColumnId::Kind,
             width: 199.0,
         }];
+        live.details_selection_bar_rated_at_width = Some(188.0);
+        live.details_selection_bar_show_rated_at = false;
         live.details_selection_bar_show_size = false;
         live.details_selection_bar_show_video_codec = true;
         live.details_selection_bar_name_width_auto = false;
@@ -11259,6 +11402,8 @@ mod tests {
                 width: 199.0,
             }]
         );
+        assert_eq!(edited.details_selection_bar_rated_at_width, Some(188.0));
+        assert!(!edited.details_selection_bar_show_rated_at);
         assert!(!edited.details_selection_bar_show_size);
         assert!(edited.details_selection_bar_show_video_codec);
         assert!(!edited.details_selection_bar_name_width_auto);
@@ -13780,8 +13925,10 @@ mod tests {
                     width: 234.0,
                 },
             ];
+            settings.details_selection_bar_rated_at_width = Some(198.0);
             settings.details_selection_bar_show_preview = false;
             settings.details_selection_bar_show_rating = false;
+            settings.details_selection_bar_show_rated_at = false;
             settings.details_selection_bar_show_tags = false;
             settings.details_selection_bar_show_kind = false;
             settings.details_selection_bar_show_page_count = false;
@@ -13795,7 +13942,16 @@ mod tests {
             settings.details_selection_bar_show_video_codec = true;
             settings.details_selection_bar_name_width_auto = false;
             settings.details_selection_bar_name_width = 345.0;
-            let expected_data = selection_bar_data_value(&settings);
+            let mut expected = settings.clone();
+            // RatedAt の位置は v3.4.0 互換のため保存せず、読み込み時に不足列として
+            // 末尾へ補完する。ほかの下部情報バー設定は従来どおり完全に往復する。
+            expected
+                .details_selection_bar_column_order
+                .retain(|column| *column != DetailsColumnId::RatedAt);
+            expected
+                .details_selection_bar_column_order
+                .push(DetailsColumnId::RatedAt);
+            let expected_data = selection_bar_data_value(&expected);
 
             settings.save();
             reset_backup_state_for_test();
@@ -13806,6 +13962,8 @@ mod tests {
                 DetailsSelectionBarMode::Dedicated
             );
             assert_eq!(selection_bar_data_value(&loaded), expected_data);
+            assert_eq!(loaded.details_selection_bar_rated_at_width, Some(198.0));
+            assert!(!loaded.details_selection_bar_show_rated_at);
         }
 
         /// `thumb_aspect_auto` の save→load ラウンドトリップ。
