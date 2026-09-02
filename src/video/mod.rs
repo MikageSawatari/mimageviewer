@@ -64,7 +64,7 @@ pub mod screenshot;
 pub(crate) mod seek_strip;
 #[cfg(feature = "dev-tools")]
 pub mod seek_strip_batch;
-pub(crate) mod seek_strip_layout;
+pub mod seek_strip_layout;
 pub(crate) mod seek_strip_thumbs;
 pub(crate) mod seek_strip_wave;
 pub mod spherical_metadata;

@@ -4398,7 +4398,7 @@ impl KeyAction {
             VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
             VideoTileMode => "動画タイルモードを切り替える",
             VideoSeekStripCycle => {
-                "動画のシークストリップをなし、サムネイル、音声波形の順に切り替える"
+                "動画のシークストリップの表示を順に切り替える（環境設定で通す表示を選べる）"
             }
             VideoSeekStripToggle => {
                 "動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）"

@@ -6925,6 +6925,52 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         });
 
         ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-height", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("シークストリップの高さ");
+                egui::ComboBox::from_id_salt("video_seek_strip_height")
+                    .selected_text(s.video_seek_strip_height.label())
+                    .show_ui(ui, |ui| {
+                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_height,
+                                preset,
+                                preset.label(),
+                            );
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "低いほど画像は小さくなりますが、動画全体を表示したときに一度に並ぶ枚数が増えます。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-cycle", |ui, state| {
+            let s = &mut state.settings;
+            ui.label("シークストリップをキーで切り替えるときに通す表示");
+            let mut cycle = s.video_seek_strip_cycle;
+            for showing in crate::video::seek_strip_layout::SEEK_STRIP_SHOWING_ORDER {
+                let mut enabled = cycle.contains(showing);
+                if ui.checkbox(&mut enabled, showing.label()).changed() {
+                    cycle.set(showing, enabled);
+                }
+            }
+            // 全部外すとキーが無反応になるので、その場で既定へ戻す。
+            s.video_seek_strip_cycle = cycle.normalized();
+            ui.label(
+                egui::RichText::new(
+                    "外した表示もシークバー右下のボタンのメニューからは選べます。すべて外した場合は「場面 (周辺)」だけが有効に戻ります。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-interval", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {

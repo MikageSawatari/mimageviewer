@@ -98,9 +98,13 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
 動画のシークストリップは `VideoSeekStripCycle` (既定 <kbd>Shift</kbd>+<kbd>S</kbd>) で
-「なし → サムネイル → 音声波形 → なし」の順に切り替える。`VideoSeekStripToggle` は
+「なし → 場面 (周辺) → 場面 (全体) → 波形 (周辺) → 波形 (全体) → なし」の順に切り替える。
+環境設定 (`Settings.video_seek_strip_cycle`) で外した表示は飛ばす。**外した表示も右下の
+メニューからは選べる**ので、設定で到達不能な表示は作らない (全解除は読み込み時に
+「場面 (周辺)」だけ有効へ正規化する)。`VideoSeekStripToggle` は
 表示中なら閉じ、非表示なら上ドラッグと同じく最後に選んだサムネイル / 音声波形を復元する。
-`VideoSeekStripNone` / `VideoSeekStripThumbnails` / `VideoSeekStripWaveform` は指定状態へ直接移る。
+`VideoSeekStripNone` / `VideoSeekStripThumbnails` / `VideoSeekStripWaveform` は表示範囲
+(周辺 / 全体) を保ったまま指定内容へ直接移る。
 この追加 4 action に既定 chord はなく、ユーザーが `[FsVideo]` で任意に割り当てる。
 長さ情報が無い、または場面 index が疎すぎて strip material unavailable と確定した動画では、
 これら 5 action は film button / 上ドラッグと同じく設定状態を変更しない no-op とする。

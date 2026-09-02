@@ -11,7 +11,8 @@ use eframe::egui;
 use crate::settings::VideoSeekStripMode;
 
 /// ストリップが動画のどこを写すか。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum SeekStripSpan {
     /// 再生位置を中央に固定し、その周辺を流す (従来)。
     #[default]
@@ -44,7 +45,8 @@ impl SeekStripSpan {
 ///
 /// `Smallest` は実機確認で足した段 (2026-09-01)。全体表示の枚数はセルの高さで決まるので、
 /// 「小」でも思ったほど並ばない、という利用者の報告への答えがこれ。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum SeekStripHeight {
     #[default]
     Large,
@@ -178,12 +180,22 @@ impl SeekStripView {
 ///
 /// 巡回から外したモードも右下メニューからは直接選べる。ここは**到達可能性ではなく
 /// 巡回の長さ**を決める設定であり、機能自体の非表示にはしない。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeekStripCycleSet {
+    // 4 つとも既定 true。**項目ごとに既定を持つ**ので、将来 5 つ目を足しても、
+    // その項目を知らない設定を読んだときに構造ごと既定へ落ちない。
+    #[serde(default = "default_true")]
     pub thumbnails_window: bool,
+    #[serde(default = "default_true")]
     pub thumbnails_whole: bool,
+    #[serde(default = "default_true")]
     pub waveform_window: bool,
+    #[serde(default = "default_true")]
     pub waveform_whole: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for SeekStripCycleSet {

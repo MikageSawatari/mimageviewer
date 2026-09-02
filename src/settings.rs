@@ -4642,6 +4642,17 @@ pub struct Settings {
     /// どうかを表す state ではなく、明示的な復元先だけを所有する。
     #[serde(default, alias = "video_seek_strip_mode")]
     pub video_seek_strip_last_choice: VideoSeekStripMode,
+    /// ストリップが動画のどこを写すか (周辺 / 全体)。表示内容と直交するので、
+    /// 場面と波形を行き来しても選択を保つ。
+    #[serde(default)]
+    pub video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan,
+    /// ストリップの高さ (大 / 中 / 小 / 最小)。
+    #[serde(default)]
+    pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// `Shift+S` の巡回に含める表示。**機能自体の非表示ではない** — 外した表示も
+    /// 右下のメニューからは選べる。全解除は `sanitize` が既定へ戻す。
+    #[serde(default)]
+    pub video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -6127,6 +6138,9 @@ impl Default for Settings {
             video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
             video_seek_strip_state: VideoSeekStripState::default(),
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
+            video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
+            video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_seek_strip_locked: false,
@@ -7665,6 +7679,8 @@ impl Settings {
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
             .last_choice(self.video_seek_strip_last_choice);
+        // 巡回対象を全部外した設定は `Shift+S` を無反応にする。読み込み時に既定へ戻す。
+        self.video_seek_strip_cycle = self.video_seek_strip_cycle.normalized();
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -8508,6 +8524,63 @@ mod tests {
             loaded.video_seek_strip_last_choice,
             VideoSeekStripMode::Waveform
         );
+    }
+
+    /// 表示範囲・高さ・巡回対象は保存され、既定は従来の見え方のまま。
+    #[test]
+    fn video_seek_strip_span_height_and_cycle_round_trip_with_the_shipped_defaults() {
+        use crate::video::seek_strip_layout::{SeekStripHeight, SeekStripSpan};
+
+        // 既定は出荷済みの見え方 (周辺表示・大) で、更新しても見た目が変わらない。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Window);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Large);
+        assert_eq!(
+            loaded.video_seek_strip_cycle,
+            crate::video::seek_strip_layout::SeekStripCycleSet::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_span = SeekStripSpan::Whole;
+        settings.video_seek_strip_height = SeekStripHeight::Smallest;
+        settings.video_seek_strip_cycle.waveform_whole = false;
+        let stored = serde_json::to_value(settings).unwrap();
+        assert_eq!(stored["video_seek_strip_span"], "whole");
+        assert_eq!(stored["video_seek_strip_height"], "smallest");
+        assert_eq!(stored["video_seek_strip_cycle"]["waveform_whole"], false);
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.video_seek_strip_span, SeekStripSpan::Whole);
+        assert_eq!(loaded.video_seek_strip_height, SeekStripHeight::Smallest);
+        assert!(!loaded.video_seek_strip_cycle.waveform_whole);
+        assert!(loaded.video_seek_strip_cycle.thumbnails_window);
+    }
+
+    /// 巡回対象を全部外した設定は読み込みで既定へ戻す。そのままだと `Shift+S` が
+    /// 「非表示 → 非表示」になり、キーが無反応になる。
+    #[test]
+    fn sanitize_restores_a_seek_strip_cycle_that_has_nothing_left_in_it() {
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: false,
+        };
+        settings.sanitize();
+        assert!(settings.video_seek_strip_cycle.thumbnails_window);
+
+        // 1 つでも残っていれば、その選択をそのまま尊重する。
+        let mut settings = Settings::default();
+        settings.video_seek_strip_cycle = crate::video::seek_strip_layout::SeekStripCycleSet {
+            thumbnails_window: false,
+            thumbnails_whole: false,
+            waveform_window: false,
+            waveform_whole: true,
+        };
+        settings.sanitize();
+        assert!(!settings.video_seek_strip_cycle.thumbnails_window);
+        assert!(settings.video_seek_strip_cycle.waveform_whole);
     }
 
     #[test]

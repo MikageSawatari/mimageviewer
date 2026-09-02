@@ -814,6 +814,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["プレビュー", "サムネイル", "速度", "位置", "seek"]
     ),
     entry!(
+        "video/seek-strip-height",
+        Video,
+        "シークストリップの高さ",
+        ["動画", "サムネイル", "大きさ", "枚数", "seek"]
+    ),
+    entry!(
+        "video/seek-strip-cycle",
+        Video,
+        "シークストリップをキーで切り替えるときに通す表示",
+        ["動画", "波形", "全体", "周辺", "キー", "seek"]
+    ),
+    entry!(
         "video/seek-strip-interval",
         Video,
         "シークストリップの画像間隔",

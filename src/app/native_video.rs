@@ -6916,7 +6916,7 @@ impl App {
             top_locked: self.settings.video_top_bar_locked,
             bottom_lock: self.settings.video_bottom_lock(),
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
-            seek_strip_height: self.video_seek_strip_height,
+            seek_strip_height: self.settings.video_seek_strip_height,
         }
     }
 
@@ -7445,7 +7445,7 @@ impl App {
     pub(crate) fn open_video_seek_strip(&mut self, fs_idx: usize) -> bool {
         let view = crate::video::seek_strip_layout::SeekStripView::showing(
             self.settings.video_seek_strip_last_choice,
-            self.video_seek_strip_span,
+            self.settings.video_seek_strip_span,
         );
         self.set_video_seek_strip_view(fs_idx, view)
     }
@@ -7457,7 +7457,7 @@ impl App {
             None => crate::video::seek_strip_layout::SeekStripView::Hidden,
             Some(mode) => crate::video::seek_strip_layout::SeekStripView::showing(
                 mode,
-                self.video_seek_strip_span,
+                self.settings.video_seek_strip_span,
             ),
         }
     }
@@ -7708,7 +7708,7 @@ impl App {
             action,
             current,
             self.settings.video_seek_strip_last_choice,
-            self.video_seek_strip_cycle_set,
+            self.settings.video_seek_strip_cycle,
             strip_available,
         ) else {
             return false;
@@ -7725,7 +7725,7 @@ impl App {
         use crate::video::seek_strip_layout::SeekStripView;
 
         let previous_state = self.settings.video_seek_strip_state;
-        let previous_span = self.video_seek_strip_span;
+        let previous_span = self.settings.video_seek_strip_span;
         let SeekStripView::Showing(showing) = view else {
             self.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::None;
             if previous_state != crate::settings::VideoSeekStripState::None {
@@ -7751,7 +7751,7 @@ impl App {
         );
         // 表示範囲は先に決める。内容の切替が新しい軸やワーカーを作るとき、その時点の
         // 表示範囲で作れるようにするため。
-        self.video_seek_strip_span = showing.span;
+        self.settings.video_seek_strip_span = showing.span;
         let applied = if runtime_matches {
             true
         } else if owns_session {
@@ -7762,19 +7762,20 @@ impl App {
             self.ensure_video_seek_strip_session(fs_idx, showing)
         };
         if !applied {
-            self.video_seek_strip_span = previous_span;
+            self.settings.video_seek_strip_span = previous_span;
             return false;
         }
 
         let last_choice = state.last_choice(self.settings.video_seek_strip_last_choice);
-        let settings_changed =
-            previous_state != state || self.settings.video_seek_strip_last_choice != last_choice;
+        let settings_changed = previous_state != state
+            || previous_span != showing.span
+            || self.settings.video_seek_strip_last_choice != last_choice;
         self.settings.video_seek_strip_state = state;
         self.settings.video_seek_strip_last_choice = last_choice;
         if settings_changed {
             self.settings.save();
         }
-        settings_changed || previous_span != showing.span || !runtime_matches
+        settings_changed || !runtime_matches
     }
 
     #[cfg(windows)]
@@ -8030,10 +8031,11 @@ impl App {
         fs_idx: usize,
         height: crate::video::seek_strip_layout::SeekStripHeight,
     ) -> bool {
-        if self.video_seek_strip_height == height {
+        if self.settings.video_seek_strip_height == height {
             return false;
         }
-        self.video_seek_strip_height = height;
+        self.settings.video_seek_strip_height = height;
+        self.settings.save();
         let bar_lock = self.native_bar_lock_state();
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_bar_lock_state(bar_lock);
