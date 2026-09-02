@@ -262,6 +262,7 @@ pub(crate) enum OperationSettingsTab {
     Behavior,
     RightDrag,
     MouseButtons,
+    Gamepad,
 }
 
 impl OperationSettingsTab {
@@ -270,6 +271,7 @@ impl OperationSettingsTab {
             Self::Behavior => "動作",
             Self::RightDrag => "右ドラッグ・右クリック",
             Self::MouseButtons => "マウスボタン",
+            Self::Gamepad => "ゲームパッド",
         }
     }
 }
@@ -2976,6 +2978,7 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
             OperationSettingsTab::Behavior,
             OperationSettingsTab::RightDrag,
             OperationSettingsTab::MouseButtons,
+            OperationSettingsTab::Gamepad,
         ] {
             if ui
                 .selectable_label(state.operation_settings_tab == tab, tab.label())
@@ -2990,6 +2993,7 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
         OperationSettingsTab::Behavior => page_operation_behavior(ui, state),
         OperationSettingsTab::RightDrag => page_right_drag_modes(ui, state),
         OperationSettingsTab::MouseButtons => page_mouse_buttons(ui, state),
+        OperationSettingsTab::Gamepad => page_gamepad_device(ui, state),
     }
 }
 

@@ -1726,12 +1726,41 @@ pub(super) fn page_ring_shortcut_assignments(
     ring_shortcut_context_editor(ui, &mut state.settings.ring_shortcuts, context);
 }
 
+/// 設定タブの「ゲームパッド」。**割り当てではなく、デバイスを読むかどうか**を持つ。
+/// 割り当ての編集はトップレベルの「ゲームパッド」タブ
+/// ([`page_gamepad_assignments`]) 側。
+pub(super) fn page_gamepad_device(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.small("ゲームパッドからの操作を受け付けるかどうかを切り替えます。割り当ての編集は上の「ゲームパッド」タブです。");
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut state.settings.gamepad_enabled,
+        "ゲームパッドの操作を受け付ける",
+    );
+    ui.add_space(4.0);
+    if state.settings.gamepad_enabled {
+        ui.small("オフにすると、接続されていてもボタン・スティックの操作を一切受け付けません。誤って触れてしまう場合に使ってください。");
+        ui.small("マウスジェスチャとリングショートカットのマウス操作は、この設定の対象外です。");
+    } else {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "現在ゲームパッドは無効です。接続していても操作を受け付けません。",
+        );
+    }
+}
 pub(super) fn page_gamepad_assignments(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
     ui.small("固定ボタンは既定動作で使い、X+方向リングだけ編集できます。");
+    if !state.settings.gamepad_enabled {
+        // 無効のまま割り当てを編集して「効かない」と悩まないように、ここでも言う。
+        ui.add_space(4.0);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "現在ゲームパッドは無効です (設定 → ゲームパッド)。ここでの割り当ては保存されますが、有効にするまで動きません。",
+        );
+    }
     ui.add_space(8.0);
     gamepad_layout_preview(ui, context);
     ui.add_space(12.0);
