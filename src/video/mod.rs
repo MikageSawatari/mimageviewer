@@ -4996,11 +4996,16 @@ fn run_native_video_output(
                     info_panel_open,
                     info_panel_locked,
                 } => {
-                    presenter.set_overlay_side_panel_state(
+                    // 固定の切替は映像の transform を作り直す。バーの固定と同じ扱い。
+                    if let Err(err) = presenter.set_overlay_side_panel_state(
                         mode,
                         info_panel_open,
                         info_panel_locked,
-                    );
+                    ) {
+                        crate::logger::log(format!(
+                            "[native-video] set info panel reservation transform failed: {err}"
+                        ));
+                    }
                 }
                 NativeVideoOutputCommand::SetBarLockState {
                     top_locked,

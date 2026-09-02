@@ -1058,6 +1058,9 @@ pub struct NativeRenderCore {
     video_top_bar_locked: bool,
     video_bottom_lock: VideoBottomLock,
     fullscreen_fixed_bar_gap_px: u32,
+    /// 右情報パネルが場所を占めているか (= 固定中かつ描ける)。overlay 内部の状態でも
+    /// 変わるので、`reconcile_info_panel_reservation` が突き合わせて覚える。
+    video_info_panel_reserved: bool,
     /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル (= 従来挙動)。
     /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で `update_video_visual_transform`
     /// の M11/M22 を anisotropic にして表示比を補正する。decoder の VideoInfo 経由で
@@ -3398,6 +3401,7 @@ impl NativeRenderCore {
                 last_pixel_probe: None,
                 video_compact: false,
                 video_top_bar_locked: initial_bar_lock.top_locked,
+                video_info_panel_reserved: false,
                 video_bottom_lock: initial_bar_lock.bottom_lock,
                 fullscreen_fixed_bar_gap_px: initial_bar_lock.fixed_bar_gap_px,
                 sar_num: 1,
@@ -5718,6 +5722,7 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
+        self.reconcile_info_panel_reservation()?;
         Ok(outcome)
     }
 
@@ -5887,10 +5892,13 @@ impl NativeRenderCore {
         mode: FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
         info_panel_locked: bool,
-    ) {
+    ) -> Result<(), String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_side_panel_state(mode, info_panel_open, info_panel_locked);
         }
+        // 固定を切り替えた瞬間に映像を寄せる。次のファイル移動まで待たせない
+        // (実機報告 2026-09-02: ロックしても映像が左に寄らず、前後移動で直った)。
+        self.reconcile_info_panel_reservation()
     }
 
     pub(crate) fn set_overlay_bar_lock_state(
@@ -6138,6 +6146,7 @@ impl NativeRenderCore {
         } else {
             NativeOverlayInputOutcome::empty()
         };
+        self.reconcile_info_panel_reservation()?;
         // Codex CP5 P1 反映: tick 経路でも overlay UI が時間経過で表示/非表示に変わるので、
         // 必ず HUD region に反映する。漏らすと periodic 表示状態 (= toast / hover preview /
         // tile overlay refresh 等) と region がズレて VST にクリックが奪われる。
@@ -6259,6 +6268,24 @@ impl NativeRenderCore {
     /// `resize()` が `self.width` を**末尾で**更新するため (= 呼び出し時点では 1 resize
     /// 前の値)。stale なサイズで transform を計算すると最大化/復元/ドラッグの追従が
     /// 1 ステップ遅れる (2026-05 修正)。
+    /// 右情報パネルが場所を占めるかの答えが変わったら、映像の transform を作り直す。
+    ///
+    /// **command が来たときだけでは足りない。** 予約は overlay 内部の状態でも変わる —
+    /// VST パネル、ヘルプ、360、速度ポップアップ、メタ情報の到着。バーの固定と違って
+    /// 外から来ないので、overlay を描いた後にここで突き合わせる (backlog §1.158)。
+    /// 覚えた値は `video_visual_layout` も読むので、1 フレーム内で両者が食い違わない。
+    fn reconcile_info_panel_reservation(&mut self) -> Result<(), String> {
+        let reserved = self
+            .egui_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.right_panel_reserves_space());
+        if self.video_info_panel_reserved != reserved {
+            self.video_info_panel_reserved = reserved;
+            self.update_video_visual_transform(self.width, self.height)?;
+        }
+        Ok(())
+    }
+
     fn update_video_visual_transform(&self, win_w: u32, win_h: u32) -> Result<(), String> {
         let (sar_num, sar_den, orientation) = transform_geometry_for_surface(
             self.surface_content,
@@ -6314,10 +6341,7 @@ impl NativeRenderCore {
                 .as_ref()
                 .is_some_and(|overlay| overlay.seek_strip_reserves_space()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
-            info_panel_reserved: self
-                .egui_overlay
-                .as_ref()
-                .is_some_and(|overlay| overlay.right_panel_reserves_space()),
+            info_panel_reserved: self.video_info_panel_reserved,
         }
     }
 

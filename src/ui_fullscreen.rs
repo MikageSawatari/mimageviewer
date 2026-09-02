@@ -2301,7 +2301,6 @@ struct StillSidePanelChromeInputs {
 /// ここに並ぶのは、パネルを描かないモードとして描画側の分岐が既に持っている条件である。
 #[derive(Clone, Copy)]
 struct StillInfoPanelLockInputs {
-    is_music_view: bool,
     is_video: bool,
     video_tile_active: bool,
     local_adjust_active: bool,
@@ -2317,7 +2316,6 @@ struct StillInfoPanelLockInputs {
 
 fn still_info_panel_lock_effective(locked: bool, input: StillInfoPanelLockInputs) -> bool {
     locked
-        && !input.is_music_view
         && !input.is_video
         && !input.video_tile_active
         && !input.local_adjust_active
@@ -2739,17 +2737,26 @@ fn music_left_panel_visible_from_inputs(
     open_state: crate::ui_helpers::MetadataPanelOpenState,
     modal_open: bool,
 ) -> bool {
-    music_right_panel_visible_from_inputs(mode, hover_active, open_state, modal_open)
+    // 左パネル (ブックマーク) に固定は無い。右と同じ判定を共有するので false を渡す。
+    music_right_panel_visible_from_inputs(mode, hover_active, open_state, modal_open, false)
 }
 
+/// 音楽ビューの右パネルを描くか。**固定中は召喚方法によらず描く。**
+///
+/// モーダル中だけは描かない (背後クリック漏れ防止)。確保する側と同じ答えでなければ
+/// 右に空白の帯が残る (backlog §1.158)。
 fn music_right_panel_visible_from_inputs(
     mode: crate::settings::FsSidePanelMode,
     hover_active: bool,
     open_state: crate::ui_helpers::MetadataPanelOpenState,
     modal_open: bool,
+    locked: bool,
 ) -> bool {
     if modal_open {
         return false;
+    }
+    if locked {
+        return true;
     }
     let explicit = crate::ui_helpers::metadata_panel_explicit_shown(mode, open_state);
     match mode.normalized() {
@@ -2776,6 +2783,7 @@ impl MusicViewFrameUiState {
         left_open_state: crate::ui_helpers::MetadataPanelOpenState,
         right_open_state: crate::ui_helpers::MetadataPanelOpenState,
         modal_open: bool,
+        right_locked: bool,
     ) -> Self {
         Self {
             left_panel_visible: music_left_panel_visible_from_inputs(
@@ -2789,6 +2797,7 @@ impl MusicViewFrameUiState {
                 right_hover_active,
                 right_open_state,
                 modal_open,
+                right_locked,
             ),
             modal_open,
         }
@@ -13309,7 +13318,6 @@ impl App {
         still_info_panel_lock_effective(
             self.fs_info_panel.locked,
             StillInfoPanelLockInputs {
-                is_music_view: self.fs_music_view_active(fs_idx),
                 is_video,
                 video_tile_active: self.video_tile_mode_active,
                 local_adjust_active: self.local_adjust_mode,
@@ -13328,6 +13336,18 @@ impl App {
         )
     }
 
+    /// ロック中の右情報パネルが確保する幅。**パネル自身の矩形と同じ規則で出す。**
+    ///
+    /// 音楽ビューだけパネルの既定幅が違う (`MUSIC_RIGHT_PANEL_WIDTH`)。ここで静止画の幅を
+    /// 使うと、確保した帯とパネルの左端が食い違って隙間か重なりが出る (backlog §1.158)。
+    fn locked_info_panel_reserved_width(&self, full_rect: egui::Rect, fs_idx: usize) -> f32 {
+        if self.fs_music_view_active(fs_idx) {
+            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
+        } else {
+            metadata_panel_rect(full_rect).width()
+        }
+    }
+
     fn fullscreen_media_rect(
         &self,
         full_rect: egui::Rect,
@@ -13340,7 +13360,7 @@ impl App {
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
             self.settings.fullscreen_fixed_bar_gap_px,
             self.still_info_panel_lock_effective_for_idx(fs_idx, is_video)
-                .then(|| metadata_panel_rect(full_rect).width())
+                .then(|| self.locked_info_panel_reserved_width(full_rect, fs_idx))
                 .unwrap_or(0.0),
         )
     }
@@ -23528,6 +23548,8 @@ impl App {
                 self.music_right_panel_active,
                 self.fs_info_panel.open,
                 music_modal_open,
+                panel_fs_idx
+                    .is_some_and(|idx| self.still_info_panel_lock_effective_for_idx(idx, false)),
             );
         // When the OS cursor is hidden, egui still exposes the last hover position.
         // Treat that position as stale and block passive hover side effects until a
@@ -36811,7 +36833,20 @@ impl App {
         // 動画 native の右メタデータパネル (`native_metadata_panel_rect`) と同じく幅を
         // ビュー幅の半分でクランプする (Inc 7 ④ / Codex P3)。狭幅ウィンドウで右パネルが
         // timeline の半分超を覆わないようにする。
-        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(rect.width() * 0.5);
+        // 固定中は `fullscreen_media_rect` が既に右を空けている。パネルはその**空けた帯**へ
+        // 置くので、右端は縮める前の位置に戻す。縮んだ `rect` の右端に置くと、確保した帯が
+        // そのまま空白として残る (backlog §1.158)。
+        let panel_reserved_w = self
+            .still_info_panel_lock_effective_for_idx(fs_idx, false)
+            .then(|| rect.width())
+            .map(|_| {
+                crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+                    .min((rect.width() + crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH) * 0.5)
+            })
+            .unwrap_or(0.0);
+        let panel_right_edge = rect.right() + panel_reserved_w;
+        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
+            .min((rect.width() + panel_reserved_w) * 0.5);
         // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
         // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
@@ -36841,14 +36876,14 @@ impl App {
             egui::pos2(rect.left() + left_w, panel_band_bottom),
         );
         let right_panel_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.right() - right_w, panel_band_top),
-            egui::pos2(rect.right(), panel_band_bottom),
+            egui::pos2(panel_right_edge - right_w, panel_band_top),
+            egui::pos2(panel_right_edge, panel_band_bottom),
         );
         let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
         if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
             let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
             let right_open =
-                hover_pos.is_some_and(|p| p.x >= rect.right() - trigger_w && in_band(p));
+                hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
             let left_sustain = self.music_left_panel_active
                 && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
             let right_sustain = self.music_right_panel_active
@@ -36866,6 +36901,7 @@ impl App {
             self.music_left_panel_open,
             self.fs_info_panel.open,
             music_modal_open,
+            panel_reserved_w > 0.0,
         );
         let left_hover = frame_ui.left_panel_visible;
         let right_hover = frame_ui.right_panel_visible;
@@ -44985,10 +45021,35 @@ mod tests {
             false,
         ));
 
+        // 固定中は召喚方法によらず出す。モーダル中だけは出さない — 出さない状況で
+        // 領域だけ確保すると右が空白の帯になる (backlog §1.158)。
+        assert!(music_right_panel_visible_from_inputs(
+            FsSidePanelMode::ClickToShow,
+            false,
+            Closed,
+            false,
+            true,
+        ));
+        assert!(music_right_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            Closed,
+            false,
+            true,
+        ));
+        assert!(!music_right_panel_visible_from_inputs(
+            FsSidePanelMode::Hover,
+            false,
+            Closed,
+            true,
+            true,
+        ));
+
         assert!(!music_right_panel_visible_from_inputs(
             FsSidePanelMode::ClickToShow,
             true,
             Closed,
+            false,
             false,
         ));
         assert!(music_right_panel_visible_from_inputs(
@@ -44996,17 +45057,20 @@ mod tests {
             false,
             ByPointer,
             false,
+            false,
         ));
         assert!(!music_right_panel_visible_from_inputs(
             FsSidePanelMode::Hover,
             false,
             ByPointer,
+            false,
             false,
         ));
         assert!(music_right_panel_visible_from_inputs(
             FsSidePanelMode::Hover,
             false,
             ByTouchHandle,
+            false,
             false,
         ));
 
@@ -45021,6 +45085,7 @@ mod tests {
             false,
             ByPointer,
             true,
+            false,
         ));
     }
 
@@ -45060,6 +45125,7 @@ mod tests {
             Closed,
             Closed,
             false,
+            false,
         );
         assert!(!idle.blocks_cursor_auto_hide());
 
@@ -45069,6 +45135,7 @@ mod tests {
             false,
             Closed,
             Closed,
+            false,
             false,
         );
         assert!(hover_left.left_panel_visible);
@@ -45081,6 +45148,7 @@ mod tests {
             Closed,
             ByPointer,
             false,
+            false,
         );
         assert!(click_right.right_panel_visible);
         assert!(click_right.blocks_cursor_auto_hide());
@@ -45092,6 +45160,7 @@ mod tests {
             Closed,
             Closed,
             true,
+            false,
         );
         assert!(!modal.left_panel_visible);
         assert!(!modal.right_panel_visible);
@@ -47591,7 +47660,6 @@ mod tests {
     #[test]
     fn every_mode_that_hides_the_info_panel_also_drops_the_lock() {
         let none = StillInfoPanelLockInputs {
-            is_music_view: false,
             is_video: false,
             video_tile_active: false,
             local_adjust_active: false,
@@ -47607,8 +47675,7 @@ mod tests {
         assert!(still_info_panel_lock_effective(true, none));
         assert!(!still_info_panel_lock_effective(false, none));
 
-        let suppressors: [(&str, fn(&mut StillInfoPanelLockInputs)); 12] = [
-            ("music", |i| i.is_music_view = true),
+        let suppressors: [(&str, fn(&mut StillInfoPanelLockInputs)); 11] = [
             ("video", |i| i.is_video = true),
             ("video_tile", |i| i.video_tile_active = true),
             ("local_adjust", |i| i.local_adjust_active = true),

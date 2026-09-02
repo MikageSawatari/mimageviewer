@@ -581,13 +581,58 @@ impl App {
             egui::FontId::proportional(13.0),
             egui::Color32::from_gray(205),
         );
+        // 鍵ボタン。静止画・動画と同じ状態を触り、固定中はタイムラインへ重ねず領域を確保する
+        // (利用者要望 2026-09-02、backlog §1.158)。
+        let locked_now = self.fs_info_panel.locked;
+        let lock_rect = egui::Rect::from_center_size(
+            egui::pos2(title_rect.right() - 16.0, title_rect.center().y),
+            egui::vec2(24.0, 24.0),
+        );
+        let lock_response = ui
+            .interact(
+                lock_rect,
+                ui.id().with(("music_right_lock", fs_idx)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(if locked_now {
+                "固定を解除 (重ねる一時表示に戻す)"
+            } else {
+                "パネルを固定 (重ねず、前後へ移動しても表示したまま)"
+            });
+        if locked_now || lock_response.hovered() {
+            ui.painter().rect_filled(
+                lock_rect,
+                4.0,
+                if locked_now {
+                    egui::Color32::from_rgba_unmultiplied(90, 110, 150, 220)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                },
+            );
+        }
+        // 鍵の形は上下バー / 動画と同じ共有ベクターを使う (複製しない)。
+        crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
+            ui.painter(),
+            lock_rect.center(),
+            lock_rect.width() * 0.34,
+            locked_now,
+        );
+        if lock_response.clicked() {
+            self.fs_info_panel.locked = !locked_now;
+            if !self.fs_info_panel.locked {
+                self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            }
+        }
+
         let mut close_requested = false;
-        if music_side_panel_close_visible(
-            self.settings.fullscreen_side_panel_mode,
-            self.fs_info_panel.open,
-        ) {
+        if !locked_now
+            && music_side_panel_close_visible(
+                self.settings.fullscreen_side_panel_mode,
+                self.fs_info_panel.open,
+            )
+        {
             let close_rect = egui::Rect::from_center_size(
-                egui::pos2(title_rect.right() - 16.0, title_rect.center().y),
+                egui::pos2(title_rect.right() - 44.0, title_rect.center().y),
                 egui::vec2(24.0, 24.0),
             );
             let close_response = ui
