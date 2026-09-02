@@ -2241,9 +2241,21 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
 - 出力サイズは「そのまま」「1/2 サイズ」「1/4 サイズ」から選ぶ。crop / 見開き / 隠蔽プリセット合成後の画像を基準に Lanczos3 で縮小し、既定値は `Settings::export_default_scale` に保存する。
 - JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。JPEG の Orientation は表示で回転済みの画素と一致するよう正規化する。
-- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。
+- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。一覧からの一括エクスポートは別系統の設定を持つ (下記)。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
 - 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
+- 隠蔽プリセット出力 (`_1`〜`_4`) は表示スナップショットへマスクを重ねるのではなく、**隠蔽適用前の段 (`raw → 消しゴム → 補正レイヤー`) から表示と同じ順で合成し直す**。`隠蔽 → 色補正 / final AI → シャープ → カラー化 → LUT → post filter → 注釈` を `export_dialog::compose_conceal_variant` が再実行し、final AI もプリセットごとに掛け直す。`_0` は表示スナップショットをそのまま書き出す。段を落とすと `_0` と寸法から食い違うため、製本の「表示専用段を飛ばす」規則はここへ持ち込まない。詳細は [display-pipeline.md](display-pipeline.md) §3.0。
+
+### 一覧からの一括エクスポート
+
+- サムネイル一覧で複数選択 (チェック優先、無ければカーソル選択) して `Ctrl+E` を押すと、一括エクスポートダイアログを開く。選択の解釈は「本へ追加」と同じ `grid_selection_indices` を使う。
+- 対象は `Image` / `ZipImage` / `PdfPage` とファイル名スタックのメンバー。フォルダ / 動画 / 音声 / 書庫そのものは除外し、**件数をダイアログに表示する** (黙って落とさない)。
+- 1 件ぶんの「デコード → 合成 → 縮小 → エンコード → 書き出し」は製本と同じ `books::write_composited_page` を通る。編集の有無にかかわらず必ず合成経路を使う (出力形式とサイズを選ぶので無編集の byte copy では要求を満たせない)。`append_pages_at` は経由しない (ページ採番 / 上限 / `restore_declines` など本固有の処理が付いてくるため)。
+- 出力名はテンプレート。置換子は `<filename>` (`capture_basename_for_idx` と同じ自己識別名) / `<dirname>` (元があったフォルダ名) / `<num>` (4 桁連番)。未知の `<...>` は展開せず残す。禁止文字は `_` へ置換する。同名は上書きせず末尾に連番を付ける (既存ファイルと、その実行で既に書いた名前の両方を避ける)。
+- 出力形式は `CaptureFormat` (PNG / JPEG 95 / 85 / 75)。`BakedEditSnapshot::format` を書き出し直前に上書きする。メタデータ転記は行わない (製本ページと同じく新しい完成画像として扱う)。
+- 進捗とキャンセルは単ページと同じ `ExportEvent` / `ExportPending` / `poll_export_pending` を共有する。
+- 永続化設定は `Settings::export_batch_directory` / `export_batch_template` / `export_batch_format` / `export_batch_scale`。保存先は単ページの `export_last_directory` とは別に持つ (一括は決まったフォルダへ繰り返し出す使い方が主なため)。
+- キーは `KeyContext::Grid` の `KeyAction::GridExportSelection` (既定 `Ctrl+E`)。フルスクリーンの `FsExport` と既定キーは同じだが action は別に持つ。1 つへまとめると、利用者が保存済みの keymap 上書き (action 名がキー) の意味が黙って変わるため。`consume_action` は `KeyContext` を強制しないので、呼び出し側でフルスクリーン表示中を除外する。
 
 ### SNS 分割書き出し
 

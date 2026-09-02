@@ -61,12 +61,16 @@ pub(crate) struct SelectedFinalAiModels {
     pub(crate) upscale: Option<ModelKind>,
 }
 
+/// `category_override` は「表示側が既に分類済みならその答えを使う」ための入口。
+/// auto upscale のモデル選択は分類結果に依存するので、同じページの別経路 (Ctrl+E の
+/// プリセット再合成など) が表示と違うモデルを選ばないようにする。`None` ならここで分類する。
 pub(crate) fn select_final_ai_models(
     source: &egui::ColorImage,
     params: &crate::adjustment::AdjustParams,
     mode: crate::settings::AiFeatureMode,
     upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
     denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    category_override: Option<crate::ai::ImageCategory>,
 ) -> Option<SelectedFinalAiModels> {
     let [width, height] = source.size;
     let upscale_request = effective_upscale_request(mode, params);
@@ -83,8 +87,10 @@ pub(crate) fn select_final_ai_models(
         match upscale_request.expect("in-range upscale has a request") {
             Some(kind) => Some(kind),
             None => {
-                let source = crate::app::color_image_to_dynamic(source);
-                let category = crate::ai::classify::classify_heuristic(&source);
+                let category = category_override.unwrap_or_else(|| {
+                    let source = crate::app::color_image_to_dynamic(source);
+                    crate::ai::classify::classify_heuristic(&source)
+                });
                 mode.auto_upscale_model(category)
             }
         }

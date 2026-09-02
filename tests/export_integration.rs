@@ -19,7 +19,7 @@ fn solid_image(w: usize, h: usize, color: egui::Color32) -> Arc<egui::ColorImage
 fn single_pixels(base_pixels: Arc<egui::ColorImage>) -> ExportPixels {
     ExportPixels::Single(ExportPagePixels {
         base_pixels,
-        conceal_mask: None,
+        conceal_variant: None,
         crop: None,
         rotation: mimageviewer::rotation_db::Rotation::None,
     })
@@ -189,6 +189,7 @@ fn export_single_jpeg_with_metadata() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: true,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -218,6 +219,7 @@ fn export_batch_no_collision() {
             entry("preset2", 2),
         ],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -244,6 +246,7 @@ fn export_batch_with_collision_uses_session_number() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0), entry("preset1", 1)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -271,6 +274,7 @@ fn export_batch_partial_failure_continues() {
             entry("preset2", 2),
         ],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -297,6 +301,7 @@ fn export_with_scale_half_produces_half_dimensions() {
         scale: ExportScale::Half,
         entries: vec![entry("current", 0)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
 
@@ -319,6 +324,7 @@ fn export_with_scale_quarter_produces_quarter_dimensions() {
         scale: ExportScale::Quarter,
         entries: vec![entry("current", 0)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
 
@@ -341,6 +347,7 @@ fn export_cancel_mid_batch() {
         scale: ExportScale::Full,
         entries: (0..5).map(|i| entry(&format!("entry{i}"), i)).collect(),
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
 
@@ -383,6 +390,7 @@ fn export_fallback_format_for_heic() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: true,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -417,6 +425,7 @@ fn export_zip_source_no_path() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: true,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -452,6 +461,7 @@ fn export_zip_di2_orientation_canonical_after_display_rotation() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: true,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -479,6 +489,7 @@ fn export_animated_webp_fails() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -507,6 +518,7 @@ fn export_webp_source_read_failure_fails_all_entries() {
         scale: ExportScale::Full,
         entries: vec![entry("a", 0), entry("b", 1)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -535,6 +547,7 @@ fn export_animated_webp_rejected_when_output_is_png() {
         scale: ExportScale::Full,
         entries: vec![entry("current", 0)],
         include_metadata: false,
+        local_ai_activity: None,
     })
     .unwrap();
     let events = collect_events(pending, 5);
@@ -587,4 +600,128 @@ fn export_orientation_preserved() {
 
     let out = std::fs::read(dst).unwrap();
     assert_eq!(jpeg_orientation(&out), Some(6));
+}
+// ── 一覧からの一括エクスポート ───────────────────────────────────────────
+//
+// ここが「デコード → 合成 → 縮小 → エンコード → 書き出し」を実ファイルで通す唯一の
+// テスト。合成は製本と同じ `books::write_composited_page` なので、この経路が壊れると
+// 本の焼き込みも一緒に壊れる。
+
+fn batch_edits(
+    format: mimageviewer::capture::CaptureFormat,
+) -> mimageviewer::books::BakedEditSnapshot {
+    mimageviewer::books::BakedEditSnapshot {
+        params: mimageviewer::adjustment::AdjustParams::default(),
+        rotation: mimageviewer::rotation_db::Rotation::None,
+        conceal: None,
+        erase: None,
+        local_adjust: None,
+        comic: None,
+        comic_source_dims: None,
+        export_crop: None,
+        crop_legacy_writeback: None,
+        format,
+        jpeg_matte: mimageviewer::capture::JpegMatte::Black,
+    }
+}
+
+fn batch_item(
+    source_path: &std::path::Path,
+    filename: &str,
+    dirname: &str,
+    format: mimageviewer::capture::CaptureFormat,
+) -> mimageviewer::export_batch::BatchExportItem {
+    mimageviewer::export_batch::BatchExportItem {
+        filename: filename.to_string(),
+        dirname: dirname.to_string(),
+        source: mimageviewer::books::CompositeSource::File {
+            path: source_path.to_path_buf(),
+        },
+        edits: batch_edits(format),
+    }
+}
+
+fn write_source_png(path: &std::path::Path, w: u32, h: u32, rgb: [u8; 3]) {
+    let mut buf = image::RgbaImage::new(w, h);
+    for pixel in buf.pixels_mut() {
+        *pixel = image::Rgba([rgb[0], rgb[1], rgb[2], 255]);
+    }
+    buf.save(path).unwrap();
+}
+
+#[test]
+fn batch_export_writes_every_item_through_the_shared_composite_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("a.png");
+    write_source_png(&src, 8, 4, [10, 20, 30]);
+
+    let format = mimageviewer::capture::CaptureFormat::Png;
+    let pending = mimageviewer::export_batch::spawn_batch_export_worker(
+        mimageviewer::export_batch::BatchExportRequest {
+            // 保存先はまだ存在しない。worker が作れることも同時に確かめる。
+            output_dir: out_dir.clone(),
+            template: "<dirname>_<filename>".to_string(),
+            scale: ExportScale::Half,
+            items: vec![
+                batch_item(&src, "a", "src", format),
+                // 同じテンプレート結果になる 2 件目。上書きせず連番になること。
+                batch_item(&src, "a", "src", format),
+            ],
+        },
+    )
+    .unwrap();
+
+    let events = collect_events(pending, 20);
+
+    assert_eq!(completed_count(&events), 2);
+    assert!(events.iter().all(|e| !matches!(e, ExportEvent::Failed(_))));
+
+    let first = image::open(out_dir.join("src_a.png")).unwrap().to_rgba8();
+    let second = image::open(out_dir.join("src_a_1.png")).unwrap().to_rgba8();
+    // 1/2 サイズが書き出し直前に効いている。
+    assert_eq!(first.dimensions(), (4, 2));
+    assert_eq!(second.dimensions(), (4, 2));
+    assert_eq!(first.get_pixel(0, 0).0, [10, 20, 30, 255]);
+}
+
+#[test]
+fn batch_export_reports_a_missing_source_as_one_failed_item_and_keeps_going() {
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let good = src_dir.join("good.png");
+    write_source_png(&good, 4, 4, [200, 100, 50]);
+    let missing = src_dir.join("gone.png");
+
+    let format = mimageviewer::capture::CaptureFormat::Jpeg85;
+    let pending = mimageviewer::export_batch::spawn_batch_export_worker(
+        mimageviewer::export_batch::BatchExportRequest {
+            output_dir: out_dir.clone(),
+            template: "<filename>".to_string(),
+            scale: ExportScale::Full,
+            items: vec![
+                batch_item(&missing, "gone", "src", format),
+                batch_item(&good, "good", "src", format),
+            ],
+        },
+    )
+    .unwrap();
+
+    let events = collect_events(pending, 20);
+
+    assert_eq!(completed_count(&events), 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ExportEvent::Failed(_)))
+            .count(),
+        1
+    );
+    // 拡張子は選んだ形式に従う。
+    assert!(out_dir.join("good.jpg").exists());
+    assert!(!out_dir.join("gone.jpg").exists());
 }

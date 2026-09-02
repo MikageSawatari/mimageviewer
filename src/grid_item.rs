@@ -532,8 +532,12 @@ pub fn sort_folder_block(
 /// 設定された 4 行のカテゴリ割り当てで items と同位置メタデータを並べ直す。
 ///
 /// 各行は [`sort_folder_block`] で同じ `SortOrder` を適用する。`sort == None` は
-/// レーティング設定時刻順など、呼び出し側が既に作った行内順序を安定保持する集約ビュー用。
-/// 空行は出力を持たないため自動的に読み飛ばされる。
+/// 呼び出し側が既に作った行内順序を安定保持する集約ビュー用。空行は出力を持たないため
+/// 自動的に読み飛ばされる。
+///
+/// **カテゴリ間の順序は保たれない**。行内は安定でも 4 行へ分配して連結するので、
+/// 「時刻で一列に並べる」ことを要求するビューへこれを通してはならない
+/// ([`materialize_view_rows`] の `arrange` を参照)。
 pub fn arrange_grid_items(
     items: &mut Vec<GridItem>,
     image_metas: &mut Vec<Option<(i64, i64)>>,
@@ -568,6 +572,49 @@ pub fn arrange_grid_items(
     // §1.6 の 4 カテゴリ外にある検索専用/レガシー疑似セルは、欠落させず末尾へ保つ。
     items.append(&mut other_items);
     image_metas.append(&mut other_metas);
+}
+
+/// ソート済みのビュー行から grid の items と同位置メタデータを作る。
+///
+/// `arrange` が真のときだけ [`arrange_grid_items`] を通し、行の並びも再配置結果へ
+/// 合わせ直す。偽のときは行順がそのまま表示順になる。時刻ソートのように「一列に並べる」
+/// ことが要求そのものであるビューは偽を渡す (docs/next-release-backlog.md §1.142)。
+///
+/// レーティング一覧とブックマーク一覧が同じ形をしているため、行を items へ落とす手順と
+/// 再配置後の対応付け規約はここが唯一の所有者。
+pub fn materialize_view_rows<R>(
+    rows: &mut Vec<R>,
+    display_order: &crate::settings::GridDisplayOrder,
+    arrange: bool,
+    item_of: impl Fn(&R) -> &GridItem,
+    meta_of: impl Fn(&R) -> Option<(i64, i64)>,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    let mut items: Vec<GridItem> = rows.iter().map(|row| item_of(row).clone()).collect();
+    let mut image_metas: Vec<Option<(i64, i64)>> = rows.iter().map(|row| meta_of(row)).collect();
+    if !arrange {
+        return (items, image_metas);
+    }
+    arrange_grid_items(&mut items, &mut image_metas, display_order, None);
+    // 再配置で並びが変わったので、行も同じ順序へ合わせ直す。`perf_key` は重複し得る
+    // (同一 ZIP 内の別ページなど) ので、key ごとの FIFO で 1 対 1 に対応付ける。
+    let mut rows_by_key: std::collections::HashMap<String, std::collections::VecDeque<R>> =
+        std::collections::HashMap::new();
+    for row in rows.drain(..) {
+        rows_by_key
+            .entry(item_of(&row).perf_key())
+            .or_default()
+            .push_back(row);
+    }
+    *rows = items
+        .iter()
+        .map(|item| {
+            rows_by_key
+                .get_mut(&item.perf_key())
+                .and_then(std::collections::VecDeque::pop_front)
+                .expect("arranged grid item must retain its source row")
+        })
+        .collect();
+    (items, image_metas)
 }
 
 fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind> {

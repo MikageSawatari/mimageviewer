@@ -34,6 +34,17 @@ pub struct OperationCustomizeBundle {
     pub ring_shortcuts: RingShortcutSettings,
     #[serde(default)]
     pub menu_layout: MenuLayoutSettings,
+    /// ゲームパッドからの操作を受け付けるか。
+    ///
+    /// **既定を `true` にする関数を明示する。**`#[serde(default)]` だと bool の
+    /// 既定は `false` なので、この項目を知らない頃に書き出した bundle を取り込むと、
+    /// 利用者が触ってもいないのにゲームパッドが無効になる。
+    #[serde(default = "default_gamepad_enabled")]
+    pub gamepad_enabled: bool,
+}
+
+fn default_gamepad_enabled() -> bool {
+    true
 }
 
 impl OperationCustomizeBundle {
@@ -47,6 +58,7 @@ impl OperationCustomizeBundle {
             keymap: settings.keymap.clone(),
             ring_shortcuts: settings.ring_shortcuts.clone(),
             menu_layout: settings.menu_layout.clone(),
+            gamepad_enabled: settings.gamepad_enabled,
         }
     }
 
@@ -60,6 +72,7 @@ impl OperationCustomizeBundle {
             keymap: KeymapSettings::default(),
             ring_shortcuts: RingShortcutSettings::default(),
             menu_layout: MenuLayoutSettings::default(),
+            gamepad_enabled: default_gamepad_enabled(),
         }
     }
 
@@ -73,6 +86,7 @@ impl OperationCustomizeBundle {
         settings.keymap = self.keymap.clone();
         settings.ring_shortcuts = self.ring_shortcuts.clone();
         settings.menu_layout = self.menu_layout.clone();
+        settings.gamepad_enabled = self.gamepad_enabled;
     }
 }
 
@@ -453,6 +467,45 @@ fn is_leap_year(year: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// この項目を知らない頃の bundle を取り込んでも、ゲームパッドを勝手に切らない。
+    ///
+    /// `#[serde(default)]` のままだと bool の既定は false なので、古い共有ファイルを
+    /// 読み込んだだけで無効になる。利用者が触っていない設定を、取り込みが変えてはいけない。
+    #[test]
+    fn an_older_bundle_does_not_turn_the_gamepad_off() {
+        let older = r#"{
+            "format": "mimageviewer.operation-customize",
+            "format_version": 1,
+            "app_version": "3.4.0",
+            "exported_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let bundle: OperationCustomizeBundle = serde_json::from_str(older).unwrap();
+        assert!(
+            bundle.gamepad_enabled,
+            "項目を持たない bundle は「有効のまま」と読む"
+        );
+
+        let mut settings = Settings::default();
+        settings.gamepad_enabled = true;
+        bundle.apply_to(&mut settings);
+        assert!(settings.gamepad_enabled, "取り込みで無効へ倒れない");
+    }
+
+    /// 有効/無効は共有 bundle を往復しても保たれる。
+    #[test]
+    fn the_gamepad_switch_survives_a_bundle_round_trip() {
+        let mut settings = Settings::default();
+        settings.gamepad_enabled = false;
+        let bundle = OperationCustomizeBundle::from_settings(&settings);
+        assert!(!bundle.gamepad_enabled);
+
+        let text = serde_json::to_string(&bundle).unwrap();
+        let restored: OperationCustomizeBundle = serde_json::from_str(&text).unwrap();
+        let mut applied = Settings::default();
+        restored.apply_to(&mut applied);
+        assert!(!applied.gamepad_enabled);
+    }
     use crate::keymap::{KeyBindingOverride, MenuCommandId};
     use crate::ring_shortcut::{RingActionId, ViewerShortRightClickAction};
 

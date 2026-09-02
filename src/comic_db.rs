@@ -85,15 +85,7 @@ impl ComicDb {
     }
 
     pub(crate) fn get_checked(&self, key: &str) -> Result<Option<Vec<AnnotationObject>>, String> {
-        use rusqlite::OptionalExtension as _;
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT doc_json FROM comic_entries WHERE page_path = ?1")
-            .map_err(|error| error.to_string())?;
-        let json: Option<String> = stmt
-            .query_row([key], |row| row.get(0))
-            .optional()
-            .map_err(|error| error.to_string())?;
+        let json = self.get_json_checked(key)?;
         Ok(json.and_then(|json| match serde_json::from_str(&json) {
             Ok(objects) => Some(objects),
             Err(error) => {
@@ -103,6 +95,45 @@ impl ComicDb {
                 None
             }
         }))
+    }
+
+    /// 未選択の注釈を別操作の全置換で保持するときの strict read。破損行を空注釈と
+    /// みなすと、別種類だけをリセットした操作が注釈まで削除してしまう。
+    pub(crate) fn get_checked_strict(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<AnnotationObject>>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT doc_version, doc_json FROM comic_entries WHERE page_path = ?1")
+            .map_err(|error| error.to_string())?;
+        let row: Option<(i64, String)> = stmt
+            .query_row([key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((doc_version, json)) = row else {
+            return Ok(None);
+        };
+        if doc_version != i64::from(DOC_VERSION) {
+            return Err(format!(
+                "comic.db の注釈形式が未対応です key={key}: version={doc_version}"
+            ));
+        }
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|error| format!("comic.db の注釈 JSON が壊れています key={key}: {error}"))
+    }
+
+    fn get_json_checked(&self, key: &str) -> Result<Option<String>, String> {
+        use rusqlite::OptionalExtension as _;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT doc_json FROM comic_entries WHERE page_path = ?1")
+            .map_err(|error| error.to_string())?;
+        stmt.query_row([key], |row| row.get(0))
+            .optional()
+            .map_err(|error| error.to_string())
     }
 
     /// 生の `(doc_version, doc_json)` を取得する（サイドカー dual-write 用、パース回避）。
@@ -308,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_json_returns_none_not_panic() {
+    fn edit_bundle_bulk_comic_strict_reader_rejects_corrupt_json() {
         let (db, p) = tmp_db();
         db.set_raw("k", DOC_VERSION, "{ this is not valid json ]")
             .unwrap();
@@ -319,6 +350,16 @@ mod tests {
             db.get_raw("k").map(|(_, j)| j).as_deref(),
             Some("{ this is not valid json ]")
         );
+        assert!(db.get_checked_strict("k").is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn edit_bundle_bulk_comic_strict_reader_rejects_unknown_document_version() {
+        let (db, p) = tmp_db();
+        db.set_raw("k", DOC_VERSION + 1, "[]").unwrap();
+        assert_eq!(db.get("k"), Some(Vec::new()));
+        assert!(db.get_checked_strict("k").is_err());
         let _ = std::fs::remove_file(&p);
     }
 

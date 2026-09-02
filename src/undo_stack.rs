@@ -1,12 +1,14 @@
-//! メタ情報操作 (レーティング / タグ) の Undo/Redo スタック。
+//! メタ情報と非破壊補正の Undo/Redo スタック。
 //!
 //! # スコープ
 //!
-//! このスタックが扱うのは **メタ情報の値変更だけ**。具体的には:
+//! このスタックが扱うのは次の軽量な値変更:
 //!
 //! - レーティング: F1-F5 / F6 / Shift+F1-F6 でファイル本体・コンテナ (フォルダ /
 //!   ZIP / PDF) に付与/解除されるスター値。
 //! - タグ: トグル (1 タグの追加/削除) と全 mIV タグクリア。
+//! - 画像補正: ページ個別 / お気に入り標準 / 全体標準。
+//! - 補正レイヤー: ページ単位のレイヤー配列。
 //!
 //! ファイル操作 (削除・移動・改名・カット&ペースト) は**含めない**。Cut/Paste は
 //! mIV 自身が機能として持っていないし、削除はゴミ箱経由なので OS 側の責任で十分。
@@ -232,6 +234,72 @@ impl UndoStack {
         self.redo.clear();
     }
 
+    /// 貼り付け / リセットで外部から置き換えたページについて、古い編集 Undo/Redo だけを
+    /// 両スタックから除く。Rating / Tag、別ページ、Favorite / Global の補正履歴は残す。
+    ///
+    /// 1 entry が複数ページを含む場合は対象 change だけを落とし、残りを同じ entry として
+    /// 保持する。これにより一括補正の別ページまで Undo 不可にしない。
+    pub fn discard_page_edit_changes(
+        &mut self,
+        page_indices: &[usize],
+        page_key: &str,
+        adjustment: bool,
+        local_adjustment: bool,
+    ) {
+        fn retain_entry(
+            mut entry: UndoEntry,
+            page_indices: &[usize],
+            page_key: &str,
+            adjustment: bool,
+            local_adjustment: bool,
+        ) -> Option<UndoEntry> {
+            match &mut entry {
+                UndoEntry::Adjustment { changes, .. } if adjustment => {
+                    changes.retain(|change| match &change.scope {
+                        AdjustUndoScope::Page(idx) => !page_indices.contains(idx),
+                        AdjustUndoScope::PageKey(target) => target.page_key != page_key,
+                        AdjustUndoScope::Favorite(_) | AdjustUndoScope::Global => true,
+                    });
+                }
+                UndoEntry::LocalAdjustment { changes, .. } if local_adjustment => {
+                    changes.retain(|change| !page_indices.contains(&change.idx));
+                }
+                _ => {}
+            }
+            entry.is_meaningful().then_some(entry)
+        }
+
+        fn prune(
+            stack: &mut VecDeque<UndoEntry>,
+            page_indices: &[usize],
+            page_key: &str,
+            adjustment: bool,
+            local_adjustment: bool,
+        ) {
+            *stack = std::mem::take(stack)
+                .into_iter()
+                .filter_map(|entry| {
+                    retain_entry(entry, page_indices, page_key, adjustment, local_adjustment)
+                })
+                .collect();
+        }
+
+        prune(
+            &mut self.undo,
+            page_indices,
+            page_key,
+            adjustment,
+            local_adjustment,
+        );
+        prune(
+            &mut self.redo,
+            page_indices,
+            page_key,
+            adjustment,
+            local_adjustment,
+        );
+    }
+
     pub fn undo_len(&self) -> usize {
         self.undo.len()
     }
@@ -423,5 +491,94 @@ mod tests {
         s.clear();
         assert!(!s.can_undo());
         assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn edit_bundle_bulk_discard_keeps_metadata_and_other_page_changes() {
+        let mut s = UndoStack::new();
+        s.push(rating_entry("c:/rating.jpg", 0, 3));
+        s.push(UndoEntry::Adjustment {
+            changes: vec![
+                AdjustmentChange {
+                    scope: AdjustUndoScope::Page(7),
+                    before: None,
+                    after: Some(AdjustParams::default()),
+                },
+                AdjustmentChange {
+                    scope: AdjustUndoScope::Page(8),
+                    before: None,
+                    after: Some(AdjustParams::default()),
+                },
+                AdjustmentChange {
+                    scope: AdjustUndoScope::PageKey(crate::app::PageAdjustmentTarget {
+                        page_key: "remote-target".to_string(),
+                        location_path: None,
+                        sidecar_coords: None,
+                        compiled_book: false,
+                        idx_hint: None,
+                    }),
+                    before: None,
+                    after: Some(AdjustParams::default()),
+                },
+                AdjustmentChange {
+                    scope: AdjustUndoScope::Global,
+                    before: Some(AdjustParams::default()),
+                    after: Some(AdjustParams {
+                        brightness: 0.5,
+                        ..AdjustParams::default()
+                    }),
+                },
+            ],
+            summary: "mixed adjustment".to_string(),
+        });
+        s.push(UndoEntry::LocalAdjustment {
+            changes: vec![
+                LocalAdjustmentChange {
+                    idx: 7,
+                    before: local_adjust_core::LocalAdjustmentLayers::default(),
+                    after: local_adjust_core::LocalAdjustmentLayers::new(vec![
+                        local_adjust_core::LocalAdjustmentLayer::new(
+                            "target",
+                            local_adjust_core::LocalMask::Full,
+                            local_adjust_core::LocalEffect::None,
+                        ),
+                    ]),
+                },
+                LocalAdjustmentChange {
+                    idx: 8,
+                    before: local_adjust_core::LocalAdjustmentLayers::default(),
+                    after: local_adjust_core::LocalAdjustmentLayers::new(vec![
+                        local_adjust_core::LocalAdjustmentLayer::new(
+                            "other",
+                            local_adjust_core::LocalMask::Full,
+                            local_adjust_core::LocalEffect::None,
+                        ),
+                    ]),
+                },
+            ],
+            summary: "mixed local adjustment".to_string(),
+        });
+        let local_entry = s.pop_undo().unwrap();
+        s.push_redo(local_entry);
+
+        s.discard_page_edit_changes(&[7], "remote-target", true, true);
+
+        assert_eq!(s.undo_len(), 2, "rating と adjustment entry は残る");
+        assert_eq!(s.redo_len(), 1, "別ページの local-adjust change は残る");
+        match &s.undo[1] {
+            UndoEntry::Adjustment { changes, .. } => {
+                assert_eq!(changes.len(), 2);
+                assert!(matches!(changes[0].scope, AdjustUndoScope::Page(8)));
+                assert!(matches!(changes[1].scope, AdjustUndoScope::Global));
+            }
+            _ => panic!("expected adjustment"),
+        }
+        match &s.redo[0] {
+            UndoEntry::LocalAdjustment { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].idx, 8);
+            }
+            _ => panic!("expected local adjustment"),
+        }
     }
 }

@@ -14,6 +14,12 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 `keymap.ini.imported*.bak` へ退避する。Action 名・書式・固定扱いの入力は
 [keymap.ini.default](keymap.ini.default) と、コマンド設定画面の表示を正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
+ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
+設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
+無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、
+スティックのずれで `request_repaint` が飛び続けて UI が起きたままになる。
+マウスジェスチャ / リングフリックは対象外。
+
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
 フリック、マウス戻る / 進む / ホイールクリック、ゲームパッド <kbd>X</kbd> リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。

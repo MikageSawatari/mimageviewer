@@ -2226,6 +2226,15 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
 どこから追加しても原寸の edit composite になる。編集が 1 つも無い File / ZIP entry は
 この経路へ入れず byte copy を維持する。
 
+Ctrl+E の隠蔽プリセット出力 (`_1`〜`_4`) は逆に、表示専用段を **落とさない**。`_0` は
+表示スナップショット (= 上の 12 段を通った final composite + 注釈) をそのまま書き出し、
+`_1`〜`_4` は 4 (隠蔽) の入力まで戻って隠蔽のパラメータだけを差し替え、そこから先を同じ順で
+流し直す (`export_dialog::compose_conceal_variant`)。final AI も掛け直すので、プリセット
+1 枚につき推論が 1 回走る。段を落とすと `_0` と `_1`〜`_4` が別物 (AI 拡大の有無で寸法まで
+違う) になるため、製本の「表示専用段を飛ばす」規則をここへ持ち込まない。逆に、隠蔽が
+焼き込み済みの final composite へマスクを重ねると隠蔽が二重に掛かる。v1.1.0 はこれを
+避けるために `conceal_mask: None` を固定し、結果としてプリセット出力ごと無効化していた。
+
 ### 3.1 詳細
 
 詳細は [preset-and-adjustment.md](preset-and-adjustment.md) に譲る。ここでは要点のみ:

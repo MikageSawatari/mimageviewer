@@ -9622,6 +9622,108 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.items_are_reading_history_view);
     }
 
+    /// §1.143(a): `details_sort_key` は全フォルダ共通の永続設定なので、別フォルダで
+    /// 列ヘッダを押した状態がレーティング一覧へ持ち込まれ、★時刻順を黙って上書きする。
+    /// ビューの既定ソートを入れ直すのと同じ場所で、列ソートの所有権も戻す。
+    #[test]
+    fn entering_the_rating_list_takes_back_a_column_sort_carried_in_from_another_folder() {
+        let mut app = setup_app();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_video_dimensions = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
+        app.settings.details_sort_ascending = false;
+
+        app.enter_rating_view_from_menu(2);
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar,
+            "持ち込まれた列ソートは、ビューへ入った時点で所有権を返す"
+        );
+        assert!(app.settings.details_sort_ascending);
+        assert!(
+            !app.details_header_sort_active(),
+            "所有権が戻っていれば、ツールバー / メニューのソートは選べる"
+        );
+    }
+
+    /// ブックマーク一覧も同じ規約 (§1.143(a))。
+    #[test]
+    fn opening_the_bookmark_list_takes_back_a_column_sort_carried_in_from_another_folder() {
+        let mut app = setup_app();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_video_dimensions = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
+        app.settings.details_sort_ascending = false;
+
+        app.open_bookmark_browser();
+        if let Some(pending) = app.bookmark_browser_pending.take() {
+            pending.cancel();
+        }
+
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(app.settings.details_sort_ascending);
+    }
+
+    /// 所有権を返すだけで、ビューの中で列ヘッダを押す道は塞がない。
+    /// (バックログ候補 (i) 「レーティング / ブックマークを列ソートの対象外にする」だと
+    /// 「詳細表示で名前順にも並べたい」が潰れる。)
+    #[test]
+    fn a_column_header_pressed_inside_the_rating_list_still_takes_over_the_order() {
+        let mut app = setup_app();
+        app.items = vec![
+            crate::grid_item::GridItem::Image(std::path::PathBuf::from(r"C:\x\b.jpg")),
+            crate::grid_item::GridItem::Image(std::path::PathBuf::from(r"C:\x\a.jpg")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.details_order = app.visible_indices.clone();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.items_are_rating_view = true;
+
+        app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
+
+        assert_eq!(app.details_order, vec![1, 0]);
+        assert!(app.details_header_sort_active());
+    }
+
+    /// ツールバーとメニューは同じ述語を見る。片方だけが見ていると、選べるのに何も
+    /// 起きない入口が残る (§1.143(a) で実際にメニュー側がそうなっていた)。
+    #[test]
+    fn the_sort_lock_reason_is_the_single_owner_for_both_entry_points() {
+        use crate::app::GridSortLockReason;
+
+        let mut app = setup_app();
+        app.items = vec![crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+            r"C:\x\a.jpg",
+        ))];
+        app.visible_indices = vec![0];
+        app.details_order = app.visible_indices.clone();
+
+        assert_eq!(app.grid_sort_lock_reason(), None, "通常フォルダでは選べる");
+
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::DetailsHeaderSort)
+        );
+
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+        app.items_are_reading_history_view = true;
+        app.current_folder = None;
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::PageOrderFixed),
+            "ページ順の固定が列ヘッダより優先する"
+        );
+    }
+
     #[test]
     fn location_menu_rating_view_records_previous_folder_for_back() {
         let mut app = setup_app();
@@ -25474,6 +25576,63 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(state.output_dir_text, source_dir.display().to_string());
     }
 
+    /// 一括エクスポートは選択の中から書き出せる物だけを取り、残りを件数で返す。
+    /// 黙って落とすとユーザーは「N 件選んだのに M 件しか出ない」で理由を失う。
+    #[test]
+    fn batch_export_items_take_only_exportable_selection_and_count_the_rest() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "c:/trip/clip.mp4",
+        )));
+        app.items
+            .push(GridItem::Folder(std::path::PathBuf::from("c:/trip/sub")));
+        app.visible_indices = vec![0, 1, 2];
+        for _ in 0..3 {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.checked = [0usize, 1, 2].into_iter().collect();
+
+        let (items, skipped) = app.grid_batch_export_items(&ctx);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(skipped, 2);
+        assert_eq!(items[0].filename, "a");
+        assert_eq!(items[0].dirname, "trip");
+    }
+
+    /// チェックが無ければカーソル選択を使う。本への追加と同じ規則。
+    #[test]
+    fn batch_export_items_fall_back_to_the_cursor_selection() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/b.jpg")));
+        app.visible_indices = vec![0, 1];
+        for _ in 0..2 {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.checked.clear();
+        app.selected = Some(1);
+
+        let (items, skipped) = app.grid_batch_export_items(&ctx);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| i.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
     /// PDF ページでは「元の場所」が PDF ファイルのあるディレクトリを指す。
     #[test]
     fn export_dialog_source_dir_for_pdf_page_is_pdf_parent() {
@@ -34510,7 +34669,7 @@ mod pipeline_cache_refactor_tests {
         );
 
         std::fs::write(folder.join("b.png"), b"new").unwrap();
-        app.check_external_folder_changes();
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Resumed);
 
         assert!(
             app.retained_final_ai_cache.is_empty(),

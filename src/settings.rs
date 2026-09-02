@@ -4113,6 +4113,20 @@ pub struct Settings {
     /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
+    /// グリッド選択の一括エクスポートの保存先。単ページの `export_last_directory` とは
+    /// 別に持つ (一括は「送信用」など決まったフォルダへ繰り返し出す使い方が主で、
+    /// 単ページの直前保存先で上書きされると毎回選び直しになる)。
+    #[serde(default)]
+    pub export_batch_directory: Option<PathBuf>,
+    /// 一括エクスポートのファイル名テンプレート (`<filename>` / `<dirname>` / `<num>`)。
+    #[serde(default = "default_export_batch_template")]
+    pub export_batch_template: String,
+    /// 一括エクスポートの出力形式。
+    #[serde(default)]
+    pub export_batch_format: crate::capture::CaptureFormat,
+    /// 一括エクスポートの出力サイズ。
+    #[serde(default)]
+    pub export_batch_scale: crate::export_dialog::ExportScale,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -4251,6 +4265,13 @@ pub struct Settings {
     /// 連結読みの左スティック最大入力時スクロール速度 (画面サイズ比 %/秒)。
     #[serde(default = "default_continuous_reading_gamepad_scroll_percent_per_sec")]
     pub continuous_reading_gamepad_scroll_percent_per_sec: u32,
+    /// ゲームパッドからの操作を受け付けるか。false のときは**デバイスを読む
+    /// スレッドごと止める** (`GamepadRuntime::drain`)。読み捨てるだけだと、
+    /// スティックのずれで UI が起き続ける。
+    ///
+    /// 対象はゲームパッドだけで、マウスジェスチャ・リングフリックは含まない。
+    #[serde(default = "default_gamepad_enabled")]
+    pub gamepad_enabled: bool,
 
     /// ZIP/PDF/対応アーカイブを一覧や起動引数/SendTo から明示的に開いたとき、
     /// ページ一覧を経由せずページを即フルスクリーンで開く。ON のときフルスクリーン中の
@@ -5733,6 +5754,10 @@ fn default_continuous_reading_wheel_scroll_percent() -> u32 {
 fn default_continuous_reading_key_scroll_percent() -> u32 {
     16
 }
+fn default_gamepad_enabled() -> bool {
+    true
+}
+
 fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
     130
 }
@@ -5763,6 +5788,11 @@ pub fn default_rating_filter() -> [bool; 6] {
 
 /// `Ctrl+E` ダイアログのバリエーションチェック初期値。
 /// `[現在の設定, プリセット 1, 2, 3, 4]` → 現在の設定だけ ON。
+/// 既定のテンプレート。単ページ `Ctrl+E` の既定ファイル名 (`<元の名前>_edited`) に揃える。
+pub fn default_export_batch_template() -> String {
+    "<filename>_edited".to_string()
+}
+
 pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
@@ -6010,6 +6040,7 @@ impl Default for Settings {
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
             continuous_reading_gamepad_scroll_percent_per_sec:
                 default_continuous_reading_gamepad_scroll_percent_per_sec(),
+            gamepad_enabled: default_gamepad_enabled(),
             auto_fullscreen_zip_pdf: false,
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
@@ -6204,6 +6235,10 @@ impl Default for Settings {
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
             export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
+            export_batch_directory: None,
+            export_batch_template: default_export_batch_template(),
+            export_batch_format: crate::capture::CaptureFormat::default(),
+            export_batch_scale: crate::export_dialog::ExportScale::default(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -8348,6 +8383,25 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ゲームパッドの有効/無効は既定 true。設定を知らない頃のファイルを読んでも、
+    /// 既存利用者のパッドを黙って切らない。
+    #[test]
+    fn the_gamepad_stays_enabled_unless_it_was_turned_off_on_purpose() {
+        assert!(Settings::default().gamepad_enabled);
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(
+            missing.gamepad_enabled,
+            "この設定を知らない頃のファイルでも、パッドは有効のまま"
+        );
+
+        let turned_off: Settings = serde_json::from_str(r#"{"gamepad_enabled":false}"#).unwrap();
+        assert!(!turned_off.gamepad_enabled);
+        let round_tripped: Settings =
+            serde_json::from_str(&serde_json::to_string(&turned_off).unwrap()).unwrap();
+        assert!(!round_tripped.gamepad_enabled, "切った状態は次回も残る");
+    }
 
     #[test]
     fn sns_split_settings_have_stable_defaults() {

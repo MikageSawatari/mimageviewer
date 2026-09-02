@@ -95,10 +95,51 @@ impl GamepadRuntime {
         }
     }
 
-    pub fn drain(&mut self, ctx: &egui::Context) -> Vec<PadEvent> {
+    /// この frame ぶんのイベントを取り出す。`enabled` が false のときは
+    /// **デバイスを読むスレッドごと止める**。
+    ///
+    /// 読み捨てるだけでは足りない。gilrs スレッドは入力を拾うたびに
+    /// `ctx.request_repaint()` を呼ぶので、スティックが少しずれているパッドが
+    /// 挿さっているだけで UI が起き続ける。無効にした人が求めているのは
+    /// 「反応しないこと」であって「反応しないまま起き続けること」ではない。
+    pub fn drain(&mut self, ctx: &egui::Context, enabled: bool) -> Vec<PadEvent> {
+        if !enabled {
+            self.stop();
+            return Vec::new();
+        }
         self.ensure_started(ctx);
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.drain(..).collect()
+    }
+
+    /// 設定から drain までの配線を見るテスト用。デバイス無しで 1 件流し込む。
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&mut self, event: PadEvent) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(event);
+    }
+
+    /// 読み取りスレッドを止め、溜まっていたイベントを捨てる。再度 `enabled` に
+    /// なれば `ensure_started` が新しいスレッドを立てる。
+    ///
+    /// `shutdown` は次に生きるスレッドと共有しないよう、停止のたびに新しい
+    /// フラグへ差し替える。使い回すと、再開したスレッドが前回の停止要求を
+    /// 読んで即座に終了する。
+    fn stop(&mut self) {
+        if !self.started {
+            return;
+        }
+        self.started = false;
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown = Arc::new(AtomicBool::new(false));
+        #[cfg(not(test))]
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.clear();
     }
 
     #[cfg(test)]
@@ -551,7 +592,45 @@ fn step_due(
 
 #[cfg(test)]
 mod tests {
-    use super::{GamepadInputState, PadAxis, PadButton, WestReleaseOutcome};
+    use super::{
+        GamepadInputState, GamepadRuntime, PadAxis, PadButton, PadEvent, WestReleaseOutcome,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// 無効にしたら、読むのをやめる。
+    ///
+    /// 読んだ結果を捨てるだけでは足りない: gilrs スレッドは入力のたびに repaint を
+    /// 要求するので、スティックがずれているパッドが挿さっているだけで UI が起き続ける。
+    #[test]
+    fn disabling_the_pad_stops_reading_it_and_re_enabling_starts_again() {
+        let ctx = egui::Context::default();
+        let mut runtime = GamepadRuntime::new();
+
+        assert!(runtime.drain(&ctx, true).is_empty());
+        assert!(runtime.started, "有効なら読み取りを始める");
+
+        // 停止前に届いていた分は配らない。無効にした後で古い入力が 1 回流れると、
+        // 「切ったのに動いた」になる。
+        runtime
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(PadEvent::ButtonPressed(PadButton::South));
+        assert!(runtime.drain(&ctx, false).is_empty());
+        assert!(!runtime.started, "無効なら読み取りを止める");
+        assert!(
+            runtime.queue.lock().unwrap().is_empty(),
+            "溜まっていた入力は捨てる"
+        );
+        assert!(
+            !runtime.shutdown.load(Ordering::Relaxed),
+            "停止フラグは次のスレッドと共有しない。使い回すと再開したスレッドが即座に終了する"
+        );
+
+        assert!(runtime.drain(&ctx, true).is_empty());
+        assert!(runtime.started, "有効に戻したら読み取りを再開する");
+    }
+
     use crate::ring_shortcut::RingDirection;
     use std::time::Instant;
 
