@@ -11,6 +11,24 @@ fn export_crop_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) 
     (full_rect.bottom() - panel_pos.y - PANEL_MARGIN).clamp(220.0, 440.0)
 }
 
+/// Whether the crop overlay may still act on the pointer this frame.
+///
+/// `pointer_allowed` answers "may the tool panel have this pointer", which is the wrong
+/// question to ask of a drag that is already running. A drag starts on the image and owns
+/// the pointer until the button comes up, so passing over the panel -- which sits in the
+/// letterbox beside a portrait page -- must not end it. Ending it there froze the box for
+/// good, because a create drag can only begin on a press, so coming back onto the image
+/// did nothing (report 2026-09-02).
+fn crop_overlay_keeps_the_pointer(
+    pointer_allowed: bool,
+    drag_in_progress: bool,
+    primary_down: bool,
+) -> bool {
+    // The button being up with a drag still recorded is stale state, not a live gesture,
+    // so it is cleared like any other disallowed frame.
+    pointer_allowed || (drag_in_progress && primary_down)
+}
+
 fn clamp_pos_to_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
     egui::pos2(
         pos.x.clamp(rect.left(), rect.right()),
@@ -498,7 +516,13 @@ impl App {
             );
         }
 
-        if !pointer_allowed {
+        let drag_in_progress =
+            self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
+        if !crop_overlay_keeps_the_pointer(
+            pointer_allowed,
+            drag_in_progress,
+            ui.input(|i| i.pointer.primary_down()),
+        ) {
             self.export_crop_drag = None;
             self.export_crop_create_drag = None;
             return false;
@@ -679,6 +703,38 @@ fn centered_default_crop(image_size: [usize; 2]) -> CropRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drag that is already running survives the pointer wandering onto the tool panel.
+    ///
+    /// The panel sits in the letterbox beside a portrait page, so dragging a new box out
+    /// past the left edge of the image lands on it. Dropping the drag there froze the box
+    /// permanently, since only a press can begin one.
+    #[test]
+    fn a_running_crop_drag_keeps_the_pointer_over_the_panel() {
+        assert!(crop_overlay_keeps_the_pointer(false, true, true));
+    }
+
+    /// Everything else still yields: no drag to protect, or a stale one whose button is up.
+    #[test]
+    fn a_disallowed_pointer_yields_when_no_drag_is_running() {
+        assert!(!crop_overlay_keeps_the_pointer(false, false, true));
+        assert!(!crop_overlay_keeps_the_pointer(false, true, false));
+        assert!(!crop_overlay_keeps_the_pointer(false, false, false));
+    }
+
+    /// An allowed pointer never depended on a drag being under way.
+    #[test]
+    fn an_allowed_pointer_is_kept_whatever_the_drag_state() {
+        for drag_in_progress in [false, true] {
+            for primary_down in [false, true] {
+                assert!(crop_overlay_keeps_the_pointer(
+                    true,
+                    drag_in_progress,
+                    primary_down
+                ));
+            }
+        }
+    }
 
     fn white(w: usize, h: usize) -> egui::ColorImage {
         egui::ColorImage::new([w, h], vec![egui::Color32::WHITE; w * h])

@@ -66,9 +66,10 @@ impl App {
                     } else {
                         ui.label("キャッシュ情報を取得中...");
                     }
-                    // 動画タイル モード サムネ DB は別ファイル管理だが、
-                    // 削除操作 (フォルダ単位 / すべて) は静止画キャッシュと一括で
-                    // 走るので、サイズもこのダイアログに表示する。
+                    // 動画用の DB は別ファイル管理だが、削除操作 (フォルダ単位 /
+                    // すべて) は静止画キャッシュと一括で走るので、サイズもこの
+                    // ダイアログに表示する。タイルモードのサムネだけでなく、シーク
+                    // ストリップのサムネ・再開プレビュー・粗い波形も同じ DB にある。
                     if let Some(tile_bytes) = self.cache_manager_tile_bytes {
                         let tile_str = if tile_bytes >= 1024 * 1024 * 1024 {
                             format!("{:.2} GB", tile_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -79,7 +80,7 @@ impl App {
                         } else {
                             "0 MB".to_string()
                         };
-                        ui.label(format!("うち動画タイル サムネ: {tile_str}"));
+                        ui.label(format!("うち動画のサムネイル・波形: {tile_str}"));
                     }
                     if let Some(entries) = self.cache_manager_auto_aspect_entries {
                         ui.label(format!("比率自動判定キャッシュ: {entries} フォルダ"));
@@ -207,7 +208,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label("すべてのサムネイルキャッシュを削除します。");
                     ui.label("(編集結果のプレビューキャッシュも一緒に削除されます)");
-                    ui.label("(動画タイル モードのサムネ キャッシュも一緒に削除されます)");
+                    ui.label("(動画のサムネイル・波形のキャッシュも一緒に削除されます)");
                     ui.label("(比率自動判定キャッシュも一緒に削除されます)");
                     ui.label("この操作は元に戻せません。");
                     ui.add_space(8.0);

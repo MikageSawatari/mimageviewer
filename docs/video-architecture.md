@@ -300,7 +300,11 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 固定したバーは映像へ重ねず、`compute_video_visual_transform` の target 矩形から上部 54pt / 下部
 64pt と `fullscreen_fixed_bar_gap_px` の共通余白を除外し、残った領域へ映像を letterbox fit する。
 `BarAndStrip` では presenter が所有する `Option<NativeOverlaySeekStrip>` が `Some` のときだけ
-ストリップ 104pt も下部予約領域へ足す。`Some` / `None` の変化は transform と表示解像度 surface の
+ストリップの高さも下部予約領域へ足す。**その高さは選んだプリセット (大 104 / 中 72 / 小 48pt) で
+変わるので、`VideoVisualLayout` は「表示中か」ではなく占めている points を運ぶ。** 高さの正本は
+overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・セル寸法・波形ラスタの要求・左右パネルの
+hover band も同じ `SeekStripLayout` から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md)
+の「全体表示と高さ」)。`Some` / `None` の変化は transform と表示解像度 surface の
 準備状態を更新し、ストリップを「なし」にしたときは固定設定を保持したまま領域だけを解放する。
 論理 pt と余白は native overlay の pixels-per-point で物理 px に変換する。presenter HWND は monitor
 全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
@@ -744,9 +748,9 @@ src/video/
 ├── thumbnail.rs            # hover / marker thumbnail worker
 ├── seek_strip.rs           # seek strip の軸・窓・gesture 純ロジック
 ├── seek_strip_thumbs.rs    # seek strip の窓単位 thumbnail worker
-├── seek_strip_wave.rs      # seek strip の時間窓 waveform 解析・raster worker
+├── seek_strip_wave.rs      # seek strip の時間窓 / 粗い全尺 waveform 解析・raster worker
 ├── tile_thumbnails.rs      # tile mode 一括 thumbnail worker
-├── tile_thumb_cache.rs     # tile thumbnail SQLite/WebP cache
+├── tile_thumb_cache.rs     # tile/resume WebP + 粗い波形 chunk の共有 SQLite cache
 ├── screenshot.rs           # 現在 frame の clipboard copy
 ├── ffmpeg_loader.rs        # 同居 FFmpeg DLL の検証
 └── upscale/                # resumable offline upscale job / queue / manifest / paths
@@ -798,11 +802,18 @@ thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰ま
 BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
 側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
 
-動画シークストリップの persisted source of truth は
-`Settings.video_seek_strip_state` (`none / thumbnails / waveform`) ひとつで、開閉 bool と mode を
-分けない。`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
+動画シークストリップの表示状態は、非表示を含む 5 値 (`SeekStripView` = 非表示 +
+(場面 / 波形) × (周辺 / 全体)) ひとつで、開閉 bool と内容と範囲を分けない。表示内容は
+`Settings.video_seek_strip_state` (`none / thumbnails / waveform`)、表示範囲は
+`SeekStripSpan` が持ち、合わせるのは `App::video_seek_strip_view()` の 1 か所だけ。
+`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
 明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
 サムネイル軸、2 種類の worker を 1 session として所有する。
+
+**全体表示では中心位置は状態ではなく導出値**で、`pin_whole_center` だけが書く。軸の真ん中
+(場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した
+まま、中身を止めて赤線だけを動かせる。場面の軸は `StripAxis::whole` (尺を帯のセル数で等分した
+`TimeGrid`) で、セル数は presenter が実寸から報告する。
 
 **セッションを畳む境界と、記憶している選択は別物である** (§1.146、2026-08-31)。
 `Settings.video_seek_strip_state` を消すのは `SeekStripCloseCause::is_user_dismissal`
@@ -860,19 +871,25 @@ source session reset で `Unknown` へ戻すため、前ファイルの unavaila
 background で作る。保持 span は通常 3 倍だが 3600 秒で上限とする。可視 span が 60 分以上なら
 保持 span は可視 span と同じになり、同幅の background upgrade は出さない。
 
-可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
-60 秒 chunk でメモリ内だけに構築する。foreground latest-wins request を loop 先頭で処理し、無いとき
-だけ現在中心に最も近い未試行 chunk を 1 個埋める。chunk 中は foreground へ譲らないため、待ち上限は
-1 chunk で、thread / decoder は増えない。粗い列が可視範囲を被覆し要求 bin 幅が 100ms 以上なら
-粗い列を使い、未被覆か解像度不足でも可視 span 30 分以下は従来の窓復号を維持する。30 分超は
-粗い列だけを progressive に描き、未解析列は暗い背景かつ中心線なしで区別する。粗い列、bitset、
-content revision は worker とともに捨て、永続 cache は持たない。chunk 単位の decode / 合成失敗は
-coverage と別の failed bitset に記録して選択から外し、残りの構築を継続する。終了は両 bitset の和で
-判定するが、failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と
-音声 track なしだけはファイル単位の `Unavailable` として全体を止める。
+波形モードで可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
+60 秒 chunk で構築する。列を作った直後、共有 `TileThumbCache` の `video_tile_thumbs.db` から
+file identity (`path` / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
+1 batch で読み、長さと添字を検証できた chunk を coverage へ戻す。未取得 chunk は従来どおり
+foreground latest-wins request を loop 先頭で処理し、無いときだけ現在中心に最も近いものを 1 個埋め、
+復号・合成に成功した chunk だけを DB へ保存する。波形モード以外では背景段を止め、10 分の構築閾値、
+中心優先度、1 worker / 1 decoder は変えない。
+
+粗い列が可視範囲を被覆し要求 bin 幅が 100ms 以上なら粗い列を使い、未被覆か解像度不足でも可視 span
+30 分以下は従来の窓復号を維持する。30 分超は粗い列だけを progressive に描き、未解析列は暗い背景かつ
+中心線なしで区別する。永続化するのは量子化済みの粗い chunk だけで、列の実体、coverage / failed bitset、
+content revision、窓解析と raster LRU は worker のメモリに置く。chunk 単位の decode / 合成失敗は
+failed bitset にだけ記録して永続化せず、残りの構築を継続する。終了は coverage と failed の和で判定するが、
+failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と音声 track なし
+だけはファイル単位の `Unavailable` として全体を止める。
 
 `AudioRangeDecoder::open` は FFI で音声以外の `AVStream.discard` を `AVDISCARD_ALL` にし、
-chunk perf は `wave_coarse_chunk`、粗い列からの描画は `wave_coarse_serve` へ出す。従来窓の
+永続 chunk の一括読み込みは `wave_coarse_cache`、chunk perf は `wave_coarse_chunk`、粗い列からの描画は
+`wave_coarse_serve` へ出す。従来窓の
 pre-roll bins は raster 前に捨て、全尺前提の beat grid は作らない。窓波形 raster の LRU は
 file identity、時間窓、bin 幅、物理幅をキーにしたメモリ内 8 件だけである。
 audio stream が無い場合は通常の media property として typed status で保持し、
@@ -919,11 +936,13 @@ strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする 
 中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
 同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
 100ms cadence で
-playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。HUD の vector
-film-strip button は `none → thumbnails → waveform → none` を 1 クリック巡回し、OFF は非アクティブ、
-waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
-ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
-従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
+playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。**この追従と
+ドラッグ移動は周辺表示だけのもの**で、全体表示は帯を動かさず、離した位置の時刻へ 1 回 seek する。
+HUD の vector film-strip button はメニューを開き、非表示・4 表示・3 高さを直接選べる
+(巡回は `Shift+S`)。OFF は非アクティブ、waveform はフィルム上の vector 音符で区別する。
+ストリップ本体にはモード切替 UI を置かず、全域を
+ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ選んだ高さのぶん上へ退避し、
+非表示時は従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
 
 **D17 の共有 1 枚プレビュー**: seek bar と seek strip は presenter-local な同じ preview target を
 更新し、`ThumbnailWorker` の latest-wins request、許容値計算、texture、描画出口を共有する。
@@ -1908,8 +1927,11 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   最後にデコードできたフレームを fallback に使う。worker は cancel フラグを
   1 パケットごとに確認するので別 interval / 動画への切替時は自然終了する。
   同じ frame-selection は seek hover サムネ `thumbnail.rs` と共通
-- `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
-  動画の長さが変わっても再ヒットする (Phase 8.C の修正)
+- `tile_thumb_cache.rs`: 共有 `video_tile_thumbs.db` の永続キャッシュ。タイル / resume サムネイルは
+  SQLite + WebP で、タイルは **絶対 PTS をキー**にしているため動画の長さが変わっても再ヒットする
+  (Phase 8.C の修正)。`video_wave_chunks` は粗い全尺波形の量子化 bin を chunk 単位で持ち、path、
+  動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。既存のファイル単位・
+  フォルダ単位・全件削除は両方のキャッシュを同時に消す
 - **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
   どのモニターで再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは
   「動画 × 絶対 PTS」で 1 行に集約され、列数を切り替えても解像感が混ざらない

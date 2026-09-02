@@ -1838,12 +1838,41 @@ pub(super) fn page_ring_shortcut_assignments(
     ring_shortcut_context_editor(ui, &mut state.settings.ring_shortcuts, context);
 }
 
+/// 設定タブの「ゲームパッド」。**割り当てではなく、デバイスを読むかどうか**を持つ。
+/// 割り当ての編集はトップレベルの「ゲームパッド」タブ
+/// ([`page_gamepad_assignments`]) 側。
+pub(super) fn page_gamepad_device(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.small("ゲームパッドからの操作を受け付けるかどうかを切り替えます。割り当ての編集は上の「ゲームパッド」タブです。");
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut state.settings.gamepad_enabled,
+        "ゲームパッドの操作を受け付ける",
+    );
+    ui.add_space(4.0);
+    if state.settings.gamepad_enabled {
+        ui.small("オフにすると、接続されていてもボタン・スティックの操作を一切受け付けません。誤って触れてしまう場合に使ってください。");
+        ui.small("マウスジェスチャとリングショートカットのマウス操作は、この設定の対象外です。");
+    } else {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "現在ゲームパッドは無効です。接続していても操作を受け付けません。",
+        );
+    }
+}
 pub(super) fn page_gamepad_assignments(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     context: RingShortcutContext,
 ) {
     ui.small("固定ボタンは既定動作で使い、X+方向リングだけ編集できます。");
+    if !state.settings.gamepad_enabled {
+        // 無効のまま割り当てを編集して「効かない」と悩まないように、ここでも言う。
+        ui.add_space(4.0);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "現在ゲームパッドは無効です (設定 → ゲームパッド)。ここでの割り当ては保存されますが、有効にするまで動きません。",
+        );
+    }
     ui.add_space(8.0);
     gamepad_layout_preview(ui, context);
     ui.add_space(12.0);
@@ -7031,6 +7060,52 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 egui::RichText::new(
                     "大きいほどシークバーのプレビューが早く表示されます。0.0 は位置の正確さを優先します。\n\
                      大きめの値で構いません。迷ったら大きめにしてください。値を上げても、実際のズレはその動画で利用できる近い画像までに限られます。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-height", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("シークストリップの高さ");
+                egui::ComboBox::from_id_salt("video_seek_strip_height")
+                    .selected_text(s.video_seek_strip_height.label())
+                    .show_ui(ui, |ui| {
+                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_height,
+                                preset,
+                                preset.label(),
+                            );
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "低いほど画像は小さくなりますが、動画全体を表示したときに一度に並ぶ枚数が増えます。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-cycle", |ui, state| {
+            let s = &mut state.settings;
+            ui.label("シークストリップをキーで切り替えるときに通す表示");
+            let mut cycle = s.video_seek_strip_cycle;
+            for showing in crate::video::seek_strip_layout::SEEK_STRIP_SHOWING_ORDER {
+                let mut enabled = cycle.contains(showing);
+                if ui.checkbox(&mut enabled, showing.label()).changed() {
+                    cycle.set(showing, enabled);
+                }
+            }
+            // 全部外すとキーが無反応になるので、その場で既定へ戻す。
+            s.video_seek_strip_cycle = cycle.normalized();
+            ui.label(
+                egui::RichText::new(
+                    "外した表示もシークバー右下のボタンのメニューからは選べます。すべて外した場合は「場面 (周辺)」だけが有効に戻ります。",
                 )
                 .small(),
             );

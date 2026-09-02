@@ -859,14 +859,23 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   左右パネル表示に応じて必要なバーを表示する。固定解除後はその自動表示へ直ちに戻る。
 - 動画シークバーはトラック下側に秒 / 分 / 時間の目盛りを描き、幅に応じて許可系列から間引く。
   描画順は進捗塗り → 目盛り → chapter / bookmark / pin とし、既存マーカーを前面に保つ。
-- 動画シークストリップの保存状態は `Settings.video_seek_strip_state` の
-  `none / thumbnails / waveform` の 3 値ひとつとし、開閉 bool と mode を分けない。
-  `VideoSeekStripCycle` (既定 `Shift+S`) は「なし → サムネイル → 波形 → なし」を巡回する。
+- 動画シークストリップの表示状態は、非表示を含む 5 値 (表示内容 `none / thumbnails / waveform`
+  × 表示範囲 `window / whole`) ひとつとし、開閉 bool と内容と範囲を分けない。内容は
+  `Settings.video_seek_strip_state`、範囲は `Settings.video_seek_strip_span` が持ち、
+  合わせるのは `App::video_seek_strip_view()` の 1 か所だけ。
+  `VideoSeekStripCycle` (既定 `Shift+S`) は「なし → 場面 (周辺) → 場面 (全体) → 波形 (周辺) →
+  波形 (全体) → なし」を巡回し、`Settings.video_seek_strip_cycle` で外した表示は飛ばす。
+  全解除は読み込み時に「場面 (周辺)」だけ有効へ正規化する。
   既定 chord なしの `VideoSeekStripToggle` は表示 / 非表示を切り替えて、再表示時は最後の
   non-none 選択を復元する。`VideoSeekStripNone` / `VideoSeekStripThumbnails` /
-  `VideoSeekStripWaveform` は指定状態へ直接移る。
+  `VideoSeekStripWaveform` は表示範囲を保ったまま指定内容へ直接移る。
   シークバーから上へドラッグした場合は、明示保存した最後の non-none 選択へ戻す。
-  下部ロックボタンの左にベクター描画のフィルムアイコンを置き、1 クリックで同じ順に巡回する。
+  全体表示では帯の中身を動かさず、赤線を `再生位置 / 尺` へ写す。中心位置は状態ではなく
+  導出値とし、ポインタが指した時刻へ 1 回 seek する。範囲の段階値もホイールも持たない。
+  帯の高さは `Settings.video_seek_strip_height` (大 104 / 中 72 / 小 48 / 最小 36pt) の 1 か所で
+  解決し、描画・入力・映像の予約・波形ラスタの要求が同じ値を見る。
+  下部ロックボタンの左にベクター描画のフィルムアイコンを置き、クリックで非表示・4 表示・
+  3 段の高さを直接選ぶメニューを開く (巡回から外した表示にもここから届く)。
   OFF は非アクティブ表示、波形はフィルム上にベクター描画の音符を重ねる。ストリップ本体は全域を
   ドラッグ面とし、モード切替 UI は置かない。
 - ストリップ上のホイールは上回転で範囲を 1 段狭く、下回転で 1 段広くし、その設定を即時保存する。
@@ -1871,6 +1880,9 @@ Ctrl+C / Ctrl+X / Ctrl+V も同じ Shell verb ヘルパーを使い、コピー 
 | `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
 | `video_top_bar_locked` | bool | false | 動画の上部情報バーを固定表示する。ON のときは上端のバー領域と共通余白を映像フィット範囲から除外する。静止画設定とは独立 |
 | `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
+| `video_seek_strip_span` | enum | `window` | シークストリップが動画のどこを写すか。`window` = 再生位置の周辺、`whole` = 動画全体を帯の横幅へ収める。表示内容 (場面 / 波形) と直交し、行き来しても保つ |
+| `video_seek_strip_height` | enum | `large` | シークストリップの高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt。低いほど全体表示で一度に並ぶ枚数が増える |
+| `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |

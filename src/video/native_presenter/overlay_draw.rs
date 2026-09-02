@@ -6137,17 +6137,11 @@ pub(super) fn native_panel_top() -> f32 {
     56.0
 }
 
-pub(super) fn native_panel_hover_bottom(
-    overlay_height_points: f32,
-    seek_strip_visible: bool,
-) -> f32 {
+pub(super) fn native_panel_hover_bottom(overlay_height_points: f32, seek_strip_points: f32) -> f32 {
     // シーク HUD または、その直上に表示中のシークストリップの上に 2pt の隙間を保つ。
-    // ストリップ非表示時は従来の HUD top - 2pt を変えない。
-    let strip_height = if seek_strip_visible {
-        crate::video::native_presenter::SEEK_STRIP_HEIGHT
-    } else {
-        0.0
-    };
+    // ストリップ非表示時は従来の HUD top - 2pt を変えない。高さはプリセットで変わるので、
+    // ここでは量をそのまま受け取る (定数を読み直さない)。
+    let strip_height = seek_strip_points.max(0.0);
     (overlay_height_points
         - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + strip_height + 2.0))
         .max(native_panel_top())
@@ -7641,7 +7635,7 @@ mod tests {
         let overlay_h = 1080.0_f32;
         let overlay_w = 1920.0_f32;
 
-        let hover_bottom = native_panel_hover_bottom(overlay_h, false);
+        let hover_bottom = native_panel_hover_bottom(overlay_h, 0.0);
         let jump = native_jump_panel_rect(overlay_h);
         let meta = native_metadata_panel_rect(overlay_w, overlay_h);
 
@@ -7667,7 +7661,8 @@ mod tests {
             pixels_per_point: 1.0,
             top_bar_locked: true,
             bottom_lock: VideoBottomLock::BarAndStrip,
-            seek_strip_visible: true,
+            seek_strip_visible_points: crate::video::seek_strip_layout::SeekStripHeight::Large
+                .points(),
             fixed_bar_gap_px: 0,
         });
         assert!(top > 0.0 && bottom > 0.0, "この設定では上下とも確保される");
@@ -7693,18 +7688,22 @@ mod tests {
 
     #[test]
     fn side_panel_hover_bottom_reserves_visible_seek_strip() {
-        use crate::video::native_presenter::{HUD_BOTTOM_HEIGHT, SEEK_STRIP_HEIGHT};
+        use crate::video::native_presenter::HUD_BOTTOM_HEIGHT;
+        use crate::video::seek_strip_layout::SeekStripHeight;
         let overlay_h = 1080.0_f32;
 
-        let without_strip = native_panel_hover_bottom(overlay_h, false);
-        let with_strip = native_panel_hover_bottom(overlay_h, true);
-
+        let without_strip = native_panel_hover_bottom(overlay_h, 0.0);
         assert_eq!(without_strip, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
-        assert_eq!(
-            with_strip,
-            overlay_h - (HUD_BOTTOM_HEIGHT + SEEK_STRIP_HEIGHT + 2.0)
-        );
-        assert_eq!(without_strip - with_strip, SEEK_STRIP_HEIGHT);
+
+        // どの高さを選んでも、帯の上端の 2pt 上で帯が終わる。
+        for height in SeekStripHeight::ALL {
+            let with_strip = native_panel_hover_bottom(overlay_h, height.points());
+            assert_eq!(
+                with_strip,
+                overlay_h - (HUD_BOTTOM_HEIGHT + height.points() + 2.0)
+            );
+            assert_eq!(without_strip - with_strip, height.points());
+        }
     }
 
     #[test]

@@ -1460,6 +1460,20 @@ impl crate::app::App {
                 }
                 None
             }
+            // 一括側はチェック集合を自分で解決する。cursor は「チェックが空のとき
+            // どこへ効かせるか」だけに使う (`select_bulk_target_indices`)。
+            MenuCommand::BulkPasteEditBundle => {
+                if let Some(idx) = target.item_index {
+                    self.request_bulk_paste_page_edit_bundle(idx);
+                }
+                None
+            }
+            MenuCommand::ResetPageEdits => {
+                if let Some(idx) = target.item_index {
+                    self.request_bulk_reset_page_edits(idx);
+                }
+                None
+            }
             MenuCommand::JumpToFolder => match &target.item {
                 GridItem::Folder(path) => {
                     Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))

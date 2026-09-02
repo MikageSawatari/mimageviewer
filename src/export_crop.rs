@@ -606,6 +606,72 @@ pub fn crop_from_xywh_inputs(
     .sanitized(width, height)
 }
 
+/// Build a crop from the pressed point and the current pointer.
+///
+/// **`a` is the point the user pressed and it stays where it is**, ratio or no ratio.
+/// This used to fit the two-point rectangle to the ratio *around its centre*, which moved
+/// the pressed point out from under the cursor as soon as a ratio was locked, while
+/// dragging an existing handle kept its opposite corner still. One gesture, two answers.
+fn crop_from_points_with_aspect(
+    a: [f32; 2],
+    b: [f32; 2],
+    width: usize,
+    height: usize,
+    aspect_ratio: f32,
+) -> CropRect {
+    let ratio = aspect_ratio.max(0.01);
+    let max_w = width.max(1) as f32;
+    let max_h = height.max(1) as f32;
+    let anchor_x = a[0].clamp(0.0, max_w);
+    let anchor_y = a[1].clamp(0.0, max_h);
+
+    // The box lives in the pointer's quadrant, exactly as the unconstrained rectangle
+    // does; a tie grows the same way `min`/`max` resolves it there. Which side it grows
+    // on is also what decides how much room is left before the image edge.
+    let grow_right = b[0] >= a[0];
+    let grow_down = b[1] >= a[1];
+    let room_x = if grow_right {
+        max_w - anchor_x
+    } else {
+        anchor_x
+    };
+    let room_y = if grow_down {
+        max_h - anchor_y
+    } else {
+        anchor_y
+    };
+
+    // The corner follows both axes and takes the larger width the two imply, the same rule
+    // `aspect_drag_widths` uses for a corner handle.
+    let desired_width = (b[0] - a[0]).abs().max((b[1] - a[1]).abs() * ratio);
+    let available_width = room_x.min(room_y * ratio);
+    // A ratio-locked rectangle needs width >= 1 and height = width / ratio >= 1.
+    let min_width = ratio.max(1.0);
+    let crop_width = desired_width.clamp(min_width, available_width.max(min_width));
+    let crop_height = crop_width / ratio;
+
+    // Pressing on the very edge and dragging off the image leaves less room than the
+    // smallest legal rectangle. `sanitized` then pulls the box back inside, which is the
+    // one case where the anchor moves -- there is nowhere else for it to go.
+    let min_x = if grow_right {
+        anchor_x
+    } else {
+        anchor_x - crop_width
+    };
+    let min_y = if grow_down {
+        anchor_y
+    } else {
+        anchor_y - crop_height
+    };
+    CropRect {
+        min_x,
+        min_y,
+        max_x: min_x + crop_width,
+        max_y: min_y + crop_height,
+    }
+    .sanitized(width, height)
+}
+
 pub fn crop_from_points(
     a: [f32; 2],
     b: [f32; 2],
@@ -613,18 +679,16 @@ pub fn crop_from_points(
     height: usize,
     aspect_ratio: Option<f32>,
 ) -> CropRect {
-    let crop = CropRect {
+    if let Some(ratio) = aspect_ratio {
+        return crop_from_points_with_aspect(a, b, width, height, ratio);
+    }
+    CropRect {
         min_x: a[0].min(b[0]),
         min_y: a[1].min(b[1]),
         max_x: a[0].max(b[0]),
         max_y: a[1].max(b[1]),
     }
-    .sanitized(width, height);
-    if let Some(ratio) = aspect_ratio {
-        crop.fit_to_aspect_around_center(ratio, width, height)
-    } else {
-        crop
-    }
+    .sanitized(width, height)
 }
 
 pub fn crop_color_image(
@@ -1034,6 +1098,116 @@ mod tests {
             max_x: 400.0,
             max_y: 500.0,
         }
+    }
+
+    /// The pressed point is a corner of the result, whichever way the pointer went.
+    ///
+    /// The image is large enough that no direction runs out of room, so nothing but the
+    /// anchoring rule can decide where the corner lands.
+    #[test]
+    fn a_ratio_locked_create_drag_keeps_the_pressed_point_still() {
+        const RATIO: f32 = 3.0 / 2.0;
+        let press = [500.0_f32, 500.0_f32];
+        for (dx, dy) in [
+            (240.0, 100.0),
+            (-240.0, 100.0),
+            (240.0, -100.0),
+            (-240.0, -100.0),
+        ] {
+            let rect = crop_from_points(
+                press,
+                [press[0] + dx, press[1] + dy],
+                1000,
+                1000,
+                Some(RATIO),
+            );
+            let corner_x = if dx >= 0.0 { rect.min_x } else { rect.max_x };
+            let corner_y = if dy >= 0.0 { rect.min_y } else { rect.max_y };
+            assert_close(corner_x, press[0]);
+            assert_close(corner_y, press[1]);
+            assert_close(rect.width() / rect.height(), RATIO);
+        }
+    }
+
+    /// The corner follows both axes and takes the larger width the two imply, which is the
+    /// rule a corner handle already uses. Dragging mostly downward must therefore be sized
+    /// by the vertical distance, not the horizontal one.
+    #[test]
+    fn a_ratio_locked_create_drag_is_sized_by_the_axis_that_asks_for_more() {
+        const RATIO: f32 = 3.0 / 2.0;
+        let press = [100.0_f32, 100.0_f32];
+
+        let wide = crop_from_points(
+            press,
+            [press[0] + 300.0, press[1] + 10.0],
+            2000,
+            2000,
+            Some(RATIO),
+        );
+        assert_close(wide.width(), 300.0);
+
+        let tall = crop_from_points(
+            press,
+            [press[0] + 10.0, press[1] + 300.0],
+            2000,
+            2000,
+            Some(RATIO),
+        );
+        assert_close(tall.height(), 300.0);
+        assert_close(tall.width(), 300.0 * RATIO);
+    }
+
+    /// Running into the image edge stops the box there instead of moving the anchor, the
+    /// way a handle drag stops against its own limit.
+    #[test]
+    fn a_ratio_locked_create_drag_stops_at_the_edge_without_moving_the_anchor() {
+        const RATIO: f32 = 1.0;
+        // 80 px of room below the press, 900 to its right: the shorter axis is the limit.
+        let press = [100.0_f32, 920.0_f32];
+        let rect = crop_from_points(press, [900.0, 1000.0], 1000, 1000, Some(RATIO));
+
+        assert_close(rect.min_x, press[0]);
+        assert_close(rect.min_y, press[1]);
+        assert_close(rect.height(), 80.0);
+        assert_close(rect.width(), 80.0);
+    }
+
+    /// Without a ratio the two points are simply the opposite corners, unchanged.
+    #[test]
+    fn a_free_create_drag_still_spans_the_two_points() {
+        let rect = crop_from_points([400.0, 300.0], [120.0, 380.0], 1000, 1000, None);
+        assert_rect_close(
+            rect,
+            CropRect {
+                min_x: 120.0,
+                min_y: 300.0,
+                max_x: 400.0,
+                max_y: 380.0,
+            },
+        );
+    }
+
+    /// Switching the aspect mode on an existing rectangle still fits around its centre.
+    ///
+    /// The create drag stopped calling this, but the mode switch and the SNS split still
+    /// do, and they want the rectangle to stay where it is rather than pinned to a corner.
+    #[test]
+    fn fitting_an_existing_rect_to_a_ratio_still_keeps_its_centre() {
+        let base = CropRect {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 500.0,
+            max_y: 500.0,
+        };
+        let fitted = base.fit_to_aspect_around_center(2.0, 1000, 1000);
+        assert_close(
+            (fitted.min_x + fitted.max_x) * 0.5,
+            (base.min_x + base.max_x) * 0.5,
+        );
+        assert_close(
+            (fitted.min_y + fitted.max_y) * 0.5,
+            (base.min_y + base.max_y) * 0.5,
+        );
     }
 
     fn assert_close(actual: f32, expected: f32) {

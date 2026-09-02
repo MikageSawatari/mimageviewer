@@ -15,6 +15,12 @@ pub(super) struct VideoSeekStripSession {
     owner_fs_idx: usize,
     video_path: std::path::PathBuf,
     duration_secs: f64,
+    /// 帯が動画のどこを写しているか。
+    ///
+    /// **全体表示では `center` は状態ではなく導出値**で、`pin_whole_center` だけが書く。
+    /// 帯が動かないので、中心は常に軸の真ん中 (場面) / 尺の真ん中 (波形) に置き、
+    /// 動くのは赤線だけになる。
+    span: crate::video::seek_strip_layout::SeekStripSpan,
     center: crate::video::seek_strip::SeekStripCenter,
     axis: VideoSeekStripAxisState,
     thumbnail_worker: Option<crate::video::seek_strip_thumbs::SeekStripThumbnailWorker>,
@@ -69,6 +75,7 @@ impl VideoSeekStripSession {
             owner_fs_idx: 0,
             video_path,
             duration_secs: 600.0,
+            span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             center: crate::video::seek_strip::SeekStripCenter::Waveform {
                 center_time_secs: 0.0,
             },
@@ -93,6 +100,73 @@ impl VideoSeekStripSession {
             visible_pending_reported: false,
             range_edited_at_save_generation: None,
         }
+    }
+}
+
+#[cfg(windows)]
+impl VideoSeekStripSession {
+    /// 全体表示の軸を、帯が報告したセル数へ合わせる。
+    ///
+    /// セル数は帯の幅と高さで決まるので、ウィンドウのリサイズや高さの変更で変わる。
+    /// キーフレーム軸ではなく等間隔の格子を使うのは、**全体を等間隔で見渡すのが目的**
+    /// だから。ワーカーは格子の時刻から許容幅内の近傍キーフレームを採るので、任意
+    /// フレームの精密復号は起きない。
+    fn rebuild_whole_axis_if_needed(&mut self) -> bool {
+        if !matches!(
+            self.center,
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { .. }
+        ) {
+            return false;
+        }
+        let cells = self.visible_count.max(1);
+        let Some(axis) = crate::video::seek_strip::StripAxis::whole(self.duration_secs, cells)
+        else {
+            return false;
+        };
+        if let VideoSeekStripAxisState::Ready(current) = &self.axis
+            && current.as_ref() == &axis
+        {
+            return false;
+        }
+        self.axis = VideoSeekStripAxisState::Ready(std::sync::Arc::new(axis));
+        self.last_requested_center = None;
+        self.last_sent_thumbnail_request_id = None;
+        true
+    }
+
+    /// 全体表示の中心を導出値として置き直す。**ここだけが書く。**
+    ///
+    /// 帯は動かないので、中心は常に軸の真ん中 (場面) / 尺の真ん中 (波形) にある。
+    /// 波形は「1 画面の範囲 = 尺」にすることで、周辺表示と同じ写像のまま全体を写す。
+    fn pin_whole_center(&mut self) -> bool {
+        match &mut self.center {
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                let VideoSeekStripAxisState::Ready(axis) = &self.axis else {
+                    return false;
+                };
+                let pinned = axis.cell_count() as f64 * 0.5;
+                if center_index.to_bits() == pinned.to_bits() {
+                    return false;
+                }
+                *center_index = pinned;
+            }
+            crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+                if !self.duration_secs.is_finite() || self.duration_secs <= 0.0 {
+                    return false;
+                }
+                let pinned = self.duration_secs * 0.5;
+                if center_time_secs.to_bits() == pinned.to_bits()
+                    && self.waveform_span_secs.to_bits() == self.duration_secs.to_bits()
+                {
+                    return false;
+                }
+                *center_time_secs = pinned;
+                self.waveform_span_secs = self.duration_secs;
+                self.last_wave_request = None;
+                self.pending_wave_span = None;
+            }
+        }
+        true
     }
 }
 
@@ -133,6 +207,7 @@ pub(crate) struct HeldSeekStripWaveWorker {
 fn take_or_spawn_seek_strip_wave_worker(
     holdover: &mut Option<HeldSeekStripWaveWorker>,
     path: &std::path::Path,
+    cache: Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 ) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
     if let Some(held) = holdover.take() {
         if crate::path_key::eq_keep_drive(&held.path, path) {
@@ -144,7 +219,7 @@ fn take_or_spawn_seek_strip_wave_worker(
             return held.worker;
         }
     }
-    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf())
+    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf(), cache)
 }
 
 /// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
@@ -156,24 +231,39 @@ fn wave_background_paused_for_mode(mode: crate::settings::VideoSeekStripMode) ->
     mode != crate::settings::VideoSeekStripMode::Waveform
 }
 
+/// 表示状態を変えるキー操作を、非表示を含む 5 値の次の状態へ写す。
+///
+/// 巡回だけが `cycle_set` を見る。内容を直接指名する操作は表示範囲を変えない
+/// (場面と波形を行き来しても、周辺 / 全体の選択は保つ)。
 #[cfg(windows)]
-fn requested_video_seek_strip_state(
+fn requested_video_seek_strip_view(
     action: KeyAction,
-    current: crate::settings::VideoSeekStripState,
+    current: crate::video::seek_strip_layout::SeekStripView,
     last_choice: crate::settings::VideoSeekStripMode,
+    cycle_set: crate::video::seek_strip_layout::SeekStripCycleSet,
     strip_available: bool,
-) -> Option<crate::settings::VideoSeekStripState> {
+) -> Option<crate::video::seek_strip_layout::SeekStripView> {
+    use crate::video::seek_strip_layout::SeekStripView;
     if !strip_available {
         return None;
     }
+    let span = current.span();
     match action {
-        KeyAction::VideoSeekStripCycle => Some(current.cycle()),
-        KeyAction::VideoSeekStripToggle => Some(current.toggle(last_choice)),
-        KeyAction::VideoSeekStripNone => Some(crate::settings::VideoSeekStripState::None),
-        KeyAction::VideoSeekStripThumbnails => {
-            Some(crate::settings::VideoSeekStripState::Thumbnails)
-        }
-        KeyAction::VideoSeekStripWaveform => Some(crate::settings::VideoSeekStripState::Waveform),
+        KeyAction::VideoSeekStripCycle => Some(cycle_set.next(current)),
+        KeyAction::VideoSeekStripToggle => Some(if current.is_visible() {
+            SeekStripView::Hidden
+        } else {
+            SeekStripView::showing(last_choice, span)
+        }),
+        KeyAction::VideoSeekStripNone => Some(SeekStripView::Hidden),
+        KeyAction::VideoSeekStripThumbnails => Some(SeekStripView::showing(
+            crate::settings::VideoSeekStripMode::Thumbnails,
+            span,
+        )),
+        KeyAction::VideoSeekStripWaveform => Some(SeekStripView::showing(
+            crate::settings::VideoSeekStripMode::Waveform,
+            span,
+        )),
         _ => None,
     }
 }
@@ -3947,7 +4037,8 @@ impl App {
             | Ev::OpenSeekStrip
             | Ev::MoveSeekStrip { .. }
             | Ev::CommitSeekStrip { .. }
-            | Ev::SetSeekStripState { .. }
+            | Ev::SetSeekStripView { .. }
+            | Ev::SetSeekStripHeight { .. }
             | Ev::StepSeekStripRange { .. }
             | Ev::ToggleTileMode
             | Ev::TogglePerfOverlay
@@ -4431,7 +4522,10 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::MoveSeekStrip { center } => {
+                // 全体表示の帯は動かない。表示範囲を切り替えた直後に届く 1 つ前の帯からの
+                // 移動を当てると、固定しているはずの中身が 1 フレームだけ流れる。
                 if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+                    && session.span == crate::video::seek_strip_layout::SeekStripSpan::Window
                     && center.mode() == session.center.mode()
                     && center
                         .time_secs(match &session.axis {
@@ -4453,13 +4547,17 @@ impl App {
                     VideoSeekStripRuntime::Open(session)
                         if center.mode() == session.center.mode() =>
                     {
-                        session.center = center;
                         let target_secs = center
                             .time_secs(match &session.axis {
                                 VideoSeekStripAxisState::Ready(axis) => Some(axis.as_ref()),
                                 VideoSeekStripAxisState::Resolving { .. } => None,
                             })
                             .map(|target_secs| target_secs.clamp(0.0, session.duration_secs));
+                        // 全体表示では、届いた位置は「指した時刻」であって新しい中心では
+                        // ない。中心は導出値なので `pin_whole_center` に任せる。
+                        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Window {
+                            session.center = center;
+                        }
                         session.drag_state = VideoSeekStripDragState::Idle;
                         session.last_follow_recenter_at = Some(std::time::Instant::now());
                         target_secs
@@ -4492,11 +4590,22 @@ impl App {
                         session.last_wave_request = None;
                         session.pending_wave_span = None;
                     }
+                    // 全体表示のセル数は帯が決める。届いた枚数で軸を作り直してから要求する。
+                    if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
+                        session.rebuild_whole_axis_if_needed();
+                        session.pin_whole_center();
+                    }
                     Self::request_video_seek_strip_window(session);
                 }
             }
-            crate::video::NativeVideoOutputEvent::SetSeekStripState { state } => {
-                if self.set_video_seek_strip_state(fs_idx, state) {
+            crate::video::NativeVideoOutputEvent::SetSeekStripView { view } => {
+                if self.set_video_seek_strip_view(fs_idx, view) {
+                    self.mark_native_video_hud_activity(ctx);
+                    self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetSeekStripHeight { height } => {
+                if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
@@ -6808,6 +6917,7 @@ impl App {
             top_locked: self.settings.video_top_bar_locked,
             bottom_lock: self.settings.video_bottom_lock(),
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
+            seek_strip_height: self.settings.video_seek_strip_height,
         }
     }
 
@@ -6832,9 +6942,6 @@ impl App {
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
         let bar_lock = self.native_bar_lock_state();
-        let top_bar_locked = bar_lock.top_locked;
-        let bottom_lock = bar_lock.bottom_lock;
-        let fixed_bar_gap_px = bar_lock.fixed_bar_gap_px;
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -6930,7 +7037,7 @@ impl App {
         };
         player.set_native_metadata(Some(metadata));
         player.set_native_side_panel_state(side_panel_mode, info_panel_open);
-        player.set_native_bar_lock_state(top_bar_locked, bottom_lock, fixed_bar_gap_px);
+        player.set_native_bar_lock_state(bar_lock);
     }
 
     #[cfg(windows)]
@@ -7337,22 +7444,37 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn open_video_seek_strip(&mut self, fs_idx: usize) -> bool {
-        let state = crate::settings::VideoSeekStripState::restore(
+        let view = crate::video::seek_strip_layout::SeekStripView::showing(
             self.settings.video_seek_strip_last_choice,
+            self.settings.video_seek_strip_span,
         );
-        self.set_video_seek_strip_state(fs_idx, state)
+        self.set_video_seek_strip_view(fs_idx, view)
+    }
+
+    /// 表示中の 5 値。内容は設定が、表示範囲は App が持ち、**合わせるのはここだけ**。
+    #[cfg(windows)]
+    pub(crate) fn video_seek_strip_view(&self) -> crate::video::seek_strip_layout::SeekStripView {
+        match self.settings.video_seek_strip_state.mode() {
+            None => crate::video::seek_strip_layout::SeekStripView::Hidden,
+            Some(mode) => crate::video::seek_strip_layout::SeekStripView::showing(
+                mode,
+                self.settings.video_seek_strip_span,
+            ),
+        }
     }
 
     #[cfg(windows)]
     fn ensure_video_seek_strip_session(
         &mut self,
         fs_idx: usize,
-        mode: crate::settings::VideoSeekStripMode,
+        showing: crate::video::seek_strip_layout::SeekStripShowing,
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
+        let mode = showing.mode;
         if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
             && session.owner_fs_idx == fs_idx
             && session.center.mode() == mode
+            && session.span == showing.span
         {
             return true;
         }
@@ -7443,6 +7565,7 @@ impl App {
                 owner_fs_idx: fs_idx,
                 video_path: path,
                 duration_secs,
+                span: showing.span,
                 center,
                 axis,
                 thumbnail_worker,
@@ -7578,64 +7701,76 @@ impl App {
                 crate::video::seek_strip::video_position_controls_available(info.duration_secs)
                     && availability.allows_open()
             });
-        let current = self.settings.video_seek_strip_state;
+        let current = self.video_seek_strip_view();
         // Cycle/toggle/direct-state shortcuts must be the same no-op as the disabled film button
         // and unavailable upward drag. In particular, do not rewrite the remembered state merely
         // because the current video has no usable duration.
-        let Some(next) = requested_video_seek_strip_state(
+        let Some(next) = requested_video_seek_strip_view(
             action,
             current,
             self.settings.video_seek_strip_last_choice,
+            self.settings.video_seek_strip_cycle,
             strip_available,
         ) else {
             return false;
         };
-        self.set_video_seek_strip_state(fs_idx, next)
+        self.set_video_seek_strip_view(fs_idx, next)
     }
 
     #[cfg(windows)]
-    fn set_video_seek_strip_state(
+    pub(crate) fn set_video_seek_strip_view(
         &mut self,
         fs_idx: usize,
-        state: crate::settings::VideoSeekStripState,
+        view: crate::video::seek_strip_layout::SeekStripView,
     ) -> bool {
+        use crate::video::seek_strip_layout::SeekStripView;
+
         let previous_state = self.settings.video_seek_strip_state;
-        if state == crate::settings::VideoSeekStripState::None {
-            self.settings.video_seek_strip_state = state;
-            if previous_state != state {
+        let previous_span = self.settings.video_seek_strip_span;
+        let SeekStripView::Showing(showing) = view else {
+            self.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::None;
+            if previous_state != crate::settings::VideoSeekStripState::None {
                 self.settings.save();
             }
             let stopped = self.stop_video_seek_strip_session(
                 crate::video::seek_strip::SeekStripCloseCause::Toggle,
             );
-            return previous_state != state || stopped;
-        }
-
-        let Some(mode) = state.mode() else {
-            return false;
+            return previous_state != crate::settings::VideoSeekStripState::None || stopped;
         };
+
+        let state = crate::settings::VideoSeekStripState::from_mode(showing.mode);
         let runtime_matches = matches!(
             &self.video_seek_strip_runtime,
             VideoSeekStripRuntime::Open(session)
-                if session.owner_fs_idx == fs_idx && session.center.mode() == mode
+                if session.owner_fs_idx == fs_idx
+                    && session.center.mode() == showing.mode
+                    && session.span == showing.span
         );
-        let applied = if runtime_matches {
-            true
-        } else if matches!(
+        let owns_session = matches!(
             &self.video_seek_strip_runtime,
             VideoSeekStripRuntime::Open(session) if session.owner_fs_idx == fs_idx
-        ) {
-            self.set_video_seek_strip_runtime_mode(fs_idx, mode)
+        );
+        // 表示範囲は先に決める。内容の切替が新しい軸やワーカーを作るとき、その時点の
+        // 表示範囲で作れるようにするため。
+        self.settings.video_seek_strip_span = showing.span;
+        let applied = if runtime_matches {
+            true
+        } else if owns_session {
+            let mode_switched = self.set_video_seek_strip_runtime_mode(fs_idx, showing.mode);
+            let span_switched = self.set_video_seek_strip_runtime_span(fs_idx, showing.span);
+            mode_switched || span_switched
         } else {
-            self.ensure_video_seek_strip_session(fs_idx, mode)
+            self.ensure_video_seek_strip_session(fs_idx, showing)
         };
         if !applied {
+            self.settings.video_seek_strip_span = previous_span;
             return false;
         }
 
         let last_choice = state.last_choice(self.settings.video_seek_strip_last_choice);
-        let settings_changed =
-            previous_state != state || self.settings.video_seek_strip_last_choice != last_choice;
+        let settings_changed = previous_state != state
+            || previous_span != showing.span
+            || self.settings.video_seek_strip_last_choice != last_choice;
         self.settings.video_seek_strip_state = state;
         self.settings.video_seek_strip_last_choice = last_choice;
         if settings_changed {
@@ -7709,6 +7844,7 @@ impl App {
         mode: crate::settings::VideoSeekStripMode,
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
+        let wave_cache = self.video_tile_cache.clone();
         let Some(session) = (match &self.video_seek_strip_runtime {
             VideoSeekStripRuntime::Open(session) if session.owner_fs_idx == fs_idx => Some(session),
             _ => None,
@@ -7758,6 +7894,7 @@ impl App {
             Some(take_or_spawn_seek_strip_wave_worker(
                 &mut self.video_seek_strip_wave_holdover,
                 &path,
+                wave_cache,
             ))
         } else {
             None
@@ -7823,6 +7960,107 @@ impl App {
         session.wave_holdover = None;
         Self::request_video_seek_strip_window(session);
         true
+    }
+
+    /// 表示範囲だけを切り替える。内容 (場面 / 波形) は変えない。
+    ///
+    /// 全体表示は等間隔の格子を自前で持つので、周辺表示へ戻すときはワーカーの
+    /// キーフレーム軸を採り直すところからやり直す (`Resolving` へ戻す)。
+    #[cfg(windows)]
+    fn set_video_seek_strip_runtime_span(
+        &mut self,
+        fs_idx: usize,
+        span: crate::video::seek_strip_layout::SeekStripSpan,
+    ) -> bool {
+        use crate::video::seek_strip_layout::SeekStripSpan;
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.owner_fs_idx != fs_idx || session.span == span {
+            return false;
+        }
+        let current_time = match (&session.center, &session.axis) {
+            (
+                crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index },
+                VideoSeekStripAxisState::Ready(axis),
+            ) => axis.time_for_center_index(*center_index),
+            (
+                crate::video::seek_strip::SeekStripCenter::Thumbnails { .. },
+                VideoSeekStripAxisState::Resolving { initial_time_secs },
+            ) => Some(*initial_time_secs),
+            (crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }, _) => {
+                Some(*center_time_secs)
+            }
+        }
+        .unwrap_or(0.0);
+        session.span = span;
+        session.drag_state = VideoSeekStripDragState::Idle;
+        match span {
+            SeekStripSpan::Whole => {
+                session.rebuild_whole_axis_if_needed();
+                session.pin_whole_center();
+            }
+            SeekStripSpan::Window => {
+                session.waveform_span_secs = self.settings.video_seek_strip_waveform_span_secs;
+                session.last_wave_request = None;
+                session.pending_wave_span = None;
+                match &mut session.center {
+                    crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+                        *center_time_secs = current_time;
+                    }
+                    crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                        *center_index = 0.0;
+                        session.axis = VideoSeekStripAxisState::Resolving {
+                            initial_time_secs: current_time,
+                        };
+                    }
+                }
+                session.last_requested_center = None;
+                session.last_sent_thumbnail_request_id = None;
+            }
+        }
+        Self::request_video_seek_strip_window(session);
+        true
+    }
+
+    /// 帯の高さを変える。
+    ///
+    /// 高さは映像の予約と帯の寸法の両方を動かすので、presenter へは固定バーの状態と
+    /// 同じ経路 (`NativeBarLockState`) で送る。全体表示ではセル数も変わるが、その
+    /// 作り直しは帯が新しい枚数を報告したときに起きる。
+    #[cfg(windows)]
+    pub(crate) fn set_video_seek_strip_height(
+        &mut self,
+        fs_idx: usize,
+        height: crate::video::seek_strip_layout::SeekStripHeight,
+    ) -> bool {
+        if self.settings.video_seek_strip_height == height {
+            return false;
+        }
+        self.settings.video_seek_strip_height = height;
+        self.settings.save();
+        let bar_lock = self.native_bar_lock_state();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_bar_lock_state(bar_lock);
+        }
+        true
+    }
+
+    /// 全体表示のあいだ、軸と中心を帯の実寸へ追随させる。
+    #[cfg(windows)]
+    fn sync_video_seek_strip_whole_span(&mut self) -> bool {
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.span != crate::video::seek_strip_layout::SeekStripSpan::Whole {
+            return false;
+        }
+        let rebuilt = session.rebuild_whole_axis_if_needed();
+        let pinned = session.pin_whole_center();
+        if rebuilt || pinned {
+            Self::request_video_seek_strip_window(session);
+        }
+        rebuilt || pinned
     }
 
     #[cfg(windows)]
@@ -8018,6 +8256,11 @@ impl App {
         let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
+        // 全体表示は等間隔の格子を使うので、最小間隔の設定は効かない。設定が変わって
+        // いても `min_interval_secs` は据え置き、周辺表示へ戻ったときに作り直す。
+        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
+            return;
+        }
         let new_minimum = self.settings.video_seek_strip_min_interval_secs;
         if session.min_interval_secs.to_bits() == new_minimum.to_bits() {
             return;
@@ -8051,9 +8294,14 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn rebuild_video_seek_strip_waveform_span(&mut self) {
+        let wave_cache = self.video_tile_cache.clone();
         let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
+        // 全体表示の 1 画面の範囲は尺そのもの (`pin_whole_center` が所有する)。
+        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
+            return;
+        }
         let new_span_secs = self.settings.video_seek_strip_waveform_span_secs;
         if session.waveform_span_secs.to_bits() == new_span_secs.to_bits() {
             return;
@@ -8080,6 +8328,7 @@ impl App {
         // above is display-only and cannot satisfy coverage for the new preference.
         session.wave_worker = Some(crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
             session.video_path.clone(),
+            wave_cache,
         ));
         session.wave_holdover = previous_raster;
         Self::request_video_seek_strip_window(session);
@@ -8101,6 +8350,11 @@ impl App {
             return false;
         };
         if session.owner_fs_idx != fs_idx {
+            return false;
+        }
+        // 全体表示では帯が動かない。動くのは赤線で、その位置は再生位置から毎フレーム
+        // 導出される。ここで中心を動かすと、固定しているはずの中身が流れ出す。
+        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
             return false;
         }
         let current_time_secs = match (&session.center, &session.axis) {
@@ -8212,6 +8466,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_native_video_seek_strip(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let wave_cache = self.video_tile_cache.clone();
         let current_path = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } if player.error().is_none() => {
                 Some(player.path().clone())
@@ -8239,7 +8494,9 @@ impl App {
             );
             return;
         }
-        let Some(mode) = self.settings.video_seek_strip_state.mode() else {
+        let crate::video::seek_strip_layout::SeekStripView::Showing(showing) =
+            self.video_seek_strip_view()
+        else {
             self.stop_video_seek_strip_session(
                 crate::video::seek_strip::SeekStripCloseCause::Toggle,
             );
@@ -8248,14 +8505,17 @@ impl App {
         let session_matches = matches!(
             (&self.video_seek_strip_runtime, current_path.as_ref()),
             (VideoSeekStripRuntime::Open(session), Some(path))
-                if &session.video_path == path && session.center.mode() == mode
+                if &session.video_path == path
+                    && session.center.mode() == showing.mode
+                    && session.span == showing.span
         );
-        if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, mode) {
+        if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, showing) {
             return;
         }
 
         self.follow_video_seek_strip_playhead(fs_idx);
         self.rebuild_video_seek_strip_adopted_list();
+        self.sync_video_seek_strip_whole_span();
         if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
             && matches!(
                 session.center,
@@ -8268,6 +8528,18 @@ impl App {
         }
         let thumbnail_range_value_secs = self.settings.video_seek_strip_min_interval_secs;
         let waveform_range_value_secs = self.settings.video_seek_strip_waveform_span_secs;
+        // 全体表示のセル幅は、並べるサムネイルと同じ縦横比から決める。ストリップの抽出は
+        // 復号した寸法をそのまま縮めるので、動画が申告する幅と高さの比で一致する。
+        let video_cell_aspect = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.info(),
+                _ => None,
+            })
+            .and_then(|info| {
+                (info.width > 0 && info.height > 0).then(|| info.width as f32 / info.height as f32)
+            });
         let mut axis_failure = None;
         let mut axis_unavailable = None;
         let mut stall_report: Option<String> = None;
@@ -8308,6 +8580,7 @@ impl App {
                                 session.wave_worker = Some(take_or_spawn_seek_strip_wave_worker(
                                     &mut self.video_seek_strip_wave_holdover,
                                     &session.video_path,
+                                    wave_cache.clone(),
                                 ));
                             }
                             Self::request_video_seek_strip_window(session);
@@ -8472,6 +8745,8 @@ impl App {
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
                     center: session.center,
+                    span: session.span,
+                    cell_aspect: video_cell_aspect,
                     axis: match &session.axis {
                         VideoSeekStripAxisState::Resolving { .. } => {
                             crate::video::native_presenter::NativeOverlaySeekStripAxis::Resolving
@@ -12785,7 +13060,8 @@ mod native_video_key_observation_tests {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("clip.mp4");
-            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone());
+            let worker =
+                crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
             let identity = worker.identity_for_test();
             app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(
                 VideoSeekStripSession::for_wave_holdover_test(path, worker),
@@ -12826,7 +13102,7 @@ mod native_video_key_observation_tests {
         let one = dir.path().join("one.mp4");
         let other = dir.path().join("other.mp4");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
         let held_identity = worker.identity_for_test();
         // 預けるときと同じ状態にしてから拾わせる。
         worker.set_background_paused(true);
@@ -12835,7 +13111,7 @@ mod native_video_key_observation_tests {
             worker,
         });
 
-        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one);
+        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one, None);
         assert_eq!(
             reused.identity_for_test(),
             held_identity,
@@ -12847,13 +13123,13 @@ mod native_video_key_observation_tests {
         );
         assert!(holdover.is_none(), "持ち越しは 1 本ぶんだけ");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
         let stale_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
             path: one.clone(),
             worker,
         });
-        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other);
+        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other, None);
         assert_ne!(
             fresh.identity_for_test(),
             stale_identity,
@@ -12871,8 +13147,10 @@ mod native_video_key_observation_tests {
     fn pausing_the_background_analysis_is_visible_where_the_worker_reads_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
-        let worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(dir.path().join("none.mp4"));
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            dir.path().join("none.mp4"),
+            None,
+        );
         assert!(!worker.background_is_paused(), "作った直後は動いている");
         worker.set_background_paused(true);
         assert!(worker.background_is_paused());
@@ -12882,24 +13160,70 @@ mod native_video_key_observation_tests {
 
     #[test]
     fn unknown_duration_makes_every_seek_strip_key_action_a_state_preserving_no_op() {
-        let current = crate::settings::VideoSeekStripState::Waveform;
+        use crate::video::seek_strip_layout::{SeekStripCycleSet, SeekStripSpan, SeekStripView};
+
+        let current = SeekStripView::showing(
+            crate::settings::VideoSeekStripMode::Waveform,
+            SeekStripSpan::Whole,
+        );
         let last_choice = crate::settings::VideoSeekStripMode::Waveform;
+        let cycle_set = SeekStripCycleSet::default();
         for action in VIDEO_SEEK_STRIP_ACTIONS {
             assert_eq!(
-                requested_video_seek_strip_state(action, current, last_choice, false),
+                requested_video_seek_strip_view(action, current, last_choice, cycle_set, false),
                 None,
                 "{action:?} must not change the remembered strip state"
             );
         }
 
+        // 内容を指名する操作は表示範囲を持ち越す。場面と波形を往復するたびに全体表示が
+        // 周辺表示へ戻ると、選び直しが要る。
         assert_eq!(
-            requested_video_seek_strip_state(
+            requested_video_seek_strip_view(
                 KeyAction::VideoSeekStripThumbnails,
                 current,
                 last_choice,
+                cycle_set,
                 true,
             ),
-            Some(crate::settings::VideoSeekStripState::Thumbnails)
+            Some(SeekStripView::showing(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                SeekStripSpan::Whole
+            ))
+        );
+    }
+
+    /// `Shift+S` は 5 値を巡回する。巡回から外したモードは飛ばし、外れているモードを
+    /// メニューから選んでいても行き止まりにしない。
+    #[test]
+    fn the_cycle_key_walks_the_enabled_modes_and_then_hides_the_strip() {
+        use crate::video::seek_strip_layout::{
+            SEEK_STRIP_SHOWING_ORDER, SeekStripCycleSet, SeekStripView,
+        };
+
+        let last_choice = crate::settings::VideoSeekStripMode::Thumbnails;
+        let cycle_set = SeekStripCycleSet::default();
+        let mut view = SeekStripView::Hidden;
+        for expected in SEEK_STRIP_SHOWING_ORDER {
+            view = requested_video_seek_strip_view(
+                KeyAction::VideoSeekStripCycle,
+                view,
+                last_choice,
+                cycle_set,
+                true,
+            )
+            .expect("表示できる動画では巡回する");
+            assert_eq!(view, SeekStripView::Showing(expected));
+        }
+        assert_eq!(
+            requested_video_seek_strip_view(
+                KeyAction::VideoSeekStripCycle,
+                view,
+                last_choice,
+                cycle_set,
+                true,
+            ),
+            Some(SeekStripView::Hidden)
         );
     }
 }

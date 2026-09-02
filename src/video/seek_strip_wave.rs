@@ -7,7 +7,9 @@
 //! over thirty minutes are served progressively from that column. The first request is one visible
 //! screen, followed by a same-scale wider upgrade where window decode still applies. Rasterization
 //! also runs here, and only versioned RGBA plus its time coverage crosses to the App and native
-//! presenter. All caches are process-memory-only by design.
+//! presenter. D32 persists only the coarse full-length column in the shared video tile SQLite
+//! cache because rebuilding it can take seconds; raster and window-analysis caches remain
+//! process-memory-only.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, bounded};
 use music_core::{AnalysisConfig, TimelineAnalysis, WaveformBin};
+
+use crate::video::tile_thumb_cache::TileThumbCache;
 
 /// One strip width in waveform mode.
 #[cfg(test)]
@@ -68,6 +72,14 @@ impl WaveFileIdentity {
             .map(crate::ui_helpers::mtime_secs)
             .unwrap_or(0);
         Self::from_known_meta(path, mtime, size)
+    }
+
+    fn size(&self) -> i64 {
+        self.size
+    }
+
+    fn mtime(&self) -> i64 {
+        self.mtime
     }
 }
 
@@ -415,9 +427,11 @@ pub(crate) fn waveform_bin_secs(span_secs: f64, pixel_width: usize) -> f64 {
     (raw * 1000.0).ceil() / 1000.0
 }
 
+const QUANTIZED_WAVEFORM_BIN_BYTES: usize = 7;
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct QuantizedWaveformBin([u8; 7]);
+struct QuantizedWaveformBin([u8; QUANTIZED_WAVEFORM_BIN_BYTES]);
 
 fn quantize_unit(value: f32) -> u8 {
     if value.is_finite() {
@@ -520,6 +534,14 @@ impl CoarseScale {
 
     fn chunk_secs(self) -> f64 {
         self.bin_secs * COARSE_BINS_PER_CHUNK as f64
+    }
+
+    /// The bin width as the persisted rows spell it.
+    ///
+    /// Both the lookup and the store have to agree on this integer, so it has one owner
+    /// rather than the same rounding written at each call site.
+    fn bin_secs_millis(self) -> i64 {
+        (self.bin_secs * 1000.0).round() as i64
     }
 
     fn chunk_count(self) -> usize {
@@ -730,6 +752,57 @@ impl CoarseWaveform {
         };
         let bin_end = update.bin_start + update.bins.len();
         self.bins[update.bin_start..bin_end].copy_from_slice(&update.bins);
+        self.coverage.insert(chunk_index)
+    }
+
+    /// The slots one chunk owns, in the byte order [`apply_persisted_chunk`] reads back.
+    ///
+    /// The writer lives here, beside the reader, because the two have to agree on the
+    /// short final chunk. Spelling the slice at the call site instead would let a test
+    /// that repeats the same expression pass while the worker persists the wrong range.
+    fn chunk_bytes(&self, chunk_index: usize) -> Option<Vec<u8>> {
+        let (bin_start, bin_end) = self.chunk_bin_range(chunk_index)?;
+        Some(
+            self.bins[bin_start..bin_end]
+                .iter()
+                .flat_map(|bin| bin.0)
+                .collect(),
+        )
+    }
+
+    /// The half-open slot range of one chunk, or `None` when the index is past the column.
+    fn chunk_bin_range(&self, chunk_index: usize) -> Option<(usize, usize)> {
+        if chunk_index >= self.scale.chunk_count() {
+            return None;
+        }
+        let bin_start = chunk_index.checked_mul(COARSE_BINS_PER_CHUNK)?;
+        let bin_end = bin_start
+            .saturating_add(COARSE_BINS_PER_CHUNK)
+            .min(self.scale.bin_count);
+        (bin_end > bin_start).then_some((bin_start, bin_end))
+    }
+
+    fn apply_persisted_chunk(&mut self, chunk_index: usize, bytes: &[u8]) -> bool {
+        let Some((bin_start, bin_end)) = self.chunk_bin_range(chunk_index) else {
+            return false;
+        };
+        let expected_slots = bin_end - bin_start;
+        let Some(expected_bytes) = expected_slots.checked_mul(QUANTIZED_WAVEFORM_BIN_BYTES) else {
+            return false;
+        };
+        if bytes.len() != expected_bytes {
+            return false;
+        }
+
+        let bins = bytes
+            .chunks_exact(QUANTIZED_WAVEFORM_BIN_BYTES)
+            .map(|chunk| {
+                QuantizedWaveformBin([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                ])
+            })
+            .collect::<Vec<_>>();
+        self.bins[bin_start..bin_end].copy_from_slice(&bins);
         self.coverage.insert(chunk_index)
     }
 
@@ -1123,7 +1196,7 @@ pub(crate) struct SeekStripWaveWorker {
 }
 
 impl SeekStripWaveWorker {
-    pub(crate) fn spawn(path: PathBuf) -> Self {
+    pub(crate) fn spawn(path: PathBuf, cache: Option<Arc<TileThumbCache>>) -> Self {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let pending = Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(WaveSharedState {
@@ -1145,7 +1218,7 @@ impl SeekStripWaveWorker {
             .name("video-seek-strip-wave".into())
             .spawn(move || {
                 let identity = WaveFileIdentity::from_file(&path);
-                let mut runtime = WaveWorkerRuntime::new();
+                let mut runtime = WaveWorkerRuntime::new(identity.clone(), cache);
                 while !worker_cancel.load(Ordering::Acquire) {
                     let request = lock_recover(&worker_pending).take();
                     if let Some(request) = request {
@@ -1306,6 +1379,8 @@ struct ActiveWaveRequest {
 }
 
 struct WaveWorkerRuntime {
+    identity: WaveFileIdentity,
+    cache: Option<Arc<TileThumbCache>>,
     decoder: Option<crate::audio_decode::AudioRangeDecoder>,
     decoder_open_error: Option<crate::audio_decode::AudioDecodeOpenError>,
     coarse: CoarseBuildState,
@@ -1315,8 +1390,10 @@ struct WaveWorkerRuntime {
 }
 
 impl WaveWorkerRuntime {
-    fn new() -> Self {
+    fn new(identity: WaveFileIdentity, cache: Option<Arc<TileThumbCache>>) -> Self {
         Self {
+            identity,
+            cache,
             decoder: None,
             decoder_open_error: None,
             coarse: CoarseBuildState::Dormant,
@@ -1326,7 +1403,7 @@ impl WaveWorkerRuntime {
         }
     }
 
-    fn start_coarse_if_needed(&mut self, duration_secs: f64, visible_span_secs: f64) {
+    fn start_coarse_if_needed(&mut self, path: &Path, duration_secs: f64, visible_span_secs: f64) {
         if visible_span_secs >= COARSE_BUILD_MIN_SPAN_SECS
             && matches!(self.coarse, CoarseBuildState::Dormant)
         {
@@ -1339,7 +1416,34 @@ impl WaveWorkerRuntime {
                         scale.bytes() as f64 / (1024.0 * 1024.0)
                     ));
                 }
-                CoarseBuildState::Building(CoarseWaveform::new(duration_secs, scale))
+                let mut coarse = CoarseWaveform::new(duration_secs, scale);
+                let cache_t0 = Instant::now();
+                let loaded_chunks = self
+                    .cache
+                    .as_ref()
+                    .map(|cache| {
+                        cache
+                            .lookup_wave_chunks(
+                                path,
+                                self.identity.mtime(),
+                                self.identity.size(),
+                                scale.bin_secs_millis(),
+                                scale.bin_count as i64,
+                            )
+                            .into_iter()
+                            .filter_map(|(chunk_index, bytes)| {
+                                usize::try_from(chunk_index)
+                                    .ok()
+                                    .map(|chunk_index| (chunk_index, bytes))
+                            })
+                            .filter(|(chunk_index, bytes)| {
+                                coarse.apply_persisted_chunk(*chunk_index, bytes)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                emit_wave_coarse_cache(loaded_chunks, scale.chunk_count(), cache_t0.elapsed());
+                CoarseBuildState::Building(coarse)
             } else {
                 crate::logger::log(format!(
                     "[wave] no coarse column: duration {duration_secs:.0}s is past the {:.0}s a column can span at {MAX_COARSE_BIN_SECS}s per bin; wide spans will decode their own window",
@@ -1571,9 +1675,38 @@ fn process_next_coarse_chunk(
         );
         return true;
     }
-    let covered_chunks = coarse.coverage.marked_count();
-    let failed_chunks = coarse.failed.marked_count();
-    let total_chunks = coarse.coverage.chunk_count;
+    let (covered_chunks, failed_chunks, total_chunks, bin_secs_millis, bin_count, persisted_bins) = {
+        let Some(coarse) = runtime.coarse() else {
+            return false;
+        };
+        (
+            coarse.coverage.marked_count(),
+            coarse.failed.marked_count(),
+            coarse.coverage.chunk_count,
+            coarse.scale.bin_secs_millis(),
+            coarse.scale.bin_count as i64,
+            coarse.chunk_bytes(chunk_index),
+        )
+    };
+    // Only a chunk that just decoded and composed is written; a failed one stays in the
+    // failed bitset so a transient decode error is not baked into the database (D32).
+    if let Some(cache) = runtime.cache.as_ref()
+        && let Some(persisted_bins) = persisted_bins.as_deref()
+        && let Err(error) = cache.store_wave_chunk(
+            path,
+            runtime.identity.mtime(),
+            runtime.identity.size(),
+            bin_secs_millis,
+            bin_count,
+            chunk_index as i64,
+            persisted_bins,
+        )
+    {
+        crate::logger::log(format!(
+            "[wave] failed to persist coarse chunk {chunk_index} for {}: {error}",
+            path.display()
+        ));
+    }
     emit_wave_coarse_chunk(
         chunk_index,
         decode_elapsed,
@@ -1754,7 +1887,11 @@ fn process_wave_request(
         id: request.id,
         signature,
     });
-    runtime.start_coarse_if_needed(signature.duration_secs(), signature.visible_span_secs());
+    runtime.start_coarse_if_needed(
+        path,
+        signature.duration_secs(),
+        signature.visible_span_secs(),
+    );
     let Some(window) = waveform_window(
         signature.center_time_secs(),
         signature.duration_secs(),
@@ -2092,6 +2229,31 @@ fn emit_wave_perf(
     }
 }
 
+fn emit_wave_coarse_cache(loaded_chunks: usize, total_chunks: usize, elapsed: Duration) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            stringify!(video_strip),
+            stringify!(wave_coarse_cache),
+            None,
+            0,
+            &[
+                (
+                    stringify!(loaded_chunks),
+                    serde_json::Value::from(loaded_chunks as u64),
+                ),
+                (
+                    stringify!(total_chunks),
+                    serde_json::Value::from(total_chunks as u64),
+                ),
+                (
+                    stringify!(elapsed_ms),
+                    serde_json::Value::from(elapsed.as_secs_f64() * 1000.0),
+                ),
+            ],
+        );
+    }
+}
+
 fn emit_wave_coarse_chunk(
     chunk_index: usize,
     decode: Duration,
@@ -2224,6 +2386,15 @@ fn emit_wave_coarse_serve(coarse: &CoarseWaveform, signature: WaveRequestSignatu
 mod tests {
     use super::*;
 
+    const TEST_WAVE_PATH: &str = stringify!(wave_runtime_test_mp4);
+
+    fn runtime_without_cache() -> WaveWorkerRuntime {
+        WaveWorkerRuntime::new(
+            WaveFileIdentity::from_known_meta(Path::new(TEST_WAVE_PATH), 1, 1),
+            None,
+        )
+    }
+
     /// A chunk at the default scale. Not a constant of the system any more: the width
     /// follows the column's bin width, and only a column that has not been coarsened
     /// lands on sixty seconds.
@@ -2248,7 +2419,7 @@ mod tests {
         const PIXEL_HEIGHT: usize = 94;
         let center_time_secs = duration_secs * 0.5;
         for visible_span_secs in [60.0, 600.0, 1800.0, 3600.0, 7200.0, 10_800.0] {
-            let worker = SeekStripWaveWorker::spawn(path.clone());
+            let worker = SeekStripWaveWorker::spawn(path.clone(), None);
             let signature = WaveRequestSignature::new(
                 center_time_secs,
                 duration_secs,
@@ -2329,6 +2500,149 @@ mod tests {
         ];
         for (original, restored) in original.into_iter().zip(round_trip) {
             assert!((original - restored).abs() <= 1.0 / 255.0);
+        }
+    }
+
+    fn analyzed_coarse_chunk(scale: CoarseScale, chunk_index: usize) -> Vec<WaveformBin> {
+        let bin_start = chunk_index * COARSE_BINS_PER_CHUNK;
+        let bin_end = bin_start
+            .saturating_add(COARSE_BINS_PER_CHUNK)
+            .min(scale.bin_count);
+        (bin_start..bin_end)
+            .map(|bin_index| {
+                let value = ((bin_index % 251) + 1) as f32 / 255.0;
+                WaveformBin {
+                    start_secs: bin_index as f64 * scale.bin_secs,
+                    duration_secs: scale.bin_secs,
+                    peak_l: value,
+                    rms_l: value * 0.5,
+                    peak_r: 1.0 - value * 0.5,
+                    rms_r: value * 0.25,
+                    band_energy: [value * 0.2, value * 0.4, value * 0.6],
+                    ..WaveformBin::default()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn persisted_coarse_chunk_restores_coverage_and_quantized_bins() {
+        let duration_secs = 180.0;
+        let scale = CoarseScale::for_duration(duration_secs).unwrap();
+        let chunk_index = 1;
+        let mut source = CoarseWaveform::new(duration_secs, scale);
+        assert!(source.apply_chunk(chunk_index, &analyzed_coarse_chunk(scale, chunk_index)));
+        let bytes = source
+            .chunk_bytes(chunk_index)
+            .expect("the chunk is inside the column");
+        let expected = source.waveform_bins(0.0, duration_secs);
+
+        let mut restored = CoarseWaveform::new(duration_secs, scale);
+        assert!(restored.apply_persisted_chunk(chunk_index, &bytes));
+        assert!(restored.coverage.contains(chunk_index));
+        assert_eq!(restored.waveform_bins(0.0, duration_secs), expected);
+    }
+
+    /// The worker's own round trip: write a chunk, read it back from the real schema.
+    ///
+    /// Both halves are production code — `chunk_bytes` writes and `apply_persisted_chunk`
+    /// reads — so a writer that persisted the wrong slots cannot be hidden by a test that
+    /// repeats the writer's own expression. The short final chunk is included because that
+    /// is the range the two halves have to agree on.
+    #[test]
+    fn a_stored_chunk_comes_back_through_the_database_unchanged() {
+        let duration_secs = 3601.0;
+        let scale = CoarseScale::for_duration(duration_secs).unwrap();
+        let path = Path::new(r"C:\Videos\Round Trip.mp4");
+        let (video_mtime, video_size) = (1_700_000_000, 4_096);
+        let db = TileThumbCache::open_in_memory();
+        let chunk_indices = [0, scale.chunk_count() - 1];
+
+        let mut source = CoarseWaveform::new(duration_secs, scale);
+        for chunk_index in chunk_indices {
+            assert!(source.apply_chunk(chunk_index, &analyzed_coarse_chunk(scale, chunk_index)));
+            db.store_wave_chunk(
+                path,
+                video_mtime,
+                video_size,
+                scale.bin_secs_millis(),
+                scale.bin_count as i64,
+                chunk_index as i64,
+                &source
+                    .chunk_bytes(chunk_index)
+                    .expect("the chunk is inside the column"),
+            )
+            .expect("the chunk must persist");
+        }
+
+        let mut restored = CoarseWaveform::new(duration_secs, scale);
+        let stored = db.lookup_wave_chunks(
+            path,
+            video_mtime,
+            video_size,
+            scale.bin_secs_millis(),
+            scale.bin_count as i64,
+        );
+        assert_eq!(stored.len(), chunk_indices.len());
+        for (chunk_index, bytes) in stored {
+            assert!(restored.apply_persisted_chunk(chunk_index as usize, &bytes));
+        }
+
+        for chunk_index in chunk_indices {
+            assert!(restored.coverage.contains(chunk_index));
+        }
+        assert_eq!(
+            restored.waveform_bins(0.0, duration_secs),
+            source.waveform_bins(0.0, duration_secs)
+        );
+    }
+
+    #[test]
+    fn persisted_coarse_chunk_accepts_a_short_final_chunk() {
+        let duration_secs = 61.0;
+        let scale = CoarseScale::for_duration(duration_secs).unwrap();
+        let chunk_index = scale.chunk_count() - 1;
+        let mut source = CoarseWaveform::new(duration_secs, scale);
+        assert!(source.apply_chunk(chunk_index, &analyzed_coarse_chunk(scale, chunk_index)));
+        let bytes = source
+            .chunk_bytes(chunk_index)
+            .expect("the chunk is inside the column");
+        assert_eq!(bytes.len(), 10 * QUANTIZED_WAVEFORM_BIN_BYTES);
+        let expected = source.waveform_bins(0.0, duration_secs);
+
+        let mut restored = CoarseWaveform::new(duration_secs, scale);
+        assert!(restored.apply_persisted_chunk(chunk_index, &bytes));
+        assert!(restored.coverage.contains(chunk_index));
+        assert_eq!(restored.waveform_bins(0.0, duration_secs), expected);
+    }
+
+    #[test]
+    fn persisted_coarse_chunk_rejects_malformed_or_wrong_slot_counts() {
+        let duration_secs = 120.0;
+        let scale = CoarseScale::for_duration(duration_secs).unwrap();
+        let expected_bytes = COARSE_BINS_PER_CHUNK * QUANTIZED_WAVEFORM_BIN_BYTES;
+        let not_a_multiple = vec![0; expected_bytes + 1];
+        let wrong_slot_count = vec![0; (COARSE_BINS_PER_CHUNK - 1) * QUANTIZED_WAVEFORM_BIN_BYTES];
+
+        for bytes in [&not_a_multiple[..], &wrong_slot_count[..]] {
+            let mut coarse = CoarseWaveform::new(duration_secs, scale);
+            assert!(!coarse.apply_persisted_chunk(0, bytes));
+            assert!(!coarse.coverage.contains(0));
+            assert!(coarse.waveform_bins(0.0, duration_secs).is_empty());
+        }
+    }
+
+    #[test]
+    fn persisted_coarse_chunk_rejects_an_out_of_range_index() {
+        let duration_secs = 120.0;
+        let scale = CoarseScale::for_duration(duration_secs).unwrap();
+        let bytes = vec![1; COARSE_BINS_PER_CHUNK * QUANTIZED_WAVEFORM_BIN_BYTES];
+        let mut coarse = CoarseWaveform::new(duration_secs, scale);
+
+        for chunk_index in [scale.chunk_count(), scale.chunk_count() + 1] {
+            assert!(!coarse.apply_persisted_chunk(chunk_index, &bytes));
+            assert_eq!(coarse.coverage.marked_count(), 0);
+            assert!(coarse.waveform_bins(0.0, duration_secs).is_empty());
         }
     }
 
@@ -2444,8 +2758,12 @@ mod tests {
     /// 入らないこと。
     #[test]
     fn a_file_without_a_column_neither_waits_for_one_nor_decodes_past_the_ceiling() {
-        let mut runtime = WaveWorkerRuntime::new();
-        runtime.start_coarse_if_needed(1e300, COARSE_BUILD_MIN_SPAN_SECS);
+        let mut runtime = runtime_without_cache();
+        runtime.start_coarse_if_needed(
+            Path::new(TEST_WAVE_PATH),
+            1e300,
+            COARSE_BUILD_MIN_SPAN_SECS,
+        );
         assert!(matches!(&runtime.coarse, CoarseBuildState::OverBudget));
 
         for visible_span_secs in [1800.0, 3600.0, 7200.0, 10_800.0] {
@@ -2586,10 +2904,18 @@ mod tests {
 
     #[test]
     fn coarse_build_starts_at_the_visible_span_threshold_only() {
-        let mut runtime = WaveWorkerRuntime::new();
-        runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS - 0.001);
+        let mut runtime = runtime_without_cache();
+        runtime.start_coarse_if_needed(
+            Path::new(TEST_WAVE_PATH),
+            3600.0,
+            COARSE_BUILD_MIN_SPAN_SECS - 0.001,
+        );
         assert!(matches!(&runtime.coarse, CoarseBuildState::Dormant));
-        runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS);
+        runtime.start_coarse_if_needed(
+            Path::new(TEST_WAVE_PATH),
+            3600.0,
+            COARSE_BUILD_MIN_SPAN_SECS,
+        );
         assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
     }
 
@@ -2824,7 +3150,7 @@ mod tests {
             raster: None,
         });
         let latest_request_id = AtomicU64::new(request_id);
-        let mut runtime = WaveWorkerRuntime::new();
+        let mut runtime = runtime_without_cache();
         runtime.coarse =
             CoarseBuildState::Unavailable(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack);
 

@@ -34,6 +34,37 @@ pub(crate) enum StripAxis {
 }
 
 impl StripAxis {
+    /// 動画全体をちょうど `cells` 個のセルへ等分した軸。
+    ///
+    /// 全体表示はセル数が先に決まる (帯の幅と高さで決まる) ので、間隔はそこから逆算する。
+    /// 割り算の丸めでセルが 1 つ増えることがあるため、**実際のセル数を数えて合わせる**。
+    /// ここがずれると、帯に収まらない末尾のセルが 1 つでき、赤線の右端と最終セルの
+    /// 右端が一致しなくなる。
+    pub(crate) fn whole(duration_secs: f64, cells: usize) -> Option<Self> {
+        if !duration_secs.is_finite() || duration_secs <= 0.0 || cells == 0 {
+            return None;
+        }
+        let build = |interval_secs: f64| Self::TimeGrid {
+            interval_secs,
+            fallback_interval_secs: interval_secs,
+            duration_secs,
+        };
+        let interval_secs = duration_secs / cells as f64;
+        if !interval_secs.is_finite() || interval_secs <= 0.0 {
+            return None;
+        }
+        let axis = build(interval_secs);
+        if axis.cell_count() == cells {
+            return Some(axis);
+        }
+        // 1 ulp 分だけ広げると ceil が 1 つ下がる。狭める側には寄せない (足りないセルは
+        // 帯に穴を作る)。
+        let widened = build(interval_secs * (1.0 + 8.0 * f64::EPSILON));
+        (widened.cell_count() == cells)
+            .then_some(widened)
+            .or(Some(axis))
+    }
+
     /// 軸上に存在するセル数を返す。
     pub(crate) fn cell_count(&self) -> usize {
         match self {
@@ -779,6 +810,51 @@ fn subtract_range(current: &CellRange, previous: &CellRange) -> Vec<CellRange> {
         ranges.push(range);
     }
     ranges
+}
+
+/// 全体表示の軸は、帯が決めたセル数をそのまま持つ。
+#[cfg(test)]
+mod whole_axis_tests {
+    use super::StripAxis;
+
+    #[test]
+    fn a_whole_axis_has_exactly_the_requested_cells() {
+        for duration_secs in [1.0, 7.5, 120.0, 3_600.0, 12_345.678] {
+            for cells in [1_usize, 2, 7, 13, 30, 64, 137, 512] {
+                let axis =
+                    StripAxis::whole(duration_secs, cells).expect("a usable duration has an axis");
+                assert_eq!(
+                    axis.cell_count(),
+                    cells,
+                    "duration={duration_secs} cells={cells}"
+                );
+                let first = axis.cell(0).expect("the first cell exists");
+                assert!(first.abs() < 1e-9, "先頭セルは動画の先頭");
+                let last = axis.cell(cells - 1).expect("the last cell exists");
+                assert!(last < duration_secs, "末尾セルは尺の内側");
+                assert!(axis.cell(cells).is_none(), "セルは帯の枚数で終わる");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_cells_are_evenly_spaced_from_start_to_end() {
+        let cells = 10;
+        let axis = StripAxis::whole(100.0, cells).expect("axis");
+        for index in 0..cells {
+            let expected = index as f64 * 10.0;
+            let actual = axis.cell(index).expect("cell");
+            assert!((actual - expected).abs() < 1e-6, "{index}: {actual}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_duration_has_no_whole_axis() {
+        for duration_secs in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(StripAxis::whole(duration_secs, 12).is_none());
+        }
+        assert!(StripAxis::whole(60.0, 0).is_none());
+    }
 }
 
 const SEEK_ROW_GESTURE_THRESHOLD_POINTS: f32 = 24.0;

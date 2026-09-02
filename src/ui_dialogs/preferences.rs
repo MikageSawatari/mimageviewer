@@ -265,6 +265,7 @@ pub(crate) enum OperationSettingsTab {
     Behavior,
     RightDrag,
     MouseButtons,
+    Gamepad,
 }
 
 impl OperationSettingsTab {
@@ -273,6 +274,7 @@ impl OperationSettingsTab {
             Self::Behavior => "動作",
             Self::RightDrag => "右ドラッグ・右クリック",
             Self::MouseButtons => "マウスボタン",
+            Self::Gamepad => "ゲームパッド",
         }
     }
 }
@@ -1809,7 +1811,11 @@ impl App {
         };
         let mut edited_ring = state.settings.ring_shortcuts.clone();
         edited_ring.sanitize();
-        state.settings.keymap != self.settings.keymap || edited_ring != self.settings.ring_shortcuts
+        // 編集した項目をここへ足し忘れると、変更が「未保存」と見なされず、
+        // 閉じるときの確認も出ないまま黙って捨てられる。
+        state.settings.keymap != self.settings.keymap
+            || edited_ring != self.settings.ring_shortcuts
+            || state.settings.gamepad_enabled != self.settings.gamepad_enabled
     }
 
     fn request_close_preferences_dialog(&mut self) {
@@ -2727,6 +2733,7 @@ impl App {
         );
         bundle.keymap = state.settings.keymap;
         bundle.ring_shortcuts = state.settings.ring_shortcuts;
+        bundle.gamepad_enabled = state.settings.gamepad_enabled;
         self.apply_operation_customize_bundle(bundle);
     }
 
@@ -2980,6 +2987,7 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
             OperationSettingsTab::Behavior,
             OperationSettingsTab::RightDrag,
             OperationSettingsTab::MouseButtons,
+            OperationSettingsTab::Gamepad,
         ] {
             if ui
                 .selectable_label(state.operation_settings_tab == tab, tab.label())
@@ -2994,6 +3002,7 @@ fn draw_operation_settings_page(ui: &mut egui::Ui, state: &mut PreferencesState)
         OperationSettingsTab::Behavior => page_operation_behavior(ui, state),
         OperationSettingsTab::RightDrag => page_right_drag_modes(ui, state),
         OperationSettingsTab::MouseButtons => page_mouse_buttons(ui, state),
+        OperationSettingsTab::Gamepad => page_gamepad_device(ui, state),
     }
 }
 
@@ -3140,6 +3149,39 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 操作カスタマイズで切った設定が、OK で本体へ届く。
+    ///
+    /// この経路は編集した `Settings` を丸ごと採用せず、**bundle へ写した項目だけ**を
+    /// 反映する。写し忘れると、画面では切れているのに保存されず、開き直すと戻る
+    /// (2026-09-02 実機報告)。未保存判定にも同じ写し忘れが効くので、閉じるときの
+    /// 確認も出ないまま黙って捨てられる。
+    #[test]
+    fn turning_the_gamepad_off_in_the_dialog_reaches_the_app() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+
+        let mut state = PreferencesState::from_settings(
+            &app.settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        state.settings.gamepad_enabled = false;
+
+        app.operation_customize_state = Some(state);
+        assert!(
+            app.operation_customize_dialog_has_unsaved_changes(),
+            "切った状態は未保存の変更として数える"
+        );
+
+        let state = app.operation_customize_state.take().unwrap();
+        app.apply_operation_customize_state(state);
+        assert!(!app.settings.gamepad_enabled, "OK で本体へ届く");
+    }
 
     #[test]
     fn associated_app_candidates_come_only_from_current_handlers() {

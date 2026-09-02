@@ -14,6 +14,12 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 `keymap.ini.imported*.bak` へ退避する。Action 名・書式・固定扱いの入力は
 [keymap.ini.default](keymap.ini.default) と、コマンド設定画面の表示を正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
+ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
+設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
+無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、
+スティックのずれで `request_repaint` が飛び続けて UI が起きたままになる。
+マウスジェスチャ / リングフリックは対象外。
+
 マウスとゲームパッドも原則 keymap 対象外だが、例外として、マウス右ドラッグの
 フリック、マウス戻る / 進む / ホイールクリック、ゲームパッド <kbd>X</kbd> リングは
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
@@ -98,9 +104,13 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
 動画のシークストリップは `VideoSeekStripCycle` (既定 <kbd>Shift</kbd>+<kbd>S</kbd>) で
-「なし → サムネイル → 音声波形 → なし」の順に切り替える。`VideoSeekStripToggle` は
+「なし → 場面 (周辺) → 場面 (全体) → 波形 (周辺) → 波形 (全体) → なし」の順に切り替える。
+環境設定 (`Settings.video_seek_strip_cycle`) で外した表示は飛ばす。**外した表示も右下の
+メニューからは選べる**ので、設定で到達不能な表示は作らない (全解除は読み込み時に
+「場面 (周辺)」だけ有効へ正規化する)。`VideoSeekStripToggle` は
 表示中なら閉じ、非表示なら上ドラッグと同じく最後に選んだサムネイル / 音声波形を復元する。
-`VideoSeekStripNone` / `VideoSeekStripThumbnails` / `VideoSeekStripWaveform` は指定状態へ直接移る。
+`VideoSeekStripNone` / `VideoSeekStripThumbnails` / `VideoSeekStripWaveform` は表示範囲
+(周辺 / 全体) を保ったまま指定内容へ直接移る。
 この追加 4 action に既定 chord はなく、ユーザーが `[FsVideo]` で任意に割り当てる。
 長さ情報が無い、または場面 index が疎すぎて strip material unavailable と確定した動画では、
 これら 5 action は film button / 上ドラッグと同じく設定状態を変更しない no-op とする。
