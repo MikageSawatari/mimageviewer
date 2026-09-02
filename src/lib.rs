@@ -68,6 +68,7 @@ pub mod dwm_transitions {
 }
 pub mod edit_bundle;
 mod edit_bundle_app;
+mod edit_bundle_bulk;
 pub mod edit_preview_cache;
 mod edit_source;
 pub mod editing_addon;

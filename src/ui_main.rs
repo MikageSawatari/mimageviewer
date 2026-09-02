@@ -5022,7 +5022,7 @@ impl App {
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let sort_lock = self.grid_sort_lock_reason();
         let rating_counts = self.rating_counts();
         let selected_video_path =
             self.selected
@@ -5770,13 +5770,17 @@ impl App {
                                         }
                                     }
                                 });
-                                if book_sort_locked {
+                                if let Some(reason) = sort_lock {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
-                                    ui.add_enabled(false, egui::Button::new("ソート順: 固定"))
-                                        .on_disabled_hover_text(
-                                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                        );
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Button::new(format!(
+                                            "ソート順: {}",
+                                            reason.short_label()
+                                        )),
+                                    )
+                                    .on_disabled_hover_text(reason.tooltip());
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
                                         for &order in crate::settings::SortOrder::all() {
@@ -7491,7 +7495,7 @@ impl App {
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
-        let book_sort_locked = self.page_order_locked_for_current_view();
+        let sort_lock = self.grid_sort_lock_reason();
         if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
             self.request_book_list_refresh();
         }
@@ -8010,19 +8014,11 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                     }
                 }
                 TS::Sort => {
-                    let details_sort_disabled = self.details_header_sort_active();
-                    let sort_disabled = details_sort_disabled || book_sort_locked;
+                    let sort_disabled = sort_lock.is_some();
                     let sort_label = toolbar_label(ui, "ソート:", 54.0, drag_enabled);
-                    let sort_label = if book_sort_locked {
-                        sort_label.hover_tip(
-                            "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                        )
-                    } else if details_sort_disabled {
-                        sort_label.hover_tip(
-                            "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
-                        )
-                    } else {
-                        sort_label.hover_tip(lead_hint)
+                    let sort_label = match sort_lock {
+                        Some(reason) => sort_label.hover_tip(reason.tooltip()),
+                        None => sort_label.hover_tip(lead_hint),
                     };
                     self.finish_toolbar_section_lead(
                         ui,
@@ -8040,7 +8036,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             // `horizontal_wrapped` に直接載せ、幅不足時はツールバー全体の
                             // 次行へ自然に流す。
                             for &order in &tb_sorts {
-                                let selected = if book_sort_locked {
+                                let selected = if sort_disabled {
                                     false
                                 } else if self.items_are_bookmark_view {
                                     self.bookmark_view_sort
@@ -8057,12 +8053,9 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 );
                                 // 固定中はボタンが無効なので、通常 hover ではなく disabled
                                 // 専用ツールチップで固定理由を出す。
-                                let resp = if book_sort_locked {
-                                    resp.hover_tip_disabled(
-                                        "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                    )
-                                } else {
-                                    resp.on_hover_text(order.description())
+                                let resp = match sort_lock {
+                                    Some(reason) => resp.hover_tip_disabled(reason.tooltip()),
+                                    None => resp.on_hover_text(order.description()),
                                 };
                                 if resp.clicked() && !selected {
                                     self.settings.sort_order = order;
@@ -8112,8 +8105,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            let current_text = if book_sort_locked {
-                                "固定".to_string()
+                            let current_text = if let Some(reason) = sort_lock {
+                                reason.short_label().to_string()
                             } else if self.items_are_bookmark_view {
                                 self.bookmark_view_sort.short_label().to_string()
                             } else if self.items_are_rating_view {
@@ -8203,10 +8196,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             // 固定中はコンボが無効なので、disabled 専用ツールチップで
                             // 「固定」表示のホバー時に固定理由を出す。
                             let combo_id = combo.response.id;
-                            if book_sort_locked {
-                                combo.response.hover_tip_disabled(
-                                    "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                                );
+                            if let Some(reason) = sort_lock {
+                                combo.response.hover_tip_disabled(reason.tooltip());
                             }
                             toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo_id);
                         }

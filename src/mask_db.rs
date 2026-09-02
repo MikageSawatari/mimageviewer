@@ -1456,6 +1456,22 @@ impl MaskDb {
         &self,
         key: &str,
     ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        self.get_full_checked_impl(key, false)
+    }
+
+    /// 未選択のマスクを一括全置換で保持するため、vector JSON 破損も明示的な失敗にする。
+    pub(crate) fn get_full_strict(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
+        self.get_full_checked_impl(key, true)
+    }
+
+    fn get_full_checked_impl(
+        &self,
+        key: &str,
+        strict_vectors: bool,
+    ) -> Result<Option<(Vec<bool>, Vec<Shape>, [usize; 2])>, String> {
         use rusqlite::OptionalExtension as _;
         let mut stmt = self
             .conn
@@ -1477,10 +1493,19 @@ impl MaskDb {
         };
         let bitmap = decompress_mask(&blob, width, height)
             .ok_or_else(|| "erase mask decompression failed".to_string())?;
-        let shapes = vectors_json
-            .as_deref()
-            .map(shapes_from_json)
-            .unwrap_or_default();
+        let shapes = if strict_vectors {
+            vectors_json
+                .as_deref()
+                .map(try_shapes_from_json)
+                .transpose()
+                .map_err(|error| format!("erase mask vectors JSON is invalid: {error}"))?
+                .unwrap_or_default()
+        } else {
+            vectors_json
+                .as_deref()
+                .map(shapes_from_json)
+                .unwrap_or_default()
+        };
         Ok(Some((bitmap, shapes, [width, height])))
     }
 
@@ -2651,6 +2676,19 @@ mod tests {
             loaded,
             std::collections::HashSet::from(["c:/b.jpg".to_string()])
         );
+    }
+
+    #[test]
+    fn edit_bundle_bulk_mask_strict_reader_rejects_corrupt_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = MaskDb::open_at(&temp.path().join("mask.db")).unwrap();
+        let compressed = compress_mask(&[true]);
+        db.set_raw("key", &compressed, Some("{invalid"), 1, 1)
+            .unwrap();
+
+        let (_, shapes, _) = db.get_full_checked("key").unwrap().unwrap();
+        assert!(shapes.is_empty(), "通常readerの寛容動作は保つ");
+        assert!(db.get_full_strict("key").is_err());
     }
 
     #[test]

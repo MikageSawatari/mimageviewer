@@ -16213,7 +16213,8 @@ impl App {
 
                         let tail_t0 = std::time::Instant::now();
                         if let Some(rotation) = rotation_choice {
-                            self.set_image_rotation(fs_idx, rotation);
+                            // 従来の単一操作はDB障害時もセッション中の表示を更新する。
+                            let _ = self.set_image_rotation(fs_idx, rotation);
                         }
 
                         // ── フルスクリーン用コンテキストメニュー ──
@@ -16453,6 +16454,7 @@ impl App {
 
                 // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
                 self.show_edit_bundle_paste_confirm_dialog(ctx);
+                self.show_bulk_page_edit_dialog(ctx);
 
                 // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
                 // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
