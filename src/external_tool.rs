@@ -2182,6 +2182,7 @@ impl crate::app::App {
             };
             PageEditContext {
                 page_key,
+                stage: self.settings.bake_stage_external_tool,
                 params,
                 conceal_preset: self.current_conceal_preset_from_settings(),
                 erase_mono_tolerance: self.settings.erase_inpaint_mono_tolerance,

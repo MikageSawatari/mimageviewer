@@ -1578,6 +1578,104 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+/// 出力ごとに「どこまで焼くか」を選ぶ表。
+///
+/// **1 か所にまとめて置く。** この設定の値は「製本と Ctrl+E で何が違うか」が見えることに
+/// あるので、各機能のページへ散らすと比べられなくなる。
+///
+/// 行ごとに 1 つだけ選ぶ (radio)。段は積み上げなので、**選んだ段までが塗られる**見せ方に
+/// する。チェックボックスの表にすると「AI だけ入れて編集は外す」を作ろうとさせてしまう。
+pub(super) fn page_bake_stage(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "bake-stage/matrix", page_bake_stage_body);
+}
+
+fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::bake_stage::BakeStage;
+
+    ui.heading("書き出しの焼き込み");
+    ui.add(
+        egui::Label::new(concat!(
+            "画像をファイルへ出すとき、どこまで反映するかを出力ごとに選びます。",
+            "右の段ほど多くを焼き込みます。",
+        ))
+        .wrap(),
+    );
+    ui.add_space(8.0);
+
+    let rows: [(
+        &str,
+        fn(&mut crate::settings::Settings) -> &mut BakeStage,
+        &str,
+    ); 4] = [
+        ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
+        (
+            "エクスポート (1 枚)",
+            |s| &mut s.bake_stage_export,
+            "フルスクリーンの Ctrl+E",
+        ),
+        (
+            "エクスポート (まとめて)",
+            |s| &mut s.bake_stage_export_batch,
+            "一覧で選んでの Ctrl+E",
+        ),
+        (
+            "外部ツール",
+            |s| &mut s.bake_stage_external_tool,
+            "別のアプリへ渡す一時ファイル",
+        ),
+    ];
+
+    egui::Grid::new("bake_stage_matrix")
+        .num_columns(4)
+        .spacing([18.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("");
+            for stage in BakeStage::ALL {
+                ui.label(egui::RichText::new(stage.label()).strong());
+            }
+            ui.end_row();
+
+            for (name, field, hint) in rows {
+                ui.label(name).on_hover_text(hint);
+                let current = *field(&mut state.settings);
+                for stage in BakeStage::ALL {
+                    // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
+                    let included = stage <= current;
+                    let mut selected = included;
+                    if ui.checkbox(&mut selected, "").clicked() {
+                        *field(&mut state.settings) = stage;
+                    }
+                }
+                ui.end_row();
+            }
+        });
+
+    ui.add_space(10.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(concat!(
+                "編集 = 補正・回転・注釈・消しゴム・隠蔽・切り取り。",
+                "AI 処理 = AI アップスケールとノイズ除去。",
+                "表示用補正 = スマートシャープ・カラー化・LUT・ポストフィルタ。",
+            ))
+            .weak(),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(concat!(
+                "後から別のソフトで加工するなら、浅い段のほうが扱いやすくなります。",
+                "そのまま見せる画像を作るなら、深い段が画面に近くなります。",
+            ))
+            .weak(),
+        )
+        .wrap(),
+    );
+}
+
 pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label("Ctrl+S で保存するキャプチャの形式と保存先を設定します。");
     ui.add_space(8.0);

@@ -4037,6 +4037,23 @@ pub struct Settings {
     /// Ctrl+S キャプチャ保存形式。
     #[serde(default)]
     pub capture_format: crate::capture::CaptureFormat,
+    /// 出力ごとに「どこまで焼くか」。
+    ///
+    /// 同じ画像でも出力先によって欲しい段が違うので、**機能ごとに持つ**。既定が機能ごとに
+    /// 違う以上、単一の設定では表せない。正本は
+    /// [docs/bake-stage-unification-plan.md](../docs/bake-stage-unification-plan.md)。
+    ///
+    /// 既定は現行の挙動をそのまま:
+    /// 製本と外部ツールは「編集まで」(後から加工する前提の出力)、
+    /// <kbd>Ctrl+E</kbd> は 1 枚も一括も「表示用補正まで」(同じキーなので既定を揃える)。
+    #[serde(default)]
+    pub bake_stage_book: crate::bake_stage::BakeStage,
+    #[serde(default = "default_bake_stage_export")]
+    pub bake_stage_export: crate::bake_stage::BakeStage,
+    #[serde(default = "default_bake_stage_export")]
+    pub bake_stage_export_batch: crate::bake_stage::BakeStage,
+    #[serde(default)]
+    pub bake_stage_external_tool: crate::bake_stage::BakeStage,
     /// 製本の本棚ルート。None のときは OS の Pictures/mimageviewer/books を使う。
     #[serde(default)]
     pub book_root: Option<PathBuf>,
@@ -5593,6 +5610,11 @@ where
 fn default_stack_separator() -> char {
     '_'
 }
+/// <kbd>Ctrl+E</kbd> の既定。表示用補正まで焼く。
+fn default_bake_stage_export() -> crate::bake_stage::BakeStage {
+    crate::bake_stage::BakeStage::DisplayAdjust
+}
+
 fn default_active_book_name() -> String {
     crate::books::DEFAULT_BOOK_NAME.to_string()
 }
@@ -5976,6 +5998,10 @@ impl Default for Settings {
             slideshow_end_action: SlideshowEndAction::default(),
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
+            bake_stage_book: crate::bake_stage::BakeStage::default(),
+            bake_stage_export: default_bake_stage_export(),
+            bake_stage_export_batch: default_bake_stage_export(),
+            bake_stage_external_tool: crate::bake_stage::BakeStage::default(),
             book_root: None,
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),

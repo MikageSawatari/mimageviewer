@@ -147,6 +147,8 @@ impl MaterializeSource {
 pub struct PageEditContext {
     pub page_key: String,
     pub params: crate::adjustment::AdjustParams,
+    /// どこまで焼くか。外部ツールの設定から UI スレッドで確定させて渡す。
+    pub stage: crate::bake_stage::BakeStage,
     pub conceal_preset: crate::conceal::ConcealPreset,
     pub erase_mono_tolerance: u8,
     pub comic_source_dims: Option<[usize; 2]>,
@@ -694,6 +696,7 @@ impl MaterializeSession {
             export_crop.as_ref(),
             context.erase_mono_tolerance,
             context.comic_source_dims,
+            context.stage,
         )?;
 
         let conceal = conceal_raw.map(|(bitmap, shapes, size)| crate::books::BookConcealSnapshot {
@@ -775,8 +778,7 @@ impl MaterializeSession {
                 crop_legacy_writeback: None,
                 format: crate::capture::CaptureFormat::Png,
                 jpeg_matte: crate::capture::JpegMatte::Black,
-                // 段は既定の「編集まで」。呼び出し側が段を選べるようになるまで挙動は変わらない。
-                stage: crate::bake_stage::BakeStage::default(),
+                stage: context.stage,
                 creative_lut: None,
                 ai: None,
             },
@@ -1312,6 +1314,10 @@ fn check_current(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 同じ出力になる要求を同じ値へ畳む指紋。
+///
+/// **段も含める。** 同じ編集内容でも、どこまで焼いたかで出力が違う。含めないと
+/// 「AI まで」で作った一時ファイルが「編集まで」の要求へ再利用される。
 fn edit_fingerprint(
     params: &crate::adjustment::AdjustParams,
     rotation: crate::rotation_db::Rotation,
@@ -1323,6 +1329,7 @@ fn edit_fingerprint(
     crop: Option<&crate::export_crop::CropSettings>,
     erase_mono_tolerance: u8,
     comic_source_dims: Option<[usize; 2]>,
+    stage: crate::bake_stage::BakeStage,
 ) -> Result<[u8; 32], String> {
     let mut digest = sha2::Sha256::new();
     for (domain, value) in [
@@ -1339,6 +1346,7 @@ fn edit_fingerprint(
             serde_json::to_vec(&erase_mono_tolerance),
         ),
         ("comic_source_dims", serde_json::to_vec(&comic_source_dims)),
+        ("stage", serde_json::to_vec(&stage)),
     ] {
         let value = value.map_err(|error| format!("編集状態を検証できません: {error}"))?;
         digest.update((domain.len() as u32).to_le_bytes());
@@ -1937,6 +1945,35 @@ mod tests {
         );
     }
     #[test]
+    /// 段が違えば出力が違うので、指紋も違わなければならない。同じにすると
+    /// 「AI まで」で作った一時ファイルが「編集まで」の要求へ再利用される。
+    #[test]
+    fn the_fingerprint_separates_requests_that_bake_to_different_depths() {
+        let for_stage = |stage| {
+            edit_fingerprint(
+                &crate::adjustment::AdjustParams::default(),
+                crate::rotation_db::Rotation::None,
+                None,
+                None,
+                None,
+                &crate::conceal::ConcealPreset::default(),
+                None,
+                None,
+                0,
+                None,
+                stage,
+            )
+            .unwrap()
+        };
+        let edits = for_stage(crate::bake_stage::BakeStage::Edits);
+        let ai = for_stage(crate::bake_stage::BakeStage::Ai);
+        let display = for_stage(crate::bake_stage::BakeStage::DisplayAdjust);
+        assert_ne!(edits, ai);
+        assert_ne!(ai, display);
+        assert_ne!(edits, display);
+    }
+
+    #[test]
     fn edit_fingerprint_covers_erase_tolerance_and_comic_source_dimensions() {
         let fingerprint = |tolerance, dimensions| {
             edit_fingerprint(
@@ -1950,6 +1987,7 @@ mod tests {
                 None,
                 tolerance,
                 dimensions,
+                crate::bake_stage::BakeStage::default(),
             )
             .unwrap()
         };

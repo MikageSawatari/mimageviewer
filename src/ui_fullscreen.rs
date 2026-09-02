@@ -34330,7 +34330,13 @@ impl App {
                 original_name,
             })
         } else {
-            let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+            let edits = self.book_baked_edit_snapshot(
+                &key,
+                None,
+                params,
+                rotation,
+                self.settings.bake_stage_book,
+            )?;
             let basename = std::path::Path::new(&original_name)
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -34383,12 +34389,15 @@ impl App {
         }
     }
 
+    /// `stage` は**呼び出し側が渡す**。同じ builder を製本と一括エクスポートが共有しており、
+    /// 出力ごとに欲しい段が違うため (製本 = 編集まで / Ctrl+E = 表示用補正まで が既定)。
     fn book_baked_edit_snapshot(
         &mut self,
         key: &str,
         idx: Option<usize>,
         params: crate::adjustment::AdjustParams,
         rotation: crate::rotation_db::Rotation,
+        stage: crate::bake_stage::BakeStage,
     ) -> Result<crate::books::BakedEditSnapshot, String> {
         let has_conceal = self.conceal_page_keys.contains(key);
         let has_erase = self.mask_page_keys.contains(key);
@@ -34535,8 +34544,9 @@ impl App {
             jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                 self.fs_transparent_bg_mode,
             ),
-            // 段は既定の「編集まで」。呼び出し側が段を選べるようになるまで挙動は変わらない。
-            stage: crate::bake_stage::BakeStage::default(),
+            stage,
+            // TODO(段取り 5): 表示用補正まで焼くときは解決済み LUT と AI ランナーを渡す。
+            // いまはどの呼び出し側も「編集まで」なので到達しない。
             creative_lut: None,
             ai: None,
         })
@@ -34600,7 +34610,13 @@ impl App {
                         .and_then(|stem| stem.to_str())
                         .unwrap_or("page")
                         .to_string();
-                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    let edits = self.book_baked_edit_snapshot(
+                        &key,
+                        Some(idx),
+                        params,
+                        rotation,
+                        self.settings.bake_stage_book,
+                    )?;
                     Ok(crate::books::BookPageSource::Composited {
                         source: crate::books::CompositeSource::File { path },
                         basename,
@@ -34625,7 +34641,13 @@ impl App {
                         .and_then(|stem| stem.to_str())
                         .unwrap_or("page")
                         .to_string();
-                    let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                    let edits = self.book_baked_edit_snapshot(
+                        &key,
+                        Some(idx),
+                        params,
+                        rotation,
+                        self.settings.bake_stage_book,
+                    )?;
                     Ok(crate::books::BookPageSource::Composited {
                         source: crate::books::CompositeSource::ZipEntry {
                             zip_path,
@@ -34639,7 +34661,13 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => {
-                let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+                let edits = self.book_baked_edit_snapshot(
+                    &key,
+                    Some(idx),
+                    params,
+                    rotation,
+                    self.settings.bake_stage_book,
+                )?;
                 Ok(crate::books::BookPageSource::Composited {
                     source: crate::books::CompositeSource::PdfPage {
                         pdf_path,
@@ -34733,7 +34761,13 @@ impl App {
             .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
         let params = self.effective_params(idx).clone();
         let rotation = self.get_rotation(idx);
-        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation)?;
+        let edits = self.book_baked_edit_snapshot(
+            &key,
+            Some(idx),
+            params,
+            rotation,
+            self.settings.bake_stage_export_batch,
+        )?;
         Ok(Some(crate::export_batch::BatchExportItem {
             filename,
             dirname,
@@ -34755,7 +34789,13 @@ impl App {
             .and_then(|db| db.get_key(&key))
             .unwrap_or(crate::rotation_db::Rotation::None);
         let params = self.stack_member_effective_params(path, &key);
-        let edits = self.book_baked_edit_snapshot(&key, None, params, rotation)?;
+        let edits = self.book_baked_edit_snapshot(
+            &key,
+            None,
+            params,
+            rotation,
+            self.settings.bake_stage_export_batch,
+        )?;
         Ok(crate::export_batch::BatchExportItem {
             filename: crate::capture::basename_for_path(path),
             dirname: Self::batch_export_dirname_for_path(path),
