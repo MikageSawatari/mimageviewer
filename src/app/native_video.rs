@@ -207,6 +207,7 @@ pub(crate) struct HeldSeekStripWaveWorker {
 fn take_or_spawn_seek_strip_wave_worker(
     holdover: &mut Option<HeldSeekStripWaveWorker>,
     path: &std::path::Path,
+    cache: Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 ) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
     if let Some(held) = holdover.take() {
         if crate::path_key::eq_keep_drive(&held.path, path) {
@@ -218,7 +219,7 @@ fn take_or_spawn_seek_strip_wave_worker(
             return held.worker;
         }
     }
-    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf())
+    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf(), cache)
 }
 
 /// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
@@ -7843,6 +7844,7 @@ impl App {
         mode: crate::settings::VideoSeekStripMode,
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
+        let wave_cache = self.video_tile_cache.clone();
         let Some(session) = (match &self.video_seek_strip_runtime {
             VideoSeekStripRuntime::Open(session) if session.owner_fs_idx == fs_idx => Some(session),
             _ => None,
@@ -7892,6 +7894,7 @@ impl App {
             Some(take_or_spawn_seek_strip_wave_worker(
                 &mut self.video_seek_strip_wave_holdover,
                 &path,
+                wave_cache,
             ))
         } else {
             None
@@ -8291,6 +8294,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn rebuild_video_seek_strip_waveform_span(&mut self) {
+        let wave_cache = self.video_tile_cache.clone();
         let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
@@ -8324,6 +8328,7 @@ impl App {
         // above is display-only and cannot satisfy coverage for the new preference.
         session.wave_worker = Some(crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
             session.video_path.clone(),
+            wave_cache,
         ));
         session.wave_holdover = previous_raster;
         Self::request_video_seek_strip_window(session);
@@ -8461,6 +8466,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_native_video_seek_strip(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let wave_cache = self.video_tile_cache.clone();
         let current_path = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } if player.error().is_none() => {
                 Some(player.path().clone())
@@ -8574,6 +8580,7 @@ impl App {
                                 session.wave_worker = Some(take_or_spawn_seek_strip_wave_worker(
                                     &mut self.video_seek_strip_wave_holdover,
                                     &session.video_path,
+                                    wave_cache.clone(),
                                 ));
                             }
                             Self::request_video_seek_strip_window(session);
@@ -13053,7 +13060,8 @@ mod native_video_key_observation_tests {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("clip.mp4");
-            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone());
+            let worker =
+                crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
             let identity = worker.identity_for_test();
             app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(
                 VideoSeekStripSession::for_wave_holdover_test(path, worker),
@@ -13094,7 +13102,7 @@ mod native_video_key_observation_tests {
         let one = dir.path().join("one.mp4");
         let other = dir.path().join("other.mp4");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
         let held_identity = worker.identity_for_test();
         // 預けるときと同じ状態にしてから拾わせる。
         worker.set_background_paused(true);
@@ -13103,7 +13111,7 @@ mod native_video_key_observation_tests {
             worker,
         });
 
-        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one);
+        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one, None);
         assert_eq!(
             reused.identity_for_test(),
             held_identity,
@@ -13115,13 +13123,13 @@ mod native_video_key_observation_tests {
         );
         assert!(holdover.is_none(), "持ち越しは 1 本ぶんだけ");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone());
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
         let stale_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
             path: one.clone(),
             worker,
         });
-        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other);
+        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other, None);
         assert_ne!(
             fresh.identity_for_test(),
             stale_identity,
@@ -13139,8 +13147,10 @@ mod native_video_key_observation_tests {
     fn pausing_the_background_analysis_is_visible_where_the_worker_reads_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
-        let worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(dir.path().join("none.mp4"));
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            dir.path().join("none.mp4"),
+            None,
+        );
         assert!(!worker.background_is_paused(), "作った直後は動いている");
         worker.set_background_paused(true);
         assert!(worker.background_is_paused());

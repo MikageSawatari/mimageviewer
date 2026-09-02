@@ -65125,7 +65125,7 @@ fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
         let path = dir.path().join("clip.mp4");
         app.video_seek_strip_wave_holdover = Some(native_video::HeldSeekStripWaveWorker {
             path: path.clone(),
-            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path),
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path, None),
         });
 
         app.close_video_seek_strip(cause);

@@ -748,9 +748,9 @@ src/video/
 ├── thumbnail.rs            # hover / marker thumbnail worker
 ├── seek_strip.rs           # seek strip の軸・窓・gesture 純ロジック
 ├── seek_strip_thumbs.rs    # seek strip の窓単位 thumbnail worker
-├── seek_strip_wave.rs      # seek strip の時間窓 waveform 解析・raster worker
+├── seek_strip_wave.rs      # seek strip の時間窓 / 粗い全尺 waveform 解析・raster worker
 ├── tile_thumbnails.rs      # tile mode 一括 thumbnail worker
-├── tile_thumb_cache.rs     # tile thumbnail SQLite/WebP cache
+├── tile_thumb_cache.rs     # tile/resume WebP + 粗い波形 chunk の共有 SQLite cache
 ├── screenshot.rs           # 現在 frame の clipboard copy
 ├── ffmpeg_loader.rs        # 同居 FFmpeg DLL の検証
 └── upscale/                # resumable offline upscale job / queue / manifest / paths
@@ -871,19 +871,25 @@ source session reset で `Unknown` へ戻すため、前ファイルの unavaila
 background で作る。保持 span は通常 3 倍だが 3600 秒で上限とする。可視 span が 60 分以上なら
 保持 span は可視 span と同じになり、同幅の background upgrade は出さない。
 
-可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
-60 秒 chunk でメモリ内だけに構築する。foreground latest-wins request を loop 先頭で処理し、無いとき
-だけ現在中心に最も近い未試行 chunk を 1 個埋める。chunk 中は foreground へ譲らないため、待ち上限は
-1 chunk で、thread / decoder は増えない。粗い列が可視範囲を被覆し要求 bin 幅が 100ms 以上なら
-粗い列を使い、未被覆か解像度不足でも可視 span 30 分以下は従来の窓復号を維持する。30 分超は
-粗い列だけを progressive に描き、未解析列は暗い背景かつ中心線なしで区別する。粗い列、bitset、
-content revision は worker とともに捨て、永続 cache は持たない。chunk 単位の decode / 合成失敗は
-coverage と別の failed bitset に記録して選択から外し、残りの構築を継続する。終了は両 bitset の和で
-判定するが、failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と
-音声 track なしだけはファイル単位の `Unavailable` として全体を止める。
+波形モードで可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
+60 秒 chunk で構築する。列を作った直後、共有 `TileThumbCache` の `video_tile_thumbs.db` から
+file identity (`path` / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
+1 batch で読み、長さと添字を検証できた chunk を coverage へ戻す。未取得 chunk は従来どおり
+foreground latest-wins request を loop 先頭で処理し、無いときだけ現在中心に最も近いものを 1 個埋め、
+復号・合成に成功した chunk だけを DB へ保存する。波形モード以外では背景段を止め、10 分の構築閾値、
+中心優先度、1 worker / 1 decoder は変えない。
+
+粗い列が可視範囲を被覆し要求 bin 幅が 100ms 以上なら粗い列を使い、未被覆か解像度不足でも可視 span
+30 分以下は従来の窓復号を維持する。30 分超は粗い列だけを progressive に描き、未解析列は暗い背景かつ
+中心線なしで区別する。永続化するのは量子化済みの粗い chunk だけで、列の実体、coverage / failed bitset、
+content revision、窓解析と raster LRU は worker のメモリに置く。chunk 単位の decode / 合成失敗は
+failed bitset にだけ記録して永続化せず、残りの構築を継続する。終了は coverage と failed の和で判定するが、
+failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と音声 track なし
+だけはファイル単位の `Unavailable` として全体を止める。
 
 `AudioRangeDecoder::open` は FFI で音声以外の `AVStream.discard` を `AVDISCARD_ALL` にし、
-chunk perf は `wave_coarse_chunk`、粗い列からの描画は `wave_coarse_serve` へ出す。従来窓の
+永続 chunk の一括読み込みは `wave_coarse_cache`、chunk perf は `wave_coarse_chunk`、粗い列からの描画は
+`wave_coarse_serve` へ出す。従来窓の
 pre-roll bins は raster 前に捨て、全尺前提の beat grid は作らない。窓波形 raster の LRU は
 file identity、時間窓、bin 幅、物理幅をキーにしたメモリ内 8 件だけである。
 audio stream が無い場合は通常の media property として typed status で保持し、
@@ -1921,8 +1927,11 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   最後にデコードできたフレームを fallback に使う。worker は cancel フラグを
   1 パケットごとに確認するので別 interval / 動画への切替時は自然終了する。
   同じ frame-selection は seek hover サムネ `thumbnail.rs` と共通
-- `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
-  動画の長さが変わっても再ヒットする (Phase 8.C の修正)
+- `tile_thumb_cache.rs`: 共有 `video_tile_thumbs.db` の永続キャッシュ。タイル / resume サムネイルは
+  SQLite + WebP で、タイルは **絶対 PTS をキー**にしているため動画の長さが変わっても再ヒットする
+  (Phase 8.C の修正)。`video_wave_chunks` は粗い全尺波形の量子化 bin を chunk 単位で持ち、path、
+  動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。既存のファイル単位・
+  フォルダ単位・全件削除は両方のキャッシュを同時に消す
 - **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
   どのモニターで再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは
   「動画 × 絶対 PTS」で 1 行に集約され、列数を切り替えても解像感が混ざらない
