@@ -536,6 +536,8 @@ mod windows_impl {
         let shell_forwarder = shell_menu
             .as_ref()
             .map(|menu| ContextMenuMessageForwarder::new(menu, lazy_shell_submenu));
+        let z_forwarder = diagnostic_z_order();
+        let disabled_reason_count = disabled_reasons.len();
         let tooltip = if disabled_reasons.is_empty() {
             None
         } else {
@@ -549,6 +551,7 @@ mod windows_impl {
                 }
             }
         };
+        let z_tooltip = diagnostic_z_order();
         let message_state = MenuMessageState {
             shell: shell_forwarder,
             tooltip,
@@ -605,7 +608,7 @@ mod windows_impl {
             let foreground_after = unsafe { GetForegroundWindow().0 as usize as u64 };
             let owner = hwnd.0 as usize as u64;
             crate::logger::log(format!(
-                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_com={z_com_init} z_popup={z_create_popup} z_miv={z_append_miv} z_shell={z_shell_built} z_subclass={z_subclass} z_pre_track={z_before_track} z_after={}",
+                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind} z_entry={z_at_entry} z_com={z_com_init} z_popup={z_create_popup} z_miv={z_append_miv} z_shell={z_shell_built} z_fwd={z_forwarder} z_tip={z_tooltip} disabled_reasons={disabled_reason_count} z_subclass={z_subclass} z_pre_track={z_before_track} z_after={}",
                 foreground_before == owner,
                 foreground_before != foreground_after,
                 diagnostic_z_order(),
