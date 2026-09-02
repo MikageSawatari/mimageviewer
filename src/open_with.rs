@@ -620,6 +620,11 @@ fn shell_execute_with_progid(
     Some(launched_any)
 }
 
+// Windows 専用。呼ぶのは同名の `#[cfg(windows)]` ラッパーだけで、非 Windows 側の
+// ラッパーはここへ来ない。gate が無いと `windows` crate も
+// `file_drag::shell_data_object_for_paths` も非 Windows で解決できず、CI の
+// ubuntu チェックだけが落ちる (Windows ローカルでは cfg(windows) が常に真のため)。
+#[cfg(windows)]
 fn invoke_association_handler_inner(
     extension: &str,
     expected_id: &str,

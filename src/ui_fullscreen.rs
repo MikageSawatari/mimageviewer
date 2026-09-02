@@ -13310,6 +13310,22 @@ impl App {
             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
     }
 
+    /// 動画タイルモードが動いているか。**この 1 か所で cfg を吸収する。**
+    ///
+    /// `App::video_tile_mode_active` は `#[cfg(windows)]` フィールドで、タイルモード自体が
+    /// Windows 専用。ここを素で読むと非 Windows で解決できず、**Windows のローカルビルドでは
+    /// 決して出ない失敗**として ubuntu の CI だけが落ちる (cfg(windows) が常に真のため)。
+    #[cfg(windows)]
+    fn video_tile_mode_running(&self) -> bool {
+        self.video_tile_mode_active
+    }
+
+    /// 非 Windows にタイルモードは無いので、常に動いていない。
+    #[cfg(not(windows))]
+    fn video_tile_mode_running(&self) -> bool {
+        false
+    }
+
     /// 右情報パネルのロックが**いま効いているか**。
     ///
     /// **表示領域を確保する側と、パネルを描く側の両方がこれを見る。**片方だけが別の条件を
@@ -13319,7 +13335,7 @@ impl App {
             self.fs_info_panel.locked,
             StillInfoPanelLockInputs {
                 is_video,
-                video_tile_active: self.video_tile_mode_active,
+                video_tile_active: self.video_tile_mode_running(),
                 local_adjust_active: self.local_adjust_mode,
                 sns_split_active: self.sns_split.is_some(),
                 export_crop_active: self.export_crop_mode,
