@@ -622,6 +622,11 @@ fn batch_edits(
         crop_legacy_writeback: None,
         format,
         jpeg_matte: mimageviewer::capture::JpegMatte::Black,
+        // 一覧の一括書き出しが実際に使う段 (`Settings::bake_stage_export_batch` の既定)。
+        // ここだけが実ファイルで合成経路を通すので、出荷される段を通す。
+        stage: mimageviewer::bake_stage::BakeStage::DisplayAdjust,
+        creative_lut: None,
+        ai: None,
     }
 }
 
