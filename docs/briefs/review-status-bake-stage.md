@@ -6,36 +6,36 @@
 指摘の原文は [review-findings-bake-stage-raw.md](review-findings-bake-stage-raw.md)。
 依頼書は [review-bake-stage-and-external-tool.md](review-bake-stage-and-external-tool.md)。
 
-## 対応済み (`0292abed`)
+## 対応済み
 
-| # | 内容 | 判定 |
+| # | 内容 | 対応 |
 | --- | --- | --- |
-| 1 | embedded fullscreen で起動確認 modal / ピッカーが描かれない | **本物。私の見落とし。** 3 つのうち進捗だけ複製していた。描き手を `show_external_tool_modals` に一本化し、他所から個別に呼んでいないかをソース走査テストで固定 |
-| 6 | `page_requires_full_composite` が段を見ず、表示専用効果だけのページで合成が飛ぶ | **本物。最重要。** 判定に段を渡し、表示専用 params と AI モデルを直接見る |
-| 7 | `DisplayAdjust` の LUT がどの経路にも運ばれていない | **本物。** 製本 / バッチ / 外部ツールで、表示側と同じ resolver を通して解決 |
+| 1 | embedded fullscreen で起動確認 modal / ピッカーが描かれない | `0292abed` 描き手を `show_external_tool_modals` に一本化 |
+| 6 | `page_requires_full_composite` が段を見ない | `0292abed` 判定に段と表示専用 params / AI モデルを渡す |
+| 7 | `DisplayAdjust` の LUT がどの経路にも運ばれていない | `0292abed` 表示側と同じ resolver を通す |
+| 2 | native video 経路で context menu と ACK に到達しない | `9096effe` **両方の早期 return を確認**。本体を `update_frame` へ分け、`eframe::App::update` を「飛ばせない tail」にした |
+| 3 | frame 番号が要求元 viewport の所有権を持たない | `9096effe` modal の所有者を「利用者が操作した窓」にした。所有 viewport が消えた frame は main が肩代わり |
+| 9 | supersede がツール横断 | `de95cfa5` **実装ではなく正本の記述が誤り**。準備中は入力が止まるので準備中の要求は常に高々 1 つ。プランを訂正 |
+| 10 | PDF パスワードがパス単位でない | `de95cfa5` `pdf_open_password` に 1 か所化。開く経路と同じ順序 |
+| 11 | `{page}` が items の位置由来 | `de95cfa5` 読書履歴と同じ数え方に。ページでない項目が混ざる一覧では付けない |
+| 12 | `VideoFrame` が音声も通す | `b25cd718` `has_video` を判定に追加。SAR / source 差し替えは出荷済みの Ctrl+S と共有の制限としてプランへ記録 |
+| 4 (前半) | `TempOriginal` + `Merged` が「元バイト列」を約束しながら PNG を出す | `b25cd718` `effective_spread` に規則を 1 つ置いた |
 
 ## 未対応
 
-| # | 内容 | 確認状況 |
+| # | 内容 | 状況 |
 | --- | --- | --- |
-| 2 | native video 経路で context menu と ACK に到達しない | **fs body 側は確認済み** — [ui_fullscreen.rs:14353](../../src/ui_fullscreen.rs) の `return` が backdrop 分岐にある。**root 側 (app.rs の early return) は未確認**。両方飛ぶなら、動画からキーで外部ツールを起動すると進捗も出ず永久待ちになる |
-| 3 | frame 番号が要求元 viewport の所有権を持たない (背面 F12 窓が main 由来の modal を先取りし得る) | 未確認 |
-| 4 | `SpreadPolicy::Merged` が `PayloadPolicy` と `BakeStage` を迂回 (表示最終画素を先に合成するため「編集前」でも表示補正込みの PNG が出る) | 未確認。**設計判断が要る** — Merged を段の下へ入れるか、UI で組み合わせを禁じるか |
-| 5 | バッチ Ctrl+E が既に `DisplayAdjust` へ配線済み | **私の報告が誤りだった (配線済み)。挙動変更は利用者の意図どおり**なので、コードはこのままでよい。ただし AI 未配線のため現状は「表示補正は焼くが AI は焼かない」中間状態。利用者判断でこのまま進める (master へは混ぜない) |
-| 8 | Merged の合成と全画素 hash が UI スレッド | 未確認 |
-| 9 | supersede がツール横断 (別ツールの準備中要求まで cancel) | 未確認。設計書 §4.7 は同一ツールのみ置換と書いている |
-| 10 | PDF materialization がパス単位のパスワードを見ず `pdf_current_password` 固定 | 未確認 |
-| 11 | `{page}` が論理ページ列でなく items の位置由来 | 未確認 |
-| 12 | `VideoFrame(path, millis)` が提示済みフレームを一意に表さない (音声との潰し / source swap / SAR 未反映) | 未確認 |
-| 13 | 指紋に AI の feature mode / 実モデル / ロード状態が無い (段取り 4 で顕在化) | 未確認 |
-| 14 | stack 経路だけ `comic_source_dims` が `None` で、AI 配線後に注釈位置が分岐 (段取り 4 で顕在化) | 未確認 |
+| 4 (後半) | `Merged` に焼き込み段が効かない | **段取り 6 で解消**。合成をワーカー経路へ移すときに一緒に直す。それまでは設定画面に明記 |
+| 8 | Merged の合成と全画素 hash が UI スレッド | **段取り 6 で解消** (同上)。hash は pixel ベースのままにする — 構造的な鍵は #13 の課題を丸ごと抱えるため |
+| 5 | バッチ Ctrl+E が既に `DisplayAdjust` へ配線済み | **私の報告が誤りだった。挙動変更は利用者の意図どおり**なのでこのまま (master へは混ぜない) |
+| 13 | 指紋に AI の feature mode / 実モデル / ロード状態が無い | **段取り 4 と同時**。AI を配線した瞬間に効く |
+| 14 | stack 経路だけ `comic_source_dims` が `None` | **段取り 4 と同時**。AI を配線すると注釈位置が通常ページと分岐する |
 
 ## 進め方
 
-1. #2 の root 側を確認 → 対応
-2. #4 は設計判断を利用者に確認してから
-3. #3 / #8 / #9〜#12 を順に
-4. #13 / #14 は段取り 4 (AI のモデル決定の切り出し) と同時に
+1. 段取り 4 (AI のモデル決定を表示側から切り出す) — #13 / #14 をここで同時に
+2. 段取り 5 / 6 — #4 後半 と #8 をここで同時に
+3. 段取り 7 (マニュアル / 製品ページ)
 
 ## 段取りの現況
 
