@@ -194,11 +194,11 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DeleteMenu, DestroyMenu,
-        DestroyWindow, GetCursorPos, HMENU, HWND_TOPMOST, MF_BYPOSITION, MF_GRAYED, MF_POPUP,
-        MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_STYLE,
-        WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT, WS_EX_TOPMOST,
-        WS_POPUP,
+        DestroyWindow, GetCursorPos, GetForegroundWindow, HMENU, HWND_TOPMOST, MF_BYPOSITION,
+        MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SendMessageW, SetWindowPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+        WINDOW_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUSELECT,
+        WS_EX_TOPMOST, WS_POPUP,
     };
     use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref};
 
@@ -554,6 +554,10 @@ mod windows_impl {
             miv_count,
         );
         let track_t0 = Instant::now();
+        // 診断: どの窓をオーナーにしてメニューを出し、その前後で前面窓が変わるか。
+        // 「F12 の別窓で右クリックするとメインが前に出る」の機構を推測でなく実測で決めるため
+        // (backlog §1.162)。原因が確定したら消す。
+        let foreground_before = unsafe { GetForegroundWindow().0 as usize as u64 };
         let selected = unsafe {
             TrackPopupMenuEx(
                 menu.handle(),
@@ -565,6 +569,15 @@ mod windows_impl {
             )
             .0 as u32
         };
+        {
+            let foreground_after = unsafe { GetForegroundWindow().0 as usize as u64 };
+            let owner = hwnd.0 as usize as u64;
+            crate::logger::log(format!(
+                "native_context_menu: owner=0x{owner:x} fg_before=0x{foreground_before:x} fg_after=0x{foreground_after:x} owner_was_fg={} fg_changed={} target={target_kind}",
+                foreground_before == owner,
+                foreground_before != foreground_after,
+            ));
+        }
         message_state.hide_tooltip();
         emit_native_menu_timing(
             "show_track_popup_block",
