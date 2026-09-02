@@ -912,6 +912,23 @@ fn spread_reading_order(left: usize, right: usize) -> (usize, usize) {
     }
 }
 
+/// この viewport が外部ツールの modal を描くか。
+///
+/// **所有者は「利用者がその操作をした窓」**で、先着ではない。viewer の viewport は
+/// main の tail より前に描くので、先着にすると背面の F12 窓が main 由来の modal を
+/// 攫い、前面の main は「ダイアログが無いのに入力だけ止まる」になる。
+///
+/// 所有 viewport は消えることがある (フルスクリーンを閉じる context menu からの起動、
+/// native 動画の早期 return)。その frame は main が肩代わりする。main の tail は全 viewer
+/// viewport より後に走るので、`owner_drawn_this_frame` はその時点で確定している。
+fn external_tool_modal_viewport_draws(
+    viewport: egui::ViewportId,
+    owner: egui::ViewportId,
+    owner_drawn_this_frame: bool,
+) -> bool {
+    viewport == owner || (viewport == egui::ViewportId::ROOT && !owner_drawn_this_frame)
+}
+
 fn external_tool_capability(
     tool: &ExternalTool,
     target: ExternalToolMenuTarget,
@@ -2492,6 +2509,8 @@ impl crate::app::App {
             );
             return;
         }
+        // ピッカーはグリッドのキー操作からしか開かない (= main の窓)。
+        self.external_tool_modal_viewport = egui::ViewportId::ROOT;
         self.external_tool_picker = Some(ExternalToolPickerRequest {
             targets,
             target_kind,
@@ -2566,6 +2585,8 @@ impl crate::app::App {
         targets: &[LaunchTarget],
         origin: MaterializeOperationOrigin,
     ) {
+        // 進捗 / 確認 modal は、利用者がこの操作をした窓が所有する。
+        self.external_tool_modal_viewport = ctx.viewport_id();
         let operation = match self.build_materialize_operation(ctx, tool, targets, origin) {
             Ok(operation) => operation,
             Err(error) => {
@@ -2583,10 +2604,13 @@ impl crate::app::App {
 
     pub(crate) fn start_open_with(
         &mut self,
+        ctx: &egui::Context,
         display_name: String,
         launch: ExternalToolLaunch,
         file: PathBuf,
     ) {
+        // ネットワーク EXE の確認 modal も、操作した窓が所有する。
+        self.external_tool_modal_viewport = ctx.viewport_id();
         let request = build_open_with_launch_request(display_name.clone(), launch, file);
         let operation = ExternalLaunchOperation {
             tool_name: display_name,
@@ -2883,10 +2907,22 @@ impl crate::app::App {
     /// 到達した方が描く**。frame 番号で持つのは、tail ごと飛ぶ frame があり bool では
     /// clear する場所が無いから。
     pub(crate) fn show_external_tool_modals(&mut self, ctx: &egui::Context) {
-        if self.external_tool_launch_ui_frame == Some(self.frame_counter) {
+        let viewport = ctx.viewport_id();
+        if self.external_tool_launch_ui_frame == Some((viewport, self.frame_counter)) {
             return;
         }
-        self.external_tool_launch_ui_frame = Some(self.frame_counter);
+        self.external_tool_launch_ui_frame = Some((viewport, self.frame_counter));
+        let owner = self.external_tool_modal_viewport;
+        if viewport == owner {
+            self.external_tool_modal_owner_drawn_frame = Some(self.frame_counter);
+        }
+        if !external_tool_modal_viewport_draws(
+            viewport,
+            owner,
+            self.external_tool_modal_owner_drawn_frame == Some(self.frame_counter),
+        ) {
+            return;
+        }
         self.show_external_tool_picker(ctx);
         self.show_external_tool_launch_confirmation(ctx);
         self.show_external_tool_materialize_progress(ctx);
@@ -3290,8 +3326,67 @@ mod tests {
         let owner = "self.show_external_tool_modals(ctx)";
         assert_eq!(
             app.matches(owner).count() + fullscreen.matches(owner).count(),
-            2,
-            "描き手は main update の tail と fullscreen body の 2 か所から呼ぶ              (フルスクリーン中は tail が飛ぶため)"
+            3,
+            concat!(
+                "描き手は update_frame の tail / fullscreen body / ",
+                "`eframe::App::update` の取りこぼし拾いの 3 か所"
+            )
+        );
+    }
+
+    /// modal は「利用者がその操作をした窓」が描く。先着では決めない。
+    ///
+    /// viewer の viewport は main の tail より前に描くので、先着にすると背面の F12 窓が
+    /// main 由来の modal を攫い、前面の main は「ダイアログが無いのに入力だけ止まる」に
+    /// なる (Codex Sol 指摘 #3)。
+    #[test]
+    fn the_window_the_user_acted_in_owns_the_modal() {
+        let root = egui::ViewportId::ROOT;
+        let detached = egui::ViewportId::from_hash_of("detached-viewer");
+        let fullscreen = egui::ViewportId::from_hash_of("fullscreen");
+
+        // main 由来の要求: 先に描く背面 F12 窓は描かず、main が描く。
+        assert!(!external_tool_modal_viewport_draws(detached, root, false));
+        assert!(external_tool_modal_viewport_draws(root, root, false));
+
+        // F12 窓由来の要求: その窓が描き、main は肩代わりしない。
+        assert!(external_tool_modal_viewport_draws(
+            detached, detached, false
+        ));
+        assert!(!external_tool_modal_viewport_draws(root, detached, true));
+
+        // 所有 viewport が消えた frame (フルスクリーンを閉じる起動 / native 動画の早期
+        // return) は main が肩代わりする。しないと ACK が来ず、起動が永久に始まらない。
+        assert!(external_tool_modal_viewport_draws(root, fullscreen, false));
+        assert!(!external_tool_modal_viewport_draws(
+            detached, fullscreen, false
+        ));
+    }
+
+    /// `update_frame` が早期 return した frame でも、modal の描画と spawn 境界の ACK は
+    /// 落ちない。
+    ///
+    /// native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の 3 経路は、tail まで
+    /// 到達しない。フルスクリーンで動画へ移動しただけで準備中の要求が ACK されなくなり、
+    /// 動画を閉じるまで外部ツールが起動しない状態になっていた (Codex Sol 指摘 #2)。
+    #[test]
+    fn the_launch_boundary_is_acked_even_when_the_frame_body_returns_early() {
+        let app = include_str!("app.rs");
+        let wrapper = app
+            .split_once("self.update_frame(ctx, frame);")
+            .expect("`eframe::App::update` は本体を update_frame へ委譲すること")
+            .1;
+        let tail: String = wrapper.lines().take(20).collect::<Vec<_>>().join(
+            "
+",
+        );
+        assert!(
+            tail.contains("self.show_external_tool_modals(ctx);"),
+            "早期 return を飛び越える tail で modal を描いていない"
+        );
+        assert!(
+            tail.contains("self.authorize_external_tool_launch_boundaries_after_ui();"),
+            "早期 return を飛び越える tail で spawn 境界を ACK していない"
         );
     }
 

@@ -1564,6 +1564,7 @@ impl crate::app::App {
                 // (2026-09-01 に別件の調査中に発見)。
                 match launch_target.real_file() {
                     Ok(file) => self.start_open_with(
+                        ctx,
                         display_name,
                         crate::external_tool::ExternalToolLaunch::Association { handler_id },
                         file.to_path_buf(),
