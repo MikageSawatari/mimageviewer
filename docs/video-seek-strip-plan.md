@@ -423,7 +423,8 @@ TimeGrid を選ぶ。
 利用者要望。**現行の「再生位置を中央に固定して周辺を流す表示」はそのまま残し、動画全体を
 横幅へ収めた表示を選べるようにする。** 用途は精密なフレーム選択ではなく、**高さ 32〜48px
 程度の小さなサムネイルで場面や明るさの大まかな違いを把握すること** (粗い時間間隔で可、と
-利用者に確認済み)。正本は backlog §1.155。
+利用者に確認済み)。backlog §1.155 から起こし、**着地時にその項目は消したので、以降は
+本書が正本**。高さは実機確認で 4 段になった (下の D29)。
 
 | # | 決定 | 補足 |
 | --- | --- | --- |
@@ -916,7 +917,7 @@ enum SeekRowGesture {
 | # | 論点 | 決まったこと |
 | --- | --- | --- |
 | U2 | `KeyframeIndex` と `TimeGrid` の判定式 | `decide_strip_axis` (`seek_strip.rs`)。**主判定は「最後のキーフレームが、素材内で観測した最大 GOP 1 個分以内に末尾へ到達しているか」**。percentage coverage を主判定にすると短尺・長 GOP 素材を誤って拒否するので採らない。timestamp が単調でない索引は無条件で `TimeGrid`。加えて D24 で、完全な索引でも最大 raw GOP が `SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS = 15.0` を越える素材は復号前に `Unavailable` とする |
-| U3 | ストリップの高さ・セル幅・枚数 | §1.155 以降は `SeekStripLayout` (`seek_strip_layout.rs`) が所有する。高さは大 104 / 中 72 / 小 48pt、周辺表示のセル幅は 152 / 102 / 64pt (大は出荷済みの値を維持)。**枚数は既定値を持たない**。周辺表示は帯幅から `ceil(width / cell_width) + 2`、全体表示は高さと動画の縦横比から `round(width / (高さ x 比))` を出し、`RequestSeekStripWindow` で App へ渡す |
+| U3 | ストリップの高さ・セル幅・枚数 | 全体表示と高さプリセット以降は `SeekStripLayout` (`seek_strip_layout.rs`) が所有する。高さは大 104 / 中 72 / 小 48 / 最小 36pt、周辺表示のセル幅は 152 / 102 / 64 / 45pt (大は出荷済みの値を維持)。**枚数は既定値を持たない**。周辺表示は帯幅から `ceil(width / cell_width) + 2`、全体表示は高さと動画の縦横比から `round(width / (高さ x 比))` を出し、`RequestSeekStripWindow` で App へ渡す |
 | U4 | ストリップ用サムネイルの抽出幅 | `STRIP_THUMB_EXTRACT_WIDTH = 320` (`seek_strip_thumbs.rs`)。出発点のまま。22,811 件の実素材 sweep でも容量・見やすさの問題は出なかったので変えない |
 | U5 | 窓の `bin_secs` | `waveform_bin_secs(span_secs, pixel_width)` (`seek_strip_wave.rs`)。**描画 1 物理画素あたり解析 1 bin を上限**にし、ミリ秒へ丸めてキャッシュキーを安定させ、下限は解析側の 10ms。粗い全尺列だけは別で、表示密度に依らず `COARSE_BIN_SECS = 0.100` 固定 (D27) |
 ## 10. スコープ外
