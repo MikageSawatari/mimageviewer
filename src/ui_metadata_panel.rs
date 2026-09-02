@@ -16,6 +16,62 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 
+/// 鍵アイコンをベクターで描く。
+///
+/// **フォント依存の記号 (🔒 / 🔓) を使わない。** Yu Gothic には無く、環境によって豆腐に
+/// なる (CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」)。開錠時は弦を右上へずらす。
+fn draw_panel_lock_glyph(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
+    let color = if locked {
+        egui::Color32::from_gray(240)
+    } else {
+        egui::Color32::from_gray(215)
+    };
+    let stroke = egui::Stroke::new(1.6, color);
+    let center = rect.center();
+    let unit = rect.width().min(rect.height());
+    let body_w = unit * 0.46;
+    let body_h = unit * 0.34;
+    let body = egui::Rect::from_center_size(
+        egui::pos2(center.x, center.y + unit * 0.14),
+        egui::vec2(body_w, body_h),
+    );
+    painter.rect_filled(body, unit * 0.06, color);
+
+    // 弦。閉じているときは本体の中央上、開いているときは右へずらして片側だけ立てる。
+    let shackle_r = unit * 0.17;
+    let shackle_center = egui::pos2(
+        center.x + if locked { 0.0 } else { unit * 0.16 },
+        body.top() - shackle_r * 0.15,
+    );
+    let mut arc = Vec::new();
+    for step in 0..=12 {
+        let t = step as f32 / 12.0;
+        let angle = std::f32::consts::PI * (1.0 + t);
+        arc.push(egui::pos2(
+            shackle_center.x + shackle_r * angle.cos(),
+            shackle_center.y + shackle_r * angle.sin(),
+        ));
+    }
+    painter.add(egui::Shape::line(arc, stroke));
+    // 閉じているときだけ左脚を本体まで下ろす。
+    if locked {
+        painter.line_segment(
+            [
+                egui::pos2(shackle_center.x - shackle_r, shackle_center.y),
+                egui::pos2(shackle_center.x - shackle_r, body.top()),
+            ],
+            stroke,
+        );
+    }
+    painter.line_segment(
+        [
+            egui::pos2(shackle_center.x + shackle_r, shackle_center.y),
+            egui::pos2(shackle_center.x + shackle_r, body.top()),
+        ],
+        stroke,
+    );
+}
+
 #[derive(Clone)]
 struct TagPanelRow {
     label: Option<String>,
@@ -70,14 +126,18 @@ impl App {
             && crate::ui_fullscreen::metadata_panel_hover_active_at(
                 full_rect,
                 pointer_pos,
-                self.metadata_panel_hover_active,
+                self.fs_info_panel.hover_active,
                 navigator_exclusion,
             );
-        self.metadata_panel_hover_active = !explicit && hover_visible;
+        self.fs_info_panel.hover_active = !explicit && hover_visible;
     }
 
-    /// フルスクリーンでメタデータパネルをオーバーレイ描画する。
-    /// 画像は常に `full_rect` 全体に表示し、パネルは画像の上に重ねる。
+    /// フルスクリーンで右情報パネルを描画する。
+    ///
+    /// ロック OFF では画像へ重ねる。ロック ON では画像側が右を空けているので重ならない
+    /// (領域を空けるかどうかは `still_info_panel_lock_effective_for_idx` が決め、ここは
+    /// 同じ答えを `lock_effective` として受け取る。両者が別々に条件を綴ると、パネルを
+    /// 描かないモードで右に空白の帯が残る。backlog §1.158)。
     ///
     /// 表示条件:
     /// - 通常ホバー: マウスカーソルが画面右端にある間
@@ -92,8 +152,9 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
+        lock_effective: bool,
     ) -> bool {
-        self.draw_metadata_panel_inner(ui, ctx, full_rect)
+        self.draw_metadata_panel_inner(ui, ctx, full_rect, lock_effective)
     }
 
     fn draw_metadata_panel_inner(
@@ -101,6 +162,7 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         full_rect: egui::Rect,
+        lock_effective: bool,
     ) -> bool {
         let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
 
@@ -114,11 +176,14 @@ impl App {
             !self.still_touch_chrome_is_latched(ctx),
             navigator_exclusion,
         );
-        let hover_visible = self.metadata_panel_hover_active;
-        let explicit = self.metadata_panel_click_shown();
-
-        let visible = explicit || self.fullscreen_tag_picker_open || hover_visible;
-        if !visible {
+        // 表示するかの答えは `FullscreenInfoPanelState` だけが出す。ロックは実効値を使う。
+        let mut panel_state = self.fs_info_panel;
+        panel_state.locked = lock_effective;
+        let explicit = panel_state.explicit_shown(self.settings.fullscreen_side_panel_mode);
+        if !panel_state.visible(
+            self.settings.fullscreen_side_panel_mode,
+            self.fullscreen_tag_picker_open,
+        ) {
             return false;
         }
 
@@ -174,10 +239,49 @@ impl App {
             egui::Color32::from_gray(200),
         );
 
+        // 鍵ボタン。ON では画像へ重ねず、右にパネル幅の領域を確保する (backlog §1.158)。
+        // 閉じるボタンの左隣に置き、ロック中は閉じるボタンを出さない (閉じるのは解錠が先)。
+        let button_size = 22.0;
+        let button_margin = 5.0;
+        let lock_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                title_rect.max.x - button_size - button_margin,
+                title_rect.min.y + (TITLE_BAR_H - button_size) * 0.5,
+            ),
+            egui::vec2(button_size, button_size),
+        );
+        let lock_resp = ui.interact(
+            lock_rect,
+            egui::Id::new("metadata_lock_btn"),
+            egui::Sense::click(),
+        );
+        let locked_now = self.fs_info_panel.locked;
+        let lock_bg = if locked_now {
+            egui::Color32::from_rgba_unmultiplied(90, 110, 150, 220)
+        } else if lock_resp.hovered() {
+            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 200)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(lock_rect, 3.0, lock_bg);
+        draw_panel_lock_glyph(ui.painter(), lock_rect, locked_now);
+        let lock_hint = if locked_now {
+            "固定を解除 (画像へ重ねる一時表示に戻す)"
+        } else {
+            "パネルを固定 (画像に重ねず、前後へ移動しても表示したまま)"
+        };
+        if lock_resp.on_hover_text(lock_hint).clicked() {
+            self.fs_info_panel.locked = !locked_now;
+            if !self.fs_info_panel.locked {
+                // 解錠したら、その場の明示 open として残す (パネルが消えると操作を見失う)。
+                self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            }
+        }
+
         // pointer / touch handle で明示的に開いた右パネルを閉じるボタン。
-        if explicit {
+        if explicit && !locked_now {
             let close_size = 22.0;
-            let close_margin = 5.0;
+            let close_margin = 5.0 + button_size + 4.0;
             let close_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     title_rect.max.x - close_size - close_margin,

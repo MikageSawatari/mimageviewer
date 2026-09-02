@@ -839,6 +839,9 @@ pub(in crate::app) struct ViewerContextBundle {
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
     panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
+    /// App-global に置くと別ウィンドウの操作で他方のパネルが開閉する (backlog §1.158)。
+    fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
     pano_toast_shown_for_current_fs: bool,
     analysis_mode: bool,
     analysis_hover_color: Option<[u8; 4]>,
@@ -1392,6 +1395,7 @@ impl ViewerContextBundle {
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
             panorama_state: None,
+            fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
             analysis_mode: false,
             analysis_hover_color: None,
@@ -1717,6 +1721,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,
@@ -1960,6 +1965,7 @@ impl App {
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
+        swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
         swap_field!(analysis_mode);
         swap_field!(analysis_hover_color);
@@ -2234,6 +2240,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,
@@ -2438,6 +2445,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
             analysis_hover_color,

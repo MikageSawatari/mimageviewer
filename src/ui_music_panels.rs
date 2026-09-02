@@ -584,7 +584,7 @@ impl App {
         let mut close_requested = false;
         if music_side_panel_close_visible(
             self.settings.fullscreen_side_panel_mode,
-            self.fs_info_panel_open,
+            self.fs_info_panel.open,
         ) {
             let close_rect = egui::Rect::from_center_size(
                 egui::pos2(title_rect.right() - 16.0, title_rect.center().y),

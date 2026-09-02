@@ -2294,6 +2294,43 @@ struct StillSidePanelChromeInputs {
     animated: bool,
 }
 
+/// 右情報パネルのロックが**効くか**を決める入力。
+///
+/// ロックは「重ねずに右へ領域を確保する」なので、**確保する条件と描く条件が同じ**でなければ
+/// ならない。別々に綴ると、パネルを描かないモードで右だけ空白の帯が残る (backlog §1.158)。
+/// ここに並ぶのは、パネルを描かないモードとして描画側の分岐が既に持っている条件である。
+#[derive(Clone, Copy)]
+struct StillInfoPanelLockInputs {
+    is_music_view: bool,
+    is_video: bool,
+    video_tile_active: bool,
+    local_adjust_active: bool,
+    sns_split_active: bool,
+    export_crop_active: bool,
+    view_trim_active: bool,
+    analysis_active: bool,
+    panorama_active: bool,
+    compare_wipe_active: bool,
+    overlay_edit_active: bool,
+    zoom_active: bool,
+}
+
+fn still_info_panel_lock_effective(locked: bool, input: StillInfoPanelLockInputs) -> bool {
+    locked
+        && !input.is_music_view
+        && !input.is_video
+        && !input.video_tile_active
+        && !input.local_adjust_active
+        && !input.sns_split_active
+        && !input.export_crop_active
+        && !input.view_trim_active
+        && !input.analysis_active
+        && !input.panorama_active
+        && !input.compare_wipe_active
+        && !input.overlay_edit_active
+        && !input.zoom_active
+}
+
 fn still_side_panel_chrome_enabled(input: StillSidePanelChromeInputs) -> bool {
     !input.is_music_view
         && !input.analysis_active
@@ -8006,11 +8043,20 @@ fn compare_shader_visible_region(
     Some((visible, [uv_min.x, uv_min.y, uv_max.x, uv_max.y]))
 }
 
+/// 固定表示中の上下バーと、ロック中の右情報パネルを除いた画像の表示領域。
+///
+/// **画像の矩形を決めるのはここ 1 か所。** 描画・ズーム・パン・hit-test・ルーペ・
+/// ナビゲータ・範囲コピーは、ここから解いた矩形か `fullscreen_page_layout` を見る。
+/// 見た目だけ画像を寄せて、入力座標を旧位置に残さないための境界である (backlog §1.158)。
+///
+/// `right_panel_width` は 0 でなければ右端を空ける。パネル自身の矩形と同じ値を渡すこと
+/// (別々に clamp すると幅が食い違う)。
 fn fullscreen_rect_excluding_fixed_bars(
     full_rect: egui::Rect,
     top_locked: bool,
     seek_locked: bool,
     fixed_bar_gap_px: u32,
+    right_panel_width: f32,
 ) -> egui::Rect {
     let gap = fixed_bar_gap_px.min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
     let top = if top_locked {
@@ -8023,10 +8069,13 @@ fn fullscreen_rect_excluding_fixed_bars(
     } else {
         full_rect.bottom()
     };
-    egui::Rect::from_min_max(
-        egui::pos2(full_rect.left(), top),
-        egui::pos2(full_rect.right(), bottom),
-    )
+    // 幅が足りなくても画像領域を潰さない。上下バーと同じ形で 1px は残す。
+    let right = if right_panel_width > 0.0 {
+        (full_rect.right() - right_panel_width).max(full_rect.left() + 1.0)
+    } else {
+        full_rect.right()
+    };
+    egui::Rect::from_min_max(egui::pos2(full_rect.left(), top), egui::pos2(right, bottom))
 }
 
 /// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
@@ -10432,7 +10481,7 @@ impl App {
         }
         let left_open = self.adjustment_mode.is_open();
         let right_open = self.metadata_panel_click_shown()
-            || self.metadata_panel_hover_active
+            || self.fs_info_panel.hover_active
             || self.fullscreen_tag_picker_open;
         for (edge, rect) in [
             crate::ui_helpers::PanelEdge::Left,
@@ -10583,10 +10632,10 @@ impl App {
             self.music_left_panel_open = next;
         }
         if let Some(source) = right {
-            let next = music_panel_open_state_after_reach(mode, self.fs_info_panel_open, source);
-            if next != self.fs_info_panel_open {
-                self.fs_info_panel_open = next;
-                self.metadata_panel_hover_active = false;
+            let next = music_panel_open_state_after_reach(mode, self.fs_info_panel.open, source);
+            if next != self.fs_info_panel.open {
+                self.fs_info_panel.open = next;
+                self.fs_info_panel.hover_active = false;
                 changed = true;
             }
         }
@@ -13252,6 +13301,33 @@ impl App {
             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
     }
 
+    /// 右情報パネルのロックが**いま効いているか**。
+    ///
+    /// **表示領域を確保する側と、パネルを描く側の両方がこれを見る。**片方だけが別の条件を
+    /// 綴ると、パネルを描かないモードで右に空白の帯が残る (backlog §1.158)。
+    fn still_info_panel_lock_effective_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
+        still_info_panel_lock_effective(
+            self.fs_info_panel.locked,
+            StillInfoPanelLockInputs {
+                is_music_view: self.fs_music_view_active(fs_idx),
+                is_video,
+                video_tile_active: self.video_tile_mode_active,
+                local_adjust_active: self.local_adjust_mode,
+                sns_split_active: self.sns_split.is_some(),
+                export_crop_active: self.export_crop_mode,
+                view_trim_active: self.view_trim_mode,
+                analysis_active: self.analysis_mode,
+                panorama_active: self.is_panorama_mode_active(fs_idx),
+                compare_wipe_active: matches!(
+                    self.compare_view_mode,
+                    crate::app::CompareViewMode::Wipe { .. }
+                ),
+                overlay_edit_active: self.is_overlay_edit_mode_active(),
+                zoom_active: self.fs_zoom_mode_engaged(),
+            },
+        )
+    }
+
     fn fullscreen_media_rect(
         &self,
         full_rect: egui::Rect,
@@ -13263,6 +13339,9 @@ impl App {
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
             self.settings.fullscreen_fixed_bar_gap_px,
+            self.still_info_panel_lock_effective_for_idx(fs_idx, is_video)
+                .then(|| metadata_panel_rect(full_rect).width())
+                .unwrap_or(0.0),
         )
     }
 
@@ -15228,6 +15307,9 @@ impl App {
                         // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
                         // (= 上バーの 360 / × / window のみ、機能制限モード)。
                         let panorama_mode_active_now = self.is_panorama_mode_active(fs_idx);
+                        // 画像領域を狭めた側と同じ答えを描画側にも渡す (§1.158)。
+                        let info_panel_lock_effective =
+                            self.still_info_panel_lock_effective_for_idx(fs_idx, state.is_video);
                         let analysis_active =
                             self.analysis_mode && !is_spread_double && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
@@ -15912,7 +15994,12 @@ impl App {
                             side_panel_visible = true;
                             let panel_rect = adjustment_panel_rect(full_rect);
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
-                            right_panel_visible = self.draw_metadata_panel(ui, ctx, full_rect);
+                            right_panel_visible = self.draw_metadata_panel(
+                                ui,
+                                ctx,
+                                full_rect,
+                                info_panel_lock_effective,
+                            );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
@@ -15930,7 +16017,12 @@ impl App {
                             // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
                             // 低下を避けるためメタデータ右パネル全体を抑制する。
                             // ZipPla ズーム中も右パネルは抑止する (パン操作を邪魔しない)。
-                            right_panel_visible = self.draw_metadata_panel(ui, ctx, full_rect);
+                            right_panel_visible = self.draw_metadata_panel(
+                                ui,
+                                ctx,
+                                full_rect,
+                                info_panel_lock_effective,
+                            );
                             side_panel_visible = right_panel_visible;
                         }
                         let callouts_enabled =
@@ -23407,7 +23499,7 @@ impl App {
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
         let has_right_panel = self.metadata_panel_click_shown()
-            || self.metadata_panel_hover_active
+            || self.fs_info_panel.hover_active
             || self.fullscreen_tag_picker_open;
         let music_modal_open = music_view_active
             && (self.music_bookmark_modal_open()
@@ -23423,7 +23515,7 @@ impl App {
             && music_right_panel_visible_from_inputs(
                 self.settings.fullscreen_side_panel_mode,
                 self.music_right_panel_active,
-                self.fs_info_panel_open,
+                self.fs_info_panel.open,
                 music_modal_open,
             );
         // When the OS cursor is hidden, egui still exposes the last hover position.
@@ -23839,7 +23931,7 @@ impl App {
                 if touch_panel_tap_command_dismisses_before_dispatch(
                     command,
                     self.adjustment_mode,
-                    self.fs_info_panel_open,
+                    self.fs_info_panel.open,
                 ) {
                     // The two panels form one modal touch-owned group: a canvas
                     // tap outside them closes both touch-owned sides and is not
@@ -24378,7 +24470,7 @@ impl App {
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
                                 let has_right_panel = self.metadata_panel_click_shown()
-                                    || self.metadata_panel_hover_active
+                                    || self.fs_info_panel.hover_active
                                     || self.fullscreen_tag_picker_open;
                                 let in_side_panel = fullscreen_side_panel_contains_pointer(
                                     full_rect,
@@ -30845,7 +30937,7 @@ impl App {
             && !in_right
             && !in_left_callout
             && !self.metadata_panel_click_shown()
-            && !self.metadata_panel_hover_active
+            && !self.fs_info_panel.hover_active
             && !self.adjustment_mode.is_open()
             && !self.view_trim_mode
             && !self.is_overlay_edit_mode_active()
@@ -36761,7 +36853,7 @@ impl App {
             self.music_left_panel_active,
             self.music_right_panel_active,
             self.music_left_panel_open,
-            self.fs_info_panel_open,
+            self.fs_info_panel.open,
             music_modal_open,
         );
         let left_hover = frame_ui.left_panel_visible;
@@ -43179,7 +43271,7 @@ mod tests {
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
-        app.metadata_panel_hover_active = true;
+        app.fs_info_panel.hover_active = true;
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
@@ -43215,7 +43307,7 @@ mod tests {
         );
 
         assert_eq!(result, (FsPageNav::None, false));
-        assert!(!app.metadata_panel_hover_active);
+        assert!(!app.fs_info_panel.hover_active);
         assert!(!app.adjustment_mode.is_open());
     }
 
@@ -45661,13 +45753,13 @@ mod tests {
 
         app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
         assert_eq!(
-            app.fs_info_panel_open,
+            app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
         );
         assert!(app.metadata_panel_click_shown());
         app.open_still_side_panel_by_touch(StillSidePanelAction::OpenMetadata);
         assert_eq!(
-            app.fs_info_panel_open,
+            app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
         );
     }
@@ -45686,7 +45778,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
         app.adjustment_mode = ByTouchHandle;
-        app.fs_info_panel_open = ByTouchHandle;
+        app.fs_info_panel.open = ByTouchHandle;
 
         for command in [
             TouchCommand::ToggleChrome,
@@ -45696,25 +45788,25 @@ mod tests {
             assert!(touch_panel_tap_command_dismisses_before_dispatch(
                 command,
                 app.adjustment_mode,
-                app.fs_info_panel_open
+                app.fs_info_panel.open
             ));
         }
         assert!(app.close_touch_owned_side_panels());
         assert_eq!(app.adjustment_mode, Closed);
-        assert_eq!(app.fs_info_panel_open, Closed);
+        assert_eq!(app.fs_info_panel.open, Closed);
 
         // Pointer ownership retains the established mouse contract: canvas
         // clicks are dispatched normally and do not dismiss either panel.
         app.adjustment_mode = ByPointer;
-        app.fs_info_panel_open = ByPointer;
+        app.fs_info_panel.open = ByPointer;
         assert!(!touch_panel_tap_command_dismisses_before_dispatch(
             TouchCommand::ToggleChrome,
             app.adjustment_mode,
-            app.fs_info_panel_open
+            app.fs_info_panel.open
         ));
         assert!(!app.close_touch_owned_side_panels());
         assert_eq!(app.adjustment_mode, ByPointer);
-        assert_eq!(app.fs_info_panel_open, ByPointer);
+        assert_eq!(app.fs_info_panel.open, ByPointer);
     }
 
     #[test]
@@ -45772,7 +45864,7 @@ mod tests {
         app.settings.touch_still_chrome_learned = true;
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
         app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
-        app.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
         app.fs_zoom = 2.0;
         let state = FsFrameState {
             is_video: false,
@@ -45832,7 +45924,7 @@ mod tests {
             crate::ui_helpers::MetadataPanelOpenState::Closed
         );
         assert_eq!(
-            app.fs_info_panel_open,
+            app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::Closed
         );
         assert!(
@@ -47447,6 +47539,85 @@ mod tests {
         assert!(still_touch_chrome_latched(&ctx, 7, Some(reopened)));
         toggle_still_touch_chrome_latch(&ctx, 7, Some(reopened));
         assert!(!still_touch_chrome_latched(&ctx, 7, Some(reopened)));
+    }
+
+    /// ロック中の画像領域は、**パネル矩形と同じ幅ちょうど**だけ右を空ける (backlog §1.158)。
+    ///
+    /// 予約幅を別に綴ると、画像の右端とパネルの左端が食い違って隙間か重なりが出る。
+    /// 幅が足りないときも画像領域を潰さない。
+    #[test]
+    fn the_locked_info_panel_takes_exactly_its_own_width_from_the_image() {
+        for size in [
+            egui::vec2(2560.0, 1440.0),
+            egui::vec2(900.0, 700.0),
+            egui::vec2(600.0, 800.0),
+            // パネルが幅の半分まで縮む極端な幅。
+            egui::vec2(120.0, 400.0),
+        ] {
+            let full = egui::Rect::from_min_size(egui::pos2(11.0, 7.0), size);
+            let panel = metadata_panel_rect(full);
+            let unlocked = fullscreen_rect_excluding_fixed_bars(full, false, false, 0, 0.0);
+            let locked = fullscreen_rect_excluding_fixed_bars(full, false, false, 0, panel.width());
+            assert_eq!(unlocked.right(), full.right(), "ロック無しでは右を空けない");
+            assert!(
+                (locked.right() - panel.left()).abs() < 0.01,
+                "size={size:?}: 画像の右端 {} とパネルの左端 {} が合っていない",
+                locked.right(),
+                panel.left()
+            );
+            assert!(locked.width() >= 1.0, "size={size:?}: 画像領域が潰れた");
+            assert_eq!(locked.left(), full.left());
+            assert_eq!(locked.top(), unlocked.top());
+            assert_eq!(locked.bottom(), unlocked.bottom());
+        }
+    }
+
+    /// パネルを描かないモードでは**ロックも効かない**。
+    ///
+    /// 効かせると右に空白の帯だけが残る。予約する側と描く側が同じ答えを見るための
+    /// 述語なので、モードを 1 つずつ落として全部が抑止することを確かめる
+    /// (backlog §1.158、Codex の 2026-09-02 レビュー指摘 4)。
+    #[test]
+    fn every_mode_that_hides_the_info_panel_also_drops_the_lock() {
+        let none = StillInfoPanelLockInputs {
+            is_music_view: false,
+            is_video: false,
+            video_tile_active: false,
+            local_adjust_active: false,
+            sns_split_active: false,
+            export_crop_active: false,
+            view_trim_active: false,
+            analysis_active: false,
+            panorama_active: false,
+            compare_wipe_active: false,
+            overlay_edit_active: false,
+            zoom_active: false,
+        };
+        assert!(still_info_panel_lock_effective(true, none));
+        assert!(!still_info_panel_lock_effective(false, none));
+
+        let suppressors: [(&str, fn(&mut StillInfoPanelLockInputs)); 12] = [
+            ("music", |i| i.is_music_view = true),
+            ("video", |i| i.is_video = true),
+            ("video_tile", |i| i.video_tile_active = true),
+            ("local_adjust", |i| i.local_adjust_active = true),
+            ("sns_split", |i| i.sns_split_active = true),
+            ("export_crop", |i| i.export_crop_active = true),
+            ("view_trim", |i| i.view_trim_active = true),
+            ("analysis", |i| i.analysis_active = true),
+            ("panorama", |i| i.panorama_active = true),
+            ("compare_wipe", |i| i.compare_wipe_active = true),
+            ("overlay_edit", |i| i.overlay_edit_active = true),
+            ("zoom", |i| i.zoom_active = true),
+        ];
+        for (name, apply) in suppressors {
+            let mut inputs = none;
+            apply(&mut inputs);
+            assert!(
+                !still_info_panel_lock_effective(true, inputs),
+                "{name} 中にロックが効いている (右が空白の帯になる)"
+            );
+        }
     }
 
     #[test]
@@ -49429,7 +49600,7 @@ mod tests {
     fn locked_seek_bar_reserves_bottom_media_rect() {
         let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
         let panel = fullscreen_seek_panel_rect(full);
-        let media = fullscreen_rect_excluding_fixed_bars(full, false, true, 0);
+        let media = fullscreen_rect_excluding_fixed_bars(full, false, true, 0, 0.0);
 
         assert_eq!(panel.top(), 800.0 - FS_SEEK_BAR_HEIGHT);
         assert_eq!(panel.bottom(), 800.0);
@@ -49441,7 +49612,7 @@ mod tests {
     #[test]
     fn locked_top_and_seek_bars_reserve_both_edges_of_media_rect() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0);
+        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0, 0.0);
 
         assert_eq!(media.top(), TOP_BAR_HEIGHT);
         assert_eq!(media.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT);
@@ -49451,11 +49622,11 @@ mod tests {
     #[test]
     fn fixed_bar_gap_is_subtracted_only_at_locked_edges() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let both = fullscreen_rect_excluding_fixed_bars(full, true, true, 24);
+        let both = fullscreen_rect_excluding_fixed_bars(full, true, true, 24, 0.0);
         assert_eq!(both.top(), TOP_BAR_HEIGHT + 24.0);
         assert_eq!(both.bottom(), 800.0 - FS_SEEK_BAR_HEIGHT - 24.0);
 
-        let hover_bars = fullscreen_rect_excluding_fixed_bars(full, false, false, 24);
+        let hover_bars = fullscreen_rect_excluding_fixed_bars(full, false, false, 24, 0.0);
         assert_eq!(hover_bars, full);
 
         let panel = fullscreen_seek_panel_rect(full);
@@ -49470,7 +49641,7 @@ mod tests {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         let top_bar = fullscreen_top_bar_rect(full);
         let seek_panel = fullscreen_seek_panel_rect(full);
-        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0);
+        let media = fullscreen_rect_excluding_fixed_bars(full, true, true, 0, 0.0);
         const HALF_STROKE: f32 = 0.5;
 
         let top_y = fullscreen_top_bar_separator_y(top_bar, true);

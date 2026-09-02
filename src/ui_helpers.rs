@@ -348,6 +348,59 @@ impl MetadataPanelOpenState {
     }
 }
 
+/// 右情報パネルの表示状態。**viewer context ごとの一時状態**で、正本は
+/// `ViewerContextBundle`、`App` 側はマウント中 context の投影である。
+///
+/// 明示 open (`open`)・ロック (`locked`)・ホバー latch (`hover_active`) を 1 つの型に
+/// まとめるのは、「いまこのウィンドウでパネルが出ているか」という**1 つの問いの答えを
+/// 出す場所を 1 か所にする**ため。裸の bool を並べると、ロックしているのに閉じている、
+/// のような矛盾した組を作れてしまう (backlog §1.158)。
+///
+/// App-global にしてはならない。`with_viewer_context` は bundle のフィールドだけを
+/// 差し替えて別ウィンドウの入力・描画を走らせるので、global に置くと**別ウィンドウの
+/// 操作で他方のパネルが開閉する** (Codex の 2026-09-02 レビューで確認済み)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FullscreenInfoPanelState {
+    /// 明示 open を生成した入力 owner。**現在ファイルだけの transient 状態。**
+    pub(crate) open: MetadataPanelOpenState,
+    /// 鍵ボタンによる固定。ON では画像へ重ねず、右に領域を確保する。
+    pub(crate) locked: bool,
+    /// 右端ホバーで開いた状態の latch。カーソルがパネル内にいる間だけ維持する。
+    pub(crate) hover_active: bool,
+}
+
+impl FullscreenInfoPanelState {
+    /// 明示 open として扱うか (ホバーとロックを除く)。
+    pub(crate) fn explicit_shown(self, mode: crate::settings::FsSidePanelMode) -> bool {
+        metadata_panel_explicit_shown(mode, self.open)
+    }
+
+    /// パネルを描くか。**この問いの答えはここだけが出す。**
+    ///
+    /// `tag_picker_open` は編集中のタグ候補が開いている間の維持。呼び出し側が
+    /// 「ロックなら描く」を別に書くと、予約領域と描画の可否が割れて空白帯になる。
+    pub(crate) fn visible(
+        self,
+        mode: crate::settings::FsSidePanelMode,
+        tag_picker_open: bool,
+    ) -> bool {
+        self.locked || self.explicit_shown(mode) || tag_picker_open || self.hover_active
+    }
+
+    /// 前後のファイル / ページへ移ったとき。**ロック中は維持し、内容だけ更新する。**
+    pub(crate) fn on_display_target_changed(&mut self) {
+        if !self.locked {
+            self.open = MetadataPanelOpenState::Closed;
+            self.hover_active = false;
+        }
+    }
+
+    /// フルスクリーンを本当に出たとき。ロックは次回へ持ち越さない。
+    pub(crate) fn on_fullscreen_exit(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// 現在の mode と owner から、明示 open の右情報パネルを表示するか解決する。
 pub(crate) fn metadata_panel_explicit_shown(
     mode: crate::settings::FsSidePanelMode,

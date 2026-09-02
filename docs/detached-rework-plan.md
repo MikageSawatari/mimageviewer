@@ -1459,6 +1459,50 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-02 §1.158 で、右情報パネルの表示状態を `ViewerContextBundle` 所有へ移す
+(ClaudeCode が案を起票し、Codex が §2 / BA-7 に照らして「所有先は正解」と判定。ただし
+「lock の bool 追加だけ」は不承認で、以下の条件付き同意):**
+
+**触った範囲**: [src/ui_helpers.rs](../src/ui_helpers.rs) の `FullscreenInfoPanelState` 新設、
+[src/app.rs](../src/app.rs) の `fs_info_panel_open` / `metadata_panel_hover_active` を
+その型へ統合、[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+bundle field 追加 (宣言 / `empty()` / swap / fork 分類)、
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の `fullscreen_rect_excluding_fixed_bars` へ
+右予約幅を追加、[src/ui_metadata_panel.rs](../src/ui_metadata_panel.rs) の鍵ボタン。
+detached / switching predicate、viewport ID / 登録 / recreate、runtime / host ownership、
+placement / focus / window lifecycle は変更しない。
+
+**不変条件と所有境界**: 明示 open・ロック・ホバー latch を 1 つの型にまとめ、正本を bundle、
+`App` 側をマウント中 context の投影とする。`panorama_state` / `fs_zoom` と同じ形で、fork では
+`move_to_parked` 群 (= フルスクリーンの閲覧セッションが parked 側へ移り、main は既定へ戻る)。
+「いまこのウィンドウでパネルが出ているか」の答えは `FullscreenInfoPanelState::visible` だけが
+出す。表示領域を空ける側と描く側は同じ `still_info_panel_lock_effective` を通り、パネルを
+描かないモードではロックも効かない (でないと右に空白の帯が残る)。
+
+**なぜ症状パッチではないか**: BA-7 が禁じるのは detached 判定専用の App-global フラグで、
+右情報パネルは main / F12 共通の viewer-context UI 状態である。`DetachedWindowRuntime` は
+HWND / placement / 窓 lifecycle の所有者なので、そちらへ入れる方が責務違反になる。
+また `fs_info_panel_open` の App-global 据え置きには実害が確定していた —
+`with_viewer_context` は bundle field だけを swap して別ウィンドウの入力・描画を走らせるため、
+片方の窓の `open_fullscreen()` が他方の open owner を消す。§1.158 の「別ウィンドウの操作で
+他方のパネルが開閉しない」は、open の移動なしには満たせない。
+
+**close の意味付け**: `close_fullscreen` はフォルダ移動の再オープンでも呼ばれるため、
+「ロック中は reset しない」だけでは終了時も残る。既にその関数が持っている
+`preserve_viewport_for_folder_nav_reopen` (= viewport を保持して開き直すか) を close cause と
+して使い、新しいフラグは足していない。
+
+**凍結表示の扱い (2026-09-02 利用者判断)**: ロック中のウィンドウが非アクティブになったら、
+**画像の矩形は据え置き、パネルだけ描かない**。画像を全幅へ戻すと切り替えのたびにちらつき、
+幾何が動くこと自体が別の不具合を呼ぶため。凍結 snapshot 側に特別扱いは無く、live と同じ
+`fullscreen_media_rect` を通る。利用者向けには「パネルはアクティブなウィンドウでのみ見える」
+と説明する。
+
+**入力判定 (2026-09-02 利用者判断)**: マウスのページ送りとタップの左右判定は、画像ではなく
+**画面の左右**で決めたまま据え置く。Codex は非対称になると指摘したが、画像が左へ寄っても
+操作の当たり判定を動かさない方が良いという判断。意図的な仕様なので、後から「揃える」
+修正を入れないこと。
+
 **2026-09-01 §1.154 で、凍結 snapshot の clip / UV 導出を配置と同じ所有者へ寄せる
 (ClaudeCode が案を起票し、Codex が §2 に照らして「症状パッチではなく構造的修正」と同意。
 Codex の補正 5 点を反映):**

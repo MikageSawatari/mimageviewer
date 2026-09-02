@@ -10618,11 +10618,9 @@ pub struct App {
     /// 旧メタデータ固定表示フラグ。静止画経路は Settings 由来へ置換済み。
     /// detached context bundle の互換状態として後続 Run まで残す。
     pub(crate) show_metadata_panel: bool,
-    /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
-    pub(crate) metadata_panel_hover_active: bool,
-    /// 右情報パネルの明示 open owner。pointer は ClickToShow 専用、touch handle は
-    /// Hover でも表示する。現在ファイルだけの transient 状態。
-    pub(crate) fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
+    /// **正本は `ViewerContextBundle`**、ここはマウント中 context の投影である。
+    pub(crate) fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -13939,8 +13937,7 @@ impl App {
             search_index_db,
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
-            metadata_panel_hover_active: false,
-            fs_info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -38013,7 +38010,7 @@ impl App {
             self.toggle_analysis_mode();
         }
         self.show_metadata_panel = false;
-        self.metadata_panel_hover_active = false;
+        self.fs_info_panel.hover_active = false;
         self.fs_loupe_locked = false;
 
         self.persist_pending_view_trim_state();
@@ -52124,6 +52121,12 @@ impl App {
             self.fs_nav_locked_gen.is_some() && self.fs_viewport_shown;
 
         self.reset_fs_side_panel_runtime_for_file_change();
+        // **フォルダ移動の再オープンと、本当の終了を区別する。** この関数はフォルダ移動でも
+        // 呼ばれるので、単に「ロック中は reset しない」にすると終了時も残る (§1.158)。
+        // 判断は既にここにある viewport 保持の可否と同じ意味なので、新しいフラグは足さない。
+        if !preserve_viewport_for_folder_nav_reopen {
+            self.fs_info_panel.on_fullscreen_exit();
+        }
         self.fullscreen_idx = None;
         self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
         self.fs_pdf_display_target = None;
@@ -60561,7 +60564,7 @@ impl App {
     pub(crate) fn metadata_panel_click_shown(&self) -> bool {
         crate::ui_helpers::metadata_panel_explicit_shown(
             self.settings.fullscreen_side_panel_mode,
-            self.fs_info_panel_open,
+            self.fs_info_panel.open,
         )
     }
 
@@ -60590,9 +60593,11 @@ impl App {
     }
 
     fn close_fs_side_panel_runtime(&mut self) {
-        self.metadata_panel_hover_active = false;
+        // 右情報パネルはロック中だけ維持する。表示対象が変わっても内容を更新するだけで
+        // 閉じない、というのがロックの意味 (backlog §1.158)。ロックを解くのは
+        // フルスクリーンを本当に出たときだけで、その判断は `close_fullscreen` が持つ。
+        self.fs_info_panel.on_display_target_changed();
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
         self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
@@ -60601,11 +60606,11 @@ impl App {
     pub(crate) fn toggle_fullscreen_click_info_open(&mut self) {
         let next = crate::ui_helpers::toggle_side_panel_by_pointer(
             self.settings.fullscreen_side_panel_mode,
-            self.fs_info_panel_open,
+            self.fs_info_panel.open,
         );
-        if next != self.fs_info_panel_open {
-            self.fs_info_panel_open = next;
-            self.metadata_panel_hover_active = false;
+        if next != self.fs_info_panel.open {
+            self.fs_info_panel.open = next;
+            self.fs_info_panel.hover_active = false;
         }
     }
 
@@ -60628,9 +60633,9 @@ impl App {
     }
 
     pub(crate) fn open_fullscreen_touch_info_panel(&mut self) {
-        self.fs_info_panel_open =
-            crate::ui_helpers::open_side_panel_by_touch(self.fs_info_panel_open);
-        self.metadata_panel_hover_active = false;
+        self.fs_info_panel.open =
+            crate::ui_helpers::open_side_panel_by_touch(self.fs_info_panel.open);
+        self.fs_info_panel.hover_active = false;
     }
 
     pub(crate) fn close_fullscreen_adjustment_panel(&mut self) {
@@ -60641,8 +60646,8 @@ impl App {
     }
 
     pub(crate) fn close_fullscreen_info_panel(&mut self) {
-        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        self.metadata_panel_hover_active = false;
+        self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.fs_info_panel.hover_active = false;
     }
 
     /// A canvas tap outside the open panel group closes every touch-owned side
@@ -60652,7 +60657,7 @@ impl App {
         let close_left =
             self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
         let close_right =
-            self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+            self.fs_info_panel.open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
         if close_left {
             self.close_fullscreen_adjustment_panel();
         }
@@ -60668,7 +60673,7 @@ impl App {
         if self.adjustment_mode == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
             self.close_fullscreen_adjustment_panel();
         }
-        if self.fs_info_panel_open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
+        if self.fs_info_panel.open == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle {
             self.close_fullscreen_info_panel();
         }
     }
@@ -60690,7 +60695,7 @@ impl App {
         }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        self.fs_info_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
         closed
     }
 
@@ -63825,7 +63830,7 @@ impl App {
         self.reset_erase_mode();
         self.deactivate_compare_view();
         self.show_metadata_panel = false;
-        self.metadata_panel_hover_active = false;
+        self.fs_info_panel.hover_active = false;
     }
 
     /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して

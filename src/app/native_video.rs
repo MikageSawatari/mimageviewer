@@ -4563,7 +4563,7 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::DismissTouchSidePanels => {
-                if self.fs_info_panel_open
+                if self.fs_info_panel.open
                     == crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle
                 {
                     self.close_fullscreen_info_panel();
@@ -6830,7 +6830,7 @@ impl App {
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let info_panel_open = self.fs_info_panel_open;
+        let info_panel_open = self.fs_info_panel.open;
         let bar_lock = self.native_bar_lock_state();
         let top_bar_locked = bar_lock.top_locked;
         let bottom_lock = bar_lock.bottom_lock;
