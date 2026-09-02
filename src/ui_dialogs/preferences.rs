@@ -645,6 +645,13 @@ pub(crate) struct PreferencesState {
     // ── 外部ツールページ ────────────────────────────────────────
     /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
     external_tool_target: crate::external_tool::LaunchTarget,
+    /// その対象を実際に起動したときにプレースホルダへ入る値。
+    ///
+    /// **プレビューが起動と違う値を出さないため**に、起動側と同じ
+    /// `App::placeholder_facts_for_target` から採る。以前はプレビュー専用に空の
+    /// facts を組んでいたので、`{page}` / `{entry}` / `{time}` は常に「値なし」に
+    /// 見えていた (2026-09-02 利用者指摘)。
+    external_tool_target_facts: crate::external_tool::PlaceholderFacts,
     /// 関連付けアプリを列挙する対象の拡張子 (小文字、先頭 `.` なし)。
     ///
     /// 以前はメインウィンドウで選択中のファイルから採っていたが、環境設定で
@@ -1089,6 +1096,7 @@ impl PreferencesState {
     pub(crate) fn from_settings(
         s: &Settings,
         external_tool_target: crate::external_tool::LaunchTarget,
+        external_tool_target_facts: crate::external_tool::PlaceholderFacts,
         ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
         audio_normalize_db_available: bool,
         audio_normalize_entry_count: usize,
@@ -1168,6 +1176,7 @@ impl PreferencesState {
             highlight: None,
             expanded,
             external_tool_target,
+            external_tool_target_facts,
             external_tool_association_ext,
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
             external_tool_editor_loaded_for: None,
@@ -1889,15 +1898,18 @@ impl App {
 
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
+            let external_tool_index = self.fullscreen_idx.or(self.selected);
             let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
-                self.fullscreen_idx
-                    .or(self.selected)
-                    .and_then(|index| self.items.get(index)),
+                external_tool_index.and_then(|index| self.items.get(index)),
             );
+            // 起動側と同じ facts を採る (プレビューが別の値を出さないように)。
+            let external_tool_target_facts =
+                self.placeholder_facts_for_target(&external_tool_target, external_tool_index);
             #[cfg_attr(not(windows), allow(unused_mut))]
             let mut new_state = PreferencesState::from_settings(
                 &self.settings,
                 external_tool_target,
+                external_tool_target_facts,
                 self.ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
@@ -2613,6 +2625,7 @@ impl App {
             let mut state = PreferencesState::from_settings(
                 &self.settings,
                 crate::external_tool::LaunchTarget::None,
+                crate::external_tool::PlaceholderFacts::default(),
                 self.ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
@@ -3192,6 +3205,7 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &settings,
             crate::external_tool::LaunchTarget::None,
+            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,
@@ -3245,6 +3259,7 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
+            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,
@@ -3303,6 +3318,7 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
+            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,
@@ -3338,6 +3354,7 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
+            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,

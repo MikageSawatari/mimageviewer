@@ -12566,8 +12566,7 @@ mod phase_c_drill_nav_tests {
             entry_name: "b.jpg".to_string(),
         };
         assert_eq!(
-            app.placeholder_facts_for_target_for_test(&target, Some(1))
-                .page,
+            app.placeholder_facts_for_target(&target, Some(1)).page,
             Some(2)
         );
 
@@ -12583,8 +12582,7 @@ mod phase_c_drill_nav_tests {
         );
         app.visible_indices = vec![0, 1, 2];
         assert_eq!(
-            app.placeholder_facts_for_target_for_test(&target, Some(2))
-                .page,
+            app.placeholder_facts_for_target(&target, Some(2)).page,
             None,
             "ページでない項目が混ざる一覧では番号を付けない"
         );

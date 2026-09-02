@@ -983,12 +983,37 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 egui::RichText::new(concat!(
                     "{container} は書庫 / PDF / 動画そのもの、{entry} は書庫内の名前、",
                     "{page} は 1 始まりのページ番号、{time} は動画の再生位置 (秒) です。",
-                    "対象が持っていない値は、そのトークンごと引数から取り除きます。",
+                    "対象が持っていない値は、そのトークンごと引数から取り除きます",
+                    "(その値を待っている直前の option も一緒に取り除きます)。",
                 ))
                 .weak(),
             )
             .wrap(),
         );
+
+        // 起動側と同じ facts を出す。ここが実際の値と違うと、プレビューを見て
+        // 引数を組み立てた利用者が必ず外す。
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("現在の対象で入る値").strong());
+        let facts = &state.external_tool_target_facts;
+        for (name, value) in [
+            (
+                "{container}",
+                facts
+                    .container
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            ),
+            ("{entry}", facts.entry.clone()),
+            ("{page}", facts.page.map(|page| page.to_string())),
+            ("{time}", facts.time_secs.map(|secs| format!("{secs:.3}"))),
+        ] {
+            match value {
+                Some(value) => ui.monospace(format!("{name} = {value}")),
+                None => ui
+                    .label(egui::RichText::new(format!("{name} = (値なし → 引数から削除)")).weak()),
+            };
+        }
     }
 
     ui.add_space(6.0);
@@ -9194,6 +9219,7 @@ mod tests {
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
+            crate::external_tool::PlaceholderFacts::default(),
             None,
             false,
             0,

@@ -1224,6 +1224,15 @@ fn expand_token(
     }
 }
 
+/// option の形をしたトークンか。`-page` / `--entry=...` / Acrobat の `/A` を拾う。
+///
+/// `/` を含めるのは、`/A "page={page}" "{container}"` (Acrobat) が正本の例に
+/// あるため。`-` しか見ていなかったので、ページ番号が無い対象では `/A` だけが
+/// 残っていた (2026-09-02 利用者指摘)。
+fn looks_like_option(token: &[u8]) -> bool {
+    matches!(token.first(), Some(b'-') | Some(b'/'))
+}
+
 /// 分割済みトークン内だけでプレースホルダを置換する。
 ///
 /// 空のプレースホルダで単独の値トークンが消えた場合、直前の option トークンも除く。
@@ -1254,12 +1263,15 @@ pub fn expand_arguments_for_files(
         } else if let Some(expanded) = expand_token(token, primary, None) {
             result.push(expanded);
         }
-        if result.len() == before {
-            let placeholder_only = token.starts_with('{') && token.ends_with('}');
-            if placeholder_only
-                && result
-                    .last()
-                    .is_some_and(|previous| previous.as_encoded_bytes().starts_with(b"-"))
+        if result.len() == before && !looks_like_option(token.as_bytes()) {
+            // 消えたのは option の**値**だった。option だけ残すと、多くのツールは
+            // 次の引数を値と読むか、引数エラーになる。option ごと落とす。
+            //
+            // 自分自身が option の形をしているトークン (`--entry={entry}`) は値では
+            // ないので、直前の option を巻き添えにしない。
+            if result
+                .last()
+                .is_some_and(|previous| looks_like_option(previous.as_encoded_bytes()))
             {
                 result.pop();
             }
@@ -2383,16 +2395,7 @@ impl crate::app::App {
         u32::try_from(position).ok()
     }
 
-    #[cfg(test)]
-    pub(crate) fn placeholder_facts_for_target_for_test(
-        &self,
-        target: &LaunchTarget,
-        index: Option<usize>,
-    ) -> PlaceholderFacts {
-        self.placeholder_facts_for_target(target, index)
-    }
-
-    fn placeholder_facts_for_target(
+    pub(crate) fn placeholder_facts_for_target(
         &self,
         target: &LaunchTarget,
         index: Option<usize>,
@@ -3970,6 +3973,33 @@ mod tests {
         let ctx = PlaceholderContext::for_file(r"C:\image");
         let tokens = split_argument_template("-page {page} --entry={entry} literal");
         assert_eq!(expand_arguments(&tokens, &ctx), [OsString::from("literal")]);
+    }
+
+    /// 値が消えたら、その値を待っている option も消す。**`-` 形式だけではない。**
+    ///
+    /// 正本の例にある Acrobat の `/A "page={page}" "{container}"` は、`/` 始まりの
+    /// option に `page=N` という値を渡す形。`-` しか見ていなかったので、ページ番号の
+    /// 無い対象では `/A` だけが残っていた (2026-09-02 利用者指摘)。
+    ///
+    /// 逆に、自分自身が option の形をしているトークンは値ではないので、直前の option を
+    /// 巻き添えにしない。
+    #[test]
+    fn a_vanished_value_takes_its_option_with_it_whatever_the_option_prefix_is() {
+        let ctx = PlaceholderContext::for_file(r"C:\image");
+
+        let tokens = split_argument_template(r#"/A "page={page}" tail"#);
+        assert_eq!(
+            expand_arguments(&tokens, &ctx),
+            [OsString::from("tail")],
+            "Acrobat 形式で `/A` だけが残ってはいけない"
+        );
+
+        let tokens = split_argument_template("-flag --entry={entry} tail");
+        assert_eq!(
+            expand_arguments(&tokens, &ctx),
+            [OsString::from("-flag"), OsString::from("tail")],
+            "自分で完結した option が消えても、前の option は巻き添えにしない"
+        );
     }
 
     #[test]
