@@ -16,62 +16,6 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 
-/// 鍵アイコンをベクターで描く。
-///
-/// **フォント依存の記号 (🔒 / 🔓) を使わない。** Yu Gothic には無く、環境によって豆腐に
-/// なる (CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」)。開錠時は弦を右上へずらす。
-fn draw_panel_lock_glyph(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
-    let color = if locked {
-        egui::Color32::from_gray(240)
-    } else {
-        egui::Color32::from_gray(215)
-    };
-    let stroke = egui::Stroke::new(1.6, color);
-    let center = rect.center();
-    let unit = rect.width().min(rect.height());
-    let body_w = unit * 0.46;
-    let body_h = unit * 0.34;
-    let body = egui::Rect::from_center_size(
-        egui::pos2(center.x, center.y + unit * 0.14),
-        egui::vec2(body_w, body_h),
-    );
-    painter.rect_filled(body, unit * 0.06, color);
-
-    // 弦。閉じているときは本体の中央上、開いているときは右へずらして片側だけ立てる。
-    let shackle_r = unit * 0.17;
-    let shackle_center = egui::pos2(
-        center.x + if locked { 0.0 } else { unit * 0.16 },
-        body.top() - shackle_r * 0.15,
-    );
-    let mut arc = Vec::new();
-    for step in 0..=12 {
-        let t = step as f32 / 12.0;
-        let angle = std::f32::consts::PI * (1.0 + t);
-        arc.push(egui::pos2(
-            shackle_center.x + shackle_r * angle.cos(),
-            shackle_center.y + shackle_r * angle.sin(),
-        ));
-    }
-    painter.add(egui::Shape::line(arc, stroke));
-    // 閉じているときだけ左脚を本体まで下ろす。
-    if locked {
-        painter.line_segment(
-            [
-                egui::pos2(shackle_center.x - shackle_r, shackle_center.y),
-                egui::pos2(shackle_center.x - shackle_r, body.top()),
-            ],
-            stroke,
-        );
-    }
-    painter.line_segment(
-        [
-            egui::pos2(shackle_center.x + shackle_r, shackle_center.y),
-            egui::pos2(shackle_center.x + shackle_r, body.top()),
-        ],
-        stroke,
-    );
-}
-
 #[derive(Clone)]
 struct TagPanelRow {
     label: Option<String>,
@@ -264,7 +208,14 @@ impl App {
             egui::Color32::TRANSPARENT
         };
         ui.painter().rect_filled(lock_rect, 3.0, lock_bg);
-        draw_panel_lock_glyph(ui.painter(), lock_rect, locked_now);
+        // 鍵の形は静止画・動画の固定バーと**同じベクター**を使う。ここで描き直さない
+        // (docs/video-architecture.md「各バーとシークストリップには固定状態を示す鍵ボタン」)。
+        crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
+            ui.painter(),
+            lock_rect.center(),
+            lock_rect.width() * 0.34,
+            locked_now,
+        );
         let lock_hint = if locked_now {
             "固定を解除 (画像へ重ねる一時表示に戻す)"
         } else {

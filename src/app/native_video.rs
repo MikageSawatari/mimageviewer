@@ -3955,6 +3955,7 @@ impl App {
             | Ev::ToggleBarLock { .. }
             | Ev::ToggleSeekStripLock
             | Ev::ToggleClickInfoOpen
+            | Ev::ToggleInfoPanelLock
             | Ev::OpenTouchInfoPanel
             | Ev::DismissTouchSidePanels
             | Ev::ToggleVst3Gui
@@ -4214,6 +4215,7 @@ impl App {
                     | crate::video::NativeVideoOutputEvent::ToggleBarLock { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSeekStripLock
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::ToggleInfoPanelLock
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
@@ -4554,6 +4556,15 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
                 self.toggle_fullscreen_click_info_open();
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleInfoPanelLock => {
+                // 固定は静止画と同じ viewer context 状態。動画側で別に持たない。
+                self.fs_info_panel.locked = !self.fs_info_panel.locked;
+                if !self.fs_info_panel.locked {
+                    self.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+                }
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -6831,6 +6842,9 @@ impl App {
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel.open;
+        // 右パネルの固定は静止画と同じ状態を使う。動画でも「タグを付けながら前後へ送る」
+        // ために出したままにできる必要がある (利用者要望 2026-09-02、backlog §1.158)。
+        let info_panel_locked = self.fs_info_panel.locked;
         let bar_lock = self.native_bar_lock_state();
         let top_bar_locked = bar_lock.top_locked;
         let bottom_lock = bar_lock.bottom_lock;
@@ -6929,7 +6943,7 @@ impl App {
             }
         };
         player.set_native_metadata(Some(metadata));
-        player.set_native_side_panel_state(side_panel_mode, info_panel_open);
+        player.set_native_side_panel_state(side_panel_mode, info_panel_open, info_panel_locked);
         player.set_native_bar_lock_state(top_bar_locked, bottom_lock, fixed_bar_gap_px);
     }
 
@@ -10563,6 +10577,7 @@ impl App {
                 | Ev::ToggleSidePanelMode
                 | Ev::ToggleBarLock { .. }
                 | Ev::ToggleClickInfoOpen
+                | Ev::ToggleInfoPanelLock
                 | Ev::SetVst3PanelVisible { .. }
                 | Ev::SetVst3PanelPos { .. }
                 | Ev::Vst3ShowSlotGui { .. }

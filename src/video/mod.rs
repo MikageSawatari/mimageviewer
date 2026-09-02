@@ -731,6 +731,7 @@ pub enum NativeVideoOutputEvent {
     },
     ToggleSeekStripLock,
     ToggleClickInfoOpen,
+    ToggleInfoPanelLock,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
     ToggleVst3Gui,
@@ -1106,6 +1107,7 @@ enum NativeVideoOutputCommand {
     SetSidePanelState {
         mode: crate::settings::FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+        info_panel_locked: bool,
     },
     SetBarLockState {
         top_locked: bool,
@@ -2480,12 +2482,14 @@ impl NativeVideoOutput {
         &self,
         mode: crate::settings::FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+        info_panel_locked: bool,
     ) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetSidePanelState {
                 mode,
                 info_panel_open,
+                info_panel_locked,
             });
     }
 
@@ -4019,6 +4023,7 @@ fn send_native_overlay_command(
         Command::ToggleBarLock { bar } => NativeVideoOutputEvent::ToggleBarLock { bar },
         Command::ToggleSeekStripLock => NativeVideoOutputEvent::ToggleSeekStripLock,
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
+        Command::ToggleInfoPanelLock => NativeVideoOutputEvent::ToggleInfoPanelLock,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
         Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
@@ -4989,8 +4994,13 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetSidePanelState {
                     mode,
                     info_panel_open,
+                    info_panel_locked,
                 } => {
-                    presenter.set_overlay_side_panel_state(mode, info_panel_open);
+                    presenter.set_overlay_side_panel_state(
+                        mode,
+                        info_panel_open,
+                        info_panel_locked,
+                    );
                 }
                 NativeVideoOutputCommand::SetBarLockState {
                     top_locked,
@@ -6231,6 +6241,12 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
+                                );
+                            }                            crate::video::native_presenter::NativeOverlayCommand::ToggleInfoPanelLock => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleInfoPanelLock,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::OpenTouchInfoPanel => {
@@ -9652,9 +9668,10 @@ impl VideoPlayer {
         &self,
         mode: crate::settings::FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+        info_panel_locked: bool,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_side_panel_state(mode, info_panel_open);
+            output.set_side_panel_state(mode, info_panel_open, info_panel_locked);
         }
     }
 

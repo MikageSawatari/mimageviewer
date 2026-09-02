@@ -1528,6 +1528,9 @@ struct NativeEguiOverlay {
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
     info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    /// 右情報パネルの固定。正本は App の viewer context 状態で、静止画と共有する。
+    /// 固定中は映像へ重ねず、右へパネル幅の領域を確保する (backlog §1.158)。
+    info_panel_locked: bool,
     /// 左ジャンプパネルの明示 open owner。動画ソース単位の presenter-local session。
     /// pointer と touch handle を同じ typed state で区別し、外タップ dismiss の正本にする。
     left_panel_open: crate::ui_helpers::MetadataPanelOpenState,
@@ -2341,6 +2344,8 @@ struct NativeRightPanelVisibilityInputs {
     panorama_active: bool,
     side_panel_mode: FsSidePanelMode,
     info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+    /// 鍵ボタンによる固定。**静止画と同じく、固定中は映像へ重ねず右へ領域を確保する。**
+    info_panel_locked: bool,
 }
 
 fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInputs) -> bool {
@@ -2363,7 +2368,8 @@ fn native_right_panel_visible_from_inputs(input: NativeRightPanelVisibilityInput
         input.side_panel_mode,
         input.info_panel_open,
     );
-    input.tag_picker_open
+    input.info_panel_locked
+        || input.tag_picker_open
         || match input.side_panel_mode.normalized() {
             FsSidePanelMode::Hover => input.pointer_in_hover_rect || explicit,
             FsSidePanelMode::ClickToShow => explicit,
@@ -2581,6 +2587,8 @@ pub enum NativeOverlayCommand {
     },
     ToggleSeekStripLock,
     ToggleClickInfoOpen,
+    /// 右情報パネルの固定を切り替える (静止画の鍵ボタンと同じ状態を触る)。
+    ToggleInfoPanelLock,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
     ToggleVst3Gui,
@@ -5878,9 +5886,10 @@ impl NativeRenderCore {
         &mut self,
         mode: FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+        info_panel_locked: bool,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_side_panel_state(mode, info_panel_open);
+            overlay.set_side_panel_state(mode, info_panel_open, info_panel_locked);
         }
     }
 
@@ -6305,6 +6314,10 @@ impl NativeRenderCore {
                 .as_ref()
                 .is_some_and(|overlay| overlay.seek_strip_reserves_space()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
+            info_panel_reserved: self
+                .egui_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.right_panel_reserves_space()),
         }
     }
 
@@ -6906,6 +6919,7 @@ impl NativeEguiOverlay {
             fixed_bar_gap_px: 0,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            info_panel_locked: false,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             right_panel_hover_latched: false,
             jump_panel_hover_latched: false,
@@ -7803,14 +7817,19 @@ impl NativeEguiOverlay {
         &mut self,
         mode: FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
+        info_panel_locked: bool,
     ) {
         let mode = mode.normalized();
         let mode_changed = self.side_panel_mode != mode;
-        if !mode_changed && self.info_panel_open == info_panel_open {
+        if !mode_changed
+            && self.info_panel_open == info_panel_open
+            && self.info_panel_locked == info_panel_locked
+        {
             return;
         }
         self.side_panel_mode = mode;
         self.info_panel_open = info_panel_open;
+        self.info_panel_locked = info_panel_locked;
         if mode_changed {
             self.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.right_panel_hover_latched = false;
@@ -7839,20 +7858,24 @@ impl NativeEguiOverlay {
     /// 確保量を通す (`video_bar_reserved_points`)。compact 表示は映像側だけの
     /// 見せ方なので、全画面を置き換えるプレビューでは反映しない。
     fn video_content_rect_points(&self, overlay_w: f32, overlay_h: f32) -> egui::Rect {
-        let (top, bottom) = video_bar_reserved_points(VideoVisualLayout {
+        let layout = VideoVisualLayout {
             compact: false,
             pixels_per_point: 1.0,
             top_bar_locked: self.top_bar_locked,
             bottom_lock: self.bottom_lock,
             seek_strip_visible: self.seek_strip_reserves_space(),
             fixed_bar_gap_px: self.fixed_bar_gap_px,
-        });
+            info_panel_reserved: self.right_panel_reserves_space(),
+        };
+        let (top, bottom) = video_bar_reserved_points(layout);
         let top = top.min((overlay_h - 1.0).max(0.0));
         let bottom_edge = (overlay_h - bottom).max(top + 1.0).min(overlay_h);
-        egui::Rect::from_min_max(
-            egui::pos2(0.0, top),
-            egui::pos2(overlay_w.max(1.0), bottom_edge),
-        )
+        // 固定した右パネルの領域はプレビューにも渡す。片方だけ無視すると、切替中の
+        // プレビューだけがパネルの下へ潜り込む (§1.158 / backlog §1.162 と同じ形)。
+        let right_edge = (overlay_w.max(1.0)
+            - video_right_panel_reserved_points(layout, overlay_w.max(1.0)))
+        .max(1.0);
+        egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(right_edge, bottom_edge))
     }
 
     fn reset_side_panel_session(&mut self) {
@@ -9216,7 +9239,17 @@ impl NativeEguiOverlay {
             pointer_in_hover_rect: self.right_panel_hover_latched,
             side_panel_mode: self.side_panel_mode,
             info_panel_open: self.info_panel_open,
+            info_panel_locked: self.info_panel_locked,
         })
+    }
+
+    /// 右パネルが**場所を占めるか**。描くかとは別の問い (`seek_strip_reserves_space` と同じ形)。
+    ///
+    /// 占めるのは固定中だけ。ホバーや明示 open は従来どおり映像へ重ねる。パネルを出せない
+    /// 状況 (ヘルプ / 360 / VST / メタデータ無し等) では固定していても占めない — 占めると
+    /// 右に空白の帯だけが残る (backlog §1.158)。
+    pub(super) fn right_panel_reserves_space(&self) -> bool {
+        self.info_panel_locked && self.right_panel_visible()
     }
 
     fn jump_panel_visible(&self) -> bool {
@@ -9921,6 +9954,7 @@ impl NativeEguiOverlay {
                     tag_picker_escape_pressed,
                     &mut commands,
                     self.side_panel_mode.normalized() == FsSidePanelMode::ClickToShow,
+                    self.info_panel_locked,
                 );
             }
             if jump_panel_visible {
@@ -12228,6 +12262,10 @@ pub(super) struct VideoVisualLayout {
     /// Presenter に渡されたストリップ snapshot (`Some` = 表示中) の有無。
     pub(super) seek_strip_visible: bool,
     pub(super) fixed_bar_gap_px: u32,
+    /// 右情報パネルが**場所を占めるか** (= 固定中かつ描ける状況)。
+    /// 描くかどうかは overlay 側の `right_panel_visible` が決め、ここへは
+    /// `right_panel_reserves_space` の答えだけが来る (backlog §1.158)。
+    pub(super) info_panel_reserved: bool,
 }
 
 impl From<bool> for VideoVisualLayout {
@@ -12239,6 +12277,7 @@ impl From<bool> for VideoVisualLayout {
             bottom_lock: VideoBottomLock::None,
             seek_strip_visible: false,
             fixed_bar_gap_px: 0,
+            info_panel_reserved: false,
         }
     }
 }
@@ -12287,6 +12326,21 @@ pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32)
     (top, bottom)
 }
 
+/// 固定表示の右情報パネルが確保する量を **points** で返す。
+///
+/// 幅はパネル自身の矩形と同じ規則で決める (`native_metadata_panel_rect` と同じ
+/// 「既定幅、ただし画面幅の半分まで」)。別々に clamp すると映像の右端とパネルの左端が
+/// 食い違う。
+pub(super) fn video_right_panel_reserved_points(
+    layout: VideoVisualLayout,
+    overlay_width_points: f32,
+) -> f32 {
+    if !layout.info_panel_reserved {
+        return 0.0;
+    }
+    super::overlay_draw::native_metadata_panel_width().min(overlay_width_points.max(0.0) * 0.5)
+}
+
 pub(super) fn compute_video_visual_target_rect(
     win_w: u32,
     win_h: u32,
@@ -12305,19 +12359,22 @@ pub(super) fn compute_video_visual_target_rect(
     let content_top = top_reserved.min(win_h - 1.0);
     let content_bottom = (win_h - bottom_reserved).max(content_top + 1.0).min(win_h);
     let content_height = (content_bottom - content_top).max(1.0);
+    // 固定した右パネルも、固定バーと同じように映像へ重ねず領域を確保する (§1.158)。
+    let right_reserved = video_right_panel_reserved_points(layout, win_w / ppp) * ppp;
+    let content_width = (win_w - right_reserved).max(1.0);
 
     if layout.compact {
         VideoVisualTargetRect {
-            x: win_w * 0.5,
+            x: content_width * 0.5,
             y: content_top,
-            width: win_w * 0.5,
+            width: content_width * 0.5,
             height: content_height * 0.5,
         }
     } else {
         VideoVisualTargetRect {
             x: 0.0,
             y: content_top,
-            width: win_w,
+            width: content_width,
             height: content_height,
         }
     }
@@ -13922,6 +13979,7 @@ mod tests {
             panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            info_panel_locked: false,
         };
         assert!(
             native_right_panel_visible_from_inputs(right_hovering),
@@ -13991,6 +14049,7 @@ mod tests {
             panorama_active: false,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            info_panel_locked: false,
         };
         assert!(native_right_panel_visible_from_inputs(right_base));
         assert!(!native_right_panel_visible_from_inputs(
@@ -14067,6 +14126,59 @@ mod tests {
         ));
     }
 
+    /// 固定した右パネルは、召喚方法によらず出たままになる。ただし**出せない状況では
+    /// 出ない** — そこで出したことにすると、映像から取った領域が空白の帯として残る
+    /// (backlog §1.158)。
+    #[test]
+    fn a_locked_native_right_panel_stays_open_unless_something_hides_it() {
+        let base = NativeRightPanelVisibilityInputs {
+            shortcut_help_open: false,
+            external_drag_in_progress: false,
+            vst3_panel_visible: false,
+            metadata_available: true,
+            video_speed_popup_open: false,
+            hover_preview_active: false,
+            tag_picker_open: false,
+            pointer_in_hover_rect: false,
+            panorama_active: false,
+            side_panel_mode: FsSidePanelMode::ClickToShow,
+            info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            info_panel_locked: true,
+        };
+        // 明示 open もホバーも無いが、固定しているので出る。
+        assert!(native_right_panel_visible_from_inputs(base));
+        assert!(native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                side_panel_mode: FsSidePanelMode::Hover,
+                ..base
+            }
+        ));
+        // 固定していなければ従来どおり閉じている。
+        assert!(!native_right_panel_visible_from_inputs(
+            NativeRightPanelVisibilityInputs {
+                info_panel_locked: false,
+                ..base
+            }
+        ));
+
+        let suppressors: [(&str, fn(&mut NativeRightPanelVisibilityInputs)); 6] = [
+            ("shortcut_help", |i| i.shortcut_help_open = true),
+            ("panorama", |i| i.panorama_active = true),
+            ("external_drag", |i| i.external_drag_in_progress = true),
+            ("vst3", |i| i.vst3_panel_visible = true),
+            ("no_metadata", |i| i.metadata_available = false),
+            ("speed_popup", |i| i.video_speed_popup_open = true),
+        ];
+        for (name, apply) in suppressors {
+            let mut inputs = base;
+            apply(&mut inputs);
+            assert!(
+                !native_right_panel_visible_from_inputs(inputs),
+                "{name} 中に固定パネルが出ている (映像から取った領域が空白になる)"
+            );
+        }
+    }
+
     #[test]
     fn click_to_show_native_panels_ignore_hover_and_use_explicit_open_state() {
         let right_base = NativeRightPanelVisibilityInputs {
@@ -14081,6 +14193,7 @@ mod tests {
             panorama_active: false,
             side_panel_mode: FsSidePanelMode::ClickToShow,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            info_panel_locked: false,
         };
         assert!(!native_right_panel_visible_from_inputs(right_base));
         assert!(native_right_panel_visible_from_inputs(
@@ -14437,6 +14550,7 @@ mod tests {
                 bottom_lock: VideoBottomLock::None,
                 seek_strip_visible: false,
                 fixed_bar_gap_px: 0,
+                info_panel_reserved: false,
             },
         );
         assert!((m11 - 1.0).abs() < f32::EPSILON);
@@ -14711,6 +14825,7 @@ mod tests {
                     bottom_lock: VideoBottomLock::BarAndStrip,
                     seek_strip_visible: seek_strip_reserves_space(has_strip, availability),
                     fixed_bar_gap_px: 0,
+                    info_panel_reserved: false,
                 },
             )
         };
@@ -14764,6 +14879,46 @@ mod tests {
         assert!(seek_strip_reserves_space(true, unavailable));
     }
 
+    /// 固定した右情報パネルは、**パネル自身と同じ幅ちょうど**だけ映像から取る。
+    ///
+    /// 静止画と同じ扱い (利用者要望 2026-09-02、backlog §1.158)。占めるのは固定中だけで、
+    /// ホバーや明示 open は従来どおり映像へ重ねる。compact 表示とも両立する。
+    #[test]
+    fn a_locked_info_panel_takes_its_own_width_from_the_video() {
+        let layout = |info_panel_reserved, compact, pixels_per_point| VideoVisualLayout {
+            compact,
+            pixels_per_point,
+            top_bar_locked: false,
+            bottom_lock: VideoBottomLock::None,
+            seek_strip_visible: false,
+            fixed_bar_gap_px: 0,
+            info_panel_reserved,
+        };
+
+        for &(win_w, ppp) in &[(1920_u32, 1.0_f32), (2560, 1.25), (1280, 1.5), (400, 1.0)] {
+            let overlay_points = win_w as f32 / ppp;
+            let panel_points =
+                super::super::overlay_draw::native_metadata_panel_width().min(overlay_points * 0.5);
+            let open = compute_video_visual_target_rect(win_w, 1080, layout(false, false, ppp));
+            let locked = compute_video_visual_target_rect(win_w, 1080, layout(true, false, ppp));
+            assert_eq!(open.width, win_w as f32, "固定していないのに狭めた");
+            assert!(
+                (locked.width - (win_w as f32 - panel_points * ppp)).abs() < 0.01,
+                "win_w={win_w} ppp={ppp}: 映像幅 {} がパネル幅 {panel_points}pt と合わない",
+                locked.width
+            );
+            assert!(locked.width >= 1.0, "映像領域が潰れた");
+            assert_eq!(locked.x, 0.0);
+            assert_eq!(locked.height, open.height);
+        }
+
+        // compact (VST) 表示でも、先に固定領域を除いた残りの右上 1/4 を使う。
+        let compact = compute_video_visual_target_rect(1920, 1080, layout(true, true, 1.0));
+        let compact_open = compute_video_visual_target_rect(1920, 1080, layout(false, true, 1.0));
+        assert!(compact.width < compact_open.width);
+        assert!((compact.x - compact.width).abs() < 0.01);
+    }
+
     #[test]
     fn fixed_video_bars_reserve_target_rect_for_all_combinations_and_gap_bounds() {
         let target = |top_bar_locked, bottom_lock, seek_strip_visible, fixed_bar_gap_px| {
@@ -14777,6 +14932,7 @@ mod tests {
                     bottom_lock,
                     seek_strip_visible,
                     fixed_bar_gap_px,
+                    info_panel_reserved: false,
                 },
             )
         };
@@ -14861,6 +15017,7 @@ mod tests {
                         bottom_lock,
                         seek_strip_visible,
                         fixed_bar_gap_px: 0,
+                        info_panel_reserved: false,
                     },
                 ),
                 VideoVisualTargetRect {
@@ -14885,6 +15042,7 @@ mod tests {
                 bottom_lock: VideoBottomLock::BarOnly,
                 seek_strip_visible: false,
                 fixed_bar_gap_px: 10,
+                info_panel_reserved: false,
             },
         );
         assert_eq!(

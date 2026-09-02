@@ -5519,6 +5519,7 @@ pub(super) fn draw_native_metadata_panel(
     tag_picker_escape_pressed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
+    info_panel_locked: bool,
 ) {
     let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
     egui::Area::new(egui::Id::new("native_video_metadata_panel"))
@@ -5552,7 +5553,38 @@ pub(super) fn draw_native_metadata_panel(
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(238, 238, 238),
             );
-            if click_to_show {
+            // 鍵ボタン。静止画と同じ状態を触り、固定中は映像へ重ねず右へ領域を確保する
+            // (利用者要望 2026-09-02: タグ付けしながら前後へ送りたい。backlog §1.158)。
+            let lock_rect = egui::Rect::from_min_size(
+                rect.right_top() + egui::vec2(-30.0, 6.0),
+                egui::vec2(24.0, 24.0),
+            );
+            let lock_response = ui.interact(
+                lock_rect,
+                egui::Id::new("native_metadata_lock"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(
+                painter,
+                lock_rect,
+                lock_response.hovered(),
+                info_panel_locked,
+            );
+            crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
+                painter,
+                lock_rect.center(),
+                lock_rect.width() * 0.34,
+                info_panel_locked,
+            );
+            let lock_hint = if info_panel_locked {
+                "固定を解除 (映像へ重ねる一時表示に戻す)"
+            } else {
+                "パネルを固定 (映像に重ねず、前後へ移動しても表示したまま)"
+            };
+            if lock_response.on_hover_text(lock_hint).clicked() {
+                commands.push(NativeOverlayCommand::ToggleInfoPanelLock);
+            }
+            if click_to_show && !info_panel_locked {
                 let close_rect = egui::Rect::from_min_size(
                     rect.right_top() + egui::vec2(-58.0, 6.0),
                     egui::vec2(24.0, 24.0),
@@ -7669,6 +7701,7 @@ mod tests {
             bottom_lock: VideoBottomLock::BarAndStrip,
             seek_strip_visible: true,
             fixed_bar_gap_px: 0,
+            info_panel_reserved: false,
         });
         assert!(top > 0.0 && bottom > 0.0, "この設定では上下とも確保される");
 

@@ -430,6 +430,7 @@ mod tests {
                 bottom_lock,
                 seek_strip_visible: false,
                 fixed_bar_gap_px,
+                info_panel_reserved: false,
             };
             let VideoSurfaceSizeDecision::DisplayResolution { height, .. } =
                 decide_video_surface_size(case)
