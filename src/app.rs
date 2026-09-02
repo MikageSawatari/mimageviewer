@@ -17550,9 +17550,15 @@ impl App {
             self.enter_reading_history();
             SyntheticFolderHistoryDispatch::Restored
         } else if crate::folder_tree::path_eq(target, &bookmark_view_synthetic_path()) {
+            // 履歴で戻るのも「よそから来る」入口。メニュー経由 (`open_bookmark_browser`) と
+            // 同じく、持ち込まれた列ソートへ並びの所有権を渡さない (§1.143(a))。
+            self.reset_details_sort_to_toolbar();
             self.enter_bookmark_view();
             SyntheticFolderHistoryDispatch::Restored
         } else if crate::folder_tree::path_eq(target, &rating_view_synthetic_path()) {
+            // レーティング一覧も同じ。ビュー内で選んだ列ソートは戻ると解けるが、別
+            // フォルダの列ソートが★時刻順を黙って上書きするほうが実害が大きい。
+            self.reset_details_sort_to_toolbar();
             let stars = target_rating_view_stars.or_else(|| {
                 (1..=5)
                     .contains(&self.rating_view_stars)

@@ -9622,6 +9622,66 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.items_are_reading_history_view);
     }
 
+    /// §1.143(a) の入口の数え漏れ。履歴で戻る経路は `enter_rating_view` /
+    /// `open_bookmark_browser` を通らないので、そこだけ列ソートが持ち込まれたままだった。
+    /// 動画フォルダで列ヘッダを押してから戻るだけで、報告と同じ症状が出る。
+    #[test]
+    fn navigating_back_into_the_rating_list_also_takes_back_the_column_sort() {
+        let mut app = setup_app();
+        let real = app.tmp.path().join("before-rating-back");
+        std::fs::create_dir_all(&real).unwrap();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(real.clone());
+
+        app.enter_rating_view_from_menu(2);
+        if let Some(pending) = app.rating_view_pending.take() {
+            pending.cancel();
+        }
+        app.install_rating_view_rows();
+        app.rating_view_rows_stars = Some(2);
+
+        // 一覧を離れ、別フォルダで列ヘッダ並べ替えをしている状態を作る。
+        app.navigate_folder_history_back();
+        app.items_are_rating_view = false;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_video_dimensions = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
+        app.settings.details_sort_ascending = true;
+
+        let target = super::rating_view_synthetic_path();
+        app.pending_folder_nav_rating_view_stars = Some(2);
+        app.dispatch_synthetic_folder_history_target(&target);
+
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar,
+            "履歴で戻っても、持ち込まれた列ソートは所有権を返す"
+        );
+        assert!(app.settings.details_sort_ascending);
+    }
+
+    /// ブックマーク一覧も同じ入口を持つ。
+    #[test]
+    fn navigating_back_into_the_bookmark_list_also_takes_back_the_column_sort() {
+        let mut app = setup_app();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_video_dimensions = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
+        app.settings.details_sort_ascending = false;
+
+        let target = super::bookmark_view_synthetic_path();
+        app.dispatch_synthetic_folder_history_target(&target);
+        if let Some(pending) = app.bookmark_browser_pending.take() {
+            pending.cancel();
+        }
+
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Toolbar
+        );
+        assert!(app.settings.details_sort_ascending);
+    }
+
     /// §1.143(a): `details_sort_key` は全フォルダ共通の永続設定なので、別フォルダで
     /// 列ヘッダを押した状態がレーティング一覧へ持ち込まれ、★時刻順を黙って上書きする。
     /// ビューの既定ソートを入れ直すのと同じ場所で、列ソートの所有権も戻す。
