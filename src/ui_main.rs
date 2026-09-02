@@ -13426,6 +13426,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            // アイテムメニューを開いた経路を残す。ヘッダ右クリックでこのメニューが
+            // 出る間欠不具合 (§1.168) は再現待ちで、`context_menu_idx` を書くのは
+            // ここを含め 3 か所だけ。次に出たときログだけで経路が決まるようにしておく。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=cell idx={idx} pos={:?} cell_rect={:?} view_mode={:?}",
+                self.context_menu_pos, cell_rect, self.settings.grid_view_mode
+            ));
         }
 
         // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
@@ -13483,6 +13490,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     fn open_current_folder_context_menu_at(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
         if self.current_folder.is_some() {
+            // §1.168 の経路特定用。3 経路すべてに同じ形で残す。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=folder_bg pos={pos:?} view_mode={:?}",
+                self.settings.grid_view_mode
+            ));
             self.context_menu_idx = Some(usize::MAX);
             self.context_menu_pos = pos;
             ctx.request_repaint();
@@ -13626,6 +13638,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = pos;
+            // §1.168 の経路特定用。cell 経路と同じ理由でここにも残す。
+            crate::logger::log(format!(
+                "[ctxmenu-probe] path=short_tap idx={idx} pos={pos:?} view_mode={:?}",
+                self.settings.grid_view_mode
+            ));
             ctx.request_repaint();
         } else {
             self.open_current_folder_context_menu_at(ctx, pos);
@@ -22366,5 +22383,107 @@ mod toolbar_wrap_tests {
         let measured = measured[0];
         assert!(measured > 24.0, "前提が崩れている: {measured}");
         assert_eq!(24.0f32.max(measured), measured, "実測を採るはず");
+    }
+}
+
+#[cfg(test)]
+mod details_header_right_click_tests {
+    use super::*;
+    use crate::app::{AppTestEnvForTest, setup_app_for_test};
+    use egui_kittest::Harness;
+
+    struct HeaderState {
+        app: AppTestEnvForTest,
+    }
+
+    /// 詳細一覧をそのまま描く harness。ヘッダも背景右クリックも右ドラッグ短押しも
+    /// `render_details_list` の中にあるので、この 1 本で全経路を通せる。
+    fn details_harness(gesture: bool) -> Harness<'static, HeaderState> {
+        let mut app = setup_app_for_test();
+        app.items = (0..6)
+            .map(|i| GridItem::Image(PathBuf::from(format!(r"C:\details\{i}.jpg"))))
+            .collect();
+        app.thumbnails = (0..app.items.len())
+            .map(|_| crate::grid_item::ThumbnailState::Failed)
+            .collect();
+        app.image_metas = (0..app.items.len()).map(|_| Some((1, 10))).collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.selected = Some(0);
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        if gesture {
+            app.settings.ring_shortcuts.set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::MouseGesture,
+            );
+        }
+        Harness::builder()
+            .with_size(egui::vec2(640.0, 400.0))
+            .with_step_dt(0.01)
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = state.app.render_details_list(
+                            ui,
+                            ctx,
+                            false,
+                            None,
+                            false,
+                            GridClickPairingState::default(),
+                        );
+                    });
+                },
+                HeaderState { app },
+            )
+    }
+
+    fn secondary_click(harness: &mut Harness<'static, HeaderState>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.step();
+    }
+
+    /// 列ヘッダの右クリックは列メニューのものである。アイテムメニューを開いてはならない。
+    #[test]
+    fn right_clicking_the_column_header_does_not_open_the_item_menu() {
+        for gesture in [false, true] {
+            let mut harness = details_harness(gesture);
+            harness.step();
+            let header_pos = egui::pos2(120.0, App::DETAILS_HEADER_H * 0.5);
+            secondary_click(&mut harness, header_pos);
+            assert_eq!(
+                harness.state().app.context_menu_idx,
+                None,
+                "gesture={gesture}: ヘッダ右クリックでアイテム/フォルダメニューが開いた"
+            );
+        }
+    }
+
+    /// 行の右クリックは従来どおりアイテムメニューを開く (上の guard が効きすぎていないか)。
+    #[test]
+    fn right_clicking_a_row_still_opens_the_item_menu() {
+        for gesture in [false, true] {
+            let mut harness = details_harness(gesture);
+            harness.step();
+            let row_pos = egui::pos2(120.0, App::DETAILS_HEADER_H + App::DETAILS_ROW_H * 0.5);
+            secondary_click(&mut harness, row_pos);
+            assert!(
+                harness.state().app.context_menu_idx.is_some(),
+                "gesture={gesture}: 行の右クリックでメニューが開かない"
+            );
+        }
     }
 }
