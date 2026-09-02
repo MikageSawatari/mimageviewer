@@ -290,7 +290,8 @@ un-hide して映像が出ている間は発火させる。新しい動画への
 `right_panel_reserves_space` (= 固定中かつ `right_panel_visible`) が唯一の答えを出す** —
 ヘルプ / 360 / 外部ドラッグ / VST / メタデータ無し / 速度ポップアップでは占めない
 (占めると右に空白の帯だけが残る)。固定の lifecycle (ファイル移動で維持、フルスクリーン退出で
-解除、window ごとに独立) は静止画と共通で、backlog §1.158 を正本とする。
+解除、window ごとに独立) は静止画と共通で、
+[fullscreen-side-panel-mode-plan.md §6.6](fullscreen-side-panel-mode-plan.md) を正本とする。
 callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
 動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
 音楽ビューの左ブックマーク状態を両方閉じる。同じファイル内の遷移では右状態を保持するが、

@@ -361,6 +361,54 @@ transient とする。`Settings.fullscreen_click_info_open` は未リリース�
 - version_highlights テーブルのパース (`--lib version_highlights::`)。
 - UI スナップショット (必要なら) は `docs/ui-snapshot-policy.md` に従う。
 
+## 6.6 右情報パネルのロック (2026-09-02 実装。旧 backlog §1.158 の正本)
+
+決定 C で `Pinned` を廃止したあと、明示 open は **現在ファイルだけの transient 状態**に
+なった。「ファイルを送っても情報を見続けたい」という要求はそのまま残ったので、旧 Pinned の
+「画像へ重ねたまま開状態だけ固定する」ではなく、**上下 HUD のロックと同じ形** (領域を確保して
+重ねない) で入れ直した。バックログ §1.158 はこの節へ集約して削除した。
+
+### 状態と所有
+
+- 状態は [`FullscreenInfoPanelState`](../src/ui_helpers.rs) の 3 つ —
+  `open` (明示 open の入力 owner) / `locked` (鍵) / `hover_active` (右端ホバーの latch)。
+- **正本は `ViewerContextBundle` が持つ** (`App::fs_info_panel` はマウント中 context への投影)。
+  App-global な bool にしない。**窓ごとに独立**で、片方の窓のロックが他方のパネルを開閉しない。
+  回帰テストは `the_info_panel_lock_and_open_belong_to_one_viewer_context_each`。
+
+### 「描くか」と「場所を取るか」は 1 か所ずつ
+
+- **描くか**: `FullscreenInfoPanelState::visible(mode, tag_picker_open)` だけが答える。
+  呼び出し側が「ロック中なら描く」を別に綴らない。
+- **場所を取るか**: 静止画は `still_info_panel_lock_effective`
+  ([ui_fullscreen.rs](../src/ui_fullscreen.rs))、動画は `right_panel_reserves_space`
+  ([render_core.rs](../src/video/native_presenter/render_core.rs)) が答える。
+- **確保する条件と描く条件は同じでなければならない。** 別々に綴ると、パネルを描かないモードで
+  右に空白の帯だけが残る。静止画で確保しないのは、描画側が既にパネルを出さないモード —
+  動画 / 動画タイル / 補正レイヤー / SNS 分割 / 書き出し切り取り / 表示トリム / 分析 /
+  360 / 比較ワイプ / 注釈編集 / ズーム。
+- ロック中の画像 content rect は**パネル矩形と同じ幅ちょうど**だけ右を空ける。見た目だけ画像を
+  左へ寄せて入力座標を旧位置に残さない (描画・ズーム・パン・hit-test・ルーペ・ナビゲータが
+  同じ矩形を見る)。
+
+### lifecycle
+
+- **表示対象が変わっても閉じない。** `close_fs_side_panel_runtime` は
+  `on_display_target_changed` を呼び、内容だけを新しい対象へ更新する。
+- **解除するのはフルスクリーンを本当に出たときだけ。** その判断は `close_fullscreen` が持つ。
+- ⚠️ **フォルダ移動の内部 close→open と本当の終了を区別する述語は `fs_nav_locked_gen` 単独。**
+  OS ビューポートを作り直すかの判定と混ぜてはいけない (別の問いで、埋め込みフルスクリーンや
+  非 Windows では false になる)。混ぜていたため `Ctrl+↑↓` のたびにロックが落ちた
+  (実機報告 2026-09-02)。
+- 永続設定にしない。次回起動や次回のフルスクリーン入場へ持ち越さない。
+
+### 3 面
+
+静止画・本に加え、**動画と音楽でもロックできる** (2026-09-02 の利用者要望。タグを付けながら
+前後を送るため)。動画側の確保量・除外条件は
+[video-architecture.md](video-architecture.md) の右パネルの節を参照。鍵の形は静止画・動画の
+固定バーと同じベクターを使い、面ごとに描き直さない。
+
 ## 7. 手動実機検証チェックリスト (実施状況未確認)
 
 当時の検証計画では `.\scripts\build-release.ps1 -SkipVst3Bridge` で検証バイナリを
