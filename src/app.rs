@@ -7666,6 +7666,19 @@ pub(crate) enum ActionSurface {
     Viewer,
 }
 
+/// `check_external_folder_changes` を呼ぶ理由。
+///
+/// フォルダーの mtime を安いふるいとして使ってよいかが、これで決まる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalChangeCheck {
+    /// フォルダー監視が変化を通知してきた。**ふるいを通さない** — ファイルの中身だけが
+    /// 書き換わった場合、フォルダーの mtime は動かないため。
+    Notified,
+    /// フォーカス復帰やトレイからの復帰。契機が「戻ってきた」だけなので、毎回 read_dir
+    /// しないようフォルダーの mtime でふるう。
+    Resumed,
+}
+
 /// タグ操作の保留 Undo entry を集計するためのバッファ。
 ///
 /// 1 トランザクション (1 回の `request_tag_toggle_for_selection` / `_clear_for_selection`
@@ -17625,7 +17638,7 @@ impl App {
             ctx.request_repaint_after(delay);
         }
         if should_check {
-            self.check_external_folder_changes();
+            self.check_external_folder_changes(ExternalChangeCheck::Notified);
         }
     }
 
@@ -17779,7 +17792,7 @@ impl App {
     ///
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
     /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
-    pub(crate) fn check_external_folder_changes(&mut self) {
+    pub(crate) fn check_external_folder_changes(&mut self, reason: ExternalChangeCheck) {
         if self.global_search.active || self.tag_view.active {
             return;
         }
@@ -17794,9 +17807,6 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
-        let Some(prev_mtime) = self.current_folder_last_mtime else {
-            return;
-        };
         let Ok(meta) = folder.metadata() else {
             return;
         };
@@ -17806,8 +17816,20 @@ impl App {
         let Ok(new_mtime) = meta.modified() else {
             return;
         };
-        if new_mtime == prev_mtime {
-            return;
+        // フォルダーの mtime は**安いふるい**であって、変化の有無そのものではない。
+        // NTFS では、フォルダーの mtime が動くのは項目の追加 / 削除 / 改名のときだけで、
+        // **中のファイルが上書きされても動かない** (実測 2026-09-02)。外部ツールへ渡した
+        // 実ファイルが編集ソフトで保存し直された場合がこれに当たる。
+        //
+        // なので、監視が「変わった」と言ってきたときはふるいを通さない。ふるいが要るのは
+        // 契機が「戻ってきた」だけで、毎回 read_dir すると重い経路だけ。
+        if reason == ExternalChangeCheck::Resumed {
+            let Some(prev_mtime) = self.current_folder_last_mtime else {
+                return;
+            };
+            if new_mtime == prev_mtime {
+                return;
+            }
         }
         // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
         // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
@@ -66845,7 +66867,7 @@ impl eframe::App for App {
         // 全ユーザで動かす。
         let main_focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if main_focused_now && !self.last_main_focused && self.window_visible {
-            self.check_external_folder_changes();
+            self.check_external_folder_changes(ExternalChangeCheck::Resumed);
         }
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);

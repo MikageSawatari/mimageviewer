@@ -34510,7 +34510,7 @@ mod pipeline_cache_refactor_tests {
         );
 
         std::fs::write(folder.join("b.png"), b"new").unwrap();
-        app.check_external_folder_changes();
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Resumed);
 
         assert!(
             app.retained_final_ai_cache.is_empty(),

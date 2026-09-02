@@ -352,7 +352,7 @@ impl App {
         self.update_tray_tooltip();
         // 外部 (ComfyUI 等) がトレイ常駐中に current_folder へファイルを追加していたら
         // 自動で反映する。stat 1 回の軽量チェックで、変化が無ければ no-op。
-        self.check_external_folder_changes();
+        self.check_external_folder_changes(crate::app::ExternalChangeCheck::Resumed);
         #[cfg(windows)]
         let restored_presenters = self.sync_media_presenter_visibility_for_tray(true);
         #[cfg(not(windows))]
