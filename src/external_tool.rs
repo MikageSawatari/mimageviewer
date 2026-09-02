@@ -17,8 +17,11 @@ pub(crate) const VIRTUAL_ORIGINAL_FILE_DISABLED_REASON: &str = "圧縮ファイ�
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// テンプレートに 1 つも無ければ `{files}` を自動で足す、その判定に使う一覧。
+///
+/// `{file}` は入れない。`split_argument_template_with_default` が読み込み時点で
+/// `{files}` へ揃えるので、ここへ来る綴りは `{files}` だけ。
 const IMPLEMENTED_PLACEHOLDERS: &[&str] = &[
-    "{file}",
     "{files}",
     "{dir}",
     "{name}",
@@ -848,7 +851,7 @@ impl ExternalTool {
             id: ExternalToolId(1),
             name: String::new(),
             launch: ExternalToolLaunch::OsDefault,
-            arguments: "{file}".to_string(),
+            arguments: "{files}".to_string(),
             working_directory: None,
             payload: PayloadPolicy::TempEdited,
             video: VideoPolicy::File,
@@ -994,10 +997,13 @@ fn external_tool_picker_items(
 
 /// Windows の `CommandLineToArgvW` と同じ引用符・バックスラッシュ規則で、
 /// 引数テンプレートを先にトークンへ分割する。
-fn split_argument_template_with_default(
-    template: &str,
-    default_placeholder: &'static str,
-) -> Vec<String> {
+fn split_argument_template_with_default(template: &str) -> Vec<String> {
+    // 渡すファイルの綴りは `{files}` 1 つ。**`{file}` は同義として受けるだけで、
+    // 設定画面にも文書にも出さない。** 複数選択を「1 件ずつ」と「まとめて渡す」で
+    // 切り替えるたびに引数を書き直すのは不便で、2 つの綴りを持つ理由が無い
+    // (2026-09-02 利用者判断)。開発中に書いた古いテンプレートが literal `{file}` を
+    // ツールへ渡してしまわないよう、ここで 1 つに揃える。
+    let template = &template.replace("{file}", "{files}");
     let mut result = Vec::new();
     let chars: Vec<char> = template.chars().collect();
     let mut index = 0;
@@ -1063,25 +1069,22 @@ fn split_argument_template_with_default(
     }
 
     if !contains_known_placeholder(template) {
-        result.push(default_placeholder.to_string());
+        result.push("{files}".to_string());
     }
     result
 }
 
 pub fn split_argument_template(template: &str) -> Vec<String> {
-    split_argument_template_with_default(template, "{file}")
+    split_argument_template_with_default(template)
 }
 
+/// `{files}` は「1 件ずつ」なら 1 引数、「まとめて渡す」なら対象数ぶんの引数へ広がる。
+/// 綴りが 1 つなので、複数選択を切り替えても引数テンプレートは書き直さなくてよい。
 fn split_argument_template_for_selection(
     template: &str,
-    selection: SelectionPolicy,
+    _selection: SelectionPolicy,
 ) -> Vec<String> {
-    let default_placeholder = if selection == SelectionPolicy::Batch {
-        "{files}"
-    } else {
-        "{file}"
-    };
-    split_argument_template_with_default(template, default_placeholder)
+    split_argument_template_with_default(template)
 }
 
 fn contains_known_placeholder(template: &str) -> bool {
@@ -1096,7 +1099,6 @@ fn contains_known_placeholder(template: &str) -> bool {
 fn placeholder_value(placeholder: &str, ctx: &PlaceholderContext) -> Option<OsString> {
     let facts = &ctx.facts;
     match placeholder {
-        "{file}" => Some(ctx.file.as_os_str().to_os_string()),
         "{dir}" => Some(
             ctx.file
                 .parent()
@@ -1256,7 +1258,7 @@ pub fn expand_arguments_for_files(
         let before = result.len();
         if token.contains("{files}") {
             result.extend(contexts.iter().filter_map(|ctx| {
-                // `{file}` などの scalar は Batch でも先頭対象を指す。
+                // `{stem}` などの scalar は Batch でも先頭対象を指す。
                 // N 件へ変化させるのは `{files}` の値だけにする。
                 expand_token(token, primary, Some(ctx.file.as_os_str()))
             }));
@@ -3116,7 +3118,7 @@ mod tests {
         let tool = ExternalTool::defaults_for_editing();
         assert_eq!(tool.payload, PayloadPolicy::OriginalFile);
         assert_eq!(tool.spread, SpreadPolicy::MainPageOnly);
-        assert_eq!(tool.arguments, "{file}");
+        assert_eq!(tool.arguments, "{files}");
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
 
@@ -3842,7 +3844,7 @@ mod tests {
     /// ない**ので、実体化後のパスからは復元できない値になる。
     #[test]
     fn container_and_page_describe_the_source_not_the_materialized_file() {
-        let tokens = split_argument_template(r#"-page {page} "{container}" {file}"#);
+        let tokens = split_argument_template(r#"-page {page} "{container}" {files}"#);
         let ctx = PlaceholderContext::with_facts(
             PathBuf::from(r"C:\Temp\ext-1\page_003.png"),
             facts_for_pdf_page(r"C:\Books\manual.pdf", 3),
@@ -3863,7 +3865,7 @@ mod tests {
     /// 側は引数の解釈に失敗する。
     #[test]
     fn a_target_without_a_page_drops_the_option_and_its_value_together() {
-        let tokens = split_argument_template(r#"-page {page} --at {time} "{file}""#);
+        let tokens = split_argument_template(r#"-page {page} --at {time} "{files}""#);
         let ctx = PlaceholderContext::with_facts(
             PathBuf::from(r"C:\Images\photo.jpg"),
             PlaceholderFacts {
@@ -3922,16 +3924,16 @@ mod tests {
     fn split_argument_template_handles_whitespace_quotes_and_escapes() {
         assert_eq!(
             split_argument_template(r#"  --mode edit   "two words" tail  "#),
-            ["--mode", "edit", "two words", "tail", "{file}"]
+            ["--mode", "edit", "two words", "tail", "{files}"]
         );
         assert_eq!(
             split_argument_template(r#""a""b" "c\\\"d" "#),
-            ["a\"b", "c\\\"d", "{file}"]
+            ["a\"b", "c\\\"d", "{files}"]
         );
-        assert_eq!(split_argument_template(r#""""#), ["", "{file}"]);
+        assert_eq!(split_argument_template(r#""""#), ["", "{files}"]);
         assert_eq!(
             split_argument_template(r#""unterminated value"#),
-            ["unterminated value", "{file}"]
+            ["unterminated value", "{files}"]
         );
     }
 
@@ -3939,7 +3941,7 @@ mod tests {
     fn split_does_not_append_file_when_a_known_keyword_exists() {
         assert_eq!(
             split_argument_template("--input={file}"),
-            ["--input={file}"]
+            ["--input={files}"]
         );
         assert_eq!(split_argument_template("-page {page}"), ["-page", "{page}"]);
     }
@@ -3948,7 +3950,7 @@ mod tests {
     fn expand_arguments_supports_every_p1_placeholder_without_loss_of_boundaries() {
         let ctx = PlaceholderContext::for_file(r"C:\My Images\photo.final.JPG");
         let tokens = vec![
-            "{file}".into(),
+            "{files}".into(),
             "{dir}".into(),
             "{name}".into(),
             "{stem}".into(),
@@ -4058,7 +4060,7 @@ mod tests {
     #[test]
     fn replacement_with_spaces_remains_one_argument() {
         let ctx = PlaceholderContext::for_file(r"C:\space dir\image.png");
-        let tokens = split_argument_template("--input={file}");
+        let tokens = split_argument_template("--input={files}");
         assert_eq!(
             expand_arguments(&tokens, &ctx),
             [OsString::from(r"--input=C:\space dir\image.png")]
@@ -4087,10 +4089,10 @@ mod tests {
             PlaceholderContext::for_file(r"D:\other\second.png"),
         ];
         assert_eq!(
-            expand_arguments_for_files(&["--pair={file}:{files}".to_string()], &contexts),
+            expand_arguments_for_files(&["--pair={stem}:{files}".to_string()], &contexts),
             [
-                OsString::from(r"--pair=C:\images\first one.jpg:C:\images\first one.jpg"),
-                OsString::from(r"--pair=C:\images\first one.jpg:D:\other\second.png"),
+                OsString::from(r"--pair=first one:C:\images\first one.jpg"),
+                OsString::from(r"--pair=first one:D:\other\second.png"),
             ]
         );
     }
@@ -4220,11 +4222,61 @@ mod tests {
             ]
         );
 
+        // 綴りは 1 つなので、`{file}` と書いても「まとめて渡す」で動く。
         tool.arguments = "--input {file}".to_string();
-        assert!(
-            build_launch_operation(&tool, &targets)
-                .unwrap_err()
-                .contains("{files}")
+        let spelled_singular = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(
+            spelled_singular.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png"),
+                OsString::from(r"C:\Images\1.png"),
+            ]
+        );
+    }
+
+    /// 渡すファイルの綴りは `{files}` 1 つ。**複数選択を切り替えても引数は書き直さない。**
+    ///
+    /// 以前は「1 件ずつ」= `{file}` /「まとめて渡す」= `{files}` と綴りが分かれており、
+    /// 切り替えるたびに引数テンプレートを直す必要があった (2026-09-02 利用者判断で統合)。
+    #[test]
+    fn the_same_template_serves_one_at_a_time_and_all_at_once() {
+        let targets = [
+            LaunchTarget::RealFile(PathBuf::from(r"C:\Images\0.png")),
+            LaunchTarget::RealFile(PathBuf::from(r"C:\Images\1.png")),
+        ];
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
+        tool.arguments = "--input {files}".to_string();
+
+        tool.selection = SelectionPolicy::Each;
+        let each = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(each.requests.len(), 2);
+        assert_eq!(
+            each.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png")
+            ]
+        );
+        assert_eq!(
+            each.requests[1].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\1.png")
+            ]
+        );
+
+        tool.selection = SelectionPolicy::Batch;
+        let batch = build_launch_operation(&tool, &targets).unwrap();
+        assert_eq!(batch.requests.len(), 1);
+        assert_eq!(
+            batch.requests[0].arguments,
+            [
+                OsString::from("--input"),
+                OsString::from(r"C:\Images\0.png"),
+                OsString::from(r"C:\Images\1.png"),
+            ]
         );
     }
 
@@ -4523,7 +4575,7 @@ mod tests {
         ];
         let path = PathBuf::from(OsString::from_wide(&raw));
         let arguments = expand_arguments(
-            &["{file}".to_string()],
+            &["{files}".to_string()],
             &PlaceholderContext::for_file(&path),
         );
         assert_eq!(arguments[0].encode_wide().collect::<Vec<_>>(), raw.to_vec());

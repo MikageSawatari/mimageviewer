@@ -4610,7 +4610,7 @@ mod tests {
             loaded.external_tools[0].launch,
             ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\first.exe"))
         );
-        assert_eq!(loaded.external_tools[0].arguments, "{file}");
+        assert_eq!(loaded.external_tools[0].arguments, "{files}");
         assert_eq!(loaded.external_tools[1].id, ExternalToolId(2));
         assert_eq!(loaded.external_tools[1].name, "Second");
         assert_eq!(loaded.external_tools[1].payload, PayloadPolicy::TempEdited);

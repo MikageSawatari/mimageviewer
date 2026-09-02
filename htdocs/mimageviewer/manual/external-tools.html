@@ -175,14 +175,13 @@
           <tr><th>記法</th><th>展開されるもの</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>{file}</code></td><td>渡すファイルのパス。何も書かないときはこれが 1 つ付きます</td></tr>
-          <tr><td><code>{files}</code></td><td>対象すべて。「まとめて渡す」のときに使います</td></tr>
+          <tr><td><code>{files}</code></td><td>渡すファイルのパス。「1 件ずつ」なら 1 つ、「まとめて渡す」なら選んだ数だけ並びます。何も書かないときはこれが 1 つ付きます</td></tr>
           <tr><td><code>{dir}</code> / <code>{name}</code> / <code>{stem}</code> / <code>{ext}</code></td><td>親フォルダー / ファイル名 / 拡張子なしの名前 / 拡張子</td></tr>
           <tr><td><code>{container}</code></td><td>圧縮ファイル / PDF / 動画そのもののパス。実ファイルならそれ自身</td></tr>
           <tr><td><code>{entry}</code></td><td>圧縮ファイル内での名前</td></tr>
           <tr><td><code>{page}</code></td><td>ページ番号（1 から数えます）</td></tr>
           <tr><td><code>{time}</code> / <code>{time_ms}</code> / <code>{time_hms}</code></td><td>動画の再生位置。秒 / ミリ秒 / <code>00:01:23.456</code></td></tr>
-          <tr><td><code>{uri}</code></td><td><code>{file}</code> を URI 形式にしたもの</td></tr>
+          <tr><td><code>{uri}</code></td><td><code>{files}</code> を URI 形式にしたもの</td></tr>
         </tbody>
       </table>
     </div>

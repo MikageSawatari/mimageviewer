@@ -976,7 +976,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("利用できるプレースホルダ").strong());
-        ui.label("{file}  {files}  {dir}  {name}  {stem}  {ext}  {uri}");
+        ui.label("{files}  {dir}  {name}  {stem}  {ext}  {uri}");
         ui.label("{container}  {entry}  {page}  {time}  {time_ms}  {time_hms}");
         ui.add(
             egui::Label::new(
