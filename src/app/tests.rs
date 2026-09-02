@@ -26051,6 +26051,17 @@ mod favorite_adjustment_defaults_tests {
             app.fs_info_panel.open,
             crate::ui_helpers::MetadataPanelOpenState::Closed
         );
+
+        // **フォルダ移動 (Ctrl+↑↓) の内部 close→open では解除しない。**
+        // この判定を viewport 保持の可否と混ぜていたため、埋め込みフルスクリーンでは
+        // 移動のたびに落ちていた (実機報告 2026-09-02)。移動の意図だけで決める。
+        app.fs_info_panel.locked = true;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.close_fullscreen();
+        assert!(
+            app.fs_info_panel.locked,
+            "フォルダ移動の内部 close でロックが落ちた"
+        );
     }
 
     #[test]

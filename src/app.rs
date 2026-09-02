@@ -52121,10 +52121,16 @@ impl App {
             self.fs_nav_locked_gen.is_some() && self.fs_viewport_shown;
 
         self.reset_fs_side_panel_runtime_for_file_change();
-        // **フォルダ移動の再オープンと、本当の終了を区別する。** この関数はフォルダ移動でも
-        // 呼ばれるので、単に「ロック中は reset しない」にすると終了時も残る (§1.158)。
-        // 判断は既にここにある viewport 保持の可否と同じ意味なので、新しいフラグは足さない。
-        if !preserve_viewport_for_folder_nav_reopen {
+        // **フォルダ移動の内部 close→open と、本当の終了を区別する。** この関数はフォルダ
+        // 移動でも呼ばれるので、単に「ロック中は reset しない」にすると終了時も残る (§1.158)。
+        //
+        // 判定は `fs_nav_locked_gen` 単独。上の viewport 保持の可否と混ぜてはいけない —
+        // あちらは「OS ビューポートを作り直すか」という別の問いで、埋め込みフルスクリーンや
+        // 非 Windows では false になる。混ぜていたので Ctrl+↑↓ のたびにロックが落ちていた
+        // (実機報告 2026-09-02)。Esc 等で DFS 中に抜けた場合は、この行に来る前に
+        // `release_fs_nav_lock()` が走って None になるので、本当の終了として扱われる。
+        let closing_for_folder_nav_reopen = self.fs_nav_locked_gen.is_some();
+        if !closing_for_folder_nav_reopen {
             self.fs_info_panel.on_fullscreen_exit();
         }
         self.fullscreen_idx = None;
