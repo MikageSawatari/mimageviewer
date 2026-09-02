@@ -10647,6 +10647,11 @@ pub struct App {
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
     pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
+    /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
+    /// 「360 で見ていた」という事実はこちらが覚える。次に開いたものが 360 素材なら
+    /// `reconcile_panorama_session_intent` が state を作り直す。
+    pub(crate) panorama_intent: crate::panorama::PanoramaSessionIntent,
     /// 360 度パノラマビュー: アップロード済み wgpu テクスチャ (LRU 1、active のみ)。
     /// 別画像へナビ / 360 OFF で `None` にする。VRAM 解放のため Arc 共有。
     pub(crate) pano_uploaded: Option<std::sync::Arc<crate::panorama_wgpu::UploadedPanoTexture>>,
@@ -13944,6 +13949,7 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             panorama_state: None,
+            panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
             pano_high_res_source: std::collections::HashMap::new(),
@@ -38003,7 +38009,9 @@ impl App {
 
         self.deactivate_compare_view();
         if self.panorama_state.is_some() {
-            self.toggle_panorama_mode(fs_idx);
+            // park は利用者が 360 をやめた操作ではないので、**意図は残す**。
+            // 残さないと parked 側が resume したときに 360 が戻らない (backlog §1.145)。
+            self.apply_panorama_mode_toggle(fs_idx);
         }
         self.pano_toast_shown_for_current_fs = false;
         if self.analysis_mode {
@@ -41692,6 +41700,13 @@ impl App {
     fn park_active_detached_image_window(&mut self) -> bool {
         if let Some(fs_idx) = self.fullscreen_idx {
             self.reset_detached_pause_foreground_modes(fs_idx);
+            // **この park だけは 360 の意図も落とす** (backlog §1.145)。窓は静止
+            // スナップショットになり、context 自身は別の窓 / 別の内容へ進む。意図を
+            // 連れて行くと、新しく開いた detached 窓が次のフレームで 360 に戻り、
+            // 「新しい窓は通常表示で始まる (V で入り直せる)」という既存の契約が
+            // 破れる。live context を退避する `pause_current_active_viewer_context`
+            // 側は意図ごと bundle に残す (あちらは同じ viewer が戻ってくる)。
+            self.panorama_intent.on = false;
         }
         let Some(snapshot) = self.build_active_detached_image_window_snapshot(None) else {
             return false;
@@ -63381,6 +63396,29 @@ impl App {
         self.pano_quality_state.insert(source_key, state);
     }
 
+    /// セッションの意図 (`panorama_intent.on`) が ON で、いま開いているものが 360 素材
+    /// なら、360 モードを作り直す (backlog §1.145)。
+    ///
+    /// **復帰の契機を 1 つのイベントに決められない**ので、宣言された意図と実際の状態を
+    /// 突き合わせる形にしてある。`detect_panorama` が答えを持つ時刻は素材で違う —
+    /// 静止画は GPano XMP の到着、XMP なしの 2:1 画像は `fs_cache` の寸法確定、動画は
+    /// FFmpeg の stream info が揃った時点。どれも「その瞬間」を 1 つの通知として
+    /// 受け取れないため、フルスクリーン中は毎フレーム突き合わせる。判定は純粋
+    /// (`detect_panorama`) で、意図が OFF なら最初の行で戻る。
+    ///
+    /// 復帰は利用者が V を押したときと同じ経路 ([`Self::apply_panorama_mode_toggle`])
+    /// を通る。360 は機能制限モードなので、衝突するパネル / モードを止める副作用まで
+    /// 含めて同じでなければ、復帰したときだけ 360 と補正パネルが同時に開く。
+    pub(crate) fn reconcile_panorama_session_intent(&mut self, fs_idx: usize) {
+        if !self.panorama_intent.on || self.panorama_state.is_some() {
+            return;
+        }
+        if self.detect_panorama(fs_idx).is_none() {
+            return;
+        }
+        self.apply_panorama_mode_toggle(fs_idx);
+    }
+
     /// 「V キーで 360° ビューワー」案内トーストを必要なら出す (Codex P2 第 18 ラウンド)。
     ///
     /// 発火条件 (全て true のとき):
@@ -63405,6 +63443,10 @@ impl App {
     /// `false` = 条件未満 or 既に発火済みでスキップ。
     /// `open_fullscreen` でページ補正トーストとの競合回避に使う (Codex P3 第 20 ラウンド)。
     pub(crate) fn try_show_pano_hint_toast_returning_fired(&mut self, fs_idx: usize) -> bool {
+        // 「360 素材と分かった」は 1 つの事実で、答えが 2 つある: 意図が ON なら復帰、
+        // そうでなければ案内。復帰を先にやるので、既に 360 なのに「V キーで 360°
+        // ビューワー」と案内してしまうことがない (下の `is_some()` で落ちる)。
+        self.reconcile_panorama_session_intent(fs_idx);
         if self.pano_toast_shown_for_current_fs {
             return false;
         }
@@ -63749,18 +63791,35 @@ impl App {
         let pano = self.panorama_state.as_mut()?;
         let applied = pano.set_projection(projection);
         pano.sanitize();
+        // 選んだ方式はセッションに覚える。360 を解除して入れ直したときに既定へ
+        // 戻らないようにするためで、`on` とは独立 (backlog §1.145)。
+        self.panorama_intent.projection = Some(applied);
         self.show_feedback_toast(format!("投影方式: {}", applied.label()));
         Some(applied)
     }
 
-    /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
+    /// 360 モード ON / OFF をトグルし、**セッションの意図として記録する**。
+    /// 利用者操作 (V キー / 上バー / HUD ボタン) の入口はすべてここ。
+    ///
+    /// 記録するので、フルスクリーンを閉じて別の 360 素材を開くと復帰する
+    /// ([`Self::reconcile_panorama_session_intent`], backlog §1.145)。
+    /// 利用者の操作でない ON / OFF (= detached park の一時退避) は
+    /// [`Self::apply_panorama_mode_toggle`] を直に呼び、意図を書き換えない。
+    pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+        self.apply_panorama_mode_toggle(fs_idx);
+        self.panorama_intent.on = self.panorama_state.is_some();
+    }
+
+    /// 360 モード ON / OFF の状態遷移そのもの。fs_idx は対象画像 (検出 hint の初期視点取得用)。
+    ///
+    /// **セッションの意図 (`panorama_intent.on`) は書き換えない。**
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
     /// - スライドショー停止 (= 360 を見る間は次画像へ自動遷移しない)
     /// - adjustment_mode / local_adjust_mode / analysis_mode / erase_mode を OFF
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
-    pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+    pub(crate) fn apply_panorama_mode_toggle(&mut self, fs_idx: usize) {
         let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
         if self.panorama_state.is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
@@ -63788,10 +63847,13 @@ impl App {
         }
         // ON: GPano hint があれば初期視点に反映
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
+        // 投影方式はセッションで選んだものを優先する。環境設定の既定は「新しい
+        // セッションを何で始めるか」なので、そちらは読むだけで書き換えない。
+        let projection = self
+            .panorama_intent
+            .projection_or(self.settings.panorama_projection);
         self.panorama_state = Some(crate::panorama::PanoramaState::new(
-            init_yaw,
-            init_pitch,
-            self.settings.panorama_projection,
+            init_yaw, init_pitch, projection,
         ));
         // Video 360 owns the same native canvas as tile mode, but it is not the
         // still-viewer's restriction mode. Keep playback and panels intact.
@@ -67373,6 +67435,10 @@ impl eframe::App for App {
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
+            // 360 の意図と実際の状態を突き合わせる。素材が 360 だと分かる時刻が
+            // 静止画 / 動画で違うため、イベントではなくここで毎フレーム見る
+            // (`reconcile_panorama_session_intent` の doc 参照)。描画より前。
+            self.reconcile_panorama_session_intent(fs_idx);
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
             let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);

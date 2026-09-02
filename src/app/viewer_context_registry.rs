@@ -839,6 +839,9 @@ pub(in crate::app) struct ViewerContextBundle {
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
     panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 360 で見ているという意図 (+ 選んだ投影方式)。フルスクリーンを閉じても残る
+    /// ので、App グローバルに置くと別ウィンドウの 360 が混ざる (backlog §1.145)。
+    panorama_intent: crate::panorama::PanoramaSessionIntent,
     /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
     /// App-global に置くと別ウィンドウの操作で他方のパネルが開閉する (backlog §1.158)。
     fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
@@ -1395,6 +1398,7 @@ impl ViewerContextBundle {
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
             panorama_state: None,
+            panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
             analysis_mode: false,
@@ -1721,6 +1725,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
@@ -1965,6 +1970,7 @@ impl App {
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
+        swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
         swap_field!(analysis_mode);
@@ -2240,6 +2246,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,
@@ -2445,6 +2452,9 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、
+            // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
+            panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
             analysis_mode,

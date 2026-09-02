@@ -31648,6 +31648,175 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// backlog §1.145: 一覧へ戻る / フォルダを移動すると `close_fullscreen` が
+    /// `panorama_state` を捨てるので、360 素材が続いていても通常表示に落ちていた。
+    #[test]
+    fn the_360_view_returns_when_the_next_folder_opens_another_360_image() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = push_image(&mut app, "C:/pics/pano-carry-a.jpg");
+        insert_pano_static_source(&mut app, &ctx, first, "pano_carry_a", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(first);
+        app.toggle_panorama_mode(first);
+        assert!(app.panorama_state.is_some(), "V で 360 に入ったはず");
+
+        app.close_fullscreen();
+        assert!(
+            app.panorama_state.is_none(),
+            "state はフルスクリーン退出で捨てる (GPU リソースを抱えたままにしない)"
+        );
+        assert!(
+            app.panorama_intent.on,
+            "捨てるのは state だけで、360 で見ていたという意図は残る"
+        );
+
+        let second = push_image(&mut app, "C:/pics/pano-carry-b.jpg");
+        insert_pano_static_source(&mut app, &ctx, second, "pano_carry_b", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(second);
+        app.reconcile_panorama_session_intent(second);
+
+        assert!(
+            app.panorama_state.is_some(),
+            "次に開いたものも 360 素材なら 360 で見えるはず"
+        );
+    }
+
+    /// 復帰は「素材なら 360」であって「常に 360」ではない。
+    #[test]
+    fn an_image_that_is_not_360_material_stays_a_normal_image() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let pano = push_image(&mut app, "C:/pics/pano-then-normal-a.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            pano,
+            "pano_then_normal_a",
+            egui::Color32::BLACK,
+        );
+        app.fullscreen_idx = Some(pano);
+        app.toggle_panorama_mode(pano);
+        app.close_fullscreen();
+
+        // 正方形 = アスペクト判定にも GPano にも当たらない。
+        let square = push_image(&mut app, "C:/pics/pano-then-normal-b.jpg");
+        let pixels = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]));
+        let texture = ctx.load_texture(
+            "pano_then_normal_b",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            square,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.fullscreen_idx = Some(square);
+        app.reconcile_panorama_session_intent(square);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "360 素材でないものを 360 で描いてはいけない"
+        );
+        assert!(
+            app.panorama_intent.on,
+            "意図は残す。次がまた 360 素材なら復帰する"
+        );
+    }
+
+    /// 自分で解除したなら、それも意図。次のフォルダで勝手に戻らない。
+    #[test]
+    fn turning_360_off_by_hand_keeps_it_off_in_the_next_folder() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = push_image(&mut app, "C:/pics/pano-off-a.jpg");
+        insert_pano_static_source(&mut app, &ctx, first, "pano_off_a", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(first);
+        app.toggle_panorama_mode(first);
+        app.toggle_panorama_mode(first);
+        assert!(!app.panorama_intent.on);
+
+        app.close_fullscreen();
+        let second = push_image(&mut app, "C:/pics/pano-off-b.jpg");
+        insert_pano_static_source(&mut app, &ctx, second, "pano_off_b", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(second);
+        app.reconcile_panorama_session_intent(second);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "解除したままフォルダを移ったのに 360 が復活してはいけない"
+        );
+    }
+
+    /// backlog §1.145: 投影方式は `on` とは独立に覚える。解除して入れ直すと既定へ
+    /// 戻っていた。環境設定の既定 (`Settings::panorama_projection`) は書き換えない。
+    #[test]
+    fn the_projection_picked_in_this_session_survives_turning_360_off_and_on() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.panorama_projection = crate::panorama::PanoProjection::Perspective;
+        let idx = push_image(&mut app, "C:/pics/pano-projection-carry.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_carry",
+            egui::Color32::BLACK,
+        );
+        app.fullscreen_idx = Some(idx);
+        app.toggle_panorama_mode(idx);
+        app.set_panorama_projection(crate::panorama::PanoProjection::Stereographic);
+
+        app.toggle_panorama_mode(idx);
+        app.toggle_panorama_mode(idx);
+
+        assert_eq!(
+            app.panorama_state
+                .as_ref()
+                .expect("360 に入り直したはず")
+                .projection,
+            crate::panorama::PanoProjection::Stereographic,
+            "このセッションで選んだ写り方で戻るはず"
+        );
+        assert_eq!(
+            app.settings.panorama_projection,
+            crate::panorama::PanoProjection::Perspective,
+            "1 枚を別の写り方で見ただけで環境設定の既定を書き換えない"
+        );
+    }
+
+    /// 別ウィンドウへ退避するときの 360 OFF は利用者の操作ではないので、意図は残す。
+    /// 残さないと、退避した窓へ戻ったときに 360 が消えている。
+    #[test]
+    #[cfg(windows)]
+    fn parking_a_viewer_keeps_the_360_intent_so_resuming_restores_it() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-park.jpg");
+        insert_pano_static_source(&mut app, &ctx, idx, "pano_park", egui::Color32::BLACK);
+        app.fullscreen_idx = Some(idx);
+        app.toggle_panorama_mode(idx);
+
+        app.reset_detached_pause_foreground_modes(idx);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "退避中は前面モードを落とす (既存の契約)"
+        );
+        assert!(app.panorama_intent.on, "退避は 360 をやめた操作ではない");
+
+        app.reconcile_panorama_session_intent(idx);
+        assert!(
+            app.panorama_state.is_some(),
+            "戻したときに 360 で再開できるはず"
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn panorama_detection_has_one_entry_for_stills_and_display_oriented_video() {
@@ -47434,6 +47603,41 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.detached_image_windows.len(), 1);
         assert_eq!(app.detached_image_windows[0].location_display, "pano_a.jpg");
+    }
+
+    /// backlog §1.145: 360 の意図はフルスクリーンを閉じても残るので、**グリッドから
+    /// 新しい窓を開く**境界で連れて行かれないことを固定する。連れて行くと、既存の
+    /// 「新しい detached 窓は通常表示で始まる」契約が次のフレームで破れる
+    /// (state は空でも意図が復帰させるため)。
+    #[test]
+    fn a_new_detached_window_does_not_inherit_the_360_intent() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\pano_intent_a.jpg");
+        let second = push_image(&mut app, r"C:\pics\pano_intent_b.jpg");
+        insert_static_fs_entry(&mut app, &ctx, first, "pano_intent_first");
+        insert_static_fs_entry(&mut app, &ctx, second, "pano_intent_second");
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.fullscreen_idx = Some(first);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.fs_open_intent_from_grid = true;
+        app.toggle_panorama_mode(first);
+        assert!(app.panorama_intent.on, "V で 360 に入ったので意図が立つ");
+        let first_window_id = app.ensure_detached_viewer_window_id();
+        app.begin_mounted_detached_session_for_test(first_window_id, DetachedSource::Image);
+
+        app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
+
+        assert!(
+            app.panorama_state.is_none(),
+            "新しい窓は通常表示で始まる (既存の契約)"
+        );
+        assert!(
+            !app.panorama_intent.on,
+            "意図まで渡すと、次のフレームで 360 が復帰して契約が破れる"
+        );
     }
 
     #[test]

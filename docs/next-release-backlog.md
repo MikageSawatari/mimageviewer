@@ -2792,6 +2792,10 @@ Ctrl+- すると★時刻順は完全に消える (動画サイズは大半が�
 
 ### 1.145 360 ビューの ON 意図と投影方式が、一覧へ戻ると失われる — 利用者要望
 
+- **実装済み (2026-09-02、レーン 2、branch `display-geometry-rounding`)**。`PanoramaSessionIntent`
+  (ON の意図 + 選んだ投影方式) を `ViewerContextBundle` に持ち、`reconcile_panorama_session_intent`
+  が「意図が ON + state 無し + 360 素材」の 3 つが揃った時点で復帰させる。設計と fork ポリシーの
+  正本は [panorama-360-view-plan.md §5.1.1](panorama-360-view-plan.md)。
 - 出典: 利用者要望 (2026-08-31)。
   - 360 を解除して再度 ON にすると、投影方式が既定へ戻る。
   - `Ctrl+↑↓` でフォルダを移動すると 360 ビューが解除される。対象の素材なら継続してほしい。

@@ -1690,6 +1690,40 @@ yaw / pitch / fov を引き継ぐ。
 360 モードと相互排他: compare / erase / analysis / spread / free_rotation は
 360 アクティブ中に `early-return` で抑止する。
 
+#### 5.1.1 セッションの意図 (`panorama_intent`、backlog §1.145)
+
+`panorama_state` は「今この 1 枚をどう見ているか」なので `close_fullscreen` で捨てる
+(GPU リソースを抱えたままにしないため)。そのため一覧へ戻る / フォルダを移動すると 360 が
+解除されていた。捨てるのは state だけにして、**画像に依らない 2 つ**を別に持つ。
+
+```rust
+pub struct PanoramaSessionIntent {
+    pub on: bool,                         // 360 で見ているつもりか
+    pub projection: Option<PanoProjection>, // このセッションで選んだ写り方
+}
+```
+
+- 置き場所は `ViewerContextBundle` (= viewer ごと)。App グローバルだと窓ごとに混ざる。
+- `on` は **利用者操作の入口 (`toggle_panorama_mode`) だけ**が書く。利用者の操作でない
+  ON / OFF (detached park の一時退避) は `apply_panorama_mode_toggle` を直に呼ぶ。
+- `projection` は `on` と独立。解除して入れ直したときに既定へ戻らないようにするため。
+  `Settings::panorama_projection` は読むだけで書き換えない (§5.3 と同じ理由)。
+- 復帰は `reconcile_panorama_session_intent(fs_idx)`。意図が ON、state が無い、
+  `detect_panorama` が Some の 3 つが揃ったときだけ、利用者が <kbd>V</kbd> を押したのと
+  同じ経路で ON にする。相互排他モードの抑止まで同じでないと、復帰したときだけ 360 と
+  補正パネルが同時に開く。
+- **契機を 1 つのイベントに決められない**ので毎フレーム突き合わせる。`detect_panorama` が
+  答えを持つ時刻は素材で違う — 静止画は GPano XMP の到着、XMP なしの 2:1 画像は
+  `fs_cache` の寸法確定、動画は FFmpeg の stream info が揃った時点。判定は純粋で、
+  意図が OFF なら最初の行で戻る。
+- fork 時は `panorama_state` と同じ側へ動く (`move_to_parked!`)。渡した viewer が 360 を
+  続けるので、その viewer がページを移ったときに復帰するのも同じ側。
+- **例外は静止スナップショットへの park** (`park_active_detached_image_window`)。窓は
+  スナップショットになり context 自身は別の窓へ進むので、意図も落とす。落とさないと
+  「新しい detached 窓は通常表示で始まる」既存の契約が次のフレームで破れる。
+  live context の一時退避 (`pause_current_active_viewer_context`) は bundle ごと戻るので
+  意図を保つ。
+
 ### 5.2 入力ハンドリング (Codex P2 反映)
 
 矢印によるフルスクリーン移動と Esc によるフルスクリーン終了は維持する。一方、360 中の
@@ -1787,6 +1821,9 @@ wheel は修飾キーに関係なくすべて FOV 操作として consume し、
 - 360 でない画像へナビした際は、**`panorama_state` を保持しつつ非アクティブ
   化**。次に equirect 画像に戻ったら yaw / pitch / fov を引き継いで再開する。
   (これは「セッション内の 360 表示記憶」程度の軽い扱い。永続化はしない)
+- フルスクリーンを閉じると `panorama_state` は捨てるが、**360 で見ていたという意図は
+  残す** (§5.1.1)。次に開いた対象が 360 素材なら 360 で表示し、素材でなければ通常表示に
+  する。yaw / pitch / fov は state と一緒に消えるので初期視点から始まる。
 
 ### 6.4 補正 / AI との関係
 

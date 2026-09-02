@@ -272,6 +272,40 @@ pub const SOURCE_KIND_AI: u16 = 2;
 pub const SOURCE_KIND_AI_ADJUST: u16 = 3;
 pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
 
+/// フルスクリーンを閉じても持ち越す、360 ビューについての **利用者の意図**。
+///
+/// [`PanoramaState`] とは別物で、あちらは「今この 1 枚をどう見ているか」。画像が
+/// 変われば作り直されるし、フルスクリーンを閉じれば消える。ここに持つのは画像に
+/// 依らない 2 つだけ:
+///
+/// - `on`: 360 で見たまま離れたか。次に開いたものが 360 素材なら復帰させる。
+///   素材でなければ何も起きないので、「常に 360」ではなく「素材なら 360」という意図。
+/// - `projection`: 最後に選んだ投影方式。`on` とは独立に覚える。解除して入れ直した
+///   ときに既定へ戻らないようにするためで、`on == false` でも保持する。
+///
+/// **`Settings::panorama_projection` (= 環境設定の既定) は書き換えない**。あちらは
+/// 「新しいセッションを何で始めるか」で、こちらは「今のセッションで何を選んだか」。
+/// 1 枚だけ別の写り方で見た操作が既定を書き換えてしまうのを避けるため、この 2 つは
+/// 最初から分けてある (`PanoramaState::projection` の doc も参照)。
+///
+/// 置き場所は `ViewerContextBundle` (= viewer ごと)。App グローバルに置くと窓ごとに
+/// 360 の意図が混ざる (backlog §1.145)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanoramaSessionIntent {
+    /// 360 で見ているつもりか。
+    pub on: bool,
+    /// このセッションで選んだ投影方式。未選択なら `None` (= 既定を使う)。
+    pub projection: Option<PanoProjection>,
+}
+
+impl PanoramaSessionIntent {
+    /// 新しい 360 state を作るときの投影方式。セッションで選んだものがあればそれ、
+    /// 無ければ渡された既定 (`Settings::panorama_projection`)。
+    pub fn projection_or(self, default: PanoProjection) -> PanoProjection {
+        self.projection.unwrap_or(default)
+    }
+}
+
 /// 360 ビューのインタラクティブステート (フルスクリーン内のみ Some)。
 /// ファイル切替 / フルスクリーン退出で `panorama_state = None`。
 /// 360 でない画像へナビした場合は **保持しつつ非アクティブ化** (= 同セッション
