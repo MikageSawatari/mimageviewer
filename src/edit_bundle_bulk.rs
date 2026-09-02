@@ -578,9 +578,10 @@ fn spawn_bulk_worker(
 }
 
 impl App {
-    /// context_menu.rs は別 lane が全面更新中のため、この入口へのメニュー配線だけは後続
-    /// commit に委ねる。エンジンとダイアログは先に独立して完成させる。
-    #[allow(dead_code)]
+    /// 右クリックメニューの「編集内容をまとめて貼り付け」入口。
+    ///
+    /// `cursor_idx` はチェックが空のときの対象。チェックがあればそちらが対象になる
+    /// ([`select_bulk_target_indices`])。
     pub(crate) fn request_bulk_paste_page_edit_bundle(&mut self, cursor_idx: usize) {
         if self.edit_bundle_bulk_pending.is_some()
             || self.edit_bundle_copy_pending.is_some()
@@ -630,9 +631,9 @@ impl App {
         }
     }
 
-    /// context_menu.rs への配線は別 lane の取り込み後に行う。RESET確認はこの入口から必ず
-    /// `BulkPageEditPhase::ResetConfirm` を経由し、直接 worker を始めない。
-    #[allow(dead_code)]
+    /// 右クリックメニューの「編集内容をリセット…」入口。単一もチェック複数もここを通る。
+    ///
+    /// RESET確認は必ず `BulkPageEditPhase::ResetConfirm` を経由し、直接 worker を始めない。
     pub(crate) fn request_bulk_reset_page_edits(&mut self, cursor_idx: usize) {
         if self.edit_bundle_bulk_pending.is_some()
             || self.edit_bundle_copy_pending.is_some()
@@ -1265,7 +1266,7 @@ impl App {
                 if escape_pressed {
                     action = BulkDialogAction::CloseConfirm;
                 }
-                egui::Window::new("編集内容をまとめてリセット")
+                egui::Window::new("編集内容をリセット")
                     .id(egui::Id::new("edit_bundle_bulk_reset_confirm"))
                     .collapsible(false)
                     .resizable(false)
