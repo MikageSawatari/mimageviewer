@@ -12540,6 +12540,56 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    /// `{page}` は items 上の位置ではなく、本の中のページ位置。
+    ///
+    /// 入れ子 ZIP のディレクトリ項目が混ざると位置はずれる。ずれた番号を渡すより、
+    /// トークンごと落とす (Codex Sol 指摘 #11)。
+    #[test]
+    fn the_page_placeholder_counts_pages_not_grid_positions() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip = std::path::PathBuf::from("c:/books/book.zip");
+        app.current_folder = Some(zip.clone());
+        app.items = vec![
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "a.jpg".to_string(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "b.jpg".to_string(),
+            },
+        ];
+        app.visible_indices = vec![0, 1];
+        let target = crate::external_tool::LaunchTarget::ZipPage {
+            zip_path: zip.clone(),
+            entry_name: "b.jpg".to_string(),
+        };
+        assert_eq!(
+            app.placeholder_facts_for_target_for_test(&target, Some(1))
+                .page,
+            Some(2)
+        );
+
+        // 入れ子 ZIP のディレクトリ項目が入ると、位置とページ番号は一致しない。
+        app.items.insert(
+            0,
+            GridItem::ZipDir {
+                zip_path: zip.clone(),
+                dir_prefix: "sub/".to_string(),
+                is_archive: false,
+                representative: None,
+            },
+        );
+        app.visible_indices = vec![0, 1, 2];
+        assert_eq!(
+            app.placeholder_facts_for_target_for_test(&target, Some(2))
+                .page,
+            None,
+            "ページでない項目が混ざる一覧では番号を付けない"
+        );
+    }
+
     #[test]
     fn reading_history_page_position_requires_page_only_order() {
         use crate::grid_item::GridItem;
@@ -63268,6 +63318,33 @@ fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
         .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
         .expect("PDF page-count target");
     assert_eq!(target.pdf_password_revision, Some(1));
+}
+
+/// 開く経路と外部ツールの実体化は、**同じ順序**でパスワードを解決する。
+///
+/// 実体化はセッション値だけを見ていた。保存済みパスワードのある別の PDF を選ぶと、
+/// アプリでは開けるのに実体化だけ失敗するか、別 PDF のパスワードを試していた
+/// (Codex Sol 指摘 #10)。
+#[test]
+#[cfg(windows)]
+fn the_saved_password_wins_over_the_password_of_the_pdf_that_happens_to_be_open() {
+    let mut app = phase_c_support::setup_app();
+    app.pdf_passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+    let open_pdf = std::path::PathBuf::from(r"C:\books\open.pdf");
+    let other_pdf = std::path::PathBuf::from(r"C:\books\other.pdf");
+    app.pdf_current_password = Some("session-of-open".to_string());
+    app.pdf_passwords.set(&other_pdf, "saved-of-other");
+
+    assert_eq!(
+        app.pdf_open_password(&other_pdf).as_deref(),
+        Some("saved-of-other"),
+        "別 PDF には、いま開いている PDF のセッションパスワードではなく保存済みを使う"
+    );
+    assert_eq!(
+        app.pdf_open_password(&open_pdf).as_deref(),
+        Some("session-of-open"),
+        "保存していない PDF は、セッション値で開けなくならない"
+    );
 }
 
 #[test]

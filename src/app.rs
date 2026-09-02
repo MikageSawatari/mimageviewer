@@ -22485,6 +22485,18 @@ impl App {
     /// ワーカーにページ列挙リクエストを送り、即座に return する。
     /// 結果は `poll_pdf_enumerate` が次フレーム以降にポーリングして処理する。
     /// パスワード付き PDF の場合はダイアログで入力を求める。
+    /// この PDF を開くためのパスワード。**保存済み優先、無ければセッション値。**
+    ///
+    /// セッション値 (`pdf_current_password`) をそのまま使うと、いま開いている PDF の
+    /// パスワードを別の PDF へ渡すことになる。逆にセッション値を捨てると、利用者が
+    /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
+    /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
+    pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
+        self.pdf_passwords
+            .get(pdf_path)
+            .or_else(|| self.pdf_current_password.clone())
+    }
+
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -22544,9 +22556,7 @@ impl App {
         // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
         // しないため)。
         let saved_password: Option<String> = self.pdf_passwords.get(&pdf_path);
-        let password: Option<String> = saved_password
-            .clone()
-            .or_else(|| self.pdf_current_password.clone());
+        let password: Option<String> = self.pdf_open_password(&pdf_path);
         if previous_pdf_enumerate
             .as_ref()
             .is_some_and(|(_, previous_password, _)| previous_password != &password)
@@ -37029,7 +37039,7 @@ impl App {
         self.last_reading_history_touch = Some((key, now));
     }
 
-    fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
+    pub(crate) fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
         let mut page_count = 0_i64;
         let mut page_pos = None;
         for &candidate in self.current_grid_order() {

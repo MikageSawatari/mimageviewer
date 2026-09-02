@@ -2168,7 +2168,7 @@ impl crate::app::App {
                 MaterializeSource::PdfPage {
                     pdf_path: pdf_path.clone(),
                     page_num: *page_num,
-                    password: self.pdf_current_password.clone(),
+                    password: self.pdf_open_password(pdf_path),
                 },
                 Some(crate::adjustment_db::zip_entry_key(
                     pdf_path,
@@ -2342,15 +2342,46 @@ impl crate::app::App {
         })
     }
 
+    /// `{page}` に入れるページ番号 (1 始まり)。**items 上の位置ではない。**
+    ///
+    /// 位置をそのまま使うと、ディレクトリ項目を含む入れ子 ZIP や、別の本が混ざる
+    /// 検索結果・レーティング一覧でずれる。読書履歴と同じ数え方に揃え、**一覧が
+    /// 丸ごとページのときだけ**番号を付ける (Codex Sol 指摘 #11)。ページでない項目が
+    /// 1 つでもあれば `None` — 誤った番号を渡すより、トークンごと落ちる方がよい。
+    fn placeholder_page_number(&self, index: Option<usize>) -> Option<u32> {
+        let index = index?;
+        let folder = self.current_folder.as_deref()?;
+        if crate::app::is_synthetic_view_path(folder) {
+            return None;
+        }
+        let (position, _) = self.current_reading_history_page_position(index)?;
+        u32::try_from(position).ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn placeholder_facts_for_target_for_test(
+        &self,
+        target: &LaunchTarget,
+        index: Option<usize>,
+    ) -> PlaceholderFacts {
+        self.placeholder_facts_for_target(target, index)
+    }
+
     fn placeholder_facts_for_target(
         &self,
         target: &LaunchTarget,
         index: Option<usize>,
     ) -> PlaceholderFacts {
         match target {
-            LaunchTarget::RealFile(path) | LaunchTarget::ImagePage(path) => PlaceholderFacts {
+            LaunchTarget::RealFile(path) => PlaceholderFacts {
                 container: Some(path.clone()),
                 // 実ファイルの動画を渡すとき、再生中ならその位置を伝える。
+                time_secs: self.external_tool_video_time_secs(path),
+                ..PlaceholderFacts::default()
+            },
+            LaunchTarget::ImagePage(path) => PlaceholderFacts {
+                container: Some(path.clone()),
+                page: self.placeholder_page_number(index),
                 time_secs: self.external_tool_video_time_secs(path),
                 ..PlaceholderFacts::default()
             },
@@ -2366,8 +2397,7 @@ impl crate::app::App {
                     .current_folder
                     .as_deref()
                     .filter(|current| crate::folder_tree::path_eq(zip_path, current))
-                    .and(index)
-                    .map(|index| index as u32 + 1),
+                    .and_then(|_| self.placeholder_page_number(index)),
                 time_secs: None,
             },
             LaunchTarget::PdfPage { pdf_path, page_num } => PlaceholderFacts {
@@ -3394,6 +3424,10 @@ mod tests {
     /// 「ダイアログが無いのにクリックが効かない」状態を作らない。
     ///
     /// この 2 つを別々の条件で書いていたのが実機の固着の一部だった (2026-09-02)。
+    ///
+    /// 前半 (準備中は入力が止まる) は、**世代をツールごとに分けない**根拠でもある。
+    /// 準備中に利用者が別のツールを起動する経路が無いので、準備中の要求は常に高々
+    /// 1 つ。ツール別の世代を持っても表せる状態は増えない (Codex Sol 指摘 #9)。
     #[test]
     fn a_superseded_materialize_request_blocks_no_input_because_it_draws_no_dialog() {
         let mut app = crate::app::setup_app_for_test();
