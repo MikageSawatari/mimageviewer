@@ -929,7 +929,9 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 
 ### 済み
 
-P0 / P1 / P1b / P1c / P1d / P2a / P2b-1 / P2b-2 / P2c / P3 / P3.5 / P4 (`VideoPolicy::CurrentFrame` を除く) を実装。
+P0 〜 P4 を実装。ユーザー向けドキュメント (マニュアル `external-tools.html`、設定リファレンス、
+グリッド / ショートカット、製品ページ、privacy) と設計ドキュメント (spec / architecture-overview /
+item-kind-capability-matrix / settings-sqlite-migration) も更新済み。
 master v3.4.0 を取り込み済み。P3.5 = `PayloadPolicy` 3 値化 (一時ファイル 2 種 + 元のファイル) と
 `for_editing` / `Container` / `RealFileOnly` の廃止 (§4.3 / §4.8 / §6 の 2026-09-02 決定)。
 v3.4.0 では外部ツールを revert して出したので、**再投入時は revert コミットを revert してから
@@ -981,7 +983,15 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 
 ### 残りの段
 
-- **P5**: round-trip (`OriginalFile` で渡した実ファイルの mtime / サイズ監視と読み直し、§4.8)
+- **P5**: round-trip (`OriginalFile` で渡した実ファイルの mtime / サイズ監視と読み直し、§4.8)。
+  **利用者判断により分離** (2026-09-02)。着手時の注意: 既存の `CurrentFolderWatch` は
+  notify のイベント自体は受け取るが、`check_external_folder_changes` が**フォルダーの mtime**
+  で足切りする。ファイルの中身だけ書き換わってもフォルダーの mtime は変わらないので、
+  **この経路では拾えない**。渡したファイルは現在のフォルダー外にあることもある。
+- **右クリックでメインウィンドウが前に出る** — backlog §1.162 へ分離 (2026-09-02、利用者判断)。
+  ネイティブメニューのオーナー窓が常に `main_hwnd` である問題で、master にもある。
+  detached 凍結ルールの手順を踏んでから着手する。
+- **焼き込み段階の統一** — §7 へ分離。
 
 ### 未確認の実機項目
 
