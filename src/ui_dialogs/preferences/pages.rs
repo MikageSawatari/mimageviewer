@@ -729,27 +729,43 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
             ui.end_row();
 
+            // 引数が渡すファイルを 1 つも使っていないなら、一時ファイルは作られない。
+            // 設定が効かないのに選べるのは分かりづらい (2026-09-02 利用者指摘)。
+            let passes_file = crate::external_tool::arguments_pass_the_materialized_file(&tool);
             ui.label("渡すもの");
-            enum_combo(
-                ui,
-                "external_tool_payload",
-                &mut tool.payload,
-                &[
-                    (
-                        crate::external_tool::PayloadPolicy::TempEdited,
-                        "一時ファイル (編集を反映)",
-                    ),
-                    (
-                        crate::external_tool::PayloadPolicy::TempOriginal,
-                        "一時ファイル (編集前)",
-                    ),
-                    (
-                        crate::external_tool::PayloadPolicy::OriginalFile,
-                        "元のファイル",
-                    ),
-                ],
-            );
+            let payload_options = [
+                (
+                    crate::external_tool::PayloadPolicy::TempEdited,
+                    "一時ファイル (編集を反映)",
+                ),
+                (
+                    crate::external_tool::PayloadPolicy::TempOriginal,
+                    "一時ファイル (編集前)",
+                ),
+                (
+                    crate::external_tool::PayloadPolicy::OriginalFile,
+                    "元のファイル",
+                ),
+            ];
+            ui.add_enabled_ui(passes_file, |ui| {
+                enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options);
+            });
             ui.end_row();
+
+            if !passes_file {
+                ui.label("");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(concat!(
+                            "引数が渡すファイルを使っていないので、一時ファイルは作りません。",
+                            "ツールには {container} や {page} など、対象の場所を表す値だけが渡ります。",
+                        ))
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                ui.end_row();
+            }
 
             let passes_real_file =
                 tool.payload == crate::external_tool::PayloadPolicy::OriginalFile;

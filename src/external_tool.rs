@@ -491,6 +491,45 @@ impl ExternalMaterializeOperation {
     }
 }
 
+impl ExternalMaterializeOperation {
+    /// 引数が実体化したファイルを渡さないとき、**実体化せずに**起動計画へ落とす。
+    ///
+    /// 渡すのは `{container}` などの場所の値だけ。一時ファイルを作らないので、PDF の
+    /// ページを渡すときもレンダリングが要らず、進捗ダイアログも出ない。
+    fn into_launch_without_materializing(self) -> Result<ExternalLaunchOperation, String> {
+        let tool = self.tool;
+        let target_count = self.targets.len();
+        let mut files = Vec::with_capacity(target_count);
+        let mut facts = Vec::with_capacity(target_count);
+        for target in self.targets {
+            // 場所を渡す経路なので、場所が分からない対象はここへ来ない。来たら止める。
+            let container = target.facts.container.clone().ok_or_else(|| {
+                format!(
+                    "{}: 場所を特定できませんでした",
+                    target.request.source.display_label()
+                )
+            })?;
+            files.push(container);
+            facts.push(target.facts);
+        }
+        let requests = if tool.selection == SelectionPolicy::Each {
+            files
+                .into_iter()
+                .zip(facts)
+                .map(|(file, fact)| build_request_for_files(&tool, vec![file], vec![fact]))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![build_request_for_files(&tool, files, facts)?]
+        };
+        Ok(ExternalLaunchOperation {
+            tool_name: tool.display_name(),
+            requests,
+            target_count,
+            target_count_decision: self.target_count_decision,
+        })
+    }
+}
+
 enum ExternalQueuedOperation {
     Ready(ExternalLaunchOperation),
     Materialize(ExternalMaterializeOperation),
@@ -957,6 +996,35 @@ fn external_tool_modal_viewport_draws(
     viewport == owner || (viewport == egui::ViewportId::ROOT && !owner_drawn_this_frame)
 }
 
+/// 実体化した実ファイルから値を採るプレースホルダ。
+///
+/// これらが引数に 1 つも無ければ、ツールは一時ファイルを受け取らない。
+/// `{container}` / `{entry}` / `{page}` / `{time}` は対象の**場所**を伝えるだけなので
+/// ここには入らない。
+const FILE_DERIVED_PLACEHOLDERS: &[&str] =
+    &["{files}", "{dir}", "{name}", "{stem}", "{ext}", "{uri}"];
+
+/// このツールは実体化したファイルをツールへ渡すか。
+///
+/// `-page {page} "{container}"` のように**場所だけを伝える**引数で他のビューアへ
+/// 引き継ぐ使い方 (SumatraPDF / Acrobat) では、一時ファイルは 1 度も使われない。
+/// それでも実体化していたので、PDF ページを 1 枚レンダリングしては捨てていた
+/// (2026-09-02 利用者指摘)。
+///
+/// 関連付け / OS 既定は引数を持たず、ファイルそのものを開くので常に真。
+pub(crate) fn arguments_pass_the_materialized_file(tool: &ExternalTool) -> bool {
+    if !tool.launch.uses_process_options() {
+        return true;
+    }
+    split_argument_template_for_selection(&tool.arguments, tool.selection)
+        .iter()
+        .any(|token| {
+            FILE_DERIVED_PLACEHOLDERS
+                .iter()
+                .any(|placeholder| token.contains(placeholder))
+        })
+}
+
 fn external_tool_capability(
     tool: &ExternalTool,
     target: ExternalToolMenuTarget,
@@ -967,7 +1035,11 @@ fn external_tool_capability(
     // 「元のファイル」のツールだけは、無効でも**隠さずグレーで理由を出す** (§4.8)。
     // 利用者は「このツールで編集できる」と思っているので、黙って消えるより理由が見えた
     // 方がよい。
-    let virtual_refusal = target.has_virtual_page && tool.payload == PayloadPolicy::OriginalFile;
+    // 一時ファイルを渡さない引数 (場所だけを伝えて他のビューアへ引き継ぐ) なら、
+    // 「元のファイル」の約束は関係ない。仮想ページでも起動できる。
+    let virtual_refusal = target.has_virtual_page
+        && tool.payload == PayloadPolicy::OriginalFile
+        && arguments_pass_the_materialized_file(tool);
     Some((
         !virtual_refusal,
         virtual_refusal.then_some(VIRTUAL_ORIGINAL_FILE_DISABLED_REASON),
@@ -2661,7 +2733,25 @@ impl crate::app::App {
                 return;
             }
         };
-        match launch_confirmation(ExternalQueuedOperation::Materialize(operation)) {
+        // 合成した見開きは、その画素を渡すことが目的なので必ず実体化する。
+        let renders_pixels = operation.targets.iter().any(|target| {
+            matches!(
+                target.request.source,
+                crate::materializer::MaterializeSource::Rendered { .. }
+            )
+        });
+        let queued = if arguments_pass_the_materialized_file(tool) || renders_pixels {
+            ExternalQueuedOperation::Materialize(operation)
+        } else {
+            match operation.into_launch_without_materializing() {
+                Ok(ready) => ExternalQueuedOperation::Ready(ready),
+                Err(error) => {
+                    self.show_feedback_toast(format!("{}: {error}", tool.display_name()));
+                    return;
+                }
+            }
+        };
+        match launch_confirmation(queued) {
             Ok(operation) => self.start_external_queued_operation(operation),
             Err(confirmation) => {
                 self.external_tool_launch_confirmation = Some(confirmation);
@@ -3245,6 +3335,71 @@ mod tests {
         tool.name = String::new();
         tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:	ools\Foo Bar.exe"));
         assert_eq!(tool.menu_label(), "Foo Barで開く");
+    }
+
+    /// 引数が**場所だけ**を伝えるなら、一時ファイルは要らない。
+    ///
+    /// `-page {page} "{container}"` で他のビューアへ引き継ぐ使い方 (SumatraPDF /
+    /// Acrobat) では、渡すのは元の PDF とページ番号だけ。それでも一時ファイルを
+    /// 作っていたので、PDF ページを 1 枚レンダリングしては捨てていた。
+    #[test]
+    fn arguments_that_only_carry_the_location_need_no_temporary_file() {
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\v.exe"));
+
+        tool.arguments = r#"-page {page} "{container}""#.to_string();
+        assert!(!arguments_pass_the_materialized_file(&tool));
+
+        // 既定 (引数なし) は `{files}` が自動で付くので、一時ファイルを渡す。
+        tool.arguments = String::new();
+        assert!(arguments_pass_the_materialized_file(&tool));
+
+        // ファイル由来の値を 1 つでも使えば、一時ファイルが要る。
+        for template in [
+            "{files}",
+            "--dir {dir}",
+            "--name {name}",
+            "--stem {stem}",
+            "--ext {ext}",
+            "--uri {uri}",
+        ] {
+            tool.arguments = template.to_string();
+            assert!(
+                arguments_pass_the_materialized_file(&tool),
+                "{template} は実体化したファイルを使う"
+            );
+        }
+
+        // 関連付け / OS 既定は引数を持たず、ファイルそのものを開く。
+        tool.arguments = r#""{container}""#.to_string();
+        tool.launch = ExternalToolLaunch::OsDefault;
+        assert!(arguments_pass_the_materialized_file(&tool));
+    }
+
+    /// その使い方では「元のファイル」の約束も関係ないので、仮想ページでも起動できる。
+    ///
+    /// 「元のファイル」を選ぶと PDF / 書庫のページから起動できないため、場所を渡す
+    /// 引数と組み合わせられなかった (2026-09-02 利用者指摘)。
+    #[test]
+    fn the_original_file_promise_does_not_block_a_launch_that_passes_no_file() {
+        let target = ExternalToolMenuTarget::from_launch_targets(&[LaunchTarget::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\doc.pdf"),
+            page_num: 2,
+        }]);
+        let mut tool = menu_tool(1, "viewer", PayloadPolicy::OriginalFile);
+
+        tool.arguments = "{files}".to_string();
+        let (enabled, reason) = external_tool_capability(&tool, target).unwrap();
+        assert!(!enabled);
+        assert!(reason.is_some(), "理由を出して灰色にする");
+
+        tool.arguments = r#"-page {page} "{container}""#.to_string();
+        let (enabled, reason) = external_tool_capability(&tool, target).unwrap();
+        assert!(
+            enabled,
+            "一時ファイルを渡さないなら仮想ページでも起動できる"
+        );
+        assert!(reason.is_none());
     }
 
     #[test]
