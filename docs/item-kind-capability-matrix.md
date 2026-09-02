@@ -115,7 +115,7 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 
 | 機能・入口 | 実ファイル (`Image` / `Video` / `Audio`) | `Folder` | コンテナファイル (`ZipFile` / `PdfFile`) | `ZipImage` | `PdfPage` | `Stack` | `ZipDir` | 保存先・対象ファイルの変更 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `AsDisplayed` で加工がある場合だけ PNG 化し、それ以外の実ファイルはコピーしない。`VideoPolicy::CurrentFrame` は P4 まで適用せず動画本体を渡す。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応 (P3)**。`Original` または無加工の `AsDisplayed` は元バイト列を一時展開し、加工ありは PNG、`Container` は外側の元書庫を渡す。`RealFileOnly` は非表示。編集用 tool は `Container` 以外を同期判定で無効化し、native / egui menu の hover で理由を表示する。worker でも temp 出力を拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応 (P3)**。`Original` / `AsDisplayed` はツール指定長辺で PNG、`Container` は PDF 本体を渡す。`RealFileOnly` と編集用 tool の扱いは `ZipImage` と同じ。 | **対応 (P3)**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
+| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。クリック項目を先頭、残りを `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `TempEdited` なら常に PNG、`TempOriginal` なら常に元バイト列のコピー、`OriginalFile` なら実ファイルそのもの。動画は `VideoPolicy::CurrentFrame` のとき提示済みフレームを原寸 decode し、それ以外は動画本体を渡す (コピーしない)。 | **対応 (コンテナー入口) / 拒否 (ページ入口)**。フォルダー項目の右クリックと物理フォルダー背景はフォルダー 1 件を渡す。通常のページ対象では `Unsupported`。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応**。`TempOriginal` は常に元バイト列を一時展開、`TempEdited` は常に PNG。`OriginalFile` は元ファイルが無いので同期判定で無効化し、native / egui menu の hover で理由を表示する (隠さない)。worker でも拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応**。`TempOriginal` / `TempEdited` はツール指定長辺で PNG (PDF ページには元バイト列が無い)。`OriginalFile` の扱いは `ZipImage` と同じ。 | **対応**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
 | ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P4 までは現在ページ 1 件で、`SpreadPolicy` 3 値は適用しない。ただし起動完了前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身は viewer leaf にしない。現在の ZIP / PDF page で `Container` を選んだ場合は各 page セルのとおり親本体を渡す。 | **対応 (P3)**。現在の ZIP page をグリッドと同じ materializer へ渡す。`Container` は外側の元書庫を渡す。 | **対応 (P3)**。現在の PDF page をグリッドと同じ materializer へ渡す。`Container` は PDF 本体を渡す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ tool 定義・worker・一時ファイル寿命を使う。mIV は元 file を書き換えない。 |
 
 `SelectionPolicy::Single` は対象が 1 件のときだけ渡し、2 件以上なら全体を拒否する。既定の `Each` は
@@ -133,7 +133,7 @@ P2b-1 の `ExternalToolPicker` / `ExternalTool1` .. `ExternalTool10` /
 拒否する。右クリックは登録済みの全ツールを平坦に並べ、フォルダー背景と
 コンテナー項目だけ対象をコンテナー 1 件へ切り替える。P3 ではページ対象に含まれる `ZipImage` /
 `PdfPage` を materializer へ渡せるため、実ファイルとの混在を含む暫定全体拒否を解除した。
-`RealFileOnly` や `ZipDir` は capability 判定で拒否する。P2b-2 で一度追加したツールバー /
+`ZipDir` は capability 判定で拒否し、`OriginalFile` の tool は理由付き disabled にする。P2b-2 で一度追加したツールバー /
 メニューバーの直接起動は P2c で撤去し、導線は右クリックと固定キースロットに絞った。
 
 ## 5. スマートフォルダと検索
@@ -211,8 +211,8 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
     でも `.cbz` は検索されない (`src/folder_tree.rs:137-141`,
     `src/name_bulk_indexer.rs:339-362`)。
 13. **ExternalTool × virtual page / `Stack` / `ZipDir` (P3 で一部解消)** — `ZipImage` / `PdfPage` は
-    実体化、`Stack` は全 member 展開により対応した。`RealFileOnly` は仮想 page で非表示、元 file 以外を
-    渡す編集用 tool は理由付き disabled + worker 最終拒否になる。`ZipDir` は未対応のため、実項目との
+    実体化、`Stack` は全 member 展開により対応した。`OriginalFile` の tool は仮想 page で理由付き disabled +
+    worker 最終拒否になる (隠さない)。`ZipDir` は未対応のため、実項目との
     混在でも親 fallback / 部分実行をせず全体を拒否する (`MaterializeSource`, `validate_materializable_targets`)。
 14. **ExternalTool × checked selection × menu 対象全種別 (P2a で解消)** — menu 構築時に checked
     全件を `current_grid_order()` 順で snapshot し、右クリック項目が checked 内なら先頭へ移す。

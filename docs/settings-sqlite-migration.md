@@ -339,19 +339,24 @@ CREATE TABLE external_tools (
     launch_value         TEXT,          -- EXE path / handler ID / NULL
     arguments            TEXT NOT NULL,
     working_directory    TEXT,
-    payload              TEXT NOT NULL,
+    payload              TEXT NOT NULL, -- TempEdited / TempOriginal / OriginalFile
     video                TEXT NOT NULL,
     spread               TEXT NOT NULL,
     selection            TEXT NOT NULL,
     confirmation_threshold INTEGER NOT NULL,
     max_targets          INTEGER NOT NULL,
     pdf_render_long_edge INTEGER NOT NULL,
-    for_editing          INTEGER NOT NULL,
     keep_temp            INTEGER NOT NULL,
     sort_index           INTEGER NOT NULL
 );
 CREATE INDEX external_tools_sort ON external_tools(sort_index);
 ```
+
+このテーブルは**未リリース**なので、形が変わったら移行を書かずに作り直す。判定は
+`schema_meta.external_tools_unreleased_shape` の値で行う。**列の有無ではなく列に入る値の
+綴りまで含めた「形の版」**にしてあるのは、`payload` の値名を変えたときに列チェックでは
+検出できず、古い綴りが残った DB が読み込みで `Incompatible` になって**設定全体が
+保存されなくなる**ため。
 
 `custom_open_with_apps` はリリース済みの移行元として行を残し、mIV からは以後更新しない。
 `schema_meta.external_tools_migrated_from_custom_open_with = '1'` が無い場合だけ、
