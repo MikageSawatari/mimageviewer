@@ -634,7 +634,9 @@ fn build_axis_report(
     duration_secs: f64,
 ) -> AxisReport {
     let (kind, interval_secs, adopted_count, adopted_spacing) = match axis {
-        StripAxis::KeyframeIndex { keyframes, adopted } => {
+        StripAxis::KeyframeIndex {
+            keyframes, adopted, ..
+        } => {
             let adopted_times: Vec<f64> = adopted
                 .iter()
                 .filter_map(|index| keyframes.get(*index).copied())

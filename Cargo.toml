@@ -101,6 +101,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "bench_zip_seek"
+path = "src/bin/bench_zip_seek.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "probe_spherical"
 path = "src/bin/probe_spherical.rs"
 test = false
