@@ -14,7 +14,15 @@ use crate::app::App;
 /// 持たない実ファイル) の 2 種類。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExportBatchTarget {
-    Item(usize),
+    /// 一覧の項目。**index だけでなくページキーで身元を持つ。**
+    ///
+    /// 準備は複数フレームにまたがるので、その間に外部監視の再読込などで一覧が並び替わる
+    /// ことがある。index だけを覚えていると、残りの対象が別のファイルを指し、選んでいない
+    /// ファイルが出力されたり、選んだファイルが落ちたりする (v3.5.0 レビュー R04)。
+    Item {
+        idx: usize,
+        page_key: String,
+    },
     StackMember(std::path::PathBuf),
 }
 
@@ -41,7 +49,7 @@ pub struct ExportBatchDialogState {
 }
 
 impl ExportBatchDialogState {
-    fn preparing(&self) -> bool {
+    pub(crate) fn preparing(&self) -> bool {
         !self.pending.is_empty()
     }
 
@@ -132,7 +140,15 @@ impl App {
         (state.items, state.skipped)
     }
 
-    /// 1 フレームぶんの準備を進める。**予算を超えたら次のフレームへ持ち越す。**
+    #[cfg(test)]
+    pub(crate) fn advance_export_batch_preparation_for_test(
+        &mut self,
+        state: &mut ExportBatchDialogState,
+    ) {
+        self.advance_export_batch_preparation(state);
+    }
+
+    /// 1 フレームぶんの準備を進める。**予算を超えたら次のフレームへ持ち越す。**    /// 1 フレームぶんの準備を進める。**予算を超えたら次のフレームへ持ち越す。**
     ///
     /// 予算は「1 件は必ず進める。超えたらそこで止める」。1 件が重くても必ず前進するので
     /// 止まらず、軽い件が続くフレームではまとめて片付く。

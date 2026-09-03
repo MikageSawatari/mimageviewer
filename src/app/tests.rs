@@ -25819,6 +25819,48 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(state.pending.len(), 3, "読み出しは後続フレームへ回す");
     }
 
+    /// 準備中に一覧が並び替わっても、**選んだファイルが出る**。
+    ///
+    /// 対象を一覧 index だけで覚えていたので、複数フレームに分けた準備の途中で外部監視の
+    /// 再読込が入ると、残りの index が別のファイルを指した。選んでいないファイルが出力
+    /// されたり、同じファイルが二度入ったりする (v3.5.0 レビュー R04)。
+    #[test]
+    fn a_batch_export_target_survives_the_list_being_reordered_while_preparing() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for name in ["a.jpg", "b.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/trip/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1];
+        app.checked = [0usize, 1].into_iter().collect();
+
+        app.open_export_batch_dialog(&ctx);
+
+        // 外部監視の再読込で先頭に別ファイルが入り、選んだ 2 件が後ろへずれる。
+        app.items.insert(
+            0,
+            GridItem::Image(std::path::PathBuf::from("c:/trip/new.jpg")),
+        );
+        app.thumbnails.insert(0, ThumbnailState::Pending);
+
+        let mut state = app.export_batch_dialog.take().expect("開いている");
+        while state.preparing() {
+            app.advance_export_batch_preparation_for_test(&mut state);
+        }
+
+        let names = state
+            .items
+            .iter()
+            .map(|item| item.filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["a", "b"], "選んだ 2 件がそのまま出る");
+    }
+
     /// チェックが無ければカーソル選択を使う。本への追加と同じ規則。
     #[test]
     fn batch_export_items_fall_back_to_the_cursor_selection() {

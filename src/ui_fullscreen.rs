@@ -35083,13 +35083,13 @@ impl App {
                 }
                 continue;
             }
-            if matches!(
+            let exportable = matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
-            ) {
-                targets.push_back(ExportBatchTarget::Item(idx));
-            } else {
-                skipped += 1;
+            );
+            match exportable.then(|| self.page_path_key(idx)).flatten() {
+                Some(page_key) => targets.push_back(ExportBatchTarget::Item { idx, page_key }),
+                None => skipped += 1,
             }
         }
         (targets, skipped)
@@ -35102,11 +35102,26 @@ impl App {
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
         use crate::ui_dialogs::export_batch::ExportBatchTarget;
         match target {
-            ExportBatchTarget::Item(idx) => self.batch_export_item_for_idx(*idx),
+            ExportBatchTarget::Item { idx, page_key } => {
+                // 準備中に一覧が並び替わっていたら、**覚えたページキーで引き直す**。
+                // index をそのまま信じると別のファイルを書き出す (R04)。
+                let idx = self
+                    .export_batch_index_for_key(*idx, page_key)
+                    .ok_or_else(|| "一覧が更新され、この対象を特定できませんでした".to_string())?;
+                self.batch_export_item_for_idx(idx)
+            }
             ExportBatchTarget::StackMember(path) => {
                 self.batch_export_item_for_stack_member(path).map(Some)
             }
         }
+    }
+
+    /// 覚えた index がまだ同じページを指しているか。違えば同じキーの項目を探し直す。
+    fn export_batch_index_for_key(&self, idx: usize, page_key: &str) -> Option<usize> {
+        if self.page_path_key(idx).as_deref() == Some(page_key) {
+            return Some(idx);
+        }
+        (0..self.items.len()).find(|&idx| self.page_path_key(idx).as_deref() == Some(page_key))
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
