@@ -44932,6 +44932,35 @@ mod still_window_mode_key_tests {
         );
     }
 
+    /// 出力 worker が持つ借用は、リモートへ操作権を渡す前の静止確認に数えられる。
+    ///
+    /// 一括書き出しと外部ツールの実体化は消しゴム (MI-GAN) や AI 拡大を回し得るのに、
+    /// この静止確認から漏れていた。消しゴム付きの出力中に接続すると、ローカル AI が
+    /// 走ったまま操作権が移り、リモート側の AI と GPU / モデルを取り合う
+    /// (v3.5.0 レビュー F09)。両 worker が借用を持つことは型で強制しているので、ここでは
+    /// 借用そのものが障壁になることを固定する。
+    #[test]
+    fn a_local_output_worker_lease_holds_the_remote_acquire_barrier() {
+        let mut app = setup_app();
+        assert!(
+            app.local_ai_remote_barrier_snapshot().is_quiesced(),
+            "何も走っていなければ静止している"
+        );
+
+        let lease = app.local_ai_activity_lease();
+
+        let barrier = app.local_ai_remote_barrier_snapshot();
+        assert!(!barrier.is_quiesced(), "借用がある間は静止と見なさない");
+        assert!(
+            barrier.blocker_summary().contains("local_ai_activity"),
+            "何が止めているかをログに出せる: {}",
+            barrier.blocker_summary()
+        );
+
+        drop(lease);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+    }
+
     #[test]
     fn remote_session_barriers_keep_modal_until_final_release() {
         let mut app = setup_app();

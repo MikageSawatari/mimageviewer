@@ -1463,11 +1463,22 @@ pub(crate) fn start_launch_worker(
     })
 }
 
+/// `local_ai_activity` は worker が終わるまで持ち続ける借用。
+///
+/// 実体化は消しゴム (MI-GAN) や AI 拡大を回し得るので、リモートへ操作権を渡す前の静止確認
+/// (`local_ai_remote_barrier_snapshot`) はこの worker を数えなければならない。数えていな
+/// かったので、消しゴム付きの外部ツール起動中に接続するとローカル AI が走ったまま操作権が
+/// 移り、リモート側の AI と GPU / モデルを取り合っていた (v3.5.0 レビュー F09)。
+///
+/// **どの対象が AI を回すかを起動前に決めない。** 何を回すかは worker がページ編集を DB から
+/// 読みながら決めるので、先読みすると「AI を使うか」の綴りが 2 つになる。借用は worker の
+/// 寿命そのもので、cancel でも panic でも drop で返る。
 fn start_materialize_launch_worker(
     operation: ExternalMaterializeOperation,
     mut session: crate::materializer::MaterializeSession,
     generation: u64,
     owner_hwnd: Option<isize>,
+    local_ai_activity: crate::app::LocalAiActivityLease,
 ) -> Result<ExternalMaterializePending, String> {
     let target_count = operation.target_count();
     let progress = Arc::new(MaterializeProgress::new(target_count));
@@ -1480,6 +1491,7 @@ fn start_materialize_launch_worker(
     let worker = std::thread::Builder::new()
         .name("external-tool-materialize".to_string())
         .spawn(move || {
+            let _local_ai_activity = local_ai_activity;
             let completion = run_materialize_launch_operation(
                 operation,
                 &mut session,
@@ -2439,6 +2451,7 @@ impl crate::app::App {
                     session,
                     generation,
                     self.main_hwnd,
+                    self.local_ai_activity_lease(),
                 ) {
                     Ok(pending) => self.external_tool_materialize_pending.push(pending),
                     Err(error) if target_count == 1 => {

@@ -293,6 +293,9 @@ impl App {
             template,
             scale,
             items,
+            // 合成が消しゴム / AI 拡大を回し得るので、worker 終端までローカル AI 利用中に
+            // 見せる (v3.5.0 レビュー F09)。
+            local_ai_activity: self.local_ai_activity_lease(),
         };
         match crate::export_batch::spawn_batch_export_worker(request) {
             Ok(pending) => {

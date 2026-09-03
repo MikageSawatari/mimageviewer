@@ -37,6 +37,21 @@ pub struct BatchExportRequest {
     pub template: String,
     pub scale: ExportScale,
     pub items: Vec<BatchExportItem>,
+    /// worker が終わるまで「ローカル AI を使い得る作業が走っている」ことを示す借用。
+    ///
+    /// 合成は消しゴム (MI-GAN) や AI 拡大を回し得るので、リモートへ操作権を渡す前の
+    /// 静止確認 (`local_ai_remote_barrier_snapshot`) はこの worker を数えなければならない。
+    /// 数えていなかったので、消しゴム付きの一括書き出し中に接続するとローカル AI が
+    /// 走ったまま操作権が移り、リモート側の AI と GPU / モデルを取り合っていた
+    /// (v3.5.0 レビュー F09)。
+    ///
+    /// **どの項目が AI を回すかを起動前に決めない。** 実際に何を回すかは worker が
+    /// 合成しながら決めるので、ここで先読みすると「AI を使うか」の綴りが 2 つになる。
+    /// 借用は worker の寿命そのもので、cancel でも panic でも drop で返る。
+    ///
+    /// **`Option` にしない。** 一括書き出しは必ず合成を通るので、渡し忘れを型で防ぐ
+    /// (単枚の `ExportRequest` 側が `Option` なのは、AI を通らない経路が実在するため)。
+    pub local_ai_activity: crate::app::LocalAiActivityLease,
 }
 
 /// `<filename>` / `<dirname>` / `<num>` を展開する。未知の `<...>` は展開せずそのまま
@@ -89,12 +104,29 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
     if total == 0 {
         return Err("エクスポートする画像がありません".to_string());
     }
+    let BatchExportRequest {
+        output_dir,
+        template,
+        scale,
+        items,
+        local_ai_activity,
+    } = request;
+    let request = BatchExportPlan {
+        output_dir,
+        template,
+        scale,
+        items,
+    };
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     std::thread::Builder::new()
         .name("ctrl-e-batch-export".into())
-        .spawn(move || run_batch_export(request, worker_cancel, tx))
+        .spawn(move || {
+            // 借用は worker が終わるまで生かす (cancel / panic でも drop で返る)。
+            let _local_ai_activity = local_ai_activity;
+            run_batch_export(request, worker_cancel, tx)
+        })
         .map_err(|e| format!("一括エクスポート worker を開始できません: {e}"))?;
     Ok(ExportPending {
         cancel,
@@ -109,8 +141,16 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
     })
 }
 
+/// 借用を外した、worker が実際に読む部分。
+struct BatchExportPlan {
+    output_dir: PathBuf,
+    template: String,
+    scale: ExportScale,
+    items: Vec<BatchExportItem>,
+}
+
 fn run_batch_export(
-    request: BatchExportRequest,
+    request: BatchExportPlan,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<ExportEvent>,
 ) {
