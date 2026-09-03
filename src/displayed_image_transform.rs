@@ -26,6 +26,17 @@ const PHYSICAL_SCALE_INTEGER_EPSILON: f32 = 1.0e-4;
 /// この幅が意味を持つのは出力が `1e-3 / 2^-24` ≈ 16,777 物理ピクセルまで。表示先の
 /// 物理サイズが上限である限り安全で、ソース側の辺長がいくら大きくても関係しない。
 const PHYSICAL_PIXEL_EXTENT_EPSILON: f64 = 1.0e-3;
+/// 半画素ちょうどの境界を、f32 の誤差で取り違えないための幅。
+///
+/// 連結読みと見開きは「中心から半分の長さを引いた位置」に端を置く。長さが奇数物理 px なら
+/// この端は**ちょうど半画素**で、数学的には境界の上に乗る。f32 でそこへ辿り着くまでの
+/// 積和は数千 px の座標で 1e-4 程度ずれるため、素の比較では隣り合う段が別々の向きへ倒れ、
+/// 見える間隔が 1 物理 px ばらつく (v3.5.0 レビュー R01)。境界の近くを必ず同じ向きへ倒す。
+///
+/// 1e-2 なのは、描かれる範囲 (現在の段の近く、およそ 1e5 px まで) の f32 刻み 7.8e-3 を
+/// 上回るため。丸めの閾値が 0.5 から 0.49 へずれるが、位置の誤差は 1/100 px で見えない。
+/// これより遠い段は刻みがさらに粗くなるが、そこは描かれない。
+const PHYSICAL_PIXEL_TIE_EPSILON: f32 = 1.0e-2;
 /// A cursor mapping span smaller than one logical point cannot provide a stable pair of distinct
 /// pointer positions. Fall back to the full pan band before either axis becomes sub-point thin.
 const MIN_Z_AIM_MAPPING_SPAN_POINTS: f32 = 1.0;
@@ -892,14 +903,17 @@ pub(crate) fn physical_pixel_scale(pixels_per_point: f32) -> f32 {
 /// (gap 0 の密着も外れる。v3.5.0 レビュー F12)。`(x + 0.5).floor()` は任意の整数 n について
 /// `floor(x + n + 0.5) == floor(x + 0.5) + n` を満たすので、この可換性が成り立つ。
 ///
-/// 正の値では `round` と同じ結果になるため、寄せ幅そのものは変わらない。
+/// 境界のすぐ近くは [`PHYSICAL_PIXEL_TIE_EPSILON`] の幅で同じ向きへ倒す。奇数長のユニットは
+/// 端がちょうど半画素になり、素の比較だと f32 の誤差で段ごとに向きが割れるため。
+///
+/// 正の値では `round` とほぼ同じ結果になるため、寄せ幅そのものは変わらない。
 pub(crate) fn quantize_points_to_physical_pixels(points: f32, pixels_per_point: f32) -> f32 {
     let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
     let pixels = points * pixels_per_point;
     if !pixels.is_finite() {
         return points;
     }
-    (pixels + 0.5).floor() / pixels_per_point
+    (pixels + 0.5 + PHYSICAL_PIXEL_TIE_EPSILON).floor() / pixels_per_point
 }
 
 /// 画像 1 枚が実際に占める物理ピクセル数。

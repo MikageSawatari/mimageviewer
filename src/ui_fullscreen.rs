@@ -4352,27 +4352,33 @@ fn continuous_reading_page_rects(
     // — 貼り先はどの倍率でも寄るようになった (§1.161)。
     let span = continuous_unit_drawn_span(size, pixels_per_point);
     let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
-    // **ユニットの基準と、ユニット内の相対位置を別々に寄せる。**
+    // **ユニットの可視端から積む。中心からではない。**
     //
-    // 合成してから 1 回で寄せると、寄せの結果がスクロール位置と座標の符号に依存する。
-    // ページ高が奇数物理 px なら原点は中心からちょうど半画素で、原点をまたいだ瞬間に
-    // `-500.5` と `+500.5` が**逆向き**へ倒れ、隣り合うユニットの見える間隔が 1 物理 px
-    // 太る (gap 0 の密着も外れる。v3.5.0 レビュー F12)。基準を先に寄せておけば、段の間隔は
-    // ユニット内の相対位置だけで決まり、スクロール位置にも符号にも依存しない。
+    // 隣り合うユニットの見える間隔は「描かれる長さ + 設定した間隔」で、どちらも整数物理
+    // px。**端どうしの距離は必ず整数**になる。ところが中心どうしの距離は前後の長さの平均
+    // なので、高さの偶奇が違うと半画素になる (1000px と 1001px の間は 1000.5px)。中心と
+    // ユニット内の相対位置を別々に寄せると、この半画素が二度倒れ、共有する辺が 1 物理 px
+    // 分かれたり重なったりする (隙間と重なりが交互に出る。v3.5.0 レビュー R01)。
     //
-    // 呼び出し側は「段に共通の基準」を寄せて渡し、段ごとの間隔は物理ピクセルの整数で積む
-    // (`vertical_reading_offsets`)。したがってここの寄せは通常そのまま通る。
-    let unit_origin = egui::pos2(
-        quantize_points_to_physical_pixels(unit_rect.center().x, pixels_per_point),
-        quantize_points_to_physical_pixels(unit_rect.center().y, pixels_per_point),
-    );
-    let mut visible_x = -span.x_len * 0.5;
+    // 端から積めば偶奇が混ざっても揃い、原点をまたぐ符号の問題 (§1.159 / F12) も同時に
+    // 消える — 端の位置は前後の長さだけで決まり、中心の端数を経由しないため。
     let visible_center_y = (span.y_min + span.y_max) * 0.5;
+    let unit_origin = egui::pos2(
+        quantize_points_to_physical_pixels(
+            unit_rect.center().x - span.x_len * 0.5,
+            pixels_per_point,
+        ),
+        quantize_points_to_physical_pixels(
+            unit_rect.center().y - visible_center_y + span.y_min,
+            pixels_per_point,
+        ),
+    );
+    // ユニットの可視端を 0 とした相対位置。
+    let mut visible_x = 0.0;
 
     for page in &size.pages {
         let (band_x_lo, band_x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
-        // 帯の左端を置きたい位置から、ページ全体矩形の原点へ戻す。縦は unit 内の
-        // 相対位置がそのまま `span` に入っているので、中心から引くだけでよい。
+        // 帯の左端 / 上端を置きたい位置から、ページ全体矩形の原点へ戻す。
         //
         // **倍率で分岐せず必ず寄せる。** 以前は「整数近傍の倍率のときだけ」だったが、
         // それは貼り先が端数倍率で寄っていなかった時代の条件で、§1.161 で消えた。
@@ -4381,7 +4387,7 @@ fn continuous_reading_page_rects(
                 + quantize_points_to_physical_pixels(visible_x - band_x_lo, pixels_per_point),
             unit_origin.y
                 + quantize_points_to_physical_pixels(
-                    -visible_center_y - page.height * 0.5,
+                    -span.y_min - page.height * 0.5,
                     pixels_per_point,
                 ),
         );
@@ -50764,6 +50770,67 @@ mod tests {
         }
     }
 
+    /// 高さの**偶奇が混ざっても**、見える間隔は設定どおり。
+    ///
+    /// 段の中心どうしの距離は前後の長さの平均なので、1000px と 1001px の間は 1000.5px に
+    /// なる。中心とユニット内の相対位置を別々に寄せると、この半画素が二度倒れて、隙間と
+    /// 重なりが交互に出る (gap 0 で `[1, -1, 1, -1]`。v3.5.0 レビュー R01)。端どうしの
+    /// 距離は「描かれる長さ + 間隔」で必ず整数なので、端から積む。
+    #[test]
+    fn continuous_reading_unit_gaps_hold_when_odd_and_even_lengths_alternate() {
+        for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+            for gap in [0.0_f32, 1.0, 20.0] {
+                let page_width = 501.0 / pixels_per_point;
+                // 奇数 / 偶数を交互に。中心が半画素になる並び。
+                let heights = (0..9)
+                    .map(|pos| {
+                        let physical = if pos % 2 == 0 { 1000.0 } else { 1001.0 };
+                        physical / pixels_per_point
+                    })
+                    .collect::<Vec<_>>();
+                let offsets =
+                    vertical_reading_offsets(&heights, gap, heights.len() / 2, pixels_per_point);
+                let gap_px = (quantize_points_to_physical_pixels(gap, pixels_per_point)
+                    * pixels_per_point)
+                    .round();
+
+                let edges = offsets
+                    .iter()
+                    .zip(heights.iter())
+                    .map(|(offset, height)| {
+                        let mut page = ContinuousReadingPageSize::full(0, page_width, *height);
+                        page.logical_scale = physical_pixel_scale(pixels_per_point);
+                        let size = ContinuousReadingUnitSize {
+                            pages: vec![page],
+                            width: page_width,
+                            height: *height,
+                            page_gap: 0.0,
+                            logical_scale: physical_pixel_scale(pixels_per_point),
+                        };
+                        let unit_rect = egui::Rect::from_center_size(
+                            egui::pos2(0.0, *offset),
+                            egui::vec2(size.width, size.height),
+                        );
+                        let rects =
+                            continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+                        (
+                            rects[0].1.min.y * pixels_per_point,
+                            rects[0].1.max.y * pixels_per_point,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                for pos in 1..edges.len() {
+                    let seen = edges[pos].0 - edges[pos - 1].1;
+                    assert!(
+                        (seen - gap_px).abs() < 0.01,
+                        "ppp={pixels_per_point} gap={gap} pos={pos}: 見える間隔 {seen}px                          (設定 {gap_px}px)"
+                    );
+                }
+            }
+        }
+    }
+
     /// 固定した右情報パネルは、どんな窓幅でもウィンドウの外へ出ない。
     ///
     /// 帯の幅は `fullscreen_media_rect` が引いた量そのもの。以前は縮んだ矩形から
@@ -50830,11 +50897,21 @@ mod tests {
         assert_eq!(above, 501.0);
         assert_eq!(above - below, 1001.0, "整数距離が丸めで太らない");
 
-        // 正の値では従来と同じ結果 (寄せ幅そのものは変えていない)。
-        for value in [0.4_f32, 0.5, 0.6, 12.49, 12.5, 12.51] {
+        // 境界から離れていれば従来と同じ結果 (寄せ幅そのものは変えていない)。
+        for value in [0.3_f32, 0.7, 12.4, 12.6, -0.3, -0.7, -12.4, -12.6] {
             assert_eq!(
                 quantize_points_to_physical_pixels(value, 1.0),
                 value.round(),
+                "value={value}"
+            );
+        }
+
+        // 境界のすぐ近く (±1/100 px) は、符号によらず必ず上へ倒す。奇数長のユニットは端が
+        // ちょうど半画素になり、f32 でそこへ辿り着くまでの誤差で向きが割れるため。
+        for value in [12.5_f32, 12.495, 12.5005, -12.5, -12.495, -12.5005] {
+            assert_eq!(
+                quantize_points_to_physical_pixels(value, 1.0),
+                value.ceil(),
                 "value={value}"
             );
         }
