@@ -42,10 +42,14 @@ pub enum MaterializeSource {
     ///
     /// **ディスク上のどのファイルでもない。** 画素は `MaterializeRequest::rendered_pixels`
     /// が運ぶ (`Arc<ColorImage>` は Hash にできないので cache key には入れられない)。
-    /// ここには一時ファイル名にする `label` と、画素の `fingerprint` だけを置く。
+    /// ここには一時ファイル名にする `label` だけを置く。
+    ///
+    /// **画素の指紋は持たない。** 元ファイルが無い = stamp が採れないので、この source は
+    /// `lookup_reusable` にも cache への insert にも通らない (どちらも `modified_ns` を
+    /// 要求する)。同一性を作っても読み手がいないので、v3.5.0 まで UI 入力ハンドラ内で
+    /// 回していた全画素 SHA-256 (実測 12MP で 24ms) は捨てた (レビュー F05)。
     Rendered {
         label: String,
-        fingerprint: [u8; 32],
     },
 }
 
@@ -1823,6 +1827,28 @@ mod tests {
         );
     }
 
+    /// 合成した見開きは **一時ファイル cache に載らない**。
+    ///
+    /// 元ファイルが無いので stamp が採れず、`lookup_reusable` も cache への insert も
+    /// `modified_ns` を要求するため、どちらも通らない。つまり再利用は起きない。それでも
+    /// v3.5.0 まで、cache key を作るためだけに UI 入力ハンドラ内で全画素 SHA-256 を回して
+    /// いた (実測 12MP で 24ms)。読み手のいない同一性は作らない (レビュー F05)。
+    #[test]
+    fn a_rendered_source_is_never_cached_so_it_needs_no_pixel_identity() {
+        let source = MaterializeSource::Rendered {
+            label: "spread".to_string(),
+        };
+
+        assert!(
+            source.source_path().is_none(),
+            "元ファイルが無いので stamp を採れない"
+        );
+        assert!(
+            FileStamp::default().modified_ns.is_none(),
+            "空 stamp は lookup も insert も通らない"
+        );
+    }
+
     /// 画素は request が運ぶ。source だけ来て画素が無い組み合わせは**黙って空の PNG を
     /// 書かず**、失敗として返す。
     #[test]
@@ -1834,7 +1860,6 @@ mod tests {
         let request = MaterializeRequest {
             source: MaterializeSource::Rendered {
                 label: "spread".to_string(),
-                fingerprint: [7; 32],
             },
             policy: MaterializePolicy::TempEdited,
             page_edits: None,
@@ -1859,7 +1884,6 @@ mod tests {
         let request = MaterializeRequest {
             source: MaterializeSource::Rendered {
                 label: "page04_page05".to_string(),
-                fingerprint: [1; 32],
             },
             policy: MaterializePolicy::TempEdited,
             page_edits: None,
