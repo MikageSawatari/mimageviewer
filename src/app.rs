@@ -18018,10 +18018,10 @@ impl App {
         // その場合は捨てる — 投影が動けば監視も張り直され、必要なら次の通知で
         // 走査し直される。ここで別 context を mount して適用すると、`load_folder`
         // 側の context 操作と入れ子になる。
-        if self.projected_viewer_context_id() != owner_context_id {
+        if self.edit_request_owner_context() != owner_context_id {
             crate::logger::log(format!(
                 "external_rescan: dropped, owner={owner_context_id:?} projected={:?} folder={}",
-                self.projected_viewer_context_id(),
+                self.edit_request_owner_context(),
                 folder.display()
             ));
             return;
@@ -53061,7 +53061,15 @@ impl App {
     /// 開いたまま一覧側で貼り付けると、一覧側のキャッシュ・保持設定・undo が更新されない
     /// (v3.5.0 レビュー F08)。
     pub(crate) fn edit_request_owner_context(&self) -> ViewerContextId {
-        self.projected_viewer_context_id()
+        // 非 Windows は viewer context が 1 つしかない (registry の mount / swap も無い)。
+        #[cfg(windows)]
+        {
+            self.projected_viewer_context_id()
+        }
+        #[cfg(not(windows))]
+        {
+            ViewerContextId::single_context()
+        }
     }
 
     /// `owner` を mount した状態で `f` を実行する。context が既に無ければ `None`。
@@ -53070,7 +53078,15 @@ impl App {
         owner: ViewerContextId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
-        self.with_viewer_context(owner, f).ok()
+        #[cfg(windows)]
+        {
+            self.with_viewer_context(owner, f).ok()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = owner;
+            Some(f(self))
+        }
     }
 
     /// 焼き込みの AI 段に渡す材料。**設定と上限の解釈はここ 1 か所。**
