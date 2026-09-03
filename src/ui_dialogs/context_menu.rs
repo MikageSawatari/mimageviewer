@@ -765,7 +765,6 @@ impl crate::app::App {
         }
         if close || !open {
             self.context_menu_idx = None;
-            self.cached_handlers = None;
         }
         None
     }
@@ -848,7 +847,6 @@ impl crate::app::App {
             ) {
                 NativeGridContextMenuOutcome::Consumed { nav, .. } => {
                     self.context_menu_idx = None;
-                    self.cached_handlers = None;
                     ctx.request_repaint();
                     return nav;
                 }
@@ -892,7 +890,6 @@ impl crate::app::App {
         }
         if close || !open {
             self.context_menu_idx = None;
-            self.cached_handlers = None;
         }
 
         nav
@@ -1301,13 +1298,13 @@ impl crate::app::App {
         else {
             return Vec::new();
         };
-        let handlers = match &self.cached_handlers {
-            Some((cached_extension, handlers)) if cached_extension == &extension => {
-                handlers.clone()
-            }
-            _ => {
+        // 準備済みなら Shell を叩かない。準備が間に合っていない拡張子だけ、その場で
+        // 引いて覚える (メニューから項目を落として軽くする対処はしない、F13)。
+        let handlers = match self.cached_handlers.get(&extension) {
+            Some(handlers) => handlers.clone(),
+            None => {
                 let handlers = crate::open_with::enumerate_handlers(&extension);
-                self.cached_handlers = Some((extension, handlers.clone()));
+                self.cached_handlers.insert(extension, handlers.clone());
                 handlers
             }
         };
@@ -1727,7 +1724,6 @@ impl crate::app::App {
                 close_fullscreen, ..
             } => {
                 self.fs_context_menu_idx = None;
-                self.cached_handlers = None;
                 ctx.request_repaint();
                 return close_fullscreen;
             }
@@ -1773,7 +1769,6 @@ impl crate::app::App {
         }
         if close || !open {
             self.fs_context_menu_idx = None;
-            self.cached_handlers = None;
         }
         close_fullscreen
     }

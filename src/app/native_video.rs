@@ -12440,7 +12440,6 @@ impl App {
                 self.native_video_secondary_press_start = None;
                 if event.down {
                     self.fs_context_menu_idx = None;
-                    self.cached_handlers = None;
                     ctx.request_repaint();
                 }
                 return;
@@ -12624,7 +12623,6 @@ impl App {
             self.native_video_context_menu_dismiss_click_started_at = None;
             if event.down {
                 self.fs_context_menu_idx = None;
-                self.cached_handlers = None;
                 ctx.request_repaint();
             }
             return;

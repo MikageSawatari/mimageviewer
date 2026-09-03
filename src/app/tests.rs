@@ -25729,6 +25729,56 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(items[0].dirname, "trip");
     }
 
+    /// 関連付けアプリの一覧は、**メニューを閉じても捨てない**。
+    ///
+    /// Shell の列挙は menu を組み立てるフレームで同期実行されるので、閉じるたびに捨てて
+    /// いた旧実装は同じ拡張子でも右クリックのたびに UI を待たせていた (v3.5.0 レビュー
+    /// F13)。準備は worker がフォルダーごとに 1 回だけ回す。
+    #[test]
+    fn the_association_handler_cache_survives_closing_the_menu() {
+        let mut app = setup_app();
+        app.cached_handlers.insert(
+            ".jpg".to_string(),
+            vec![crate::open_with::AppHandler {
+                display_name: "Paint".to_string(),
+                handler_id: "paint".to_string(),
+                is_recommended: true,
+            }],
+        );
+
+        // メニューを閉じる経路をすべて通しても残る。
+        app.context_menu_idx = None;
+        app.fs_context_menu_idx = None;
+
+        assert_eq!(
+            app.cached_handlers.get(".jpg").map(Vec::len),
+            Some(1),
+            "同じ拡張子を右クリックし直しても Shell を叩き直さない"
+        );
+    }
+
+    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。
+    #[test]
+    fn the_association_prewarm_runs_once_per_folder_load() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        app.poll_association_handler_prewarm();
+        let first = app.association_prewarm_generation;
+        assert_eq!(first, Some(app.items_generation));
+
+        // 同じ世代では作り直さない。
+        app.association_prewarm = None;
+        app.poll_association_handler_prewarm();
+        assert!(
+            app.association_prewarm.is_none(),
+            "同じフォルダーで列挙を作り直さない"
+        );
+    }
+
     /// Ctrl+E を押したフレームでは、**編集内容をまだ読んでいない**。
     ///
     /// 隠蔽 / 消しゴムのマスクは圧縮 payload の展開を伴い、補正レイヤーと注釈フォントも

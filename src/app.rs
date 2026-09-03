@@ -11788,7 +11788,19 @@ pub struct App {
 
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
-    pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
+    /// 拡張子 → 関連付けアプリの一覧。**右クリックのたびに捨てない。**
+    ///
+    /// 列挙は Shell (`SHAssocEnumHandlers` + `GetUIName`) を叩くので、シェル拡張や
+    /// 関連付け先の状態しだいで待たされる。menu を閉じるたびに捨てていたため、同じ
+    /// 拡張子でも右クリックのたびに UI スレッドで引き直していた (v3.5.0 レビュー F13)。
+    /// フォルダーを読み込むたびに worker が並び直すので、関連付けの変更もそこで拾う。
+    pub(crate) cached_handlers:
+        std::collections::HashMap<String, Vec<crate::open_with::AppHandler>>,
+    /// 走らせ中の関連付け列挙 (拡張子ごと)。
+    pub(crate) association_prewarm:
+        Option<mpsc::Receiver<Vec<(String, Vec<crate::open_with::AppHandler>)>>>,
+    /// 直近で列挙を始めた items 世代。フォルダーを読み込むたびに 1 回だけ走らせる。
+    pub(crate) association_prewarm_generation: Option<u64>,
     /// 外部ツールの process spawn を UI スレッド外で行う、操作単位の短命 worker。
     /// `Each` の複数結果は各 pending 内で集約し、別々の利用者操作はこの Vec で並行保持する。
     pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
@@ -14397,7 +14409,9 @@ impl App {
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
-            cached_handlers: None,
+            cached_handlers: std::collections::HashMap::new(),
+            association_prewarm: None,
+            association_prewarm_generation: None,
             external_tool_launch_pending: Vec::new(),
             external_tool_materializer: crate::materializer::Materializer::new(),
             external_tool_materialize_pending: Vec::new(),
@@ -52974,6 +52988,72 @@ impl App {
         resume_video_upscale
     }
 
+    /// 一覧に並んでいる拡張子の関連付けアプリを、**先に worker で並べておく。**
+    ///
+    /// 右クリックのメニューは同じフレームで組み立てるので、そこから列挙を始めたのでは
+    /// 間に合わない。フォルダーを読み込むたびに 1 回だけ走らせ、メニューは準備済みの
+    /// 一覧を使う (v3.5.0 レビュー F13)。関連付けの変更もフォルダーを開き直せば拾える。
+    pub(crate) fn poll_association_handler_prewarm(&mut self) {
+        if let Some(rx) = self.association_prewarm.as_ref() {
+            match rx.try_recv() {
+                Ok(handlers) => {
+                    self.association_prewarm = None;
+                    for (extension, list) in handlers {
+                        self.cached_handlers.insert(extension, list);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.association_prewarm = None,
+            }
+            return;
+        }
+        if self.association_prewarm_generation == Some(self.items_generation) {
+            return;
+        }
+        self.association_prewarm_generation = Some(self.items_generation);
+        // 拡張子の抽出は名前を見るだけ。read_dir も stat もしない。
+        let mut extensions: Vec<String> = Vec::new();
+        for item in &self.items {
+            let Some(extension) = crate::external_tool::LaunchTarget::from_grid_item(Some(item))
+                .real_file()
+                .ok()
+                .and_then(std::path::Path::extension)
+                .and_then(|extension| extension.to_str())
+                .map(|extension| format!(".{}", extension.to_lowercase()))
+            else {
+                continue;
+            };
+            if self.cached_handlers.contains_key(&extension) || extensions.contains(&extension) {
+                continue;
+            }
+            extensions.push(extension);
+            // 1 フォルダに何十種類も混ざることは無い。上限は暴走よけ。
+            if extensions.len() >= 8 {
+                break;
+            }
+        }
+        if extensions.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("association-handler-prewarm".to_string())
+            .spawn(move || {
+                let handlers = extensions
+                    .into_iter()
+                    .map(|extension| {
+                        let list = crate::open_with::enumerate_handlers(&extension);
+                        (extension, list)
+                    })
+                    .collect();
+                let _ = tx.send(handlers);
+            })
+            .is_ok()
+        {
+            self.association_prewarm = Some(rx);
+        }
+    }
+
     /// 編集要求を出した viewer context。**要求に焼き付けて、結果をその context へ戻す。**
     ///
     /// 一括編集の pending は App-global で、その dialog は main と fullscreen の両方から
@@ -67236,6 +67316,7 @@ impl App {
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
         self.poll_external_rescan();
+        self.poll_association_handler_prewarm();
 
         // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
