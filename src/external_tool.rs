@@ -2172,12 +2172,25 @@ impl crate::app::App {
             &never_cancelled,
         )
         .map_err(|error| error.to_string())?;
+        // この指紋は **materializer の一時ファイル cache のキー**。合成した見開きは
+        // ディスク上のどのファイルでもないので、mtime / size の stamp が無く、画素そのものが
+        // 同一性になる。同じ見開きで 2 回起動したときに、書き終えた一時ファイルを再利用する
+        // ためのもので、改竄検知ではない。
+        //
+        // 4 バイトずつ `update` を呼ぶと呼び出し回数がそのまま費用になる (実測 12MP で
+        // 24ms)。同じダイジェストのまま、まとめて渡す (同 17ms)。
         let mut digest = sha2::Sha256::new();
         digest.update((image.size[0] as u64).to_le_bytes());
         digest.update((image.size[1] as u64).to_le_bytes());
+        let mut chunk: Vec<u8> = Vec::with_capacity(1 << 16);
         for pixel in &image.pixels {
-            digest.update(pixel.to_array());
+            chunk.extend_from_slice(&pixel.to_array());
+            if chunk.len() >= (1 << 16) {
+                digest.update(&chunk);
+                chunk.clear();
+            }
         }
+        digest.update(&chunk);
         let fingerprint: [u8; 32] = digest.finalize().into();
 
         Ok(crate::materializer::MaterializeRequest {
