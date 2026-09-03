@@ -8,10 +8,28 @@ use eframe::egui;
 
 use crate::app::App;
 
+/// まだ編集内容を読んでいない書き出し対象。
+///
+/// 一覧 index を持つ通常のページと、集約セルを展開したスタックメンバー (index を
+/// 持たない実ファイル) の 2 種類。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportBatchTarget {
+    Item(usize),
+    StackMember(std::path::PathBuf),
+}
+
 pub struct ExportBatchDialogState {
-    /// ダイアログを開いた瞬間に固定した書き出し対象。編集内容のスナップショットを
-    /// 含むので、開いている間にページを編集しても押した瞬間の絵が出る。
+    /// 編集内容を読み終えた書き出し対象。読んだ時点の絵で固定されるので、
+    /// ダイアログを開いている間にページを編集しても出力は変わらない。
     pub items: Vec<crate::export_batch::BatchExportItem>,
+    /// まだ読んでいない対象。**1 フレームで全部読まない。**
+    ///
+    /// 隠蔽 / 消しゴムのマスクは圧縮 payload の展開を伴い、補正レイヤーと注釈フォントも
+    /// 読み込みが要る。選択件数ぶんまとめて読むと、押してからダイアログが出るまで UI が
+    /// 止まり、キャンセルもできない (v3.5.0 レビュー F04)。フレームあたりの予算で進める。
+    pub pending: std::collections::VecDeque<ExportBatchTarget>,
+    /// 対象総数 (進捗表示用)。`items.len() + pending.len()` は失敗分だけずれる。
+    pub total: usize,
     /// 選択に含まれていたが書き出せなかった件数 (フォルダ / 動画 / 音声 / 書庫本体)。
     pub skipped: usize,
     pub output_dir_text: String,
@@ -23,6 +41,10 @@ pub struct ExportBatchDialogState {
 }
 
 impl ExportBatchDialogState {
+    fn preparing(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn output_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(self.output_dir_text.trim())
     }
@@ -53,8 +75,9 @@ impl App {
             self.show_feedback_toast("書き出す画像・ページを選択してください".to_string());
             return;
         }
-        let (items, skipped) = self.grid_batch_export_items(ctx);
-        if items.is_empty() {
+        // 対象を決めるのは安い判定だけ。編集内容はフレーム予算で読み進める (F04)。
+        let (pending, skipped) = self.grid_batch_export_targets();
+        if pending.is_empty() {
             self.show_feedback_toast("選択の中に書き出せる画像・ページがありません".to_string());
             return;
         }
@@ -67,8 +90,11 @@ impl App {
             .or_else(|| self.current_folder.clone())
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let total = pending.len();
         self.export_batch_dialog = Some(ExportBatchDialogState {
-            items,
+            items: Vec::with_capacity(total),
+            pending,
+            total,
             skipped,
             output_dir_text,
             template: self.settings.export_batch_template.clone(),
@@ -80,14 +106,67 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// ダイアログを開かずに準備を最後まで回す (テスト用)。**production と同じ 2 つの
+    /// 関数を回すだけ**で、判定は複製しない。
+    #[cfg(test)]
+    pub(crate) fn prepare_all_batch_export_items_for_test(
+        &mut self,
+    ) -> (Vec<crate::export_batch::BatchExportItem>, usize) {
+        let (pending, skipped) = self.grid_batch_export_targets();
+        let total = pending.len();
+        let mut state = ExportBatchDialogState {
+            items: Vec::new(),
+            pending,
+            total,
+            skipped,
+            output_dir_text: String::new(),
+            template: String::new(),
+            format: crate::capture::CaptureFormat::Png,
+            scale: crate::export_dialog::ExportScale::Full,
+            initial_focus_done: true,
+            error: None,
+        };
+        while state.preparing() {
+            self.advance_export_batch_preparation(&mut state);
+        }
+        (state.items, state.skipped)
+    }
+
+    /// 1 フレームぶんの準備を進める。**予算を超えたら次のフレームへ持ち越す。**
+    ///
+    /// 予算は「1 件は必ず進める。超えたらそこで止める」。1 件が重くても必ず前進するので
+    /// 止まらず、軽い件が続くフレームではまとめて片付く。
+    fn advance_export_batch_preparation(&mut self, state: &mut ExportBatchDialogState) {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
+        if state.pending.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        while let Some(target) = state.pending.pop_front() {
+            match self.batch_export_item_for_target(&target) {
+                Ok(Some(item)) => state.items.push(item),
+                Ok(None) => state.skipped += 1,
+                Err(err) => {
+                    state.skipped += 1;
+                    crate::logger::log(format!("batch export skip {target:?}: {err}"));
+                }
+            }
+            if started.elapsed() >= BUDGET {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn draw_export_batch_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut state) = self.export_batch_dialog.take() else {
             return;
         };
 
+        self.advance_export_batch_preparation(&mut state);
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let can_start = !state.items.is_empty()
+        let can_start = !state.preparing()
+            && !state.items.is_empty()
             && !state.output_dir_text.trim().is_empty()
             && !state.template.trim().is_empty();
         let mut open = true;
@@ -105,7 +184,18 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
-                ui.label(format!("{} 件を書き出します", state.items.len()));
+                if state.preparing() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "編集内容を読んでいます… {} / {} 件",
+                            state.items.len(),
+                            state.total
+                        ));
+                    });
+                } else {
+                    ui.label(format!("{} 件を書き出します", state.items.len()));
+                }
                 if state.skipped > 0 {
                     ui.small(format!(
                         "対象外の {} 件は除外しました (フォルダ・動画・音声・書庫そのもの)",
@@ -253,6 +343,10 @@ impl App {
             }
         }
 
+        // 準備中は次のフレームを要求する。ここで止めると読み進まない。
+        if state.preparing() {
+            ctx.request_repaint();
+        }
         self.export_batch_dialog = Some(state);
     }
 

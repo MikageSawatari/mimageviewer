@@ -25721,12 +25721,52 @@ mod favorite_adjustment_defaults_tests {
         }
         app.checked = [0usize, 1, 2].into_iter().collect();
 
-        let (items, skipped) = app.grid_batch_export_items(&ctx);
+        let (items, skipped) = app.prepare_all_batch_export_items_for_test();
 
         assert_eq!(items.len(), 1);
         assert_eq!(skipped, 2);
         assert_eq!(items[0].filename, "a");
         assert_eq!(items[0].dirname, "trip");
+    }
+
+    /// Ctrl+E を押したフレームでは、**編集内容をまだ読んでいない**。
+    ///
+    /// 隠蔽 / 消しゴムのマスクは圧縮 payload の展開を伴い、補正レイヤーと注釈フォントも
+    /// 読み込みが要る。選択件数ぶんをダイアログを出す前にまとめて読んでいたので、多数の
+    /// ページに編集を付けて一覧から Ctrl+E を押すと、その間 UI が止まりキャンセルもできな
+    /// かった (v3.5.0 レビュー F04)。対象を並べるのは安い判定だけにする。
+    #[test]
+    fn opening_the_batch_export_dialog_does_not_read_any_page_edits_yet() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/trip/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "c:/trip/clip.mp4",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.checked = [0usize, 1, 2, 3].into_iter().collect();
+
+        app.open_export_batch_dialog(&ctx);
+
+        let state = app
+            .export_batch_dialog
+            .as_ref()
+            .expect("ダイアログは即座に開く");
+        assert_eq!(state.total, 3, "書き出せる 3 件を対象にする");
+        assert_eq!(state.skipped, 1, "動画は安い判定で除外する");
+        assert!(
+            state.items.is_empty(),
+            "押したフレームでは 1 件も読んでいない"
+        );
+        assert_eq!(state.pending.len(), 3, "読み出しは後続フレームへ回す");
     }
 
     /// チェックが無ければカーソル選択を使う。本への追加と同じ規則。
@@ -25746,7 +25786,7 @@ mod favorite_adjustment_defaults_tests {
         app.checked.clear();
         app.selected = Some(1);
 
-        let (items, skipped) = app.grid_batch_export_items(&ctx);
+        let (items, skipped) = app.prepare_all_batch_export_items_for_test();
 
         assert_eq!(skipped, 0);
         assert_eq!(

@@ -35033,46 +35033,59 @@ impl App {
     ///
     /// 製本と違い、編集の有無にかかわらず必ず合成経路を通す。出力形式とサイズを
     /// ユーザーが選ぶので、無編集の byte copy では要求を満たせない。
-    pub(crate) fn grid_batch_export_items(
-        &mut self,
-        ctx: &egui::Context,
-    ) -> (Vec<crate::export_batch::BatchExportItem>, usize) {
-        let mut items = Vec::new();
+    /// 一括書き出しの対象を **安い判定だけで** 並べる。
+    ///
+    /// 編集内容の読み出し (マスクの展開・補正レイヤー・注釈フォント) はここでしない。
+    /// 選択件数ぶんまとめて読むと、押してからダイアログが出るまで UI が止まる
+    /// (v3.5.0 レビュー F04)。1 件ずつの読み出しは
+    /// [`Self::batch_export_item_for_target`] が担い、ダイアログが予算内で進める。
+    pub(crate) fn grid_batch_export_targets(
+        &self,
+    ) -> (
+        std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
+        usize,
+    ) {
+        use crate::ui_dialogs::export_batch::ExportBatchTarget;
+        let mut targets = std::collections::VecDeque::new();
         let mut skipped = 0usize;
         for idx in self.grid_selection_indices() {
             // スタックの集約セルは、本への追加と同じくメンバーを 1 枚ずつ展開する
             // (1 idx = N メンバーなので idx ベースの経路には乗らない)。
             if let Some(member_paths) = self.stack_member_paths(idx) {
                 for member_path in member_paths {
-                    match self.batch_export_item_for_stack_member(&member_path) {
-                        Ok(item) => items.push(item),
-                        Err(err) => {
-                            skipped += 1;
-                            crate::logger::log(format!(
-                                "batch export skip stack member {}: {err}",
-                                member_path.display()
-                            ));
-                        }
-                    }
+                    targets.push_back(ExportBatchTarget::StackMember(member_path));
                 }
                 continue;
             }
-            match self.batch_export_item_for_idx(ctx, idx) {
-                Ok(Some(item)) => items.push(item),
-                Ok(None) => skipped += 1,
-                Err(err) => {
-                    skipped += 1;
-                    crate::logger::log(format!("batch export skip idx={idx}: {err}"));
-                }
+            if matches!(
+                self.items.get(idx),
+                Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+            ) {
+                targets.push_back(ExportBatchTarget::Item(idx));
+            } else {
+                skipped += 1;
             }
         }
-        (items, skipped)
+        (targets, skipped)
+    }
+
+    /// 対象 1 件ぶんの編集内容を読む。`Ok(None)` は対象外。
+    pub(crate) fn batch_export_item_for_target(
+        &mut self,
+        target: &crate::ui_dialogs::export_batch::ExportBatchTarget,
+    ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
+        use crate::ui_dialogs::export_batch::ExportBatchTarget;
+        match target {
+            ExportBatchTarget::Item(idx) => self.batch_export_item_for_idx(*idx),
+            ExportBatchTarget::StackMember(path) => {
+                self.batch_export_item_for_stack_member(path).map(Some)
+            }
+        }
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
     fn batch_export_item_for_idx(
         &mut self,
-        _ctx: &egui::Context,
         idx: usize,
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
         let item = self
