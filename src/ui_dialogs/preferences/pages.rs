@@ -1616,25 +1616,35 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
 
-    let rows: [(
-        &str,
-        fn(&mut crate::settings::Settings) -> &mut BakeStage,
-        &str,
-    ); 4] = [
-        ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
+    /// その行の段を**誰が決めるか**。
+    ///
+    /// 「選べない出力を、選べる見た目で並べない」ため。単枚 Ctrl+E は表示済みの画素を
+    /// そのまま書き出すので段を読まない (バックログ §1.171)。効かない checkbox を
+    /// 押せる状態で出すと、下の注記を読むまで嘘をつくことになる。
+    enum StageSource {
+        Chosen(fn(&mut crate::settings::Settings) -> &mut BakeStage),
+        AlwaysDisplayedResult,
+    }
+
+    let rows: [(&str, StageSource, &str); 4] = [
+        (
+            "製本",
+            StageSource::Chosen(|s| &mut s.bake_stage_book),
+            "本棚へ追加するページ",
+        ),
         (
             "エクスポート (1 枚)",
-            |s| &mut s.bake_stage_export,
-            "フルスクリーンの Ctrl+E",
+            StageSource::AlwaysDisplayedResult,
+            "フルスクリーンの Ctrl+E。表示している結果をそのまま書き出すので、段は選べません",
         ),
         (
             "エクスポート (まとめて)",
-            |s| &mut s.bake_stage_export_batch,
+            StageSource::Chosen(|s| &mut s.bake_stage_export_batch),
             "一覧で選んでの Ctrl+E",
         ),
         (
             "外部ツール",
-            |s| &mut s.bake_stage_external_tool,
+            StageSource::Chosen(|s| &mut s.bake_stage_external_tool),
             "別のアプリへ渡す一時ファイル",
         ),
     ];
@@ -1650,15 +1660,30 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
             ui.end_row();
 
-            for (name, field, hint) in rows {
+            for (name, source, hint) in rows {
                 ui.label(name).on_hover_text(hint);
-                let current = *field(&mut state.settings);
-                for stage in BakeStage::ALL {
-                    // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
-                    let included = stage <= current;
-                    let mut selected = included;
-                    if ui.checkbox(&mut selected, "").clicked() {
-                        *field(&mut state.settings) = stage;
+                match source {
+                    StageSource::Chosen(field) => {
+                        let current = *field(&mut state.settings);
+                        for stage in BakeStage::ALL {
+                            // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
+                            let included = stage <= current;
+                            let mut selected = included;
+                            if ui.checkbox(&mut selected, "").clicked() {
+                                *field(&mut state.settings) = stage;
+                            }
+                        }
+                    }
+                    StageSource::AlwaysDisplayedResult => {
+                        // 全部入りだが、選べる訳ではない。押せない状態で全段を塗り、
+                        // 理由は hover と下の注記で言う。
+                        for _ in BakeStage::ALL {
+                            let mut always = true;
+                            ui.add_enabled(false, egui::Checkbox::without_text(&mut always))
+                                .on_disabled_hover_text(
+                                    "表示している結果をそのまま書き出すので、段は選べません",
+                                );
+                        }
                     }
                 }
                 ui.end_row();
@@ -1681,8 +1706,8 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(concat!(
-                "エクスポート (1 枚) と、外部ツールへ見開きを 1 枚に合成して渡す場合は、",
-                "この設定にかかわらず表示している結果をそのまま書き出します。",
+                "外部ツールへ見開きを 1 枚に合成して渡す場合も、",
+                "その行の段にかかわらず表示している結果をそのまま書き出します。",
             ))
             .weak(),
         )
