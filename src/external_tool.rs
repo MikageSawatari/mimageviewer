@@ -619,7 +619,7 @@ enum MaterializeLaunchDecision {
 struct ExternalLaunchAttemptResult {
     target_count: usize,
     target_label: String,
-    pub result: Result<Option<AssociationHandlerRefresh>, String>,
+    pub result: Result<ExternalLaunchOutcome, String>,
 }
 
 #[derive(Debug)]
@@ -659,9 +659,16 @@ impl ExternalLaunchPending {
                     self.completed_attempts += 1;
                     self.completed_target_count += attempt.target_count;
                     match attempt.result {
-                        Ok(refresh) => {
-                            self.succeeded_target_count += attempt.target_count;
-                            if let Some(refresh) = refresh {
+                        Ok(outcome) => {
+                            // 起動できなかった対象は成功に数えず、件ごとに理由を出す
+                            // (v3.5.0 レビュー F02)。
+                            self.succeeded_target_count += attempt
+                                .target_count
+                                .saturating_sub(outcome.failed_files.len());
+                            for (path, reason) in &outcome.failed_files {
+                                self.failures.push(format!("{}: {reason}", path.display()));
+                            }
+                            if let Some(refresh) = outcome.refresh {
                                 self.refreshes.push(refresh);
                             }
                         }
@@ -1613,10 +1620,15 @@ fn run_materialize_launch_operation(
                 match build_request_for_files(&tool, vec![path])
                     .and_then(|request| launch_request(request, owner_hwnd))
                 {
-                    Ok(refresh) => {
-                        file.transfer_to_process_directory(tool.keep_temp);
-                        succeeded_target_count += 1;
-                        if let Some(refresh) = refresh {
+                    Ok(outcome) => {
+                        // 1 件ずつ渡す経路でも、起動できなかった対象は成功に数えない。
+                        if let Some((_, reason)) = outcome.failed_files.first() {
+                            failures.push(format!("{label}: {reason}"));
+                        } else {
+                            file.transfer_to_process_directory(tool.keep_temp);
+                            succeeded_target_count += 1;
+                        }
+                        if let Some(refresh) = outcome.refresh {
                             refreshes.push(refresh);
                         }
                     }
@@ -1639,10 +1651,14 @@ fn run_materialize_launch_operation(
                     match build_request_for_files(&tool, vec![path])
                         .and_then(|request| launch_request(request, owner_hwnd))
                     {
-                        Ok(refresh) => {
-                            file.transfer_to_process_directory(tool.keep_temp);
-                            succeeded_target_count += 1;
-                            if let Some(refresh) = refresh {
+                        Ok(outcome) => {
+                            if let Some((_, reason)) = outcome.failed_files.first() {
+                                failures.push(format!("{label}: {reason}"));
+                            } else {
+                                file.transfer_to_process_directory(tool.keep_temp);
+                                succeeded_target_count += 1;
+                            }
+                            if let Some(refresh) = outcome.refresh {
                                 refreshes.push(refresh);
                             }
                         }
@@ -1661,12 +1677,26 @@ fn run_materialize_launch_operation(
                     match build_request_for_files(&tool, files)
                         .and_then(|request| launch_request(request, owner_hwnd))
                     {
-                        Ok(refresh) => {
+                        Ok(outcome) => {
+                            // **件ごとの結果で数える。** 1 件でも起動できれば全件成功と
+                            // していたので、失敗した対象が利用者に見えず、その一時ファイルも
+                            // 起動済みとして手放していた (v3.5.0 レビュー F02)。失敗した分は
+                            // mIV 側の掃除対象に残す。
+                            let failed: std::collections::HashMap<&Path, &str> = outcome
+                                .failed_files
+                                .iter()
+                                .map(|(path, reason)| (path.as_path(), reason.as_str()))
+                                .collect();
                             for file in prepared.iter_mut().flatten() {
+                                if let Some(reason) = failed.get(file.path()) {
+                                    failures.push(format!("{}: {reason}", file.path().display()));
+                                    continue;
+                                }
                                 file.transfer_to_process_directory(tool.keep_temp);
+                                succeeded_target_count += 1;
                             }
-                            succeeded_target_count = prepared_count;
-                            if let Some(refresh) = refresh {
+                            let _ = prepared_count;
+                            if let Some(refresh) = outcome.refresh {
                                 refreshes.push(refresh);
                             }
                         }
@@ -1688,10 +1718,31 @@ fn run_materialize_launch_operation(
     }
 }
 
+/// 1 回の起動要求の結果。
+///
+/// `failed_files` は**渡したのに起動できなかった対象**。関連付けアプリへ複数ファイルを
+/// 渡す経路は 1 件ずつ叩くので、一部だけ失敗し得る。ここを潰して「全件成功」にすると、
+/// 失敗した対象が利用者に見えず、その一時ファイルも起動済みとして手放してしまう
+/// (v3.5.0 レビュー F02)。
+#[derive(Debug)]
+struct ExternalLaunchOutcome {
+    refresh: Option<AssociationHandlerRefresh>,
+    failed_files: Vec<(PathBuf, String)>,
+}
+
+impl ExternalLaunchOutcome {
+    fn all_launched(refresh: Option<AssociationHandlerRefresh>) -> Self {
+        Self {
+            refresh,
+            failed_files: Vec::new(),
+        }
+    }
+}
+
 fn launch_request(
     request: ExternalLaunchRequest,
     owner_hwnd: Option<isize>,
-) -> Result<Option<AssociationHandlerRefresh>, String> {
+) -> Result<ExternalLaunchOutcome, String> {
     let ExternalLaunchRequest {
         tool_name,
         launch,
@@ -1722,7 +1773,7 @@ fn launch_request(
             }
             command
                 .spawn()
-                .map(|_| None)
+                .map(|_| ExternalLaunchOutcome::all_launched(None))
                 .map_err(|error| error.to_string())
         }
         ExternalToolLaunch::Association { handler_id } => {
@@ -1745,13 +1796,14 @@ fn launch_request(
                     owner_hwnd,
                 )
             };
-            outcome.map(|outcome| {
-                outcome
+            outcome.map(|outcome| ExternalLaunchOutcome {
+                refresh: outcome
                     .refreshed_handler_id
                     .map(|current_id| AssociationHandlerRefresh {
                         previous_id: handler_id,
                         current_id,
-                    })
+                    }),
+                failed_files: outcome.failed_paths,
             })
         }
         ExternalToolLaunch::OsDefault => {
@@ -1759,7 +1811,7 @@ fn launch_request(
                 return Err("OS の関連付けへ渡す実ファイルがありません".to_string());
             };
             opener::open(file)
-                .map(|_| None)
+                .map(|_| ExternalLaunchOutcome::all_launched(None))
                 .map_err(|error| error.to_string())
         }
     }

@@ -31894,7 +31894,6 @@ impl App {
         //   2026-05 ユーザー要望)
         // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
         if !is_video && !panorama_active {
-            let mode_available = reading_flow.is_paged() && !is_spread_double;
             let tooltip = if !reading_flow.is_paged() {
                 "360° ビューワーはページ単位表示で使えます".to_owned()
             } else if is_spread_double {
@@ -31911,8 +31910,7 @@ impl App {
                     None => "360° 画像ではありません".to_owned(),
                 }
             };
-            // 入れるかの判断は V キー / 復帰と同じ関数が持つ。`mode_available` は
-            // 上の理由文を選ぶためだけに残す。
+            // 入れるかの判断は V キー / 復帰と同じ関数が持つ。理由文は上の分岐が選ぶ。
             let is_enabled = crate::panorama::entry_allowed(
                 panorama_trigger,
                 is_video,

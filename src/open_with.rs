@@ -192,6 +192,65 @@ impl WindowsAppsHandlerIdentity {
     }
 }
 
+/// 起動経路 4 段をまたぐあいだの、**件ごとの**進み具合。
+///
+/// 起動できた対象を次の段へ渡すと二重に開き、まとめて成功として返すと失敗した対象が
+/// 利用者から見えない (v3.5.0 レビュー F02)。どちらも起きないよう、次段へ渡す対象と
+/// 打ち切り時の返し方をここが決める。
+#[derive(Debug, Default)]
+struct AssociationLaunchProgress {
+    launched: Vec<PathBuf>,
+    pending: Vec<(PathBuf, String)>,
+}
+
+impl AssociationLaunchProgress {
+    fn new(file_paths: &[PathBuf]) -> Self {
+        Self {
+            launched: Vec::new(),
+            pending: file_paths
+                .iter()
+                .map(|path| (path.clone(), String::new()))
+                .collect(),
+        }
+    }
+
+    /// 1 件ずつ叩く段の結果を取り込む。以降の段は失敗した分だけを見る。
+    fn record_per_path(&mut self, outcome: ProgIdLaunchOutcome) {
+        self.launched.extend(outcome.launched);
+        self.pending = outcome.failed;
+    }
+
+    fn pending_paths(&self) -> Vec<PathBuf> {
+        self.pending.iter().map(|(path, _)| path.clone()).collect()
+    }
+
+    fn all_launched(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// 残りを起動できなかったときの返し方。**全滅なら `Err`、一部でも起動できていれば
+    /// 失敗一覧付きの `Ok`。** 一部成功を `Err` にすると、起動済みの一時ファイルまで
+    /// 未起動として扱われる。
+    fn give_up(
+        self,
+        refreshed_handler_id: Option<String>,
+        error: AssociationLaunchError,
+    ) -> Result<AssociationInvokeOutcome, AssociationLaunchError> {
+        if self.launched.is_empty() {
+            return Err(error);
+        }
+        let message = association_launch_error_message(&error);
+        Ok(AssociationInvokeOutcome {
+            refreshed_handler_id,
+            failed_paths: self
+                .pending
+                .into_iter()
+                .map(|(path, _)| (path, message.clone()))
+                .collect(),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AssociationHandlerMatch {
     index: usize,
@@ -201,6 +260,12 @@ struct AssociationHandlerMatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AssociationInvokeOutcome {
     pub refreshed_handler_id: Option<String>,
+    /// 起動できなかった対象と理由。**空なら全件起動できた。**
+    ///
+    /// 複数ファイルを渡す経路 (`SelectionPolicy::Batch`) では、1 件でも起動できれば
+    /// 「全件成功」として扱っていたので、失敗した対象が利用者に見えず、その一時ファイルも
+    /// 起動済みとして手放していた (v3.5.0 レビュー F02)。件ごとの結果をここで返す。
+    pub failed_paths: Vec<(PathBuf, String)>,
 }
 
 /// Package full name の更新で変わらない Name と PublisherId を取り出す。
@@ -563,7 +628,7 @@ fn shell_execute_with_progid(
     handler: &windows::Win32::UI::Shell::IAssocHandler,
     file_paths: &[PathBuf],
     owner_hwnd: Option<isize>,
-) -> Option<bool> {
+) -> Option<ProgIdLaunchOutcome> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::{
         IObjectWithProgID, SEE_MASK_CLASSNAME, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -589,7 +654,7 @@ fn shell_execute_with_progid(
 
     let prog_id_wide: Vec<u16> = prog_id.encode_utf16().chain(std::iter::once(0)).collect();
     let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
-    let mut launched_any = false;
+    let mut outcome = ProgIdLaunchOutcome::default();
     for path in file_paths {
         let file_wide: Vec<u16> = path
             .as_os_str()
@@ -613,11 +678,21 @@ fn shell_execute_with_progid(
             result.as_ref().map(|_| ()),
             path
         ));
-        if result.is_ok() {
-            launched_any = true;
+        match result {
+            Ok(()) => outcome.launched.push(path.clone()),
+            Err(error) => outcome
+                .failed
+                .push((path.clone(), format!("ShellExecuteEx: {error}"))),
         }
     }
-    Some(launched_any)
+    Some(outcome)
+}
+
+/// ProgID 経路の**件ごとの**結果。
+#[derive(Default)]
+struct ProgIdLaunchOutcome {
+    launched: Vec<PathBuf>,
+    failed: Vec<(PathBuf, String)>,
 }
 
 // Windows 専用。呼ぶのは同名の `#[cfg(windows)]` ラッパーだけで、非 Windows 側の
@@ -701,14 +776,6 @@ fn invoke_association_handler_inner(
     let refreshed_handler_id = matched
         .needs_writeback
         .then(|| candidates[matched.index].handler_id.clone());
-    let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(file_paths).map_err(
-        |(failed_paths, error)| {
-            AssociationLaunchError::Shell(format!(
-                "対象ファイルを Shell に渡せません: {error:?} (解決失敗 {failed_paths} 件)"
-            ))
-        },
-    )?;
-    ensure_all_association_paths_resolved(failed_paths)?;
     // 起動経路は 4 段。**どの段も、失敗したら次を試す**。試した経路と結果はログに残し、
     // 全部駄目だったときだけ利用者へ理由を返す。
     //
@@ -718,15 +785,31 @@ fn invoke_association_handler_inner(
     //   しかも失敗までに 1.0〜1.6 秒かかった。先に置くと毎回その分待たされる
     // - ProgID 経路は shell に登録済みの verb / DelegateExecute を処理させるので、
     //   exe を直接 spawn するより素性が良い (必要な引数や DDE を飛ばさない)
+    //
+    // **段をまたぐのは「まだ起動していない対象」だけ。** ProgID 経路は 1 件ずつ叩くので
+    // 一部だけ失敗し得る。全体を再投入すると成功済みが二重に開き、全体を成功として返すと
+    // 失敗した対象が利用者から見えない (v3.5.0 レビュー F02)。
+    let mut progress = AssociationLaunchProgress::new(file_paths);
+    let mut pending: Vec<PathBuf> = file_paths.to_vec();
+
+    macro_rules! give_up {
+        ($error:expr) => {{
+            return progress.give_up(refreshed_handler_id, $error);
+        }};
+    }
 
     // 1. 正確な ProgID があれば shell に処理させる。`GetName()` の表示名 ("フォト") では
     //    引けないので、ハンドラを `IObjectWithProgID` へ QI して取る。
-    if shell_execute_with_progid(&handlers[matched.index], file_paths, owner_hwnd)
-        .is_some_and(|ok| ok)
+    if let Some(outcome) = shell_execute_with_progid(&handlers[matched.index], &pending, owner_hwnd)
     {
-        return Ok(AssociationInvokeOutcome {
-            refreshed_handler_id,
-        });
+        progress.record_per_path(outcome);
+        pending = progress.pending_paths();
+        if progress.all_launched() {
+            return Ok(AssociationInvokeOutcome {
+                refreshed_handler_id,
+                failed_paths: Vec::new(),
+            });
+        }
     }
 
     // 2. ハンドラ名が実在する .exe なら直接起動する。ハンドラ名は毎回列挙し直すので、
@@ -734,44 +817,63 @@ fn invoke_association_handler_inner(
     if let Some(executable) = executable_handler_path(&candidates[matched.index].handler_id) {
         crate::logger::log(format!(
             "open_with: launching handler executable directly path={executable:?} files={}",
-            file_paths.len()
+            pending.len()
         ));
         let mut command = std::process::Command::new(&executable);
         command
-            .args(file_paths)
+            .args(&pending)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        command.spawn().map_err(|error| {
-            AssociationLaunchError::Shell(format!("関連付けアプリを起動できません: {error}"))
-        })?;
+        if let Err(error) = command.spawn() {
+            give_up!(AssociationLaunchError::Shell(format!(
+                "関連付けアプリを起動できません: {error}"
+            )));
+        }
         return Ok(AssociationInvokeOutcome {
             refreshed_handler_id,
+            failed_paths: Vec::new(),
         });
     }
 
     // 3. packaged app 専用の起動口。実機の 2 つでは効かなかったが、file activation
     //    contract を要求する UWP handler にはこちらが正道 (docs)。ここまで落ちるのは
     //    ProgID も exe path も無い packaged app だけなので、待ち時間は普段は発生しない。
-    if activate_packaged_handler(&handlers[matched.index], file_paths).is_some_and(|ok| ok) {
+    if activate_packaged_handler(&handlers[matched.index], &pending).is_some_and(|ok| ok) {
         return Ok(AssociationInvokeOutcome {
             refreshed_handler_id,
+            failed_paths: Vec::new(),
         });
     }
 
     // 4. 従来の経路。packaged app では S_OK を返しながら起動しないことが分かっている
-    //    (2026-08-31 実機) が、従来アプリではこれで足りる。
+    //    (2026-08-31 実機) が、従来アプリではこれで足りる。データオブジェクトは**この段でしか
+    //    使わない**ので、ここまで来たときにだけ、残っている対象で組む。
+    let (data, unresolved) = match crate::file_drag::shell_data_object_for_paths(&pending) {
+        Ok(value) => value,
+        Err((failed_paths, error)) => {
+            give_up!(AssociationLaunchError::Shell(format!(
+                "対象ファイルを Shell に渡せません: {error:?} (解決失敗 {failed_paths} 件)"
+            )));
+        }
+    };
+    if let Err(error) = ensure_all_association_paths_resolved(unresolved) {
+        give_up!(error);
+    }
     let invoke_result = unsafe { handlers[matched.index].Invoke(&data) };
     crate::logger::log(format!(
         "open_with: Invoke result={:?} files={}",
         invoke_result,
-        file_paths.len()
+        pending.len()
     ));
-    invoke_result.map_err(|error| {
-        AssociationLaunchError::Shell(format!("関連付けアプリを起動できません: {error}"))
-    })?;
+    if let Err(error) = invoke_result {
+        give_up!(AssociationLaunchError::Shell(format!(
+            "関連付けアプリを起動できません: {error}"
+        )));
+    }
     Ok(AssociationInvokeOutcome {
         refreshed_handler_id,
+        failed_paths: Vec::new(),
     })
 }
 
@@ -821,6 +923,82 @@ pub(crate) fn invoke_association_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1 件ずつ叩く段で一部だけ失敗したら、**次の段へ回すのは失敗した分だけ**。
+    ///
+    /// 全体を再投入すると成功済みが二重に開く (F02)。
+    #[test]
+    fn only_the_targets_that_did_not_launch_go_on_to_the_next_stage() {
+        let paths = vec![
+            PathBuf::from(r"C:.png"),
+            PathBuf::from(r"C:.png"),
+            PathBuf::from(r"C:\c.png"),
+        ];
+        let mut progress = AssociationLaunchProgress::new(&paths);
+
+        progress.record_per_path(ProgIdLaunchOutcome {
+            launched: vec![paths[0].clone(), paths[2].clone()],
+            failed: vec![(paths[1].clone(), "ShellExecuteEx: E_FAIL".to_string())],
+        });
+
+        assert!(!progress.all_launched());
+        assert_eq!(progress.pending_paths(), vec![paths[1].clone()]);
+    }
+
+    /// 全件起動できたら、その先の段には進まない。
+    #[test]
+    fn a_fully_launched_batch_reports_no_failures() {
+        let paths = vec![PathBuf::from(r"C:.png"), PathBuf::from(r"C:.png")];
+        let mut progress = AssociationLaunchProgress::new(&paths);
+
+        progress.record_per_path(ProgIdLaunchOutcome {
+            launched: paths.clone(),
+            failed: Vec::new(),
+        });
+
+        assert!(progress.all_launched());
+        assert!(progress.pending_paths().is_empty());
+    }
+
+    /// 一部でも起動できていたら、残りは**失敗一覧付きの成功**として返す。
+    ///
+    /// ここを `Err` にすると、起動済みの対象まで未起動として扱われ、その一時ファイルが
+    /// 掃除対象へ戻ってしまう。
+    #[test]
+    fn a_partly_launched_batch_returns_the_failures_instead_of_failing_outright() {
+        let paths = vec![PathBuf::from(r"C:.png"), PathBuf::from(r"C:.png")];
+        let mut progress = AssociationLaunchProgress::new(&paths);
+        progress.record_per_path(ProgIdLaunchOutcome {
+            launched: vec![paths[0].clone()],
+            failed: vec![(paths[1].clone(), "ShellExecuteEx: E_FAIL".to_string())],
+        });
+
+        let outcome = progress
+            .give_up(
+                None,
+                AssociationLaunchError::Shell("関連付けアプリを起動できません".to_string()),
+            )
+            .expect("一部でも起動できていれば全体は失敗にしない");
+
+        assert_eq!(outcome.failed_paths.len(), 1);
+        assert_eq!(outcome.failed_paths[0].0, paths[1]);
+        assert!(!outcome.failed_paths[0].1.is_empty(), "理由を空にしない");
+    }
+
+    /// 1 件も起動できなければ、従来どおり全体の失敗。
+    #[test]
+    fn a_batch_that_launched_nothing_still_fails_as_a_whole() {
+        let paths = vec![PathBuf::from(r"C:.png")];
+        let mut progress = AssociationLaunchProgress::new(&paths);
+        progress.record_per_path(ProgIdLaunchOutcome {
+            launched: Vec::new(),
+            failed: vec![(paths[0].clone(), "ShellExecuteEx: E_FAIL".to_string())],
+        });
+
+        let error = progress.give_up(None, AssociationLaunchError::HandlerNotFound);
+
+        assert_eq!(error, Err(AssociationLaunchError::HandlerNotFound));
+    }
 
     #[test]
     fn association_extension_is_pure_and_keeps_the_dot() {
