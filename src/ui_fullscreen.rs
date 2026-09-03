@@ -34875,13 +34875,23 @@ impl App {
             crate::books::BookEraseSnapshot { mask, run }
         });
 
-        // AI 段。段が AI まで進むページだけ runtime を用意する (v3.5.0 レビュー F03)。
+        // AI 段。通す気があるページだけ runtime を用意する (v3.5.0 レビュー F03)。
         // モデルの選択は合成途中の画素に依存するので、ここでは材料だけを渡す。
-        let ai = if stage.includes_ai() {
+        //
+        // **用意できなければ失敗にする。** AI 抜きの絵は寸法から別物なので、黙って落として
+        // 成功と言ってはならない (レビュー R14)。
+        let materials = self.book_ai_materials();
+        let ai = if crate::books::stage_requests_ai(stage, &params, materials.feature_mode) {
             self.ensure_ai_runtime();
-            self.ai_runtime.clone().map(|runtime| {
-                crate::books::book_ai_snapshot(self.book_ai_materials(), runtime, params.clone())
-            })
+            let runtime = self
+                .ai_runtime
+                .clone()
+                .ok_or_else(crate::books::ai_runtime_unavailable_error)?;
+            Some(crate::books::book_ai_snapshot(
+                materials,
+                runtime,
+                params.clone(),
+            ))
         } else {
             None
         };

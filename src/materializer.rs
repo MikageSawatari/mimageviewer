@@ -748,21 +748,26 @@ impl MaterializeSession {
             },
             preset: context.conceal_preset.clone(),
         });
-        // AI 段。材料が無い / runtime を作れないページは AI を通さずに焼く。
-        let ai = if context.stage.includes_ai() {
-            match (
-                context.ai_materials.clone(),
-                self.resolve_worker_ai_runtime(context),
-            ) {
-                (Some(materials), Some(runtime)) => Some(crate::books::book_ai_snapshot(
+        // AI 段。**通す気があるのに runtime を用意できなければ失敗にする** — AI 抜きの絵は
+        // 寸法から別物なので、黙って落として成功と言ってはならない (レビュー R14)。
+        let ai = match context.ai_materials.clone() {
+            Some(materials)
+                if crate::books::stage_requests_ai(
+                    context.stage,
+                    &params,
+                    materials.feature_mode,
+                ) =>
+            {
+                let runtime = self
+                    .resolve_worker_ai_runtime(context)
+                    .ok_or_else(crate::books::ai_runtime_unavailable_error)?;
+                Some(crate::books::book_ai_snapshot(
                     materials,
                     runtime,
                     params.clone(),
-                )),
-                _ => None,
+                ))
             }
-        } else {
-            None
+            _ => None,
         };
         let erase = erase_raw.map(|(bitmap, shapes, size)| {
             let runtime = self.resolve_worker_ai_runtime(context);

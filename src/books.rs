@@ -310,6 +310,29 @@ pub struct BookAiMaterials {
     pub transparent_bg_mode: u8,
 }
 
+/// この段とこの params で **AI を通す気があるか**。実際に通せるかとは別。
+///
+/// 通す気があるのに runtime を用意できなかったときは、AI 抜きで書き出して成功と言っては
+/// ならない (v3.5.0 レビュー R14)。段が AI へ届かない、モデルを選んでいない、AI 機能が
+/// OFF、のいずれかなら「通さないのが正しい」ので、それは成功。
+///
+/// 寸法の上限は**ここでは見ない** — 合成の途中で出来上がった画素に依存するので、runner の
+/// 中で `select_final_ai_models` が判断する。上限外は正常な無処理。
+pub fn stage_requests_ai(
+    stage: crate::bake_stage::BakeStage,
+    params: &crate::adjustment::AdjustParams,
+    feature_mode: crate::settings::AiFeatureMode,
+) -> bool {
+    stage.includes_ai()
+        && (crate::ai::final_pipeline::effective_upscale_request(feature_mode, params).is_some()
+            || crate::ai::final_pipeline::effective_denoise_request(feature_mode, params).is_some())
+}
+
+/// AI を通す気があるのに runtime を用意できなかったときの文面。
+pub fn ai_runtime_unavailable_error() -> String {
+    "AI 処理を実行できないため書き出せません (AI ランタイムを初期化できませんでした)".to_string()
+}
+
 /// 焼き込み段が AI まで進むときの runner。
 ///
 /// このページが AI を要求していない (モデル未選択 / 機能 OFF / 寸法が対象外) なら、runner は
@@ -1350,6 +1373,11 @@ fn compose_book_page_with_cancel(
     //
     // `used_ai_upscale` は AI 段が入ったら真になる。スマートシャープは AI 拡大した出力へは
     // 掛けない固定規則があるので ([adjustment.rs] `effective_smart_sharpen`)、その入力になる。
+    // 注釈は**この時点の絵**の上で作られている。AI 拡大が入ると絵の大きさが変わるので、
+    // 入る前の寸法を覚えておき、注釈の座標をそこから拡縮する。一覧 index を持たない
+    // スタック内ページは `comic_source_dims` を持てず、AI を通しても注釈だけ元の位置と
+    // 大きさに残っていた (v3.5.0 レビュー R06)。**index の有無で注釈座標の意味を変えない。**
+    let source_dims_before_ai = image.size;
     let mut used_ai_upscale = false;
     if edits.stage.includes_ai()
         && let Some(ai) = &edits.ai
@@ -1372,7 +1400,10 @@ fn compose_book_page_with_cancel(
     ensure_materialization_not_cancelled(cancel.as_ref())?;
 
     if let Some(comic) = &edits.comic {
-        image = bake_comic_annotations(&image, comic, edits.comic_source_dims, cancel.as_ref())?;
+        // 保存済みの authoring 寸法があればそれが正。無ければ AI 前の寸法を使う
+        // (AI を通していなければ同じ値なので、従来の結果は変わらない)。
+        let authoring_dims = edits.comic_source_dims.or(Some(source_dims_before_ai));
+        image = bake_comic_annotations(&image, comic, authoring_dims, cancel.as_ref())?;
         ensure_materialization_not_cancelled(cancel.as_ref())?;
     }
 
@@ -2378,7 +2409,113 @@ mod tests {
         );
     }
 
-    /// AI 段の runner を **本番コードが作っている** こと。
+    /// AI で絵が大きくなったら、**注釈もその倍率で付く**。
+    ///
+    /// 一覧 index を持たないスタック内ページは `comic_source_dims` を持てない。AI 段を
+    /// 配線したことで絵の大きさは変わるのに、注釈だけ元の位置と大きさに残っていた
+    /// (v3.5.0 レビュー R06)。index の有無で注釈座標の意味を変えない。
+    #[test]
+    fn annotations_follow_the_image_when_ai_enlarges_it_even_without_stored_dims() {
+        fn yellow_square_at(center: (f32, f32), half: f32) -> comic_core::AnnotationObject {
+            let mut bubble = comic_core::BubbleObject::default();
+            bubble.shape = comic_core::BubbleShape::RoundRect {
+                half_w: half,
+                half_h: half,
+                corner_px: 0.0,
+            };
+            bubble.fill = Some(comic_core::Rgba::new(255, 235, 59, 255));
+            bubble.fill_opacity = 1.0;
+            bubble.outline.width_px = 0.0;
+            bubble.text = comic_core::TextBlock::default();
+            bubble.auto_size = false;
+            comic_core::AnnotationObject::new_bubble(1, center, bubble)
+        }
+        fn painted(image: &egui::ColorImage, x: usize, y: usize) -> bool {
+            image.pixels[y * image.size[0] + x] != egui::Color32::BLACK
+        }
+        fn doubling_runner() -> BookAiSnapshot {
+            BookAiSnapshot {
+                run: Box::new(|image, _cancel| {
+                    let [w, h] = image.size;
+                    let mut out = egui::ColorImage::new(
+                        [w * 2, h * 2],
+                        vec![egui::Color32::BLACK; w * h * 4],
+                    );
+                    for y in 0..h * 2 {
+                        for x in 0..w * 2 {
+                            out.pixels[y * w * 2 + x] = image.pixels[(y / 2) * w + (x / 2)];
+                        }
+                    }
+                    Ok(BookAiResult {
+                        image: out,
+                        used_upscale: true,
+                    })
+                }),
+            }
+        }
+
+        let base = egui::ColorImage::new([16, 16], vec![egui::Color32::BLACK; 256]);
+        let mut edits = empty_baked_edits();
+        edits.stage = crate::bake_stage::BakeStage::Ai;
+        // authoring 寸法は保存されていない (スタック内ページ)。
+        edits.comic_source_dims = None;
+        edits.comic = Some(BookComicSnapshot {
+            objects: vec![yellow_square_at((8.0, 8.0), 2.0)],
+            fonts: Arc::new(comic_core::FontSet::new()),
+            stamp_cache: std::collections::HashMap::new(),
+        });
+        edits.ai = Some(doubling_runner());
+
+        let composed = compose_book_page(base, &edits).unwrap().image;
+
+        assert_eq!(composed.size, [32, 32], "AI が 2 倍にしている");
+        assert!(
+            painted(&composed, 16, 16),
+            "拡大後の中心 (16,16) に注釈がある"
+        );
+        assert!(!painted(&composed, 6, 6), "元の枠の外 (6,6) には残らない");
+    }
+
+    /// 「AI を通す気があるか」は段・モデル選択・機能 ON/OFF で決まり、**寸法では決まらない**。    /// 「AI を通す気があるか」は段・モデル選択・機能 ON/OFF で決まり、**寸法では決まらない**。
+    ///
+    /// 通す気があるのに runtime を用意できなければ失敗にする側の述語なので、上限外を
+    /// ここで false にすると「上限外だから AI 抜きで成功」と「初期化に失敗したから AI 抜きで
+    /// 成功」が同じ答えになってしまう (v3.5.0 レビュー R14)。
+    #[test]
+    fn wanting_ai_is_decided_by_the_stage_and_the_models_not_by_the_size() {
+        use crate::bake_stage::BakeStage;
+        use crate::settings::AiFeatureMode;
+
+        let mut wants = crate::adjustment::AdjustParams::default();
+        wants.upscale_model = Some("auto".to_string());
+        let plain = crate::adjustment::AdjustParams::default();
+
+        assert!(stage_requests_ai(
+            BakeStage::Ai,
+            &wants,
+            AiFeatureMode::HighQuality
+        ));
+        assert!(stage_requests_ai(
+            BakeStage::DisplayAdjust,
+            &wants,
+            AiFeatureMode::HighQuality
+        ));
+
+        assert!(
+            !stage_requests_ai(BakeStage::Edits, &wants, AiFeatureMode::HighQuality),
+            "段が AI へ届かないなら通さないのが正しい"
+        );
+        assert!(
+            !stage_requests_ai(BakeStage::Ai, &plain, AiFeatureMode::HighQuality),
+            "モデルを選んでいなければ通さないのが正しい"
+        );
+        assert!(
+            !stage_requests_ai(BakeStage::Ai, &wants, AiFeatureMode::Disabled),
+            "AI 機能が OFF なら通さないのが正しい"
+        );
+    }
+
+    /// AI 段の runner を **本番コードが作っている** こと。    /// AI 段の runner を **本番コードが作っている** こと。
     ///
     /// v3.5.0 まで `BookAiSnapshot` を組み立てるのはこのテストだけで、設定画面は
     /// 4 出力 × 3 段をすべて動くものとして見せていた。「AI 処理」を選んでも製本・
