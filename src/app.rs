@@ -49436,18 +49436,41 @@ impl App {
         let Some((key, source, meta)) = self.current_container_rating_target() else {
             return Ok(false);
         };
+        self.write_container_rating_for_target(&key, &source, &meta, stars, capture_undo)
+    }
+
+    /// **保存先を名指しで**コンテナ評価を書く。
+    ///
+    /// リングは開いた時点の保存先を持ち回る。確定のたびに「いまのフォルダ」を引き直すと、
+    /// リングを開いたまま前面の窓が変わったときに別の窓のフォルダへ書いてしまう
+    /// (v3.5.0 レビュー N01 / Q01)。表示キャッシュの更新は、**その container を今まさに
+    /// 見ている投影だけ**に限る — 別の窓の星表示を書き換えないため。
+    pub(crate) fn write_container_rating_for_target(
+        &mut self,
+        key: &str,
+        source: &Path,
+        meta: &crate::rating_db::RatingMeta,
+        stars: u8,
+        capture_undo: bool,
+    ) -> Result<bool, String> {
+        let showing_this_container = self
+            .current_container_rating_target()
+            .is_some_and(|(current, _, _)| current == key);
         let stars = stars.min(5);
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
-        let before = self
-            .current_folder_rating_cache
-            .or_else(|| self.rating_db.as_ref().map(|db| db.get(&key)))
+        let before = showing_this_container
+            .then_some(self.current_folder_rating_cache)
+            .flatten()
+            .or_else(|| self.rating_db.as_ref().map(|db| db.get(key)))
             .unwrap_or(0);
-        self.write_user_rating_shared(&key, stars, Some(&meta))?;
+        self.write_user_rating_shared(key, stars, Some(meta))?;
         if capture_undo && before != stars {
-            self.capture_container_rating_undo(before, stars);
+            self.capture_container_rating_undo_for_target(key, source, meta, before, stars);
         }
         self.invalidate_rating_counts_cache();
-        self.current_folder_rating_cache = Some(stars);
+        if showing_this_container {
+            self.current_folder_rating_cache = Some(stars);
+        }
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
         // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
         // items に含まれないが、search container 絞り込みビュー中は含まれうる。ZipDir も
@@ -49456,9 +49479,7 @@ impl App {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, _)| {
-                (self.rating_path_key(i).as_deref() == Some(key.as_str())).then_some(i)
-            })
+            .filter_map(|(i, _)| (self.rating_path_key(i).as_deref() == Some(key)).then_some(i))
             .collect();
         for i in matching {
             self.rating_cache.insert(i, stars);
@@ -49470,7 +49491,7 @@ impl App {
         }
         self.rebuild_visible_indices();
         self.record_content_identity_for_path(
-            &source,
+            source,
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
         Ok(true)
@@ -53079,7 +53100,7 @@ impl App {
     /// **これが一覧の更新契機でもある。** メニューを閉じるたびに捨てるのをやめたので、
     /// アプリの追加 / 削除や関連付けの変更を拾う場所が他に無い。フォルダーを開き直せば
     /// 並べ直す (レビュー R13)。
-    pub(crate) fn poll_association_handler_prewarm(&mut self) {
+    pub(crate) fn poll_association_handler_prewarm(&mut self, ctx: &egui::Context) {
         if let Some(rx) = self.association_prewarm.as_ref() {
             match rx.try_recv() {
                 Ok(handlers) => {
@@ -53091,7 +53112,8 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => self.association_prewarm = None,
             }
-            return;
+            // 受け取った frame でそのまま次のバッチへ進む。ここで return すると、次の
+            // バッチの開始が「次に UI が動くとき」まで待たされる (レビュー Q02)。
         }
         if self.association_prewarm_generation != Some(self.items_generation) {
             self.association_prewarm_generation = Some(self.items_generation);
@@ -53128,6 +53150,9 @@ impl App {
         let extensions: Vec<String> = (0..PREWARM_BATCH)
             .filter_map(|_| self.association_prewarm_queue.pop_front())
             .collect();
+        // **完了したら画面を起こす。** 起こさないと、残りのバッチは次に UI が動くまで
+        // 始まらず、フォルダーを開き直しても古い候補が残る (v3.5.0 レビュー Q02)。
+        let repaint = ctx.clone();
         let (tx, rx) = mpsc::channel();
         if std::thread::Builder::new()
             .name("association-handler-prewarm".to_string())
@@ -53139,7 +53164,9 @@ impl App {
                         (extension, list)
                     })
                     .collect();
+                // 送ってから起こす。起きたフレームの poll が必ず受け取れる順序。
                 let _ = tx.send(handlers);
+                repaint.request_repaint();
             })
             .is_ok()
         {
@@ -67441,7 +67468,7 @@ impl App {
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
         self.poll_external_rescan(ctx);
-        self.poll_association_handler_prewarm();
+        self.poll_association_handler_prewarm(ctx);
 
         // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。

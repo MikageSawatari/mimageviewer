@@ -2958,6 +2958,17 @@ impl App {
         let video_volume = self.settings.video_volume;
         let video_playback_speed = self.video_playback_speed;
         let video_continuous_mode = self.video_continuous_mode;
+        // **保存先も開いた時点で固定する。** 確定時に「いまのフォルダ」を引き直すと、
+        // リングを開いたまま前面の窓が変わったときに別のフォルダへ書く (レビュー Q01)。
+        let container_rating_target =
+            self.current_container_rating_target()
+                .map(|(path_key, source_path, meta)| {
+                    crate::ring_shortcut::RingPickerContainerTarget {
+                        path_key,
+                        source_path,
+                        meta,
+                    }
+                });
         let original = RingPickerOriginalState {
             grid_cols,
             sort_order,
@@ -2965,6 +2976,7 @@ impl App {
             thumb_aspect,
             item_rating_records,
             container_rating,
+            container_rating_target,
             spread_mode,
             reading_flow,
             reading_direction,
@@ -3753,7 +3765,7 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                if let Err(error) = self.preview_ring_container_rating(picker) {
                     self.report_rating_write_error(&error);
                 }
             }
@@ -3802,7 +3814,7 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                if let Err(error) = self.preview_ring_container_rating(picker) {
                     self.report_rating_write_error(&error);
                 }
             }
@@ -3859,7 +3871,7 @@ impl App {
             RingPickerRowId::ContainerRating
                 if self.current_folder_rating() != picker.container_rating =>
             {
-                if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+                if let Err(error) = self.preview_ring_container_rating(picker) {
                     self.report_rating_write_error(&error);
                 }
             }
@@ -4562,10 +4574,30 @@ impl App {
     /// strictly after DB success, so they are the stable per-target record for
     /// both earlier live previews and this final write; dirty state and display
     /// indices alone prove nothing.
+    /// リングのコンテナ評価を、**開いた時点の保存先へ**書く。
+    ///
+    /// 「いまのフォルダ」を引き直すと、リングを開いたまま前面の窓が変わったときに別の窓の
+    /// フォルダへ書く (v3.5.0 レビュー Q01)。書ける対象が無ければ何もしない。
+    fn preview_ring_container_rating(&mut self, picker: &RingPickerState) -> Result<bool, String> {
+        let Some(target) = picker.original.container_rating_target.clone() else {
+            return Ok(false);
+        };
+        self.write_container_rating_for_target(
+            &target.path_key,
+            &target.source_path,
+            &target.meta,
+            picker.container_rating,
+            false,
+        )
+    }
+
     pub(crate) fn finalize_live_picker_ratings(
         &mut self,
         picker: &RingPickerState,
-    ) -> (Vec<RatingChange>, Option<(u8, u8)>) {
+    ) -> (
+        Vec<RatingChange>,
+        Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+    ) {
         let mut item_changes = Vec::new();
         if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
             let (touched, error) =
@@ -4616,14 +4648,21 @@ impl App {
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
         {
-            if let Err(error) = self.preview_current_folder_rating(picker.container_rating) {
+            if let Err(error) = self.preview_ring_container_rating(picker) {
                 self.report_rating_write_error(&error);
             }
-            let actual = self
-                .current_folder_rating_cache
+            // **DB を正とする。** 表示キャッシュは「いまその container を見ている投影」しか
+            // 持たないので、リングを開いた窓が前面でなくなっていると読めない (レビュー Q01)。
+            let actual = picker
+                .original
+                .container_rating_target
+                .as_ref()
+                .and_then(|target| self.rating_db.as_ref().map(|db| db.get(&target.path_key)))
                 .unwrap_or(picker.original.container_rating);
-            if picker.original.container_rating != actual {
-                container_record = Some((picker.original.container_rating, actual));
+            if picker.original.container_rating != actual
+                && let Some(target) = picker.original.container_rating_target.clone()
+            {
+                container_record = Some((target, picker.original.container_rating, actual));
             }
         }
         (item_changes, container_record)
@@ -4632,7 +4671,7 @@ impl App {
     pub(crate) fn commit_live_picker_undo(
         &mut self,
         item_changes: Vec<RatingChange>,
-        container_record: Option<(u8, u8)>,
+        container_record: Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
         if !item_changes.is_empty() {
             let common_after = item_changes
@@ -4654,8 +4693,16 @@ impl App {
             };
             self.push_rating_undo_entry(item_changes, summary);
         }
-        if let Some((before, after)) = container_record {
-            self.capture_container_rating_undo(before, after);
+        if let Some((target, before, after)) = container_record {
+            // **Undo も開いた時点の保存先へ。** ここで引き直すと、別の窓のフォルダ宛てに
+            // 操作した窓の変更前値を積む (レビュー Q01)。
+            self.capture_container_rating_undo_for_target(
+                &target.path_key,
+                &target.source_path,
+                &target.meta,
+                before,
+                after,
+            );
             self.show_container_rating_toast(after);
         }
     }

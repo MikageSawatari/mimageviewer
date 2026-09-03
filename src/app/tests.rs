@@ -25823,7 +25823,7 @@ mod favorite_adjustment_defaults_tests {
         // 既に .jpg を覚えている (古い内容)。
         app.cached_handlers.insert(".jpg".to_string(), Vec::new());
 
-        app.poll_association_handler_prewarm();
+        app.poll_association_handler_prewarm(&ctx);
 
         assert!(
             app.association_prewarm.is_some(),
@@ -25831,13 +25831,68 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。
+    /// 後続バッチは、**入力を待たずに**始まる。
+    ///
+    /// worker が結果を送るだけで画面を起こしていなかったので、残りのバッチは次に UI が
+    /// 動くまで始まらなかった。フォルダーを開き直しても 9 種類目以降の候補が古いままに
+    /// なる (v3.5.0 レビュー Q02)。完了で起こし、受け取った frame でそのまま次へ進む。
+    #[test]
+    fn a_finished_prewarm_batch_wakes_the_ui_and_starts_the_next_one() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for extension in [
+            "jpg", "png", "gif", "bmp", "tif", "avif", "heic", "jxl", "webp", "jpeg",
+        ] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/trip/a.{extension}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+
+        // 先に画面を静止させる。
+        for _ in 0..8 {
+            if !ctx.has_requested_repaint() {
+                break;
+            }
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        assert!(!ctx.has_requested_repaint(), "ここでは静止している");
+
+        app.poll_association_handler_prewarm(&ctx);
+        let queued_after_first = app.association_prewarm_queue.len();
+        assert!(queued_after_first > 0, "残りがある");
+
+        // 完了が画面を起こす。ここを起こさないと、残りは次の入力まで始まらない。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ctx.has_requested_repaint() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "完了が画面を起こさない"
+            );
+        }
+
+        // 起きた frame の poll が、受け取ってそのまま次のバッチを始める。
+        app.poll_association_handler_prewarm(&ctx);
+        assert!(
+            app.association_prewarm.is_some(),
+            "受け取った frame で次のバッチが始まる"
+        );
+        assert!(
+            app.association_prewarm_queue.len() < queued_after_first,
+            "残りが減っている"
+        );
+    }
+
+    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。
     ///
     /// 1 バッチの上限で打ち切っていたので、9 種類目以降はフォルダーを開き直しても更新
     /// されず、一度覚えた古い候補や失敗して覚えた空が終了まで残った (v3.5.0 レビュー N05)。
     #[test]
     fn every_extension_in_the_folder_eventually_gets_re_enumerated() {
         use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let extensions = [
             "jpg", "png", "gif", "bmp", "tif", "avif", "heic", "jxl", "webp", "jpeg",
@@ -25851,7 +25906,7 @@ mod favorite_adjustment_defaults_tests {
         }
 
         // 1 バッチ目。
-        app.poll_association_handler_prewarm();
+        app.poll_association_handler_prewarm(&ctx);
         assert!(app.association_prewarm.is_some());
         let after_first = app.association_prewarm_queue.len();
         assert!(
@@ -25860,14 +25915,14 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // 実行中は次のバッチを始めない。
-        app.poll_association_handler_prewarm();
+        app.poll_association_handler_prewarm(&ctx);
         assert_eq!(app.association_prewarm_queue.len(), after_first);
 
         // 完了させて続きへ。最終的に全部が処理される。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !app.association_prewarm_queue.is_empty() || app.association_prewarm.is_some() {
             assert!(std::time::Instant::now() < deadline, "列挙が終わらない");
-            app.poll_association_handler_prewarm();
+            app.poll_association_handler_prewarm(&ctx);
         }
 
         assert!(app.association_prewarm_queue.is_empty());
@@ -25877,18 +25932,19 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn the_association_prewarm_runs_once_per_folder_load() {
         use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
         app.thumbnails.push(ThumbnailState::Pending);
 
-        app.poll_association_handler_prewarm();
+        app.poll_association_handler_prewarm(&ctx);
         let first = app.association_prewarm_generation;
         assert_eq!(first, Some(app.items_generation));
 
         // 同じ世代では作り直さない。
         app.association_prewarm = None;
-        app.poll_association_handler_prewarm();
+        app.poll_association_handler_prewarm(&ctx);
         assert!(
             app.association_prewarm.is_none(),
             "同じフォルダーで列挙を作り直さない"
@@ -65505,7 +65561,61 @@ mod rating_write_failure_tests {
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
     }
 
-    /// パッドが切れたときのリング確定は、**sample の中でやらない**。
+    /// リングのコンテナ評価は、**開いた窓のフォルダ**へ書かれる。
+    ///
+    /// 確定のたびに「いまのフォルダ」を引き直していたので、リングを開いたまま前面の窓が
+    /// 変わると、別の窓のフォルダへ★を書き、Undo もそちら宛てに操作した窓の変更前値を
+    /// 積んでいた。Undo してもどちらも元へ戻らない (v3.5.0 レビュー N01 / Q01)。
+    #[test]
+    fn a_ring_container_rating_lands_on_the_folder_it_was_opened_in() {
+        let mut app = setup_app();
+        let opened_in = app.tmp.path().join("opened_in");
+        let moved_to = app.tmp.path().join("moved_to");
+        std::fs::create_dir_all(&opened_in).unwrap();
+        std::fs::create_dir_all(&moved_to).unwrap();
+        let opened_key = crate::adjustment_db::normalize_path(&opened_in);
+        let moved_key = crate::adjustment_db::normalize_path(&moved_to);
+
+        // 開いた窓は★2 のフォルダ、後で前面になる窓は★1 のフォルダ。
+        app.current_folder = Some(opened_in.clone());
+        app.set_current_folder_rating(2).unwrap();
+        let mut picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        picker
+            .dirty_rows
+            .push(crate::ring_shortcut::RingPickerRowId::ContainerRating);
+        picker.container_rating = 4;
+
+        // リングを開いたまま、投影が別のフォルダを指すようになる。
+        app.current_folder = Some(moved_to.clone());
+        app.current_folder_rating_cache = None;
+        app.set_current_folder_rating(1).unwrap();
+        let undo_before = app.meta_undo.undo_len();
+
+        let (items, container) = app.finalize_live_picker_ratings(&picker);
+        assert!(items.is_empty());
+        app.commit_live_picker_undo(items, container);
+
+        let db = app.rating_db.as_ref().unwrap();
+        assert_eq!(db.get(&opened_key), 4, "開いた窓のフォルダに書く");
+        assert_eq!(db.get(&moved_key), 1, "前面になった窓のフォルダは変えない");
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_before + 1,
+            "その変更を取り消せる"
+        );
+
+        app.apply_meta_undo();
+        let db = app.rating_db.as_ref().unwrap();
+        assert_eq!(
+            db.get(&opened_key),
+            2,
+            "Undo は開いた窓のフォルダを元へ戻す"
+        );
+        assert_eq!(db.get(&moved_key), 1);
+    }
+
+    /// パッドが切れたときのリング確定は、**sample の中でやらない**。    /// パッドが切れたときのリング確定は、**sample の中でやらない**。
     ///
     /// sample は root 投影で走る。リングのフォルダ評価は mount 中の context の保存先へ書く
     /// ので、root のまま確定すると別ウィンドウで変えた評価がメイン側のフォルダへ書かれ、

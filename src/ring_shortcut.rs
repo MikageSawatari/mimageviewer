@@ -2388,6 +2388,19 @@ pub struct RingPickerRatingTarget {
     pub session_generation: u64,
 }
 
+/// リングを開いたときの**コンテナ評価の保存先**。
+///
+/// 項目評価 ([`RingPickerRatingTarget`]) と同じ理由で、表示ではなく識別子で持つ。
+/// 確定のたびに「いまのフォルダ」を引き直していたので、リングを開いたまま前面の窓が
+/// 変わると、別の窓のフォルダへ書き込み、Undo もそちら宛てに積んでいた
+/// (v3.5.0 レビュー N01 / Q01)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RingPickerContainerTarget {
+    pub path_key: String,
+    pub source_path: PathBuf,
+    pub meta: crate::rating_db::RatingMeta,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerOriginalState {
     pub grid_cols: usize,
@@ -2396,6 +2409,8 @@ pub struct RingPickerOriginalState {
     pub thumb_aspect: crate::settings::ThumbAspect,
     pub item_rating_records: Vec<RingPickerRatingTarget>,
     pub container_rating: u8,
+    /// リングを開いたときのコンテナ評価の保存先。書ける対象が無ければ `None`。
+    pub container_rating_target: Option<RingPickerContainerTarget>,
     pub spread_mode: crate::settings::SpreadMode,
     pub reading_flow: crate::settings::ReadingFlow,
     pub reading_direction: crate::settings::ReadingDirection,

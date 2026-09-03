@@ -700,6 +700,31 @@ impl App {
         let Some((path_key, source_path, meta)) = self.current_container_rating_target() else {
             return;
         };
+        self.capture_container_rating_undo_for_target(
+            &path_key,
+            &source_path,
+            &meta,
+            before,
+            after,
+        );
+    }
+
+    /// **保存先を名指しで** Undo を積む。
+    ///
+    /// リングは開いた時点の保存先を持ち回る。ここで「いまのフォルダ」を引き直すと、
+    /// 別の窓のフォルダ宛てに、操作した窓の変更前値を記録してしまう。Undo しても
+    /// どちらも元へ戻らない (v3.5.0 レビュー N01 / Q01)。
+    pub(crate) fn capture_container_rating_undo_for_target(
+        &mut self,
+        path_key: &str,
+        source_path: &std::path::Path,
+        meta: &crate::rating_db::RatingMeta,
+        before: u8,
+        after: u8,
+    ) {
+        let path_key = path_key.to_string();
+        let source_path = source_path.to_path_buf();
+        let meta = meta.clone();
         let summary = if after == 0 {
             "コンテナの★解除".to_string()
         } else {
