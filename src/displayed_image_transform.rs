@@ -883,9 +883,23 @@ pub(crate) fn physical_pixel_scale(pixels_per_point: f32) -> f32 {
     1.0 / normalized_pixels_per_point(pixels_per_point)
 }
 
+/// 点座標を物理ピクセル格子へ寄せる。
+///
+/// **境界の .5 は必ず同じ向き (+∞ 側) へ倒す。** `f32::round` は 0 から遠い側へ倒すので、
+/// 原点をまたぐと `-500.5 → -501` / `+500.5 → +501` となり、**整数ピクセルの平行移動と
+/// 丸めが可換でなくなる**。連結読みはユニットごとに原点を寄せてから間隔を積むので、
+/// スクロールで座標の符号が変わった瞬間だけ隣り合うユニットの隙間が 1 物理 px 太る
+/// (gap 0 の密着も外れる。v3.5.0 レビュー F12)。`(x + 0.5).floor()` は任意の整数 n について
+/// `floor(x + n + 0.5) == floor(x + 0.5) + n` を満たすので、この可換性が成り立つ。
+///
+/// 正の値では `round` と同じ結果になるため、寄せ幅そのものは変わらない。
 pub(crate) fn quantize_points_to_physical_pixels(points: f32, pixels_per_point: f32) -> f32 {
     let pixels_per_point = normalized_pixels_per_point(pixels_per_point);
-    (points * pixels_per_point).round() / pixels_per_point
+    let pixels = points * pixels_per_point;
+    if !pixels.is_finite() {
+        return points;
+    }
+    (pixels + 0.5).floor() / pixels_per_point
 }
 
 /// 画像 1 枚が実際に占める物理ピクセル数。

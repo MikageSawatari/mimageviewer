@@ -859,6 +859,9 @@ impl SettingsDb {
         // INSERT OR IGNORE で冪等 (= 2 回目以降は no-op)。schema_meta 自体は init_schema
         // で作成済み。本 marker は **commit と同 transaction 内** で書く必要がある
         // (= "save_full の中身が永続化された瞬間に marker も付く" 不変条件)。
+        // この save が **新規 DB の最初の保存** かどうか。marker を書いてよいのはここだけで、
+        // 判定は marker を立てるのと同じ transaction の中で行う。
+        let bootstrap_save = !existing_bootstrap_marker_present(&tx)?;
         tx.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('bootstrap_complete', '1')",
             [],
@@ -866,18 +869,27 @@ impl SettingsDb {
         // 新規 bootstrap は Settings の既定値 (FileName) をそのまま保存し、同じ
         // transaction で「既定変更の適用済み」だけを記録する。既存 DB の値変更は
         // load_into_settings 冒頭の migration が値と marker を原子的に書く。
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
-            params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
-            params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
-            params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
-        )?;
+        //
+        // **既存 DB の通常保存では書かない。** migration が I/O / SQL 失敗で rollback した
+        // 直後は「値は旧いまま・marker 無し = 次の load で再試行する」状態で、そこへ通常保存が
+        // marker だけ立てると再試行が永久に止まる。移行元が旧 `custom_open_with_apps` の
+        // 場合、利用者の登録アプリが UI から消えたまま戻らない (v3.5.0 レビュー F15)。
+        // marker を立ててよいのは「移行を実行した migration 自身」と「移行対象が原理的に
+        // 存在しない新規 DB の bootstrap」の 2 つだけ。
+        if bootstrap_save {
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                params![RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY],
+            )?;
+        }
         // app_version は DB を「開いた版」ではなく、設定内容を最後に正常保存した版を示す。
         // backup rotation はこの save より前に走るため、bak1 側には直前の保存版が残る。
         tx.execute(
@@ -4680,6 +4692,65 @@ mod tests {
 
         assert_eq!(loaded.external_tools.len(), 1);
         assert_eq!(loaded.external_tools[0].id, ExternalToolId(41));
+        assert!(external_tools_migration_marker_present(&db));
+    }
+
+    /// 移行が一度失敗した後、**ふつうの保存**が「移行済み」を確定させてはいけない。
+    ///
+    /// `load_into_settings` は移行の I/O / SQL 失敗を握り潰して読み進む契約で、その代わり
+    /// 「値は旧いまま・marker 無し」を残して次の load で再試行する。`save_full` が marker を
+    /// 無条件に立てていたので、移行が失敗した回に別の設定を変えて保存するだけで再試行が
+    /// 止まり、旧 `custom_open_with_apps` の登録が UI から永久に消えていた (F15)。
+    #[test]
+    fn a_failed_external_tool_migration_is_still_retried_after_an_ordinary_save() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        seed_legacy_custom_apps(&db);
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER miv_fail_external_tool_insert
+                     BEFORE INSERT ON external_tools
+                     BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+                )
+                .unwrap();
+        }
+
+        let loaded = db.load_into_settings().unwrap();
+        assert!(
+            loaded.external_tools.is_empty(),
+            "移行が失敗した回は空のまま読み進む"
+        );
+        assert!(
+            !external_tools_migration_marker_present(&db),
+            "失敗した移行は marker を残さない (再試行の前提)"
+        );
+
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute_batch("DROP TRIGGER miv_fail_external_tool_insert;")
+                .unwrap();
+        }
+
+        // 障害が直った後、外部ツールとは関係のない設定変更を保存する。
+        let mut settings = loaded.clone();
+        settings.pdf_worker_count = 7;
+        db.save_full(&settings).unwrap();
+        assert!(
+            !external_tools_migration_marker_present(&db),
+            "通常保存は自分が実行していない移行を確定させない"
+        );
+
+        let reloaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            reloaded.external_tools.len(),
+            2,
+            "次の load で移行をやり直し、旧登録が戻る"
+        );
         assert!(external_tools_migration_marker_present(&db));
     }
 

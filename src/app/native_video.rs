@@ -236,10 +236,17 @@ fn wave_background_paused_for_mode(mode: crate::settings::VideoSeekStripMode) ->
 /// 巡回だけが `cycle_set` を見る。内容を直接指名する操作は表示範囲を変えない
 /// (場面と波形を行き来しても、周辺 / 全体の選択は保つ)。
 #[cfg(windows)]
+/// `last_span` は**利用者が最後に選んだ表示範囲**で、`Settings` が持つ。
+///
+/// 非表示から戻す操作でこれを `current.span()` から取らないこと。`SeekStripView::span()` は
+/// 非表示のとき「寸法を解決するための既定値」として周辺表示を返す綴りで、利用者の選択では
+/// ない。同じ 1 つの述語を 2 つの問いに使うと、メニューで「波形 (全体)」を選んで閉じ、同じ
+/// キーで開き直しただけで「波形 (周辺)」に変わる (v3.5.0 レビュー F07)。
 fn requested_video_seek_strip_view(
     action: KeyAction,
     current: crate::video::seek_strip_layout::SeekStripView,
     last_choice: crate::settings::VideoSeekStripMode,
+    last_span: crate::video::seek_strip_layout::SeekStripSpan,
     cycle_set: crate::video::seek_strip_layout::SeekStripCycleSet,
     strip_available: bool,
 ) -> Option<crate::video::seek_strip_layout::SeekStripView> {
@@ -247,7 +254,11 @@ fn requested_video_seek_strip_view(
     if !strip_available {
         return None;
     }
-    let span = current.span();
+    let span = if current.is_visible() {
+        current.span()
+    } else {
+        last_span
+    };
     match action {
         KeyAction::VideoSeekStripCycle => Some(cycle_set.next(current)),
         KeyAction::VideoSeekStripToggle => Some(if current.is_visible() {
@@ -7723,6 +7734,7 @@ impl App {
             action,
             current,
             self.settings.video_seek_strip_last_choice,
+            self.settings.video_seek_strip_span,
             self.settings.video_seek_strip_cycle,
             strip_available,
         ) else {
@@ -13182,10 +13194,18 @@ mod native_video_key_observation_tests {
             SeekStripSpan::Whole,
         );
         let last_choice = crate::settings::VideoSeekStripMode::Waveform;
+        let last_span = SeekStripSpan::Whole;
         let cycle_set = SeekStripCycleSet::default();
         for action in VIDEO_SEEK_STRIP_ACTIONS {
             assert_eq!(
-                requested_video_seek_strip_view(action, current, last_choice, cycle_set, false),
+                requested_video_seek_strip_view(
+                    action,
+                    current,
+                    last_choice,
+                    last_span,
+                    cycle_set,
+                    false
+                ),
                 None,
                 "{action:?} must not change the remembered strip state"
             );
@@ -13198,6 +13218,7 @@ mod native_video_key_observation_tests {
                 KeyAction::VideoSeekStripThumbnails,
                 current,
                 last_choice,
+                last_span,
                 cycle_set,
                 true,
             ),
@@ -13217,6 +13238,7 @@ mod native_video_key_observation_tests {
         };
 
         let last_choice = crate::settings::VideoSeekStripMode::Thumbnails;
+        let last_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
         let cycle_set = SeekStripCycleSet::default();
         let mut view = SeekStripView::Hidden;
         for expected in SEEK_STRIP_SHOWING_ORDER {
@@ -13224,6 +13246,7 @@ mod native_video_key_observation_tests {
                 KeyAction::VideoSeekStripCycle,
                 view,
                 last_choice,
+                last_span,
                 cycle_set,
                 true,
             )
@@ -13235,10 +13258,60 @@ mod native_video_key_observation_tests {
                 KeyAction::VideoSeekStripCycle,
                 view,
                 last_choice,
+                last_span,
                 cycle_set,
                 true,
             ),
             Some(SeekStripView::Hidden)
+        );
+    }
+
+    /// 非表示から戻す操作は、**利用者が最後に選んだ表示範囲**へ戻す。
+    ///
+    /// `SeekStripView::Hidden.span()` は寸法解決用の既定値 (周辺) を返す綴りで、選択の記憶では
+    /// ない。これを復元値に使っていたので、メニューで「波形 (全体)」を選び、トグルキーで閉じて
+    /// 同じキーで開き直すだけで「波形 (周辺)」へ落ちていた。上ドラッグの `open_video_seek_strip`
+    /// は保存済み span を使うため、同じ操作でも入口で結果が違っていた (F07)。
+    #[test]
+    fn reopening_a_hidden_strip_restores_the_span_the_user_last_chose() {
+        use crate::video::seek_strip_layout::{SeekStripCycleSet, SeekStripSpan, SeekStripView};
+
+        let cycle_set = SeekStripCycleSet::default();
+        let last_choice = crate::settings::VideoSeekStripMode::Waveform;
+
+        for action in [
+            KeyAction::VideoSeekStripToggle,
+            KeyAction::VideoSeekStripWaveform,
+            KeyAction::VideoSeekStripThumbnails,
+        ] {
+            let restored = requested_video_seek_strip_view(
+                action,
+                SeekStripView::Hidden,
+                last_choice,
+                SeekStripSpan::Whole,
+                cycle_set,
+                true,
+            )
+            .expect("表示できる動画では戻せる");
+            assert_eq!(
+                restored.span(),
+                SeekStripSpan::Whole,
+                "{action:?} は最後に選んだ表示範囲へ戻す"
+            );
+        }
+
+        // 記憶が周辺表示なら周辺で戻る (全体を既定にしたわけではない)。
+        assert_eq!(
+            requested_video_seek_strip_view(
+                KeyAction::VideoSeekStripToggle,
+                SeekStripView::Hidden,
+                last_choice,
+                SeekStripSpan::Window,
+                cycle_set,
+                true,
+            )
+            .map(SeekStripView::span),
+            Some(SeekStripSpan::Window)
         );
     }
 }

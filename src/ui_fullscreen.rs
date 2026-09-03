@@ -2901,6 +2901,29 @@ fn music_panel_open_state_after_reach(
     }
 }
 
+/// 音楽ビューの右パネルが占める帯 — `(確保幅, 右端, パネル幅)`。
+///
+/// `reserved` は `fullscreen_media_rect` が `rect` から**実際に引いた**幅で、ロックして
+/// いなければ 0。**縮んだ `rect` から元の幅を逆算しない。** 逆算式
+/// `R.min((rect.width() + R) / 2)` は元幅が `2R` 以上のときしか成り立たず、それ未満の
+/// 窓では確保した帯より広いパネルを右へはみ出させる (幅 640pt で 55pt。レビュー F11)。
+fn music_right_panel_band(rect: egui::Rect, reserved: f32) -> (f32, f32, f32) {
+    let reserved = if reserved.is_finite() {
+        reserved.max(0.0)
+    } else {
+        0.0
+    };
+    let right_edge = rect.right() + reserved;
+    // 帯の幅とパネルの幅は同じ 1 つの答え。ロックしていないときだけ、重ねて描く既定幅を
+    // ビュー幅の半分でクランプする (`music_side_panel_contains_pointer` と同じ規則)。
+    let width = if reserved > 0.0 {
+        reserved
+    } else {
+        crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(rect.width() * 0.5)
+    };
+    (reserved, right_edge, width)
+}
+
 fn music_side_panel_contains_pointer(
     full_rect: egui::Rect,
     pos: egui::Pos2,
@@ -4329,7 +4352,21 @@ fn continuous_reading_page_rects(
     // — 貼り先はどの倍率でも寄るようになった (§1.161)。
     let span = continuous_unit_drawn_span(size, pixels_per_point);
     let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
-    let mut visible_x = unit_rect.center().x - span.x_len * 0.5;
+    // **ユニットの基準と、ユニット内の相対位置を別々に寄せる。**
+    //
+    // 合成してから 1 回で寄せると、寄せの結果がスクロール位置と座標の符号に依存する。
+    // ページ高が奇数物理 px なら原点は中心からちょうど半画素で、原点をまたいだ瞬間に
+    // `-500.5` と `+500.5` が**逆向き**へ倒れ、隣り合うユニットの見える間隔が 1 物理 px
+    // 太る (gap 0 の密着も外れる。v3.5.0 レビュー F12)。基準を先に寄せておけば、段の間隔は
+    // ユニット内の相対位置だけで決まり、スクロール位置にも符号にも依存しない。
+    //
+    // 呼び出し側は「段に共通の基準」を寄せて渡し、段ごとの間隔は物理ピクセルの整数で積む
+    // (`vertical_reading_offsets`)。したがってここの寄せは通常そのまま通る。
+    let unit_origin = egui::pos2(
+        quantize_points_to_physical_pixels(unit_rect.center().x, pixels_per_point),
+        quantize_points_to_physical_pixels(unit_rect.center().y, pixels_per_point),
+    );
+    let mut visible_x = -span.x_len * 0.5;
     let visible_center_y = (span.y_min + span.y_max) * 0.5;
 
     for page in &size.pages {
@@ -4339,13 +4376,14 @@ fn continuous_reading_page_rects(
         //
         // **倍率で分岐せず必ず寄せる。** 以前は「整数近傍の倍率のときだけ」だったが、
         // それは貼り先が端数倍率で寄っていなかった時代の条件で、§1.161 で消えた。
-        // 整数画素ぶんの平行移動と丸めは可換なので、寄せても unit 間の間隔は保たれる。
         let rect_min = egui::pos2(
-            quantize_points_to_physical_pixels(visible_x - band_x_lo, pixels_per_point),
-            quantize_points_to_physical_pixels(
-                unit_rect.center().y - visible_center_y - page.height * 0.5,
-                pixels_per_point,
-            ),
+            unit_origin.x
+                + quantize_points_to_physical_pixels(visible_x - band_x_lo, pixels_per_point),
+            unit_origin.y
+                + quantize_points_to_physical_pixels(
+                    -visible_center_y - page.height * 0.5,
+                    pixels_per_point,
+                ),
         );
         let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
         visible_x += (band_x_hi - band_x_lo) + page_gap;
@@ -13364,6 +13402,22 @@ impl App {
         }
     }
 
+    /// いま実際に差し引かれている右情報パネルの帯幅 (ロックしていなければ 0)。
+    ///
+    /// `fullscreen_media_rect` が引く量と、パネルを描く側が戻す量は**この 1 か所から出す**。
+    /// 縮んだ矩形から元の幅を逆算すると、幅がクランプに掛かる狭い窓で逆算が成り立たず、
+    /// パネルがウィンドウの外へはみ出す (640pt で 55pt はみ出し。v3.5.0 レビュー F11)。
+    fn locked_info_panel_reserved_width_effective(
+        &self,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+        is_video: bool,
+    ) -> f32 {
+        self.still_info_panel_lock_effective_for_idx(fs_idx, is_video)
+            .then(|| self.locked_info_panel_reserved_width(full_rect, fs_idx))
+            .unwrap_or(0.0)
+    }
+
     fn fullscreen_media_rect(
         &self,
         full_rect: egui::Rect,
@@ -13375,9 +13429,7 @@ impl App {
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
             self.settings.fullscreen_fixed_bar_gap_px,
-            self.still_info_panel_lock_effective_for_idx(fs_idx, is_video)
-                .then(|| self.locked_info_panel_reserved_width(full_rect, fs_idx))
-                .unwrap_or(0.0),
+            self.locked_info_panel_reserved_width_effective(full_rect, fs_idx, is_video),
         )
     }
 
@@ -15424,8 +15476,23 @@ impl App {
                                     if self.fs_music_view_active(fs_idx) {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
-                                        music_view_frame_ui =
-                                            self.draw_fs_music_view(ui, ctx, image_rect, fs_idx);
+                                        music_view_frame_ui = self.draw_fs_music_view(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            // 解析モード / VST3 コンパクトは `image_rect` を
+                                            // 別の規則で作るので、この帯は存在しない。
+                                            if analysis_active || vst3_compact_active {
+                                                0.0
+                                            } else {
+                                                self.locked_info_panel_reserved_width_effective(
+                                                    full_rect,
+                                                    fs_idx,
+                                                    state.is_video,
+                                                )
+                                            },
+                                            fs_idx,
+                                        );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
                                         // ここで close_fs に合流させる (動画の close_requested と同じ)。
                                         if std::mem::take(&mut self.music_view_close_requested) {
@@ -27503,14 +27570,29 @@ impl App {
                 } else {
                     1.0
                 };
+                // **段に共通の基準だけを先に寄せ、段ごとの間隔 (整数物理 px) は寄せずに足す。**
+                // 合成した座標を後で寄せると、寄せがスクロール位置に依存して段の間隔が
+                // ばらつく (§1.159 / v3.5.0 レビュー F12)。
                 egui::pos2(
-                    image_rect.center().x + sign * (offsets[list_pos] - self.fs_vertical_scroll),
-                    image_rect.center().y + self.fs_pan.y,
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().x - sign * self.fs_vertical_scroll,
+                        pixels_per_point,
+                    ) + sign * offsets[list_pos],
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().y + self.fs_pan.y,
+                        pixels_per_point,
+                    ),
                 )
             } else {
                 egui::pos2(
-                    image_rect.center().x + self.fs_pan.x,
-                    image_rect.center().y - self.fs_vertical_scroll + offsets[list_pos],
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().x + self.fs_pan.x,
+                        pixels_per_point,
+                    ),
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().y - self.fs_vertical_scroll,
+                        pixels_per_point,
+                    ) + offsets[list_pos],
                 )
             };
             let unit_rect =
@@ -27563,14 +27645,27 @@ impl App {
                 } else {
                     1.0
                 };
+                // 上と同じ規則。基準だけ寄せ、段の間隔は整数物理 px のまま足す。
                 egui::pos2(
-                    image_rect.center().x + sign * (offset - self.fs_vertical_scroll),
-                    image_rect.center().y + self.fs_pan.y,
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().x - sign * self.fs_vertical_scroll,
+                        pixels_per_point,
+                    ) + sign * offset,
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().y + self.fs_pan.y,
+                        pixels_per_point,
+                    ),
                 )
             } else {
                 egui::pos2(
-                    image_rect.center().x + self.fs_pan.x,
-                    image_rect.center().y - self.fs_vertical_scroll + offset,
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().x + self.fs_pan.x,
+                        pixels_per_point,
+                    ),
+                    quantize_points_to_physical_pixels(
+                        image_rect.center().y - self.fs_vertical_scroll,
+                        pixels_per_point,
+                    ) + offset,
                 )
             };
             let unit_rect =
@@ -36998,11 +37093,14 @@ impl App {
     /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
     /// 再生位置/長さ + シークバー + 再生/一時停止ボタン」を描く。タイムライン波形 /
     /// スペクトラム / 左右パネルの作り込みは Inc 3b / Inc 5。native presenter は使わない (D3)。
+    /// `reserved_info_panel_w` は `fullscreen_media_rect` が `rect` から**実際に引いた**
+    /// 右情報パネルの帯幅。ロックしていなければ 0。縮んだ `rect` から逆算しないこと (F11)。
     pub(crate) fn draw_fs_music_view(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         rect: egui::Rect,
+        reserved_info_panel_w: f32,
         fs_idx: usize,
     ) -> MusicViewFrameUiState {
         // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
@@ -37154,17 +37252,8 @@ impl App {
         // 固定中は `fullscreen_media_rect` が既に右を空けている。パネルはその**空けた帯**へ
         // 置くので、右端は縮める前の位置に戻す。縮んだ `rect` の右端に置くと、確保した帯が
         // そのまま空白として残る (backlog §1.158)。
-        let panel_reserved_w = self
-            .still_info_panel_lock_effective_for_idx(fs_idx, false)
-            .then(|| rect.width())
-            .map(|_| {
-                crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
-                    .min((rect.width() + crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH) * 0.5)
-            })
-            .unwrap_or(0.0);
-        let panel_right_edge = rect.right() + panel_reserved_w;
-        let right_w = crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH
-            .min((rect.width() + panel_reserved_w) * 0.5);
+        let (panel_reserved_w, panel_right_edge, right_w) =
+            music_right_panel_band(rect, reserved_info_panel_w);
         // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
         // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
@@ -50595,6 +50684,138 @@ mod tests {
             assert_f32_close(rects[0].1.min.x * pixels_per_point % 1.0, 0.0);
             assert_f32_close(rects[0].1.min.y * pixels_per_point % 1.0, 0.0);
             assert_f32_close(rects[0].1.height() * pixels_per_point, 101.0);
+        }
+    }
+
+    /// ユニット間の**見える間隔**は、座標が原点をまたいでも設定どおりのまま。
+    ///
+    /// 段の位置は f64 の物理 px で積むので中心間距離は揃うが、置くときの丸めが
+    /// `f32::round` (0 から遠い側へ倒す) だと、原点をまたいだ瞬間だけ `-500.5 → -501` /
+    /// `+500.5 → +501` と**逆向き**に倒れ、隣り合う端の間が 1 物理 px 開く。gap 0 の密着も
+    /// 外れる。奇数の物理 px 高さ (= ページ原点がちょうど半画素) で、スクロールして符号が
+    /// 変わる並びを走査する (v3.5.0 レビュー F12)。
+    #[test]
+    fn continuous_reading_unit_gaps_survive_the_sign_change_at_the_origin() {
+        for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+            for gap in [0.0_f32, 1.0, 20.0] {
+                let page_height = 1001.0 / pixels_per_point;
+                let page_width = 501.0 / pixels_per_point;
+                let heights = vec![page_height; 9];
+                let offsets =
+                    vertical_reading_offsets(&heights, gap, heights.len() / 2, pixels_per_point);
+                let mut page = ContinuousReadingPageSize::full(0, page_width, page_height);
+                page.logical_scale = physical_pixel_scale(pixels_per_point);
+                let size = ContinuousReadingUnitSize {
+                    pages: vec![page],
+                    width: page_width,
+                    height: page_height,
+                    page_gap: 0.0,
+                    logical_scale: physical_pixel_scale(pixels_per_point),
+                };
+                let gap_px = (quantize_points_to_physical_pixels(gap, pixels_per_point)
+                    * pixels_per_point)
+                    .round();
+
+                let edges = offsets
+                    .iter()
+                    .map(|offset| {
+                        let unit_rect = egui::Rect::from_center_size(
+                            egui::pos2(0.0, *offset),
+                            egui::vec2(size.width, size.height),
+                        );
+                        let rects =
+                            continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+                        (
+                            rects[0].1.min.y * pixels_per_point,
+                            rects[0].1.max.y * pixels_per_point,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                for pos in 1..edges.len() {
+                    let seen = edges[pos].0 - edges[pos - 1].1;
+                    assert!(
+                        (seen - gap_px).abs() < 0.01,
+                        "ppp={pixels_per_point} gap={gap} pos={pos}: 見える間隔 {seen}px                          (設定 {gap_px}px)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 固定した右情報パネルは、どんな窓幅でもウィンドウの外へ出ない。
+    ///
+    /// 帯の幅は `fullscreen_media_rect` が引いた量そのもの。以前は縮んだ矩形から
+    /// `R.min((width + R) / 2)` で逆算しており、この式が成り立つのは元幅が `2R` 以上の
+    /// ときだけだった。本体の最小幅 640pt では確保 320pt に対し 375pt のパネルを描き、
+    /// 右端の鍵ボタンが窓の外へ出ていた (F11)。
+    #[test]
+    fn the_locked_music_info_panel_never_reaches_past_the_window() {
+        let reserve =
+            |full_w: f32| crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_w * 0.5);
+        for full_w in [640.0_f32, 700.0, 800.0, 860.0, 1280.0, 3840.0] {
+            let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(full_w, 900.0));
+            let reserved = reserve(full_w);
+            let media = egui::Rect::from_min_max(
+                full.min,
+                egui::pos2(full.right() - reserved, full.bottom()),
+            );
+
+            let (band_w, right_edge, panel_w) = music_right_panel_band(media, reserved);
+
+            assert!(
+                (right_edge - full.right()).abs() < 0.01,
+                "full_w={full_w}: パネルの右端 {right_edge} が窓の右端 {} と違う",
+                full.right()
+            );
+            assert!(
+                (panel_w - reserved).abs() < 0.01,
+                "full_w={full_w}: パネル幅 {panel_w} が確保した帯 {reserved} と違う"
+            );
+            assert!(
+                right_edge - panel_w >= media.right() - 0.01,
+                "full_w={full_w}: パネルが確保した帯より左へはみ出す"
+            );
+            assert!((band_w - reserved).abs() < 0.01);
+        }
+    }
+
+    /// ロックしていないときは重ねて描くので、帯は 0 でパネルはビュー幅の半分でクランプ。
+    #[test]
+    fn the_unlocked_music_info_panel_overlays_and_stays_inside_the_view() {
+        for full_w in [640.0_f32, 860.0, 1920.0] {
+            let media = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(full_w, 900.0));
+
+            let (band_w, right_edge, panel_w) = music_right_panel_band(media, 0.0);
+
+            assert_eq!(band_w, 0.0);
+            assert!((right_edge - media.right()).abs() < 0.01);
+            assert!(panel_w <= full_w * 0.5 + 0.01, "full_w={full_w}");
+            assert!(panel_w <= crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH + 0.01);
+        }
+    }
+
+    /// 物理ピクセル格子への寄せは、**境界の .5 を符号によらず同じ向きへ倒す**。
+    ///
+    /// `f32::round` は 0 から遠い側へ倒すので、原点をまたぐと `-500.5 → -501` /
+    /// `+500.5 → +501` となり、本来 1001px の距離が 1002px になる。連結読みは寄せた原点から
+    /// 間隔を積むので、この 1px がユニット間の隙間に出る (F12)。
+    #[test]
+    fn quantizing_moves_the_half_pixel_boundary_the_same_way_on_both_sides_of_zero() {
+        let below = quantize_points_to_physical_pixels(-500.5, 1.0);
+        let above = quantize_points_to_physical_pixels(500.5, 1.0);
+
+        assert_eq!(below, -500.0);
+        assert_eq!(above, 501.0);
+        assert_eq!(above - below, 1001.0, "整数距離が丸めで太らない");
+
+        // 正の値では従来と同じ結果 (寄せ幅そのものは変えていない)。
+        for value in [0.4_f32, 0.5, 0.6, 12.49, 12.5, 12.51] {
+            assert_eq!(
+                quantize_points_to_physical_pixels(value, 1.0),
+                value.round(),
+                "value={value}"
+            );
         }
     }
 
