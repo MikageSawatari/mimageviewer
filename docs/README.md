@@ -94,6 +94,8 @@
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |
 | [scroll-visibility-priority-plan.md](scroll-visibility-priority-plan.md) | スクロール停止後に可視サムネのジョブを優先レーンへ昇格させる仕組みと perf 計装 |
 | [prefetch-suppression-during-scroll-plan.md](prefetch-suppression-during-scroll-plan.md) | スクロール中 / 可視待ち中に prefetch を enqueue しない判定と、永久 stall を防ぐ backstop |
+| [duplicate-detection-plan.md](duplicate-detection-plan.md) | **設計 v0 (未実装)**。重複画像の検出と整理。狙いは「ほぼ同じ画像だが解像度違い / 軽微な修正」= 近重複のみ (埋め込みは使わない)。`similar.db` に 64bit + 256bit pHash を持ち、**索引を作らず線形走査**。白ページの退化ハッシュ対策 (`confidence`)、漫画は本単位で判定、削除は既存のゴミ箱経路、検証は既存の比較表示 (Diff) を再利用 |
+| [similar-image-search-research.md](similar-image-search-research.md) | 上の前段の調査メモ。類似画像検索 / 重複検出。他ツール (hydrus / digiKam / XnView MP / Eagle / Komga / Immich) の機能と用途、perceptual hash と埋め込みのアルゴリズム比較、100 万件規模の実測 (索引不要という結論)、mIV へ載せる場合の保存先・スコープ・UI 案 |
 | [dpi-multimonitor-issue.md](dpi-multimonitor-issue.md) | マルチモニター DPI 問題の調査記録 |
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
 | [pdf-pool-context-epoch-plan.md](pdf-pool-context-epoch-plan.md) | PDF レンダ pool の 3 段階優先度と、ナビゲーションで stale 化したジョブを除去する context epoch |
