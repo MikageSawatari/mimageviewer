@@ -602,6 +602,11 @@ worker を再起動しない。archive 候補が desired scope から外れて s
 
 `App::start_fs_load`:
 
+各分岐へ入る前に、App-global な `FsPageLoadScheduler` の permit を worker 側で取得する。
+総枠 6 / High 予約 2 は通常画像・ZIP/RAR 変換後・PDF で共通で、要求の ticket と result は
+viewer context ごとの `fs_pending` が所有する。したがって detached window を増やしても
+実行予算は増えず、片方の context の cancel が他方の要求を消さない。
+
 ```rust
 match grid_item {
     GridItem::PdfPage { .. } => {

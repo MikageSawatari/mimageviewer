@@ -6320,6 +6320,7 @@ fn decode_remote_ai_canonical(
         crate::canonical_image_loader::CanonicalDecodeOptions {
             susie_priority: true,
             susie_cancel: Some(cancel),
+            cancel: None,
             animation_policy: crate::canonical_image_loader::AnimationPolicy::FullFrames,
         },
     )

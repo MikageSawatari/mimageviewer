@@ -398,9 +398,14 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
 
 ### 2.2 ロードスレッド
 
-`App::start_fs_load` (app.rs) が std::thread::spawn で 1 枚ごとに spawn:
+`App::start_fs_load` (app.rs) が 1 枚ごとに worker を spawn し、worker は
+App-global な `FsPageLoadScheduler` の permit を取得してから以下へ進む。総枠は 6、
+先読み (Normal) は最大 4、現在ページと表示中の見開き相方は High で残り 2 枠も使える。
+要求と cancel / result の所有は viewer context ごとの `fs_pending` に残る。
 
 ```
+             FsPageLoadScheduler (Mutex + Condvar, RAII permit)
+                                  │
           ┌─ GridItem::Image      ┐
           ├─ GridItem::ZipImage   ┴→ canonical_image_loader::decode_canonical_image
           │                          → image crate → WIC → Susie の順で static fallback
@@ -414,6 +419,13 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
   ├─ .png/APNG → fs_animation::decode_apng_frames (通常画像のみ)
   └─ .webp    → fs_animation::decode_webp_frames / decode_webp_frames_from_bytes
                 (通常画像 / ZIP 内画像)
+```
+
+待機中の要求は cancel されると source を読まずに終了する。実行中の cancel は permit を
+即時返却せず、worker が実際に終了するまで `Cancelling` として数える。書庫読み出し直後・
+decode 前と animation frame 境界で cancel を確認し、PDFium / Susie IPC は開始後の応答まで
+permit 内で待つ。先読みから表示対象への遷移は同じ ticket の High 昇格であり、
+cancel + 再投入は行わない。
 
 Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示時は常に
 `current_frame` の raw テクスチャを直接選び、`edit_result_cache` /

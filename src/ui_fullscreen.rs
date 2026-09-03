@@ -13588,7 +13588,21 @@ impl App {
         painter.galley(rect.min + padding, galley, text_color);
     }
 
+    #[cfg(test)]
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
+        self.seek_to_continuous_page_with_contract(
+            ctx,
+            target_idx,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+        );
+    }
+
+    fn seek_to_continuous_page_with_contract(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+        load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+    ) {
         let current_page_changed = self.fullscreen_idx != Some(target_idx);
         if current_page_changed {
             if self.adjustment_mode.is_open() {
@@ -13609,6 +13623,7 @@ impl App {
         if current_page_changed {
             self.refresh_fullscreen_pdf_promotion();
         }
+        self.ensure_fs_page_load_with_contract(target_idx, load_contract);
         ctx.request_repaint();
     }
 
@@ -13617,18 +13632,20 @@ impl App {
         ctx: &egui::Context,
         current_idx: usize,
         target_idx: usize,
+        load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
     ) {
         if self.continuous_reading_active_for_idx(current_idx)
             && self.continuous_reading_supported_idx(target_idx)
         {
             // A discrete page-unit command inside one continuous stream changes
             // its anchor; it is not a fresh fullscreen file open.
-            self.seek_to_continuous_page(ctx, target_idx);
+            self.seek_to_continuous_page_with_contract(ctx, target_idx, load_contract);
         } else {
-            self.open_fullscreen_from_fs_navigation(
+            self.open_fullscreen_from_fs_navigation_with_contract(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
+                load_contract,
             );
         }
     }
@@ -13861,7 +13878,11 @@ impl App {
                 let target_idx = info.image_indices[pos];
                 if target_idx != fs_idx || continuous_label_mode {
                     if continuous_label_mode {
-                        self.seek_to_continuous_page(ctx, target_idx);
+                        self.seek_to_continuous_page_with_contract(
+                            ctx,
+                            target_idx,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                        );
                     } else {
                         target = Some(target_idx);
                     }
@@ -25221,6 +25242,21 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        self.open_fullscreen_from_fs_navigation_with_contract(
+            ctx,
+            idx,
+            history_trigger,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+        );
+    }
+
+    fn open_fullscreen_from_fs_navigation_with_contract(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
+        load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+    ) {
         #[cfg(windows)]
         if self.should_block_detached_independent_still_navigation_to_video(idx) {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
@@ -25315,7 +25351,12 @@ impl App {
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
-        self.open_fullscreen_with_materialization(idx, history_trigger, materialization);
+        self.open_fullscreen_with_materialization_and_contract(
+            idx,
+            history_trigger,
+            materialization,
+            load_contract,
+        );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
@@ -25946,7 +25987,12 @@ impl App {
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 if !self.fs_navigation_sequence_blocks_new_target() {
-                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                    self.land_still_page_navigation_target(
+                        ctx,
+                        fs_idx,
+                        new_idx,
+                        crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                    );
                 }
             } else if let FsPageNav::Split(step) = page_nav {
                 if step.source_idx == fs_idx {
@@ -25967,7 +26013,12 @@ impl App {
                         step.source_idx,
                         accept_rendition,
                     ) {
-                        self.land_still_page_navigation_target(ctx, fs_idx, step.source_idx);
+                        self.land_still_page_navigation_target(
+                            ctx,
+                            fs_idx,
+                            step.source_idx,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                        );
                     }
                     // **着地できたときだけ**左右を確定する。遷移が断られた場合に
                     // 左右だけ動くと、今見えているページの反対側が出る。
@@ -26010,7 +26061,12 @@ impl App {
                                 accept_rendition,
                             )
                         {
-                            self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                            self.land_still_page_navigation_target(
+                                ctx,
+                                fs_idx,
+                                new_idx,
+                                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            );
                         }
                     }
                 }
@@ -26064,7 +26120,12 @@ impl App {
                                 accept_rendition,
                             )
                         {
-                            self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                            self.land_still_page_navigation_target(
+                                ctx,
+                                fs_idx,
+                                new_idx,
+                                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            );
                         }
                     }
                 } else {
@@ -27876,9 +27937,7 @@ impl App {
             .collect::<Vec<_>>();
         for idx in stale_promotions {
             if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                pending.cancel();
             }
             self.fs_early_dims.remove(&idx);
         }
@@ -27901,9 +27960,7 @@ impl App {
             .collect::<Vec<_>>();
         for idx in to_cancel {
             if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                pending.cancel();
             }
             self.fs_early_dims.remove(&idx);
         }

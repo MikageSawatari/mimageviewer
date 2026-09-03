@@ -433,15 +433,43 @@ materialization 待ちの edit / final assembly は `None` を返し、未完成
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 
-`start_fs_load` はプールを持たない使い捨て `std::thread::spawn` なので、素朴に先読みを
-並列起動すると現在表示中の画像のデコードが先読みスレッドに CPU を奪われて遅延する。
-これを防ぐため `update_prefetch_window` は以下のルールで動く:
+`start_fs_load` はページごとに使い捨て worker を作るが、書庫読み出し・静止画デコード・
+アニメーション展開・PDF レンダの開始前に、App-global な
+`Arc<FsPageLoadScheduler>` から permit を取る。スケジューラは `Mutex + Condvar` と
+RAII permit で、プロセス全体を総枠 6、Normal は最大 4 に制限する。残り 2 枠は
+High (現在ページと表示中の見開き相方) 用で、表示判定は `App::page_is_displayed` に
+集約する。
 
-1. 現在画像が `fs_cache` に入っていない (デコード中) 間は、**他の全ての pending スレッドを
-   キャンセル**する (KEEP 範囲内でも)。現在画像が CPU を独占する。
-2. 同時に、先読みの新規 spawn も **延期**する。
-3. `poll_prefetch` が現在画像の完了を検出したら、再度 `update_prefetch_window` を呼び、
-   そこで初めて先読みが起動する。
+要求自体は viewer context ごとの `fs_pending` が `FsPageLoadTicket` を所有する。
+context の破棄、世代切り替え、書庫移動、close は既存の discard hook を通じて ticket を
+cancel する。待機中なら permit を取らずに消え、実行中なら `Cancelling` のまま実終了まで
+permit を保持する。cancel だけで枠を返さないため、取消済み worker を新規 worker が追い越して
+実行数を膨らませない。
+
+待機集合は `fs_pending` の ticket を映すだけで、別の要求所有キューを作らない。
+通常の先読みは context の有限な prefetch window、直接シークは後述の latest-only、
+順送りは既存の typed navigation sequence の受理境界で増加を止める。同じ idx の重複は
+`fs_pending` の map key で合流する。
+
+Normal の先読みが表示対象になった場合は同じ ticket を High に昇格し、待機順だけを変える。
+順送りは `Sequential` として受理済み target を supersede せず、シークバー / Home / End 等の
+直接移動は `LatestSeek` として同じ viewer の古い待機要求だけを開始前に落とす。実行中 worker
+への割り込みや固定待ち時間は足さない。
+
+cancel checkpoint は permit 取得直後、書庫読み出し完了後かつ decode 前、
+GIF / APNG / Animated WebP の各 frame 境界にある。PDFium と Susie IPC は開始後に
+中断可能であるように見せず、応答まで permit 内で待つ。待機数、実行数、取消中数、
+cancel から実終了までの時間は `fs.scheduler_*` perf event で観測できる。
+
+> ⚠️ **上限制御と重複したまま残っている旧規則がある。** `update_prefetch_window` は今も
+> 「現在ページが表示可能になるまで、他の pending を全部キャンセルする」を続けている
+> (`current_loading` の分岐)。これはスケジューラが無かった頃に、現在ページへ CPU を
+> 独占させるために置かれたもので、**High 予約枠と同じ目的を二重に果たしている**。
+> 残したままだと、高速ページ送り中は先読みが毎フレーム取り消されて Normal レーンが
+> 事実上使われず、「取消と再投入を繰り返さない」という設計方針
+> ([archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) §3.4) にも反する。
+> 撤去の可否は S1 の再計測後に判断する。**どちらか一方に寄せるまで、この節の記述は
+> 実装の一部しか説明していない。**
 
 ページ送りの unresolved rendition sequence 中も、worker の完成結果は同じ viewer context /
 `items_generation` の `fs_upload_backlog` に集約する。UI 側の admission は paint source に

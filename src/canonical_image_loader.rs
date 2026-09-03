@@ -8,8 +8,18 @@
 use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::Path;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
+use crate::fs_animation::{
+    AnimationDecodeResult, decode_apng_frames_cancellable,
+    decode_apng_frames_from_bytes_cancellable, decode_gif_frames_cancellable,
+    decode_gif_frames_from_bytes_cancellable, decode_webp_frames_cancellable,
+    decode_webp_frames_from_bytes_cancellable,
+};
+#[cfg(test)]
 use crate::fs_animation::{
     decode_apng_frames, decode_apng_frames_from_bytes, decode_gif_frames,
     decode_gif_frames_from_bytes, decode_webp_frames, decode_webp_frames_from_bytes,
@@ -32,6 +42,7 @@ pub enum CanonicalImageSource<'a> {
 pub struct CanonicalDecodeOptions<'a> {
     pub susie_priority: bool,
     pub susie_cancel: Option<&'a Arc<AtomicBool>>,
+    pub cancel: Option<&'a AtomicBool>,
     pub animation_policy: AnimationPolicy,
 }
 
@@ -40,6 +51,21 @@ impl CanonicalDecodeOptions<'_> {
         Self {
             susie_priority: true,
             susie_cancel: None,
+            cancel: None,
+            animation_policy,
+        }
+    }
+
+    pub fn fullscreen_cancellable(
+        animation_policy: AnimationPolicy,
+        cancel: &'_ Arc<AtomicBool>,
+    ) -> CanonicalDecodeOptions<'_> {
+        CanonicalDecodeOptions {
+            susie_priority: true,
+            // Susie IPC cannot be interrupted safely. Once entered, it must keep
+            // the scheduler permit until the reply arrives.
+            susie_cancel: None,
+            cancel: Some(cancel.as_ref()),
             animation_policy,
         }
     }
@@ -131,6 +157,13 @@ pub enum CanonicalImageDecode {
 pub enum CanonicalDecodeError {
     SourceRead(std::io::Error),
     Decode(DecodeChainFailure),
+    Cancelled(CanonicalCancelStage),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalCancelStage {
+    SourceReadComplete,
+    AnimationFrameBoundary,
 }
 
 /// 画像 → WIC → Susie の連鎖が全部失敗したときの内訳。
@@ -164,6 +197,7 @@ impl std::fmt::Display for CanonicalDecodeError {
         match self {
             Self::SourceRead(error) => write!(formatter, "source read failed: {error}"),
             Self::Decode(error) => write!(formatter, "image decode failed: {error}"),
+            Self::Cancelled(stage) => write!(formatter, "image decode cancelled at {stage:?}"),
         }
     }
 }
@@ -290,6 +324,14 @@ fn decode_canonical_image_with_fallbacks(
     fallbacks: &impl FallbackDecoder,
 ) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
     let source = ResolvedSource::resolve(source)?;
+    if options
+        .cancel
+        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    {
+        return Err(CanonicalDecodeError::Cancelled(
+            CanonicalCancelStage::SourceReadComplete,
+        ));
+    }
     let bytes = source.bytes.as_deref();
     let static_animation = if options.animation_policy == AnimationPolicy::FirstFrameOnly {
         probe_static_animation(&source)
@@ -299,40 +341,64 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "gif" {
         let frames = match bytes {
-            Some(bytes) => decode_gif_frames_from_bytes(bytes),
-            None => decode_gif_frames(source.path),
+            Some(bytes) => decode_gif_frames_from_bytes_cancellable(bytes, options.cancel),
+            None => decode_gif_frames_cancellable(source.path, options.cancel),
         };
-        if let Some(frames) = frames {
-            return Ok(CanonicalImageDecode::Animated {
-                format: CanonicalAnimatedFormat::Gif,
-                frames,
-            });
+        match frames {
+            AnimationDecodeResult::Frames(frames) => {
+                return Ok(CanonicalImageDecode::Animated {
+                    format: CanonicalAnimatedFormat::Gif,
+                    frames,
+                });
+            }
+            AnimationDecodeResult::Cancelled => {
+                return Err(CanonicalDecodeError::Cancelled(
+                    CanonicalCancelStage::AnimationFrameBoundary,
+                ));
+            }
+            AnimationDecodeResult::NotAnimatedOrFailed => {}
         }
     }
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "png" {
         let frames = match bytes {
-            Some(bytes) => decode_apng_frames_from_bytes(bytes),
-            None => decode_apng_frames(source.path),
+            Some(bytes) => decode_apng_frames_from_bytes_cancellable(bytes, options.cancel),
+            None => decode_apng_frames_cancellable(source.path, options.cancel),
         };
-        if let Some(frames) = frames {
-            return Ok(CanonicalImageDecode::Animated {
-                format: CanonicalAnimatedFormat::Apng,
-                frames,
-            });
+        match frames {
+            AnimationDecodeResult::Frames(frames) => {
+                return Ok(CanonicalImageDecode::Animated {
+                    format: CanonicalAnimatedFormat::Apng,
+                    frames,
+                });
+            }
+            AnimationDecodeResult::Cancelled => {
+                return Err(CanonicalDecodeError::Cancelled(
+                    CanonicalCancelStage::AnimationFrameBoundary,
+                ));
+            }
+            AnimationDecodeResult::NotAnimatedOrFailed => {}
         }
     }
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "webp" {
         let frames = match bytes {
-            Some(bytes) => decode_webp_frames_from_bytes(bytes),
-            None => decode_webp_frames(source.path),
+            Some(bytes) => decode_webp_frames_from_bytes_cancellable(bytes, options.cancel),
+            None => decode_webp_frames_cancellable(source.path, options.cancel),
         };
-        if let Some(frames) = frames {
-            return Ok(CanonicalImageDecode::Animated {
-                format: CanonicalAnimatedFormat::WebP,
-                frames,
-            });
+        match frames {
+            AnimationDecodeResult::Frames(frames) => {
+                return Ok(CanonicalImageDecode::Animated {
+                    format: CanonicalAnimatedFormat::WebP,
+                    frames,
+                });
+            }
+            AnimationDecodeResult::Cancelled => {
+                return Err(CanonicalDecodeError::Cancelled(
+                    CanonicalCancelStage::AnimationFrameBoundary,
+                ));
+            }
+            AnimationDecodeResult::NotAnimatedOrFailed => {}
         }
     }
 
@@ -1084,6 +1150,35 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn archive_read_completion_is_a_decode_cancel_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("book.zip");
+        let png = png_bytes(2, 2);
+        write_zip(&zip_path, &[("page.png", &png)]);
+        let cancel = AtomicBool::new(true);
+
+        let result = decode_canonical_image(
+            CanonicalImageSource::ArchiveEntry {
+                archive_path: &zip_path,
+                entry_name: "page.png",
+            },
+            CanonicalDecodeOptions {
+                susie_priority: true,
+                susie_cancel: None,
+                cancel: Some(&cancel),
+                animation_policy: AnimationPolicy::FullFrames,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(CanonicalDecodeError::Cancelled(
+                CanonicalCancelStage::SourceReadComplete
+            ))
+        ));
     }
 
     #[test]

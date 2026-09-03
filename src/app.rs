@@ -5327,6 +5327,9 @@ use crate::canonical_image_loader::{
     decode_canonical_image,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
+use crate::fs_page_load_scheduler::{
+    FsPageLoadContract, FsPageLoadPriority, FsPageLoadScheduler, FsPageLoadTicket,
+};
 use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
 
 const ANIMATION_EXPANSION_PROGRESS_DELAY: std::time::Duration =
@@ -5398,25 +5401,59 @@ pub(crate) fn animation_expansion_progress_visible(
 }
 
 pub(crate) struct FsPendingValue {
+    #[cfg(test)]
     pub(crate) cancel: Arc<AtomicBool>,
+    ticket: FsPageLoadTicket,
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
 }
 
 impl FsPendingValue {
+    fn scheduled(
+        ticket: FsPageLoadTicket,
+        rx: mpsc::Receiver<FsLoadResult>,
+        load_seq: u64,
+        purpose: FsLoadPurpose,
+    ) -> Self {
+        Self {
+            #[cfg(test)]
+            cancel: ticket.cancel_token(),
+            ticket,
+            rx,
+            load_seq,
+            purpose,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         cancel: Arc<AtomicBool>,
         rx: mpsc::Receiver<FsLoadResult>,
         load_seq: u64,
         purpose: FsLoadPurpose,
     ) -> Self {
-        Self {
+        let scheduler = FsPageLoadScheduler::new();
+        let ticket = scheduler.request_with_cancel_for_test(
+            0,
+            0,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
             cancel,
-            rx,
-            load_seq,
-            purpose,
-        }
+        );
+        Self::scheduled(ticket, rx, load_seq, purpose)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.ticket.cancel();
+    }
+
+    fn promote_to_high(&self, contract: FsPageLoadContract) -> bool {
+        self.ticket.promote_to_high(contract)
+    }
+
+    fn disarm_ticket(&mut self) {
+        self.ticket.disarm();
     }
 }
 
@@ -5495,7 +5532,7 @@ impl FsUploadResult {
 type FsUploadBacklog = ItemsGenerationVec<FsUploadResult>;
 
 fn cancel_fs_pending_value(value: &mut FsPendingValue) {
-    value.cancel.store(true, Ordering::Relaxed);
+    value.cancel();
 }
 
 fn fs_upload_backlog_idx(value: &FsUploadResult) -> usize {
@@ -10184,6 +10221,9 @@ pub struct App {
     pub(crate) content_identity_restore_pending:
         Option<content_identity_restore::ContentIdentityRestorePending>,
     pub(crate) content_identity_fallback_io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    /// Process-wide execution budget. Request ownership remains in each
+    /// viewer context's fs_pending map through FsPendingValue tickets.
+    fs_page_load_scheduler: Arc<FsPageLoadScheduler>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -13512,6 +13552,7 @@ impl App {
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
                 settings.indexer_speed_profile.io_permits().max(1),
             ));
+        let fs_page_load_scheduler = Arc::new(FsPageLoadScheduler::new());
         // DB open / schema 作成も含めて worker 内で行う。ここでは thread spawn のみ。
         let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
         // A2 の全件索引は検出設定が ON のときだけ別 worker で読む。A1 recorder は
@@ -13871,6 +13912,7 @@ impl App {
             content_restore_prompt: None,
             content_identity_restore_pending: None,
             content_identity_fallback_io_sem,
+            fs_page_load_scheduler,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
@@ -26802,7 +26844,7 @@ impl App {
 
         // in-flight pending (idx-keyed) をキャンセル
         for pending in self.fs_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
+            pending.cancel();
         }
         self.fs_pending.clear();
         for (cancel, _) in self.ai_upscale_pending.values() {
@@ -43552,9 +43594,7 @@ impl App {
                 self.fs_cache.remove(&selected);
                 self.fs_margin_bbox_cache.remove(&selected);
                 if let Some(pending) = self.fs_pending.remove(&selected) {
-                    pending
-                        .cancel
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    pending.cancel();
                 }
                 self.fs_upload_backlog.retain(|entry| entry.idx != selected);
             }
@@ -44190,6 +44230,21 @@ impl App {
         history_trigger: HistoryTrigger,
         requested_materialization: FsOpenMaterialization,
     ) {
+        self.open_fullscreen_with_materialization_and_contract(
+            idx,
+            history_trigger,
+            requested_materialization,
+            FsPageLoadContract::Sequential,
+        );
+    }
+
+    pub(crate) fn open_fullscreen_with_materialization_and_contract(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+    ) {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
@@ -44276,6 +44331,9 @@ impl App {
             self.fs_pdf_display_target = None;
         }
         self.fullscreen_idx = Some(idx);
+        if load_contract == FsPageLoadContract::LatestSeek {
+            self.apply_fs_page_load_contract(idx, load_contract);
+        }
         // 音声以外を開いたら音楽ビュー (Inc 3b/4) の状態を破棄する。フルスクリーン内で
         // 音声→画像/動画へ移動しても draw_fs_music_view は呼ばれず、放置すると旧音声の解析
         // ワーカー / 常駐 PCM / parked な spectrum worker が次の音声 open か close まで残る
@@ -44424,7 +44482,7 @@ impl App {
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
                 if materialization.admits_navigation_target_materialization() {
-                    let load_state = self.ensure_fs_page_load(idx);
+                    let load_state = self.ensure_fs_page_load_with_contract(idx, load_contract);
                     if load_state.is_display_ready() {
                         crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                     }
@@ -50916,11 +50974,20 @@ impl App {
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// 現在ページは全フレーム、先読みは全形式とも第1フレームだけを decode する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
-        let purpose = FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx));
-        self.start_fs_load_with_purpose(idx, purpose);
+        self.start_fs_load_with_contract(idx, FsPageLoadContract::Sequential);
     }
 
-    fn start_fs_load_with_purpose(&mut self, idx: usize, purpose: FsLoadPurpose) {
+    fn start_fs_load_with_contract(&mut self, idx: usize, contract: FsPageLoadContract) {
+        let purpose = FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx));
+        self.start_fs_load_with_purpose(idx, purpose, contract);
+    }
+
+    fn start_fs_load_with_purpose(
+        &mut self,
+        idx: usize,
+        purpose: FsLoadPurpose,
+        contract: FsPageLoadContract,
+    ) {
         // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
         // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
         // (docs/panorama-360-view-plan.md §4.6.0)。
@@ -51214,21 +51281,36 @@ impl App {
 
         // フルスクリーン現在ページ (ユーザーが待っているもの) は Critical、
         // それ以外 (先読み) は Normal。Critical はプールの予約ワーカーで即処理される。
-        let pdf_priority = if self.fullscreen_idx == Some(idx) {
+        let displayed = self.page_is_displayed_now(idx);
+        let scheduler_priority = if displayed {
+            FsPageLoadPriority::High
+        } else {
+            FsPageLoadPriority::Normal
+        };
+        let pdf_priority = if displayed {
             crate::pdf_loader::JobPriority::Critical
         } else {
             crate::pdf_loader::JobPriority::Normal
         };
         let pdf_context_epoch = Self::fs_pdf_render_context_epoch(pdf_priority);
 
-        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
         let pdf_ct_tx = self.pdf_content_type_tx.clone();
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
+        let ticket = self.fs_page_load_scheduler.request(
+            self.projected_viewer_context_id().serial(),
+            idx,
+            scheduler_priority,
+            contract,
+            perf_key.clone(),
+            perf_seq,
+        );
+        let cancel = ticket.cancel_token();
+        let waiter = ticket.waiter();
         self.fs_pending.insert(
             idx,
-            FsPendingValue::new(Arc::clone(&cancel), rx, perf_seq, purpose),
+            FsPendingValue::scheduled(ticket, rx, perf_seq, purpose),
         );
         // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
         // tee デコード判断を持ち込む (§3.6.2 / §4.6.0)。
@@ -51285,17 +51367,6 @@ impl App {
         let perf_key_worker = perf_key.clone();
 
         std::thread::spawn(move || {
-            // perf: スレッド起動直後の cancel 状態を記録し、早期終了した本数を把握する
-            let early_cancelled = cancel.load(Ordering::Relaxed);
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "fs",
-                    "cancel_check",
-                    perf_key_worker.as_deref(),
-                    perf_seq,
-                    &[("cancelled", serde_json::Value::from(early_cancelled))],
-                );
-            }
             // スレッド出口で reason を記録する小ヘルパー (全 return 直前に呼ぶ)
             let emit_exit = |reason: &'static str| {
                 if crate::perf::is_enabled() {
@@ -51308,8 +51379,13 @@ impl App {
                     );
                 }
             };
-            if early_cancelled {
-                emit_exit("early_cancel");
+            let Some(_permit) = waiter.acquire_cancellable() else {
+                emit_exit("cancel_before_acquire");
+                return;
+            };
+            // Checkpoint 1: cancellation can race with permit acquisition.
+            if cancel.load(Ordering::Relaxed) {
+                emit_exit("cancel_after_acquire");
                 return;
             }
             let verified_source_bytes = match relative_page_provenance.as_ref() {
@@ -51331,6 +51407,12 @@ impl App {
                 }
                 None => None,
             };
+            // Checkpoint 2 for verified relative-page source reads.
+            // Archive entry reads are checked inside decode_canonical_image.
+            if cancel.load(Ordering::Relaxed) {
+                emit_exit("cancel_after_source_read");
+                return;
+            }
             let t = std::time::Instant::now();
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -51385,7 +51467,9 @@ impl App {
                     viewport,
                     swap_page_axes,
                     pdf_password.as_deref(),
-                    Some(cancel.clone()),
+                    // PDFium cannot be interrupted once rendering begins. Keep
+                    // this scheduler permit until the IPC reply arrives.
+                    None,
                     pdf_priority,
                     pdf_context_epoch,
                     // フルスクリーンは fs_cache (memory) のみで永続 cache 無し。
@@ -51398,6 +51482,10 @@ impl App {
                         page_count: _,
                         page_size_points: _,
                     }) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            emit_exit("pdf_cancel_after_render");
+                            return;
+                        }
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
                             "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
@@ -51493,7 +51581,7 @@ impl App {
             };
             let canonical_decode = decode_canonical_image(
                 canonical_source,
-                CanonicalDecodeOptions::fullscreen(purpose.animation_policy()),
+                CanonicalDecodeOptions::fullscreen_cancellable(purpose.animation_policy(), &cancel),
             );
             if cancel.load(Ordering::Relaxed) {
                 emit_exit("cancel_after_decode");
@@ -51699,6 +51787,18 @@ impl App {
                     let _ = tx.send(FsLoadResult::Failed);
                     emit_exit("static_fail");
                 }
+                Err(CanonicalDecodeError::Cancelled(stage)) => {
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "decode_cancel",
+                            perf_key_worker.as_deref(),
+                            perf_seq,
+                            &[("stage", serde_json::Value::from(format!("{stage:?}")))],
+                        );
+                    }
+                    emit_exit("decode_cancelled");
+                }
             }
         });
     }
@@ -51852,7 +51952,7 @@ impl App {
             self.lookup_retained_pdf_page_raster(idx, target_px, "request_pdf_rerender")
         {
             if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending.cancel.store(true, Ordering::Relaxed);
+                pending.cancel();
             }
             self.enqueue_retained_pdf_page_raster_result(
                 idx,
@@ -51866,40 +51966,63 @@ impl App {
 
         // 進行中の再レンダリングがあればキャンセル
         if let Some(pending) = self.fs_pending.remove(&idx) {
-            pending.cancel.store(true, Ordering::Relaxed);
+            pending.cancel();
         }
 
-        // ワーカーに非同期リクエスト (UI スレッドをブロックしない)
-        let (cancel, render_rx) = crate::pdf_loader::render_page_async(
-            &pdf_path,
-            page_num,
-            target_px,
-            password.as_deref(),
-            priority,
-        );
-
-        // render_page_async は DynamicImage チャネルを返すが、fs_pending は
-        // FsLoadResult チャネルを期待するため、ブリッジスレッドで変換する
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
         let perf_seq = self.input_seq;
+        let perf_key = self.perf_item_key(idx);
+        let displayed = self.page_is_displayed_now(idx);
+        let scheduler_priority = if displayed {
+            FsPageLoadPriority::High
+        } else {
+            FsPageLoadPriority::Normal
+        };
+        let ticket = self.fs_page_load_scheduler.request(
+            self.projected_viewer_context_id().serial(),
+            idx,
+            scheduler_priority,
+            FsPageLoadContract::Sequential,
+            perf_key,
+            perf_seq,
+        );
+        let cancel = ticket.cancel_token();
+        let waiter = ticket.waiter();
         self.fs_pending.insert(
             idx,
-            FsPendingValue::new(
-                Arc::clone(&cancel),
-                fs_rx,
-                perf_seq,
-                FsLoadPurpose::for_page(true),
-            ),
+            FsPendingValue::scheduled(ticket, fs_rx, perf_seq, FsLoadPurpose::for_page(true)),
         );
 
         std::thread::spawn(move || {
-            match render_rx.recv() {
-                Ok(Ok(crate::pdf_loader::RenderResult {
+            let Some(_permit) = waiter.acquire_cancellable() else {
+                return;
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let job_priority = if priority {
+                crate::pdf_loader::JobPriority::Critical
+            } else {
+                crate::pdf_loader::JobPriority::Normal
+            };
+            match crate::pdf_loader::render_page(
+                &pdf_path,
+                page_num,
+                target_px,
+                password.as_deref(),
+                // PDFium render is non-interruptible once dispatched. The
+                // scheduler permit remains held until this call returns.
+                None,
+                job_priority,
+                Self::fs_pdf_render_context_epoch(job_priority),
+                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            ) {
+                Ok(crate::pdf_loader::RenderResult {
                     image: img,
                     content_type: _content_type,
                     page_count: _,
                     page_size_points: _,
-                })) => {
+                }) => {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -51921,13 +52044,11 @@ impl App {
                         animation: StaticAnimationState::Still,
                     });
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     crate::logger::log(format!("  pdf rerender FAIL: {e}"));
-                    let _ = fs_tx.send(FsLoadResult::Failed);
-                }
-                Err(_) => {
-                    crate::logger::log("  pdf rerender: cancelled (channel closed)".to_string());
-                    // キャンセル時は fs_tx を drop して poll_prefetch が Disconnected で除去
+                    if !cancel.load(Ordering::Relaxed) {
+                        let _ = fs_tx.send(FsLoadResult::Failed);
+                    }
                 }
             }
         });
@@ -51993,7 +52114,7 @@ impl App {
             .collect();
         for idx in stale_promotions {
             if let Some(pending) = self.fs_pending.remove(&idx) {
-                pending.cancel.store(true, Ordering::Relaxed);
+                pending.cancel();
             }
             self.fs_early_dims.remove(&idx);
         }
@@ -52032,7 +52153,7 @@ impl App {
             .collect();
         for k in to_cancel {
             if let Some(pending) = self.fs_pending.remove(&k) {
-                pending.cancel.store(true, Ordering::Relaxed);
+                pending.cancel();
             }
             // 先行 dims ヒントはキャンセルされた idx では意味がないので破棄。
             self.fs_early_dims.remove(&k);
@@ -52763,7 +52884,7 @@ impl App {
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches_for_session_close();
         for pending in self.fs_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
+            pending.cancel();
         }
         self.fs_pending.clear();
         self.fs_early_dims.clear();
@@ -58126,7 +58247,7 @@ impl App {
             target_idx: idx,
             started_at: std::time::Instant::now(),
         };
-        self.start_fs_load_with_purpose(idx, purpose);
+        self.start_fs_load_with_purpose(idx, purpose, FsPageLoadContract::Sequential);
         self.fs_pending
             .get(&idx)
             .is_some_and(|pending| pending.purpose == purpose)
@@ -58358,15 +58479,24 @@ impl App {
 
     /// 同じ typed state を入口ガードにも使い、必要なときだけ producer を起動する。
     pub(crate) fn ensure_fs_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        self.ensure_fs_page_load_with_contract(idx, FsPageLoadContract::Sequential)
+    }
+
+    pub(crate) fn ensure_fs_page_load_with_contract(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+    ) -> FsPageLoadState {
         // Every page that is about to be shown passes through here, which makes it the one place
         // that sees each page before the user does.
         self.verify_display_identity(idx);
         let state = self.fs_page_load_state(idx);
+        self.apply_fs_page_load_contract(idx, contract);
         if matches!(state, FsPageLoadState::DisplayReady(_)) {
             self.start_animation_promotion_if_needed(idx);
         }
         let state = if state.needs_load_request() {
-            self.start_fs_load(idx);
+            self.start_fs_load_with_contract(idx, contract);
             self.fs_page_load_state(idx)
         } else {
             self.note_fs_page_load_skipped(idx, state);
@@ -58376,6 +58506,18 @@ impl App {
             self.refresh_fullscreen_pdf_promotion();
         }
         state
+    }
+
+    fn apply_fs_page_load_contract(&mut self, idx: usize, contract: FsPageLoadContract) {
+        let promoted_waiting = self.page_is_displayed_now(idx)
+            && self
+                .fs_pending
+                .get(&idx)
+                .is_some_and(|pending| pending.promote_to_high(contract));
+        if contract == FsPageLoadContract::LatestSeek && !promoted_waiting {
+            self.fs_page_load_scheduler
+                .supersede_waiting_for_latest_seek(self.projected_viewer_context_id().serial());
+        }
     }
 
     /// Record that the page the user is looking at was considered already loaded.
@@ -65182,7 +65324,9 @@ impl App {
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for (key, purpose) in disconnected {
-            self.fs_pending.remove(&key);
+            if let Some(mut pending) = self.fs_pending.remove(&key) {
+                pending.disarm_ticket();
+            }
             self.fs_early_dims.remove(&key);
             if purpose.promotion_started_at_for(key).is_some() {
                 // **こちらが止めたものを「失敗」にしない。** `PromotionFailed` は再試行を
@@ -65197,7 +65341,9 @@ impl App {
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
         for (key, _, _, _, _) in &completed {
-            self.fs_pending.remove(key);
+            if let Some(mut pending) = self.fs_pending.remove(key) {
+                pending.disarm_ticket();
+            }
             self.fs_early_dims.remove(key);
         }
         // 既存 backlog の重複エントリ (同 idx で再ロードされたケース) は新しい方で置換。

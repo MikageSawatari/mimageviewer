@@ -1240,7 +1240,7 @@ impl ViewerContextBundle {
         }
 
         for pending in self.fs_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
+            pending.cancel();
         }
         if let Some(pending) = self.details_meta_pending.as_ref() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -1562,7 +1562,7 @@ impl App {
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
         for (_, pending) in self.fs_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
+            pending.cancel();
         }
         self.texture_backlog.clear();
         for pending in self.final_ai_pending.values() {

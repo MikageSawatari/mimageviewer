@@ -1459,6 +1459,43 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-04 バックログ §1.174 (書庫の高速ページ送りが詰まる) で、フルスクリーンの
+ページ読み込みにプロセス共通の受付上限を入れた (正本:
+[archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md)。実装 = Codex、
+検収 = ClaudeCode。双方が「症状パッチではなく構造的修正である」ことに合意済み):**
+
+**触った範囲**: [src/fs_page_load_scheduler.rs](../src/fs_page_load_scheduler.rs) を新設。
+[src/app.rs](../src/app.rs) の `FsPendingValue` が生の `Arc<AtomicBool>` の代わりに
+`FsPageLoadTicket` を持ち、`start_fs_load_with_purpose` と PDF 再レンダの worker が
+permit を取ってから読み出す。[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs)
+は既存の `fs_pending` 破棄フック (`cancel_fs_pending_value`) をチケット取消へ繋いだだけ。
+[src/ui_fullscreen.rs](../src/ui_fullscreen.rs) は順送りと直接シークの契約型を渡す経路のみ。
+**detached 述語、viewport lifecycle、window binding、placement、session 遷移には触れていない。**
+App に detached 用の新しい `bool` / `Option` は足していない (憲法 3)。
+
+**判断理由**: 先読み窓は 17 件のつもりで cancel も出していたが、cancel の確認がデコード後に
+しかないため、**実際に走っている数は最大 51 件 (3 倍)** になっていた。件数の上限が意味を
+持つのは「取消済みでも worker が実際に終わるまで枠を占有する」ときだけなので、
+repaint・遅延・再試行・固定待ち時間ではなく、**I/O とデコードの手前の受付境界**に上限を
+置いた。時間窓は使っていない (憲法 5)。
+
+**bundle と App-global の境界 (BA-7)**: 予算は機械に 1 つしかない資源 (CPU / I/O /
+展開メモリ) なので App-global に 1 インスタンス。要求の所有は従来どおり各 context の
+`fs_pending` に残し、**チケットを `FsPendingValue` の RAII に載せた**ので、context の
+retire / close / 世代切り替えは既存経路を通るだけで取消になる。撤収経路を増やしていない。
+片方の context の cancel が別窓の有効な要求を消さないことをテストで固定した。
+
+**検収で 1 件差し戻した**: `acquire_cancellable` が Waiting → Running の遷移で
+`notify_all` を呼んでおらず、**一度 park した待機者が、枠が空いていても次の permit 返却まで
+起きない**状態だった (実効同時数が 1 に潰れる)。Codex 側で緑だった予算テストも、こちらでは
+同時にタイムアウトしており、タイミング依存で通っていただけと分かった。遷移直後の
+`notify_all` を足し、park 済みの待機者が起きることを固定する回帰テスト
+(`parked_waiter_wakes_when_the_head_starts_running`) を追加した。
+
+**残っている穴**: `update_prefetch_window` の「現在ページがロード中なら他の pending を
+全部キャンセルする」規則 ([async-architecture.md](async-architecture.md) §3.3) が、
+上限制御と**同じ目的で二重に存在している**。撤去の可否は S1 の再計測後に判断する。
+
 **2026-09-03 v3.5.0 レビュー U01 で、補正 Undo の復元先解決を Undo / Redo 1 回あたり
 1 パスへまとめた (Codex が findings.md round7 で「復元側で同じ一覧をページごとに走査しない
 構造にする」と修正境界を指定し、ClaudeCode が実装。T01 の識別子方針は維持したまま、

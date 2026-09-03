@@ -100,6 +100,7 @@ pub mod folder_tree;
 pub mod font_assets;
 pub mod fs_animation;
 pub mod fs_entry;
+mod fs_page_load_scheduler;
 pub mod fts_index;
 pub mod fts_meta;
 pub mod fts_writer_dispatcher;
