@@ -5756,7 +5756,7 @@ pub(crate) mod phase_c_support {
                 std::time::Instant::now() < deadline,
                 "フォルダー再走査が返らない"
             );
-            app.poll_external_rescan();
+            app.poll_external_rescan(&egui::Context::default());
         }
     }
 
@@ -25815,6 +25815,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn reloading_the_folder_re_enumerates_extensions_already_in_the_cache() {
         use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
@@ -25830,7 +25831,49 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。
+    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。
+    ///
+    /// 1 バッチの上限で打ち切っていたので、9 種類目以降はフォルダーを開き直しても更新
+    /// されず、一度覚えた古い候補や失敗して覚えた空が終了まで残った (v3.5.0 レビュー N05)。
+    #[test]
+    fn every_extension_in_the_folder_eventually_gets_re_enumerated() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let extensions = [
+            "jpg", "png", "gif", "bmp", "tif", "avif", "heic", "jxl", "webp", "jpeg",
+        ];
+        for extension in extensions {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/trip/a.{extension}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+
+        // 1 バッチ目。
+        app.poll_association_handler_prewarm();
+        assert!(app.association_prewarm.is_some());
+        let after_first = app.association_prewarm_queue.len();
+        assert!(
+            after_first > 0,
+            "1 バッチで全部は処理しない (打ち切らずに残す)"
+        );
+
+        // 実行中は次のバッチを始めない。
+        app.poll_association_handler_prewarm();
+        assert_eq!(app.association_prewarm_queue.len(), after_first);
+
+        // 完了させて続きへ。最終的に全部が処理される。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !app.association_prewarm_queue.is_empty() || app.association_prewarm.is_some() {
+            assert!(std::time::Instant::now() < deadline, "列挙が終わらない");
+            app.poll_association_handler_prewarm();
+        }
+
+        assert!(app.association_prewarm_queue.is_empty());
+    }
+
+    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。
     #[test]
     fn the_association_prewarm_runs_once_per_folder_load() {
         use crate::grid_item::GridItem;
@@ -35324,6 +35367,7 @@ mod pipeline_cache_refactor_tests {
     /// 差し替わることを見る。
     #[test]
     fn a_watch_notification_rescans_off_the_ui_thread() {
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let folder = app.tmp.path().join("notified_rescan");
         std::fs::create_dir_all(&folder).unwrap();
@@ -35337,7 +35381,7 @@ mod pipeline_cache_refactor_tests {
         app.thumbnails = vec![ThumbnailState::Pending];
 
         std::fs::write(folder.join("b.png"), b"new").unwrap();
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
 
         assert!(
             app.external_rescan_pending.is_some(),
@@ -35366,6 +35410,7 @@ mod pipeline_cache_refactor_tests {
     /// 拾えない (v3.5.0 レビュー R02)。
     #[test]
     fn a_notification_during_a_rescan_is_kept_and_rerun_after_it() {
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let folder = app.tmp.path().join("rescan_restart");
         std::fs::create_dir_all(&folder).unwrap();
@@ -35378,12 +35423,12 @@ mod pipeline_cache_refactor_tests {
         app.items = vec![GridItem::Image(first_image.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
 
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
         assert!(app.external_rescan_pending.is_some());
 
         // 走査の最中に次の変更が届く。
         std::fs::write(folder.join("b.png"), b"new").unwrap();
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
         assert!(
             app.external_rescan_pending
                 .as_ref()
@@ -35401,12 +35446,57 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。
+    /// 走査が終わったら**画面を起こす**。
+    ///
+    /// 監視イベントは UI を起こすが、その起床で走査を始めた時点で次の予約は無くなる。
+    /// worker は結果を channel へ送るだけで再描画を要求していなかったので、静止した
+    /// グリッドでは次の入力まで結果が取り込まれない (v3.5.0 レビュー N04)。
+    #[test]
+    fn finishing_a_rescan_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rescan_wake");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.png"), b"old").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(0);
+
+        // 先に画面を静止させる。起床要求が残っていると、この検査が意味を失う。
+        for _ in 0..8 {
+            if !ctx.has_requested_repaint() {
+                break;
+            }
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        assert!(!ctx.has_requested_repaint(), "ここでは静止している");
+
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
+        let pending = app
+            .external_rescan_pending
+            .as_ref()
+            .expect("走査が始まっている");
+
+        // **起床そのものを待つ。** 眠っている UI は poll できないので、起きるかどうかが
+        // 唯一の観測点になる。送信は起床より前なので、起きたフレームの poll は必ず拾う。
+        let _ = &pending;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ctx.has_requested_repaint() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "完了が次のフレームを起こさない (入力まで取り込まれない)"
+            );
+        }
+    }
+
+    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。
     ///
     /// path 一致だけでは A→B→A を区別できず、新しい一覧へ古い結果を被せる
     /// (v3.5.0 レビュー R03)。
     #[test]
     fn a_rescan_that_finishes_after_the_list_changed_is_discarded() {
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let folder = app.tmp.path().join("rescan_stale");
         std::fs::create_dir_all(&folder).unwrap();
@@ -35418,7 +35508,7 @@ mod pipeline_cache_refactor_tests {
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
         assert!(app.external_rescan_pending.is_some());
 
         // 走査中に一覧が入れ替わった (別フォルダーへ行って戻った等)。
@@ -35440,6 +35530,7 @@ mod pipeline_cache_refactor_tests {
     /// 要求側にしか削除中の判定が無く、非同期化でその制約が完了側から外れていた (R03)。
     #[test]
     fn a_rescan_that_finishes_during_a_delete_is_discarded() {
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let folder = app.tmp.path().join("rescan_delete");
         std::fs::create_dir_all(&folder).unwrap();
@@ -35451,7 +35542,7 @@ mod pipeline_cache_refactor_tests {
         app.items = Vec::new();
         app.thumbnails = Vec::new();
 
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
         assert!(app.external_rescan_pending.is_some());
 
         let (_delete_tx, delete_rx) = std::sync::mpsc::channel();
@@ -35472,6 +35563,7 @@ mod pipeline_cache_refactor_tests {
 
     #[test]
     fn external_folder_change_clears_retained_final_ai_cache() {
+        let ctx = egui::Context::default();
         let mut app = setup_app();
         let folder = app.tmp.path().join("external_refresh");
         std::fs::create_dir_all(&folder).unwrap();
@@ -35511,7 +35603,7 @@ mod pipeline_cache_refactor_tests {
         );
 
         std::fs::write(folder.join("b.png"), b"new").unwrap();
-        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Resumed);
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Resumed);
         // 走査は worker に出る。結果が着くまで poll する (UI スレッドで読まない、F14)。
         crate::app::tests::phase_c_support::wait_for_external_rescan(&mut app);
 
@@ -65413,7 +65505,40 @@ mod rating_write_failure_tests {
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
     }
 
-    /// パッドが切れても、リングで付けた評価は**取り消せる**。
+    /// パッドが切れたときのリング確定は、**sample の中でやらない**。
+    ///
+    /// sample は root 投影で走る。リングのフォルダ評価は mount 中の context の保存先へ書く
+    /// ので、root のまま確定すると別ウィンドウで変えた評価がメイン側のフォルダへ書かれ、
+    /// Undo も別フォルダ宛てに積まれる (v3.5.0 レビュー N01)。物理側の保持解除だけを
+    /// sample が行い、確定は通常の配送と同じ場所へ回す。
+    #[test]
+    fn the_pad_teardown_leaves_the_ring_commit_to_the_normal_dispatch() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.gamepad_enabled = true;
+        app.ring_picker =
+            Some(app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid));
+        // 保持中の入力も作っておく (物理側は sample で終わること)。
+        app.gamepad
+            .push_for_test(crate::gamepad::PadEvent::AxisChanged(
+                crate::gamepad::PadAxis::LeftX,
+                0.9,
+            ));
+        let _ = app.sample_gamepad_input(&ctx);
+        assert!(!app.gamepad_state.is_idle());
+
+        app.settings.gamepad_enabled = false;
+        let batch = app.sample_gamepad_input(&ctx);
+
+        assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
+        assert!(app.gamepad_state.is_idle(), "物理側は sample が終わらせる");
+        assert!(
+            app.ring_picker.is_some(),
+            "編集の確定は sample の中でやらない"
+        );
+    }
+
+    /// パッドが切れても、リングで付けた評価は**取り消せる**。    /// パッドが切れても、リングで付けた評価は**取り消せる**。
     ///
     /// 評価行はプレビューの時点で DB へ書いており、開いたときの before から Undo を組むのは
     /// 通常の確定処理だけ。切断で overlay を捨てるようにしたとき、その確定を通していな
@@ -65447,9 +65572,15 @@ mod rating_write_failure_tests {
         assert!(app.set_rating_result(0, 4).unwrap());
         assert_eq!(app.meta_undo.undo_len(), 0);
 
-        // パッドが切れる (= 設定 OFF と同じ終端)。
+        // パッドが切れる (= 設定 OFF と同じ終端)。sample は物理側だけを終わらせ、
+        // リングの確定は通常の配送が所有 context で行う (N01)。
         app.settings.gamepad_enabled = false;
-        let _ = app.sample_gamepad_input(&ctx);
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(
+            app.ring_picker.is_some(),
+            "sample はリングを確定しない (root 投影のため)"
+        );
+        let _ = app.dispatch_gamepad_batch(&ctx, batch);
 
         assert!(app.ring_picker.is_none(), "overlay は閉じる");
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4, "評価は残る");

@@ -11823,8 +11823,13 @@ pub struct App {
     /// 走らせ中の関連付け列挙 (拡張子ごと)。
     pub(crate) association_prewarm:
         Option<mpsc::Receiver<Vec<(String, Vec<crate::open_with::AppHandler>)>>>,
-    /// 直近で列挙を始めた items 世代。フォルダーを読み込むたびに 1 回だけ走らせる。
+    /// 直近で列挙対象を並べた items 世代。フォルダーを読み込むたびに 1 回だけ並べ直す。
     pub(crate) association_prewarm_generation: Option<u64>,
+    /// まだ列挙していない拡張子。**1 バッチの上限で打ち切らず、残りを後続で処理する。**
+    ///
+    /// 先頭 8 件で止めていたので、9 種類目以降はフォルダーを開き直しても更新されず、一度
+    /// 覚えた古い候補 (や、失敗して覚えた空) が終了まで残った (v3.5.0 レビュー N05)。
+    pub(crate) association_prewarm_queue: std::collections::VecDeque<String>,
     /// 外部ツールの process spawn を UI スレッド外で行う、操作単位の短命 worker。
     /// `Each` の複数結果は各 pending 内で集約し、別々の利用者操作はこの Vec で並行保持する。
     pub(crate) external_tool_launch_pending: Vec<crate::external_tool::ExternalLaunchPending>,
@@ -14436,6 +14441,7 @@ impl App {
             cached_handlers: std::collections::HashMap::new(),
             association_prewarm: None,
             association_prewarm_generation: None,
+            association_prewarm_queue: std::collections::VecDeque::new(),
             external_tool_launch_pending: Vec::new(),
             external_tool_materializer: crate::materializer::Materializer::new(),
             external_tool_materialize_pending: Vec::new(),
@@ -17766,7 +17772,7 @@ impl App {
             ctx.request_repaint_after(delay);
         }
         if should_check {
-            self.check_external_folder_changes(ExternalChangeCheck::Notified);
+            self.check_external_folder_changes(ctx, ExternalChangeCheck::Notified);
         }
     }
 
@@ -17920,7 +17926,11 @@ impl App {
     ///
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
     /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
-    pub(crate) fn check_external_folder_changes(&mut self, reason: ExternalChangeCheck) {
+    pub(crate) fn check_external_folder_changes(
+        &mut self,
+        ctx: &egui::Context,
+        reason: ExternalChangeCheck,
+    ) {
         if self.global_search.active || self.tag_view.active {
             return;
         }
@@ -17960,11 +17970,16 @@ impl App {
             }
         }
         // 走査は worker に出す。**UI スレッドで read_dir + 全件分類をしない** (F14)。
-        self.start_external_rescan(folder, new_mtime);
+        self.start_external_rescan(ctx, folder, new_mtime);
     }
 
     /// フォルダー再走査を worker へ出す。同じフォルダーの走査が既に走っていれば足さない。
-    fn start_external_rescan(&mut self, folder: PathBuf, new_mtime: std::time::SystemTime) {
+    fn start_external_rescan(
+        &mut self,
+        ctx: &egui::Context,
+        folder: PathBuf,
+        new_mtime: std::time::SystemTime,
+    ) {
         let scan_options = ExternalRescanOptions {
             include_convertible_archives: !self
                 .settings
@@ -17991,6 +18006,10 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_folder = folder.clone();
+        // **完了したら画面を起こす。** 監視イベントは UI を起こすが、その起床で走査を
+        // 始めた時点で次の予約は無くなる。静止したグリッドでは、結果が最後のフレームの
+        // poll に間に合わないと、次の入力まで取り込まれない (v3.5.0 レビュー N04)。
+        let repaint = ctx.clone();
         let (tx, rx) = mpsc::channel();
         if std::thread::Builder::new()
             .name("external-folder-rescan".to_string())
@@ -18006,7 +18025,9 @@ impl App {
                     show_hidden_files,
                 )
                 .ok();
+                // 送ってから起こす。起きたフレームの poll が必ず受け取れる順序。
                 let _ = tx.send(scan);
+                repaint.request_repaint();
             })
             .is_err()
         {
@@ -18025,7 +18046,7 @@ impl App {
     }
 
     /// 走査結果を、**要求を出した viewer context** へ適用する。
-    pub(crate) fn poll_external_rescan(&mut self) {
+    pub(crate) fn poll_external_rescan(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.external_rescan_pending.as_ref() else {
             return;
         };
@@ -18051,9 +18072,9 @@ impl App {
         } = pending;
 
         // 走査中に届いていた変更は、結果を適用したかどうかに関係なくやり直す (R02)。
-        let restart = |app: &mut Self| {
+        let restart = |app: &mut Self, ctx: &egui::Context| {
             if restart_requested {
-                app.start_external_rescan(folder.clone(), mtime);
+                app.start_external_rescan(ctx, folder.clone(), mtime);
             }
         };
 
@@ -18081,13 +18102,13 @@ impl App {
                 "external_rescan: dropped ({reason}) owner={owner_context_id:?} folder={}                  restart={restart_requested}",
                 folder.display()
             ));
-            restart(self);
+            restart(self, ctx);
             return;
         }
         let _ = scan_options;
         let scan = scan.expect("checked above");
         self.apply_external_rescan(folder.clone(), mtime, scan);
-        restart(self);
+        restart(self, ctx);
     }
 
     /// 走査結果の適用。所有 context を mount した状態で呼ぶこと。
@@ -53072,37 +53093,41 @@ impl App {
             }
             return;
         }
-        if self.association_prewarm_generation == Some(self.items_generation) {
-            return;
-        }
-        self.association_prewarm_generation = Some(self.items_generation);
-        // 拡張子の抽出は名前を見るだけ。read_dir も stat もしない。
-        let mut extensions: Vec<String> = Vec::new();
-        for item in &self.items {
-            let Some(extension) = crate::external_tool::LaunchTarget::from_grid_item(Some(item))
-                .real_file()
-                .ok()
-                .and_then(std::path::Path::extension)
-                .and_then(|extension| extension.to_str())
-                .map(|extension| format!(".{}", extension.to_lowercase()))
-            else {
-                continue;
-            };
+        if self.association_prewarm_generation != Some(self.items_generation) {
+            self.association_prewarm_generation = Some(self.items_generation);
+            // 拡張子の抽出は名前を見るだけ。read_dir も stat もしない。
+            //
             // **既に覚えている拡張子も並べ直す。** これが唯一の更新契機で、飛ばすと
             // アプリの追加 / 削除や関連付けの変更が終了まで反映されず、一時的な失敗で
             // 空を覚えた場合も直らない (v3.5.0 レビュー R13)。
-            if extensions.contains(&extension) {
-                continue;
+            let mut extensions: Vec<String> = Vec::new();
+            for item in &self.items {
+                let Some(extension) =
+                    crate::external_tool::LaunchTarget::from_grid_item(Some(item))
+                        .real_file()
+                        .ok()
+                        .and_then(std::path::Path::extension)
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| format!(".{}", extension.to_lowercase()))
+                else {
+                    continue;
+                };
+                if extensions.contains(&extension) {
+                    continue;
+                }
+                extensions.push(extension);
             }
-            extensions.push(extension);
-            // 1 フォルダに何十種類も混ざることは無い。上限は暴走よけ。
-            if extensions.len() >= 8 {
-                break;
-            }
+            self.association_prewarm_queue = extensions.into();
         }
-        if extensions.is_empty() {
+        if self.association_prewarm_queue.is_empty() {
             return;
         }
+        // 1 バッチの件数。**残りは次の poll で続ける** — ここで打ち切ると、その先の拡張子は
+        // どのフォルダーを開いても更新されない (レビュー N05)。
+        const PREWARM_BATCH: usize = 8;
+        let extensions: Vec<String> = (0..PREWARM_BATCH)
+            .filter_map(|_| self.association_prewarm_queue.pop_front())
+            .collect();
         let (tx, rx) = mpsc::channel();
         if std::thread::Builder::new()
             .name("association-handler-prewarm".to_string())
@@ -67411,11 +67436,11 @@ impl App {
         // 全ユーザで動かす。
         let main_focused_now = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if main_focused_now && !self.last_main_focused && self.window_visible {
-            self.check_external_folder_changes(ExternalChangeCheck::Resumed);
+            self.check_external_folder_changes(ctx, ExternalChangeCheck::Resumed);
         }
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
-        self.poll_external_rescan();
+        self.poll_external_rescan(ctx);
         self.poll_association_handler_prewarm();
 
         // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。

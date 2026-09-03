@@ -754,13 +754,12 @@ impl MaterializeSession {
             },
             preset: context.conceal_preset.clone(),
         });
-        // AI 段。**通す気があるのに runtime を用意できなければ失敗にする** — AI 抜きの絵は
-        // 寸法から別物なので、黙って落として成功と言ってはならない (レビュー R14)。
+        // AI 段。runtime を用意できなくても**ここでは失敗にしない** — 寸法が対象外で AI を
+        // 通さないページまで書き出せなくなる (レビュー N03)。実際に通すと決まった時点で
+        // runner が失敗にする (レビュー R14)。
         let ai = match ai_materials {
             Some(materials) => {
-                let runtime = self
-                    .resolve_worker_ai_runtime(context)
-                    .ok_or_else(crate::books::ai_runtime_unavailable_error)?;
+                let runtime = self.resolve_worker_ai_runtime(context);
                 Some(crate::books::book_ai_snapshot(
                     materials,
                     runtime,

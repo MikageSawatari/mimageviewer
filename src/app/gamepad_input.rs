@@ -39,15 +39,26 @@ pub(crate) struct GamepadFrameBatch {
     now: Instant,
     actions: Vec<PadAction>,
     saw_input_event: bool,
+    /// この frame でパッド入力の区切りが来た (無効化 / 切断)。
+    ///
+    /// 物理側の保持解除は sample が済ませている。**残っているのは所有 context で確定
+    /// すべき編集** — リングのプレビュー評価がそれ (v3.5.0 レビュー N01)。
+    session_ended: bool,
 }
 
 impl GamepadFrameBatch {
-    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
+    #[cfg(test)]
+    pub(crate) fn session_ended_for_test(&self) -> bool {
+        self.session_ended
+    }
+
+    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
             now: Instant::now(),
             actions: Vec::new(),
+            session_ended: false,
             saw_input_event: false,
         }
     }
@@ -2290,15 +2301,17 @@ impl App {
         // 設定を OFF にすると、移動やズームと再描画が止まらなくなる (v3.5.0 レビュー F06)。
         // パッドでしか閉じられない操作 UI も、同じ遷移でここで終わらせる。
         if !enabled {
-            self.end_gamepad_input_session(ctx);
+            self.release_gamepad_input_holds(ctx);
             return GamepadFrameBatch {
                 now,
                 actions: Vec::new(),
                 saw_input_event: false,
+                session_ended: true,
             };
         }
         let mut actions = Vec::new();
         let mut saw_input_event = false;
+        let mut session_ended = false;
 
         for event in events {
             match event {
@@ -2331,7 +2344,8 @@ impl App {
                     saw_input_event = true;
                     // 握ったまま切断すると保持状態が残りリピート/アナログが止まらない。
                     // 設定 OFF と同じ終端を通す。
-                    self.end_gamepad_input_session(ctx);
+                    session_ended = true;
+                    self.release_gamepad_input_holds(ctx);
                 }
             }
         }
@@ -2350,6 +2364,7 @@ impl App {
             now,
             actions,
             saw_input_event,
+            session_ended,
         }
     }
 
@@ -2366,7 +2381,17 @@ impl App {
             now,
             actions,
             saw_input_event,
+            session_ended,
         } = batch;
+        // **リングの確定は所有 context で。** ここは通常の配送と同じ場所で、別ウィンドウが
+        // 活性なら mount 済み。評価行はプレビューの時点で DB へ書いており、開いたときの
+        // before から Undo を組むのは確定処理だけなので、捨てると書いた評価が取り消せなく
+        // なる (レビュー R12)。root で確定すると保存先を間違える (レビュー N01)。
+        //
+        // `dispatch_allowed` より前に置く。パッドはもう無いので、抑止する相手がいない。
+        if session_ended {
+            self.commit_ring_picker(ctx);
+        }
         let dispatch_allowed = self.gamepad_dispatch_allowed(ctx);
         let mut nav = None;
         let mut dispatched = false;
@@ -3497,22 +3522,22 @@ impl App {
         })
     }
 
-    /// パッド入力が終わったときの終端処理。**無効化と物理切断の共通の出口。**
+    /// パッド入力が終わったときの**物理側**の終端。無効化と切断の共通の出口。
     ///
     /// 保持中のボタン / 軸 / リピート予約を落とし、パッドでしか閉じられない overlay を
     /// 閉じる。何も残っていなければ何もしない (毎フレーム呼ばれるので再描画も要求しない)。
-    fn end_gamepad_input_session(&mut self, ctx: &egui::Context) {
-        let had_overlay = self.ring_picker.is_some()
-            || self.gamepad_favorite_picker.is_some()
+    ///
+    /// **リングの確定はここでやらない。** ここは sample の中 = root 投影で走るが、リングの
+    /// 確定はフォルダ評価のように**所有 context の保存先**へ書く。root のまま確定すると、
+    /// 別ウィンドウで変えた評価がメイン側のフォルダへ書かれる (v3.5.0 レビュー N01)。
+    /// 確定は通常の配送と同じ経路 ([`Self::dispatch_gamepad_batch`]) が担う。
+    fn release_gamepad_input_holds(&mut self, ctx: &egui::Context) {
+        let had_overlay = self.gamepad_favorite_picker.is_some()
             || self.gamepad_location_picker.is_some()
             || self.gamepad_video_marker_picker.is_some();
-        if !had_overlay && self.gamepad_state.is_idle() {
+        if !had_overlay && self.ring_picker.is_none() && self.gamepad_state.is_idle() {
             return;
         }
-        // **リングは捨てずに通常の確定を通す。** 評価行はプレビューの時点で DB へ書いて
-        // おり、開いたときの before から Undo を組むのは確定処理だけ。捨てると、書いた
-        // 評価だけが残って取り消せなくなる (v3.5.0 レビュー R12)。
-        self.commit_ring_picker(ctx);
         self.gamepad_state.clear();
         if had_overlay {
             self.gamepad_favorite_picker = None;

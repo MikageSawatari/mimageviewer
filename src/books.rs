@@ -347,9 +347,13 @@ pub fn ai_runtime_unavailable_error() -> String {
 /// このページが AI を要求していない (モデル未選択 / 機能 OFF / 寸法が対象外) なら、runner は
 /// 入力をそのまま返す。**そこで失敗にしない** — 段は「ここまで焼く」であって「必ず AI を
 /// 通す」ではない。
+///
+/// `runtime` が `None` = 用意できなかった。**その場でエラーにしない。** 実際にモデルが
+/// 選ばれるかは合成途中の画素の寸法に依るので、対象外の画像まで書き出せなくなる
+/// (v3.5.0 レビュー N03)。選ばれたときにだけ失敗にする。
 pub fn book_ai_snapshot(
     materials: BookAiMaterials,
-    runtime: Arc<crate::ai::runtime::AiRuntime>,
+    runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
     params: crate::adjustment::AdjustParams,
 ) -> BookAiSnapshot {
     let run: BookAiRunner = Box::new(move |image, cancel| {
@@ -366,6 +370,11 @@ pub fn book_ai_snapshot(
                 used_upscale: false,
             });
         };
+        // ここまで来た = このページはこの寸法で本当に AI を通す。用意できていなければ
+        // 失敗にする (AI 抜きの絵は寸法から別物なので、黙って落とさない)。
+        let Some(runtime) = runtime.as_ref() else {
+            return Err(ai_runtime_unavailable_error());
+        };
         let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
             source: Arc::new(image.clone()),
             // 色調補正は `compose_book_page` がこの直前で済ませている。
@@ -375,7 +384,7 @@ pub fn book_ai_snapshot(
             background_mode: materials.policy.transparent_bg_mode,
         };
         match crate::ai::final_pipeline::execute_selected_final_ai(
-            &runtime,
+            runtime,
             &materials.manager,
             request,
             cancel,
@@ -2483,6 +2492,43 @@ mod tests {
             "拡大後の中心 (16,16) に注釈がある"
         );
         assert!(!painted(&composed, 6, 6), "元の枠の外 (6,6) には残らない");
+    }
+
+    /// runtime が無くても、**AI を通さない画像は書き出せる**。
+    ///
+    /// 「AI を通す気があるか」は寸法を見ない (見ると「対象外だから無処理」と「壊れている」が
+    /// 同じ答えになる)。そのぶん runner まで来てから寸法で決まるので、runtime が無いことを
+    /// その手前で失敗にすると、上限を超えた画像まで書き出せなくなる (v3.5.0 レビュー N03)。
+    #[test]
+    fn a_missing_runtime_only_fails_the_images_that_actually_take_the_ai_path() {
+        let mut wants = crate::adjustment::AdjustParams::default();
+        wants.upscale_model = Some("auto".to_string());
+        let materials = BookAiMaterials {
+            manager: Arc::new(crate::ai::model_manager::ModelManager::new()),
+            policy: BookAiPolicy {
+                feature_mode: crate::settings::AiFeatureMode::HighQuality,
+                // 2048x2048 未満だけが対象。
+                upscale_limit: crate::ai::upscale::AiProcessSizeLimit::square(2048),
+                denoise_limit: crate::ai::upscale::AiProcessSizeLimit::square(2048),
+                transparent_bg_mode: 0,
+            },
+        };
+        let snapshot = book_ai_snapshot(materials, None, wants);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 上限外。AI を通さないので、runtime が無くてもそのまま返す。
+        let big = egui::ColorImage::new([4096, 4], vec![egui::Color32::BLACK; 4096 * 4]);
+        let passed_through = (snapshot.run)(&big, &cancel).expect("対象外は無処理で成功");
+        assert_eq!(passed_through.image.size, [4096, 4]);
+        assert!(!passed_through.used_upscale);
+
+        // 上限内。ここで初めて runtime が要る。
+        let small = egui::ColorImage::new([16, 16], vec![egui::Color32::BLACK; 256]);
+        let error = match (snapshot.run)(&small, &cancel) {
+            Ok(_) => panic!("対象なら失敗にする"),
+            Err(error) => error,
+        };
+        assert!(error.contains("AI"), "{error}");
     }
 
     /// 「AI を通す気があるか」は段・モデル選択・機能 ON/OFF で決まり、**寸法では決まらない**。    /// 「AI を通す気があるか」は段・モデル選択・機能 ON/OFF で決まり、**寸法では決まらない**。

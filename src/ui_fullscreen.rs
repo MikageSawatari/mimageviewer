@@ -4338,6 +4338,77 @@ fn fs_image_paint_rect_and_uv(
     }
 }
 
+/// unit 内の各ページを、**可視領域の左上を原点とした位置**へ置く。
+///
+/// 配置と長さの唯一の答え。描画も段の間隔もここが返す値を見る。
+///
+/// **置く前の中間値を長さに使わない。** 見開きのように上端と下端を別のページが決める
+/// 並びでは、ページごとの相対位置を寄せた結果と、寄せる前の union が食い違う。その差が
+/// そのまま隣り合う unit の重なりになる (左右で違うトリムの見開きで `[-1, 0, -1, 0]` px。
+/// v3.5.0 レビュー N02)。ここでは **一度置いてから** union を取る。
+struct ContinuousUnitLayout {
+    /// ページ矩形の原点 (可視左上からの相対、points)。`size.pages` と同じ並び。
+    page_origins: Vec<egui::Vec2>,
+    /// 置いた後に実際に描かれる大きさ。整数物理 px になる。
+    drawn_size: egui::Vec2,
+}
+
+fn continuous_unit_layout(
+    size: &ContinuousReadingUnitSize,
+    pixels_per_point: f32,
+) -> ContinuousUnitLayout {
+    let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
+    // 置く前の可視上端 (ページ中心を原点とした値)。ここから各ページの原点を決める。
+    let raw_top = size
+        .pages
+        .iter()
+        .map(|page| {
+            let (lo, _) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
+            -page.height * 0.5 + lo
+        })
+        .fold(f32::INFINITY, f32::min);
+    let raw_top = if raw_top.is_finite() { raw_top } else { 0.0 };
+
+    // 各ページを置く。原点は物理ピクセル格子の上に来る。
+    let mut origins = Vec::with_capacity(size.pages.len());
+    let mut cursor_x = 0.0_f32;
+    for page in &size.pages {
+        let (band_x_lo, band_x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
+        origins.push(egui::vec2(
+            quantize_points_to_physical_pixels(cursor_x - band_x_lo, pixels_per_point),
+            quantize_points_to_physical_pixels(-raw_top - page.height * 0.5, pixels_per_point),
+        ));
+        cursor_x += (band_x_hi - band_x_lo) + page_gap;
+    }
+
+    // 置いた後の可視帯の union。帯の端は格子の上にあるので、この長さは整数物理 px。
+    let mut min = egui::vec2(f32::INFINITY, f32::INFINITY);
+    let mut max = egui::vec2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (page, origin) in size.pages.iter().zip(origins.iter()) {
+        let (x_lo, x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
+        let (y_lo, y_hi) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
+        min.x = min.x.min(origin.x + x_lo);
+        min.y = min.y.min(origin.y + y_lo);
+        max.x = max.x.max(origin.x + x_hi);
+        max.y = max.y.max(origin.y + y_hi);
+    }
+    let min_len = 1.0 / pixels_per_point.max(1.0);
+    let drawn_size = if min.x.is_finite() && max.x.is_finite() {
+        egui::vec2((max.x - min.x).max(min_len), (max.y - min.y).max(min_len))
+    } else {
+        egui::vec2(size.width.max(min_len), size.height.max(min_len))
+    };
+    let shift = if min.x.is_finite() {
+        min
+    } else {
+        egui::Vec2::ZERO
+    };
+    ContinuousUnitLayout {
+        page_origins: origins.into_iter().map(|origin| origin - shift).collect(),
+        drawn_size,
+    }
+}
+
 fn continuous_reading_page_rects(
     unit_rect: egui::Rect,
     size: &ContinuousReadingUnitSize,
@@ -4347,11 +4418,7 @@ fn continuous_reading_page_rects(
     if size.pages.is_empty() {
         return rects;
     }
-    // 位置は**描画が実際に置く帯**から決める (§1.159)。理想値で置いて描画で寄せると、
-    // 寄せの差だけ unit の端が動き、間隔が最大 1 物理 px ばらつく。倍率で分岐もしない
-    // — 貼り先はどの倍率でも寄るようになった (§1.161)。
-    let span = continuous_unit_drawn_span(size, pixels_per_point);
-    let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
+    let layout = continuous_unit_layout(size, pixels_per_point);
     // **ユニットの可視端から積む。中心からではない。**
     //
     // 隣り合うユニットの見える間隔は「描かれる長さ + 設定した間隔」で、どちらも整数物理
@@ -4362,92 +4429,25 @@ fn continuous_reading_page_rects(
     //
     // 端から積めば偶奇が混ざっても揃い、原点をまたぐ符号の問題 (§1.159 / F12) も同時に
     // 消える — 端の位置は前後の長さだけで決まり、中心の端数を経由しないため。
-    let visible_center_y = (span.y_min + span.y_max) * 0.5;
     let unit_origin = egui::pos2(
         quantize_points_to_physical_pixels(
-            unit_rect.center().x - span.x_len * 0.5,
+            unit_rect.center().x - layout.drawn_size.x * 0.5,
             pixels_per_point,
         ),
         quantize_points_to_physical_pixels(
-            unit_rect.center().y - visible_center_y + span.y_min,
+            unit_rect.center().y - layout.drawn_size.y * 0.5,
             pixels_per_point,
         ),
     );
-    // ユニットの可視端を 0 とした相対位置。
-    let mut visible_x = 0.0;
 
-    for page in &size.pages {
-        let (band_x_lo, band_x_hi) = page.drawn_band(ContinuousAxis::X, pixels_per_point);
-        // 帯の左端 / 上端を置きたい位置から、ページ全体矩形の原点へ戻す。
-        //
-        // **倍率で分岐せず必ず寄せる。** 以前は「整数近傍の倍率のときだけ」だったが、
-        // それは貼り先が端数倍率で寄っていなかった時代の条件で、§1.161 で消えた。
-        let rect_min = egui::pos2(
-            unit_origin.x
-                + quantize_points_to_physical_pixels(visible_x - band_x_lo, pixels_per_point),
-            unit_origin.y
-                + quantize_points_to_physical_pixels(
-                    -span.y_min - page.height * 0.5,
-                    pixels_per_point,
-                ),
-        );
-        let rect = egui::Rect::from_min_size(rect_min, egui::vec2(page.width, page.height));
-        visible_x += (band_x_hi - band_x_lo) + page_gap;
+    for (page, origin) in size.pages.iter().zip(layout.page_origins.iter()) {
+        let rect =
+            egui::Rect::from_min_size(unit_origin + *origin, egui::vec2(page.width, page.height));
         rects.push((page.idx, rect, page.content_bbox));
     }
     rects
 }
 
-/// unit が**実際に描かれる**範囲。場所を空ける側と描く側が同じ値を見るための 1 か所。
-///
-/// `x_len` は横に並べたページの可視帯と間隔の合計、`y_min` / `y_max` は unit の中心を
-/// 原点としたときの可視帯の上下端 (points)。連結読みのスクロール軸の長さはこれで決まる
-/// (backlog §1.159)。
-#[derive(Clone, Copy, Debug)]
-struct ContinuousUnitDrawnSpan {
-    x_len: f32,
-    y_min: f32,
-    y_max: f32,
-}
-
-fn continuous_unit_drawn_span(
-    size: &ContinuousReadingUnitSize,
-    pixels_per_point: f32,
-) -> ContinuousUnitDrawnSpan {
-    let page_gap = quantize_points_to_physical_pixels(size.page_gap.max(0.0), pixels_per_point);
-    let x_len = size
-        .pages
-        .iter()
-        .map(|page| page.drawn_visible_len(ContinuousAxis::X, pixels_per_point))
-        .sum::<f32>()
-        + page_gap * size.pages.len().saturating_sub(1) as f32;
-    let (y_min, y_max) = size.pages.iter().fold(
-        (f32::INFINITY, f32::NEG_INFINITY),
-        |(min_y, max_y), page| {
-            let (lo, hi) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
-            (
-                min_y.min(-page.height * 0.5 + lo),
-                max_y.max(-page.height * 0.5 + hi),
-            )
-        },
-    );
-    ContinuousUnitDrawnSpan {
-        x_len: x_len.max(1.0),
-        y_min: if y_min.is_finite() { y_min } else { 0.0 },
-        y_max: if y_max.is_finite() {
-            y_max
-        } else {
-            size.height.max(1.0)
-        },
-    }
-}
-
-/// 再生中のページの次コマ時刻から、**最も早いもの**を選ぶ。
-///
-/// 現在ページ 1 枚だけを見ていたので、見開きの相方や連結読みの他ページは現在ページの都合で
-/// しか進まなかった (現在ページが静止画なら期限が立たず、相方は入力があるまで止まる。
-/// §1.157、Codex Sol の指摘 1)。渡すのは**描いたページ**に限る — 描いていないページの
-/// 過ぎた期限を混ぜると 0ms 起床を繰り返し、アイドルで空転する。
 fn earliest_animation_deadline(deadlines: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     deadlines
         .flatten()
@@ -27435,9 +27435,12 @@ impl App {
         // 動かなくなるが、縦横比の違うページで間隔が揃わなくなる。0px と 1px、1px と 2px の
         // 違いは知覚しやすく、解像度が変わったときの再配置は理解されやすい。
         // 詳細は [display-pipeline.md](../docs/display-pipeline.md) の連結読みの節。
-        let span = continuous_unit_drawn_span(&base, pixels_per_point);
-        base.width = span.x_len;
-        base.height = (span.y_max - span.y_min).max(1.0);
+        // **置いた後の大きさを使う。** 置く前の union は、見開きのように上端と下端を
+        // 別のページが決める並びで実際の配置と食い違い、その差がそのまま隣り合う unit の
+        // 重なりになる (レビュー N02)。
+        let drawn = continuous_unit_layout(&base, pixels_per_point).drawn_size;
+        base.width = drawn.x;
+        base.height = drawn.y.max(1.0);
         base
     }
 
@@ -34897,18 +34900,15 @@ impl App {
         // AI 段。通す気があるページだけ runtime を用意する (v3.5.0 レビュー F03)。
         // モデルの選択は合成途中の画素に依存するので、ここでは材料だけを渡す。
         //
-        // **用意できなければ失敗にする。** AI 抜きの絵は寸法から別物なので、黙って落として
-        // 成功と言ってはならない (レビュー R14)。
+        // 用意できなかった場合も**ここでは失敗にしない**。寸法が対象外で AI を通さない
+        // ページまで書き出せなくなる (レビュー N03)。実際に通すと決まった時点で runner が
+        // 失敗にする (レビュー R14)。
         let materials = self.book_ai_materials();
         let ai = if crate::books::stage_requests_ai(stage, &params, materials.policy.feature_mode) {
             self.ensure_ai_runtime();
-            let runtime = self
-                .ai_runtime
-                .clone()
-                .ok_or_else(crate::books::ai_runtime_unavailable_error)?;
             Some(crate::books::book_ai_snapshot(
                 materials,
-                runtime,
+                self.ai_runtime.clone(),
                 params.clone(),
             ))
         } else {
@@ -50814,7 +50814,88 @@ mod tests {
         }
     }
 
-    /// 高さの**偶奇が混ざっても**、見える間隔は設定どおり。
+    /// 見開きで**上端と下端を別のページが決めても**、見える間隔は設定どおり。
+    ///
+    /// unit の長さを「置く前の union」から出していたので、左右で違うトリムを掛けた見開きでは
+    /// 置いた後の帯と食い違い、その差がそのまま隣り合う unit の重なりになった
+    /// (gap 0 で `[-1, 0, -1, 0]` px。v3.5.0 レビュー N02)。長さは置いた後から取る。
+    #[test]
+    fn continuous_spread_gaps_hold_when_the_two_pages_decide_different_edges() {
+        for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0] {
+            for gap in [0.0_f32, 1.0, 20.0] {
+                // 左は上寄り、右は下寄りにトリム。可視上端は左、下端は右が決める。
+                let mut left = ContinuousReadingPageSize::full(
+                    1,
+                    501.0 / pixels_per_point,
+                    1001.0 / pixels_per_point,
+                );
+                left.content_bbox = Some(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 0.6),
+                ));
+                left.logical_scale = physical_pixel_scale(pixels_per_point);
+                let mut right = ContinuousReadingPageSize::full(
+                    2,
+                    401.0 / pixels_per_point,
+                    1000.0 / pixels_per_point,
+                );
+                right.content_bbox = Some(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.5),
+                    egui::pos2(1.0, 1.0),
+                ));
+                right.logical_scale = physical_pixel_scale(pixels_per_point);
+                let mut size = ContinuousReadingUnitSize {
+                    pages: vec![left, right],
+                    width: 1.0,
+                    height: 1.0,
+                    page_gap: 0.0,
+                    logical_scale: physical_pixel_scale(pixels_per_point),
+                };
+                // 本番と同じく、置いた後の大きさを unit の長さにする。
+                let drawn = continuous_unit_layout(&size, pixels_per_point).drawn_size;
+                size.width = drawn.x;
+                size.height = drawn.y;
+
+                let heights = vec![size.height; 7];
+                let offsets =
+                    vertical_reading_offsets(&heights, gap, heights.len() / 2, pixels_per_point);
+                let gap_px = (quantize_points_to_physical_pixels(gap, pixels_per_point)
+                    * pixels_per_point)
+                    .round();
+
+                let edges = offsets
+                    .iter()
+                    .map(|offset| {
+                        let unit_rect = egui::Rect::from_center_size(
+                            egui::pos2(0.0, *offset),
+                            egui::vec2(size.width, size.height),
+                        );
+                        let rects =
+                            continuous_reading_page_rects(unit_rect, &size, pixels_per_point);
+                        // 見える帯の上下端 (ページ矩形ではなく、実際に描かれる範囲)。
+                        let mut top = f32::INFINITY;
+                        let mut bottom = f32::NEG_INFINITY;
+                        for ((_, rect, _), page) in rects.iter().zip(size.pages.iter()) {
+                            let (lo, hi) = page.drawn_band(ContinuousAxis::Y, pixels_per_point);
+                            top = top.min((rect.min.y + lo) * pixels_per_point);
+                            bottom = bottom.max((rect.min.y + hi) * pixels_per_point);
+                        }
+                        (top, bottom)
+                    })
+                    .collect::<Vec<_>>();
+
+                for pos in 1..edges.len() {
+                    let seen = edges[pos].0 - edges[pos - 1].1;
+                    assert!(
+                        (seen - gap_px).abs() < 0.01,
+                        "ppp={pixels_per_point} gap={gap} pos={pos}: 見える間隔 {seen}px                          (設定 {gap_px}px)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 高さの**偶奇が混ざっても**、見える間隔は設定どおり。    /// 高さの**偶奇が混ざっても**、見える間隔は設定どおり。
     ///
     /// 段の中心どうしの距離は前後の長さの平均なので、1000px と 1001px の間は 1000.5px に
     /// なる。中心とユニット内の相対位置を別々に寄せると、この半画素が二度倒れて、隙間と
