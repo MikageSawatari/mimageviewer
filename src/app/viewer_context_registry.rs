@@ -16,7 +16,7 @@ impl ViewerContextId {
     }
 
     #[cfg(test)]
-    pub(in crate::app) const fn for_test(serial: u64) -> Self {
+    pub(crate) const fn for_test(serial: u64) -> Self {
         Self(serial)
     }
 }
@@ -3209,7 +3209,7 @@ impl App {
         self.last_active_detached_window_id = Some(window_id);
     }
 
-    pub(in crate::app) fn build_window_context_for_test(
+    pub(crate) fn build_window_context_for_test(
         &mut self,
         window_id: u64,
         configure: impl FnOnce(&mut Self),

@@ -239,6 +239,9 @@ fn apply_reset_kinds(mut current: PageEditBundle, kinds: ResetKinds) -> PageEdit
 }
 
 struct BulkPasteConfirm {
+    /// 操作を出した viewer context。確認ダイアログはどちらの viewport にも出るので、
+    /// **押した瞬間ではなく要求した瞬間**の所有者を持ち回す。
+    owner_context_id: crate::app::ViewerContextId,
     targets: Vec<BulkPageEditTarget>,
     dropped_non_targets: usize,
     overwrite_count: usize,
@@ -246,6 +249,7 @@ struct BulkPasteConfirm {
 }
 
 struct BulkResetConfirm {
+    owner_context_id: crate::app::ViewerContextId,
     targets: Vec<BulkPageEditTarget>,
     dropped_non_targets: usize,
     counts: ResetKindCounts,
@@ -269,6 +273,13 @@ enum BulkRunDriver {
 }
 
 struct BulkPageEditRun {
+    /// 操作を出した viewer context。**結果はここへ戻す。**
+    ///
+    /// pending は App-global で、この dialog は main と fullscreen の両方から poll される。
+    /// 先に drain した側の bundle へ結果を書いていたので、別ウィンドウを開いたまま一覧側で
+    /// 一括貼付 / 解除をすると、一覧側のキャッシュ・保持設定・undo が更新されないまま DB
+    /// だけが変わっていた (v3.5.0 レビュー F08)。
+    owner_context_id: crate::app::ViewerContextId,
     driver: BulkRunDriver,
     effect: BulkRunEffect,
     source_label: Option<String>,
@@ -283,6 +294,7 @@ struct BulkPageEditRun {
 
 enum AfterLocalAdjustFence {
     Bulk {
+        owner_context_id: crate::app::ViewerContextId,
         targets: Vec<BulkPageEditTarget>,
         dropped_non_targets: usize,
         op: BulkPageEditOp,
@@ -599,6 +611,9 @@ impl App {
             self.show_feedback_toast("コピーされた編集内容がありません".to_string());
             return;
         };
+        // **要求を出した viewer context をここで焼き付ける** (F08)。以降の確認・fence・
+        // worker 完了は、どの viewport が poll してもこの context へ戻す。
+        let owner_context_id = self.edit_request_owner_context();
         let (targets, dropped_non_targets) = self.bulk_page_edit_targets(cursor_idx);
         if targets.is_empty() {
             self.show_feedback_toast(if dropped_non_targets > 0 {
@@ -620,6 +635,7 @@ impl App {
         if overwrite_count > 0 {
             self.edit_bundle_bulk_pending = Some(BulkPageEditPending {
                 phase: BulkPageEditPhase::PasteConfirm(BulkPasteConfirm {
+                    owner_context_id,
                     targets,
                     dropped_non_targets,
                     overwrite_count,
@@ -627,7 +643,7 @@ impl App {
                 }),
             });
         } else {
-            self.start_bulk_page_edit(targets, dropped_non_targets, op);
+            self.start_bulk_page_edit(owner_context_id, targets, dropped_non_targets, op);
         }
     }
 
@@ -643,6 +659,7 @@ impl App {
             self.show_feedback_toast("別の編集内容を処理しています".to_string());
             return;
         }
+        let owner_context_id = self.edit_request_owner_context();
         let (targets, dropped_non_targets) = self.bulk_page_edit_targets(cursor_idx);
         let presences = targets
             .iter()
@@ -663,6 +680,7 @@ impl App {
         kinds.uncheck_empty(counts);
         self.edit_bundle_bulk_pending = Some(BulkPageEditPending {
             phase: BulkPageEditPhase::ResetConfirm(BulkResetConfirm {
+                owner_context_id,
                 targets,
                 dropped_non_targets,
                 counts,
@@ -746,6 +764,7 @@ impl App {
 
     fn start_bulk_page_edit(
         &mut self,
+        owner_context_id: crate::app::ViewerContextId,
         mut targets: Vec<BulkPageEditTarget>,
         dropped_non_targets: usize,
         op: BulkPageEditOp,
@@ -778,6 +797,7 @@ impl App {
                         phase: BulkPageEditPhase::WaitingForLocalAdjust(LocalAdjustFenceWait {
                             stage,
                             next: AfterLocalAdjustFence::Bulk {
+                                owner_context_id,
                                 targets,
                                 dropped_non_targets,
                                 op,
@@ -827,6 +847,7 @@ impl App {
         };
         self.edit_bundle_bulk_pending = Some(BulkPageEditPending {
             phase: BulkPageEditPhase::Running(BulkPageEditRun {
+                owner_context_id,
                 driver,
                 effect,
                 source_label,
@@ -1030,6 +1051,20 @@ impl App {
         Ok(())
     }
 
+    /// 一括編集の完了処理を、**要求を出した viewer context を mount した状態で**実行する。
+    ///
+    /// その context が既に無ければ (別ウィンドウを閉じた等)、DB は worker が既に書いている
+    /// ので成功だが、runtime へ反映する先が無い。件ごとの失敗として利用者へ出す。
+    fn in_bulk_edit_owner(
+        &mut self,
+        owner: crate::app::ViewerContextId,
+        f: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.with_owner_viewer_context(owner, f).unwrap_or_else(|| {
+            Err("編集を開始したウィンドウが閉じられたため、表示へ反映できませんでした".to_string())
+        })
+    }
+
     fn record_bulk_item_result(&mut self, target: &BulkPageEditTarget, result: Result<(), String>) {
         let Some(BulkPageEditPending {
             phase: BulkPageEditPhase::Running(run),
@@ -1128,19 +1163,32 @@ impl App {
 
         match action {
             Some(BulkPollAction::Worker(BulkWorkerEvent::Item { target, result })) => {
-                let effect = match self.edit_bundle_bulk_pending.as_ref() {
+                let (effect, owner) = match self.edit_bundle_bulk_pending.as_ref() {
                     Some(BulkPageEditPending {
                         phase: BulkPageEditPhase::Running(run),
-                    }) => run.effect,
+                    }) => (run.effect, run.owner_context_id),
                     _ => return,
                 };
-                let applied = result
-                    .and_then(|prepared| self.apply_bulk_worker_success(&target, prepared, effect));
+                // **要求を出した context へ戻す。** どの viewport が先に drain しても、
+                // items / キャッシュ / undo を更新するのは所有者側 (F08)。
+                let applied = result.and_then(|prepared| {
+                    self.in_bulk_edit_owner(owner, |app| {
+                        app.apply_bulk_worker_success(&target, prepared, effect)
+                    })
+                });
                 self.record_bulk_item_result(&target, applied);
             }
             Some(BulkPollAction::RotationOnly(target)) => {
-                let current_idx = self.current_idx_for_bulk_target(&target);
-                let result = self.reset_bulk_target_rotation(&target, current_idx);
+                let owner = match self.edit_bundle_bulk_pending.as_ref() {
+                    Some(BulkPageEditPending {
+                        phase: BulkPageEditPhase::Running(run),
+                    }) => run.owner_context_id,
+                    _ => return,
+                };
+                let result = self.in_bulk_edit_owner(owner, |app| {
+                    let current_idx = app.current_idx_for_bulk_target(&target);
+                    app.reset_bulk_target_rotation(&target, current_idx)
+                });
                 self.record_bulk_item_result(&target, result);
             }
             Some(BulkPollAction::LocalAdjustFenceReady) => {
@@ -1165,10 +1213,16 @@ impl App {
                         };
                         match wait.next {
                             AfterLocalAdjustFence::Bulk {
+                                owner_context_id,
                                 targets,
                                 dropped_non_targets,
                                 op,
-                            } => self.start_bulk_page_edit(targets, dropped_non_targets, op),
+                            } => self.start_bulk_page_edit(
+                                owner_context_id,
+                                targets,
+                                dropped_non_targets,
+                                op,
+                            ),
                             AfterLocalAdjustFence::Single { request } => {
                                 self.start_apply_page_edit_bundle(request);
                                 // 単一貼り付け側の poll はこのフレームでは既に終わっている。
@@ -1435,7 +1489,12 @@ impl App {
                 else {
                     return;
                 };
-                self.start_bulk_page_edit(confirm.targets, confirm.dropped_non_targets, confirm.op);
+                self.start_bulk_page_edit(
+                    confirm.owner_context_id,
+                    confirm.targets,
+                    confirm.dropped_non_targets,
+                    confirm.op,
+                );
             }
             BulkDialogAction::StartReset => {
                 let Some(BulkPageEditPending {
@@ -1445,6 +1504,7 @@ impl App {
                     return;
                 };
                 self.start_bulk_page_edit(
+                    confirm.owner_context_id,
                     confirm.targets,
                     confirm.dropped_non_targets,
                     BulkPageEditOp::Reset {
@@ -1721,6 +1781,88 @@ mod tests {
         );
     }
 
+    /// 一括編集の結果は、**操作を出した viewer context** の runtime へ入る。
+    ///
+    /// pending は App-global で、この dialog は main と fullscreen の両方から poll される。
+    /// 先に drain した側の bundle へ書いていたので、別ウィンドウを開いたまま一覧側で一括
+    /// 貼付をすると、一覧側のキャッシュ・保持設定・undo が更新されないまま DB だけが
+    /// 変わっていた (v3.5.0 レビュー F08)。**別ウィンドウを mount した状態で drain して**、
+    /// 所有者側に入り、別ウィンドウ側が変わらないことを見る。
+    #[test]
+    #[cfg(windows)]
+    fn a_bulk_result_lands_in_the_context_that_asked_for_it() {
+        let egui_ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![image("owner.png")];
+        let owner = app.edit_request_owner_context();
+        let key = app.page_path_key(0).expect("ページキー");
+
+        let other = app.build_window_context_for_test(940, |ctx| {
+            ctx.items = vec![image("other.png")];
+        });
+
+        let mut adjust = crate::adjustment::AdjustParams::default();
+        adjust.brightness = 7.0;
+        let (tx, rx) = mpsc::channel();
+        tx.send(BulkWorkerEvent::Item {
+            target: BulkPageEditTarget {
+                idx: 0,
+                page_key: key.clone(),
+                display_label: "owner.png".to_string(),
+                item: image("owner.png"),
+                sidecar_coords: None,
+                known_size: Some([1, 1]),
+                kept_runtime_overrides: KeptRuntimeOverrides::default(),
+            },
+            result: Ok(crate::edit_bundle::PreparedPageEditBundle {
+                source_size: [1, 1],
+                adjust: Some(adjust),
+                adjust_json: None,
+                mask: None,
+                conceal: None,
+                local_adjust_layers: None,
+                local_adjust_json: None,
+                export_crop: None,
+                comic: None,
+                comic_json: None,
+            }),
+        })
+        .expect("送れる");
+        app.edit_bundle_bulk_pending = Some(BulkPageEditPending {
+            phase: BulkPageEditPhase::Running(BulkPageEditRun {
+                owner_context_id: owner,
+                driver: BulkRunDriver::Worker { rx, thread: None },
+                effect: BulkRunEffect::Paste,
+                source_label: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                total: 1,
+                completed: 0,
+                succeeded: 0,
+                failed: 0,
+                dropped_non_targets: 0,
+                first_failure: None,
+            }),
+        });
+
+        // 別ウィンドウ側の pass が先に完了を drain する。
+        app.with_owner_viewer_context(other, |mounted| {
+            mounted.poll_bulk_page_edit(&egui_ctx);
+        })
+        .expect("別 context を mount できる");
+
+        assert_eq!(
+            app.adjustment_page_params.get(&0).map(|p| p.brightness),
+            Some(7.0),
+            "所有者の runtime に入る"
+        );
+        let other_params = app
+            .with_owner_viewer_context(other, |ctx| {
+                ctx.adjustment_page_params.get(&0).map(|p| p.brightness)
+            })
+            .expect("別 context を mount できる");
+        assert_eq!(other_params, None, "別ウィンドウの bundle は変えない");
+    }
+
     fn run_for_summary(
         total: usize,
         completed: usize,
@@ -1729,6 +1871,7 @@ mod tests {
         dropped_non_targets: usize,
     ) -> BulkPageEditRun {
         BulkPageEditRun {
+            owner_context_id: crate::app::ViewerContextId::for_test(0),
             driver: BulkRunDriver::RotationOnly {
                 remaining: VecDeque::new(),
             },

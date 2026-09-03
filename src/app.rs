@@ -52848,6 +52848,25 @@ impl App {
         resume_video_upscale
     }
 
+    /// 編集要求を出した viewer context。**要求に焼き付けて、結果をその context へ戻す。**
+    ///
+    /// 一括編集の pending は App-global で、その dialog は main と fullscreen の両方から
+    /// poll される。先に drain した側の bundle へ結果を書いていたので、別ウィンドウを
+    /// 開いたまま一覧側で貼り付けると、一覧側のキャッシュ・保持設定・undo が更新されない
+    /// (v3.5.0 レビュー F08)。
+    pub(crate) fn edit_request_owner_context(&self) -> ViewerContextId {
+        self.projected_viewer_context_id()
+    }
+
+    /// `owner` を mount した状態で `f` を実行する。context が既に無ければ `None`。
+    pub(crate) fn with_owner_viewer_context<R>(
+        &mut self,
+        owner: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        self.with_viewer_context(owner, f).ok()
+    }
+
     pub(crate) fn local_ai_activity_lease(&self) -> LocalAiActivityLease {
         LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity))
     }
