@@ -1459,6 +1459,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-03 v3.5.0 レビュー S01 で、リング picker の確定を開いた viewer context 上で
+完結させた (Codex が findings.md round5 S01 で「picker を開いた所有 context と変更対象・
+変更前値を確定まで保ち、既存の編集を終える要求を現在の前面への新規入力と区別する」修正境界を
+指定し、ClaudeCode がその境界どおりに実装。F08 と同じ「要求の所有者を識別子で持ち、既存の
+mount 境界へ戻す」構造修正で、§2 の禁止事項には該当しない):**
+
+**触った範囲**: [src/ring_shortcut.rs](../src/ring_shortcut.rs) の `RingPickerState` へ
+`owner: ViewerContextId` を追加、[src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の
+`build_ring_picker_state` で `edit_request_owner_context()` を焼き付け、
+`apply_ring_picker_state` を `with_owner_viewer_context` の薄い包みに変え、実体を
+`apply_ring_picker_state_in_owner` へ移し、画像 / 動画の行だけ
+`picker_owner_fullscreen_idx` (既存 `current_ring_picker_anchor` の一致確認) を通す。
+`commit_ring_picker` はテストから確定経路を通すために `pub(crate)` にした。
+detached の viewport lifecycle、window binding、session 遷移、snapshot DTO、
+`ring_picker_is_stale` / `close_stale_ring_picker` の判定そのものには触れていない。
+一覧の行 (並べ替え) も同じ mount を通る。`apply_sort_change_reload` は最後に `load_folder`
+へ落ちるので、本節の 2026-09-03 の注意に当たるかを回帰テストで確かめ、所有 context を
+mount したまま通しても一覧が組み上がって戻ることを固定した
+(`a_ring_sort_order_reloads_the_window_the_ring_was_opened_in`)。
+
+**判断理由**: 直していたのは「App-global な picker の確定が、画像・動画の行だけ
+`self.fullscreen_idx` を**確定時に引き直していた**」こと。評価行は Q01 で保存先を識別子に
+したが、画像行は残っていた。追加したのは要求の所有者という識別子と、既存 mount 経路の再利用で、
+viewport ごとの guard や述語は足していない。所有 context が既に無ければ反映先が無いので
+何もしない (書ける先を探し直す silent fallback にしない)。ページが入れ替わっていたかの
+判定は `ring_picker_is_stale` と同じ anchor を使い、二つ目の綴りを作らない。
+
+**残っている穴**: `meta_undo` は App-global のままなので、別ウィンドウで積んだ Undo が
+一覧側の Undo 履歴に並ぶ。これは v3.5.0 の退行ではなく以前からの所有境界の穴で、
+延期済みの R11 (同一ページの編集結果を他の viewer の cache へ通知する) と同じ層にある。
+
 **2026-09-03 v3.5.0 レビュー F08 で、一括編集の要求に所有 viewer context を焼き付けた
 (ClaudeCode が起票し、Codex が §2 に照らして「所有 context を型付き request/state に要求時から
 保持し、通常完了を既存の mount 境界へ戻す構造修正。§2 の禁止事項や症状パッチには該当しない」

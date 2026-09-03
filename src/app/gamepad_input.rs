@@ -52,7 +52,7 @@ impl GamepadFrameBatch {
         self.session_ended
     }
 
-    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
+    /// 配り先の決定だけを見るテスト用。デバイスを読まずに空の batch を作る。
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
@@ -2990,6 +2990,9 @@ impl App {
         };
         RingPickerState {
             context,
+            // **所有 context も開いた時点で固定する。** 確定時に引き直すと、リングを
+            // 開いたまま前面の窓が変わったときに別ウィンドウのページへ書く (レビュー S01)。
+            owner: self.edit_request_owner_context(),
             anchor: self.current_ring_picker_anchor(context),
             original,
             row: 0,
@@ -4553,7 +4556,7 @@ impl App {
         self.request_native_video_hud_repaint(ctx);
     }
 
-    fn commit_ring_picker(&mut self, ctx: &egui::Context) {
+    pub(crate) fn commit_ring_picker(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.ring_picker.take() else {
             return;
         };
@@ -4707,20 +4710,46 @@ impl App {
         }
     }
 
+    /// リングの確定を、**開いた viewer context を mount した状態で**行う。
+    ///
+    /// 評価行は保存先を識別子で持つが (レビュー Q01)、画像・動画の行は
+    /// 「いまフルスクリーンの何番目か」を触る。ここで引き直すと、リングを開いたまま前面の
+    /// 窓が変わったときに **操作していない別ウィンドウのページ**へ保存する。表示エフェクトは
+    /// 確定前に「開いたときの値」へ戻してから Undo を採るので、そのページの変更前値まで
+    /// 失う。配送先がメイン一覧なら `fullscreen_idx` が `None` で確定ごと落ちる
+    /// (v3.5.0 レビュー S01)。
+    ///
+    /// 所有 context が既に無ければ (窓を閉じた等) 反映先が無いので何もしない。
     fn apply_ring_picker_state(&mut self, ctx: &egui::Context, picker: RingPickerState) {
+        let owner = picker.owner;
+        self.with_owner_viewer_context(owner, move |app| {
+            app.apply_ring_picker_state_in_owner(ctx, picker)
+        });
+    }
+
+    fn apply_ring_picker_state_in_owner(&mut self, ctx: &egui::Context, picker: RingPickerState) {
         match picker.context {
             RingShortcutContext::Grid => self.apply_grid_picker_state(picker),
             RingShortcutContext::ImageFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx {
+                if let Some(fs_idx) = self.picker_owner_fullscreen_idx(&picker) {
                     self.apply_image_picker_state(ctx, fs_idx, picker);
                 }
             }
             RingShortcutContext::VideoFullscreen => {
-                if let Some(fs_idx) = self.fullscreen_idx {
+                if let Some(fs_idx) = self.picker_owner_fullscreen_idx(&picker) {
                     self.apply_video_picker_state(ctx, fs_idx, picker);
                 }
             }
         }
+    }
+
+    /// 所有 context を mount した状態で、**リングを開いたページがまだそこにあるか**を見る。
+    ///
+    /// 開いている間にその窓自身が別ページへ進んだ場合 (スライドショー等)、index は同じでも
+    /// 別の項目を指す。`ring_picker_is_stale` と同じ anchor で確かめ、違っていれば触らない。
+    fn picker_owner_fullscreen_idx(&self, picker: &RingPickerState) -> Option<usize> {
+        let fs_idx = self.fullscreen_idx?;
+        (self.current_ring_picker_anchor(picker.context) == picker.anchor).then_some(fs_idx)
     }
 
     fn apply_grid_picker_state(&mut self, picker: RingPickerState) {

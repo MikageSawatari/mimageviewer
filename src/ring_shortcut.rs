@@ -2426,6 +2426,13 @@ pub struct RingPickerOriginalState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerState {
     pub context: RingShortcutContext,
+    /// リングを開いた **viewer context**。確定はここを mount した状態で行う。
+    ///
+    /// 画像・動画の行は「いまフルスクリーンの何番目か」を触る。確定時に引き直すと、
+    /// リングを開いたまま前面の窓が変わったときに **操作していない別ウィンドウのページ**へ
+    /// 保存し、表示エフェクトはその窓の変更前値まで失う (v3.5.0 レビュー S01)。
+    /// 保存先を識別子で持つのは評価行 ([`RingPickerContainerTarget`]) と同じ理由。
+    pub owner: crate::app::ViewerContextId,
     pub anchor: RingPickerAnchor,
     pub original: RingPickerOriginalState,
     pub row: usize,

@@ -15254,7 +15254,7 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。
+    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。
     ///
     /// 最寄りのお気に入りだけを見ていたので、内側が独自標準を持たず外側が持つ入れ子では、
     /// 表示は外側の標準を使うのに外部ツールへの書き出しだけ共通標準へ落ちていた
@@ -25885,7 +25885,7 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。
+    /// 9 種類目以降の拡張子も、**いつかは並べ直される**。
     ///
     /// 1 バッチの上限で打ち切っていたので、9 種類目以降はフォルダーを開き直しても更新
     /// されず、一度覚えた古い候補や失敗して覚えた空が終了まで残った (v3.5.0 レビュー N05)。
@@ -35546,7 +35546,7 @@ mod pipeline_cache_refactor_tests {
         }
     }
 
-    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。
+    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。
     ///
     /// path 一致だけでは A→B→A を区別できず、新しい一覧へ古い結果を被せる
     /// (v3.5.0 レビュー R03)。
@@ -65615,7 +65615,7 @@ mod rating_write_failure_tests {
         assert_eq!(db.get(&moved_key), 1);
     }
 
-    /// パッドが切れたときのリング確定は、**sample の中でやらない**。    /// パッドが切れたときのリング確定は、**sample の中でやらない**。
+    /// パッドが切れたときのリング確定は、**sample の中でやらない**。
     ///
     /// sample は root 投影で走る。リングのフォルダ評価は mount 中の context の保存先へ書く
     /// ので、root のまま確定すると別ウィンドウで変えた評価がメイン側のフォルダへ書かれ、
@@ -65648,7 +65648,7 @@ mod rating_write_failure_tests {
         );
     }
 
-    /// パッドが切れても、リングで付けた評価は**取り消せる**。    /// パッドが切れても、リングで付けた評価は**取り消せる**。
+    /// パッドが切れても、リングで付けた評価は**取り消せる**。
     ///
     /// 評価行はプレビューの時点で DB へ書いており、開いたときの before から Undo を組むのは
     /// 通常の確定処理だけ。切断で overlay を捨てるようにしたとき、その確定を通していな
@@ -65882,6 +65882,352 @@ mod rating_write_failure_tests {
             .history_trigger(),
             HistoryTrigger::UserChosen
         );
+    }
+}
+
+/// リングで変えた**画像の設定**は、リングを開いた窓のページへ入る。
+///
+/// 評価行は保存先を識別子で固定したが (レビュー Q01)、画像行は確定時に
+/// 「いまフルスクリーンの何番目か」を引き直していた。リングを開いたまま別の窓が配送先に
+/// なると、操作していない窓のページへ保存し、表示エフェクトは確定前に「開いたときの値」
+/// へ戻す処理までその窓に当たるので、その窓の変更前値ごと失われる (レビュー S01)。
+mod ring_picker_owner_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::adjustment::PostFilter;
+    use crate::ring_shortcut::{RingPickerRowId, RingShortcutContext};
+
+    fn page_params(post_filter: PostFilter) -> crate::adjustment::AdjustParams {
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.post_filter = post_filter;
+        params
+    }
+
+    fn page_filter(app: &App) -> Option<PostFilter> {
+        app.adjustment_page_params.get(&0).map(|p| p.post_filter)
+    }
+
+    fn page_model(app: &App) -> Option<String> {
+        app.adjustment_page_params
+            .get(&0)
+            .and_then(|p| p.upscale_model.clone())
+    }
+
+    /// リングを開いた窓 B。ページ個別スコープにして、context ごとに別の保存先へ入るようにする。
+    fn setup_owner_window(app: &mut App, post_filter: PostFilter) {
+        app.items = vec![GridItem::Image(PathBuf::from("C:/opened/a.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.current_folder = Some(PathBuf::from("C:/opened"));
+        app.fullscreen_idx = Some(0);
+        app.adjustment_page_params
+            .insert(0, page_params(post_filter));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_ring_display_effect_lands_on_the_page_the_ring_was_opened_on() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        // 行を回している途中のプレビューが B に残り、最後に別の値で止まった状態。
+        app.adjustment_page_params
+            .insert(0, page_params(PostFilter::Pc98));
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        // 後から配送先になる別の画像窓 C。B とは別のフォルダ・別のエフェクト。
+        let other = app.build_window_context_for_test(941, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/other"));
+            c.fullscreen_idx = Some(0);
+            c.adjustment_page_params
+                .insert(0, page_params(PostFilter::Famicom));
+        });
+
+        // 配送先が別の窓になった状態で確定する (パッド切断・無効化と同じ経路)。
+        app.with_owner_viewer_context(other, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::Nearest),
+            "開いた窓のページへ入る (プレビューの後始末も同じ窓で)"
+        );
+        let other_filter = app
+            .with_owner_viewer_context(other, |a| page_filter(a))
+            .expect("別 context を mount できる");
+        assert_eq!(
+            other_filter,
+            Some(PostFilter::Famicom),
+            "配送先になった窓のページは変えない"
+        );
+
+        app.apply_meta_undo();
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::GameBoy),
+            "Undo は開いた窓の変更前値へ戻す"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_ring_upscale_model_lands_on_the_page_the_ring_was_opened_on() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::None);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::UpscaleModel);
+        picker.upscale_model_key = Some("picked-in-b".to_string());
+        app.ring_picker = Some(picker);
+
+        let other = app.build_window_context_for_test(942, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/other"));
+            c.fullscreen_idx = Some(0);
+            let mut params = crate::adjustment::AdjustParams::default();
+            params.upscale_model = Some("already-in-c".to_string());
+            c.adjustment_page_params.insert(0, params);
+        });
+
+        app.with_owner_viewer_context(other, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+
+        assert_eq!(
+            page_model(&app),
+            Some("picked-in-b".to_string()),
+            "アップスケールは確定だけで適用されるので、開いた窓に残らなければ消える"
+        );
+        let other_model = app
+            .with_owner_viewer_context(other, |a| page_model(a))
+            .expect("別 context を mount できる");
+        assert_eq!(
+            other_model,
+            Some("already-in-c".to_string()),
+            "配送先になった窓のページは変えない"
+        );
+    }
+
+    /// 配送先が**一覧の窓** (フルスクリーンでない) でも、開いた窓のページへ確定する。
+    ///
+    /// 引き直すと `fullscreen_idx` が `None` で画像設定の確定ごと落ち、プレビューだけが
+    /// 残る (レビュー S01)。
+    #[test]
+    #[cfg(windows)]
+    fn a_ring_display_effect_commits_even_when_a_grid_window_is_in_front() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        app.adjustment_page_params
+            .insert(0, page_params(PostFilter::Pc98));
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        let grid_window = app.build_window_context_for_test(943, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/grid/c.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/grid"));
+            c.fullscreen_idx = None;
+        });
+
+        app.with_owner_viewer_context(grid_window, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+
+        assert_eq!(page_filter(&app), Some(PostFilter::Nearest));
+        app.apply_meta_undo();
+        assert_eq!(page_filter(&app), Some(PostFilter::GameBoy));
+    }
+
+    /// 開いた窓が既に無ければ、反映先が無いので**どこにも書かない**。
+    #[test]
+    #[cfg(windows)]
+    fn a_ring_display_effect_from_a_closed_window_touches_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        picker.post_filter = PostFilter::Nearest;
+        picker.owner = crate::app::ViewerContextId::for_test(9_999);
+        app.ring_picker = Some(picker);
+        let undo_before = app.meta_undo.undo_len();
+
+        app.commit_ring_picker(&ctx);
+
+        assert!(app.ring_picker.is_none(), "overlay は閉じる");
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::GameBoy),
+            "いま前面の窓のページを書き換えない"
+        );
+        assert_eq!(app.meta_undo.undo_len(), undo_before, "Undo も積まない");
+    }
+
+    /// 開いた窓自身が別ページへ進んでいたら (スライドショー等)、index は同じでも別の項目。
+    /// `ring_picker_is_stale` と同じ anchor で確かめ、違っていれば触らない。
+    #[test]
+    fn a_ring_display_effect_is_dropped_when_the_owner_moved_to_another_page() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        // 同じ index が別のファイルを指すようになる。
+        app.items = vec![GridItem::Image(PathBuf::from("C:/opened/z.jpg"))];
+
+        app.commit_ring_picker(&ctx);
+
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::GameBoy),
+            "開いたときのページでなくなったら書かない"
+        );
+    }
+
+    /// 一覧側の行も同じ所有者で確定する。並べ替えは**開いた窓の一覧**を組み直す。
+    ///
+    /// `apply_sort_change_reload` は最後に `load_folder` へ落ちる。所有 context を mount した
+    /// まま `load_folder` を通しても、その context の一覧が組み上がって戻ることを固定する
+    /// (`with_viewer_context` を跨いだ再読込は 2026-09-03 に一度取りこぼした経緯がある)。
+    #[test]
+    #[cfg(windows)]
+    fn a_ring_sort_order_reloads_the_window_the_ring_was_opened_in() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("ring_sort");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            std::fs::write(folder.join(name), b"not decoded by this test").unwrap();
+        }
+        app.load_folder(folder.clone());
+        assert_eq!(app.items.len(), 2, "前提: 開いた窓に一覧がある");
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.dirty_rows.push(RingPickerRowId::GridSortOrder);
+        picker.sort_order = crate::settings::SortOrder::DateDesc;
+        app.ring_picker = Some(picker);
+        // 組み直しが所有窓へ届いたかを見るため、いったん空にする。
+        app.items.clear();
+
+        let other = app.build_window_context_for_test(944, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/other"));
+        });
+
+        app.with_owner_viewer_context(other, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+
+        assert_eq!(
+            app.settings.sort_order,
+            crate::settings::SortOrder::DateDesc,
+            "並べ替えの設定自体は App 共通"
+        );
+        assert_eq!(
+            app.items.len(),
+            2,
+            "開いた窓の一覧が組み直されて戻る (mount を跨いでも失われない)"
+        );
+        let other_items = app
+            .with_owner_viewer_context(other, |a| a.items.len())
+            .expect("別 context を mount できる");
+        assert_eq!(other_items, 1, "配送先になった窓の一覧は組み直さない");
+    }
+
+    /// パッドが切れたときも、リングの画像設定は**開いた別ウィンドウ**のページへ入る。
+    ///
+    /// 終了時の確定は通常の配送と同じ場所で走るので、前面がメイン一覧なら一覧が mount されて
+    /// いる。評価行と同じく、ここで所有者を引き直さないことを入口から通して固定する。
+    #[test]
+    #[cfg(windows)]
+    fn losing_the_pad_commits_the_ring_into_the_window_that_opened_it() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.gamepad_enabled = true;
+        // 前面に残るメイン一覧。別のフォルダ・別のページ個別補正。
+        app.items = vec![GridItem::Image(PathBuf::from("C:/main/m.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.current_folder = Some(PathBuf::from("C:/main"));
+        app.fullscreen_idx = None;
+        app.adjustment_page_params
+            .insert(0, page_params(PostFilter::Famicom));
+
+        // 別ウィンドウでリングを開き、行を回した途中のプレビューを残す。
+        let detached = app.build_window_context_for_test(945, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/opened/a.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/opened"));
+            c.fullscreen_idx = Some(0);
+            c.adjustment_page_params
+                .insert(0, page_params(PostFilter::GameBoy));
+        });
+        app.with_owner_viewer_context(detached, |a| {
+            let mut picker = a.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+            picker.dirty_rows.push(RingPickerRowId::PostFilter);
+            picker.post_filter = PostFilter::Nearest;
+            a.adjustment_page_params
+                .insert(0, page_params(PostFilter::Pc98));
+            a.ring_picker = Some(picker);
+        })
+        .expect("別 context を mount できる");
+
+        // メイン一覧が前面のままパッドが切れる。
+        app.gamepad
+            .push_for_test(crate::gamepad::PadEvent::Disconnected);
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(batch.session_ended_for_test(), "区切りを batch で伝える");
+        let _ = app.dispatch_gamepad_batch(&ctx, batch);
+
+        assert!(app.ring_picker.is_none(), "overlay は閉じる");
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::Famicom),
+            "前面のメイン一覧のページは変えない"
+        );
+        let owner_filter = app
+            .with_owner_viewer_context(detached, |a| page_filter(a))
+            .expect("別 context を mount できる");
+        assert_eq!(
+            owner_filter,
+            Some(PostFilter::Nearest),
+            "リングを開いた窓のページへ入る"
+        );
+    }
+
+    /// 同じ窓で閉じる通常の確定は、そのまま効く。
+    #[test]
+    fn a_ring_display_effect_still_commits_in_the_window_that_opened_it() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        app.adjustment_page_params
+            .insert(0, page_params(PostFilter::Pc98));
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        app.commit_ring_picker(&ctx);
+
+        assert_eq!(page_filter(&app), Some(PostFilter::Nearest));
+        app.apply_meta_undo();
+        assert_eq!(page_filter(&app), Some(PostFilter::GameBoy));
     }
 }
 
