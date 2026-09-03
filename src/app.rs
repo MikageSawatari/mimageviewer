@@ -53101,10 +53101,12 @@ impl App {
     pub(crate) fn book_ai_materials(&self) -> crate::books::BookAiMaterials {
         crate::books::BookAiMaterials {
             manager: Arc::clone(&self.ai_model_manager),
-            feature_mode: self.settings.ai_feature_mode,
-            upscale_limit: self.settings.ai_upscale_limit(),
-            denoise_limit: self.settings.ai_denoise_limit(),
-            transparent_bg_mode: self.effective_upscale_bg_mode(),
+            policy: crate::books::BookAiPolicy {
+                feature_mode: self.settings.ai_feature_mode,
+                upscale_limit: self.settings.ai_upscale_limit(),
+                denoise_limit: self.settings.ai_denoise_limit(),
+                transparent_bg_mode: self.effective_upscale_bg_mode(),
+            },
         }
     }
 

@@ -726,6 +726,11 @@ impl MaterializeSession {
             export_crop.is_some(),
             context.stage,
         );
+        // AI を通す気があるかは 1 か所で決め、**出力の同一性と実行の両方**がその答えを使う。
+        // 別々に綴ると、設定を変えたのに前の出力が再利用される (v3.5.0 レビュー R05)。
+        let ai_materials = context.ai_materials.clone().filter(|materials| {
+            crate::books::stage_requests_ai(context.stage, &params, materials.policy.feature_mode)
+        });
         let fingerprint = edit_fingerprint(
             &params,
             rotation,
@@ -738,6 +743,7 @@ impl MaterializeSession {
             context.erase_mono_tolerance,
             context.comic_source_dims,
             context.stage,
+            ai_materials.as_ref().map(|materials| materials.policy),
         )?;
 
         let conceal = conceal_raw.map(|(bitmap, shapes, size)| crate::books::BookConcealSnapshot {
@@ -750,14 +756,8 @@ impl MaterializeSession {
         });
         // AI 段。**通す気があるのに runtime を用意できなければ失敗にする** — AI 抜きの絵は
         // 寸法から別物なので、黙って落として成功と言ってはならない (レビュー R14)。
-        let ai = match context.ai_materials.clone() {
-            Some(materials)
-                if crate::books::stage_requests_ai(
-                    context.stage,
-                    &params,
-                    materials.feature_mode,
-                ) =>
-            {
+        let ai = match ai_materials {
+            Some(materials) => {
                 let runtime = self
                     .resolve_worker_ai_runtime(context)
                     .ok_or_else(crate::books::ai_runtime_unavailable_error)?;
@@ -767,7 +767,7 @@ impl MaterializeSession {
                     params.clone(),
                 ))
             }
-            _ => None,
+            None => None,
         };
         let erase = erase_raw.map(|(bitmap, shapes, size)| {
             let runtime = self.resolve_worker_ai_runtime(context);
@@ -1378,6 +1378,10 @@ fn edit_fingerprint(
     erase_mono_tolerance: u8,
     comic_source_dims: Option<[usize; 2]>,
     stage: crate::bake_stage::BakeStage,
+    // `ai_policy` は AI 段が実際に使う設定。段が AI へ届かないときだけ `None`。
+    // 出力を変える値がここに入っていないと、設定を変えた後も同じ key に当たって前の
+    // 出力を渡してしまう (v3.5.0 レビュー R05)。
+    ai_policy: Option<crate::books::BookAiPolicy>,
 ) -> Result<[u8; 32], String> {
     let mut digest = sha2::Sha256::new();
     for (domain, value) in [
@@ -1395,6 +1399,7 @@ fn edit_fingerprint(
         ),
         ("comic_source_dims", serde_json::to_vec(&comic_source_dims)),
         ("stage", serde_json::to_vec(&stage)),
+        ("ai_policy", serde_json::to_vec(&ai_policy)),
     ] {
         let value = value.map_err(|error| format!("編集状態を検証できません: {error}"))?;
         digest.update((domain.len() as u32).to_le_bytes());
@@ -2144,6 +2149,7 @@ mod tests {
                 0,
                 None,
                 stage,
+                None,
             )
             .unwrap()
         };
@@ -2153,6 +2159,56 @@ mod tests {
         assert_ne!(edits, ai);
         assert_ne!(ai, display);
         assert_ne!(edits, display);
+    }
+
+    /// AI 段の**設定が変われば出力も変わる**ので、指紋も変わらなければならない。
+    ///
+    /// 実体化 cache は source stamp と指紋で再利用を決める。AI の設定が指紋に入っていな
+    /// かったので、透過画像の AI 下地を黒→白に変えて再実行しても、前の黒下地のファイルを
+    /// そのまま渡していた (v3.5.0 レビュー R05)。
+    #[test]
+    fn the_fingerprint_separates_requests_that_use_different_ai_settings() {
+        let policy = |transparent_bg_mode, long_edge_px| crate::books::BookAiPolicy {
+            feature_mode: crate::settings::AiFeatureMode::HighQuality,
+            upscale_limit: crate::ai::upscale::AiProcessSizeLimit::square(long_edge_px),
+            denoise_limit: crate::ai::upscale::AiProcessSizeLimit::square(long_edge_px),
+            transparent_bg_mode,
+        };
+        let fingerprint = |ai_policy| {
+            edit_fingerprint(
+                &crate::adjustment::AdjustParams::default(),
+                crate::rotation_db::Rotation::None,
+                None,
+                None,
+                None,
+                &crate::conceal::ConcealPreset::default(),
+                None,
+                None,
+                0,
+                None,
+                crate::bake_stage::BakeStage::Ai,
+                ai_policy,
+            )
+            .unwrap()
+        };
+
+        let black_bg = fingerprint(Some(policy(0, 4096)));
+
+        assert_ne!(
+            black_bg,
+            fingerprint(Some(policy(1, 4096))),
+            "AI の下地を変えたら別の出力"
+        );
+        assert_ne!(
+            black_bg,
+            fingerprint(Some(policy(0, 2048))),
+            "AI の有効範囲を変えたら別の出力"
+        );
+        assert_ne!(
+            black_bg,
+            fingerprint(None),
+            "AI を通す / 通さないは別の出力"
+        );
     }
 
     #[test]
@@ -2170,6 +2226,7 @@ mod tests {
                 tolerance,
                 dimensions,
                 crate::bake_stage::BakeStage::default(),
+                None,
             )
             .unwrap()
         };

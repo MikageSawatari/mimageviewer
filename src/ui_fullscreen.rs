@@ -34881,7 +34881,7 @@ impl App {
         // **用意できなければ失敗にする。** AI 抜きの絵は寸法から別物なので、黙って落として
         // 成功と言ってはならない (レビュー R14)。
         let materials = self.book_ai_materials();
-        let ai = if crate::books::stage_requests_ai(stage, &params, materials.feature_mode) {
+        let ai = if crate::books::stage_requests_ai(stage, &params, materials.policy.feature_mode) {
             self.ensure_ai_runtime();
             let runtime = self
                 .ai_runtime

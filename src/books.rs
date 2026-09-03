@@ -303,6 +303,15 @@ pub struct BookAiSnapshot {
 #[derive(Clone)]
 pub struct BookAiMaterials {
     pub manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub policy: BookAiPolicy,
+}
+
+/// AI 段の**出力を変える設定**。実体化 cache の同一性に入れる (v3.5.0 レビュー R05)。
+///
+/// `manager` を含めないのはプロセス共通の置き場だから。ここに無い値が出力を変えるように
+/// なったら、必ずこの型へ足す — 足さないと、設定を変えた後も前の出力が再利用される。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BookAiPolicy {
     pub feature_mode: crate::settings::AiFeatureMode,
     pub upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
     pub denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
@@ -347,9 +356,9 @@ pub fn book_ai_snapshot(
         let Some(models) = crate::ai::final_pipeline::select_final_ai_models(
             image,
             &params,
-            materials.feature_mode,
-            materials.upscale_limit,
-            materials.denoise_limit,
+            materials.policy.feature_mode,
+            materials.policy.upscale_limit,
+            materials.policy.denoise_limit,
             None,
         ) else {
             return Ok(BookAiResult {
@@ -363,7 +372,7 @@ pub fn book_ai_snapshot(
             adjust_before_ai: None,
             denoise_kind: models.denoise,
             upscale_kind: models.upscale,
-            background_mode: materials.transparent_bg_mode,
+            background_mode: materials.policy.transparent_bg_mode,
         };
         match crate::ai::final_pipeline::execute_selected_final_ai(
             &runtime,
