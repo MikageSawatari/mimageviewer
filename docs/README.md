@@ -16,6 +16,7 @@
 | [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
+| [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) | **設計合意済み・未実装**。書庫の高速ページ送りが詰まる問題 (§1.174) の正本。ページ読み込みの受付・待機・実行・取消中・終了を上限つきで所有する `FsPageLoadScheduler`、ZIP 中央目次の再利用、アニメーション通知の分離 |
 | [pdf-page-count-cache-plan.md](pdf-page-count-cache-plan.md) | PDF ページ数キャッシュ、worker 境界、失敗時の扱いを触るとき |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
 | [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) | **設計合意済み・未実装**。補正スコープを「このページの個別設定 > その場所の標準」の 2 段へ再設計する計画。お気に入りごとの `□ お気に入り用標準設定を使う` (既定 OFF、ON/OFF の実体は `favorite_params` 行の有無)、標準（共通）/ 標準（お気に入り「xxx」）の名称、`Ctrl+Alt+数字` の書き込み先統一と `Ctrl+Alt+-` 追加、表示トリムとの語彙・見た目統一。永続データ変更なし・移行不要 |
