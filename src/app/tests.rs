@@ -15204,7 +15204,57 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(assert_same(&app).brightness, 20.0);
     }
 
-    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。
+    /// 製本と一括書き出しのスタックメンバーも、**表示と同じお気に入りへ透過する**。
+    ///
+    /// 外部ツール側は F10 で共通 resolver へ直したが、こちらは最寄りの 1 件しか見ておらず、
+    /// その 1 件が標準を持たない入れ子では共通標準へ落ちていた。同じページ・同じ段でも出力
+    /// 経路によって色が変わる (v3.5.0 レビュー R15)。
+    #[test]
+    fn book_and_batch_export_stack_members_use_the_same_favorite_the_view_uses() {
+        let mut app = setup_app();
+        let image_path = PathBuf::from("C:/pics/AI/deep/page.jpg");
+        let idx = push_image(&mut app, image_path.to_str().unwrap());
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from("C:/pics"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from("C:/pics/AI"));
+        let outer_id = outer.id;
+        let inner_id = inner.id;
+        app.settings.favorites = vec![outer, inner];
+        app.settings.global_preset = params_with_brightness(5.0);
+        let key = crate::adjustment_db::normalize_path(&image_path);
+
+        // 外側だけが独自標準を持つ = 内側は OFF。
+        app.adjustment_favorite_params
+            .insert(outer_id, params_with_brightness(20.0));
+        assert_eq!(
+            app.effective_params(idx).brightness,
+            20.0,
+            "表示は外側の標準"
+        );
+        assert_eq!(
+            app.stack_member_effective_params_for_test(&image_path, &key)
+                .brightness,
+            20.0,
+            "製本 / 一括書き出しも外側の標準へ透過する"
+        );
+
+        app.adjustment_favorite_params
+            .insert(inner_id, params_with_brightness(30.0));
+        assert_eq!(
+            app.stack_member_effective_params_for_test(&image_path, &key)
+                .brightness,
+            30.0
+        );
+
+        app.adjustment_favorite_params.remove(&outer_id);
+        app.adjustment_favorite_params.remove(&inner_id);
+        assert_eq!(
+            app.stack_member_effective_params_for_test(&image_path, &key)
+                .brightness,
+            5.0
+        );
+    }
+
+    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。
     ///
     /// 最寄りのお気に入りだけを見ていたので、内側が独自標準を持たず外側が持つ入れ子では、
     /// 表示は外側の標準を使うのに外部ツールへの書き出しだけ共通標準へ落ちていた
@@ -65338,6 +65388,49 @@ mod rating_write_failure_tests {
         assert_eq!(app.meta_undo.undo_len(), 1);
         assert_eq!(app.meta_undo.redo_len(), 0);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    }
+
+    /// パッドが切れても、リングで付けた評価は**取り消せる**。
+    ///
+    /// 評価行はプレビューの時点で DB へ書いており、開いたときの before から Undo を組むのは
+    /// 通常の確定処理だけ。切断で overlay を捨てるようにしたとき、その確定を通していな
+    /// かったので、書いた評価だけ残って取り消せなくなっていた (v3.5.0 レビュー R12)。
+    #[test]
+    fn losing_the_pad_still_records_the_undo_for_a_rating_made_in_the_ring() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let path = app.tmp.path().join("ring_disconnect.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, app.rating_meta_for_idx(0).as_ref())
+            .unwrap();
+        app.rating_cache.insert(0, 1);
+        app.settings.gamepad_enabled = true;
+
+        let mut picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        picker
+            .dirty_rows
+            .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
+        picker.item_rating = 4;
+        app.ring_picker = Some(picker);
+        // プレビューが既に DB へ書いている。
+        assert!(app.set_rating_result(0, 4).unwrap());
+        assert_eq!(app.meta_undo.undo_len(), 0);
+
+        // パッドが切れる (= 設定 OFF と同じ終端)。
+        app.settings.gamepad_enabled = false;
+        let _ = app.sample_gamepad_input(&ctx);
+
+        assert!(app.ring_picker.is_none(), "overlay は閉じる");
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4, "評価は残る");
+        assert_eq!(app.meta_undo.undo_len(), 1, "その評価を取り消せる");
     }
 
     #[test]

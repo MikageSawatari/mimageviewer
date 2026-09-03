@@ -34700,6 +34700,12 @@ impl App {
     /// メンバーパスの有効補正パラメータ (`effective_params(idx)` のパスベース版)。
     /// ページ個別 (adjustment_db) → お気に入り標準 → global の順で解決する。`set_page_params` は
     /// DB へ書き戻すので、集約ビューで idx キャッシュに無いメンバーでも DB から正しく拾える。
+    /// 一覧 index を持たないスタックメンバーの補正。ページ個別 → 祖先のお気に入り標準 →
+    /// 共通標準の順。
+    ///
+    /// **祖先の解決は表示と同じ resolver を通す。** 最寄りのお気に入りだけを見ていたので、
+    /// その 1 件が標準を持たない入れ子では、表示と外部ツールが外側の標準を使うのに、製本と
+    /// 一括書き出しだけ共通標準へ落ちていた (v3.5.0 レビュー R15)。
     fn stack_member_effective_params(
         &self,
         path: &std::path::Path,
@@ -34712,14 +34718,27 @@ impl App {
         {
             return p;
         }
-        if let Some(fav) = path
-            .parent()
-            .and_then(|dir| self.find_nearest_favorite(dir))
-            && let Some(p) = self.adjustment_favorite_params.get(&fav.id)
-        {
-            return p.clone();
-        }
-        self.settings.global_preset.clone()
+        path.parent()
+            .and_then(|dir| {
+                crate::final_composite::active_favorite_default_id_for_path(
+                    dir,
+                    &self.settings.favorites,
+                    None,
+                    |id| self.adjustment_favorite_params.contains_key(&id),
+                )
+            })
+            .and_then(|id| self.adjustment_favorite_params.get(&id))
+            .cloned()
+            .unwrap_or_else(|| self.settings.global_preset.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stack_member_effective_params_for_test(
+        &self,
+        path: &std::path::Path,
+        key: &str,
+    ) -> crate::adjustment::AdjustParams {
+        self.stack_member_effective_params(path, key)
     }
 
     fn book_mask_snapshot(

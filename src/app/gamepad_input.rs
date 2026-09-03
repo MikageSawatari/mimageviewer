@@ -3509,9 +3509,12 @@ impl App {
         if !had_overlay && self.gamepad_state.is_idle() {
             return;
         }
+        // **リングは捨てずに通常の確定を通す。** 評価行はプレビューの時点で DB へ書いて
+        // おり、開いたときの before から Undo を組むのは確定処理だけ。捨てると、書いた
+        // 評価だけが残って取り消せなくなる (v3.5.0 レビュー R12)。
+        self.commit_ring_picker(ctx);
         self.gamepad_state.clear();
         if had_overlay {
-            self.ring_picker = None;
             self.gamepad_favorite_picker = None;
             self.gamepad_location_picker = None;
             self.gamepad_video_marker_picker = None;
