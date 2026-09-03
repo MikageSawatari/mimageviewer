@@ -1264,6 +1264,28 @@ impl crate::app::App {
             pin: self.context_menu_pin_state(target, view),
             external_tools,
             associated_apps,
+            // キー併記は**実際の割り当て**から作る。既定キーをモデル側へ書き直すと、
+            // 操作カスタマイズで変えても native / egui の両メニューに以前のキーが出る
+            // (v3.5.0 レビュー F16)。面によって回転の action が違う。
+            shortcuts: {
+                let (rotate_ccw, rotate_cw, deselect) = match target.surface {
+                    ContextMenuSurface::Grid => (
+                        crate::keymap::KeyAction::GridRotateCcw,
+                        crate::keymap::KeyAction::GridRotateCw,
+                        Some(crate::keymap::KeyAction::GridDeselect),
+                    ),
+                    ContextMenuSurface::Fullscreen => (
+                        crate::keymap::KeyAction::FsRotateCcw,
+                        crate::keymap::KeyAction::FsRotateCw,
+                        None,
+                    ),
+                };
+                crate::context_menu_model::ContextMenuShortcutLabels {
+                    rotate_left: self.keymap.first_chord_label(rotate_ccw),
+                    rotate_right: self.keymap.first_chord_label(rotate_cw),
+                    deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
+                }
+            },
         };
         crate::context_menu_model::build_context_menu(&input)
     }

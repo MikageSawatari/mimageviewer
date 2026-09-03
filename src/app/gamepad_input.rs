@@ -2282,7 +2282,21 @@ impl App {
         let now = Instant::now();
         // 無効なら読まない。runtime 側が読み取りスレッドごと止めるので、
         // 「反応しないのに UI だけ起き続ける」状態にはならない。
-        let events = self.gamepad.drain(ctx, self.settings.gamepad_enabled);
+        let enabled = self.settings.gamepad_enabled;
+        let events = self.gamepad.drain(ctx, enabled);
+        // **無効化は物理切断と同じ終端。** 読み捨てるだけでは、握ったボタンと倒した軸が
+        // consumer 側に残ったまま `due_button_repeat` / `dispatch_gamepad_analog` が動き続け、
+        // 停止したスレッドから中立イベントは二度と届かない。スティックがずれている状態で
+        // 設定を OFF にすると、移動やズームと再描画が止まらなくなる (v3.5.0 レビュー F06)。
+        // パッドでしか閉じられない操作 UI も、同じ遷移でここで終わらせる。
+        if !enabled {
+            self.end_gamepad_input_session(ctx);
+            return GamepadFrameBatch {
+                now,
+                actions: Vec::new(),
+                saw_input_event: false,
+            };
+        }
         let mut actions = Vec::new();
         let mut saw_input_event = false;
 
@@ -2316,7 +2330,8 @@ impl App {
                 PadEvent::Disconnected => {
                     saw_input_event = true;
                     // 握ったまま切断すると保持状態が残りリピート/アナログが止まらない。
-                    self.gamepad_state.clear();
+                    // 設定 OFF と同じ終端を通す。
+                    self.end_gamepad_input_session(ctx);
                 }
             }
         }
@@ -3480,6 +3495,29 @@ impl App {
             picker.context != self.current_ring_shortcut_context()
                 || picker.anchor != self.current_ring_picker_anchor(picker.context)
         })
+    }
+
+    /// パッド入力が終わったときの終端処理。**無効化と物理切断の共通の出口。**
+    ///
+    /// 保持中のボタン / 軸 / リピート予約を落とし、パッドでしか閉じられない overlay を
+    /// 閉じる。何も残っていなければ何もしない (毎フレーム呼ばれるので再描画も要求しない)。
+    fn end_gamepad_input_session(&mut self, ctx: &egui::Context) {
+        let had_overlay = self.ring_picker.is_some()
+            || self.gamepad_favorite_picker.is_some()
+            || self.gamepad_location_picker.is_some()
+            || self.gamepad_video_marker_picker.is_some();
+        if !had_overlay && self.gamepad_state.is_idle() {
+            return;
+        }
+        self.gamepad_state.clear();
+        if had_overlay {
+            self.ring_picker = None;
+            self.gamepad_favorite_picker = None;
+            self.gamepad_location_picker = None;
+            self.gamepad_video_marker_picker = None;
+            self.clear_native_video_picker_overlay(ctx);
+            ctx.request_repaint();
+        }
     }
 
     fn close_stale_ring_picker(&mut self, ctx: &egui::Context) {
@@ -7758,6 +7796,72 @@ mod tests {
             .push_for_test(PadEvent::ButtonPressed(PadButton::South));
         let batch = app.sample_gamepad_input(&ctx);
         assert!(!batch.actions.is_empty(), "有効に戻したら届く");
+    }
+
+    /// 保持したまま OFF にしたら、**保持もそこで終わる**。
+    ///
+    /// 無効化は物理切断と同じ終端。読み捨てるだけだと、握ったボタンと倒した軸が
+    /// consumer 側に残り、停止したスレッドから中立イベントが届かないので、リピートと
+    /// アナログ操作 (と再描画) が止まらない (v3.5.0 レビュー F06)。
+    #[test]
+    fn turning_the_pad_off_ends_the_input_it_was_holding() {
+        use crate::gamepad::{PadAxis, PadEvent};
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+
+        // 十字を握り、スティックを倒したままにする。
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(!batch.actions.is_empty(), "押した frame は届く");
+        assert!(
+            !app.gamepad_state.is_idle(),
+            "押しっぱなし / 倒しっぱなしが残っている"
+        );
+
+        app.settings.gamepad_enabled = false;
+        let batch = app.sample_gamepad_input(&ctx);
+
+        assert!(batch.actions.is_empty(), "OFF の frame は操作を作らない");
+        assert!(
+            !batch.saw_input_event,
+            "OFF の frame は入力があったことにしない (再描画を続けない)"
+        );
+        assert!(
+            app.gamepad_state.is_idle(),
+            "OFF は保持中のボタン / 軸 / リピート予約をすべて終わらせる"
+        );
+
+        // リピート間隔を跨いでも、OFF のあいだは何も生えない。
+        std::thread::sleep(std::time::Duration::from_millis(320));
+        let batch = app.sample_gamepad_input(&ctx);
+        assert!(batch.actions.is_empty(), "OFF 中にリピートが湧かない");
+        assert!(!batch.saw_input_event);
+    }
+
+    /// パッドでしか閉じられない overlay は、OFF の遷移で一緒に閉じる。
+    #[test]
+    fn turning_the_pad_off_closes_the_overlays_only_the_pad_can_dismiss() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gamepad_enabled = true;
+        app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+            tab: GamepadFavoritePickerTab::Favorites,
+            favorites: GamepadListCursor::new(0),
+            smart_folders: GamepadListCursor::new(0),
+        });
+
+        app.settings.gamepad_enabled = false;
+        let _ = app.sample_gamepad_input(&ctx);
+
+        assert!(
+            app.gamepad_favorite_picker.is_none(),
+            "閉じる手段が消えた overlay を残さない"
+        );
     }
     use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};

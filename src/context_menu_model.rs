@@ -191,6 +191,29 @@ pub struct ContextMenuInput {
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
     pub associated_apps: Vec<AssociatedAppMenuEntry>,
+    pub shortcuts: ContextMenuShortcutLabels,
+}
+
+/// メニューに併記するキーの表示。**実際の割り当てから作った文字列**を呼び出し側が入れる。
+///
+/// 既定キーをこのモジュール内へ書き直すと、操作カスタマイズで割り当てを変えたり解除したり
+/// しても以前のキーが出続ける。native / egui の両描画がこの 1 つのモデルを見るので、
+/// 書き直した瞬間に両方へ同じずれが固定される (v3.5.0 レビュー F16)。
+///
+/// `None` は「そのキーは割り当てられていない」= 併記しない。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextMenuShortcutLabels {
+    pub rotate_left: Option<String>,
+    pub rotate_right: Option<String>,
+    pub deselect: Option<String>,
+}
+
+/// `label` に、割り当てがあるときだけ ` (キー)` を足す。
+fn with_key(label: &str, key: Option<&String>) -> String {
+    match key {
+        Some(key) => format!("{label} ({key})"),
+        None => label.to_string(),
+    }
 }
 
 fn item(command: MenuCommand, label: impl Into<String>) -> MenuNode {
@@ -285,8 +308,14 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             push_group(
                 &mut nodes,
                 [
-                    item(MenuCommand::RotateLeft, "左に回転 (L)"),
-                    item(MenuCommand::RotateRight, "右に回転 (R)"),
+                    item(
+                        MenuCommand::RotateLeft,
+                        with_key("左に回転", input.shortcuts.rotate_left.as_ref()),
+                    ),
+                    item(
+                        MenuCommand::RotateRight,
+                        with_key("右に回転", input.shortcuts.rotate_right.as_ref()),
+                    ),
                 ],
             );
         }
@@ -339,7 +368,10 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         if input.surface == ContextMenuSurface::Grid {
             push_group(
                 &mut nodes,
-                [item(MenuCommand::Deselect, "選択解除 (Ctrl+D)")],
+                [item(
+                    MenuCommand::Deselect,
+                    with_key("選択解除", input.shortcuts.deselect.as_ref()),
+                )],
             );
         }
         return normalize_menu(nodes);
@@ -474,8 +506,14 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         push_group(
             &mut nodes,
             [
-                item(MenuCommand::RotateLeft, "左に回転 (L)"),
-                item(MenuCommand::RotateRight, "右に回転 (R)"),
+                item(
+                    MenuCommand::RotateLeft,
+                    with_key("左に回転", input.shortcuts.rotate_left.as_ref()),
+                ),
+                item(
+                    MenuCommand::RotateRight,
+                    with_key("右に回転", input.shortcuts.rotate_right.as_ref()),
+                ),
             ],
         );
     }
@@ -586,6 +624,12 @@ mod tests {
             pin: None,
             external_tools: Vec::new(),
             associated_apps: Vec::new(),
+            // 既存の期待値と揃うよう、既定の割り当てを解決した結果を渡す。
+            shortcuts: ContextMenuShortcutLabels {
+                rotate_left: Some("L".to_string()),
+                rotate_right: Some("R".to_string()),
+                deselect: Some("Ctrl+D".to_string()),
+            },
         }
     }
 
@@ -605,6 +649,55 @@ mod tests {
         }
         visit(nodes, &mut out);
         out
+    }
+
+    /// キー併記は snapshot が渡した**実際の割り当て**をそのまま出す。
+    ///
+    /// 既定キーをモデル内へ書いていたので、操作カスタマイズで割り当てを変えても
+    /// native / egui の両メニューに以前のキーが出ていた (F16)。
+    #[test]
+    fn the_menu_shows_the_key_that_is_actually_assigned() {
+        let mut input = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        input.has_checked = true;
+        input.checked_count = 2;
+        input.shortcuts = ContextMenuShortcutLabels {
+            rotate_left: Some("Shift+F1".to_string()),
+            rotate_right: Some("Shift+F2".to_string()),
+            deselect: Some("Alt+Q".to_string()),
+        };
+
+        let shown = labels(&build_context_menu(&input));
+
+        assert!(
+            shown.contains(&"左に回転 (Shift+F1)".to_string()),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"右に回転 (Shift+F2)".to_string()),
+            "{shown:?}"
+        );
+        assert!(shown.contains(&"選択解除 (Alt+Q)".to_string()), "{shown:?}");
+        assert!(
+            !shown.iter().any(|label| label.contains("(L)")
+                || label.contains("(R)")
+                || label.contains("(Ctrl+D)")),
+            "既定キーが残っている: {shown:?}"
+        );
+    }
+
+    /// 割り当てを解除したら、括弧ごと出さない (存在しないキーを案内しない)。
+    #[test]
+    fn the_menu_drops_the_suffix_when_the_action_has_no_key() {
+        let mut input = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        input.has_checked = true;
+        input.checked_count = 2;
+        input.shortcuts = ContextMenuShortcutLabels::default();
+
+        let shown = labels(&build_context_menu(&input));
+
+        assert!(shown.contains(&"左に回転".to_string()), "{shown:?}");
+        assert!(shown.contains(&"右に回転".to_string()), "{shown:?}");
+        assert!(shown.contains(&"選択解除".to_string()), "{shown:?}");
     }
 
     fn assert_labels(input: ContextMenuInput, expected: &[&str]) {

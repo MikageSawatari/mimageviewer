@@ -342,6 +342,21 @@ impl GamepadInputState {
         changed
     }
 
+    /// 保持している入力が何も無いか。終端処理を毎フレーム空振りさせないための述語で、
+    /// [`Self::clear`] が落とす項目とここが見る項目は**同じ**でなければならない。
+    pub fn is_idle(&self) -> bool {
+        self.buttons.is_empty()
+            && self.axes.iter().all(|value| *value == 0.0)
+            && self.repeat_next.is_empty()
+            && !self.y_modifier_used
+            && self.west_ring_direction.is_none()
+            && !self.west_tap_suppressed
+            && !self.directional_neutral_required
+            && self.analog_last_tick.is_none()
+            && self.left_stick_next_step.is_none()
+            && self.trigger_next_step.is_none()
+    }
+
     /// 保持中のボタン / 軸 / リピート / step タイマをすべてクリアする。
     /// コントローラ切断時に呼び、握ったまま切断 → リピート/アナログが止まらない
     /// 不具合を防ぐ。トリガーのレンジ較正 (`trigger_ranges`) は次接続でも有効なので残す。
