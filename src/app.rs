@@ -6527,7 +6527,12 @@ impl LocalAiRemoteBarrierSnapshot {
 }
 
 impl LocalAiActivityLease {
-    fn new(active: Arc<AtomicUsize>) -> Self {
+    /// 借用を 1 つ立てる。**数える相手 (`active`) を必ず伴う。**
+    ///
+    /// 本体は [`App::local_ai_activity_lease`] から取る。crate 外の呼び出し (統合テストや
+    /// headless な道具) は自分の counter を持ち込む — 「誰も数えない借用」を作れる口を
+    /// 開けないため、counter 無しの構築手段は用意しない。
+    pub fn new(active: Arc<AtomicUsize>) -> Self {
         active.fetch_add(1, Ordering::AcqRel);
         Self { active }
     }

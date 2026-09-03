@@ -670,6 +670,11 @@ fn batch_export_writes_every_item_through_the_shared_composite_writer() {
             output_dir: out_dir.clone(),
             template: "<dirname>_<filename>".to_string(),
             scale: ExportScale::Half,
+            // crate 外なので App の counter は無い。**借用そのものは必ず伴う** —
+            // 一括書き出しがローカル AI 利用中に見えることを型で強制している (F09)。
+            local_ai_activity: mimageviewer::LocalAiActivityLease::new(std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
             items: vec![
                 batch_item(&src, "a", "src", format),
                 // 同じテンプレート結果になる 2 件目。上書きせず連番になること。
@@ -708,6 +713,11 @@ fn batch_export_reports_a_missing_source_as_one_failed_item_and_keeps_going() {
             output_dir: out_dir.clone(),
             template: "<filename>".to_string(),
             scale: ExportScale::Full,
+            // crate 外なので App の counter は無い。**借用そのものは必ず伴う** —
+            // 一括書き出しがローカル AI 利用中に見えることを型で強制している (F09)。
+            local_ai_activity: mimageviewer::LocalAiActivityLease::new(std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
             items: vec![
                 batch_item(&missing, "gone", "src", format),
                 batch_item(&good, "good", "src", format),

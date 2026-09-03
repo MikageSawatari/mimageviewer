@@ -10,6 +10,8 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+/// 一括書き出しの要求が必ず伴う借用。`app` module 自体は非公開なのでここで出す。
+pub use app::LocalAiActivityLease;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 pub mod archive_cache;
