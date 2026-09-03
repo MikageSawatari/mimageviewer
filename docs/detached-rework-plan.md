@@ -1459,6 +1459,33 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-03 v3.5.0 レビュー F08 で、一括編集の要求に所有 viewer context を焼き付けた
+(ClaudeCode が起票し、Codex が §2 に照らして「所有 context を型付き request/state に要求時から
+保持し、通常完了を既存の mount 境界へ戻す構造修正。§2 の禁止事項や症状パッチには該当しない」
+と判定):**
+
+**触った範囲**: [src/edit_bundle_bulk.rs](../src/edit_bundle_bulk.rs) の `BulkPageEditRun` /
+`BulkPasteConfirm` / `BulkResetConfirm` / `AfterLocalAdjustFence::Bulk` へ `owner_context_id` を
+追加、`in_bulk_edit_owner` 経由で worker 完了 / 回転のみ経路 / 終了時 drain / 保持 override の
+snapshot を所有 context で実行、[src/app.rs](../src/app.rs) に `edit_request_owner_context` と
+`with_owner_viewer_context` (既存 `with_viewer_context` の薄い包み) を追加、
+[src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) は
+`ViewerContextId::for_test` / `build_window_context_for_test` の可視性のみ。detached の viewport
+lifecycle、window binding、session 遷移、snapshot DTO には触れていない。
+
+**判断理由**: 直していたのは「App-global な pending を、先に drain した viewport の bundle へ
+適用していた」ことで、追加したのは要求の所有者という**識別子**と、その所有者を mount して
+完了処理を走らせる既存経路の再利用。viewport ごとの guard や述語は足していない。所有 context が
+既に無い場合は silent fallback にせず、件ごとの失敗として利用者へ出す。
+
+**残っている穴**: 同じ page key を表示している sibling viewer への失効配送は未実装。これは
+v3.5.0 の退行ではなく、単一ページ貼付にも共通する以前からの所有境界の穴 (BA-7)。
+
+**注意 (2026-09-03 に判明)**: `with_viewer_context` を `load_folder_with_scan` を含む処理の
+まわりで使うと、閉包の中の変更が戻らないことがある (外部変更の再走査で実際に踏んだ)。
+`load_folder` 側が自分で context 操作をするため。完了処理を別 context で走らせるときは、
+その処理が context table に触れないことを確かめる。
+
 **2026-09-02 §1.145 で、360 ビューのセッション意図を `ViewerContextBundle` 所有にし、
 park の 2 経路を区別する (ClaudeCode が起票し、Codex が §2 に照らして
 「構造的修正であり症状パッチではない。2 つの park の区別も恣意的ではなく構造的」と判定):**
