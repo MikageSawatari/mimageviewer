@@ -179,12 +179,12 @@ impl App {
     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
     /// Redo スタックへ移す。スタックが空なら no-op。
     pub(crate) fn apply_meta_undo(&mut self) {
-        let Some(entry) = self.meta_undo.pop_undo() else {
+        let Some(mut entry) = self.meta_undo.pop_undo() else {
             return;
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying undo: {summary}"));
-        match &entry {
+        match &mut entry {
             UndoEntry::Rating { changes, .. } => {
                 if let Err(error) =
                     self.apply_rating_changes_to_app(changes, /* use_before */ true)
@@ -210,6 +210,11 @@ impl App {
                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
             }
             UndoEntry::Adjustment { changes, .. } => {
+                // 復元先は、いまの一覧に対して 1 回だけ解決する (レビュー U01)。
+                let resolved = self.resolve_restore_scopes(changes);
+                for (change, scope) in changes.iter_mut().zip(resolved) {
+                    change.scope = scope;
+                }
                 // カスケード復元順序: Global → Favorite → Page
                 // (Page を先に書くと set_page_params の "matches default → prune" が
                 //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
@@ -232,12 +237,12 @@ impl App {
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
-        let Some(entry) = self.meta_undo.pop_redo() else {
+        let Some(mut entry) = self.meta_undo.pop_redo() else {
             return;
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying redo: {summary}"));
-        match &entry {
+        match &mut entry {
             UndoEntry::Rating { changes, .. } => {
                 if let Err(error) =
                     self.apply_rating_changes_to_app(changes, /* use_before */ false)
@@ -262,6 +267,11 @@ impl App {
                 self.submit_tag_restore_jobs(changes, /* use_before */ false);
             }
             UndoEntry::Adjustment { changes, .. } => {
+                // Undo と同じく、復元先は 1 回だけ解決する (レビュー U01)。
+                let resolved = self.resolve_restore_scopes(changes);
+                for (change, scope) in changes.iter_mut().zip(resolved) {
+                    change.scope = scope;
+                }
                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
@@ -438,27 +448,89 @@ impl App {
         self.set_local_adjust_layers_for_idx(c.idx, target.clone());
     }
 
-    /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
-    /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     /// 補正 Undo の **ページ側の復元先**。index ではなくページの識別子で持つ。
     ///
     /// `AdjustUndoScope::Page` は表示上の座標でしかない。`Page` のまま積むと、別の窓で
     /// Ctrl+Z を押したときに **同じ index に居る別の画像**を、この窓の変更前値で上書きする
-    /// (v3.5.0 レビュー T01)。`PageKey` は `idx_hint` をキー一致で検証してから使うので、
+    /// (v3.5.0 レビュー T01)。`PageKey` は取り消す直前に一覧から居場所を引き直すので、
     /// 別の窓では runtime を触らず正本 (DB) だけを戻し、同じ窓では今までどおり動く。
     /// ページキーを持たない項目 (画像でない等) だけ、従来の index 表現へ落ちる。
     pub(crate) fn page_adjust_undo_scope(&self, idx: usize) -> AdjustUndoScope {
         match self.page_adjustment_target_for_idx(idx) {
             Some(mut target) => {
-                // `idx_hint` も落とす。並べ替えでページが別の番号へ動いていたら、そこへ
-                // 戻したい。キーで引き直せば、動いた先が見つかり、別の窓では何も見つからない。
-                target.idx_hint = None;
+                // 居場所は焼き付けない。取り消すのは後なので、並べ替えで番号が動いていたり、
+                // 別の窓には最初から居なかったりする。適用の直前に
+                // [`Self::resolve_restore_scopes`] がまとめて解決する。
+                target.idx_hint = crate::app::PageIndexHint::Unresolved;
                 AdjustUndoScope::PageKey(target)
             }
             None => AdjustUndoScope::Page(idx),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_restore_scopes_for_test(
+        &self,
+        changes: &[AdjustmentChange],
+    ) -> Vec<AdjustUndoScope> {
+        self.resolve_restore_scopes(changes)
+    }
+
+    /// 復元先を、**適用のたびに、いまの一覧に対して 1 回だけ**解決する。
+    ///
+    /// `PageKey` は復元先をページ識別子で持つ (レビュー T01)。未解決のまま 1 件ずつ復元すると
+    /// `page_adjustment_indices` がページごとに一覧を最後まで走査し、全項目のキー文字列を
+    /// 作り直す。一括補正の Undo では対象件数 × 一覧件数になり、1 万件の一覧で UI が秒単位で
+    /// 止まる (v3.5.0 レビュー U01)。ここで一覧を 1 回だけ走査して各ページの居場所を決め、
+    /// 見つからなければ `Absent` を入れて後段に探し直させない。
+    ///
+    /// **前に解決した居場所は使わない。** それは前回適用したときの一覧での話で、Undo と Redo の
+    /// 間に並べ替えや窓の切り替えが入り得る。エントリが持つ正本は識別子だけ。
+    ///
+    /// 同じキーが複数の番号に居る一覧では `Unresolved` のまま残す。1 つの番号では表しきれず、
+    /// 全部へ書く必要があるため。通常の一覧では起きない。
+    fn resolve_restore_scopes(&self, changes: &[AdjustmentChange]) -> Vec<AdjustUndoScope> {
+        use crate::app::PageIndexHint;
+        let page_key = |scope: &AdjustUndoScope| match scope {
+            AdjustUndoScope::PageKey(target) => Some(target.page_key.clone()),
+            _ => None,
+        };
+        let wanted: std::collections::HashSet<String> = changes
+            .iter()
+            .filter_map(|change| page_key(&change.scope))
+            .collect();
+        if wanted.is_empty() {
+            return changes.iter().map(|change| change.scope.clone()).collect();
+        }
+        let mut found: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for idx in 0..self.items.len() {
+            let Some(key) = self.page_path_key(idx) else {
+                continue;
+            };
+            if wanted.contains(&key) {
+                found.entry(key).or_default().push(idx);
+            }
+        }
+        changes
+            .iter()
+            .map(|change| match &change.scope {
+                AdjustUndoScope::PageKey(target) => {
+                    let mut target = target.clone();
+                    target.idx_hint = match found.get(&target.page_key).map(Vec::as_slice) {
+                        Some([idx]) => PageIndexHint::At(*idx),
+                        Some(_) => PageIndexHint::Unresolved,
+                        None => PageIndexHint::Absent,
+                    };
+                    AdjustUndoScope::PageKey(target)
+                }
+                other => other.clone(),
+            })
+            .collect()
+    }
+
+    /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
+    /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     pub(crate) fn capture_adjustment_undo(
         &mut self,
         scope: AdjustUndoScope,

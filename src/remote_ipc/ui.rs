@@ -3512,7 +3512,7 @@ fn remote_adjustment_target(
         location_path,
         sidecar_coords,
         compiled_book,
-        idx_hint: None,
+        idx_hint: crate::app::PageIndexHint::Unresolved,
     })
 }
 

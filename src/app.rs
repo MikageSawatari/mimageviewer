@@ -7543,6 +7543,23 @@ pub(crate) struct AdjustmentDragSession {
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
+/// そのページが **いま mount している一覧のどこに居るか**。
+///
+/// 「まだ調べていない」と「調べたが居ない」を 1 つの `Option` で表していたので、
+/// 居ないページを触るたびに一覧を最後まで走査してキー文字列を作り直していた。一括補正の
+/// Undo では対象件数 × 一覧件数になり、1 万件の一覧で UI が秒単位で止まる
+/// (v3.5.0 レビュー U01)。両者を分けて、解決済みなら探し直さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageIndexHint {
+    /// まだ調べていない。必要になったら一覧から探す。
+    #[default]
+    Unresolved,
+    /// この番号に居るはず。使う側がキー一致を確かめてから使う。
+    At(usize),
+    /// この一覧には居ないと分かっている。探し直さない。
+    Absent,
+}
+
 /// ページ補正の永続 identity。idx が存在しない remote ページも同じ writer へ流す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageAdjustmentTarget {
@@ -7551,9 +7568,9 @@ pub struct PageAdjustmentTarget {
     pub location_path: Option<std::path::PathBuf>,
     pub sidecar_coords: Option<(std::path::PathBuf, String)>,
     pub compiled_book: bool,
-    /// ローカル UI の既存 `set_page_params(idx, ...)` だけが設定する。
-    /// remote は `None` とし、同じ key が mounted items にあればそこへ反映する。
-    pub idx_hint: Option<usize>,
+    /// 一覧での居場所。remote と、記録してから使うまでに一覧が変わり得るもの
+    /// (補正 Undo など) は `Unresolved` で作り、使う直前に解決する。
+    pub idx_hint: PageIndexHint,
 }
 
 /// 画像補正パネルで選ばれている書き込み先。
@@ -54277,7 +54294,7 @@ impl App {
                 .flatten(),
             sidecar_coords: (!compiled_book).then(|| self.sidecar_coords(idx)).flatten(),
             compiled_book,
-            idx_hint: Some(idx),
+            idx_hint: PageIndexHint::At(idx),
         })
     }
 
@@ -61792,14 +61809,18 @@ impl App {
     }
 
     fn page_adjustment_indices(&self, target: &PageAdjustmentTarget) -> Vec<usize> {
-        if let Some(idx) = target.idx_hint {
-            return (self.page_path_key(idx).as_deref() == Some(target.page_key.as_str()))
-                .then_some(vec![idx])
-                .unwrap_or_default();
+        match target.idx_hint {
+            PageIndexHint::Absent => Vec::new(),
+            PageIndexHint::At(idx) => (self.page_path_key(idx).as_deref()
+                == Some(target.page_key.as_str()))
+            .then_some(vec![idx])
+            .unwrap_or_default(),
+            // 走査はページごとに全件のキーを作り直す。まとめて解決できる呼び出しは
+            // 先に解決してから来ること (レビュー U01)。
+            PageIndexHint::Unresolved => (0..self.items.len())
+                .filter(|idx| self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str()))
+                .collect(),
         }
-        (0..self.items.len())
-            .filter(|idx| self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str()))
-            .collect()
     }
 
     pub(crate) fn stored_page_params_for_target(
@@ -61892,6 +61913,8 @@ impl App {
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
         let indices = self.page_adjustment_indices(target);
+        // 実際に書いた場所を使う。hint は解決前 (`Unresolved`) や古い番号のことがある。
+        let written_at = indices.first().copied();
         let old_by_idx = indices
             .iter()
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
@@ -61954,7 +61977,7 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        if let Some(idx) = target.idx_hint {
+        if let Some(idx) = written_at {
             self.record_content_identity_for_idx(
                 idx,
                 crate::content_identity::ContentIdentityTrigger::Edit,
@@ -61986,6 +62009,8 @@ impl App {
         let fallback = self.adjustment_standard_params_for_target(target);
         let thumb_color_changed = !old_effective_for_key.color_settings_eq(&fallback);
         let indices = self.page_adjustment_indices(target);
+        // set 側と同じ理由で、実際に消した場所を使う。
+        let written_at = indices.first().copied();
         let old_by_idx = indices
             .iter()
             .map(|idx| (*idx, self.effective_params(*idx).clone()))
@@ -62031,7 +62056,7 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        if let Some(idx) = target.idx_hint {
+        if let Some(idx) = written_at {
             self.record_content_identity_for_idx(
                 idx,
                 crate::content_identity::ContentIdentityTrigger::Edit,

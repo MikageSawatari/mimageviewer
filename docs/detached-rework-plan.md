@@ -1459,6 +1459,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-03 v3.5.0 レビュー U01 で、補正 Undo の復元先解決を Undo / Redo 1 回あたり
+1 パスへまとめた (Codex が findings.md round7 で「復元側で同じ一覧をページごとに走査しない
+構造にする」と修正境界を指定し、ClaudeCode が実装。T01 の識別子方針は維持したまま、
+解決の回数だけを直す性能修正で、§2 の禁止事項には該当しない):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の `PageAdjustmentTarget.idx_hint` を
+`Option<usize>` から 3 値の `PageIndexHint` (`Unresolved` / `At` / `Absent`) に変え、
+`page_adjustment_indices` を 3 分岐にした。`set_page_params_for_target` /
+`clear_page_params_for_target` の末尾の `record_content_identity_for_idx` は、hint ではなく
+**実際に書いた index** を使う。[src/undo_ops.rs](../src/undo_ops.rs) に
+`resolve_restore_scopes` を新設し、`apply_meta_undo` / `apply_meta_redo` が適用前に 1 回だけ
+呼ぶ。[src/remote_ipc/ui.rs](../src/remote_ipc/ui.rs) は構築時の値だけ。detached の
+viewport lifecycle、window binding、session 遷移、snapshot DTO には触れていない。
+
+**判断理由**: T01 で復元先を識別子にしたとき、`idx_hint` を落として毎回一覧から探すように
+した。`Option<usize>` の `None` が「まだ調べていない」と「調べたが居ない」の両方を意味して
+いたため、居ないページを触るたびに一覧を最後まで走査して全項目のキー文字列を作り直し、
+一括補正の Undo が対象件数 × 一覧件数になっていた (1 万件の一覧・5,000 ページで検索だけ
+約 14 秒)。2 つの意味を型で分け、Undo 1 回につき一覧を 1 回だけ走査して各ページの居場所を
+決める。index へ戻したわけではなく、正本は識別子のまま。**前に解決した居場所は使わない** —
+Undo と Redo の間に並べ替えや窓の切り替えが入り得るので、適用のたびに引き直す。
+
+**残っている穴**: 同じキーが複数の番号に居る一覧では `Unresolved` のまま残し、従来どおり
+走査へ回す。1 つの番号では全部の書き込み先を表せないため。通常の一覧では起きない。
+
 **2026-09-03 v3.5.0 レビュー T01 / T02 で、補正 Undo の復元先をページの識別子にし、
 リング HUD の後始末を開いた窓へ戻した (Codex が findings.md round6 で
 「復元先の page identity を確定まで保ち、Undo / Redo で現在の index に解釈し直さない」

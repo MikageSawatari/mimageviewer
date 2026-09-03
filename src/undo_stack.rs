@@ -520,7 +520,7 @@ mod tests {
                         location_path: None,
                         sidecar_coords: None,
                         compiled_book: false,
-                        idx_hint: None,
+                        idx_hint: crate::app::PageIndexHint::Unresolved,
                     }),
                     before: None,
                     after: Some(AdjustParams::default()),
