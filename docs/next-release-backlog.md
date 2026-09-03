@@ -3335,146 +3335,21 @@ emote-web-log.jsonl`):
 
 ### 5.0 次版の「重要な変更点」に載せるもの
 
-[src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ書く候補。
+[src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ書く候補をここに貯める。
 **既定の挙動が変わったもの**は `must_read` に入れる (更新後初回起動で自動表示される。
-ここに載せないと利用者に伝わらない)。載せたらこの節から消す。
+ここに載せないと利用者に伝わらない)。リリース手順 Phase 1 の 5.5 で `TABLE` へ書き写し、
+**書いたらこの節から消す**。
 
-| 変更 | 区分 | 入った版 |
+| 変更 | 区分 | 入る版 |
 | --- | --- | --- |
-| 右クリックの「アプリケーションで開く…」に登録したアプリが、環境設定の外部ツール設定へ移った (登録は自動で引き継がれる) | must_read | v3.5.0 (予定) |
-| レーティング / ブックマーク一覧で時刻順を選ぶと、フォルダや書庫を先に並べる再配置を通さなくなった (時刻どおりに一列で並ぶ) | must_read | v3.5.0 (予定) |
-| 動画の `Shift+S` の巡回が 3 段階 (非表示 / サムネイル / 波形) から 5 段階へ (全体表示が加わった) | must_read | v3.5.0 (予定) |
-| 右情報パネルに鍵ボタンが付き、固定するとファイルを移動しても開いたままになる (画像へは重ねず右に領域を確保する) | highlights | v3.5.0 (予定) |
-| 複数選択したまま `Ctrl+E` で一括エクスポートできる (出力先 / 形式 / サイズ / ファイル名テンプレート) | highlights | v3.5.0 (予定) |
-| `Ctrl+E` の隠蔽加工プリセット出力が再び選べる (v1.1.0 から選べなくなっていた) | highlights | v3.5.0 (予定) |
-| 編集内容を複数の画像へまとめて貼り付けられる / まとめてリセットできる | highlights | v3.5.0 (予定) |
-| 360 ビューの ON と投影方式が、次に開いた 360 素材へ引き継がれる | highlights | v3.5.0 (予定) |
-| 動画のシークストリップに全体表示と高さ 3 段階が加わった | highlights | v3.5.0 (予定) |
-| 詳細表示に「★設定時刻」列が加わり、レーティング一覧でその順に並べられる | highlights | v3.5.0 (予定) |
+| (次版ぶんはまだ無い) | | |
 
-**この表は候補案 (2026-09-03 時点)。** リリース手順 Phase 1 の 5.5 で
-[src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ書き写し、書いたら
-この表から消す。`must_read` の 3 件は**いずれもリリース済みの挙動が変わるもの**なので、
-落とすと利用者に伝わらない。
+v3.5.0 ぶんは記載済み (必読 3 件 = 右クリックの Windows 項目の移動 / 時刻順で種類をまとめない /
+`Shift+S` 巡回が 5 段階、新機能 4 件 = 外部ツール連携 / シークストリップ全体表示 /
+情報パネル固定 / 一括エクスポート)。候補に挙げていた「隠蔽加工プリセット出力」「編集内容の
+一括貼付・リセット」「360 の引き継ぎ」「★設定時刻列」は、ダイアログを短く保つため
+**載せない判断**をした (挙動の変更ではなく追加機能なので、更新履歴で足りる)。
 
-v3.2.0 ぶんは [src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ記載済み
-(必読 3 件 = 代表画像の既定 / バケツの塗り 1px / 消しゴムの色調合わせ、新機能 7 件)。
-
-### 5.11 v3.2.0 出荷前確認の記録 (2026-08-23)
-
-**動画アップスケール (`video-upscale-shader`) をマージした後の最終ビルドに対する記録。**
-マージ前のビルドに対する旧記録はこれで置き換えた。
-
-配布ビルド: `build-dist.ps1` (全体テスト込み) → 署名の 1 本目で
-SimplySign のクラウド鍵セッション切れにより失敗 → 再ログイン後
-`build-dist.ps1 -SkipRustTests` で完走 (同一ソースでゲート通過済みのため但し書きに合致)。
-
-| 項目 | 結果 |
-| --- | --- |
-| Rust 全体テスト | ✅ 失敗 0 件 (`lib` 単体でも 6,200 passed)。**フルゲート中に mIV を操作すると `ui_fullscreen::tests` が 5 件落ちる**ので触らないこと |
-| CI (GitHub Actions) | ✅ 緑 (`f053625d`)。**`build.rs` の fxc 呼び出しが非 Windows で問題ないことを実証**。`native_presenter` が `#[cfg(windows)]` なので生成テーブルを `include!` する経路が Linux に無く、`find_fxc` も `Ok(None)` になる |
-| コード署名 | ✅ 単体exe / setup.exe / portable の 3 種とも `Valid` + RFC3161。内包 vendor PE (pdfium / onnxruntime / FFmpeg 6 本) も `Valid` |
-| CRT 静的リンク | ✅ `VCRUNTIME140.dll` / `MSVCP140.dll` 依存なし |
-| PDFium | ✅ 最新 (chromium/8009) |
-| FFmpeg | ⏸ 4 コミット新しい版あり (`n7.1.5-12-g1fdbca85aa` → `-16-g9a4bb2c579`)。**見送り** — 同じ 7.1.5 系で必要な修正が特定できておらず、更新すると LGPL 対応ソースの再掲と製品ページの手書き節の更新が伴う |
-| idle health: static-foreground | ✅ PASS (完全 sleep、perf event 0 件 / CPU 1 コア比 0.0396。外部 sampler が同一 session を確認済み) |
-| idle health: static-background | ✅ PASS (完全 sleep、perf event 0 件 / CPU 1 コア比 0.0167) |
-| idle health: tray-residency | ⏭ 本ビルドでは未実施。マージ前ビルドでは PASS したが**軽い条件のみ** (`evidence_floor` が起動時のままで、サムネイル読込中に閉じた状態では測っていない) |
-| idle health: video-pin-background | ⏭ 未実施 (waiver)。動画を代表画像に固定し、かつキャッシュから読み直される状態のフォルダが必要 |
-| ポータブル版 smoke | ✅ 実機確認済み (`data\` が exe の隣、APPDATA 不変) |
-| 「重要な変更点」表示 | ✅ `--whatsnew-from 3.1.3` で**必読 4 + 新機能 8** を確認 |
-| 機能の実機確認 | ✅ 製本の復元抑止 (出ないこと + Explorer コピーでは出ること)、動画アップスケール、復元モーダル / ESC、動画バー固定、設定の移動先、**T キー** (別ウィンドウ動画 → メインで PDF → 動画へ戻って T)、**キー割り当て一覧のラベル 2 件** |
-
-**見送り (実施不要と判断)**: 検索ベンチ回帰 (本版で検索未変更)、perf smoke。
-
-**次回への申し送り**: `Assert-MivSignReady` は証明書ストアの存在確認だけなので、
-SimplySign のクラウド鍵セッションが切れていても通過する (証明書の公開情報だけが残り
-秘密鍵が外れるため)。**ビルド 40 分を消費してから署名で落ちる。**
-使い捨ての PE を 1 本実署名してから配布ビルドに入れば数秒で分かる。
-事前チェック自体をその形にする改善は §5.12。
-
-### 5.13 v3.2.0 の残り公開作業 (2026-08-23 時点)
-
-**出荷判断は済んでいる。出荷前確認は 2026-08-23 に全件完了した。**残りは公開手順のみ。手順の正本は CLAUDE.md「リリース手順チェックリスト」。
-
-済んでいるもの: Phase 0 (更新履歴・利用者承認済み) / Phase 1 (版番号・installer・製品ページ・
-`changelog.html` 再生成・`version_highlights`) / Phase 2 (PDFium 最新・FFmpeg 見送り判断・CI 緑) /
-全体テスト / 配布ビルドと署名。記録は §5.11。
-
-残り:
-
-1. ✅ **配布ビルドの最終版を検証** — 3 種とも `Valid` + RFC3161、CRT 静的。
-2. ✅ **実機確認 (利用者)** — アイドル健全性 2 シナリオ、T キー、キー割り当てラベル、
-   製本、ポータブル版 smoke すべて完了。
-3. ✅ **§5.11 の記録を最終ビルドに合わせて更新。**
-4. ✅ **push** — `master` と `master:main` を `09758b90` まで同期。
-5. ✅ **Vector 申請用 zip** — `dist\mImageViewer_installer_v3.2.0.zip` (setup.exe + readme.txt)。
-6. ✅ **タグと Release** — `v3.2.0` を公開。body は README の v3.2.0 節 (7,111 バイト)。
-   Assets 4 点とも `uploaded`。<https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.2.0>
-7. ✅ **リリース日** — 2026-08-23 で README 見出し・製品ページとも一致。
-8. ✅ **Phase 5** — mikage.to 反映済み / Vector 申請済み (2026-08-23)。
-   任意の窓の杜・MS Store は見送り (毎リリース必須ではない)。
-9. **公開後の目視確認 (未実施)** — 別マシンで起動し、更新通知ダイアログの body が崩れずに出るか。
-
-**この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
-
-### 5.15 v3.3.1 の公開記録 (2026-08-30)
-
-測定値は [release-verification-records.md](release-verification-records.md) の v3.3.1 節。
-ここには**公開作業の到達点**だけ置く。
-
-1. ✅ **Phase 0 / 1** — README 更新履歴 (4,359 バイト、8KB 上限内なので短縮版なし)、
-   バージョン表記 5 箇所、製品ページの版・最終更新・ポータブル版リンク、
-   `changelog.html` 再生成、`version_highlights.rs` に must_read 1 件
-   (カーソル位置の復元 = 既定で挙動が変わるもの)。既知の問題は 2 件残置し、
-   **未修正のゲームパッド十字キーによる別ウィンドウ動画シーク不可を 1 件追加**。
-2. ✅ **Phase 2** — PDFium は最新。**FFmpeg を更新** (H.264 フレームスレッド同期の修正 2 件、
-   詳細は verification-records)。`check-non-windows-shadow.ps1` PASS。
-   `test-full.ps1` 全緑。idle health 4 シナリオ PASS。perf smoke は 2 回取得。
-3. ✅ **Phase 3** — `build-dist.ps1 -SkipVst3Bridge`。4 成果物すべて署名 +
-   RFC3161 タイムスタンプ、`dumpbin` で VCRUNTIME/MSVCP 不在を確認。
-4. ✅ **Phase 4** — タグ `v3.3.1` 公開、Assets 4 点。
-   <https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.3.1>
-   公開 body は 4,321 バイトで、**記法が `changelog_markdown` の対応範囲に収まることを
-   機械的に確認** (13 行すべて箇条書き、`**` 28 個で釣り合い、`<kbd>` 2 組、
-   他の HTML タグ・見出し・リンク・画像なし)。
-5. ✅ **Phase 5** — mikage.to 反映済み。**3 つのダウンロードリンクは GitHub Releases 向けで、
-   実際に辿って 200 + サイズ一致を確認。FFmpeg 対応ソースは実際に落として sha256 照合済み**
-   (LGPL 義務)。Vector 申請済み。窓の杜は見送り。**MS Store は保留** — v3.3.0 がまだ審査中のため。
-6. ✅ **公開後の目視確認 — 手順から外した。** 崩れの主因である記法は自動テスト
-   (`changelog_markdown::tests::the_newest_changelog_entry_only_uses_markup_this_renderer_handles`)
-   が公開**前**に見る。目視は体裁しか分からず、公開後でないと試せなかった。
-7. ✅ **積み残しの掃除** — mikage.to の `/mimageviewer/mimageviewer.exe` (ページから
-   参照されていない古い単体exe) を削除。404 を確認済み。
-
-**この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
-
-### 5.14 v3.3.0 の公開記録 (2026-08-29)
-
-測定値は [release-verification-records.md](release-verification-records.md) の v3.3.0 節。
-ここには**公開作業の到達点**だけ置く。
-
-1. ✅ **Phase 0 / 1** — README 更新履歴 (6,958 バイト、8KB 上限内なので短縮版なし)、
-   バージョン表記 4 箇所、製品ページの版・最終更新・ポータブル版リンク、
-   `changelog.html` 再生成 (差分なし)、`version_highlights.rs`、既知の問題 2 件は残置
-   (どちらも今回直していない)。
-2. ✅ **Phase 2** — 依存確認・`test-full.ps1` 7,604 passed / 0 failed・idle health 4 シナリオ
-   PASS・perf smoke 97.3%。
-3. ✅ **Phase 3** — `build-dist.ps1 -SkipVst3Bridge`。**1 回目は起動中の mIV を検出して停止**
-   (ガードが正しく働いた。core 8 = 本体 + PDF ワーカープール)。終了後に再実行して成功。
-   4 成果物すべて署名済み、`dumpbin` / `signtool` の回帰チェック合格。
-4. ✅ **Phase 4** — タグ `v3.3.0` 公開、Release body は README 節とバイト一致、
-   Assets 4 点。<https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.3.0>
-5. ✅ **Phase 5** — mikage.to 反映済み / Vector 申請済み (2026-08-29)。
-   窓の杜は**メジャーリリース時のみ**とする方針に変更。MS Store は更新を実施
-   (版付き直リンク `https://mikage.to/mimageviewer/download/v3.3.0/mImageViewer_setup.exe`
-   がリダイレクト 0・`Content-Length` 一致を確認済み)。X 告知済み。
-6. **公開後の目視確認 (未実施)** — 別マシンで起動し、更新通知ダイアログの body が
-   崩れずに出るか。
-7. **この版のレビュー** — 26 件中 11 件修正、1 件反証で取り下げ、12 件を v3.3.1 へ。
-   正本は [review-v3.3.0/README.md](review-v3.3.0/README.md)、先送りの判断根拠は §1.0。
-
-**この節はここで閉じる。** 次版のリリース記録は新しい節を起こす。
 
 ### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
 
