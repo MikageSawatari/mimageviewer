@@ -440,6 +440,25 @@ impl App {
 
     /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
     /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
+    /// 補正 Undo の **ページ側の復元先**。index ではなくページの識別子で持つ。
+    ///
+    /// `AdjustUndoScope::Page` は表示上の座標でしかない。`Page` のまま積むと、別の窓で
+    /// Ctrl+Z を押したときに **同じ index に居る別の画像**を、この窓の変更前値で上書きする
+    /// (v3.5.0 レビュー T01)。`PageKey` は `idx_hint` をキー一致で検証してから使うので、
+    /// 別の窓では runtime を触らず正本 (DB) だけを戻し、同じ窓では今までどおり動く。
+    /// ページキーを持たない項目 (画像でない等) だけ、従来の index 表現へ落ちる。
+    pub(crate) fn page_adjust_undo_scope(&self, idx: usize) -> AdjustUndoScope {
+        match self.page_adjustment_target_for_idx(idx) {
+            Some(mut target) => {
+                // `idx_hint` も落とす。並べ替えでページが別の番号へ動いていたら、そこへ
+                // 戻したい。キーで引き直せば、動いた先が見つかり、別の窓では何も見つからない。
+                target.idx_hint = None;
+                AdjustUndoScope::PageKey(target)
+            }
+            None => AdjustUndoScope::Page(idx),
+        }
+    }
+
     pub(crate) fn capture_adjustment_undo(
         &mut self,
         scope: AdjustUndoScope,
@@ -549,21 +568,26 @@ impl App {
             let after_p = self.adjustment_page_params.get(idx);
             if Some(before_p) != after_p {
                 changes.push(AdjustmentChange {
-                    scope: AdjustUndoScope::Page(*idx),
+                    scope: self.page_adjust_undo_scope(*idx),
                     before: Some(before_p.clone()),
                     after: after_p.cloned(),
                 });
             }
         }
         // 新規追加された Page (旧側に無かったキー)
-        for (idx, after_p) in &self.adjustment_page_params {
-            if !pages_before.contains_key(idx) {
-                changes.push(AdjustmentChange {
-                    scope: AdjustUndoScope::Page(*idx),
-                    before: None,
-                    after: Some(after_p.clone()),
-                });
-            }
+        let added: Vec<usize> = self
+            .adjustment_page_params
+            .keys()
+            .filter(|idx| !pages_before.contains_key(idx))
+            .copied()
+            .collect();
+        for idx in added {
+            let after_p = self.adjustment_page_params.get(&idx).cloned();
+            changes.push(AdjustmentChange {
+                scope: self.page_adjust_undo_scope(idx),
+                before: None,
+                after: after_p,
+            });
         }
 
         // Favorite 差分
@@ -597,14 +621,15 @@ impl App {
         }
 
         if let Some(target) = external_target {
-            let represented_by_index = changes.iter().any(|change| match &change.scope {
+            let represented_by_page_change = changes.iter().any(|change| match &change.scope {
                 AdjustUndoScope::Page(idx) => {
                     self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str())
                 }
+                AdjustUndoScope::PageKey(other) => other.page_key == target.page_key,
                 _ => false,
             });
             let external_after = self.stored_page_params_for_target(&target);
-            if !represented_by_index && external_before != external_after {
+            if !represented_by_page_change && external_before != external_after {
                 changes.push(AdjustmentChange {
                     scope: AdjustUndoScope::PageKey(target),
                     before: external_before,

@@ -4211,14 +4211,25 @@ impl App {
         let _ = ctx;
     }
 
-    fn clear_native_video_picker_overlay(&mut self, ctx: &egui::Context) {
+    /// リングの native HUD を消し、**消せた player の idx** を返す。
+    ///
+    /// 届く相手は mount 中の context のフルスクリーン動画だけ。返り値で「どこにも届かな
+    /// かった」を観測できるようにしてある (v3.5.0 レビュー T02)。
+    pub(crate) fn clear_native_video_picker_overlay(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<usize> {
         #[cfg(windows)]
         {
-            self.set_native_video_ring_picker_overlay(None);
+            let reached = self.set_native_video_ring_picker_overlay(None);
             self.request_native_video_hud_repaint(ctx);
+            reached
         }
         #[cfg(not(windows))]
-        let _ = ctx;
+        {
+            let _ = ctx;
+            None
+        }
     }
 
     pub(crate) fn sync_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
@@ -4560,9 +4571,7 @@ impl App {
         let Some(picker) = self.ring_picker.take() else {
             return;
         };
-        if picker.context == RingShortcutContext::VideoFullscreen {
-            self.clear_native_video_picker_overlay(ctx);
-        }
+        // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
         self.gamepad_state.cancel_west_ring();
         self.gamepad_state.require_directional_neutral();
         let (item_rating_changes, container_rating_record) =
@@ -4720,14 +4729,31 @@ impl App {
     /// (v3.5.0 レビュー S01)。
     ///
     /// 所有 context が既に無ければ (窓を閉じた等) 反映先が無いので何もしない。
-    fn apply_ring_picker_state(&mut self, ctx: &egui::Context, picker: RingPickerState) {
+    /// 戻り値はリング HUD を消せた player の idx (動画以外・届かなかった場合は `None`)。
+    pub(crate) fn apply_ring_picker_state(
+        &mut self,
+        ctx: &egui::Context,
+        picker: RingPickerState,
+    ) -> Option<usize> {
         let owner = picker.owner;
         self.with_owner_viewer_context(owner, move |app| {
             app.apply_ring_picker_state_in_owner(ctx, picker)
-        });
+        })
+        .flatten()
     }
 
-    fn apply_ring_picker_state_in_owner(&mut self, ctx: &egui::Context, picker: RingPickerState) {
+    fn apply_ring_picker_state_in_owner(
+        &mut self,
+        ctx: &egui::Context,
+        picker: RingPickerState,
+    ) -> Option<usize> {
+        // **native HUD の後始末も開いた窓の上で。** setter は mount 中の `fullscreen_idx` と
+        // `fs_cache` から player を引くので、前面の窓で呼んでも開いた窓の presenter には
+        // 届かず、パッドを失った後もリングが描かれたまま残る (v3.5.0 レビュー T02)。
+        // ページが動いていても表示は片付けるので、下の anchor 判定より前に置く。
+        let hud_cleared = (picker.context == RingShortcutContext::VideoFullscreen)
+            .then(|| self.clear_native_video_picker_overlay(ctx))
+            .flatten();
         match picker.context {
             RingShortcutContext::Grid => self.apply_grid_picker_state(picker),
             RingShortcutContext::ImageFullscreen => {
@@ -4741,6 +4767,7 @@ impl App {
                 }
             }
         }
+        hud_cleared
     }
 
     /// 所有 context を mount した状態で、**リングを開いたページがまだそこにあるか**を見る。

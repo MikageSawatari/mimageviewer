@@ -46,12 +46,17 @@ use crate::adjustment::AdjustParams;
 /// 書き戻しは `App::apply_adjustment_change_to_app` がスコープごとに分岐する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdjustUndoScope {
-    /// ページ個別設定 (`adjustment_page_params[fs_idx]`)。`fs_idx` は capture 時点の
-    /// フルスクリーン idx。フルスクリーン中の画像移動・終了で undo_stack ごとクリア
-    /// されるので idx の陳腐化は起きない前提。
+    /// ページ個別設定を**表示上の index だけ**で指す。ページキーを取れない項目
+    /// (画像でない等) 用の退避先で、通常の補正はここへ積まない。
+    ///
+    /// この前提は「フルスクリーン中の画像移動・終了で undo_stack ごとクリアされるので
+    /// idx は陳腐化しない」だったが、成り立つのは 1 つの窓の中だけだった。別の窓は自分の
+    /// index を持つので、そこで Ctrl+Z を押すと同じ番号の別の画像を書き換えていた
+    /// (v3.5.0 レビュー T01)。`App::page_adjust_undo_scope` を使って `PageKey` で積む。
     Page(usize),
-    /// 一覧に mount されていない remote ページ。論理キーと永続化座標を capture 時に
-    /// 固定し、ページ移動後も同じ対象へ Undo/Redo する。
+    /// ページ個別設定を**ページの識別子**で指す。論理キーと永続化座標を capture 時に
+    /// 固定し、並べ替え・別ウィンドウ・一覧に mount されていない remote ページでも
+    /// 同じ対象へ Undo/Redo する。
     PageKey(crate::app::PageAdjustmentTarget),
     /// お気に入り標準 (`adjustment_favorite_params[uuid]`)。
     Favorite(uuid::Uuid),

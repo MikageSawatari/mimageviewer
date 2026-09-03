@@ -1459,6 +1459,39 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-03 v3.5.0 レビュー T01 / T02 で、補正 Undo の復元先をページの識別子にし、
+リング HUD の後始末を開いた窓へ戻した (Codex が findings.md round6 で
+「復元先の page identity を確定まで保ち、Undo / Redo で現在の index に解釈し直さない」
+「native 表示の終了を、開いた context / presenter が所有するライフサイクルへ戻す」と
+修正境界を指定し、ClaudeCode がその境界どおりに実装。S01 と同じ「識別子で持ち、既存の
+所有者へ戻す」構造修正で、§2 の禁止事項には該当しない):**
+
+**触った範囲**: [src/undo_ops.rs](../src/undo_ops.rs) に `page_adjust_undo_scope` を新設し、
+`capture_adjust_full_inner` の 2 か所と [src/app.rs](../src/app.rs) /
+[src/ui_adjustment_panel.rs](../src/ui_adjustment_panel.rs) の直接構築 3 か所をそこへ寄せた。
+[src/undo_stack.rs](../src/undo_stack.rs) は `AdjustUndoScope` の doc のみ。
+[src/app/native_video.rs](../src/app/native_video.rs) の
+`set_native_video_ring_picker_overlay` が届いた idx を返すようにし、
+[src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の
+`clear_native_video_picker_overlay` 呼び出しを `commit_ring_picker` から
+`apply_ring_picker_state_in_owner` (= owner を mount した中) へ移した。
+detached の viewport lifecycle、window binding、session 遷移、snapshot DTO、
+`ring_picker_is_stale` の判定には触れていない。
+
+**判断理由**: T01 で直したのは「Undo が復元先を**表示上の index**で持っていた」こと。
+`AdjustUndoScope::Page` の doc は「フルスクリーン中の画像移動・終了で undo_stack ごと
+クリアされるので idx は陳腐化しない」と書いていたが、成り立つのは 1 つの窓の中だけで、
+別の窓は自分の index 空間を持つ。既にあった `PageKey` (= ページ識別子) へ寄せただけで、
+3 つ目の綴りを足していない。`idx_hint` は落として毎回キーで引き直すので、並べ替えで
+ページが動いていれば動いた先へ戻り、別の窓では何も見つからず runtime を触らない。
+T02 は setter が「どこにも届かなかった」を黙って捨てていたので、届いた idx を返すようにし、
+その答えを所有者 mount の中で取る。無関係な前面 player への一括 clear は入れていない。
+
+**残っている穴**: 別の窓で Undo したとき、正本 (DB) は戻るが、**開いた窓の runtime**
+(`adjustment_page_params`) は変更後のままで、その窓が読み直すまで表示に反映されない。
+これは「別ページの正本を書き換える」T01 とは別の層で、**同じページを見ている別 viewer へ
+失効を配る** R11 / backlog §1.173 と同じ。今回そちらへ明示的に追記した。
+
 **2026-09-03 v3.5.0 レビュー S01 で、リング picker の確定を開いた viewer context 上で
 完結させた (Codex が findings.md round5 S01 で「picker を開いた所有 context と変更対象・
 変更前値を確定まで保ち、既存の編集を終える要求を現在の前面への新規入力と区別する」修正境界を

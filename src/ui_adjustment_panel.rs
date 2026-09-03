@@ -16369,7 +16369,7 @@ impl App {
                         self.set_page_params(fs_idx, edit_params.clone());
                         let after = self.adjustment_page_params.get(&fs_idx).cloned();
                         self.capture_adjustment_undo(
-                            crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                            self.page_adjust_undo_scope(fs_idx),
                             before,
                             after,
                             "ページ個別の補正".to_string(),
@@ -16425,7 +16425,7 @@ impl App {
                     }
                     let after = self.adjustment_page_params.get(&fs_idx).cloned();
                     self.capture_adjustment_undo(
-                        crate::undo_stack::AdjustUndoScope::Page(fs_idx),
+                        self.page_adjust_undo_scope(fs_idx),
                         session.before,
                         after,
                         "ページ個別の補正".to_string(),

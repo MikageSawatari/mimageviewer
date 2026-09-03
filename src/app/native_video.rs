@@ -11637,16 +11637,22 @@ impl App {
     }
 
     #[cfg(windows)]
+    /// リング HUD を **mount 中の context の**フルスクリーン動画へ渡し、届いた idx を返す。
+    ///
+    /// `fullscreen_idx` も `fs_cache` も context ごとなので、この setter は mount している
+    /// 窓の player にしか届かない。届かなかったことを黙って捨てていたので、別の窓で終了処理を
+    /// 走らせるとリングを開いた窓の HUD が残ったままになっていた (v3.5.0 レビュー T02)。
+    /// 呼び出し側が届いたかを確かめられるように、答えを返す。
     pub(crate) fn set_native_video_ring_picker_overlay(
         &self,
         overlay: Option<crate::video::native_presenter::NativeOverlayRingPicker>,
-    ) {
-        let Some(fs_idx) = self.fullscreen_idx else {
-            return;
+    ) -> Option<usize> {
+        let fs_idx = self.fullscreen_idx?;
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return None;
         };
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_ring_picker_overlay(overlay);
-        }
+        player.set_native_ring_picker_overlay(overlay);
+        Some(fs_idx)
     }
 
     #[cfg(windows)]

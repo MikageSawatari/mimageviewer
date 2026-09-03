@@ -38355,7 +38355,7 @@ impl App {
                 }
                 let after = self.adjustment_page_params.get(&session.fs_idx).cloned();
                 self.capture_adjustment_undo(
-                    crate::undo_stack::AdjustUndoScope::Page(session.fs_idx),
+                    self.page_adjust_undo_scope(session.fs_idx),
                     session.before,
                     after,
                     "ページ個別の補正".to_string(),

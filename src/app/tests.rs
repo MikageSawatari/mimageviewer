@@ -66209,6 +66209,224 @@ mod ring_picker_owner_tests {
         );
     }
 
+    /// 別の窓で Undo しても、**その窓の画像は書き換えない**。
+    ///
+    /// 補正 Undo は復元先を index だけで持っていた。index は表示上の座標なので、リングを
+    /// 開いた窓 B で確定したあと前面の A / C で Ctrl+Z を押すと、同じ index に居る**別の
+    /// 画像**が B の変更前値で塗り替えられていた (v3.5.0 レビュー T01)。Redo も同じ形で
+    /// B の変更後値を書いていた。
+    #[test]
+    #[cfg(windows)]
+    fn undoing_from_another_window_leaves_that_window_s_image_alone() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        setup_owner_window(&mut app, PostFilter::GameBoy);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        let other = app.build_window_context_for_test(946, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/other"));
+            c.fullscreen_idx = Some(0);
+            c.adjustment_page_params
+                .insert(0, page_params(PostFilter::Famicom));
+        });
+
+        app.with_owner_viewer_context(other, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+        assert_eq!(
+            page_filter(&app),
+            Some(PostFilter::Nearest),
+            "前提: B へ入る"
+        );
+
+        // 前面の窓のまま Ctrl+Z / Ctrl+Y。
+        let (after_undo, after_redo) = app
+            .with_owner_viewer_context(other, |a| {
+                a.apply_meta_undo();
+                let undone = page_filter(a);
+                a.apply_meta_redo();
+                (undone, page_filter(a))
+            })
+            .expect("別 context を mount できる");
+
+        assert_eq!(
+            after_undo,
+            Some(PostFilter::Famicom),
+            "Undo は前面の窓の画像を書き換えない"
+        );
+        assert_eq!(
+            after_redo,
+            Some(PostFilter::Famicom),
+            "Redo も前面の窓の画像を書き換えない"
+        );
+    }
+
+    /// 別の窓で Undo しても、**正本 (DB) は開いた窓のページを戻す**。
+    ///
+    /// 別ページを守るために復元そのものを捨てたのでは、書いた補正を取り消せなくなる。
+    #[test]
+    #[cfg(windows)]
+    fn undoing_from_another_window_still_restores_the_owner_page_in_the_store() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let owner_image = app.tmp.path().join("owner.jpg");
+        std::fs::write(&owner_image, b"not decoded by this test").unwrap();
+        app.items = vec![GridItem::Image(owner_image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.fullscreen_idx = Some(0);
+        app.set_page_params(0, page_params(PostFilter::GameBoy));
+        let owner_key = crate::adjustment_db::normalize_path(&owner_image);
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.dirty_rows.push(RingPickerRowId::PostFilter);
+        picker.post_filter = PostFilter::Nearest;
+        app.ring_picker = Some(picker);
+
+        let other = app.build_window_context_for_test(947, |c| {
+            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/other"));
+            c.fullscreen_idx = Some(0);
+            c.adjustment_page_params
+                .insert(0, page_params(PostFilter::Famicom));
+        });
+
+        app.with_owner_viewer_context(other, |a| a.commit_ring_picker(&ctx))
+            .expect("別 context を mount できる");
+        let stored_after_commit = app
+            .adjustment_db
+            .as_ref()
+            .and_then(|db| db.get_page_params(&owner_key))
+            .map(|p| p.post_filter);
+        assert_eq!(
+            stored_after_commit,
+            Some(PostFilter::Nearest),
+            "前提: 開いた窓のページが正本に入る"
+        );
+
+        app.with_owner_viewer_context(other, |a| a.apply_meta_undo())
+            .expect("別 context を mount できる");
+
+        let stored_after_undo = app
+            .adjustment_db
+            .as_ref()
+            .and_then(|db| db.get_page_params(&owner_key))
+            .map(|p| p.post_filter);
+        assert_eq!(
+            stored_after_undo,
+            Some(PostFilter::GameBoy),
+            "開いた窓のページは正本から戻せる"
+        );
+    }
+
+    /// 同じ窓の一覧が並べ替わっても、Undo は**そのページ**へ戻す。
+    ///
+    /// index で持っていると、並べ替え後の同じ index に居る別の画像を書き換える。
+    #[test]
+    fn undo_follows_the_page_after_the_list_is_reordered() {
+        let mut app = setup_app();
+        let first = app.tmp.path().join("a.jpg");
+        let second = app.tmp.path().join("b.jpg");
+        for path in [&first, &second] {
+            std::fs::write(path, b"not decoded by this test").unwrap();
+        }
+        app.items = vec![
+            GridItem::Image(first.clone()),
+            GridItem::Image(second.clone()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.fullscreen_idx = Some(0);
+        app.set_page_params(0, page_params(PostFilter::GameBoy));
+        app.set_page_params(1, page_params(PostFilter::Famicom));
+
+        app.capture_adjust_full("テスト".to_string(), |a| {
+            a.set_page_params(0, page_params(PostFilter::Nearest));
+        });
+
+        // 並べ替えで index が入れ替わる。
+        app.items.swap(0, 1);
+        let swapped = app.adjustment_page_params.get(&0).cloned();
+        let swapped_other = app.adjustment_page_params.get(&1).cloned();
+        app.adjustment_page_params.insert(0, swapped_other.unwrap());
+        app.adjustment_page_params.insert(1, swapped.unwrap());
+
+        app.apply_meta_undo();
+
+        assert_eq!(
+            app.adjustment_page_params.get(&1).map(|p| p.post_filter),
+            Some(PostFilter::GameBoy),
+            "動いた先のページへ戻す"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&0).map(|p| p.post_filter),
+            Some(PostFilter::Famicom),
+            "同じ index に来た別の画像は変えない"
+        );
+    }
+
+    /// 動画リングの native HUD は、**開いた窓の presenter** から消える。
+    ///
+    /// setter は mount 中の `fullscreen_idx` / `fs_cache` から player を引く。終了処理を
+    /// 前面の一覧で走らせていたので、リングを開いた動画窓の HUD が残り、パッドを失った後は
+    /// 閉じる手段も無くなっていた (v3.5.0 レビュー T02)。
+    #[test]
+    #[cfg(windows)]
+    fn the_video_ring_hud_is_cleared_on_the_window_that_opened_it() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        // 前面はメイン一覧。フルスクリーンの動画を持たない。
+        app.items = vec![GridItem::Image(PathBuf::from("C:/main/m.jpg"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.current_folder = Some(PathBuf::from("C:/main"));
+        app.fullscreen_idx = None;
+
+        let video = PathBuf::from("C:/opened/movie.mp4");
+        let owner = app.build_window_context_for_test(948, |c| {
+            c.items = vec![GridItem::Video(video.clone())];
+            c.thumbnails = vec![ThumbnailState::Pending];
+            c.current_folder = Some(PathBuf::from("C:/opened"));
+            c.fullscreen_idx = Some(0);
+            c.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                        video.clone(),
+                        0.0,
+                    )),
+                    load_seq: 0,
+                },
+            );
+        });
+
+        let picker = app
+            .with_owner_viewer_context(owner, |a| {
+                a.build_ring_picker_state(RingShortcutContext::VideoFullscreen)
+            })
+            .expect("別 context を mount できる");
+        assert_eq!(picker.context, RingShortcutContext::VideoFullscreen);
+
+        // 前面の一覧からは開いた窓の player に届かない。だから mount が要る。
+        assert_eq!(
+            app.clear_native_video_picker_overlay(&ctx),
+            None,
+            "前提: 前面の一覧には消せる player が無い"
+        );
+
+        let reached = app.apply_ring_picker_state(&ctx, picker);
+
+        assert_eq!(
+            reached,
+            Some(0),
+            "リングを開いた動画窓の presenter まで表示解除が届く"
+        );
+    }
     /// 同じ窓で閉じる通常の確定は、そのまま効く。
     #[test]
     fn a_ring_display_effect_still_commits_in_the_window_that_opened_it() {
