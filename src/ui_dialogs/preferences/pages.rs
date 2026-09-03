@@ -1681,6 +1681,17 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(concat!(
+                "エクスポート (1 枚) と、外部ツールへ見開きを 1 枚に合成して渡す場合は、",
+                "この設定にかかわらず表示している結果をそのまま書き出します。",
+            ))
+            .weak(),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(concat!(
                 "後から別のソフトで加工するなら、浅い段のほうが扱いやすくなります。",
                 "そのまま見せる画像を作るなら、深い段が画面に近くなります。",
             ))

@@ -25807,7 +25807,30 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。
+    /// フォルダーを読み込み直したら、**覚えている拡張子も並べ直す**。
+    ///
+    /// メニューを閉じるたびに捨てるのをやめたので、他に更新契機が無い。飛ばすと、アプリを
+    /// 入れた / 消した / 関連付けを変えたことが終了まで反映されず、一時的な失敗で空を
+    /// 覚えた場合も直らない (v3.5.0 レビュー R13)。
+    #[test]
+    fn reloading_the_folder_re_enumerates_extensions_already_in_the_cache() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        // 既に .jpg を覚えている (古い内容)。
+        app.cached_handlers.insert(".jpg".to_string(), Vec::new());
+
+        app.poll_association_handler_prewarm();
+
+        assert!(
+            app.association_prewarm.is_some(),
+            "覚えている拡張子でも並べ直す"
+        );
+    }
+
+    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。    /// 準備は**フォルダーごとに 1 回**。毎フレーム worker を作らない。
     #[test]
     fn the_association_prewarm_runs_once_per_folder_load() {
         use crate::grid_item::GridItem;

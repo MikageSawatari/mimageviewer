@@ -53053,7 +53053,11 @@ impl App {
     ///
     /// 右クリックのメニューは同じフレームで組み立てるので、そこから列挙を始めたのでは
     /// 間に合わない。フォルダーを読み込むたびに 1 回だけ走らせ、メニューは準備済みの
-    /// 一覧を使う (v3.5.0 レビュー F13)。関連付けの変更もフォルダーを開き直せば拾える。
+    /// 一覧を使う (v3.5.0 レビュー F13)。
+    ///
+    /// **これが一覧の更新契機でもある。** メニューを閉じるたびに捨てるのをやめたので、
+    /// アプリの追加 / 削除や関連付けの変更を拾う場所が他に無い。フォルダーを開き直せば
+    /// 並べ直す (レビュー R13)。
     pub(crate) fn poll_association_handler_prewarm(&mut self) {
         if let Some(rx) = self.association_prewarm.as_ref() {
             match rx.try_recv() {
@@ -53084,7 +53088,10 @@ impl App {
             else {
                 continue;
             };
-            if self.cached_handlers.contains_key(&extension) || extensions.contains(&extension) {
+            // **既に覚えている拡張子も並べ直す。** これが唯一の更新契機で、飛ばすと
+            // アプリの追加 / 削除や関連付けの変更が終了まで反映されず、一時的な失敗で
+            // 空を覚えた場合も直らない (v3.5.0 レビュー R13)。
+            if extensions.contains(&extension) {
                 continue;
             }
             extensions.push(extension);
