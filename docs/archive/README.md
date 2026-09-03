@@ -14,7 +14,9 @@
 - `folders-archives/` — フォルダ表示、ZIP/PDF、製本ナビゲーション
 - `performance-refactoring/` — 性能調査、応答性監査、リファクタリング
 - `release/` — 過去版の計画、リリース本文、安定性レビュー
-- `review-v2.3.0/`、`review-v2.7.0/` — 版ごとのレビュー資料一式
+- `review-v2.3.0/`、`review-v2.7.0/`、`review-v3.5.0/` — 版ごとのレビュー資料一式
+  (v3.5.0 は出荷前の 8 巡ぶん。追跡するのは Markdown だけなので、findings が参照する
+  probe スクリプトとログはリポジトリに入っていない)
 - `search-metadata/` — 検索プロトタイプ、タグ、sidecar メタデータ
 - `ui-input/` — UI 改修、キー入力移行、操作設計
 - `video/` — 動画・音楽再生、native presenter、offline upscale
