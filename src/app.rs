@@ -7686,8 +7686,27 @@ pub(crate) struct ExternalRescanPending {
     pub(crate) owner_context_id: ViewerContextId,
     pub(crate) folder: PathBuf,
     pub(crate) mtime: std::time::SystemTime,
+    /// 要求した時点の一覧世代。**別のフォルダーへ行って戻った (A→B→A) 結果を、
+    /// 新しい一覧へ被せないための条件。** path 一致だけでは区別できない
+    /// (v3.5.0 レビュー R03)。
+    pub(crate) items_generation: u64,
+    /// 走査の条件。隠しファイル表示などを変えて読み直したら、古い条件の結果は捨てる。
+    pub(crate) scan_options: ExternalRescanOptions,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: mpsc::Receiver<Option<folder_scan::ScannedDir>>,
+    /// 走査中に届いた次の変更。**通知を捨てず、完了後にもう一度走らせる。**
+    ///
+    /// 「いま走っているから要らない」と扱うと、走査が stamp を読んだ後の上書きを
+    /// 取りこぼす。同名上書きはフォルダーの mtime を動かさないので、復帰時のふるいでも
+    /// 拾えない (v3.5.0 レビュー R02)。
+    pub(crate) restart_requested: bool,
+}
+
+/// フォルダー走査の条件。変われば結果の意味も変わる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalRescanOptions {
+    pub(crate) include_convertible_archives: bool,
+    pub(crate) show_hidden_files: bool,
 }
 
 /// `check_external_folder_changes` を呼ぶ理由。
@@ -17946,20 +17965,29 @@ impl App {
 
     /// フォルダー再走査を worker へ出す。同じフォルダーの走査が既に走っていれば足さない。
     fn start_external_rescan(&mut self, folder: PathBuf, new_mtime: std::time::SystemTime) {
-        if self
-            .external_rescan_pending
-            .as_ref()
-            .is_some_and(|pending| crate::folder_tree::path_eq(&pending.folder, &folder))
+        let scan_options = ExternalRescanOptions {
+            include_convertible_archives: !self
+                .settings
+                .archive_file_handling_ignores_convertible(),
+            show_hidden_files: self.settings.show_hidden_files,
+        };
+        // 同じ要求が既に走っているなら、**通知を捨てずに再走査を予約する**。走査が stamp を
+        // 読んだ後の上書きを取りこぼさないため (v3.5.0 レビュー R02)。
+        if let Some(pending) = self.external_rescan_pending.as_mut()
+            && crate::folder_tree::path_eq(&pending.folder, &folder)
+            && pending.scan_options == scan_options
         {
+            pending.restart_requested = true;
             return;
         }
-        // 別のフォルダーの走査は用済み。結果を待たずに捨てる。
+        // 別のフォルダー / 別の条件の走査は用済み。結果を待たずに捨てる。
         if let Some(previous) = self.external_rescan_pending.take() {
             previous.cancel.store(true, Ordering::Relaxed);
         }
-        let include_convertible_archives =
-            !self.settings.archive_file_handling_ignores_convertible();
-        let show_hidden_files = self.settings.show_hidden_files;
+        let ExternalRescanOptions {
+            include_convertible_archives,
+            show_hidden_files,
+        } = scan_options;
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_folder = folder.clone();
@@ -17988,8 +18016,11 @@ impl App {
             owner_context_id: self.edit_request_owner_context(),
             folder,
             mtime: new_mtime,
+            items_generation: self.items_generation,
+            scan_options,
             cancel,
             rx,
+            restart_requested: false,
         });
     }
 
@@ -18009,29 +18040,54 @@ impl App {
         let Some(pending) = self.external_rescan_pending.take() else {
             return;
         };
-        let Some(scan) = scan else {
-            return;
-        };
         let ExternalRescanPending {
             owner_context_id,
             folder,
             mtime,
+            items_generation,
+            scan_options,
+            restart_requested,
             ..
         } = pending;
-        // **要求を出した context だけが適用する。** 監視・要求・適用はどれも同じ
-        // (mount 済みの) 投影で動くので、ここが食い違うのは投影が動いたということ。
-        // その場合は捨てる — 投影が動けば監視も張り直され、必要なら次の通知で
-        // 走査し直される。ここで別 context を mount して適用すると、`load_folder`
-        // 側の context 操作と入れ子になる。
-        if self.edit_request_owner_context() != owner_context_id {
+
+        // 走査中に届いていた変更は、結果を適用したかどうかに関係なくやり直す (R02)。
+        let restart = |app: &mut Self| {
+            if restart_requested {
+                app.start_external_rescan(folder.clone(), mtime);
+            }
+        };
+
+        // 要求したときの前提が今も成り立っているか。**一致しなければ捨てる。**
+        //
+        // - 投影が動いた: 監視も張り直されるので、必要なら次の通知で走査し直される。
+        //   ここで別 context を mount して適用すると `load_folder` 側の context 操作と
+        //   入れ子になる。
+        // - 一覧世代が違う: A→B→A と戻った、または条件を変えて読み直した。path が同じでも
+        //   別の一覧なので被せない (R03)。
+        // - 削除の最中: 削除結果の世代を壊す。要求側の判定だけでは非同期化で外れている (R03)。
+        let dropped_reason = if self.edit_request_owner_context() != owner_context_id {
+            Some("owner_not_projected")
+        } else if self.items_generation != items_generation {
+            Some("items_generation_changed")
+        } else if self.delete_pending.is_some() {
+            Some("delete_in_progress")
+        } else if scan.is_none() {
+            Some("scan_failed")
+        } else {
+            None
+        };
+        if let Some(reason) = dropped_reason {
             crate::logger::log(format!(
-                "external_rescan: dropped, owner={owner_context_id:?} projected={:?} folder={}",
-                self.edit_request_owner_context(),
+                "external_rescan: dropped ({reason}) owner={owner_context_id:?} folder={}                  restart={restart_requested}",
                 folder.display()
             ));
+            restart(self);
             return;
         }
-        self.apply_external_rescan(folder, mtime, scan);
+        let _ = scan_options;
+        let scan = scan.expect("checked above");
+        self.apply_external_rescan(folder.clone(), mtime, scan);
+        restart(self);
     }
 
     /// 走査結果の適用。所有 context を mount した状態で呼ぶこと。

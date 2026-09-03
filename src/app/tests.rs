@@ -35244,6 +35244,117 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// 走査中に届いた通知を**捨てない**。
+    ///
+    /// 「いま走っているから要らない」と扱うと、走査が stamp を読んだ後の上書きを取り
+    /// こぼす。同名上書きはフォルダーの mtime を動かさないので、復帰時のふるいでも
+    /// 拾えない (v3.5.0 レビュー R02)。
+    #[test]
+    fn a_notification_during_a_rescan_is_kept_and_rerun_after_it() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rescan_restart");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        std::fs::write(&first_image, b"old").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.items = vec![GridItem::Image(first_image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        assert!(app.external_rescan_pending.is_some());
+
+        // 走査の最中に次の変更が届く。
+        std::fs::write(folder.join("b.png"), b"new").unwrap();
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        assert!(
+            app.external_rescan_pending
+                .as_ref()
+                .is_some_and(|pending| pending.restart_requested),
+            "2 回目の通知は再走査として覚える"
+        );
+
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
+            "取りこぼさず最後の変更まで反映する"
+        );
+    }
+
+    /// 一覧が入れ替わった後に返ってきた古い走査は**捨てる**。
+    ///
+    /// path 一致だけでは A→B→A を区別できず、新しい一覧へ古い結果を被せる
+    /// (v3.5.0 レビュー R03)。
+    #[test]
+    fn a_rescan_that_finishes_after_the_list_changed_is_discarded() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rescan_stale");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.png"), b"old").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(0);
+        app.items = Vec::new();
+        app.thumbnails = Vec::new();
+
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        assert!(app.external_rescan_pending.is_some());
+
+        // 走査中に一覧が入れ替わった (別フォルダーへ行って戻った等)。
+        let next_generation = app.items_generation + 1;
+        app.set_items_generation(next_generation);
+        app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/other/x.jpg"))];
+
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert_eq!(app.items.len(), 1, "古い走査で新しい一覧を上書きしない");
+        assert!(
+            matches!(&app.items[0], GridItem::Image(path) if path.ends_with("x.jpg")),
+            "差し替えた一覧のまま"
+        );
+    }
+
+    /// 削除の最中に返ってきた走査も捨てる。
+    ///
+    /// 要求側にしか削除中の判定が無く、非同期化でその制約が完了側から外れていた (R03)。
+    #[test]
+    fn a_rescan_that_finishes_during_a_delete_is_discarded() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rescan_delete");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.png"), b"old").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(0);
+        app.items = Vec::new();
+        app.thumbnails = Vec::new();
+
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+        assert!(app.external_rescan_pending.is_some());
+
+        let (_delete_tx, delete_rx) = std::sync::mpsc::channel();
+        app.delete_pending = Some(crate::delete_worker::DeletePending {
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            rx: delete_rx,
+            total: 1,
+            succeeded: vec![],
+            failed: vec![],
+            purged_pdf_password_paths: vec![],
+            purge_deferred: false,
+        });
+
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert!(app.items.is_empty(), "削除の最中は一覧を差し替えない");
+    }
+
     #[test]
     fn external_folder_change_clears_retained_final_ai_cache() {
         let mut app = setup_app();
