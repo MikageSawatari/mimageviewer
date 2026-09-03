@@ -5747,6 +5747,19 @@ pub(crate) mod phase_c_support {
     use super::{App, AppTestConfig};
     use tempfile::TempDir;
 
+    /// 外部変更の再走査は worker が返すので、テストは結果が届くまで poll する。
+    /// UI スレッドで read_dir しない契約 (F14) を、テスト側でも同じ形で待つ。
+    pub(crate) fn wait_for_external_rescan(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.external_rescan_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "フォルダー再走査が返らない"
+            );
+            app.poll_external_rescan();
+        }
+    }
+
     /// テスト終了時に `data_dir::set_test_override(None)` + `reset_global_for_test()` +
     /// `set_save_suppressed(false)` を呼ぶ RAII ガード。
     /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
@@ -35097,6 +35110,50 @@ mod pipeline_cache_refactor_tests {
     /// 外部アプリが現在フォルダの実ファイルを差し替えた場合、同じ path / 同じ寸法でも
     /// retained key だけでは内容差分を表せない。signature 差分で自動再ロードする経路では
     /// 保持 LRU を捨て、旧画像の AI 結果を新画像に流用しない。
+    /// 監視通知の再走査は **UI スレッドで走らせない**。
+    ///
+    /// 通知はファイルの中身だけが書き換わった場合も拾うので、フォルダーの mtime を
+    /// ふるいに使えない。そのぶん通知のたびに全項目の列挙・分類・signature 計算が要るが、
+    /// それを同期実行すると大きなフォルダーや遅い共有先で表示と入力が止まる
+    /// (v3.5.0 レビュー F14)。呼んだフレームでは一覧を差し替えず、worker の結果で
+    /// 差し替わることを見る。
+    #[test]
+    fn a_watch_notification_rescans_off_the_ui_thread() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("notified_rescan");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        std::fs::write(&first_image, b"old").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.items = vec![GridItem::Image(first_image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        std::fs::write(folder.join("b.png"), b"new").unwrap();
+        app.check_external_folder_changes(crate::app::ExternalChangeCheck::Notified);
+
+        assert!(
+            app.external_rescan_pending.is_some(),
+            "走査は worker に出す"
+        );
+        assert_eq!(
+            app.items.len(),
+            1,
+            "呼んだフレームでは一覧を差し替えない (= 走査を待っていない)"
+        );
+
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
+            "worker の結果で差し替わる"
+        );
+    }
+
     #[test]
     fn external_folder_change_clears_retained_final_ai_cache() {
         let mut app = setup_app();
@@ -35139,6 +35196,8 @@ mod pipeline_cache_refactor_tests {
 
         std::fs::write(folder.join("b.png"), b"new").unwrap();
         app.check_external_folder_changes(crate::app::ExternalChangeCheck::Resumed);
+        // 走査は worker に出る。結果が着くまで poll する (UI スレッドで読まない、F14)。
+        crate::app::tests::phase_c_support::wait_for_external_rescan(&mut app);
 
         assert!(
             app.retained_final_ai_cache.is_empty(),
@@ -45467,6 +45526,7 @@ mod still_window_mode_key_tests {
 
         assert!(app.viewer_session_is_detached_or_switching());
         app.sync_after_restore(&ctx);
+        crate::app::tests::phase_c_support::wait_for_external_rescan(&mut app);
         app.reconcile_fullscreen_after_main_focus(&ctx, true, false);
 
         assert!(app.window_visible);

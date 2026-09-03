@@ -811,7 +811,19 @@ impl App {
                     return;
                 }
             }
-            self.snapshot_bulk_kept_overrides(&mut targets, &op);
+            // 保持 override の snapshot は **UI memory を読む**。確認ボタンと fence の
+            // 完了はどちらの viewport でも起き得るので、読む先を所有者へ固定する
+            // (v3.5.0 レビュー F08 の追補)。
+            let snapshotted = self.with_owner_viewer_context(owner_context_id, |app| {
+                app.snapshot_bulk_kept_overrides(&mut targets, &op);
+            });
+            if snapshotted.is_none() {
+                self.show_feedback_toast(
+                    "編集を開始したウィンドウが閉じられたため、一括編集を開始できませんでした"
+                        .to_string(),
+                );
+                return;
+            }
         }
 
         let total = targets.len();
@@ -917,14 +929,20 @@ impl App {
         };
         run.cancel.store(true, Ordering::Relaxed);
         let effect = run.effect;
+        let owner = run.owner_context_id;
         let BulkRunDriver::Worker { rx, thread } = &mut run.driver else {
             // 回転のみはUI threadでしか進まないので、終了時に未処理分を開始しない。
             return;
         };
 
         if drain_bulk_worker_events(rx, |target, result| {
-            let result = result
-                .and_then(|prepared| self.apply_bulk_worker_success(&target, prepared, effect));
+            // 終了時の残り分も要求元へ戻す。回転リセットは所有者の items から idx を
+            // 引き直すので、mount 中の別ウィンドウで解決すると別のページを触り得る。
+            let result = result.and_then(|prepared| {
+                self.in_bulk_edit_owner(owner, |app| {
+                    app.apply_bulk_worker_success(&target, prepared, effect)
+                })
+            });
             if let Err(error) = result {
                 crate::logger::log(format!(
                     "edit_bundle_bulk: exit drain failed key={} label={} error={error}",

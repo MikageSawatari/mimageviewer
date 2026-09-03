@@ -7667,6 +7667,24 @@ pub(crate) enum ActionSurface {
     Viewer,
 }
 
+/// 外部変更を確かめるためのフォルダー再走査。**UI スレッドで走らせない。**
+///
+/// 監視通知は「中身だけが書き換わった」場合も拾うため、フォルダーの mtime をふるいに
+/// 使えない。そのぶん通知のたびに全項目の列挙・分類・signature 計算が必要になるが、
+/// それを UI スレッドで同期実行すると、大きなフォルダーや遅い共有先で表示と入力が
+/// 止まる (v3.5.0 レビュー F14)。debounce は発火回数を減らすだけで、発火後の待ちは
+/// 減らさない。
+///
+/// 結果は**要求を出した viewer context** へ戻す。走査中に別のフォルダーへ移っていたら
+/// 捨てる (`folder` の一致で判定する)。
+pub(crate) struct ExternalRescanPending {
+    pub(crate) owner_context_id: ViewerContextId,
+    pub(crate) folder: PathBuf,
+    pub(crate) mtime: std::time::SystemTime,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<Option<folder_scan::ScannedDir>>,
+}
+
 /// `check_external_folder_changes` を呼ぶ理由。
 ///
 /// フォルダーの mtime を安いふるいとして使ってよいかが、これで決まる。
@@ -10516,6 +10534,8 @@ pub struct App {
     // ── ファイル操作後のフォルダ再読み込みフラグ ────────────────────
     pub(crate) pending_reload: bool,
     /// 現在表示中の実フォルダを監視し、外部変更や Shell 標準メニュー操作を
+    /// 外部変更の確認に使う、走らせ中のフォルダー再走査 (UI スレッドで走らせない)。
+    pub(crate) external_rescan_pending: Option<ExternalRescanPending>,
     /// debounce 後に `check_external_folder_changes` へ流す。
     pub(crate) current_folder_watch: Option<CurrentFolderWatch>,
     /// watcher 起動に失敗したフォルダ。毎フレーム同じ失敗ログを出さないため、
@@ -13933,6 +13953,7 @@ impl App {
             delete_confirm_label: None,
             pending_reload: false,
             current_folder_watch: None,
+            external_rescan_pending: None,
             current_folder_watch_failed: None,
             drop_copy_pending: Vec::new(),
             capture_pending: None,
@@ -17900,13 +17921,118 @@ impl App {
                 return;
             }
         }
+        // 走査は worker に出す。**UI スレッドで read_dir + 全件分類をしない** (F14)。
+        self.start_external_rescan(folder, new_mtime);
+    }
+
+    /// フォルダー再走査を worker へ出す。同じフォルダーの走査が既に走っていれば足さない。
+    fn start_external_rescan(&mut self, folder: PathBuf, new_mtime: std::time::SystemTime) {
+        if self
+            .external_rescan_pending
+            .as_ref()
+            .is_some_and(|pending| crate::folder_tree::path_eq(&pending.folder, &folder))
+        {
+            return;
+        }
+        // 別のフォルダーの走査は用済み。結果を待たずに捨てる。
+        if let Some(previous) = self.external_rescan_pending.take() {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        let include_convertible_archives =
+            !self.settings.archive_file_handling_ignores_convertible();
+        let show_hidden_files = self.settings.show_hidden_files;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_folder = folder.clone();
+        let (tx, rx) = mpsc::channel();
+        if std::thread::Builder::new()
+            .name("external-folder-rescan".to_string())
+            .spawn(move || {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // 一時的なネットワーク切断や権限エラーを「空フォルダへの変更」として
+                // 扱わない。読めなければ None を返し、呼び出し側は何もしない。
+                let scan = folder_scan::scan_directory_with_convertible_archives(
+                    &worker_folder,
+                    include_convertible_archives,
+                    show_hidden_files,
+                )
+                .ok();
+                let _ = tx.send(scan);
+            })
+            .is_err()
+        {
+            return;
+        }
+        self.external_rescan_pending = Some(ExternalRescanPending {
+            owner_context_id: self.edit_request_owner_context(),
+            folder,
+            mtime: new_mtime,
+            cancel,
+            rx,
+        });
+    }
+
+    /// 走査結果を、**要求を出した viewer context** へ適用する。
+    pub(crate) fn poll_external_rescan(&mut self) {
+        let Some(pending) = self.external_rescan_pending.as_ref() else {
+            return;
+        };
+        let scan = match pending.rx.try_recv() {
+            Ok(scan) => scan,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.external_rescan_pending = None;
+                return;
+            }
+        };
+        let Some(pending) = self.external_rescan_pending.take() else {
+            return;
+        };
+        let Some(scan) = scan else {
+            return;
+        };
+        let ExternalRescanPending {
+            owner_context_id,
+            folder,
+            mtime,
+            ..
+        } = pending;
+        // **要求を出した context だけが適用する。** 監視・要求・適用はどれも同じ
+        // (mount 済みの) 投影で動くので、ここが食い違うのは投影が動いたということ。
+        // その場合は捨てる — 投影が動けば監視も張り直され、必要なら次の通知で
+        // 走査し直される。ここで別 context を mount して適用すると、`load_folder`
+        // 側の context 操作と入れ子になる。
+        if self.projected_viewer_context_id() != owner_context_id {
+            crate::logger::log(format!(
+                "external_rescan: dropped, owner={owner_context_id:?} projected={:?} folder={}",
+                self.projected_viewer_context_id(),
+                folder.display()
+            ));
+            return;
+        }
+        self.apply_external_rescan(folder, mtime, scan);
+    }
+
+    /// 走査結果の適用。所有 context を mount した状態で呼ぶこと。
+    fn apply_external_rescan(
+        &mut self,
+        folder: PathBuf,
+        new_mtime: std::time::SystemTime,
+        scan: folder_scan::ScannedDir,
+    ) {
+        // 走査中に別のフォルダーへ移っていたら捨てる。
+        if !self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
+        {
+            return;
+        }
         // mtime が変わっていても、フォルダ内容 (paths + mtimes + sizes) が同一なら
         // items 差し替えをスキップして画面ちらつきを防ぐ。Windows Search や
         // ウイルススキャン等が触っただけで mtime が更新されるケースを救済する。
-        let Ok(scan) = scan_directory_with_settings(&folder, &self.settings) else {
-            // 一時的なネットワーク切断や権限エラーを「空フォルダへの変更」として扱わない。
-            return;
-        };
         let new_sig = signature_from_scan(&scan);
         if self.current_folder_signature == Some(new_sig) {
             self.current_folder_last_mtime = Some(new_mtime);
@@ -67109,6 +67235,7 @@ impl App {
         }
         self.last_main_focused = main_focused_now;
         self.poll_current_folder_watch(ctx);
+        self.poll_external_rescan();
 
         // dirty のまま一定時間が経ったサイドカーを書き出す (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
