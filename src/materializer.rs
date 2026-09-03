@@ -161,6 +161,8 @@ pub struct PageEditContext {
     pub comic_source_dims: Option<[usize; 2]>,
     pub ai_runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
     pub ai_model_manager: Arc<crate::ai::model_manager::ModelManager>,
+    /// AI 段を焼くための材料。`None` は「この経路では AI 段を焼かない」。
+    pub ai_materials: Option<crate::books::BookAiMaterials>,
     /// Stack member は App の idx cache に載らないため、worker でページ個別値を解決する。
     pub load_page_params_from_db: bool,
 }
@@ -623,6 +625,33 @@ impl MaterializeSession {
         lease.finish(key, source_stamp)
     }
 
+    /// worker で使う AI runtime。UI が既に持っていればそれを、無ければ worker が 1 度だけ作る。
+    ///
+    /// 消しゴム (MI-GAN) と AI 段が同じ 1 つを共有する。別々に作ると同じ GPU 上に
+    /// 2 つの session が並ぶ。
+    fn resolve_worker_ai_runtime(
+        &mut self,
+        context: &PageEditContext,
+    ) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
+        if let Some(runtime) = context.ai_runtime.clone() {
+            return Some(runtime);
+        }
+        if self.worker_ai_runtime.is_none() {
+            self.worker_ai_runtime = crate::ai::runtime::AiRuntime::new_with_backend(
+                crate::ai::AiBackend::DirectMl,
+            )
+            .map(Arc::new)
+            .map_err(|error| {
+                crate::logger::log(format!(
+                    "materializer: AI runtime init failed; using diffusion fallback: {error}"
+                ));
+                error
+            })
+            .ok();
+        }
+        self.worker_ai_runtime.clone()
+    }
+
     fn load_page_edits(
         &mut self,
         context: &PageEditContext,
@@ -715,41 +744,43 @@ impl MaterializeSession {
             },
             preset: context.conceal_preset.clone(),
         });
+        // AI 段。材料が無い / runtime を作れないページは AI を通さずに焼く。
+        let ai = if context.stage.includes_ai() {
+            match (
+                context.ai_materials.clone(),
+                self.resolve_worker_ai_runtime(context),
+            ) {
+                (Some(materials), Some(runtime)) => Some(crate::books::book_ai_snapshot(
+                    materials,
+                    runtime,
+                    params.clone(),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let erase = erase_raw.map(|(bitmap, shapes, size)| {
-            let runtime = context.ai_runtime.clone().or_else(|| {
-                if self.worker_ai_runtime.is_none() {
-                    self.worker_ai_runtime = crate::ai::runtime::AiRuntime::new_with_backend(
-                        crate::ai::AiBackend::DirectMl,
-                    )
-                    .map(Arc::new)
-                    .map_err(|error| {
-                        crate::logger::log(format!(
-                            "materializer: AI runtime init failed; using diffusion fallback: {error}"
-                        ));
-                        error
-                    })
-                    .ok();
-                }
-                self.worker_ai_runtime.clone()
-            });
+            let runtime = self.resolve_worker_ai_runtime(context);
             let manager = Arc::clone(&context.ai_model_manager);
             let mono_tolerance = context.erase_mono_tolerance;
-            let run: crate::books::BookEraseRunner = Box::new(move |base, bitmap, shapes, cancel| {
-                let result = crate::ui_erase::erase_from_saved_mask(
-                    runtime.as_ref(),
-                    &manager,
-                    base,
-                    bitmap,
-                    shapes,
-                    mono_tolerance,
-                    cancel,
-                    "materializer-composite",
-                )?;
-                Ok(crate::books::BookEraseResult {
-                    image: result.image,
-                    used_diffusion_fallback: result.used_diffusion_fallback,
-                })
-            });
+            let run: crate::books::BookEraseRunner =
+                Box::new(move |base, bitmap, shapes, cancel| {
+                    let result = crate::ui_erase::erase_from_saved_mask(
+                        runtime.as_ref(),
+                        &manager,
+                        base,
+                        bitmap,
+                        shapes,
+                        mono_tolerance,
+                        cancel,
+                        "materializer-composite",
+                    )?;
+                    Ok(crate::books::BookEraseResult {
+                        image: result.image,
+                        used_diffusion_fallback: result.used_diffusion_fallback,
+                    })
+                });
             crate::books::BookEraseSnapshot {
                 mask: crate::books::BookMaskSnapshot {
                     bitmap,
@@ -788,7 +819,7 @@ impl MaterializeSession {
                 jpeg_matte: crate::capture::JpegMatte::Black,
                 stage: context.stage,
                 creative_lut,
-                ai: None,
+                ai,
             },
             requires_composite,
             fingerprint,
@@ -1592,6 +1623,7 @@ mod tests {
             comic_source_dims: None,
             ai_runtime: None,
             ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
+            ai_materials: None,
             load_page_params_from_db,
         }
     }

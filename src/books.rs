@@ -295,6 +295,77 @@ pub struct BookAiSnapshot {
     pub run: BookAiRunner,
 }
 
+/// AI 段を焼くための材料。
+///
+/// **モデルの選択はここで決めない。** 自動判別も寸法の上限判定も、合成の途中で出来上がった
+/// 画素そのものに依存する。材料だけを持ち回り、選択と実行は runner の中で
+/// [`crate::ai::final_pipeline`] へ委ねる — 表示 / 単枚エクスポートと同じ 1 つの答えを使う。
+#[derive(Clone)]
+pub struct BookAiMaterials {
+    pub manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub feature_mode: crate::settings::AiFeatureMode,
+    pub upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    pub denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+    /// 透過画像を不透明化するときの下地 (0 = 黒 / 1 = 白)。表示側と同じ値を渡す。
+    pub transparent_bg_mode: u8,
+}
+
+/// 焼き込み段が AI まで進むときの runner。
+///
+/// このページが AI を要求していない (モデル未選択 / 機能 OFF / 寸法が対象外) なら、runner は
+/// 入力をそのまま返す。**そこで失敗にしない** — 段は「ここまで焼く」であって「必ず AI を
+/// 通す」ではない。
+pub fn book_ai_snapshot(
+    materials: BookAiMaterials,
+    runtime: Arc<crate::ai::runtime::AiRuntime>,
+    params: crate::adjustment::AdjustParams,
+) -> BookAiSnapshot {
+    let run: BookAiRunner = Box::new(move |image, cancel| {
+        let Some(models) = crate::ai::final_pipeline::select_final_ai_models(
+            image,
+            &params,
+            materials.feature_mode,
+            materials.upscale_limit,
+            materials.denoise_limit,
+            None,
+        ) else {
+            return Ok(BookAiResult {
+                image: image.clone(),
+                used_upscale: false,
+            });
+        };
+        let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
+            source: Arc::new(image.clone()),
+            // 色調補正は `compose_book_page` がこの直前で済ませている。
+            adjust_before_ai: None,
+            denoise_kind: models.denoise,
+            upscale_kind: models.upscale,
+            background_mode: materials.transparent_bg_mode,
+        };
+        match crate::ai::final_pipeline::execute_selected_final_ai(
+            &runtime,
+            &materials.manager,
+            request,
+            cancel,
+            &crate::ai::final_pipeline::NoFinalAiProgress,
+        ) {
+            Ok(output) => Ok(BookAiResult {
+                image: output.image,
+                used_upscale: output.used_upscale,
+            }),
+            Err(crate::ai::final_pipeline::FinalAiExecutionError::Cancelled) => {
+                Err(materialization_cancelled_error())
+            }
+            // AI を通った絵は寸法から別物になる。黙って AI 抜きへ落とさず失敗にする
+            // (単枚エクスポートの同経路と同じ判断)。
+            Err(crate::ai::final_pipeline::FinalAiExecutionError::Failed(error)) => {
+                Err(format!("AI 処理に失敗しました: {error}"))
+            }
+        }
+    });
+    BookAiSnapshot { run }
+}
+
 pub struct BookConcealSnapshot {
     pub mask: BookMaskSnapshot,
     pub preset: crate::conceal::ConcealPreset,
@@ -2305,6 +2376,29 @@ mod tests {
             with_upscale.image.pixels, base.pixels,
             "アップスケールした出力にはシャープを掛けない"
         );
+    }
+
+    /// AI 段の runner を **本番コードが作っている** こと。
+    ///
+    /// v3.5.0 まで `BookAiSnapshot` を組み立てるのはこのテストだけで、設定画面は
+    /// 4 出力 × 3 段をすべて動くものとして見せていた。「AI 処理」を選んでも製本・
+    /// 一括書き出し・外部ツールでは AI 拡大もデノイズも走らなかった (レビュー F03)。
+    /// 段の意味は合成側 (`compose_book_page`) が持つので、ここでは **producer の不在**
+    /// を見る。
+    #[test]
+    fn the_ai_bake_stage_is_built_by_production_code_not_only_by_tests() {
+        for path in ["src/ui_fullscreen.rs", "src/materializer.rs"] {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("{path} を読めない (cwd はクレート root): {error}"));
+            assert!(
+                source.contains("book_ai_snapshot("),
+                "{path} が AI 段の runner を作っていない"
+            );
+            assert!(
+                !source.contains("ai: None,"),
+                "{path} が AI 段を無条件で捨てている"
+            );
+        }
     }
 
     /// 段を深くしたら、**表示専用効果しかないページも合成に通す**こと。

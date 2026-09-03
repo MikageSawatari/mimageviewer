@@ -53073,6 +53073,20 @@ impl App {
         self.with_viewer_context(owner, f).ok()
     }
 
+    /// 焼き込みの AI 段に渡す材料。**設定と上限の解釈はここ 1 か所。**
+    ///
+    /// 製本・一括書き出し・外部ツールが同じ答えを使う。runtime は渡さない — UI が持って
+    /// いなければ worker が自分で作る経路があるため (v3.5.0 レビュー F03)。
+    pub(crate) fn book_ai_materials(&self) -> crate::books::BookAiMaterials {
+        crate::books::BookAiMaterials {
+            manager: Arc::clone(&self.ai_model_manager),
+            feature_mode: self.settings.ai_feature_mode,
+            upscale_limit: self.settings.ai_upscale_limit(),
+            denoise_limit: self.settings.ai_denoise_limit(),
+            transparent_bg_mode: self.effective_upscale_bg_mode(),
+        }
+    }
+
     pub(crate) fn local_ai_activity_lease(&self) -> LocalAiActivityLease {
         LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity))
     }

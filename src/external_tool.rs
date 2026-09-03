@@ -2072,6 +2072,11 @@ impl crate::app::App {
                 stage: self.settings.bake_stage_external_tool,
                 // 実体の選択は worker が **確定した params** から行う (F10)。
                 creative_luts: self.creative_lut_library.snapshot(),
+                ai_materials: self
+                    .settings
+                    .bake_stage_external_tool
+                    .includes_ai()
+                    .then(|| self.book_ai_materials()),
                 params,
                 conceal_preset: self.current_conceal_preset_from_settings(),
                 erase_mono_tolerance: self.settings.erase_inpaint_mono_tolerance,

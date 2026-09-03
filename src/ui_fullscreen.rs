@@ -34869,6 +34869,17 @@ impl App {
             crate::books::BookEraseSnapshot { mask, run }
         });
 
+        // AI 段。段が AI まで進むページだけ runtime を用意する (v3.5.0 レビュー F03)。
+        // モデルの選択は合成途中の画素に依存するので、ここでは材料だけを渡す。
+        let ai = if stage.includes_ai() {
+            self.ensure_ai_runtime();
+            self.ai_runtime.clone().map(|runtime| {
+                crate::books::book_ai_snapshot(self.book_ai_materials(), runtime, params.clone())
+            })
+        } else {
+            None
+        };
+
         // `params` は下でムーブするので、解決はその前に済ませる。
         let creative_lut = stage
             .includes_display_adjust()
@@ -34892,8 +34903,7 @@ impl App {
             // 表示用補正まで焼くときだけ解決する。選択 ID から実体を引けるのは登録済み
             // ライブラリを持つ側だけなので、ここで解決して渡す (表示側と同じ resolver)。
             creative_lut,
-            // TODO(段取り 4): AI のモデル決定を表示側から切り出したら、ここでランナーを作る。
-            ai: None,
+            ai,
         })
     }
 
