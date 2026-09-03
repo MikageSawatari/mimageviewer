@@ -149,9 +149,13 @@ pub struct PageEditContext {
     pub params: crate::adjustment::AdjustParams,
     /// どこまで焼くか。外部ツールの設定から UI スレッドで確定させて渡す。
     pub stage: crate::bake_stage::BakeStage,
-    /// 解決済みの Creative LUT。選択 ID から実体を引けるのは登録済みライブラリを持つ側
-    /// だけなので、`ai_runtime` と同じく UI スレッドで解決して渡す。
-    pub creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    /// 読み込み済み Creative LUT の一覧。**解決済みの 1 本ではなく一覧を渡す。**
+    ///
+    /// どの LUT を使うかは params が決めるが、スタック内ページのように一覧 index を
+    /// 持たない対象では worker が params を DB から読み直す。UI で仮置き params から
+    /// 解決してしまうと、ページ個別の LUT が無視され、親か共通の色で書き出される
+    /// (v3.5.0 レビュー F10)。params と LUT は同じ所有者が同じ 1 つの答えから解決する。
+    pub creative_luts: crate::creative_lut::CreativeLutSnapshot,
     pub conceal_preset: crate::conceal::ConcealPreset,
     pub erase_mono_tolerance: u8,
     pub comic_source_dims: Option<[usize; 2]>,
@@ -632,15 +636,15 @@ impl MaterializeSession {
         check_current(&self.inner, cancel, generation)?;
         let databases = self.databases.as_ref().expect("opened above");
         let key = &context.page_key;
-        let params = if context.load_page_params_from_db {
+        let stored_params = if context.load_page_params_from_db {
             databases
                 .adjustment
                 .get_page_params_checked(key)
                 .map_err(|error| format!("補正データを読み取れません: {error}"))?
-                .unwrap_or_else(|| context.params.clone())
         } else {
-            context.params.clone()
+            None
         };
+        let (params, creative_lut) = baked_params_and_lut(context, stored_params);
         check_current(&self.inner, cancel, generation)?;
         let rotation = databases
             .rotation
@@ -783,7 +787,7 @@ impl MaterializeSession {
                 format: crate::capture::CaptureFormat::Png,
                 jpeg_matte: crate::capture::JpegMatte::Black,
                 stage: context.stage,
-                creative_lut: context.creative_lut.clone(),
+                creative_lut,
                 ai: None,
             },
             requires_composite,
@@ -1516,6 +1520,28 @@ fn pid_is_alive(pid: u32) -> bool {
     PathBuf::from("/proc").join(pid.to_string()).exists()
 }
 
+/// 焼き込みに使う params と、その params が指す Creative LUT。**両方を 1 か所で決める。**
+///
+/// `stored` は DB のページ個別値 (`load_page_params_from_db` のときだけ読む)。UI 側で
+/// 仮置き params から LUT を解決して渡していたので、スタック内ページのように worker が
+/// params を読み直す対象では、ページ個別の LUT が捨てられ親か共通の色で書き出されていた
+/// (v3.5.0 レビュー F10)。
+fn baked_params_and_lut(
+    context: &PageEditContext,
+    stored: Option<crate::adjustment::AdjustParams>,
+) -> (
+    crate::adjustment::AdjustParams,
+    Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+) {
+    let params = stored.unwrap_or_else(|| context.params.clone());
+    let creative_lut = context
+        .stage
+        .includes_display_adjust()
+        .then(|| context.creative_luts.resolve(&params))
+        .flatten();
+    (params, creative_lut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1542,6 +1568,97 @@ mod tests {
             pdf_render_long_edge: 4096,
             rendered_pixels: None,
         }
+    }
+
+    fn lut_named(name: &str) -> crate::creative_lut::SharedCreativeLut {
+        std::sync::Arc::new(local_adjust_core::CubeLutParams {
+            name: name.to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn page_edit_context(
+        placeholder: crate::adjustment::AdjustParams,
+        luts: crate::creative_lut::CreativeLutSnapshot,
+        load_page_params_from_db: bool,
+    ) -> PageEditContext {
+        PageEditContext {
+            page_key: "key".to_string(),
+            params: placeholder,
+            stage: crate::bake_stage::BakeStage::DisplayAdjust,
+            creative_luts: luts,
+            conceal_preset: crate::conceal::ConcealPreset::default(),
+            erase_mono_tolerance: 0,
+            comic_source_dims: None,
+            ai_runtime: None,
+            ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
+            load_page_params_from_db,
+        }
+    }
+
+    fn params_with_lut(id: uuid::Uuid) -> crate::adjustment::AdjustParams {
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.creative_lut = crate::creative_lut::CreativeLutSelection {
+            id: Some(id),
+            strength: 1.0,
+        };
+        params
+    }
+
+    /// ページ個別の params を worker が読み直したら、**LUT もその params から引く**。
+    ///
+    /// UI で仮置き params から解決した 1 本を渡していたので、一覧 index を持たない
+    /// スタック内ページでは、ページ個別に設定した LUT が捨てられて親か共通の色で
+    /// 書き出されていた (v3.5.0 レビュー F10)。
+    #[test]
+    fn the_baked_lut_follows_the_params_the_worker_actually_uses() {
+        let page_lut_id = uuid::Uuid::from_u128(1);
+        let parent_lut_id = uuid::Uuid::from_u128(2);
+        let luts = crate::creative_lut::CreativeLutSnapshot::from_loaded(
+            [
+                (page_lut_id, lut_named("page")),
+                (parent_lut_id, lut_named("parent")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // UI が渡すのは親 / 共通の仮置き値。実際に焼くのは DB のページ個別値。
+        let context = page_edit_context(params_with_lut(parent_lut_id), luts, true);
+
+        let (params, lut) = baked_params_and_lut(&context, Some(params_with_lut(page_lut_id)));
+
+        assert_eq!(params.creative_lut.id, Some(page_lut_id));
+        assert_eq!(lut.expect("ページ個別の LUT が選ばれる").0.name, "page");
+    }
+
+    /// DB にページ個別値が無ければ、仮置き値とその LUT で焼く。
+    #[test]
+    fn the_baked_lut_falls_back_to_the_placeholder_when_the_page_has_no_row() {
+        let parent_lut_id = uuid::Uuid::from_u128(2);
+        let luts = crate::creative_lut::CreativeLutSnapshot::from_loaded(
+            [(parent_lut_id, lut_named("parent"))].into_iter().collect(),
+        );
+        let context = page_edit_context(params_with_lut(parent_lut_id), luts, true);
+
+        let (params, lut) = baked_params_and_lut(&context, None);
+
+        assert_eq!(params.creative_lut.id, Some(parent_lut_id));
+        assert_eq!(lut.expect("親の LUT で焼く").0.name, "parent");
+    }
+
+    /// 表示補正を焼かない段では LUT を焼かない (段の意味を LUT だけ素通りさせない)。
+    #[test]
+    fn a_stage_without_display_adjust_bakes_no_lut() {
+        let lut_id = uuid::Uuid::from_u128(1);
+        let luts = crate::creative_lut::CreativeLutSnapshot::from_loaded(
+            [(lut_id, lut_named("page"))].into_iter().collect(),
+        );
+        let mut context = page_edit_context(params_with_lut(lut_id), luts, true);
+        context.stage = crate::bake_stage::BakeStage::Edits;
+
+        let (_, lut) = baked_params_and_lut(&context, Some(params_with_lut(lut_id)));
+
+        assert!(lut.is_none());
     }
 
     /// 一時ポリシーは**実ファイルもコピーする**。渡した先で上書き保存されても元データが

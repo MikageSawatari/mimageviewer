@@ -321,6 +321,31 @@ struct ManagedCopyBatch {
 
 /// Runtime cache owned by `App`. File reads and `.cube` parsing happen in one
 /// background batch whenever the registered entry signature changes.
+/// 読み込み済み LUT の不変スナップショット。worker が params から自分で引く。
+#[derive(Clone, Debug, Default)]
+pub struct CreativeLutSnapshot {
+    loaded: HashMap<Uuid, SharedCreativeLut>,
+}
+
+impl CreativeLutSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_loaded(loaded: HashMap<Uuid, SharedCreativeLut>) -> Self {
+        Self { loaded }
+    }
+
+    /// params が指す LUT と強度。identity か、その LUT が読み込めていなければ `None`。
+    pub fn resolve(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<(SharedCreativeLut, f32)> {
+        if params.creative_lut.is_identity() {
+            return None;
+        }
+        let lut = self.loaded.get(&params.creative_lut.id?)?;
+        Some((Arc::clone(lut), params.creative_lut.strength))
+    }
+}
+
 #[derive(Default)]
 pub struct CreativeLutLibrary {
     loaded: HashMap<Uuid, SharedCreativeLut>,
@@ -510,6 +535,17 @@ impl CreativeLutLibrary {
 
     pub fn get(&self, id: Option<Uuid>) -> Option<SharedCreativeLut> {
         id.and_then(|id| self.loaded.get(&id).cloned())
+    }
+
+    /// worker へ渡す読み込み済み LUT の一覧。
+    ///
+    /// 値は `Arc` なので clone は参照カウントの加算だけ。**解決済みの 1 本ではなく
+    /// 一覧を渡す**のは、どの LUT を使うかが params 側で決まり、その params を worker が
+    /// 読み直すことがあるため (v3.5.0 レビュー F10)。
+    pub fn snapshot(&self) -> CreativeLutSnapshot {
+        CreativeLutSnapshot {
+            loaded: self.loaded.clone(),
+        }
     }
 
     pub fn error(&self, id: Uuid) -> Option<&str> {

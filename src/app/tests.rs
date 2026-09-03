@@ -15191,6 +15191,58 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(assert_same(&app).brightness, 20.0);
     }
 
+    /// 一覧 index を持たないスタック内ページの土台も、**表示と同じお気に入りへ透過する**。
+    ///
+    /// 最寄りのお気に入りだけを見ていたので、内側が独自標準を持たず外側が持つ入れ子では、
+    /// 表示は外側の標準を使うのに外部ツールへの書き出しだけ共通標準へ落ちていた
+    /// (v3.5.0 レビュー F10)。
+    #[test]
+    fn a_stack_member_without_an_index_falls_back_to_the_same_favorite_the_view_uses() {
+        let mut app = setup_app();
+        let image_path = PathBuf::from("C:/pics/AI/deep/page.jpg");
+        let idx = push_image(&mut app, image_path.to_str().unwrap());
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from("C:/pics"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from("C:/pics/AI"));
+        let outer_id = outer.id;
+        let inner_id = inner.id;
+        app.settings.favorites = vec![outer, inner];
+        app.settings.global_preset = params_with_brightness(5.0);
+
+        // 外側だけが独自標準を持つ = 内側は OFF。
+        app.adjustment_favorite_params
+            .insert(outer_id, params_with_brightness(20.0));
+        assert_eq!(
+            app.effective_params(idx).brightness,
+            20.0,
+            "表示は外側の標準"
+        );
+        assert_eq!(
+            app.stack_member_default_params_for_test(&image_path)
+                .brightness,
+            20.0,
+            "書き出しの土台も外側の標準へ透過する"
+        );
+
+        // 内側にも標準を置いたら、両方とも内側を使う。
+        app.adjustment_favorite_params
+            .insert(inner_id, params_with_brightness(30.0));
+        assert_eq!(app.effective_params(idx).brightness, 30.0);
+        assert_eq!(
+            app.stack_member_default_params_for_test(&image_path)
+                .brightness,
+            30.0
+        );
+
+        // どちらも無ければ共通標準。
+        app.adjustment_favorite_params.remove(&outer_id);
+        app.adjustment_favorite_params.remove(&inner_id);
+        assert_eq!(
+            app.stack_member_default_params_for_test(&image_path)
+                .brightness,
+            5.0
+        );
+    }
+
     #[test]
     fn key_based_page_adjustment_updates_mounted_state_and_preserves_remote_undo() {
         let mut app = setup_app();

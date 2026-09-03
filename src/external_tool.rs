@@ -1939,10 +1939,30 @@ impl crate::app::App {
         })
     }
 
+    /// 一覧 index を持たない対象 (スタック内ページ) の、DB にページ個別値が無いときの土台。
+    ///
+    /// **表示と同じ規則で解決する。** 最寄りのお気に入りだけを見ていたので、その
+    /// お気に入りが標準を持っていない場合、表示は外側の標準を使うのに書き出しだけ共通標準へ
+    /// 落ちていた (v3.5.0 レビュー F10)。
+    #[cfg(test)]
+    pub(crate) fn stack_member_default_params_for_test(
+        &self,
+        path: &Path,
+    ) -> crate::adjustment::AdjustParams {
+        self.stack_member_default_params(path)
+    }
+
     fn stack_member_default_params(&self, path: &Path) -> crate::adjustment::AdjustParams {
         path.parent()
-            .and_then(|folder| self.find_nearest_favorite(folder))
-            .and_then(|favorite| self.adjustment_favorite_params.get(&favorite.id))
+            .and_then(|folder| {
+                crate::final_composite::active_favorite_default_id_for_path(
+                    folder,
+                    &self.settings.favorites,
+                    None,
+                    |id| self.adjustment_favorite_params.contains_key(&id),
+                )
+            })
+            .and_then(|id| self.adjustment_favorite_params.get(&id))
             .cloned()
             .unwrap_or_else(|| self.settings.global_preset.clone())
     }
@@ -2038,12 +2058,8 @@ impl crate::app::App {
             PageEditContext {
                 page_key,
                 stage: self.settings.bake_stage_external_tool,
-                creative_lut: self
-                    .settings
-                    .bake_stage_external_tool
-                    .includes_display_adjust()
-                    .then(|| self.resolved_creative_lut(&params))
-                    .flatten(),
+                // 実体の選択は worker が **確定した params** から行う (F10)。
+                creative_luts: self.creative_lut_library.snapshot(),
                 params,
                 conceal_preset: self.current_conceal_preset_from_settings(),
                 erase_mono_tolerance: self.settings.erase_inpaint_mono_tolerance,
