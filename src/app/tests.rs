@@ -65885,6 +65885,109 @@ mod rating_write_failure_tests {
     }
 }
 
+/// 一括補正の適用と取り消しに、**どこで**時間がかかっているかを測る道具。
+///
+/// 判定はしない (環境で絶対値が変わる)。内訳を出して、次の改善が何を狙うべきかを決める
+/// ための計測。バックログ §1.176 の作業で使う。
+///
+/// ```powershell
+/// cargo test -p mimageviewer --lib bulk_adjust_cost -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod bulk_adjust_cost_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::time::Instant;
+
+    const PAGES: usize = 2_000;
+
+    fn params(brightness: f32) -> crate::adjustment::AdjustParams {
+        let mut p = crate::adjustment::AdjustParams::default();
+        p.brightness = brightness;
+        p
+    }
+
+    #[test]
+    #[ignore = "計測。合否ではない"]
+    fn bulk_adjust_cost_breakdown() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("pages");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..PAGES {
+            let path = root.join(format!("p{i:05}.jpg"));
+            std::fs::write(&path, b"not decoded by this test").unwrap();
+            paths.push(path);
+        }
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; PAGES];
+        app.current_folder = Some(root.clone());
+        let keys: Vec<String> = paths
+            .iter()
+            .map(|p| crate::adjustment_db::normalize_path(p))
+            .collect();
+
+        // 1. 一括適用 (Ctrl+1〜0 と同じ経路: 1 ページずつ set_page_params)
+        let t = Instant::now();
+        app.capture_adjust_full("計測".to_string(), |a| {
+            for idx in 0..PAGES {
+                a.set_page_params(idx, params(10.0));
+            }
+        });
+        let apply_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // 2. 取り消し
+        let t = Instant::now();
+        app.apply_meta_undo();
+        let undo_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // 3. やり直し
+        let t = Instant::now();
+        app.apply_meta_redo();
+        let redo_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // 4. DB だけ: 1 行ずつ (= いまの経路が発行している形)
+        let t = Instant::now();
+        {
+            let db = app.adjustment_db.as_ref().expect("DB");
+            for key in &keys {
+                db.set_page_params(key, &params(20.0)).unwrap();
+            }
+        }
+        let db_row_by_row_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // 5. DB だけ: 1 トランザクション (= 既にある bulk API)
+        let t = Instant::now();
+        {
+            let db = app.adjustment_db.as_mut().expect("DB");
+            db.set_page_params_bulk(&keys, &params(30.0)).unwrap();
+        }
+        let db_bulk_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // 6. 索引解決だけ (U01 で直した部分。比較用)
+        let scopes: Vec<crate::undo_stack::AdjustmentChange> = (0..PAGES)
+            .map(|idx| crate::undo_stack::AdjustmentChange {
+                scope: app.page_adjust_undo_scope(idx),
+                before: None,
+                after: Some(params(10.0)),
+            })
+            .collect();
+        let t = Instant::now();
+        let _ = app.resolve_restore_scopes_for_test(&scopes);
+        let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        println!("\n=== 一括補正のコスト内訳 ({PAGES} ページ) ===");
+        println!("  適用 (capture_adjust_full + set_page_params x N) : {apply_ms:9.1} ms");
+        println!("  取り消し (apply_meta_undo)                       : {undo_ms:9.1} ms");
+        println!("  やり直し (apply_meta_redo)                       : {redo_ms:9.1} ms");
+        println!("  ── 内訳 ──");
+        println!("  DB 1 行ずつ (いまの発行のしかた)                 : {db_row_by_row_ms:9.1} ms");
+        println!("  DB 1 トランザクション (既存 bulk API)            : {db_bulk_ms:9.1} ms");
+        println!("  復元先の解決 (U01 で直した部分)                  : {resolve_ms:9.1} ms");
+        println!();
+    }
+}
+
 /// 補正 Undo の復元先は、**適用の直前に一覧を 1 回だけ走査して**決める。
 ///
 /// 復元先をページ識別子にしたとき (レビュー T01)、居場所を毎回探し直すようにしたので、

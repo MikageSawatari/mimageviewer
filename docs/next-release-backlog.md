@@ -3074,6 +3074,51 @@ Z 順をメニュー構築の 7 点で採り、反転する 1 区間を名指し
   `adjustment_page_params` は変更後のまま残るので、その窓が読み直すまで表示に反映されない。
   ここで場当たりの通知を足すと本項の設計と二重になるため、**本項でまとめて配送する**。
 
+### 1.176 一括補正の適用と取り消しで、ページ数ぶんの DB 書き込みが UI を数秒止める
+
+- **症状**: 一覧で多数チェックして <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>0</kbd> のスロット一括適用、
+  および その <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> で、UI が数秒固まる
+  (利用者確認 2026-09-03)。
+- **v3.5.0 の退行ではない。** v3.4.0 の `apply_slot_to_grid_selection` と
+  `apply_adjustment_change_to_app` も同じく 1 ページずつ `set_page_params` を呼んでいる
+  (`git show v3.4.0:src/app.rs` / `:src/undo_ops.rs` で確認)。v3.5.0 の U01 で直したのは
+  復元先の**検索**コストで、こちらは元からある**書き込み**コスト。
+
+**計測** (`cargo test -p mimageviewer --lib bulk_adjust_cost -- --ignored --nocapture`、
+2,000 ページ、開発機 / 一時フォルダの DB):
+
+| 区間 | 時間 |
+|---|---:|
+| 適用 (`capture_adjust_full` + `set_page_params` × N) | 5,584 ms |
+| 取り消し (`apply_meta_undo`) | 4,139 ms |
+| やり直し (`apply_meta_redo`) | 3,770 ms |
+| — DB を 1 行ずつ (いまの発行のしかた) | 3,367 ms |
+| — DB を 1 トランザクション (既存 `set_page_params_bulk`) | **11 ms** |
+| — 復元先の解決 (U01 で直した部分) | 5 ms |
+
+- **分かっていること**: `set_page_params` は 1 ページごとに `conn.execute` を呼ぶので、
+  **ページ数ぶんの暗黙トランザクション**になる。同じ 2,000 行を 1 トランザクションで書くと
+  11 ms なので、**約 300 倍**の差。U01 で直した検索はもう支配的ではない (5 ms)。
+- **分かっていないこと**: 適用 5,584 ms のうち DB が 3,367 ms として、**残り約 2,200 ms の
+  行き先はまだ特定していない** (キャッシュ無効化 / `effective_params` / サイドカー /
+  `capture_adjust_full` の差分取り、のどれか)。**先にここを内訳へ落としてから**設計する。
+  DB だけ直して「半分速くなりました」で終わらせない。
+
+**直し方の候補** (内訳が出てから決める):
+
+- 既に `AdjustmentDb::set_page_params_bulk` / `remove_page_params_bulk` があり、
+  「全画像に適用」(`app.rs` の 1 箇所) だけが使っている。スロット一括適用と Undo / Redo の
+  復元も、**同じページ集合をまとめて 1 トランザクションで書く**経路へ寄せる。
+- ただし現状の書き込みは 1 ページごとに「標準と一致するなら行を消す」判定 (`matches_default`)
+  と sidecar 反映を挟むので、単純に bulk API へ差し替えるだけでは意味が変わる。
+  **set と remove の 2 群へ振り分けてから**それぞれ 1 トランザクションにする形になる。
+- キャッシュ無効化 (`clear_caches_for_param_change` / `bump_adjustment_generation`) を
+  ページごとに回している分も、まとめて 1 回にできるか見る。
+
+- 計測用の道具は `src/app/tests.rs` の `bulk_adjust_cost_tests` に置いてある
+  (`#[ignore]`、合否判定はしない)。直したら同じ道具で前後を比べる。
+- 規模 / 優先度: Medium / P2。
+
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
 - **症状は 2 つある。同じものかは未確定。**
