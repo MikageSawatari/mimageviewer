@@ -6,6 +6,7 @@ members = [
     "crates/local-adjust-core",
     "crates/comic-core",
     "crates/music-core",
+    "crates/musicvideo-core",
     "crates/remote-ipc",
     "crates/remote-web",
     "crates/vst3-host-tester",
@@ -14,6 +15,7 @@ members = [
     "tools/local_adjust_lab",
     "tools/comic_lab",
     "tools/music_lab",
+    "tools/musicvideo_lab",
     "tools/seek_strip_probe",
     "tools/viewer_context_audit",
 ]

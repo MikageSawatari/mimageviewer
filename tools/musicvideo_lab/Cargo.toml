@@ -1,0 +1,18 @@
+[package]
+name = "musicvideo_lab"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp"] }
+musicvideo-core = { path = "../../crates/musicvideo-core" }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ラボは vendor/ (FFmpeg DLL) 無しでビルドできることを要件にするので、音声デコードは
+# symphonia を使う (music_lab と同じ)。本体統合時は src/audio_decode.rs (FFmpeg) が
+# 同じインターリーブ stereo f32 / 48kHz を供給する。
+symphonia = { version = "0.5", features = ["aac", "alac", "flac", "isomp4", "mkv", "mp3", "ogg", "pcm", "vorbis", "wav"] }
