@@ -2458,6 +2458,19 @@ emote-web-log.jsonl`):
     こちらが凍結スナップショットに切り替わる」という今回の状況と形が合う。**ただし利用者が
     単ページ / 見開き / 連結読みのどれで見ていたかはログに出ていない** (`spread` / `連結` の
     ログ出力が 1 件も無い) ので、経路は特定できていない。
+
+- **上の 2 経路は塞がった (2026-09-04 に確認)。この節に残るのは Codex 追補の側だけ。**
+  - 見開き左右も detached の凍結スナップショットも、いまは `resolve_fs_spread_page_transform`
+    という 1 つの入口を通る。レイアウト矩形を `from_resolved_rect` へ直接渡さず、
+    `fit_display_size_in_rect` で一様に letterbox してから `resolve_fs_transform_in_layout_rect`
+    を呼ぶ (`e2987744c` / `76148e06a` = v3.4.0、`00680be94` = v3.5.0)。
+  - **ただし `from_resolved_rect` 自体は今も非一様を無言で受け入れる。** `scale_x` と `scale_y`
+    を別に出して平均するだけで、拒否もログもない。「次にやること」に書いた
+    `|scale_x - scale_y|` の計装は未実施。**別の呼び出しが増えたときに同じことが起きる。**
+  - **Codex 追補の placement 所有境界はそのまま**。最大化時の placement 更新は実測 `outer_rect`
+    を捨てて seed placement に `maximized = true` を立てて書き戻し、passive 側は正規化矩形を
+    現在の `full_rect` へ X/Y 独立に戻すだけで、`image_dims` からの contain / 一様 scale の
+    再解決を通らない。
 - **Codex 追補 (2026-08-23、ClaudeCode 分析との差分)**:
   - perf ログでは、静止画を開いた直後の `896x1152` final composite は
     `scale_x=scale_y=1.188666`、Lanczos も `1597x2054` で、画像データ・texture・通常の
