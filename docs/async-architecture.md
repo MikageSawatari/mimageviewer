@@ -219,6 +219,11 @@ scope だけは更新する。worker は UI state を直接変更せず、候補
 drop で自動 release + `notify_all` で起床。spurious wakeup 耐性のため条件は
 `while` ループで再確認。
 
+cancel token を所有する worker は、permit 待ちにも `acquire_cancellable` を使う。
+50ms の timeout は cancel 観測点であり、優先度順序と起床は通常の `acquire` と同じ
+Condvar を使う。`None` は失敗ではなく取消終端として扱い、Item / Progress / Finished
+などの成功・失敗イベントを送らず、型付きの取消理由を perf / log に残して終了する。
+
 **飢餓ポリシー (明示)**: High が連続投入される間 Low は無制限に待つ。これは
 UI 応答性最優先という方針の意図的な選択。アイドル 数秒で High キューが空き、
 Low が進む。不足する場面は「AC 電源時のみインデックス」等の別機構で制御する。
@@ -597,6 +602,9 @@ std::thread::spawn(move || {
 ```
 
 送信失敗 (受信側 drop) は無視する。フォルダ切替で既に捨てられているだけ。
+`GlobalIoSemaphore` を使う cancel 可能 worker では、処理本体だけでなく permit 待ちも
+`acquire_cancellable` で token を観測する。取消時は cache 書き戻しや結果送信へ進まず、
+通常完了 / 処理失敗とは別の typed outcome にする。
 
 ---
 

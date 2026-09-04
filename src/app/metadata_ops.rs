@@ -375,6 +375,93 @@ pub(super) fn run_metadata_load(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaIoStage {
+    CreatedAt,
+    AiMetadataFile,
+    AiMetadataArchive,
+    ImageCatalogLoad,
+    ImageDimensionsFile,
+    ImageDimensionsArchive,
+    VideoProbe,
+    AudioProbe,
+    ContainerCatalogOpen,
+    ZipCatalogRead,
+    ZipEnumerate,
+    ZipCatalogWrite,
+    FolderCatalogRead,
+    FolderCount,
+    FolderCatalogWrite,
+    RarCatalogRead,
+    RarInspect,
+    RarCatalogWrite,
+    PdfCatalogRead,
+    PdfEnumerate,
+    PdfCatalogWrite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaCancelReason {
+    BeforeTarget,
+    PermitWait(DetailsMetaIoStage),
+    AfterIo(DetailsMetaIoStage),
+    BeforePublish,
+    BeforeFinished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaEventKind {
+    Item,
+    Progress,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaWorkerExit {
+    Completed,
+    Cancelled(DetailsMetaCancelReason),
+    ReceiverDisconnected(DetailsMetaEventKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsPageCountError {
+    Failed,
+    Cancelled(DetailsMetaCancelReason),
+}
+
+impl From<()> for DetailsPageCountError {
+    fn from(_: ()) -> Self {
+        Self::Failed
+    }
+}
+
+fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit) {
+    match exit {
+        DetailsMetaWorkerExit::Completed => {}
+        DetailsMetaWorkerExit::Cancelled(reason) => {
+            let reason = format!("{reason:?}");
+            crate::logger::log(format!(
+                "details-meta-load: cancelled generation={generation} reason={reason}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "details_meta",
+                    "load_cancelled",
+                    None,
+                    generation,
+                    &[("reason", serde_json::Value::from(reason))],
+                );
+            }
+        }
+        DetailsMetaWorkerExit::ReceiverDisconnected(event) => {
+            crate::logger::log(format!(
+                "details-meta-load: receiver disconnected generation={generation} event={event:?}"
+            ));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_details_meta_load(
     generation: u64,
     visible_targets: Vec<DetailsMetaTarget>,
@@ -389,6 +476,38 @@ pub(super) fn run_details_meta_load(
     priority_rx: mpsc::Receiver<Vec<DetailsMetaTarget>>,
     page_count_config: DetailsPageCountConfig,
 ) {
+    let exit = run_details_meta_load_inner(
+        generation,
+        visible_targets,
+        background_targets,
+        initial_done,
+        initial_failed,
+        total,
+        cache_dir,
+        io_sem,
+        cancel,
+        tx,
+        priority_rx,
+        page_count_config,
+    );
+    record_details_meta_worker_exit(generation, exit);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_details_meta_load_inner(
+    generation: u64,
+    visible_targets: Vec<DetailsMetaTarget>,
+    background_targets: Vec<DetailsMetaTarget>,
+    initial_done: usize,
+    initial_failed: usize,
+    total: usize,
+    cache_dir: PathBuf,
+    io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DetailsMetaEvent>,
+    priority_rx: mpsc::Receiver<Vec<DetailsMetaTarget>>,
+    page_count_config: DetailsPageCountConfig,
+) -> DetailsMetaWorkerExit {
     const SLOW_AI_METADATA_ITEM_MS: f64 = 100.0;
 
     let perf_on = crate::perf::is_enabled();
@@ -433,7 +552,7 @@ pub(super) fn run_details_meta_load(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return;
+            return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::BeforeTarget);
         }
 
         while let Ok(targets) = priority_rx.try_recv() {
@@ -498,8 +617,10 @@ pub(super) fn run_details_meta_load(
                     page_count = count;
                     page_count_checked = true;
                 }
-                Err(()) if cancel.load(Ordering::Relaxed) => return,
-                Err(()) => {
+                Err(DetailsPageCountError::Cancelled(reason)) => {
+                    return DetailsMetaWorkerExit::Cancelled(reason);
+                }
+                Err(DetailsPageCountError::Failed) => {
                     page_count_checked = true;
                     page_count_failed = true;
                 }
@@ -509,7 +630,11 @@ pub(super) fn run_details_meta_load(
             && let Some(path) = details_created_time_path(&target.item)
         {
             created_at = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                    return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::PermitWait(
+                        DetailsMetaIoStage::CreatedAt,
+                    ));
+                };
                 let metadata = match target.relative_page_provenance.as_ref() {
                     Some(provenance) => provenance
                         .open_verified()
@@ -550,7 +675,11 @@ pub(super) fn run_details_meta_load(
             let metadata = match &target.item {
                 GridItem::Image(path) => {
                     let wait_t0 = perf_on.then(std::time::Instant::now);
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                        return DetailsMetaWorkerExit::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::AiMetadataFile),
+                        );
+                    };
                     if let Some(t0) = wait_t0 {
                         item_permit_wait_ms += t0.elapsed().as_secs_f64() * 1000.0;
                     }
@@ -578,7 +707,14 @@ pub(super) fn run_details_meta_load(
                 } => {
                     if zip_entry_bytes.is_none() {
                         let wait_t0 = perf_on.then(std::time::Instant::now);
-                        let _permit = io_sem.acquire(target.priority);
+                        let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel)
+                        else {
+                            return DetailsMetaWorkerExit::Cancelled(
+                                DetailsMetaCancelReason::PermitWait(
+                                    DetailsMetaIoStage::AiMetadataArchive,
+                                ),
+                            );
+                        };
                         if let Some(t0) = wait_t0 {
                             item_permit_wait_ms += t0.elapsed().as_secs_f64() * 1000.0;
                         }
@@ -590,7 +726,9 @@ pub(super) fn run_details_meta_load(
                         }
                     }
                     if cancel.load(Ordering::Relaxed) {
-                        return;
+                        return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::AfterIo(
+                            DetailsMetaIoStage::AiMetadataArchive,
+                        ));
                     }
                     let extract_t0 = perf_on.then(std::time::Instant::now);
                     let metadata = zip_entry_bytes
@@ -655,7 +793,13 @@ pub(super) fn run_details_meta_load(
         {
             if !catalog_maps.contains_key(folder) {
                 let map = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                        return DetailsMetaWorkerExit::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(
+                                DetailsMetaIoStage::ImageCatalogLoad,
+                            ),
+                        );
+                    };
                     crate::catalog::CatalogDb::open(&cache_dir, folder)
                         .and_then(|db| db.load_all())
                         .ok()
@@ -677,7 +821,11 @@ pub(super) fn run_details_meta_load(
             && let GridItem::Image(path) = &target.item
         {
             let probed = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                    return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::PermitWait(
+                        DetailsMetaIoStage::ImageDimensionsFile,
+                    ));
+                };
                 if let Some(provenance) = target.relative_page_provenance.as_ref() {
                     if !relative_page_bytes_loaded {
                         relative_page_bytes = provenance.read_verified().ok();
@@ -700,11 +848,17 @@ pub(super) fn run_details_meta_load(
             } = &target.item
         {
             if zip_entry_bytes.is_none() {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                    return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::PermitWait(
+                        DetailsMetaIoStage::ImageDimensionsArchive,
+                    ));
+                };
                 zip_entry_bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
             }
             if cancel.load(Ordering::Relaxed) {
-                return;
+                return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::AfterIo(
+                    DetailsMetaIoStage::ImageDimensionsArchive,
+                ));
             }
             dims = zip_entry_bytes
                 .as_deref()
@@ -726,19 +880,30 @@ pub(super) fn run_details_meta_load(
         if target.load_video_meta {
             if let GridItem::Video(path) = &target.item {
                 video_probe = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                        return DetailsMetaWorkerExit::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::VideoProbe),
+                        );
+                    };
                     probe_video_details(path, &cancel)
                 };
             } else if let GridItem::Audio(path) = &target.item {
                 // 音声は長さ / コーデックだけを cancel・deadline 対応の probe で取る
                 // (解像度は無い)。DetailsVideoProbe の dims=None で流用する。
                 video_probe = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
+                        return DetailsMetaWorkerExit::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::AudioProbe),
+                        );
+                    };
                     probe_audio_details(path, &cancel)
                 };
             }
         }
 
+        if cancel.load(Ordering::Relaxed) {
+            return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::BeforePublish);
+        }
         let image_dims_failed = matches!(
             &target.item,
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
@@ -802,7 +967,7 @@ pub(super) fn run_details_meta_load(
             })
             .is_err()
         {
-            return;
+            return DetailsMetaWorkerExit::ReceiverDisconnected(DetailsMetaEventKind::Item);
         }
 
         done = (done + 1).min(total);
@@ -814,12 +979,12 @@ pub(super) fn run_details_meta_load(
             })
             .is_err()
         {
-            return;
+            return DetailsMetaWorkerExit::ReceiverDisconnected(DetailsMetaEventKind::Progress);
         }
     }
 
     if cancel.load(Ordering::Relaxed) {
-        return;
+        return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::BeforeFinished);
     }
     if let Some(t0) = worker_t0 {
         crate::perf::event(
@@ -873,7 +1038,14 @@ pub(super) fn run_details_meta_load(
             ],
         );
     }
-    let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
+    if tx
+        .send(DetailsMetaEvent::Finished { generation, failed })
+        .is_err()
+    {
+        DetailsMetaWorkerExit::ReceiverDisconnected(DetailsMetaEventKind::Finished)
+    } else {
+        DetailsMetaWorkerExit::Completed
+    }
 }
 
 #[cfg(test)]
@@ -1025,9 +1197,11 @@ fn load_details_page_count(
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
     cancel: &Arc<AtomicBool>,
     config: &DetailsPageCountConfig,
-) -> Result<Option<u32>, ()> {
+) -> Result<Option<u32>, DetailsPageCountError> {
     if cancel.load(Ordering::Relaxed) {
-        return Err(());
+        return Err(DetailsPageCountError::Cancelled(
+            DetailsMetaCancelReason::BeforeTarget,
+        ));
     }
     if let Some(count) = target.warm_page_count {
         return Ok(Some(count));
@@ -1046,15 +1220,23 @@ fn load_details_page_count(
         };
     // The catalog is only an optimization.  A corrupt/unwritable cache must not
     // make an otherwise readable container lose its page count.
-    let catalog = identity_is_cacheable
-        .then(|| catalogs.get_or_open(cache_dir, folder, io_sem, target.priority))
-        .flatten();
+    let catalog = if identity_is_cacheable {
+        catalogs
+            .get_or_open(cache_dir, folder, io_sem, target.priority, cancel)
+            .map_err(DetailsPageCountError::Cancelled)?
+    } else {
+        None
+    };
 
     match &target.item {
         GridItem::ZipFile(path) => {
             if let Some(catalog) = catalog {
                 let cached = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                        return Err(DetailsPageCountError::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::ZipCatalogRead),
+                        ));
+                    };
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Zip,
@@ -1068,15 +1250,25 @@ fn load_details_page_count(
                 }
             }
             let entries = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::ZipEnumerate),
+                    ));
+                };
                 crate::zip_loader::enumerate_image_entries(path).map_err(|_| ())?
             };
             if cancel.load(Ordering::Relaxed) {
-                return Err(());
+                return Err(DetailsPageCountError::Cancelled(
+                    DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::ZipEnumerate),
+                ));
             }
             let count = u32::try_from(entries.len()).map_err(|_| ())?;
             if let Some(catalog) = catalog {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::ZipCatalogWrite),
+                    ));
+                };
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Zip,
@@ -1092,7 +1284,13 @@ fn load_details_page_count(
             let options = config.image_folder_options.as_ref().ok_or(())?;
             if let Some(catalog) = catalog {
                 let cached = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                        return Err(DetailsPageCountError::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(
+                                DetailsMetaIoStage::FolderCatalogRead,
+                            ),
+                        ));
+                    };
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Folder,
@@ -1106,14 +1304,24 @@ fn load_details_page_count(
                 }
             }
             let count = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::FolderCount),
+                    ));
+                };
                 crate::app::folder_scan::image_folder_page_count(path, options).map_err(|_| ())?
             };
             if cancel.load(Ordering::Relaxed) {
-                return Err(());
+                return Err(DetailsPageCountError::Cancelled(
+                    DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::FolderCount),
+                ));
             }
             if let Some(catalog) = catalog {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::FolderCatalogWrite),
+                    ));
+                };
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Folder,
@@ -1131,7 +1339,11 @@ fn load_details_page_count(
         } => {
             if let Some(catalog) = catalog {
                 let cached = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                        return Err(DetailsPageCountError::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarCatalogRead),
+                        ));
+                    };
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Archive,
@@ -1145,16 +1357,26 @@ fn load_details_page_count(
                 }
             }
             let inspection = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarInspect),
+                    ));
+                };
                 crate::rar_loader::inspect_for_direct_read(path).map_err(|_| ())?
             };
             if cancel.load(Ordering::Relaxed) {
-                return Err(());
+                return Err(DetailsPageCountError::Cancelled(
+                    DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::RarInspect),
+                ));
             }
             let count = (inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct)
                 .then_some(inspection.summary.image_count);
             if let Some(catalog) = catalog {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarCatalogWrite),
+                    ));
+                };
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Archive,
@@ -1172,7 +1394,11 @@ fn load_details_page_count(
             let pdf_password = config.pdf_passwords.get(path);
             if let Some(catalog) = catalog {
                 let cached = {
-                    let _permit = io_sem.acquire(target.priority);
+                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                        return Err(DetailsPageCountError::Cancelled(
+                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogRead),
+                        ));
+                    };
                     catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
@@ -1185,7 +1411,11 @@ fn load_details_page_count(
                 }
             }
             let pages = {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfEnumerate),
+                    ));
+                };
                 crate::pdf_loader::enumerate_pages_with_cancel(
                     path,
                     pdf_password.as_deref(),
@@ -1194,14 +1424,20 @@ fn load_details_page_count(
                 .map_err(|_| ())?
             };
             if cancel.load(Ordering::Relaxed) {
-                return Err(());
+                return Err(DetailsPageCountError::Cancelled(
+                    DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::PdfEnumerate),
+                ));
             }
             let count = u32::try_from(pages.len()).map_err(|_| ())?;
             if count == 0 {
                 return Ok(None);
             }
             if let Some(catalog) = catalog {
-                let _permit = io_sem.acquire(target.priority);
+                let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                    return Err(DetailsPageCountError::Cancelled(
+                        DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogWrite),
+                    ));
+                };
                 let _ = catalog.set_pdf_meta(
                     key,
                     target.source_mtime,
@@ -1240,13 +1476,18 @@ impl ContainerCatalogCache {
         folder: &Path,
         io_sem: &crate::io_semaphore::GlobalIoSemaphore,
         priority: crate::io_semaphore::IoPriority,
-    ) -> Option<&crate::catalog::CatalogDb> {
+        cancel: &AtomicBool,
+    ) -> Result<Option<&crate::catalog::CatalogDb>, DetailsMetaCancelReason> {
         if let Some(position) = self.lru.iter().position(|entry| entry == folder) {
             self.lru.remove(position);
         }
         if !self.entries.contains_key(folder) {
             let opened = {
-                let _permit = io_sem.acquire(priority);
+                let Some(_permit) = io_sem.acquire_cancellable(priority, cancel) else {
+                    return Err(DetailsMetaCancelReason::PermitWait(
+                        DetailsMetaIoStage::ContainerCatalogOpen,
+                    ));
+                };
                 crate::catalog::CatalogDb::open(cache_dir, folder).ok()
             };
             self.entries.insert(folder.to_path_buf(), opened);
@@ -1258,7 +1499,7 @@ impl ContainerCatalogCache {
             };
             self.entries.remove(&oldest);
         }
-        self.entries.get(folder).and_then(Option::as_ref)
+        Ok(self.entries.get(folder).and_then(Option::as_ref))
     }
 }
 
@@ -1795,7 +2036,7 @@ mod tests {
                 &cancel,
                 &config,
             ),
-            Err(()),
+            Err(DetailsPageCountError::Failed),
             "画像認識規則が変わったら古いZIPページ数cacheを再利用しない"
         );
     }
@@ -1900,6 +2141,81 @@ mod tests {
             load_video_meta: false,
             priority: crate::io_semaphore::IoPriority::Low,
         }
+    }
+
+    #[test]
+    fn details_meta_worker_cancelled_while_waiting_for_io_exits_without_failure_event() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("waiting.png");
+        std::fs::write(&path, b"not decoded by this test").unwrap();
+        let mut target = no_io_details_target(0);
+        target.key = crate::adjustment_db::normalize_path(&path);
+        target.item = GridItem::Image(path);
+        target.source_size = 24;
+        target.load_ai_metadata = false;
+        target.load_created_at = true;
+        target.priority = crate::io_semaphore::IoPriority::Normal;
+
+        let io_sem = Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1));
+        let holder = io_sem.acquire(crate::io_semaphore::IoPriority::Normal);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_sem = Arc::clone(&io_sem);
+        let worker_cancel = Arc::clone(&cancel);
+        let cache_dir = temp.path().join("cache");
+        let worker = std::thread::spawn(move || {
+            run_details_meta_load(
+                23,
+                vec![target],
+                Vec::new(),
+                0,
+                0,
+                1,
+                cache_dir,
+                worker_sem,
+                worker_cancel,
+                tx,
+                mpsc::channel().1,
+                DetailsPageCountConfig {
+                    fingerprint: 0,
+                    image_folder_options: None,
+                    pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+                },
+            );
+            done_tx.send(()).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while io_sem.waiting_for_test(crate::io_semaphore::IoPriority::Normal) != 1 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cancel.store(true, Ordering::Relaxed);
+        if let Err(error) = done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            drop(holder);
+            worker.join().unwrap();
+            panic!("cancelled worker did not exit while permit stayed held: {error}");
+        }
+
+        assert_eq!(io_sem.stats().0, 0, "worker acquired the held permit");
+        assert_eq!(
+            io_sem.waiting_for_test(crate::io_semaphore::IoPriority::Normal),
+            0,
+            "cancelled waiter remained registered"
+        );
+        drop(holder);
+        worker.join().unwrap();
+        let replacement = io_sem
+            .try_acquire(crate::io_semaphore::IoPriority::Normal)
+            .expect("replacement worker must not be blocked by the cancelled waiter");
+        drop(replacement);
+        let events = rx.into_iter().collect::<Vec<_>>();
+        assert!(
+            events.is_empty(),
+            "cancellation emitted {} events",
+            events.len()
+        );
     }
 
     #[test]
@@ -2023,6 +2339,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
         let mut cache = ContainerCatalogCache::new(2);
         for name in ["one", "two", "three"] {
             let folder = temp.path().join(name);
@@ -2034,7 +2351,9 @@ mod tests {
                         &folder,
                         &io_sem,
                         crate::io_semaphore::IoPriority::Normal,
+                        &cancel,
                     )
+                    .unwrap()
                     .is_some()
             );
             assert!(cache.entries.len() <= 2);
