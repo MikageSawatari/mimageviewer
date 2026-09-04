@@ -34542,18 +34542,19 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// Loading the current page must not cancel prefetch that is still in range.
+    /// While the current page is loading, other pending loads are cancelled.
     ///
-    /// This used to assert the opposite: while the current page was loading, every other
-    /// pending load was cancelled so the current one could have the CPU to itself. The
-    /// page-load scheduler now reserves permits for the displayed page, so that job is
-    /// done by admission rather than by mass cancellation. Keeping both was actively
-    /// harmful - a cancelled request holds its permit until the worker really exits, so
-    /// cancelling every frame filled the whole budget with work already known to be
-    /// unwanted (measured 2026-09-04: 5 of 6 permits held by cancelling workers, and the
-    /// displayed page itself waiting up to 201ms behind them).
+    /// This overlaps with the page-load scheduler's reserved permits, and on 2026-09-04 it
+    /// was removed on the argument that the reservation made it redundant. Measuring on
+    /// the real machine showed the opposite: permits held by cancelled workers went from
+    /// 5 of 6 to 6 of 6, `running` sat at a median of zero, and the displayed page went
+    /// from 148ms to 396ms. The archive read has no interior cancel point, so a prefetch
+    /// that acquires a permit commits to roughly 700ms of uninterruptible work; cancelling
+    /// while it is still waiting is what prevents that commitment. Shortening the
+    /// uninterruptible section comes first - that is S2, reusing the archive directory.
+    /// See docs/archive-page-load-scheduler-plan.md 8.1.
     #[test]
-    fn paged_prefetch_starts_current_and_keeps_in_range_siblings() {
+    fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
         let mut app = setup_app();
         let current = push_image(&mut app, r"C:\missing\current.png");
         let sibling = push_image(&mut app, r"C:\missing\sibling.png");
@@ -34578,10 +34579,9 @@ mod pipeline_cache_refactor_tests {
         app.update_prefetch_window(current);
 
         assert!(
-            !sibling_cancel.load(std::sync::atomic::Ordering::Relaxed),
-            "an in-range prefetch must keep running while the current page loads",
+            sibling_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "prefetch is stopped before it can commit a permit to an uninterruptible read",
         );
-        assert!(app.fs_pending.contains_key(&sibling));
         assert!(app.fs_pending.contains_key(&current));
         assert_eq!(
             app.fs_page_load_state(current),
@@ -34590,8 +34590,8 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// Out-of-range prefetch is still cancelled. Dropping the mass-cancel rule must not
-    /// turn the keep window into a leak.
+    /// Prefetch outside the keep window is cancelled even when the current page is ready,
+    /// so the window itself - not only the "current page is loading" rule - bounds pending.
     #[test]
     fn paged_prefetch_still_cancels_siblings_outside_the_keep_window() {
         let mut app = setup_app();

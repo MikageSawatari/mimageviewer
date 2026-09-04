@@ -461,13 +461,13 @@ GIF / APNG / Animated WebP の各 frame 境界にある。PDFium と Susie IPC �
 中断可能であるように見せず、応答まで permit 内で待つ。待機数、実行数、取消中数、
 cancel から実終了までの時間は `fs.scheduler_*` perf event で観測できる。
 
-`update_prefetch_window` が止めるのは **KEEP 範囲外**と、**表示から外れた昇格**だけになった。
-かつては「現在ページがロード中なら他の pending を全部キャンセルする」規則があり、
-現在ページへ CPU を独占させる役目を負っていたが、その役目は High 予約枠が担う。
-**2026-09-04 に撤去した** — 取消済みでも実行枠は worker の実終了まで空かないので、毎フレーム
-巻き込みキャンセルすると予算全体が「もう要らないと分かっている仕事」で埋まる。実機計測では
-取消中が常時 5/6 枠を占め、6 枠すべてが取消中になった 16 回では表示中ページ自身が最大 201ms
-待たされていた。先読みの新規開始を現在ページの完了まで見送る点 (early return) は残している。
+`update_prefetch_window` は今も「現在ページがロード中なら他の pending をキャンセルし、
+先読みの新規開始も見送る」を続ける。**上限制御と役割が重なるが、S2 (書庫目次の再利用) が
+入るまでは残す。** 2026-09-04 に「High 予約枠があれば不要」として撤去したところ実機計測で
+悪化した (取消中が占める枠 5/6 → 6/6、`running` の中央値 0、ページ完成 p50 148ms → 396ms)。
+書庫読み出しに中断の境目が無いため、**permit を取った先読みは 700ms 前後の中断不能な読み出しに
+commit する**。巻き込みキャンセルはその commit の前に止めていた。中断不能区間を短くするのが先。
+経緯は [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) §8.1。
 
 
 ページ送りの unresolved rendition sequence 中も、worker の完成結果は同じ viewer context /

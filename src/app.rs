@@ -52126,16 +52126,17 @@ impl App {
 
         self.start_animation_promotion_if_needed(current_idx);
 
-        // 現在ページがまだ表示可能でない間は、先読みの新規開始を見送る (下の early return)。
-        // retained PDF final-AI は raw fs_cache が無くても表示可能なので loading に含めない。
+        // 現在ページがまだ表示可能でない間は、他の pending をキャンセルし、先読みの新規開始も
+        // 見送る。retained PDF final-AI は raw fs_cache が無くても表示可能なので loading に含めない。
         //
-        // **ここで他の pending を巻き込んでキャンセルしない。** かつては現在ページへ CPU を
-        // 独占させるため「ロード中なら全部キャンセル」していたが、その役目は
-        // `FsPageLoadScheduler` の High 予約枠が担う (docs/archive-page-load-scheduler-plan.md §3.3)。
-        // 取消済みでも worker が実際に終わるまで実行枠は空かないので、毎フレーム巻き込み
-        // キャンセルすると **予算全体が「もう要らないと分かっている仕事」で埋まる**。
-        // 2026-09-04 の実機計測では取消中が常時 5/6 枠を占め、6 枠すべてが取消中になった
-        // 16 回では表示中ページ自身が最大 201ms 待たされていた。
+        // **これは上限制御と役割が重なっているが、S2 (書庫目次の再利用) が入るまでは残す。**
+        // 2026-09-04 に「High 予約枠があれば不要」と判断して撤去したところ、実機計測で
+        // **悪化した**: 取消中が占める枠は 5/6 → 6/6 (全枠が取消中の標本が 58%)、`running` の
+        // 中央値は 0、ページ完成は p50 148ms → 396ms。理由は、書庫読み出しに中断の境目が無く、
+        // **一度 permit を取った先読みは中断できない読み出しに 700ms 前後 commit してしまう**ため。
+        // 巻き込みキャンセルは、その commit が起きる前 (= 待機中) に先読みを止めていた。
+        // 中断できない区間を短くするのが先で、それが S2 の仕事。
+        // 経緯: docs/archive-page-load-scheduler-plan.md §8.1。
         let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
 
         let to_cancel: Vec<usize> = self
@@ -52145,9 +52146,11 @@ impl App {
                 if k == current_idx {
                     return None;
                 }
-                // KEEP 範囲外と、表示から外れた昇格だけを止める。ここを「current 以外は全部」に
+                // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
+                // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
                 // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
-                (!keep_set.contains(&k)
+                (current_loading
+                    || !keep_set.contains(&k)
                     || (pending.purpose.promotion_started_at_for(k).is_some()
                         && !Self::page_is_displayed(k, current_idx, displayed_partner)))
                 .then_some(k)
