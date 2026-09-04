@@ -7773,6 +7773,53 @@ mod animated_playback_only_pipeline_tests {
                 .any(|(key, _)| key.edit_key.idx == 0)
         );
     }
+
+    #[test]
+    fn ctrl_e_rejects_animated_images_instead_of_exporting_the_first_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.items
+            .push(crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "c:/p/animated.gif",
+            )));
+        app.visible_indices = vec![0];
+        app.thumbnails
+            .push(crate::grid_item::ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+
+        let frame0 = egui::ColorImage::filled([2, 1], egui::Color32::RED);
+        let frame1 = egui::ColorImage::filled([2, 1], egui::Color32::GREEN);
+        let tex0 = ctx.load_texture(
+            "export_animation_frame_0",
+            frame0.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex1 = ctx.load_texture(
+            "export_animation_frame_1",
+            frame1.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Animated {
+                frames: vec![(tex0, 0.1), (tex1, 0.1)],
+                frame_pixels: vec![Arc::new(frame0), Arc::new(frame1)],
+                current_frame: 1,
+                playback: crate::fs_animation::AnimationPlayback::Paused,
+                load_seq: 0,
+            },
+        );
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        assert!(app.export_dialog.is_none());
+        assert_eq!(
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(message, _, _)| message.as_str()),
+            Some("アニメーション画像はエクスポートできません")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -25370,9 +25417,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.export_crop_mode);
     }
 
-    /// 見開き表示中の Ctrl+E は左右ページを 1 つの export snapshot として開く。
+    /// 見開き表示中の Ctrl+E は左右ページを 1 つの worker 合成要求として開く。
     #[test]
-    fn open_export_dialog_uses_spread_pixels_when_spread_is_visible() {
+    fn open_export_dialog_uses_spread_sources_when_spread_is_visible() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
         let ctx = egui::Context::default();
@@ -25430,15 +25477,23 @@ mod favorite_adjustment_defaults_tests {
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other("spread".to_string())
         );
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.size, [1, 2]);
-                assert_eq!(right.base_pixels.size, [1, 2]);
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert_eq!(left.predicted_size, [1, 2]);
+                assert_eq!(right.predicted_size, [1, 2]);
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("spread export should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("spread export should prepare both page sources")
             }
         }
 
@@ -25452,13 +25507,21 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("right-page entry should still snapshot the visible spread")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("right-page entry should still prepare the visible spread")
             }
         }
     }
@@ -25951,13 +26014,21 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("visible spread layout should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("visible spread layout should prepare both page sources")
             }
         }
     }
