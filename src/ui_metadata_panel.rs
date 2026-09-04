@@ -208,7 +208,7 @@ enum SimilarPanelModel {
 
 #[derive(Default)]
 struct SimilarPanelActions {
-    open_preferences: bool,
+    open_favorites: bool,
     open_hit: Option<crate::similar_index::QueryHit>,
     hovered_hit: Option<crate::similar_index::QueryHit>,
 }
@@ -969,10 +969,8 @@ impl App {
         {
             self.pin_similar_hit(ctx, &hit, full_rect);
         }
-        if similar_actions.open_preferences {
-            self.open_preferences_page(
-                crate::ui_dialogs::preferences::PreferencesPage::SimilarIndex,
-            );
+        if similar_actions.open_favorites {
+            self.show_favorites_editor = true;
         }
         if let Some(hit) = similar_actions.open_hit {
             self.open_similar_hit(&hit);
@@ -1860,14 +1858,38 @@ fn tag_picker_tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui
 }
 
 fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
-    ui.horizontal(|ui| {
-        if tag_picker_tab_button(ui, "情報", *tab == MetadataPanelTab::Info).clicked() {
-            *tab = MetadataPanelTab::Info;
-        }
-        if tag_picker_tab_button(ui, "類似", *tab == MetadataPanelTab::Similar).clicked() {
-            *tab = MetadataPanelTab::Similar;
-        }
-    });
+    const TAB_HEIGHT: f32 = 24.0;
+    const TAB_GAP: f32 = 4.0;
+    let width = ui.available_width().max(1.0);
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(width, TAB_HEIGHT), egui::Sense::hover());
+    let tab_width = ((row_rect.width() - TAB_GAP) / 2.0).max(1.0);
+    let info_rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(tab_width, TAB_HEIGHT));
+    let similar_rect = egui::Rect::from_min_size(
+        egui::pos2(info_rect.right() + TAB_GAP, row_rect.top()),
+        egui::vec2(tab_width, TAB_HEIGHT),
+    );
+    if crate::ui_helpers::draw_panel_tab_button(
+        ui,
+        info_rect,
+        "metadata_panel_info_tab",
+        "情報",
+        *tab == MetadataPanelTab::Info,
+    )
+    .clicked()
+    {
+        *tab = MetadataPanelTab::Info;
+    }
+    if crate::ui_helpers::draw_panel_tab_button(
+        ui,
+        similar_rect,
+        "metadata_panel_similar_tab",
+        "類似",
+        *tab == MetadataPanelTab::Similar,
+    )
+    .clicked()
+    {
+        *tab = MetadataPanelTab::Similar;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1885,8 +1907,8 @@ fn draw_similar_panel(
     match model {
         SimilarPanelModel::NoIndex => {
             ui.label("索引がありません");
-            if ui.button("環境設定で索引を作成").clicked() {
-                actions.open_preferences = true;
+            if ui.button("お気に入りで索引を有効にする").clicked() {
+                actions.open_favorites = true;
             }
         }
         SimilarPanelModel::Preparing => {

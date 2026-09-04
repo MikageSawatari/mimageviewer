@@ -210,6 +210,12 @@ impl SimilarIndexManager {
             .configure(roots, pdf_passwords, activity_gate);
     }
 
+    /// favorite を OFF にしたとき、その範囲だけを worker 上で即時削除する。
+    /// 後続の全走査が中断・失敗しても、OFF にした範囲の行を残さない。
+    pub fn purge_disabled_favorite(&self, root: &Path) {
+        self.scheduler.queue_purge(root.to_path_buf());
+    }
+
     /// メタデータ索引 supervisor の watcher から再照合を要求する軽量 notifier。
     pub fn notifier(&self) -> SimilarIndexNotifier {
         SimilarIndexNotifier {
@@ -254,7 +260,7 @@ impl SimilarIndexManager {
         }
     }
 
-    /// 設定画面用の軽量集計。署名本体は読まず、DB I/O は専用 worker で行う。
+    /// お気に入り編集の状態表示用集計。署名本体は読まず、DB I/O は専用 worker で行う。
     pub fn summary(&self) -> IndexSummaryStatus {
         let mut state = self.summary.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
@@ -410,6 +416,7 @@ struct SchedulerConfig {
 #[derive(Default)]
 struct SchedulerState {
     config: Option<SchedulerConfig>,
+    pending_purge_roots: BTreeSet<PathBuf>,
     revision: u64,
     worker_running: bool,
     shutdown: bool,
@@ -524,6 +531,31 @@ impl SimilarIndexScheduler {
         }
     }
 
+    fn queue_purge(self: &Arc<Self>, root: PathBuf) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.shutdown {
+            return;
+        }
+        state.pending_purge_roots.insert(root);
+        state.revision = state.revision.wrapping_add(1);
+        if let Some(cancel) = self
+            .active_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let should_start = !state.worker_running && state.config.is_some();
+        if should_start {
+            state.worker_running = true;
+        }
+        drop(state);
+        if should_start {
+            self.spawn_worker();
+        }
+    }
+
     fn spawn_worker(self: &Arc<Self>) {
         let scheduler = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
@@ -554,8 +586,8 @@ impl SimilarIndexScheduler {
         register_prefill_db(&db, &self.enabled_roots);
 
         loop {
-            let (revision, config, cancel) = {
-                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (revision, config, cancel, purge_roots) = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.shutdown {
                     return;
                 }
@@ -567,7 +599,8 @@ impl SimilarIndexScheduler {
                 let cancel = Arc::new(AtomicBool::new(false));
                 *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(Arc::clone(&cancel));
-                (state.revision, config, cancel)
+                let purge_roots = std::mem::take(&mut state.pending_purge_roots);
+                (state.revision, config, cancel, purge_roots)
             };
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
                 IndexProgress::Running(RunningProgress {
@@ -575,14 +608,32 @@ impl SimilarIndexScheduler {
                     current_path: None,
                     report: IndexReport::default(),
                 });
-            let outcome = run_index_job(
-                &db,
-                &config.roots,
-                &config.pdf_passwords,
-                config.activity_gate.as_deref(),
-                &cancel,
-                &self.progress,
-            );
+            let keep_roots = config
+                .roots
+                .iter()
+                .map(|root| crate::search_index_db::normalize_path(root))
+                .collect::<Vec<_>>();
+            let purge_roots = purge_roots
+                .iter()
+                .map(|root| crate::search_index_db::normalize_path(root))
+                .collect::<Vec<_>>();
+            let outcome = db
+                .purge_roots_except(&purge_roots, &keep_roots)
+                .map_err(|error| format!("disabled favorite purge failed: {error}"))
+                .and_then(|purged| {
+                    run_index_job(
+                        &db,
+                        &config.roots,
+                        &config.pdf_passwords,
+                        config.activity_gate.as_deref(),
+                        &cancel,
+                        &self.progress,
+                    )
+                    .map(|mut report| {
+                        report.removed = report.removed.saturating_add(purged as u64);
+                        report
+                    })
+                });
             self.invalidate_loaded_state();
 
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -637,12 +688,7 @@ impl SimilarIndexScheduler {
 }
 
 fn key_is_under_any(key: &str, roots: &[String]) -> bool {
-    roots.iter().any(|root| {
-        key == root
-            || key
-                .strip_prefix(root)
-                .is_some_and(|suffix| root.ends_with('/') || suffix.starts_with('/'))
-    })
+    crate::similar_db::key_is_under_any(key, roots)
 }
 
 enum MemoryState {

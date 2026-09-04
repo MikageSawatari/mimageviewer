@@ -137,8 +137,6 @@ pub(crate) enum PreferencesPage {
     SusiePlugins,
     /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
-    /// お気に入り配下から別バージョンを探す索引
-    SimilarIndex,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
     TrayResidency,
     /// v0.8.1: レーティング XMP 書き込み設定
@@ -182,7 +180,6 @@ impl PreferencesPage {
         Self::PlaybackResume,
         Self::SusiePlugins,
         Self::IndexerSpeed,
-        Self::SimilarIndex,
         Self::TrayResidency,
         Self::Rating,
         Self::UpdateCheck,
@@ -218,7 +215,6 @@ impl PreferencesPage {
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "検索インデックス",
-            Self::SimilarIndex => "別バージョン",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
             Self::UpdateCheck => "更新確認",
@@ -463,7 +459,6 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::PlaybackResume,
             PreferencesPage::Rating,
             PreferencesPage::IndexerSpeed,
-            PreferencesPage::SimilarIndex,
         ],
     },
     TreeCategory {
@@ -648,9 +643,6 @@ pub(crate) struct PreferencesState {
     pub highlight: Option<(&'static str, f64)>,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
-
-    // ── 別バージョン索引ページ ──────────────────────────────────
-    pub similar_index_summary: crate::similar_index::IndexSummaryStatus,
 
     // ── 外部ツールページ ────────────────────────────────────────
     /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
@@ -1177,7 +1169,6 @@ impl PreferencesState {
             pending_anchor: None,
             highlight: None,
             expanded,
-            similar_index_summary: crate::similar_index::IndexSummaryStatus::Preparing,
             external_tool_target,
             external_tool_association_ext,
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
@@ -1974,17 +1965,6 @@ impl App {
                     (s.plugin_name.unwrap_or_else(|| "(不明)".to_string()), ms)
                 })
                 .collect();
-        }
-
-        let similar_index_summary = self.similar_index.summary();
-        if let Some(state) = self.pref_state.as_mut() {
-            state.similar_index_summary = similar_index_summary;
-            if matches!(
-                state.similar_index_summary,
-                crate::similar_index::IndexSummaryStatus::Preparing
-            ) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
         }
 
         let mut open = true;
@@ -3154,7 +3134,6 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
-        PreferencesPage::SimilarIndex => page_similar_index(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
         PreferencesPage::UpdateCheck => page_update_check(ui, state),

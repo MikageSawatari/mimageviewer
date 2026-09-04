@@ -19971,12 +19971,20 @@ impl App {
     }
 
     /// 別バージョン索引フラグの変更を、対象 snapshot と共有 watcher の両方へ即時反映する。
-    pub(crate) fn apply_favorite_similar_index_change(&mut self) {
+    /// OFF 時の削除も同じ worker へ渡し、後続の全走査の完走には依存させない。
+    pub(crate) fn apply_favorite_similar_index_change(
+        &mut self,
+        favorite_path: &std::path::Path,
+        new_on: bool,
+    ) {
         self.similar_index.configure(
             &self.settings.favorites,
             self.pdf_passwords.clone(),
             Some(Arc::clone(&self.activity_gate)),
         );
+        if !new_on {
+            self.similar_index.purge_disabled_favorite(favorite_path);
+        }
         if let Some(manager) = self.indexer_manager.as_mut() {
             manager.sync_with_favorites(&self.settings.favorites);
         }

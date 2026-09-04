@@ -745,6 +745,75 @@ impl SimilarDb {
         Ok(removed)
     }
 
+    /// OFF になった favorite 配下の索引データを、次の全走査の完走を待たずに削除する。
+    ///
+    /// favorite は重なり得るため、`keep_roots` 配下でもあるキーは残す。公開済み世代、
+    /// 構築途中の世代、prefill を同じ transaction で掃除し、公開件数の集計も追従させる。
+    pub fn purge_roots_except(
+        &self,
+        purge_roots: &[String],
+        keep_roots: &[String],
+    ) -> rusqlite::Result<usize> {
+        if purge_roots.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let should_purge =
+            |key: &str| key_is_under_any(key, purge_roots) && !key_is_under_any(key, keep_roots);
+
+        let item_keys = query_string_column(&transaction, "SELECT item_key FROM item")?;
+        let container_keys =
+            query_string_column(&transaction, "SELECT container_key FROM container")?;
+        let build_item_keys = query_string_column(&transaction, "SELECT item_key FROM item_build")?;
+        let build_container_keys =
+            query_string_column(&transaction, "SELECT container_key FROM container_build")?;
+        let prefill_keys = query_string_column(&transaction, "SELECT item_key FROM item_prefill")?;
+
+        let mut removed = 0;
+        for key in item_keys.into_iter().filter(|key| should_purge(key)) {
+            removed += transaction.execute("DELETE FROM item WHERE item_key = ?1", [&key])?;
+        }
+        for key in container_keys.into_iter().filter(|key| should_purge(key)) {
+            removed += transaction.execute("DELETE FROM item WHERE container_key = ?1", [&key])?;
+            removed +=
+                transaction.execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
+        }
+        for key in build_item_keys.into_iter().filter(|key| should_purge(key)) {
+            removed += transaction.execute("DELETE FROM item_build WHERE item_key = ?1", [&key])?;
+        }
+        for key in build_container_keys
+            .into_iter()
+            .filter(|key| should_purge(key))
+        {
+            removed +=
+                transaction.execute("DELETE FROM item_build WHERE container_key = ?1", [&key])?;
+            removed += transaction.execute(
+                "DELETE FROM container_build WHERE container_key = ?1",
+                [&key],
+            )?;
+        }
+        for key in prefill_keys.into_iter().filter(|key| should_purge(key)) {
+            removed +=
+                transaction.execute("DELETE FROM item_prefill WHERE item_key = ?1", [&key])?;
+        }
+
+        transaction.execute(
+            "UPDATE index_run
+             SET registered_items = (
+               SELECT COUNT(*) FROM item i
+               LEFT JOIN container c ON c.container_key = i.container_key
+               WHERE i.hash_version = index_run.hash_version
+                 AND (i.container_key IS NULL OR c.scan_state = ?1)
+             )
+             WHERE singleton = 1",
+            [ScanState::Complete as i64],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     #[cfg(test)]
     fn count_staged(&self) -> usize {
         self.conn
@@ -753,6 +822,22 @@ impl SimilarDb {
             .query_row("SELECT COUNT(*) FROM item_build", [], |row| row.get(0))
             .unwrap()
     }
+}
+
+pub(crate) fn key_is_under_any(key: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        key == root
+            || key
+                .strip_prefix(root)
+                .is_some_and(|suffix| root.ends_with('/') || suffix.starts_with('/'))
+    })
+}
+
+fn query_string_column(transaction: &Transaction<'_>, sql: &str) -> rusqlite::Result<Vec<String>> {
+    let mut statement = transaction.prepare(sql)?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect()
 }
 
 fn building_page_count(
@@ -1116,5 +1201,89 @@ mod tests {
         let rows = db.load_search_rows(current_hash_version()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].item.item_key, "c:/enabled/a.jpg");
+    }
+
+    #[test]
+    fn disabled_favorite_purge_preserves_enabled_overlap_and_prefix_sibling() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        for (key, marker) in [
+            ("c:/library/drop/a.jpg", 1),
+            ("c:/library/keep/a.jpg", 2),
+            ("c:/library-old/a.jpg", 3),
+        ] {
+            db.upsert_loose_item(&item(key, None, None, marker))
+                .unwrap();
+        }
+        let drop_book = db
+            .begin_container_build("c:/library/drop/book.zip", ContainerKind::Zip, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            drop_book,
+            &item(
+                "c:/library/drop/book.zip\u{1f}page.jpg",
+                Some("c:/library/drop/book.zip"),
+                Some(0),
+                4,
+            ),
+        )
+        .unwrap();
+        db.complete_container("c:/library/drop/book.zip", drop_book)
+            .unwrap();
+        let building = db
+            .begin_container_build("c:/library/drop/building.zip", ContainerKind::Zip, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            building,
+            &item(
+                "c:/library/drop/building.zip\u{1f}page.jpg",
+                Some("c:/library/drop/building.zip"),
+                Some(0),
+                5,
+            ),
+        )
+        .unwrap();
+        let prefill = item("c:/library/drop/prefill.jpg", None, None, 6);
+        db.put_prefill(&prefill).unwrap();
+        db.record_completed_index(current_hash_version(), 1234, CompletedIndexStats::default())
+            .unwrap();
+
+        let removed = db
+            .purge_roots_except(&["c:/library".to_owned()], &["c:/library/keep".to_owned()])
+            .unwrap();
+        // loose + complete page/container + Building page/public/build row + prefill。
+        assert_eq!(removed, 7);
+
+        let keys = db
+            .load_search_rows(current_hash_version())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.item_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "c:/library/keep/a.jpg".to_owned(),
+                "c:/library-old/a.jpg".to_owned(),
+            ]
+        );
+        assert!(db.load_complete_containers().unwrap().is_empty());
+        assert_eq!(db.count_staged(), 0);
+        assert!(
+            db.load_prefill(
+                &prefill.item_key,
+                prefill.mtime,
+                prefill.file_size,
+                prefill.hash_version,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.load_index_summary(current_hash_version())
+                .unwrap()
+                .unwrap()
+                .registered_items,
+            2
+        );
     }
 }

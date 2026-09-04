@@ -136,7 +136,7 @@ impl App {
         // (ループ中に self を再帰的に &mut 借りる回避)。
         let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
-        let mut similar_index_changed = false;
+        let mut similar_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
         let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
@@ -250,6 +250,13 @@ impl App {
             .map(|(id, h)| (*id, h.snapshot_stats()))
             .collect();
         let similar_progress = self.similar_index_progress();
+        let similar_summary = self.similar_index.summary();
+        if matches!(
+            similar_summary,
+            crate::similar_index::IndexSummaryStatus::Preparing
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
 
         egui::Window::new("お気に入り")
             .open(&mut open)
@@ -583,7 +590,11 @@ impl App {
                                                 "",
                                             );
                                             if similar_resp.changed() {
-                                                similar_index_changed = true;
+                                                similar_index_toggles.push((
+                                                    fav_path.clone(),
+                                                    self.settings.favorites[i]
+                                                        .auto_index_similar,
+                                                ));
                                                 any_setting_dirty = true;
                                             }
                                             draw_similar_state_inline(
@@ -663,7 +674,7 @@ impl App {
                             for f in &mut self.settings.favorites {
                                 if !f.auto_index_similar {
                                     f.auto_index_similar = true;
-                                    similar_index_changed = true;
+                                    similar_index_toggles.push((f.path.clone(), true));
                                     any_setting_dirty = true;
                                 }
                             }
@@ -672,7 +683,7 @@ impl App {
                             for f in &mut self.settings.favorites {
                                 if f.auto_index_similar {
                                     f.auto_index_similar = false;
-                                    similar_index_changed = true;
+                                    similar_index_toggles.push((f.path.clone(), false));
                                     any_setting_dirty = true;
                                 }
                             }
@@ -813,6 +824,7 @@ impl App {
                             .on_hover_text(format!("{name}: {msg}"));
                         }
                     }
+                    draw_similar_index_summary(ui, &similar_summary, &similar_progress);
                     // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
                     // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -920,9 +932,9 @@ impl App {
             if removed.auto_index_metadata {
                 meta_index_toggles.push((removed.id, false));
             }
-            if removed.auto_index_similar {
-                similar_index_changed = true;
-            }
+            // 旧版で OFF 後に残った行も含め、favorite 自体の削除では常に掃除を要求する。
+            // 他の ON favorite と範囲が重なる行は SimilarDb 側が保持する。
+            similar_index_toggles.push((removed.path.clone(), false));
             // 補正のお気に入り標準も即時に掃除する (次回起動時の prune_favorite_params
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
             // 効いたまま、という不整合を避ける。
@@ -942,8 +954,8 @@ impl App {
         for (fav_id, new_on) in &meta_index_toggles {
             self.apply_favorite_meta_index_change(*fav_id, *new_on);
         }
-        if similar_index_changed {
-            self.apply_favorite_similar_index_change();
+        for (path, new_on) in &similar_index_toggles {
+            self.apply_favorite_similar_index_change(path, *new_on);
         }
 
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
@@ -985,6 +997,107 @@ impl App {
             self.cc.show = true;
         }
     }
+}
+
+fn draw_similar_index_summary(
+    ui: &mut egui::Ui,
+    status: &crate::similar_index::IndexSummaryStatus,
+    progress: &crate::similar_index::IndexProgress,
+) {
+    use crate::similar_index::IndexSummaryStatus;
+
+    match status {
+        IndexSummaryStatus::NoIndex => {
+            if !matches!(progress, crate::similar_index::IndexProgress::Running(_)) {
+                ui.label(
+                    egui::RichText::new("  別バージョン: 索引なし")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        }
+        IndexSummaryStatus::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("別バージョン索引の情報を読込中")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
+        }
+        IndexSummaryStatus::Ready(summary) => {
+            let updated =
+                crate::app::format_details_timestamp(summary.completed_at_unix_secs, true);
+            let updated = if updated.is_empty() {
+                "不明"
+            } else {
+                &updated
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン（前回完了）: {} 件 / 最終更新 {updated}",
+                    format_count(summary.registered_items),
+                ))
+                .size(11.0)
+                .monospace()
+                .color(ui.visuals().weak_text_color()),
+            );
+            draw_similar_failure_breakdown(
+                ui,
+                "前回完了時に",
+                summary.password_required_pdfs,
+                summary.corrupt_containers,
+                summary.zero_page_containers,
+                summary.decode_failures,
+                summary.io_failures,
+            );
+        }
+        IndexSummaryStatus::Failed(error) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン索引の情報を読み込めませんでした: {error}"
+                ))
+                .size(11.0)
+                .color(ui.visuals().error_fg_color),
+            );
+        }
+    }
+
+    if let crate::similar_index::IndexProgress::Running(running) = progress {
+        draw_similar_failure_breakdown(
+            ui,
+            "今回",
+            running.report.password_required_pdfs,
+            running.report.corrupt_containers,
+            running.report.zero_page_containers,
+            running.report.decode_failures,
+            running.report.io_failures,
+        );
+    }
+}
+
+fn draw_similar_failure_breakdown(
+    ui: &mut egui::Ui,
+    run_label: &str,
+    password_required_pdfs: u64,
+    corrupt_containers: u64,
+    zero_page_containers: u64,
+    decode_failures: u64,
+    io_failures: u64,
+) {
+    ui.label(
+        egui::RichText::new(format!(
+            "    {run_label}確認できなかった項目: パスワード付き PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
+            format_count(password_required_pdfs),
+            format_count(corrupt_containers),
+            format_count(zero_page_containers),
+            format_count(decode_failures),
+            format_count(io_failures),
+        ))
+        .size(11.0)
+        .color(ui.visuals().weak_text_color()),
+    );
 }
 
 fn favorites_editor_dialog_geometry(

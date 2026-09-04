@@ -133,19 +133,24 @@ impl App {
                 match self.settings.try_add_favorite(name, target.clone()) {
                     Ok(()) => {
                         // 追加した最後のエントリに自動インデックスフラグを反映
-                        let (newly_on_structure, fav_id, fav_path) =
+                        let (newly_on_structure, newly_on_similar, fav_id, fav_path) =
                             if let Some(last) = self.settings.favorites.last_mut() {
                                 last.auto_index_structure = self.fav_add_auto_index_structure;
                                 last.auto_index_metadata = self.fav_add_auto_index_metadata;
                                 last.auto_index_thumbs = self.fav_add_auto_index_thumbs;
                                 last.auto_index_similar = self.fav_add_auto_index_similar;
-                                (last.auto_index_structure, last.id, last.path.clone())
+                                (
+                                    last.auto_index_structure,
+                                    last.auto_index_similar,
+                                    last.id,
+                                    last.path.clone(),
+                                )
                             } else {
-                                (false, uuid::Uuid::nil(), std::path::PathBuf::new())
+                                (false, false, uuid::Uuid::nil(), std::path::PathBuf::new())
                             };
                         self.settings.save();
                         // メタ索引 / 別バージョン索引を共有 supervisor へ反映する。
-                        self.apply_favorite_similar_index_change();
+                        self.apply_favorite_similar_index_change(&fav_path, newly_on_similar);
                         // 名前索引: 新規追加 + structure=true なら bulk を起動。
                         // apply_favorite_name_index_change に一本化して、cancel/progress
                         // 管理 (name_bulk_handles) も揃える。

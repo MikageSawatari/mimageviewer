@@ -9223,23 +9223,8 @@ fn draw_left_panel_tab_button(
     tab: crate::settings::FullscreenLeftPanelTab,
     selected: &mut crate::settings::FullscreenLeftPanelTab,
 ) -> bool {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     let active = *selected == tab;
-    let bg = if active {
-        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
-    } else if resp.hovered() {
-        egui::Color32::from_rgba_unmultiplied(95, 95, 95, 210)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 180)
-    };
-    ui.painter().rect_filled(rect, 5.0, bg);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        tab.label(),
-        egui::FontId::proportional(13.0),
-        egui::Color32::WHITE,
-    );
+    let resp = crate::ui_helpers::draw_panel_tab_button(ui, rect, id, tab.label(), active);
     if resp.clicked() && !active {
         *selected = tab;
         true

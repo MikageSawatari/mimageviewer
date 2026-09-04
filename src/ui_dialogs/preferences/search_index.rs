@@ -755,12 +755,6 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["インデクサ", "index", "I/O", "High", "Low"]
     ),
     entry!(
-        "similar-index/run",
-        SimilarIndex,
-        "現在の索引",
-        ["別バージョン", "類似画像", "お気に入り", "バックグラウンド"]
-    ),
-    entry!(
         "tray/residency",
         TrayResidency,
         "アプリを閉じる代わりに、タスクトレイに常駐する",

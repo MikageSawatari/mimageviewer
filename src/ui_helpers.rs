@@ -22,6 +22,35 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
 
+/// フルスクリーン左右パネルで共有するタブの外観。
+///
+/// 各パネルは配置だけを決め、選択色・hover 色・文字組みはここへ集約する。
+pub(crate) fn draw_panel_tab_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let background = if selected {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+    } else if response.hovered() {
+        egui::Color32::from_rgba_unmultiplied(95, 95, 95, 210)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 180)
+    };
+    ui.painter().rect_filled(rect, 5.0, background);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    response
+}
+
 fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
     events
         .iter()
