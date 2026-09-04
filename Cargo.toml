@@ -80,6 +80,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "bench_dupe"
+path = "src/bin/bench_dupe.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "bench_scroll"
 path = "src/bin/bench_scroll.rs"
 test = false
