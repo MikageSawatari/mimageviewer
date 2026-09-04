@@ -52,6 +52,7 @@ pub mod delete_worker;
 pub mod diagnostics;
 mod displayed_image_transform;
 mod double_click_time;
+pub mod dupe;
 #[cfg(windows)]
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
