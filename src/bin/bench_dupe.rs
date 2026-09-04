@@ -13,6 +13,9 @@ use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage, Rgba, Rg
 use mimageviewer::dupe::{self, Algo, LumaMetrics, Proxy, Sig, Signature};
 use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
 use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
+use mimageviewer::similar_image::{
+    PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
+};
 use mimageviewer::thumb_loader::{
     DctDecodeError, apply_exif_orientation, apply_exif_orientation_from_bytes,
     decode_jpeg_turbo_scaled_from_bytes,
@@ -29,8 +32,6 @@ const SCHEMA_VERSION: u32 = 1;
 // decode exactly (core p99 4, max 8, 1840/1840 within distance 8). A target is
 // kept rather than always decoding whole so that peak memory stays bounded on
 // very large sources.
-const JPEG_DCT_TARGET_EDGE: u32 = 2048;
-const DEFAULT_PDF_RENDER_LONG_EDGE: u32 = 1024;
 const DEFAULT_LARGE_DIFF_THRESHOLD_BIN: u8 = 0;
 
 type Result<T> = std::result::Result<T, String>;
@@ -255,17 +256,6 @@ struct SynthRecord {
 struct DecodedImage {
     rgba: RgbaImage,
     source_dims: (u32, u32),
-    method: String,
-    scale_num: u32,
-    scale_den: u32,
-    note: Option<String>,
-}
-
-struct CanonicalFileProxy {
-    decoded: DecodedImage,
-    proxy: Proxy,
-    decode_ms: f64,
-    proxy_ms: f64,
 }
 
 #[derive(Clone)]
@@ -751,7 +741,7 @@ fn run_pdf_scan(args: &[String]) -> Result<()> {
     let mut dir = None;
     let mut output = None;
     let mut recursive = false;
-    let mut render_long_edge = DEFAULT_PDF_RENDER_LONG_EDGE;
+    let mut render_long_edge = PDF_RENDER_LONG_EDGE;
     let mut limit_books = None;
     let mut max_pages_per_book = None;
     let mut index = 0;
@@ -925,10 +915,18 @@ fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<Pdf
             task.page_count, rendered.page_count
         ));
     }
-    let rgba = rendered.image.to_rgba8();
-    let (render_width, render_height) = rgba.dimensions();
+    let render_dims = rendered.image.dimensions();
     let signature_start = Instant::now();
-    let proxy = proxy_from_rgba(&rgba, (render_width, render_height));
+    let proxy = proxy_from_source(
+        ProxySource::Raster {
+            image: &rendered.image,
+            source_dims: render_dims,
+            format: SimilarImageFormat::Pdf,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    .proxy;
     let computed = dupe::all_algos()
         .iter()
         .map(|&algo| dupe::compute(algo, &proxy))
@@ -948,8 +946,8 @@ fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<Pdf
         page_count: task.page_count,
         quality,
         render_long_edge,
-        render_width,
-        render_height,
+        render_width: render_dims.0,
+        render_height: render_dims.1,
         render_ms,
         signature_ms,
         total_ms: elapsed_ms(total_start),
@@ -1787,8 +1785,14 @@ fn scan_one(path: &Path) -> Result<ScanRecord> {
     let bytes =
         std::fs::read(path).map_err(|error| format!("read image {}: {error}", path.display()))?;
 
-    let canonical = canonical_proxy_from_file_bytes(path, &bytes)?;
-    let decoded_dims = canonical.decoded.rgba.dimensions();
+    let canonical = proxy_from_source(
+        ProxySource::File {
+            path,
+            verified_bytes: Some(&bytes),
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
 
     let signature_start = Instant::now();
     let signatures = dupe::all_algos()
@@ -1801,70 +1805,22 @@ fn scan_one(path: &Path) -> Result<ScanRecord> {
         schema_version: SCHEMA_VERSION,
         proxy_version: dupe::PROXY_VERSION,
         path: path.to_path_buf(),
-        width: canonical.decoded.source_dims.0,
-        height: canonical.decoded.source_dims.1,
+        width: canonical.source_dims.0,
+        height: canonical.source_dims.1,
         file_size,
         extension: extension_lower(path),
         decode: DecodeInfo {
-            method: canonical.decoded.method,
-            scale_num: canonical.decoded.scale_num,
-            scale_den: canonical.decoded.scale_den,
-            decoded_width: decoded_dims.0,
-            decoded_height: decoded_dims.1,
-            note: canonical.decoded.note,
+            method: canonical.method.as_str().to_owned(),
+            scale_num: canonical.scale_num,
+            scale_den: canonical.scale_den,
+            decoded_width: canonical.decoded_dims.0,
+            decoded_height: canonical.decoded_dims.1,
+            note: canonical.note,
         },
         decode_ms: canonical.decode_ms,
         signature_ms,
         total_ms: elapsed_ms(total_start),
         signatures,
-    })
-}
-
-/// The single file-backed path from encoded bytes to the canonical visual proxy.
-///
-/// Measurement modes must use this function for every signature derived from an
-/// image file. Experimental raw pixels (PDF renders and decode-selfcheck's
-/// deliberately varied DCT targets) enter below this boundary by design.
-fn canonical_proxy_from_file_bytes(path: &Path, bytes: &[u8]) -> Result<CanonicalFileProxy> {
-    let decode_start = Instant::now();
-    let decoded = decode_canonical_file(path, bytes)?;
-    let decode_ms = elapsed_ms(decode_start);
-    let proxy_start = Instant::now();
-    let proxy = proxy_from_rgba(&decoded.rgba, decoded.source_dims);
-    let proxy_ms = elapsed_ms(proxy_start);
-    Ok(CanonicalFileProxy {
-        decoded,
-        proxy,
-        decode_ms,
-        proxy_ms,
-    })
-}
-
-fn proxy_from_rgba(rgba: &RgbaImage, source_dims: (u32, u32)) -> Proxy {
-    let mut proxy = dupe::proxy::build(rgba.as_raw(), rgba.width(), rgba.height());
-    // A JPEG DCT-scaled decode contains fewer pixels than the source. The
-    // canonical samples come from that explicit decode, while the Proxy
-    // metadata continues to describe the EXIF-oriented source dimensions.
-    proxy.src_width = source_dims.0;
-    proxy.src_height = source_dims.1;
-    proxy
-}
-
-fn decode_canonical_file(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
-    if matches!(extension_lower(path).as_str(), "jpg" | "jpeg") {
-        return decode_jpeg_at_target(path, bytes, JPEG_DCT_TARGET_EDGE);
-    }
-
-    let (image, method, note) = decode_full(path, bytes)?;
-    let image = apply_exif_orientation(image, path);
-    let source_dims = image.dimensions();
-    Ok(DecodedImage {
-        rgba: image.to_rgba8(),
-        source_dims,
-        method,
-        scale_num: 1,
-        scale_den: 1,
-        note: (note != "direct decode").then_some(note),
     })
 }
 
@@ -1877,29 +1833,19 @@ fn decode_jpeg_at_target(path: &Path, bytes: &[u8], target_edge: u32) -> Result<
             Ok(DecodedImage {
                 rgba: image.to_rgba8(),
                 source_dims,
-                method: "turbojpeg_dct".to_owned(),
-                scale_num: stats.scale_num,
-                scale_den: 8,
-                note: None,
             })
         }
         Err(DctDecodeError::TerminalRejection(error)) => Err(format!(
             "terminal JPEG rejection for {}: {error}",
             path.display()
         )),
-        Err(DctDecodeError::Fallback(turbo_error)) => {
-            let (image, method, fallback_note) = decode_full(path, bytes)?;
+        Err(DctDecodeError::Fallback(_)) => {
+            let (image, _, _) = decode_full(path, bytes)?;
             let image = apply_exif_orientation(image, path);
             let source_dims = image.dimensions();
             Ok(DecodedImage {
                 rgba: image.to_rgba8(),
                 source_dims,
-                method,
-                scale_num: 8,
-                scale_den: 8,
-                note: Some(format!(
-                    "TurboJPEG fallback: {turbo_error}; {fallback_note}"
-                )),
             })
         }
     }
@@ -1910,9 +1856,15 @@ fn selfcheck_pdf_page<W: Write>(writer: &mut W, path: &Path, page_num: u32) -> R
     let render_1024 = render_pdf_page_signatures(path, page_num, 1024)?;
     let render_2048 = render_pdf_page_signatures(path, page_num, 2048)?;
     let jpeg_bytes = encode_jpeg(&render_1024.rgba, 95)?;
-    let jpeg_canonical =
-        canonical_proxy_from_file_bytes(Path::new("pdf-selfcheck.jpg"), &jpeg_bytes)?;
-    let jpeg_dims = jpeg_canonical.decoded.source_dims;
+    let jpeg_canonical = proxy_from_source(
+        ProxySource::Encoded {
+            filename_hint: "pdf-selfcheck.jpg",
+            bytes: &jpeg_bytes,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let jpeg_dims = jpeg_canonical.source_dims;
     let jpeg_signatures = PreparedSignatures::compute(&jpeg_canonical.proxy);
     let source_path = PathBuf::from(format!("{}::page_{}", path.display(), page_num));
     let mut records = 0;
@@ -2494,8 +2446,15 @@ fn run_synth(args: &[String]) -> Result<()> {
     for path in &paths {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("read image {}: {error}", path.display()))?;
-        let canonical = canonical_proxy_from_file_bytes(path, &bytes)?;
-        let dims = canonical.decoded.source_dims;
+        let canonical = proxy_from_source(
+            ProxySource::File {
+                path,
+                verified_bytes: Some(&bytes),
+            },
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let dims = canonical.source_dims;
         let original_signatures = PreparedSignatures::compute(&canonical.proxy);
 
         // This full-resolution decode only supplies pixels from which synthetic
@@ -2630,7 +2589,17 @@ fn decode_full_oriented_for_synthesis(path: &Path, bytes: &[u8]) -> Result<RgbaI
 }
 
 fn signatures_from_rgba(rgba: &RgbaImage, source_dims: (u32, u32)) -> PreparedSignatures {
-    let proxy = proxy_from_rgba(rgba, source_dims);
+    let image = DynamicImage::ImageRgba8(rgba.clone());
+    let proxy = proxy_from_source(
+        ProxySource::Raster {
+            image: &image,
+            source_dims,
+            format: SimilarImageFormat::Other,
+        },
+        None,
+    )
+    .expect("raster Proxy source is infallible")
+    .proxy;
     PreparedSignatures::compute(&proxy)
 }
 
@@ -2694,8 +2663,16 @@ fn emit_encoded_related_transform<W: Write>(
     large_diff_threshold_bin: u8,
 ) -> Result<usize> {
     let synthetic_path = source_path.with_extension(extension);
-    let canonical = canonical_proxy_from_file_bytes(&synthetic_path, encoded)?;
-    let transformed_dims = canonical.decoded.source_dims;
+    let filename_hint = synthetic_path.to_string_lossy();
+    let canonical = proxy_from_source(
+        ProxySource::Encoded {
+            filename_hint: filename_hint.as_ref(),
+            bytes: encoded,
+        },
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let transformed_dims = canonical.source_dims;
     let transformed_signatures = PreparedSignatures::compute(&canonical.proxy);
     write_synth_comparison(
         writer,
@@ -3312,27 +3289,40 @@ mod tests {
         // Twice the target on the long edge, so the canonical path must scale
         // whatever the target is set to. Sizing this to a literal tied the test
         // to one value of the constant.
-        RgbaImage::from_fn(JPEG_DCT_TARGET_EDGE * 2, JPEG_DCT_TARGET_EDGE, |x, y| {
-            let checker = (((x / 31) + (y / 29)) & 1) as u8 * 73;
-            Rgba([
-                (x.wrapping_mul(17) as u8).wrapping_add(checker),
-                (y.wrapping_mul(29) as u8).wrapping_sub(checker),
-                ((x ^ y).wrapping_mul(11) as u8).wrapping_add(checker),
-                255,
-            ])
-        })
+        RgbaImage::from_fn(
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE * 2,
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE,
+            |x, y| {
+                let checker = (((x / 31) + (y / 29)) & 1) as u8 * 73;
+                Rgba([
+                    (x.wrapping_mul(17) as u8).wrapping_add(checker),
+                    (y.wrapping_mul(29) as u8).wrapping_sub(checker),
+                    ((x ^ y).wrapping_mul(11) as u8).wrapping_add(checker),
+                    255,
+                ])
+            },
+        )
     }
 
     #[test]
     fn canonical_jpeg_file_proxy_uses_configured_dct_target() {
         let image = jpeg_fixture();
         let encoded = encode_jpeg(&image, 95).unwrap();
-        let canonical =
-            canonical_proxy_from_file_bytes(Path::new("fixture.jpg"), &encoded).unwrap();
+        let canonical = proxy_from_source(
+            ProxySource::Encoded {
+                filename_hint: "fixture.jpg",
+                bytes: &encoded,
+            },
+            None,
+        )
+        .unwrap();
 
-        assert!(canonical.decoded.scale_num < canonical.decoded.scale_den);
-        assert_eq!(canonical.decoded.rgba.width(), JPEG_DCT_TARGET_EDGE);
-        assert_eq!(canonical.decoded.source_dims, image.dimensions());
+        assert!(canonical.scale_num < canonical.scale_den);
+        assert_eq!(
+            canonical.decoded_dims.0,
+            mimageviewer::similar_image::JPEG_DCT_TARGET_EDGE
+        );
+        assert_eq!(canonical.source_dims, image.dimensions());
     }
 
     #[test]
@@ -3340,8 +3330,14 @@ mod tests {
         let image = jpeg_fixture();
         let original = signatures_from_rgba(&image, image.dimensions());
         let encoded = encode_jpeg(&image, 70).unwrap();
-        let canonical =
-            canonical_proxy_from_file_bytes(Path::new("fixture.jpg"), &encoded).unwrap();
+        let canonical = proxy_from_source(
+            ProxySource::Encoded {
+                filename_hint: "fixture.jpg",
+                bytes: &encoded,
+            },
+            None,
+        )
+        .unwrap();
         let expected = PreparedSignatures::compute(&canonical.proxy);
         let expected_distance =
             required_hamming(&original.pdq256.sig, &expected.pdq256.sig, "Pdq256").unwrap();

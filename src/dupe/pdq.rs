@@ -6,6 +6,20 @@ const INPUT_SIDE: usize = 64;
 const DCT_SIDE: usize = 16;
 const SUBSET_SIDE: usize = 8;
 
+/// 永続化した PDQ-256 から、左上 8x8 の literal subset を取り出す。
+/// Pdq64 を別途保存・再計算しないための読み込み後 helper。
+pub fn subset64(full: &[u8; 32]) -> [u8; 8] {
+    let mut subset = [0u8; 8];
+    for row in 0..SUBSET_SIDE {
+        for column in 0..SUBSET_SIDE {
+            let full_index = row * DCT_SIDE + column;
+            let subset_index = row * SUBSET_SIDE + column;
+            set_bit(&mut subset, subset_index, bit(full, full_index));
+        }
+    }
+    subset
+}
+
 pub(crate) struct PdqHashes {
     pub full: Box<[u8; 32]>,
     pub subset: Box<[u8; 8]>,
@@ -118,6 +132,10 @@ fn set_bit(bytes: &mut [u8], index: usize, value: bool) {
     }
 }
 
+fn bit(bytes: &[u8], index: usize) -> bool {
+    bytes[index / 8] & (1 << (7 - index % 8)) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,10 +154,6 @@ mod tests {
             .zip(b)
             .map(|(left, right)| (left ^ right).count_ones())
             .sum()
-    }
-
-    fn bit(bytes: &[u8], index: usize) -> bool {
-        bytes[index / 8] & (1 << (7 - index % 8)) != 0
     }
 
     struct Rng(u64);
@@ -162,6 +176,8 @@ mod tests {
             *value = ((index * 37 + index / INPUT_SIDE * 19) & 0xff) as u8;
         }
         let hashes = compute(&proxy_with_gray64(gray));
+
+        assert_eq!(subset64(&hashes.full), *hashes.subset);
 
         assert_eq!(hashes.full.len() * 8, 256);
         assert_eq!(hashes.subset.len() * 8, 64);

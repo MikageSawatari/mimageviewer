@@ -54,6 +54,26 @@ pub(crate) fn folder_media_sort_order(
     }
 }
 
+fn similar_index_item_key(item: &crate::grid_item::GridItem) -> Option<String> {
+    match item {
+        crate::grid_item::GridItem::Image(path) => {
+            Some(crate::similar_index::item_key_for_file(path))
+        }
+        crate::grid_item::GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(crate::similar_index::item_key_for_zip_page(
+            zip_path, entry_name,
+        )),
+        crate::grid_item::GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => Some(crate::similar_index::item_key_for_pdf_page(
+            pdf_path, *page_num,
+        )),
+        _ => None,
+    }
+}
+
 /// 一覧中の保持帯の基準位置。フルスクリーン中は凍結した一覧スクロール位置ではなく、
 /// 現在ページへ追従する。フィルタ変更などで現在ページが display list にない場合だけ
 /// 一覧側の位置へ戻す。
@@ -10432,6 +10452,10 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
+    // ── 別バージョン索引 (明示開始・UI は Step 3) ─────────────────
+    // constructor は DB を開かず、開始／初回 query の worker だけが I/O する。
+    pub(crate) similar_index: crate::similar_index::SimilarIndexManager,
+
     /// 名前索引 Supervisor のアクティブ handle (favorite_id → handle)。
     ///
     /// `auto_index_structure = true` のお気に入りごとに 1 つ。長期スレッド +
@@ -13992,6 +14016,7 @@ impl App {
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
             indexer_manager,
+            similar_index: crate::similar_index::SimilarIndexManager::new(crate::data_dir::get()),
             name_index_supervisors: std::collections::HashMap::new(),
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
@@ -19684,6 +19709,41 @@ impl App {
             );
             self.name_index_supervisors.insert(fav_id, handle);
         }
+    }
+
+    /// お気に入り全体の別バージョン索引を明示開始する。UI から自動では呼ばない。
+    pub(crate) fn start_similar_index(&self) -> Result<(), crate::similar_index::StartError> {
+        self.similar_index.start(
+            self.settings
+                .favorites
+                .iter()
+                .map(|favorite| favorite.path.clone())
+                .collect(),
+            self.pdf_passwords.clone(),
+            Some(Arc::clone(&self.activity_gate)),
+        )
+    }
+
+    pub(crate) fn cancel_similar_index(&self) {
+        self.similar_index.cancel();
+    }
+
+    pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
+        self.similar_index.progress()
+    }
+
+    pub(crate) fn query_similar_item(&self, item: &GridItem) -> crate::similar_index::ItemQuery {
+        let Some(key) = similar_index_item_key(item) else {
+            return crate::similar_index::ItemQuery::NotIndexed;
+        };
+        self.similar_index.query_item(&key)
+    }
+
+    pub(crate) fn query_similar_book(&self, item: &GridItem) -> crate::similar_index::BookQuery {
+        let Some(key) = similar_index_item_key(item) else {
+            return crate::similar_index::BookQuery::NotIndexed;
+        };
+        self.similar_index.query_book(&key)
     }
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
