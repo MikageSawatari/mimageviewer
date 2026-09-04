@@ -27,22 +27,6 @@ fn select_native_video_display_mode_toggle(
 }
 
 #[cfg(windows)]
-fn native_video_key_display_mode_toggle(
-    panorama_detected: bool,
-    video_zoom_available: bool,
-) -> NativeVideoDisplayModeToggle {
-    select_native_video_display_mode_toggle(panorama_detected, video_zoom_available)
-}
-
-#[cfg(windows)]
-fn native_video_event_display_mode_toggle(
-    panorama_detected: bool,
-    video_zoom_available: bool,
-) -> NativeVideoDisplayModeToggle {
-    select_native_video_display_mode_toggle(panorama_detected, video_zoom_available)
-}
-
-#[cfg(windows)]
 pub(super) enum VideoSeekStripAxisState {
     Resolving { initial_time_secs: f64 },
     Ready(std::sync::Arc<crate::video::seek_strip::StripAxis>),
@@ -4518,7 +4502,7 @@ impl App {
                 self.apply_native_video_zoom_wheel(ctx, fs_idx, delta, pointer_points);
             }
             crate::video::NativeVideoOutputEvent::TogglePanorama => {
-                let target = native_video_event_display_mode_toggle(
+                let target = select_native_video_display_mode_toggle(
                     self.detect_panorama(fs_idx).is_some(),
                     self.native_video_zoom_available(fs_idx),
                 );
@@ -10188,7 +10172,7 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
             }
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
-                let target = native_video_key_display_mode_toggle(
+                let target = select_native_video_display_mode_toggle(
                     self.detect_panorama(fs_idx).is_some(),
                     self.native_video_zoom_available(fs_idx),
                 );
@@ -13164,23 +13148,22 @@ mod iconic_thumbnail_tests {
 mod native_video_display_mode_toggle_tests {
     use super::*;
 
-    fn assert_three_way_dispatch(dispatch: impl Fn(bool, bool) -> NativeVideoDisplayModeToggle) {
-        assert_eq!(dispatch(true, true), NativeVideoDisplayModeToggle::Panorama);
+    /// V キーと overlay イベントは同じ 1 つの規則を呼ぶ。ここで固定するのはその規則で、
+    /// 「両方の入口が同じ関数を通る」ことは、選ぶ関数がこれ 1 つしかないことが保証する。
+    #[test]
+    fn the_display_mode_key_picks_panorama_zoom_or_nothing() {
         assert_eq!(
-            dispatch(false, true),
+            select_native_video_display_mode_toggle(true, true),
+            NativeVideoDisplayModeToggle::Panorama
+        );
+        assert_eq!(
+            select_native_video_display_mode_toggle(false, true),
             NativeVideoDisplayModeToggle::VideoZoom
         );
-        assert_eq!(dispatch(false, false), NativeVideoDisplayModeToggle::NoOp);
-    }
-
-    #[test]
-    fn v_key_dispatches_panorama_zoom_or_no_op() {
-        assert_three_way_dispatch(native_video_key_display_mode_toggle);
-    }
-
-    #[test]
-    fn overlay_event_dispatches_panorama_zoom_or_no_op() {
-        assert_three_way_dispatch(native_video_event_display_mode_toggle);
+        assert_eq!(
+            select_native_video_display_mode_toggle(false, false),
+            NativeVideoDisplayModeToggle::NoOp
+        );
     }
 }
 
