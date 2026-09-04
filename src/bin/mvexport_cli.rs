@@ -79,6 +79,16 @@ fn run() -> Result<(), String> {
         summary.realtime_ratio,
         summary.rgba_sha256.as_deref().unwrap_or("未計算")
     );
+    println!(
+        "区間外内訳: audio_decode_secs={:.3} aac_encode_secs={:.3} mux_secs={:.3} faststart_secs={:.3} rename_secs={:.6} frame_hash_secs={:.3} other_secs={:.3}",
+        summary.audio_decode_secs,
+        summary.aac_encode_secs,
+        summary.mux_secs,
+        summary.faststart_secs,
+        summary.rename_secs,
+        summary.frame_hash_secs,
+        summary.other_secs,
+    );
 
     let verification = verify_exported_mp4(&args.output).map_err(|error| error.to_string())?;
     println!(
