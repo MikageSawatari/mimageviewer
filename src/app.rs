@@ -12451,12 +12451,9 @@ pub struct App {
     /// キー操作で開いた外部ツール選択モーダル。対象は open 時点の snapshot を保持する。
     pub(crate) external_tool_picker: Option<crate::external_tool::ExternalToolPickerRequest>,
 
-    // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
-    /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
-    pub(crate) cached_nav_indices: Option<Vec<usize>>,
-    /// フルスクリーンのシークバー/ページ番号 overlay 用 reading-index キャッシュ
-    /// (fs_idx keyed)。`cached_nav_indices` と同じ箇所で無効化する。
-    pub(crate) cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    // ── viewer navigation の導出一覧キャッシュ ──────────────────
+    /// nav / 静止画 / seek 情報を一括失効する context-local owner。
+    pub(crate) viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
 
     // ── AI アップスケール ──────────────────────────────────────────
     /// AI ランタイム (ONNX Runtime)
@@ -15050,8 +15047,7 @@ impl App {
             external_tool_modal_owner_drawn_frame: None,
             external_tool_launch_confirmation: None,
             external_tool_picker: None,
-            cached_nav_indices: None,
-            cached_fs_seek_info: None,
+            viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
 
             // AI (settings から復元)
             ai_runtime: None,
@@ -16202,6 +16198,7 @@ impl App {
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
+        self.viewer_navigation_caches.invalidate();
         self.invalidate_facet_name_cache();
         idx
     }
@@ -22518,6 +22515,7 @@ impl App {
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
+        self.viewer_navigation_caches.invalidate();
         self.invalidate_facet_name_cache();
         self.visible_indices.clear();
         self.details_order.clear();
@@ -46894,8 +46892,7 @@ impl App {
                 .unwrap_or_default();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
-            self.cached_nav_indices = None;
-            self.cached_fs_seek_info = None;
+            self.viewer_navigation_caches.invalidate();
             if !self.checked.is_empty() {
                 let vi = &self.visible_indices;
                 self.checked.retain(|idx| vi.binary_search(idx).is_ok());
@@ -47028,8 +47025,7 @@ impl App {
         } else {
             self.details_order.clear();
         }
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
         // 「F1 で非表示にした後、矢印キーで一覧先頭に飛ぶ」挙動も解消される。
@@ -47930,6 +47926,7 @@ impl App {
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
+                self.viewer_navigation_caches.invalidate();
             }
         }
         self.scroll_to_selected = true;
@@ -48080,8 +48077,7 @@ impl App {
 
     pub(crate) fn rebuild_details_order(&mut self) {
         self.details_order_revision = self.details_order_revision.wrapping_add(1);
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
             self.settings.details_sort_ascending = true;
@@ -52756,10 +52752,11 @@ impl App {
     /// フルスクリーンの前後移動 / スライドショーはフィルタ後かつ詳細表示では
     /// `details_order` 適用後の display list を使うため、先読みも同じ順序に揃える。
     /// ★フィルタや Ctrl+F で疎な一覧になっても、非表示の raw idx を先読みしない。
-    fn collect_image_indices(&self) -> Vec<usize> {
-        Self::collect_image_indices_from(&self.items, self.current_grid_order())
+    fn collect_image_indices(&mut self) -> Arc<Vec<usize>> {
+        self.get_still_image_indices()
     }
 
+    #[cfg(test)]
     fn collect_image_indices_from(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
         crate::ui_helpers::still_image_display_indices(items, visible_indices)
     }
@@ -54547,7 +54544,7 @@ impl App {
     }
 
     /// 先読み範囲内の item_idx 集合を計算する。
-    fn compute_keep_set(&self, current_idx: usize) -> std::collections::HashSet<usize> {
+    fn compute_keep_set(&mut self, current_idx: usize) -> std::collections::HashSet<usize> {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             // フルスクリーン表示中に★/Ctrl+Fフィルタが変わり、現在ページが
@@ -54589,7 +54586,7 @@ impl App {
     }
 
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
-    pub(crate) fn ai_prefetch_targets(&self, current_idx: usize) -> Vec<usize> {
+    pub(crate) fn ai_prefetch_targets(&mut self, current_idx: usize) -> Vec<usize> {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return Vec::new();
@@ -54649,7 +54646,10 @@ impl App {
     /// AI 先読み対象を前後に分けた表示モデルを返す。総 target が 0 なら非表示
     /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は表示を
     /// 隠して「AI 処理中」ラベルだけ見せる。
-    pub(crate) fn final_ai_prefetch_indicator(&self, fs_idx: usize) -> Option<FsPrefetchIndicator> {
+    pub(crate) fn final_ai_prefetch_indicator(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<FsPrefetchIndicator> {
         let image_indices = self.collect_image_indices();
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
         let target_positions = interleaved_prefetch_positions(

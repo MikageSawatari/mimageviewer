@@ -1433,6 +1433,9 @@ pub fn still_image_display_indices(items: &[GridItem], display_order: &[usize]) 
     crate::app::measure_nav_helper(
         crate::app::NavHelperPerfKind::StillImageDisplayIndices,
         || {
+            #[cfg(test)]
+            STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT
+                .set(STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get() + 1);
             display_order
                 .iter()
                 .copied()
@@ -1449,7 +1452,26 @@ pub fn still_image_display_indices(items: &[GridItem], display_order: &[usize]) 
     )
 }
 
-fn adjacent_idx_in_order(nav_indices: &[usize], current: usize, delta: i32) -> Option<usize> {
+#[cfg(test)]
+std::thread_local! {
+    static STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_still_image_display_indices_build_count_for_test() {
+    STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn still_image_display_indices_build_count_for_test() -> usize {
+    STILL_IMAGE_DISPLAY_INDICES_BUILD_COUNT.get()
+}
+
+pub(crate) fn adjacent_idx_in_order(
+    nav_indices: &[usize],
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
     if nav_indices.is_empty() {
         return None;
     }
@@ -1588,6 +1610,26 @@ pub fn large_jump_page_idx(
     forward: bool,
 ) -> Option<usize> {
     let nav_indices = page_jump_nav_indices(items, display_order);
+    large_jump_page_idx_from_nav_indices(
+        &nav_indices,
+        current,
+        mode,
+        percent,
+        fixed_count,
+        min_step,
+        forward,
+    )
+}
+
+pub(crate) fn large_jump_page_idx_from_nav_indices(
+    nav_indices: &[usize],
+    current: usize,
+    mode: crate::settings::FullscreenJumpMode,
+    percent: u32,
+    fixed_count: usize,
+    min_step: usize,
+    forward: bool,
+) -> Option<usize> {
     let step = match mode {
         crate::settings::FullscreenJumpMode::Percent => {
             percent_jump_page_step(nav_indices.len(), percent)

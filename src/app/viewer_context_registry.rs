@@ -955,8 +955,7 @@ pub(in crate::app) struct ViewerContextBundle {
     pending_auto_fs_open: bool,
     pending_return_to_parent: bool,
     pdf_placeholder_count: Option<u32>,
-    cached_nav_indices: Option<Vec<usize>>,
-    cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
     fs_nav_locked_gen: Option<u64>,
     fs_nav_dropped_block_signature: Option<String>,
     fs_nav_dropped_block_count: u32,
@@ -1483,8 +1482,7 @@ impl ViewerContextBundle {
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
-            cached_nav_indices: None,
-            cached_fs_seek_info: None,
+            viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
             fs_nav_locked_gen: None,
             fs_nav_dropped_block_signature: None,
             fs_nav_dropped_block_count: 0,
@@ -1811,8 +1809,7 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -2058,8 +2055,7 @@ impl App {
         swap_field!(pending_auto_fs_open);
         swap_field!(pending_return_to_parent);
         swap_field!(pdf_placeholder_count);
-        swap_field!(cached_nav_indices);
-        swap_field!(cached_fs_seek_info);
+        swap_field!(viewer_navigation_caches);
         swap_field!(fs_nav_locked_gen);
         swap_field!(fs_nav_dropped_block_signature);
         swap_field!(fs_nav_dropped_block_count);
@@ -2334,8 +2330,7 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -2507,7 +2502,7 @@ impl App {
             slideshow_anchor_idx,
             continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
-            cached_fs_seek_info,
+            viewer_navigation_caches,
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
@@ -2603,7 +2598,6 @@ impl App {
             pending_auto_fs_open,
             pending_return_to_parent,
             pdf_placeholder_count,
-            cached_nav_indices,
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
             thumb_pixels,
@@ -2714,8 +2708,7 @@ impl App {
         detached.favsearch_subfolder_restore = None;
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
-        detached.cached_nav_indices = None;
-        detached.cached_fs_seek_info = None;
+        detached.viewer_navigation_caches.invalidate();
         detached.selected = Some(idx);
 
         detached

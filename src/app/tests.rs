@@ -7,6 +7,147 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[test]
+fn collect_image_indices_builds_the_still_list_once_for_repeated_calls() {
+    let mut app = setup_app_for_test();
+    app.items = vec![
+        GridItem::Image(PathBuf::new()),
+        GridItem::Video(PathBuf::new()),
+        GridItem::Image(PathBuf::new()),
+    ];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.viewer_navigation_caches.invalidate();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        1
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    let added = app.push_grid_item_pending(GridItem::Image(PathBuf::new()));
+    app.visible_indices.push(added);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 1]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_generation_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    let next_generation = app.items_generation.wrapping_add(1);
+    app.set_items_generation(next_generation);
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_filter_change() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3).map(|_| GridItem::Image(PathBuf::new())).collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.search_filter = Some(std::collections::HashSet::from([0, 2]));
+    app.rebuild_visible_indices();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_details_order_change() {
+    let mut app = setup_app_for_test();
+    app.items = ['b', 'a', 'c']
+        .into_iter()
+        .map(|name| GridItem::Image(PathBuf::from(name.to_string())))
+        .collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+    app.settings.details_sort_ascending = true;
+    app.rebuild_details_order();
+    assert_eq!(app.collect_image_indices().as_ref(), &[1, 0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_continuous_reading_toggle() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.reading_flow = crate::settings::ReadingFlow::Vertical;
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn navigation_cache_is_owned_by_each_viewer_context() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        detached.visible_indices = (0..detached.items.len()).collect();
+        detached.bump_items_generation();
+        assert_eq!(detached.collect_image_indices().as_ref(), &[0, 2]);
+    });
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
 #[cfg(windows)]
 fn test_detached_host_lease(
     window_id: u64,
@@ -1075,7 +1216,7 @@ fn spread_display_units_are_built_once_for_repeated_pair_resolution() {
         .collect();
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
-    app.cached_nav_indices = None;
+    app.viewer_navigation_caches.invalidate();
     app.spread_mode = crate::settings::SpreadMode::Ltr;
 
     crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -1266,7 +1407,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
         .collect();
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
-    app.cached_nav_indices = None;
+    app.viewer_navigation_caches.invalidate();
     app.spread_mode = crate::settings::SpreadMode::Ltr;
     let main_nav = (0..app.items.len()).collect::<Vec<_>>();
 
@@ -1282,7 +1423,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
             .collect();
         detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
         detached.visible_indices = (0..detached.items.len()).collect();
-        detached.cached_nav_indices = None;
+        detached.viewer_navigation_caches.invalidate();
         detached.spread_mode = crate::settings::SpreadMode::LtrCover;
         assert_eq!(
             detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
@@ -19017,7 +19158,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
@@ -19044,7 +19185,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
 
@@ -19275,7 +19416,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
@@ -19295,7 +19436,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 3];
         app.visible_indices = vec![0, 1, 2];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         for idx in 0..3 {
@@ -19315,7 +19456,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 2];
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         let expected = SpreadPair::Double { left: 0, right: 1 };
@@ -19360,7 +19501,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-resync-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
         crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -19423,7 +19564,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-nav-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
         app.fullscreen_idx = Some(4);
@@ -19544,7 +19685,7 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         app.visible_indices = (0..4).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19648,7 +19789,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("split-nav-{k}"), dims));
         }
         app.visible_indices = (0..3).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
 
         crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -19746,7 +19887,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitRtl;
 
         app.fullscreen_idx = Some(0);
@@ -19799,7 +19940,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
         app.fullscreen_idx = Some(0);
         app.fullscreen_page_slice = PageSlice::Left;
@@ -19835,7 +19976,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..4).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
 
             app.fullscreen_idx = Some(2);
@@ -19891,7 +20032,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..5).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
             app.spread_shift_anchor_idx = anchor;
             app.fullscreen_idx = Some(final_unit_start);
@@ -19940,7 +20081,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19992,7 +20133,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3, 4, 5];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
         app.fullscreen_idx = Some(3);
 
@@ -20058,7 +20199,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover; // pair_start=1 で [1,2] を表示中
         app.fullscreen_idx = Some(1);
         assert_eq!(
@@ -20092,7 +20233,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Rtl;
         app.fullscreen_idx = Some(0);
         assert_eq!(
@@ -20127,7 +20268,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -25861,7 +26002,7 @@ mod favorite_adjustment_defaults_tests {
             layout_dims: None,
         };
         app.visible_indices = vec![first, second];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
 
         for (mode, expected_indices, expected_textures) in [
             (
@@ -55720,7 +55861,7 @@ mod still_window_mode_key_tests {
         app.spread_shift_anchor_idx = Some(excluded);
         app.fs_zoom_pdf_rerender_idx = Some(video);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
-        app.cached_nav_indices = Some(vec![before, video, last]);
+        let _ = app.collect_image_indices();
         app.fs_vertical_cache_keep_set.insert(video);
         app.fs_context_menu_idx = Some(video);
         app.adjust_scope_selection_idx = Some(video);
@@ -55740,7 +55881,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.spread_shift_anchor_idx, None);
         assert_eq!(app.fs_zoom_pdf_rerender_idx, Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
-        assert!(app.cached_nav_indices.is_none());
+        assert!(!app.viewer_navigation_caches.has_entries_for_test());
         assert!(app.fs_vertical_cache_keep_set.is_empty());
         assert!(app.fs_context_menu_idx.is_none());
         assert!(app.adjust_scope_selection_idx.is_none());

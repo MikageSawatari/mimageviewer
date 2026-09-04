@@ -8326,6 +8326,8 @@ fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+    #[cfg(test)]
+    NAV_INDICES_BUILD_COUNT.set(NAV_INDICES_BUILD_COUNT.get() + 1);
     visible_indices
         .iter()
         .copied()
@@ -8339,6 +8341,21 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NAV_INDICES_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_nav_indices_build_count_for_test() {
+    NAV_INDICES_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn nav_indices_build_count_for_test() -> usize {
+    NAV_INDICES_BUILD_COUNT.get()
 }
 
 fn is_spread_pairable_item(item: Option<&GridItem>) -> bool {
@@ -10193,11 +10210,79 @@ pub(crate) struct FsKeyAction {
 
 #[derive(Clone)]
 pub(crate) struct FsSeekInfo {
-    image_indices: Vec<usize>,
+    image_indices: Arc<Vec<usize>>,
     current_pos: usize,
     media_count: usize,
     video_count: usize,
     other_count: usize,
+}
+
+/// 表示順から導出する一覧と seek 情報をまとめて所有する viewer context 単位のキャッシュ。
+///
+/// 3 つを別 field に戻すと失効点が再び分裂するため、破棄は常に単一メソッドで
+/// 一括して行う。main / detached 間ではこの owner 自体を共有せず bundle と一緒に交換する。
+#[derive(Default)]
+pub(crate) struct ViewerNavigationCaches {
+    source: Option<(u64, ReadingFlow)>,
+    nav_indices: Option<Arc<Vec<usize>>>,
+    still_image_indices: Option<Arc<Vec<usize>>>,
+    fs_seek_info: Option<(usize, FsSeekInfo)>,
+}
+
+impl ViewerNavigationCaches {
+    pub(crate) fn invalidate(&mut self) {
+        self.source = None;
+        self.nav_indices = None;
+        self.still_image_indices = None;
+        self.fs_seek_info = None;
+    }
+
+    fn ensure_source(&mut self, items_generation: u64, reading_flow: ReadingFlow) {
+        let source = (items_generation, reading_flow);
+        if self.source == Some(source) {
+            return;
+        }
+        self.invalidate();
+        self.source = Some(source);
+    }
+
+    fn nav_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.nav_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_nav_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.nav_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn still_image_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.still_image_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_still_image_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.still_image_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn fs_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
+        self.fs_seek_info
+            .as_ref()
+            .filter(|(cached_idx, _)| *cached_idx == fs_idx)
+            .map(|(_, info)| info.clone())
+    }
+
+    fn install_fs_seek_info(&mut self, fs_idx: usize, info: FsSeekInfo) {
+        self.fs_seek_info = Some((fs_idx, info));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_entries_for_test(&self) -> bool {
+        self.nav_indices.is_some()
+            || self.still_image_indices.is_some()
+            || self.fs_seek_info.is_some()
+    }
 }
 
 // Page labels live on the fullscreen viewer's fixed dark surfaces. They must
@@ -13940,11 +14025,10 @@ impl App {
         )
     }
 
-    fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
-        let display_order = self.current_grid_order();
-        let image_indices = build_image_reading_indices(&self.items, display_order);
+    fn fullscreen_seek_info(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+        let image_indices = self.get_still_image_indices();
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let nav_indices = build_nav_indices(&self.items, display_order);
+        let nav_indices = self.get_nav_indices();
         let (video_count, other_count) =
             count_seek_overlay_non_image_items(&self.items, &nav_indices);
         let media_count = image_indices.len() + video_count + other_count;
@@ -13961,17 +14045,17 @@ impl App {
     ///
     /// シークバー (locked 時は常時表示) とページ番号 overlay (既定 ON) は毎フレーム
     /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
-    /// フレームごとに作り直すのは純粋な無駄なので、`cached_nav_indices` と同じ
-    /// 無効化点 (rebuild_visible_indices / rebuild_details_order) でクリアされる
-    /// キャッシュに乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
+    /// フレームごとに作り直すのは純粋な無駄なので、一覧キャッシュと同じ owner に
+    /// 乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
     fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
-        if let Some((cached_idx, info)) = self.cached_fs_seek_info.as_ref()
-            && *cached_idx == fs_idx
-        {
-            return Some(info.clone());
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(info) = self.viewer_navigation_caches.fs_seek_info(fs_idx) {
+            return Some(info);
         }
         let info = self.fullscreen_seek_info(fs_idx)?;
-        self.cached_fs_seek_info = Some((fs_idx, info.clone()));
+        self.viewer_navigation_caches
+            .install_fs_seek_info(fs_idx, info.clone());
         Some(info)
     }
 
@@ -19459,25 +19543,39 @@ impl App {
     // ── 見開きペアリング ────────────────────────────────────────────────
 
     /// build_nav_indices の結果をキャッシュして返す。
-    fn get_nav_indices(&mut self) -> Vec<usize> {
+    fn get_nav_indices(&mut self) -> Arc<Vec<usize>> {
         crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
-            if let Some(ref cached) = self.cached_nav_indices {
-                return cached.clone();
+            self.viewer_navigation_caches
+                .ensure_source(self.items_generation, self.reading_flow);
+            if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
+                return cached;
             }
             let nav = build_nav_indices(&self.items, self.current_grid_order());
-            self.cached_nav_indices = Some(nav.clone());
-            nav
+            self.viewer_navigation_caches.install_nav_indices(nav)
         })
     }
 
+    /// 連結読み・先読み用の静止画一覧を viewer context 内で共有する。
+    pub(crate) fn get_still_image_indices(&mut self) -> Arc<Vec<usize>> {
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
+            return cached;
+        }
+        let indices =
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order());
+        self.viewer_navigation_caches
+            .install_still_image_indices(indices)
+    }
+
     pub(crate) fn fullscreen_large_jump_target(
-        &self,
+        &mut self,
         fs_idx: usize,
         forward: bool,
     ) -> Option<usize> {
-        crate::ui_helpers::large_jump_page_idx(
-            &self.items,
-            self.current_grid_order(),
+        let nav = self.get_still_image_indices();
+        crate::ui_helpers::large_jump_page_idx_from_nav_indices(
+            &nav,
             fs_idx,
             self.settings.fullscreen_jump_mode,
             self.settings.fullscreen_jump_percent,
@@ -19499,7 +19597,7 @@ impl App {
         // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
         // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
         let nav = if self.continuous_reading_active_for_idx(idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -19545,7 +19643,7 @@ impl App {
             None => return FsPageNav::Delta(base_delta),
         };
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -19591,7 +19689,7 @@ impl App {
         dir: i32,
     ) -> Option<(usize, usize)> {
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -25530,12 +25628,11 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        let display_order = self.current_grid_order().to_vec();
+        let image_indices = self.get_still_image_indices();
         // **自動送りは、読み手が自分で送るのと同じ歩幅にする。**分割を無視すると、
         // スライドショーを始めた瞬間に分割が解除されて画面が大きく変わってしまう
         // (2026-08-26 の実機判断)。
         let slide_nav = if self.spread_mode.is_spread() || self.spread_mode.is_split() {
-            let image_indices = build_image_reading_indices(&self.items, &display_order);
             self.spread_page_nav_for_indices(&image_indices, cur, 1)
         } else {
             FsPageNav::Delta(1)
@@ -25554,7 +25651,7 @@ impl App {
             // 別ページの半分へ。着地してから左右を確定する。
             FsPageNav::Split(step) => Some(step.source_idx),
             FsPageNav::Delta(delta) => {
-                crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
+                crate::ui_helpers::adjacent_idx_in_order(&image_indices, cur, delta)
             }
             FsPageNav::None | FsPageNav::Boundary { .. } => None,
         };
@@ -25936,14 +26033,17 @@ impl App {
         fs_idx: usize,
         at_end: bool,
     ) -> Option<usize> {
-        let display_order = self.current_grid_order().to_vec();
         let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
-        let target = crate::ui_helpers::boundary_page_navigation_idx(
-            &self.items,
-            &display_order,
-            at_end,
-            continuous_reading,
-        )?;
+        let nav = if continuous_reading {
+            self.get_still_image_indices()
+        } else {
+            self.get_nav_indices()
+        };
+        let target = if at_end {
+            nav.last().copied()
+        } else {
+            nav.first().copied()
+        }?;
         if target != fs_idx {
             Some(target)
         } else {
@@ -26644,13 +26744,18 @@ impl App {
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = crate::ui_helpers::adjacent_page_navigation_idx(
-                    &self.items,
-                    &display_order,
-                    fs_idx,
-                    nav_delta.signum(),
-                    self.continuous_reading_active_for_idx(fs_idx),
-                ) {
+                } else if let Some(new_idx) = if self.continuous_reading_active_for_idx(fs_idx) {
+                    let nav = self.get_still_image_indices();
+                    crate::ui_helpers::adjacent_idx_in_order(&nav, fs_idx, nav_delta.signum())
+                } else {
+                    crate::ui_helpers::adjacent_page_navigation_idx(
+                        &self.items,
+                        &display_order,
+                        fs_idx,
+                        nav_delta.signum(),
+                        false,
+                    )
+                } {
                     let moved = new_idx != fs_idx;
                     if !moved || !self.fs_navigation_sequence_blocks_new_target() {
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -27771,8 +27876,7 @@ impl App {
         &mut self,
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
-        let display_order = self.current_grid_order().to_vec();
-        let image_indices = build_image_reading_indices(&self.items, &display_order);
+        let image_indices = self.get_still_image_indices();
         let mut image_units = Vec::new();
 
         if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
@@ -38318,6 +38422,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nav_indices_cache_reuses_the_same_allocation() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..6).map(|_| GridItem::Image(PathBuf::new())).collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.viewer_navigation_caches.invalidate();
+
+        reset_nav_indices_build_count_for_test();
+        let first = app.get_nav_indices();
+        let second = app.get_nav_indices();
+
+        assert_eq!(nav_indices_build_count_for_test(), 1);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    fn cached_and_uncached_navigation_lists_are_identical() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        app.visible_indices = vec![2, 1, 0];
+        let uncached_nav = build_nav_indices(&app.items, &app.visible_indices);
+        let uncached_still =
+            crate::ui_helpers::still_image_display_indices(&app.items, &app.visible_indices);
+
+        app.viewer_navigation_caches.invalidate();
+        assert_eq!(app.get_nav_indices().as_ref(), &uncached_nav);
+        assert_eq!(app.get_still_image_indices().as_ref(), &uncached_still);
+    }
+
+    #[test]
+    fn viewer_navigation_cache_invalidate_clears_all_three_entries() {
+        let mut caches = ViewerNavigationCaches::default();
+        caches.ensure_source(7, ReadingFlow::Paged);
+        caches.install_nav_indices(vec![0, 1]);
+        caches.install_still_image_indices(vec![0]);
+        caches.install_fs_seek_info(
+            0,
+            FsSeekInfo {
+                image_indices: Arc::new(vec![0]),
+                current_pos: 0,
+                media_count: 2,
+                video_count: 1,
+                other_count: 0,
+            },
+        );
+
+        caches.invalidate();
+
+        assert!(caches.nav_indices().is_none());
+        assert!(caches.still_image_indices().is_none());
+        assert!(caches.fs_seek_info(0).is_none());
+    }
+
+    #[test]
     fn fs_render_perf_timer_does_not_read_clock_when_disabled() {
         let clock_called = std::cell::Cell::new(false);
         let mut recorder = fs_render_perf_start_with(false, || {
@@ -42454,7 +42615,7 @@ mod tests {
                 app.items = (0..7).map(|_| GridItem::Image(PathBuf::new())).collect();
                 app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
                 app.visible_indices = (0..app.items.len()).collect();
-                app.cached_nav_indices = None;
+                app.viewer_navigation_caches.invalidate();
                 app.spread_mode = mode;
                 app.fullscreen_idx = Some(2);
                 for idx in 0..app.items.len() {
@@ -43605,7 +43766,7 @@ mod tests {
             egui::Color32::LIGHT_GREEN,
         );
         app.visible_indices = vec![left, right];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.fullscreen_idx = Some(left);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;

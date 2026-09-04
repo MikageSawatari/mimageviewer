@@ -1498,6 +1498,12 @@ token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`land
 **nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
 ページ読みと連結読みの列切替を混同しない。
 
+nav index 列自体は `ViewerNavigationCaches` が `Arc<Vec<usize>>` で保持する。動画を含む
+ページ単位列、動画を除く連結読み・先読み列、seek 情報の 3 つを 1 owner にまとめ、
+表示集合 / 詳細 sort / snapshot の index 空間変更では `invalidate` 1 回で同時に破棄する。
+items 世代と連結方式は owner の source key でも照合する。owner は
+`ViewerContextBundle` と一緒に交換し、main / detached 間で共有しない。
+
 未知寸法は従来どおり縦長と同じ `false` に分類する。`fs_cache`、thumbnail の source / layout 寸法、
 `page_dims_cache` への記録で cached nav 上の実効的な横長性が反転した場合だけ
 `landscape_epoch` を進める。したがって未知→縦長では再構築せず、未知 / 縦長→横長では

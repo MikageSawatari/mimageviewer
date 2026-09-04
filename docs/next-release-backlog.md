@@ -2202,11 +2202,11 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) §7
 (寸法が判明すると表示単位数が変わる件と同じ根)。
 
-### 1.183 ページ送り中に 1 秒に 1 回ほど短く止まる — 時間の行き先が計測できていない (2026-09-04)
+### 1.183 ページ送り中に 1 秒に 1 回ほど短く止まる — nav 一覧の再構築と複製 (2026-09-04)
 
 - 出典: 利用者報告 (2026-09-04)「ページ送りもだいたい大丈夫ですが、ときどきひっかかりを
   感じます。1 秒に 1 回くらいのペースで定期的にちょっととまります」。
-- **未着手。着手前に計装が要る (下記)。**
+- **原因特定・構造修正済み。利用者実機での再計測待ち。**
 
 #### 分かっていること
 
@@ -2287,6 +2287,31 @@ CPU の submit は 0.9ms しかないので「GPU 実行が重い」と考えた
 - `ui.update_breakdown` に、UI frame 内の `still_image_display_indices` / `get_nav_indices`
   それぞれの呼び出し回数と累計時間を追加。worker thread や UI frame 外の呼び出しは数えない。
 - どちらも `--perf-log` 無効時は時計を読まず、表示・キャッシュ・先読みの挙動は変えない。
+
+#### 原因特定と修正 (2026-09-04)
+
+追加計装後の実機ログでは、遅い時間の 91% が `App::update`、GPU / present は 9%。
+`render_fullscreen_viewport` 内は poll_prefetch 28.7% / tail 27.3% / 描画 27.0% /
+事前計算 10.0% に分散しており、単独の描画段ではなく共通入力を追った。
+
+| | 遅いフレームあたり |
+| --- | --- |
+| `get_nav_indices` | p50 13 回 / 最大 56 回、p50 1.52ms / max 146ms |
+| `still_image_display_indices` | p50 5 回 / 最大 8 回、p50 2.68ms / max 114ms |
+| 合計 | update 全体の 27.4% |
+
+`poll_prefetch` 内では `update_prefetch_window` が 50.1% (p95 145ms / max 294ms)。
+同関数の `collect_image_indices` が静止画一覧を毎回作り直していた。さらに
+`get_nav_indices` はキャッシュヒットしても 10,000 要素の `Vec` を呼ぶたびに複製していた。
+
+修正では nav 一覧と静止画一覧を `Arc<Vec<usize>>` で保持し、seek 情報と合わせて
+viewer context ごとの `ViewerNavigationCaches` に集約した。items 世代と連結方式は
+owner の source key、表示 filter / 詳細 sort / snapshot index swap は単一の
+`invalidate` で 3 キャッシュを同時に失効する。owner は `ViewerContextBundle` と
+一緒に mount / swap され、main と detached では共有しない。
+
+残件: `poll_prefetch` の `auto_apply_saved_mask` は 14.5% (p50 4.55ms、毎回)。
+本修正では触らず、別件として計測を継続する。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
