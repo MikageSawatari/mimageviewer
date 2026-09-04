@@ -63,6 +63,7 @@ pub enum LayerKind {
     Solid { fill: Animatable<Fill> },
     Image { image: ImageId, fit: Fit },
     Spectrum(SpectrumLayer),
+    PitchKeyboard(PitchKeyboardLayer),
     ProgressBar(ProgressBarLayer),
     TimeText(TimeTextLayer),
 }
@@ -72,6 +73,12 @@ pub struct SpectrumLayer {
     pub band_count: usize,
     pub point_count: usize,
     pub shape: SpectrumShape,
+    pub fill: Animatable<Fill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PitchKeyboardLayer {
+    /// 点灯している鍵に使う塗り。消灯色と枠は本体鍵盤と同じ規則で決まる。
     pub fill: Animatable<Fill>,
 }
 

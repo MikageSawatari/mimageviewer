@@ -17,8 +17,8 @@
 //!   (§5.6、長尺ファイルの出現遅延対策)。`RwLock` は解析 read と窓コピー read を並行させ spectrum を
 //!   固まらせないため (詳細は `MusicPcm` の doc)。
 //!
-//! 描画 (`draw`) のピクセル/カラー計算はラボ実装を字面どおり移植している (ラボが機能の正本、
-//! §2.1「再利用する」原則)。egui 依存があるため music-core には置けず本体側モジュールとして持つ。
+//! 鍵盤の輝度・低域整理・配置と Bass ▼ の判断は `music-core::keyboard` にあり、音楽ビデオ
+//! 書き出しと共有する。このモジュールには、その結果を egui の描画 API へ渡す処理だけを置く。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -26,8 +26,9 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use music_core::{
-    SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI,
-    SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
+    KeyboardAnimationState, KeyboardRect, SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI,
+    SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
+    layout_bass_markers, layout_keyboard, prepare_keyboard_frame,
 };
 
 // ── レイアウト・解析定数 (ラボと同値) ──
@@ -40,63 +41,8 @@ const SPECTRUM_PANEL_GAP: f32 = 8.0;
 const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 /// 解析窓の半径 (秒)。再生位置 ±この秒数を切り出して FFT に食わせる。
 const SPECTRUM_SNAPSHOT_RADIUS_SECS: f64 = 1.0;
-const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
-const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
-const KEY_SUSTAIN_ATTACK: f32 = 0.18;
-const KEY_SUSTAIN_RELEASE: f32 = 0.965;
-// ── 鍵盤の倍音サリエンス / 縦グラデ演出パラメータ (実機で視覚チューニングする想定) ──
-/// Layer ② 倍音サリエンス加点の強さ。center = raw × (1 + α·harmonic_support)。加点のみ (乗数≥1)
-/// なので生より暗くならない。0 で加点無効。
-const KEY_HARMONIC_BOOST: f32 = 0.9;
-/// Layer ③ 適応的局所正規化: 参照する片側窓幅 (半音)。±この範囲で密度適応しきい値を作る。
-const KEY_LOCAL_WINDOW: usize = 6;
-/// Layer ③ 窓内で満額に光らせる目安本数 (窓内の上位この番目の値をしきい値に = 密度目安)。
-/// 和音 (1オクターブに 3-4 音) を潰さない程度に。
-const KEY_LOCAL_TARGET: usize = 3;
-/// Layer ③ しきい値比 (boosted/local_ref) → 際立ち のマップ下端/上端。lo 以下=floor、hi 以上=満額。
-const KEY_LOCAL_RATIO_LO: f32 = 0.85;
-const KEY_LOCAL_RATIO_HI: f32 = 1.25;
-/// Layer ③ 埋もれた鍵の最小 factor (完全に消さずチラつき防止)。
-const KEY_LOCAL_FLOOR: f32 = 0.2;
-/// Layer ③ 適用強度の周波数フェード。低域 (~FULL_HZ 以下)=full(1.0) / 高域 (~FADE_HZ 以上)=MIN。
-/// 機能している中高域を壊さないよう低域中心に効かせる。
-const KEY_LOCAL_FULL_HZ: f32 = 160.0;
-const KEY_LOCAL_FADE_HZ: f32 = 700.0;
-const KEY_LOCAL_MIN_STRENGTH: f32 = 0.45;
-/// Layer ④ 偶数/奇数倍音サポートの EMA 平滑係数 (縦グラデのチラつき防止、大きいほど即応)。
-const KEY_HARMONIC_SMOOTH: f32 = 0.45;
-/// Layer ④ 縦グラデで倍音の伸びをどこまで許すか (上下端 = center × factor.clamp(0, これ))。
-const KEY_GRADIENT_SPREAD: f32 = 1.0;
-/// Bass 音マーカー (▼) のパラメータ。上の Bass 表示と同じ配色 (key_color) + afterglow 減衰。
-const BASS_MARKER_MIN_CONF: f32 = 0.06;
-/// 明るさ用に信頼度を持ち上げる係数。
-const BASS_MARKER_CONF_GAIN: f32 = 1.6;
-/// afterglow 減衰 (毎フレーム)。オクターブ間の一瞬のちらつきを目で追いやすくする。
-const BASS_MARKER_DECAY: f32 = 0.92;
-/// 直近光っていた octave へのバイアス (flip-flop 抑制)。
-const BASS_MARKER_STICKY: f32 = 0.15;
-/// これ未満の afterglow 強度は描かない。
-const BASS_MARKER_DRAW_MIN: f32 = 0.03;
-const BASS_MARKER_MIN_MIDI: u8 = 24; // ~C1 (32.7Hz)
-const BASS_MARKER_MAX_MIDI: u8 = 55; // ~G3 (196Hz)
-const BASS_MARKER_W: f32 = 7.0;
-const BASS_MARKER_H: f32 = 5.0;
 const BASS_MARKER_ALPHA_MIN: f32 = 80.0;
 const BASS_MARKER_ALPHA_MAX: f32 = 255.0;
-/// 偶数倍音の半音オフセット (2,4,6,8倍)。オクターブ (2/4/8倍) は整数半音でぴったり乗る。
-const EVEN_HARMONIC_OFFSETS: [usize; 4] = [12, 24, 31, 36];
-/// 偶数倍音の寄与重み (高次ほど小さく = 1/n)。
-const EVEN_HARMONIC_WEIGHTS: [f32; 4] = [0.5, 0.25, 0.166_7, 0.125];
-/// 奇数倍音の半音オフセット (3,5,7倍)。平均律からズレるので近傍 bin の max で拾う。
-const ODD_HARMONIC_OFFSETS: [usize; 3] = [19, 28, 34];
-/// 奇数倍音の寄与重み (高次ほど小さく = 1/n)。
-const ODD_HARMONIC_WEIGHTS: [f32; 3] = [0.333_3, 0.2, 0.142_9];
-/// 黒鍵の幅 / 高さ (白鍵に対する比)。実物のピアノ (幅~0.56 / 高さ~0.64) よりやや大きめにして、
-/// 白鍵が面積で目立ちすぎるのを抑え、縦グラデ (上=奇数 / 下=偶数) の表示余地も確保する。
-const KEY_BLACK_WIDTH_RATIO: f32 = 0.70;
-const KEY_BLACK_HEIGHT_RATIO: f32 = 0.68;
-const KEYBOARD_DISPLAY_MIN_MIDI: u8 = 12; // C0
-const KEYBOARD_DISPLAY_MAX_MIDI: u8 = 143; // B10, 18kHz 軸で右端はクリップされる。
 const SPECTRUM_ANALYSIS_MIN_HZ: f32 = 20.0;
 const SPECTRUM_AXIS_MIN_HZ: f32 = SPECTRUM_ANALYSIS_MIN_HZ;
 const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
@@ -248,17 +194,11 @@ pub struct MusicSpectrumState {
     // ── 描画状態 (draw で毎フレーム減衰更新) ──
     bands: Vec<f32>,
     notes: Vec<f32>,
+    note_min_midi: u8,
     trail: Vec<f32>,
     prev_bands: Vec<f32>,
     onsets: Vec<f32>,
-    note_sustain: Vec<f32>,
-    note_trail: Vec<f32>,
-    /// 縦グラデ用: 偶数倍音サポート (鍵の下方向の伸び) を平滑保持。
-    note_even: Vec<f32>,
-    /// 縦グラデ用: 奇数倍音サポート (鍵の上方向の伸び) を平滑保持。
-    note_odd: Vec<f32>,
-    /// Bass 音マーカー ▼ の afterglow 強度 (note index ごと、毎フレーム減衰)。
-    bass_marker_trail: Vec<f32>,
+    keyboard: KeyboardAnimationState,
     /// 直近 `update` で PCM (`Arc<MusicPcm>`) が渡っていたか。false = まだ解析ワーカー起動待ち。
     source_present: bool,
     /// 直近 `update` で PCM のデコードが完了していたか。バンドが空でこれが false の間は
@@ -277,14 +217,11 @@ impl Default for MusicSpectrumState {
             last_center: f64::NEG_INFINITY,
             bands: Vec::new(),
             notes: Vec::new(),
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
             trail: Vec::new(),
             prev_bands: Vec::new(),
             onsets: Vec::new(),
-            note_sustain: Vec::new(),
-            note_trail: Vec::new(),
-            note_even: Vec::new(),
-            note_odd: Vec::new(),
-            bass_marker_trail: Vec::new(),
+            keyboard: KeyboardAnimationState::default(),
             source_present: false,
             source_complete: false,
         }
@@ -303,14 +240,11 @@ impl MusicSpectrumState {
         self.cancel_worker();
         self.bands.clear();
         self.notes.clear();
+        self.note_min_midi = SPECTRUM_NOTE_MIN_MIDI;
         self.trail.clear();
         self.prev_bands.clear();
         self.onsets.clear();
-        self.note_sustain.clear();
-        self.note_trail.clear();
-        self.note_even.clear();
-        self.note_odd.clear();
-        self.bass_marker_trail.clear();
+        self.keyboard.clear();
         self.pending = false;
         self.last_request = None;
         self.last_center = f64::NEG_INFINITY;
@@ -425,6 +359,7 @@ impl MusicSpectrumState {
             }
         }
         if let Some(analysis) = latest {
+            self.note_min_midi = analysis.note_min_midi;
             self.bands = analysis.bands;
             self.notes = analysis.notes;
         }
@@ -482,10 +417,8 @@ impl MusicSpectrumState {
                 &painter,
                 keyboard_rect,
                 &self.notes,
-                &mut self.note_sustain,
-                &mut self.note_trail,
-                &mut self.note_even,
-                &mut self.note_odd,
+                self.note_min_midi,
+                &mut self.keyboard,
                 norm_gain_db,
             );
             // まだデコード中 (窓が取れない) 間はプロット領域に「解析中」を出し、無反応に見せない。
@@ -578,10 +511,8 @@ impl MusicSpectrumState {
             &painter,
             keyboard_rect,
             &self.notes,
-            &mut self.note_sustain,
-            &mut self.note_trail,
-            &mut self.note_even,
-            &mut self.note_odd,
+            self.note_min_midi,
+            &mut self.keyboard,
             norm_gain_db,
         );
         // 上の Bass グラフと同じ推定を鍵盤上の ▼ で示す (afterglow 減衰、明るさ=信頼度)。
@@ -589,7 +520,8 @@ impl MusicSpectrumState {
             &painter,
             keyboard_rect,
             &self.notes,
-            &mut self.bass_marker_trail,
+            self.note_min_midi,
+            &mut self.keyboard,
             bass_marker,
         );
     }
@@ -632,7 +564,11 @@ fn compute_spectrum(
         Some((window, local_center)) => {
             analyzer.analyze_moving_window(&window, pcm.sample_rate, local_center)
         }
-        None => SpectrumAnalysis::default(),
+        None => SpectrumAnalysis {
+            bands: Vec::new(),
+            notes: Vec::new(),
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+        },
     }
 }
 
@@ -716,86 +652,53 @@ fn draw_pitch_keyboard(
     painter: &egui::Painter,
     rect: egui::Rect,
     notes: &[f32],
-    note_sustain: &mut Vec<f32>,
-    note_trail: &mut Vec<f32>,
-    note_even: &mut Vec<f32>,
-    note_odd: &mut Vec<f32>,
+    note_min_midi: u8,
+    keyboard: &mut KeyboardAnimationState,
     norm_gain_db: f32,
 ) {
     // 鍵盤矩形でクリップし、均等幅で描いた鍵の軸外はみ出しを表示上でカットする。
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-    let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-    for slot in [
-        &mut *note_sustain,
-        &mut *note_trail,
-        &mut *note_even,
-        &mut *note_odd,
-    ] {
-        if slot.len() != note_count {
-            slot.clear();
-            slot.resize(note_count, 0.0);
-        }
-    }
-    let sustained_notes = update_keyboard_sustain(notes, note_sustain);
-    let visuals = compute_keyboard_visuals(&sustained_notes, note_count, norm_gain_db);
-    for idx in 0..note_count {
-        // center (基音) は attack 即時 / release 減衰。倍音サポートは EMA で平滑してチラつきを抑える。
-        note_trail[idx] = (note_trail[idx] * KEY_HIGHLIGHT_DECAY).max(visuals.center[idx]);
-        note_even[idx] =
-            note_even[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.even[idx] * KEY_HARMONIC_SMOOTH;
-        note_odd[idx] =
-            note_odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.odd[idx] * KEY_HARMONIC_SMOOTH;
+    let frame = prepare_keyboard_frame(notes, note_min_midi, norm_gain_db, keyboard);
+    let layout = layout_keyboard(
+        &frame,
+        KeyboardRect::new(rect.left(), rect.top(), rect.right(), rect.bottom()),
+    );
+
+    for x in layout.octave_guides_x {
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(
+                0.8,
+                egui::Color32::from_rgba_unmultiplied(120, 134, 148, 82),
+            ),
+        );
     }
 
-    for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
-        let x = spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
-        if x > rect.left() && x < rect.right() {
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(
-                    0.8,
-                    egui::Color32::from_rgba_unmultiplied(120, 134, 148, 82),
-                ),
-            );
+    for key in layout.keys {
+        let key_rect = egui::Rect::from_min_max(
+            egui::pos2(key.rect.left, key.rect.top),
+            egui::pos2(key.rect.right, key.rect.bottom),
+        );
+        let corner = if key.black { 1.0 } else { 0.0 };
+        if key.real_key {
+            let center_val = key.levels.center;
+            let mid_color = key_fill(key.midi, center_val, key.black);
+            let top_color = key_fill(key.midi, center_val * key.levels.odd, key.black);
+            let bottom_color = key_fill(key.midi, center_val * key.levels.even, key.black);
+            fill_key_gradient(&painter, key_rect, top_color, mid_color, bottom_color);
+        } else {
+            painter.rect_filled(key_rect, corner, unlit_key_base(key.black, false));
         }
-    }
-
-    // 白鍵を先に、黒鍵を後に描いて z 順 (黒鍵が上) を保つ。
-    for want_black in [false, true] {
-        for midi in KEYBOARD_DISPLAY_MIN_MIDI..=KEYBOARD_DISPLAY_MAX_MIDI {
-            if is_black_key(midi) != want_black {
-                continue;
-            }
-            let Some(key_rect) = conventional_key_rect(rect, midi, want_black) else {
-                continue;
-            };
-            let corner = if want_black { 1.0 } else { 0.0 };
-            let real_key = (SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI).contains(&midi);
-            if real_key {
-                // Layer ④ 縦グラデ: 中央=基音 / 上端=奇数倍音 / 下端=偶数倍音。色相は key_color が
-                // ピッチクラスで決めるので維持され、明るさ (濃さ) だけが倍音で変わる。
-                let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
-                let center_val = note_trail[idx];
-                let even_factor = note_even[idx].clamp(0.0, KEY_GRADIENT_SPREAD);
-                let odd_factor = note_odd[idx].clamp(0.0, KEY_GRADIENT_SPREAD);
-                let mid_color = key_fill(midi, center_val, want_black);
-                let top_color = key_fill(midi, center_val * odd_factor, want_black);
-                let bottom_color = key_fill(midi, center_val * even_factor, want_black);
-                fill_key_gradient(&painter, key_rect, top_color, mid_color, bottom_color);
-            } else {
-                painter.rect_filled(key_rect, corner, unlit_key_base(want_black, false));
-            }
-            let stroke = if want_black {
-                egui::Stroke::new(
-                    0.75,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
-                )
-            } else {
-                egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
-            };
-            painter.rect_stroke(key_rect, corner, stroke, egui::StrokeKind::Inside);
-        }
+        let stroke = if key.black {
+            egui::Stroke::new(
+                0.75,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            )
+        } else {
+            egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
+        };
+        painter.rect_stroke(key_rect, corner, stroke, egui::StrokeKind::Inside);
     }
 }
 
@@ -806,67 +709,33 @@ fn draw_bass_marker(
     painter: &egui::Painter,
     keyboard_rect: egui::Rect,
     notes: &[f32],
-    trail: &mut Vec<f32>,
+    note_min_midi: u8,
+    keyboard: &mut KeyboardAnimationState,
     bass_marker: Option<(u8, f32)>,
 ) {
-    let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-    if trail.len() != note_count {
-        trail.clear();
-        trail.resize(note_count, 0.0);
-    }
-    // afterglow: 毎フレーム緩やかに減衰させ、オクターブ間の一瞬のちらつきに残光を残す。
-    for value in trail.iter_mut() {
-        *value *= BASS_MARKER_DECAY;
-    }
-    // 現在の推定を対象鍵に載せる。Bass 音域で推定ピッチクラスに一致する鍵のうちエネルギー最大を
-    // 選ぶが、直近光っていた octave に軽くバイアスして flip-flop を抑える。
-    if let Some((pitch_class, confidence)) = bass_marker
-        && confidence >= BASS_MARKER_MIN_CONF
-    {
-        let pc = pitch_class % 12;
-        let mut best_idx = None;
-        let mut best_score = 0.0_f32;
-        for midi in BASS_MARKER_MIN_MIDI..=BASS_MARKER_MAX_MIDI {
-            if midi % 12 != pc || !(SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI).contains(&midi)
-            {
-                continue;
-            }
-            let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
-            let energy = notes.get(idx).copied().unwrap_or(0.0);
-            let score = energy + trail[idx] * BASS_MARKER_STICKY;
-            if score > best_score {
-                best_score = score;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(idx) = best_idx {
-            let target = (confidence * BASS_MARKER_CONF_GAIN).clamp(0.0, 1.0);
-            trail[idx] = trail[idx].max(target);
-        }
-    }
-    // 残光のある鍵に ▼ を描く。色は上の Bass 表示と同じ key_color、明るさ = afterglow 強度。
-    for idx in 0..trail.len() {
-        let intensity = trail[idx];
-        if intensity < BASS_MARKER_DRAW_MIN {
-            continue;
-        }
-        let midi = SPECTRUM_NOTE_MIN_MIDI + idx as u8;
-        let Some(key_rect) = conventional_key_rect(keyboard_rect, midi, is_black_key(midi)) else {
-            continue;
-        };
-        let cx = key_rect.center().x;
-        let base_y = keyboard_rect.top() - 1.0;
-        let m = intensity.clamp(0.0, 1.0);
-        let base = key_color(60 + midi % 12, 0.75 + 0.25 * m);
+    let markers = layout_bass_markers(
+        notes,
+        note_min_midi,
+        KeyboardRect::new(
+            keyboard_rect.left(),
+            keyboard_rect.top(),
+            keyboard_rect.right(),
+            keyboard_rect.bottom(),
+        ),
+        keyboard,
+        bass_marker,
+    );
+    for marker in markers {
+        let m = marker.intensity.clamp(0.0, 1.0);
+        let base = key_color(60 + marker.midi % 12, 0.75 + 0.25 * m);
         let alpha =
             (BASS_MARKER_ALPHA_MIN + (BASS_MARKER_ALPHA_MAX - BASS_MARKER_ALPHA_MIN) * m) as u8;
         let color = color_with_alpha(base, alpha);
-        // 下向き ▼ (頂点が鍵を指す)。
-        let triangle = vec![
-            egui::pos2(cx - BASS_MARKER_W * 0.5, base_y - BASS_MARKER_H),
-            egui::pos2(cx + BASS_MARKER_W * 0.5, base_y - BASS_MARKER_H),
-            egui::pos2(cx, base_y),
-        ];
+        let triangle = marker
+            .triangle
+            .into_iter()
+            .map(|point| egui::pos2(point.x, point.y))
+            .collect();
         painter.add(egui::Shape::convex_polygon(
             triangle,
             color,
@@ -917,255 +786,11 @@ fn fill_key_gradient(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32]) -> Vec<f32> {
-    let mut sustained = Vec::with_capacity(sustain.len());
-    let raw_peak = (0..sustain.len())
-        .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
-        .fold(0.0_f32, f32::max);
-    let broad_threshold = raw_peak * 0.42;
-    let broad_count = if raw_peak > KEY_HIGHLIGHT_MIN_PEAK {
-        (0..sustain.len())
-            .filter(|idx| notes.get(*idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) > broad_threshold)
-            .count()
-    } else {
-        0
-    };
-    let broad_ratio = broad_count as f32 / sustain.len().max(1) as f32;
-    let attack_scale = if broad_ratio > 0.34 { 0.35 } else { 1.0 };
-
-    for (idx, slot) in sustain.iter_mut().enumerate() {
-        let current = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        if current >= *slot {
-            let attack = KEY_SUSTAIN_ATTACK * attack_scale;
-            *slot = *slot * (1.0 - attack) + current * attack;
-        } else {
-            *slot = (*slot * KEY_SUSTAIN_RELEASE).max(current);
-        }
-        sustained.push(*slot);
-    }
-    sustained
-}
-
-/// 鍵盤 1 フレーム分の描画量。`center` が中央 (基音) の明るさ、`even`/`odd` が縦グラデの
-/// 下 / 上方向の伸び (倍音サポート)。
-struct KeyboardVisuals {
-    center: Vec<f32>,
-    even: Vec<f32>,
-    odd: Vec<f32>,
-}
-
-/// 知覚補正済み notes から、鍵盤の中央明るさ (Layer ② 加点のみ倍音サリエンス + Layer ③ 適応的
-/// 局所正規化) と、偶数 / 奇数倍音サポートを求める。減点は一切せず、加点は乗数≥1 なので生より
-/// 暗くならない (オクターブ重ねの実音を消さない / 高音域を沈めないため)。
-fn compute_keyboard_visuals(
-    notes: &[f32],
-    note_count: usize,
-    norm_gain_db: f32,
-) -> KeyboardVisuals {
-    let flat = || KeyboardVisuals {
-        center: vec![0.0; note_count],
-        even: vec![0.0; note_count],
-        odd: vec![0.0; note_count],
-    };
-    let raw: Vec<f32> = (0..note_count)
-        .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
-        .collect();
-    let peak = raw.iter().copied().fold(0.0_f32, f32::max);
-    if peak < KEY_HIGHLIGHT_MIN_PEAK {
-        return flat();
-    }
-
-    let mut even_energy = vec![0.0_f32; note_count];
-    let mut odd_energy = vec![0.0_f32; note_count];
-    for idx in 0..note_count {
-        let (even, odd) = harmonic_energies(&raw, idx);
-        even_energy[idx] = even;
-        odd_energy[idx] = odd;
-    }
-
-    // Layer ② 加点のみ (乗数≥1): 基音に倍音支持があるほど明るくする。積 (HPS) ではなく和。
-    let mut boosted = vec![0.0_f32; note_count];
-    for idx in 0..note_count {
-        let support = ((even_energy[idx] + odd_energy[idx]) / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
-        boosted[idx] = raw[idx] * (1.0 + KEY_HARMONIC_BOOST * support);
-    }
-
-    // Layer ③ 適応的局所正規化: 各鍵の周囲 ±KEY_LOCAL_WINDOW 半音の分布に対する相対的な際立ちで
-    // 明るさを絞る。局所しきい値 = 窓内の上位 KEY_LOCAL_TARGET 番目の値 (密度適応) なので、密な帯
-    // (低域クラッタ) は強い鍵だけ残し、疎な帯は主音がしきい値を明確に超えて強調される (= オクターブ
-    // 内で光る鍵数が一定に近づく)。「選択」(local_factor) と「明るさ」(絶対レベル×presence) を分離し、
-    // 静かな帯の主音が誤って満額で光らないようにする。低域ほど強く、中高域は弱く掛けて既存の
-    // (機能している) 挙動を保つ。旧 ±1 ピークゲートを置換。
-    let boosted_peak = boosted.iter().copied().fold(0.0_f32, f32::max).max(1.0e-6);
-    // 全体ラウドネスゲート: 静かな箇所で鍵盤が光りっぱなしにならないよう全体を抑える。Norm
-    // (ラウドネス正規化) 適用中は presence 用の peak だけ gain 分持ち上げ、録音レベルが小さくても
-    // 体感ラウドネスに合った明るさにする (パターンは boosted のまま = 不変)。
-    let presence_peak = music_core::apply_display_gain_db(peak, norm_gain_db);
-    let presence = ((presence_peak - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
-        .clamp(0.0, 1.0)
-        .powf(0.7);
-    let center = (0..note_count)
-        .map(|idx| {
-            let lo = idx.saturating_sub(KEY_LOCAL_WINDOW);
-            let hi = (idx + KEY_LOCAL_WINDOW).min(note_count - 1);
-            let local_ref = kth_largest(&boosted[lo..=hi], KEY_LOCAL_TARGET);
-            let ratio = boosted[idx] / (local_ref + 1.0e-4);
-            let prominence = smoothstep(KEY_LOCAL_RATIO_LO, KEY_LOCAL_RATIO_HI, ratio);
-            let local_factor = KEY_LOCAL_FLOOR + (1.0 - KEY_LOCAL_FLOOR) * prominence;
-            let hz = midi_to_hz(SPECTRUM_NOTE_MIN_MIDI + idx as u8);
-            let strength = local_declutter_strength(hz);
-            let eff = 1.0 - strength * (1.0 - local_factor);
-            ((boosted[idx] / boosted_peak) * presence * eff).clamp(0.0, 1.0)
-        })
-        .collect();
-    // 縦グラデの伸び factor: 各鍵の倍音エネルギーを基音に対する相対量 (0..1) にする。
-    let even = (0..note_count)
-        .map(|idx| (even_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
-    let odd = (0..note_count)
-        .map(|idx| (odd_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
-    KeyboardVisuals { center, even, odd }
-}
-
-/// `values` の k 番目 (1-indexed) に大きい値。要素数 < k なら最小値 (= しきい値が低く全通過)。
-fn kth_largest(values: &[f32], k: usize) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut buf: Vec<f32> = values.to_vec();
-    buf.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    buf[k.clamp(1, buf.len()) - 1]
-}
-
-/// 適応的局所正規化の適用強度。低域 (~KEY_LOCAL_FULL_HZ 以下)=1.0、高域 (~KEY_LOCAL_FADE_HZ 以上)
-/// =KEY_LOCAL_MIN_STRENGTH。log 周波数で補間。
-fn local_declutter_strength(hz: f32) -> f32 {
-    let fade = smoothstep(
-        KEY_LOCAL_FULL_HZ.log2(),
-        KEY_LOCAL_FADE_HZ.log2(),
-        hz.max(1.0).log2(),
-    );
-    1.0 - (1.0 - KEY_LOCAL_MIN_STRENGTH) * fade
-}
-
-fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    if (edge1 - edge0).abs() <= f32::EPSILON {
-        return if value >= edge1 { 1.0 } else { 0.0 };
-    }
-    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// note index `idx` の偶数 / 奇数倍音の重み付きエネルギーを、知覚補正済み `notes` から求める。
-/// オクターブ倍音 (2/4/8倍) は整数半音に乗るが、奇数倍音や 6倍は平均律からズレるので近傍 bin の
-/// max で拾う。高次ほど寄与は小さい (重みは 1/n)。
-fn harmonic_energies(notes: &[f32], idx: usize) -> (f32, f32) {
-    let sample = |offset: usize| -> f32 {
-        let center = idx + offset;
-        let mut best = notes.get(center).copied().unwrap_or(0.0);
-        if center >= 1 {
-            best = best.max(notes.get(center - 1).copied().unwrap_or(0.0));
-        }
-        best = best.max(notes.get(center + 1).copied().unwrap_or(0.0));
-        best.clamp(0.0, 1.0)
-    };
-    let mut even = 0.0_f32;
-    for (offset, weight) in EVEN_HARMONIC_OFFSETS.iter().zip(EVEN_HARMONIC_WEIGHTS) {
-        even += weight * sample(*offset);
-    }
-    let mut odd = 0.0_f32;
-    for (offset, weight) in ODD_HARMONIC_OFFSETS.iter().zip(ODD_HARMONIC_WEIGHTS) {
-        odd += weight * sample(*offset);
-    }
-    (even, odd)
-}
-
-fn conventional_key_rect(rect: egui::Rect, midi: u8, black: bool) -> Option<egui::Rect> {
-    let pc = midi % 12;
-    let octave_c = midi - pc;
-    let (x0, white_w) = conventional_octave_geometry(rect, octave_c)?;
-    let (left, right, bottom) = if black {
-        // 黒鍵を白鍵境界の真上に置くと中央の白鍵 (D / G・A) の露出上部が狭くなる。実物ピアノ
-        // のように黒鍵を外側へずらし、各グループ内の白鍵の露出上部幅を均等にする (= 見える面積が
-        // 揃う)。シフト量は黒鍵幅 r から導出: CDE (黒2) は C#/D# を ±r/6、FGAB (黒3) は外側の
-        // F#/A# を ±r/4、中央 G# は据え置き。単位は white_w (center は後で white_w 倍される)。
-        let r = KEY_BLACK_WIDTH_RATIO;
-        let center = match pc {
-            1 => 1.0 - r / 6.0,  // C# 左(外側)へ
-            3 => 2.0 + r / 6.0,  // D# 右(外側)へ
-            6 => 4.0 - r / 4.0,  // F# 左(外側)へ
-            8 => 5.0,            // G# 中央のまま
-            10 => 6.0 + r / 4.0, // A# 右(外側)へ
-            _ => return None,
-        };
-        let w = white_w * r;
-        (
-            x0 + white_w * center - w * 0.5,
-            x0 + white_w * center + w * 0.5,
-            rect.top() + rect.height() * KEY_BLACK_HEIGHT_RATIO,
-        )
-    } else {
-        let index = match pc {
-            0 => 0,
-            2 => 1,
-            4 => 2,
-            5 => 3,
-            7 => 4,
-            9 => 5,
-            11 => 6,
-            _ => return None,
-        } as f32;
-        (
-            x0 + white_w * index,
-            x0 + white_w * (index + 1.0),
-            rect.bottom(),
-        )
-    };
-    // 鍵は自然な (横クランプしない) 幅のまま返す。端のはみ出しは呼び出し側の painter クリップで
-    // カットする (幅を切り詰めると枠線が表示端に残って縦線化するため)。
-    let left = left + 0.25;
-    let right = right - 0.25;
-    if right <= left {
-        return None;
-    }
-    // 完全に表示外の鍵は描かない (無駄描画の削減、可視分はクリップ任せ)。
-    if right < rect.left() || left > rect.right() {
-        return None;
-    }
-    Some(egui::Rect::from_min_max(
-        egui::pos2(left, rect.top()),
-        egui::pos2(right, bottom),
-    ))
-}
-
-fn conventional_octave_geometry(rect: egui::Rect, octave_c: u8) -> Option<(f32, f32)> {
-    // クランプしない log 座標を使う。これで全オクターブが均等幅になり、軸下限 (20Hz) 未満の最低
-    // オクターブだけ横方向に圧縮されて鍵が小さくなる現象が無くなる (端は painter クリップで切る)。
-    let c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c));
-    let next_c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c.saturating_add(12)));
-    let octave_w = next_c_x - c_x;
-    if octave_w <= 1.0 {
-        return None;
-    }
-    let white_w = octave_w / 7.0;
-    Some((c_x - white_w * 0.5, white_w))
-}
-
 fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
     let min = SPECTRUM_AXIS_MIN_HZ;
     let max = SPECTRUM_VIEW_MAX_HZ;
     let t = (hz.clamp(min, max).log2() - min.log2()) / (max.log2() - min.log2());
     rect.left() + t.clamp(0.0, 1.0) * rect.width()
-}
-
-/// `spectrum_axis_x` のクランプなし版 (鍵盤ジオメトリ用)。hz が軸レンジ外だと左端より左 / 右端より
-/// 右の座標を返す。均等幅で鍵を並べ、表示端は呼び出し側の painter クリップでカットする前提。
-fn spectrum_axis_x_unclamped(rect: egui::Rect, hz: f32) -> f32 {
-    let min = SPECTRUM_AXIS_MIN_HZ;
-    let max = SPECTRUM_VIEW_MAX_HZ;
-    let t = (hz.max(1.0).log2() - min.log2()) / (max.log2() - min.log2());
-    rect.left() + t * rect.width()
 }
 
 fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
@@ -1229,10 +854,6 @@ fn note_name_from_midi(midi: i32) -> String {
     let pitch_class = midi.rem_euclid(12) as usize;
     let octave = midi.div_euclid(12) - 1;
     format!("{}{}", NAMES[pitch_class], octave)
-}
-
-fn is_black_key(midi: u8) -> bool {
-    matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
 }
 
 fn key_color(midi: u8, value: f32) -> egui::Color32 {
@@ -1440,62 +1061,5 @@ mod tests {
         assert_eq!(note_label_for_hz(440.0), "A4");
         assert_eq!(note_label_for_hz(261.6256), "C4");
         assert_eq!(note_label_for_hz(0.0), "--");
-    }
-
-    #[test]
-    fn keyboard_visuals_silence_is_flat() {
-        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let visuals = compute_keyboard_visuals(&vec![0.0; note_count], note_count, 0.0);
-        assert_eq!(visuals.center.len(), note_count);
-        assert!(visuals.center.iter().all(|v| *v == 0.0));
-        assert!(visuals.even.iter().all(|v| *v == 0.0));
-        assert!(visuals.odd.iter().all(|v| *v == 0.0));
-    }
-
-    #[test]
-    fn keyboard_visuals_detect_even_harmonics() {
-        // 基音 + 2倍音 (オクターブ, +12) + 4倍音 (+24) の偶数倍音構成 → even サポートが odd を上回り、
-        // 加点で基音の center が点灯する。
-        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let mut notes = vec![0.0_f32; note_count];
-        let fundamental = 24usize; // +24 が範囲内に収まる位置。
-        notes[fundamental] = 0.8;
-        notes[fundamental + 12] = 0.5;
-        notes[fundamental + 24] = 0.3;
-        let visuals = compute_keyboard_visuals(&notes, note_count, 0.0);
-        assert!(visuals.center[fundamental] > 0.0);
-        assert!(
-            visuals.even[fundamental] > visuals.odd[fundamental],
-            "even {} should exceed odd {}",
-            visuals.even[fundamental],
-            visuals.odd[fundamental]
-        );
-    }
-
-    #[test]
-    fn keyboard_peak_gate_attenuates_adjacent_key() {
-        // 隣接した 2 鍵のうち弱い方 (局所最大でない) は floor まで減衰する。
-        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let mut notes = vec![0.0_f32; note_count];
-        notes[40] = 0.9;
-        notes[41] = 0.7; // 局所最大ではない (左隣が強い)。
-        let visuals = compute_keyboard_visuals(&notes, note_count, 0.0);
-        assert!(
-            visuals.center[40] > visuals.center[41],
-            "local max {} should exceed gated neighbor {}",
-            visuals.center[40],
-            visuals.center[41]
-        );
-    }
-
-    #[test]
-    fn black_key_classification_matches_semitones() {
-        // C C# D D# E F F# G G# A A# B
-        let expected = [
-            false, true, false, true, false, false, true, false, true, false, true, false,
-        ];
-        for (pc, want) in expected.iter().enumerate() {
-            assert_eq!(is_black_key(60 + pc as u8), *want, "pc={pc}");
-        }
     }
 }

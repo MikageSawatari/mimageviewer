@@ -7,6 +7,7 @@
 pub mod analysis;
 pub mod beat;
 pub mod effects;
+pub mod keyboard;
 pub mod playback;
 pub mod timeline;
 
@@ -20,5 +21,10 @@ pub use analysis::{
 };
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};
+pub use keyboard::{
+    BassMarkerPlacement, KEYBOARD_NOTE_COUNT, KeyPlacement, KeyboardAnimationState, KeyboardFrame,
+    KeyboardLayout, KeyboardLevels, KeyboardPoint, KeyboardRect, layout_bass_markers,
+    layout_keyboard, prepare_keyboard_frame,
+};
 pub use playback::{PlaybackIntent, PlaybackSnapshot};
 pub use timeline::{MediaVisualMode, MusicBookmark, MusicModeSource, MusicTimelineLayout};

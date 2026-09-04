@@ -1,3 +1,5 @@
+use music_core::{KeyboardFrame, SPECTRUM_NOTE_MIN_MIDI};
+
 use crate::model::{
     Fill, Fit, Glow, ImageId, LayerKind, NormRect, Project, SpectrumShape, TextAlign, TimeFormat,
 };
@@ -5,11 +7,33 @@ use crate::model::{
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SpectrumFrame {
     pub bands: Vec<f32>,
+    pub notes: Vec<f32>,
+    pub note_min_midi: u8,
+    pub keyboard: KeyboardFrame,
 }
 
 impl SpectrumFrame {
     pub fn new(bands: Vec<f32>) -> Self {
-        Self { bands }
+        Self {
+            bands,
+            notes: Vec::new(),
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            keyboard: KeyboardFrame::default(),
+        }
+    }
+
+    pub fn from_analysis(
+        bands: Vec<f32>,
+        notes: Vec<f32>,
+        note_min_midi: u8,
+        keyboard: KeyboardFrame,
+    ) -> Self {
+        Self {
+            bands,
+            notes,
+            note_min_midi,
+            keyboard,
+        }
     }
 }
 
@@ -43,6 +67,10 @@ pub enum SceneItemKind {
         values: Vec<f32>,
         point_count: usize,
         shape: SpectrumShape,
+        fill: Fill,
+    },
+    PitchKeyboard {
+        keyboard: KeyboardFrame,
         fill: Fill,
     },
     ProgressBar {
@@ -111,6 +139,10 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                     fill: layer.fill.evaluate(time),
                 }
             }
+            LayerKind::PitchKeyboard(layer) => SceneItemKind::PitchKeyboard {
+                keyboard: spectrum.keyboard.clone(),
+                fill: layer.fill.evaluate(time),
+            },
             LayerKind::ProgressBar(layer) => SceneItemKind::ProgressBar {
                 progress,
                 border_thickness_px: layer.border_thickness_px.max(0.0),

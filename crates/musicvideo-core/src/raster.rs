@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
+use music_core::{KeyboardFrame, KeyboardRect, layout_keyboard};
+
 use crate::assets::{AssetError, Assets, ImageAsset};
 use crate::model::{
     Fill, Fit, Glow, ImageId, NormRect, Rgba8, SpectrumDirection, SpectrumShape, TextAlign,
@@ -329,6 +331,15 @@ fn draw_item(
             values,
             *point_count,
             *shape,
+            fill,
+            item.opacity,
+            item.corner_radius_px,
+            mask_mode,
+        ),
+        SceneItemKind::PitchKeyboard { keyboard, fill } => draw_pitch_keyboard(
+            frame,
+            rect,
+            keyboard,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -840,6 +851,199 @@ fn bar_coverage(x: f32, y: f32, bar: SpectrumBar) -> f32 {
         outside + qx.max(qy).min(0.0)
     };
     (0.5 - distance).clamp(0.0, 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pitch_keyboard(
+    frame: &mut Frame,
+    rect: PixelRect,
+    keyboard: &KeyboardFrame,
+    fill: &Fill,
+    opacity: f32,
+    corner_radius_px: f32,
+    mask_mode: bool,
+) {
+    let background = if mask_mode {
+        Rgba8::WHITE
+    } else {
+        Rgba8::BLACK
+    };
+    draw_filled_rect(
+        frame,
+        rect,
+        &Fill::Solid(background),
+        opacity,
+        corner_radius_px,
+        mask_mode,
+    );
+    if mask_mode {
+        return;
+    }
+
+    let layout = layout_keyboard(
+        keyboard,
+        KeyboardRect::new(
+            rect.x0 as f32,
+            rect.y0 as f32,
+            rect.x1 as f32,
+            rect.y1 as f32,
+        ),
+    );
+    for x in layout.octave_guides_x {
+        draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px);
+    }
+    let sampler = FillSampler::new(fill, rect);
+    for key in layout.keys {
+        draw_keyboard_key(frame, rect, key, &sampler, opacity, corner_radius_px);
+    }
+}
+
+fn draw_keyboard_guide(
+    frame: &mut Frame,
+    clip: PixelRect,
+    x: f32,
+    opacity: f32,
+    corner_radius_px: f32,
+) {
+    let min_x = (x - 1.0).floor().max(clip.x0 as f32) as usize;
+    let max_x = (x + 1.0).ceil().min(clip.x1 as f32) as usize;
+    let width = frame.width as usize;
+    let color = Rgba8::new(120, 134, 148, 82);
+    for y in clip.y0..clip.y1 {
+        for pixel_x in min_x..max_x {
+            let px = pixel_x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let line_coverage = (0.5 - ((px - x).abs() - 0.4)).clamp(0.0, 1.0);
+            let clip_coverage = rounded_rect_coverage(px, py, clip, corner_radius_px);
+            if line_coverage <= 0.0 || clip_coverage <= 0.0 {
+                continue;
+            }
+            let offset = (y * width + pixel_x) * 4;
+            blend_pixel(
+                &mut frame.rgba[offset..offset + 4],
+                color,
+                opacity * line_coverage * clip_coverage,
+            );
+        }
+    }
+}
+
+fn draw_keyboard_key(
+    frame: &mut Frame,
+    clip: PixelRect,
+    key: music_core::KeyPlacement,
+    sampler: &FillSampler<'_>,
+    opacity: f32,
+    corner_radius_px: f32,
+) {
+    let min_x = key.rect.left.floor().max(clip.x0 as f32) as usize;
+    let min_y = key.rect.top.floor().max(clip.y0 as f32) as usize;
+    let max_x = key.rect.right.ceil().min(clip.x1 as f32) as usize;
+    let max_y = key.rect.bottom.ceil().min(clip.y1 as f32) as usize;
+    let key_corner = if key.black { 1.0 } else { 0.0 };
+    let stroke_width = if key.black { 0.75 } else { 0.8 };
+    let stroke_color = if key.black {
+        Rgba8::new(255, 255, 255, 80)
+    } else {
+        Rgba8::new(0, 0, 0, 155)
+    };
+    let base = unlit_keyboard_key(key.black, key.real_key);
+    let band_position = key.note_position;
+    let width = frame.width as usize;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let outer = float_rounded_rect_coverage(px, py, key.rect, key_corner);
+            let clip_coverage = rounded_rect_coverage(px, py, clip, corner_radius_px);
+            let coverage = outer * clip_coverage;
+            if coverage <= 0.0 {
+                continue;
+            }
+            let color = if key.real_key {
+                let level = keyboard_vertical_level(key, py);
+                let active = sampler.sample(px, py, band_position, false);
+                let amount = (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
+                mix_rgba(base, active, amount)
+            } else {
+                base
+            };
+            let offset = (y * width + x) * 4;
+            blend_pixel(
+                &mut frame.rgba[offset..offset + 4],
+                color,
+                opacity * coverage,
+            );
+
+            let inner = KeyboardRect::new(
+                key.rect.left + stroke_width,
+                key.rect.top + stroke_width,
+                key.rect.right - stroke_width,
+                key.rect.bottom - stroke_width,
+            );
+            let inner_coverage = if inner.right > inner.left && inner.bottom > inner.top {
+                float_rounded_rect_coverage(px, py, inner, (key_corner - stroke_width).max(0.0))
+            } else {
+                0.0
+            };
+            let stroke_coverage = (outer - inner_coverage).max(0.0) * clip_coverage;
+            if stroke_coverage > 0.0 {
+                blend_pixel(
+                    &mut frame.rgba[offset..offset + 4],
+                    stroke_color,
+                    opacity * stroke_coverage,
+                );
+            }
+        }
+    }
+}
+
+fn keyboard_vertical_level(key: music_core::KeyPlacement, y: f32) -> f32 {
+    let middle = (key.rect.top + key.rect.bottom) * 0.5;
+    if y <= middle {
+        let amount = ((y - key.rect.top) / (middle - key.rect.top).max(1.0e-6)).clamp(0.0, 1.0);
+        let top = key.levels.center * key.levels.odd;
+        top + (key.levels.center - top) * amount
+    } else {
+        let amount = ((y - middle) / (key.rect.bottom - middle).max(1.0e-6)).clamp(0.0, 1.0);
+        let bottom = key.levels.center * key.levels.even;
+        key.levels.center + (bottom - key.levels.center) * amount
+    }
+}
+
+fn unlit_keyboard_key(black: bool, real: bool) -> Rgba8 {
+    match (black, real) {
+        (false, true) => Rgba8::new(208, 214, 219, 255),
+        (false, false) => Rgba8::new(58, 64, 70, 255),
+        (true, true) => Rgba8::new(13, 16, 19, 255),
+        (true, false) => Rgba8::new(34, 39, 44, 255),
+    }
+}
+
+fn mix_rgba(from: Rgba8, to: Rgba8, amount: f32) -> Rgba8 {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel = |from: u8, to: u8| {
+        (from as f32 + (to as f32 - from as f32) * amount).clamp(0.0, 255.0) as u8
+    };
+    Rgba8::new(
+        channel(from.r, to.r),
+        channel(from.g, to.g),
+        channel(from.b, to.b),
+        channel(from.a, to.a),
+    )
+}
+
+fn float_rounded_rect_coverage(x: f32, y: f32, rect: KeyboardRect, radius_px: f32) -> f32 {
+    let width = rect.width();
+    let height = rect.height();
+    let radius = radius_px.max(0.0).min(width.min(height) * 0.5);
+    let center_x = (rect.left + rect.right) * 0.5;
+    let center_y = (rect.top + rect.bottom) * 0.5;
+    let qx = (x - center_x).abs() - (width * 0.5 - radius);
+    let qy = (y - center_y).abs() - (height * 0.5 - radius);
+    let outside = qx.max(0.0).hypot(qy.max(0.0));
+    let inside = qx.max(qy).min(0.0);
+    (0.5 - (outside + inside - radius)).clamp(0.0, 1.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1800,6 +2004,7 @@ mod tests {
     use super::*;
     use crate::MAX_SCALED_IMAGE_CACHE_ENTRIES;
     use crate::model::{Fit, GradientStop, GradientStops};
+    use music_core::{KeyboardAnimationState, SPECTRUM_NOTE_MIN_MIDI, prepare_keyboard_frame};
 
     fn item(kind: SceneItemKind) -> SceneItem {
         SceneItem {
@@ -1892,6 +2097,110 @@ mod tests {
         );
         assert_eq!(resample_spectrum(&[0.4], 3), vec![0.4; 3]);
         assert_eq!(resample_spectrum(&[], 2), vec![0.0; 2]);
+    }
+
+    #[test]
+    fn pitch_keyboard_is_deterministic_and_uses_fill_opacity_and_glow() {
+        let mut notes = vec![0.0; music_core::KEYBOARD_NOTE_COUNT];
+        notes[(60 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.9;
+        notes[(64 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.65;
+        notes[(67 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.7;
+        let mut state = KeyboardAnimationState::default();
+        let mut keyboard = KeyboardFrame::default();
+        for _ in 0..4 {
+            keyboard = prepare_keyboard_frame(&notes, SPECTRUM_NOTE_MIN_MIDI, 0.0, &mut state);
+        }
+        let keyboard_item = |fill, opacity, glow| SceneItem {
+            rect: NormRect::new(0.1, 0.3, 0.8, 0.35),
+            opacity,
+            rotation_deg: 0.0,
+            corner_radius_px: 6.0,
+            glow,
+            kind: SceneItemKind::PitchKeyboard {
+                keyboard: keyboard.clone(),
+                fill: Fill::Solid(fill),
+            },
+        };
+        let glow = Some(Glow {
+            color: Rgba8::new(0, 180, 255, 220),
+            radius_px: 6.0,
+            spread_px: 2.0,
+        });
+        let keyboard_scene = scene(
+            320,
+            120,
+            keyboard_item(Rgba8::new(255, 40, 20, 255), 0.75, glow),
+        );
+        let mut first = Frame::new(1, 1).unwrap();
+        let mut second = Frame::new(2, 2).unwrap();
+        let _ = render_frame(&keyboard_scene, &Assets::default(), &mut first).unwrap();
+        let _ = render_frame(&keyboard_scene, &Assets::default(), &mut second).unwrap();
+        assert_eq!(first, second);
+
+        let keyboard_rect = norm_rect_to_pixels(
+            keyboard_scene.items[0].rect,
+            keyboard_scene.width,
+            keyboard_scene.height,
+        );
+        assert!(
+            first
+                .rgba
+                .chunks_exact(4)
+                .enumerate()
+                .any(|(index, pixel)| {
+                    let x = index % first.width as usize;
+                    let y = index / first.width as usize;
+                    (x < keyboard_rect.x0
+                        || x >= keyboard_rect.x1
+                        || y < keyboard_rect.y0
+                        || y >= keyboard_rect.y1)
+                        && pixel[..3] != [0, 0, 0]
+                })
+        );
+
+        let mut other_fill = Frame::new(1, 1).unwrap();
+        let _ = render_frame(
+            &scene(
+                320,
+                120,
+                keyboard_item(Rgba8::new(20, 255, 40, 255), 0.75, glow),
+            ),
+            &Assets::default(),
+            &mut other_fill,
+        )
+        .unwrap();
+        assert_ne!(first, other_fill);
+
+        let mut other_opacity = Frame::new(1, 1).unwrap();
+        let _ = render_frame(
+            &scene(
+                320,
+                120,
+                keyboard_item(Rgba8::new(255, 40, 20, 255), 0.35, glow),
+            ),
+            &Assets::default(),
+            &mut other_opacity,
+        )
+        .unwrap();
+        assert_ne!(first, other_opacity);
+    }
+
+    #[test]
+    fn pitch_keyboard_key_edges_have_partial_analytic_coverage() {
+        let keyboard = KeyboardFrame::default();
+        let layout = layout_keyboard(&keyboard, KeyboardRect::new(0.0, 0.0, 320.0, 40.0));
+        let black = layout.keys.into_iter().find(|key| key.black).unwrap();
+        let min_x = black.rect.left.floor() as i32 - 1;
+        let min_y = black.rect.top.floor() as i32 - 1;
+        let max_x = black.rect.right.ceil() as i32 + 1;
+        let max_y = black.rect.bottom.ceil() as i32 + 1;
+        assert!((min_y..max_y).any(|y| {
+            (min_x..max_x).any(|x| {
+                let coverage =
+                    float_rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, black.rect, 1.0);
+                coverage > 0.0 && coverage < 1.0
+            })
+        }));
     }
 
     #[test]

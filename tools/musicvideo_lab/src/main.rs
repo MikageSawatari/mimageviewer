@@ -1,7 +1,6 @@
 //! `musicvideo_lab` — 音楽ビデオ書き出しのラボ GUI。
 //!
-//! 正本: `docs/music-video-export-plan.md`。P1a/P2a のブリーフは `docs/brief-musicvideo-p1a.md`
-//! と `docs/brief-musicvideo-p2a.md`。
+//! 正本: `docs/music-video-export-plan.md`。各 increment のブリーフは `docs/brief-musicvideo-*.md`。
 
 use std::path::PathBuf;
 use std::sync::Arc;

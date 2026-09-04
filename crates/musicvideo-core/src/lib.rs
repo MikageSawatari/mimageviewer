@@ -1,7 +1,6 @@
 //! `musicvideo-core` — 音楽ビデオ書き出しの純ロジック（egui / FFmpeg / wgpu 非依存）。
 //!
-//! 正本: `docs/music-video-export-plan.md`。P1a/P2a のブリーフは `docs/brief-musicvideo-p1a.md`
-//! と `docs/brief-musicvideo-p2a.md`。
+//! 正本: `docs/music-video-export-plan.md`。各 increment のブリーフは `docs/brief-musicvideo-*.md`。
 //!
 //! テキストは `comic-core`、スペクトラム解析は `music-core` を呼ぶ。ここで別のフォント
 //! スタックや別の解析器を立てない。
@@ -21,9 +20,9 @@ pub use assets::{
 };
 pub use model::{
     Animatable, Fill, Fit, Glow, GradientStop, GradientStops, GradientStopsError, ImageId, Interp,
-    Keyframe, Layer, LayerId, LayerKind, NormRect, Output, ProgressBarLayer, Project, Rgba8,
-    SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TimeFormat, TimeTextLayer, Track,
-    TrackError,
+    Keyframe, Layer, LayerId, LayerKind, NormRect, Output, PitchKeyboardLayer, ProgressBarLayer,
+    Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TimeFormat,
+    TimeTextLayer, Track, TrackError,
 };
 pub use preset::{
     DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, DEFAULT_OUTPUT, DEFAULT_SPECTRUM_BANDS,

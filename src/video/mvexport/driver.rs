@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_the_third as ffmpeg;
 use musicvideo_core::{
-    Frame, LayerKind, RenderReport, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset,
-    evaluate, render_frame,
+    Frame, LayerKind, RenderReport, Smoothing, SpectrumSource, UnresolvedAsset, evaluate,
+    render_frame,
 };
 use sha2::{Digest, Sha256};
 
@@ -122,8 +122,10 @@ pub(super) fn export(
             / plan.frame_rate.numerator as f64;
 
         let render_started = Instant::now();
-        let bands = SpectrumFrame::new(spectrum.frame_at(&decoded.stereo_samples, t_secs).to_vec());
-        let scene = evaluate(&request.project, t_secs, &bands);
+        let spectrum_frame = spectrum
+            .full_frame_at(&decoded.stereo_samples, t_secs, 0.0)
+            .clone();
+        let scene = evaluate(&request.project, t_secs, &spectrum_frame);
         let report = render_frame(&scene, &request.assets, &mut rgba).map_err(|error| {
             ExportError::Render(format!(
                 "フレーム {} の合成に失敗しました: {error}",

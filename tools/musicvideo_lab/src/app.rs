@@ -12,7 +12,10 @@ use musicvideo_core::{
 
 use crate::decode::{AudioData, decode_audio};
 use crate::export::{ExportOutcome, export_png_sequence, frame_count};
-use crate::project::{BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, spectrum_band_count};
+use crate::project::{
+    BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, new_pitch_keyboard_layer,
+    spectrum_band_count,
+};
 
 type AudioLoadResult = Result<(PathBuf, Arc<AudioData>), String>;
 type ImageLoadResult = Result<(PathBuf, ImageAsset), String>;
@@ -236,21 +239,25 @@ impl MusicVideoLabApp {
                     return;
                 }
                 let band_count = spectrum_band_count(&project);
-                let bands = match audio {
+                let spectrum_frame = match audio {
                     Some(audio) => SpectrumSource::new(
                         audio.sample_rate,
                         band_count,
                         Smoothing::Average { factor: 0.7 },
                     )
-                    .map(|mut source| source.frame_at(&audio.stereo_pcm, position_secs).to_vec())
+                    .map(|mut source| {
+                        source
+                            .full_frame_at(&audio.stereo_pcm, position_secs, 0.0)
+                            .clone()
+                    })
                     .map_err(|error| format!("スペクトラム解析に失敗しました: {error}")),
-                    None => Ok(vec![0.0; band_count]),
+                    None => Ok(SpectrumFrame::new(vec![0.0; band_count])),
                 };
-                let result = bands.and_then(|bands| {
+                let result = spectrum_frame.and_then(|spectrum_frame| {
                     if worker_cancel.load(Ordering::Relaxed) {
                         return Err("プレビューをキャンセルしました".to_owned());
                     }
-                    let scene = evaluate(&project, position_secs, &SpectrumFrame::new(bands));
+                    let scene = evaluate(&project, position_secs, &spectrum_frame);
                     let mut frame = Frame::new(project.output.width, project.output.height)
                         .map_err(|error| format!("プレビューを確保できません: {error}"))?;
                     let started = Instant::now();
@@ -542,6 +549,12 @@ impl eframe::App for MusicVideoLabApp {
                         self.selected_layer = index;
                     }
                 }
+                if ui.button("＋ ピッチ鍵盤を追加").clicked() {
+                    let layer = new_pitch_keyboard_layer(&self.project);
+                    self.project.layers.push(layer);
+                    self.selected_layer = self.project.layers.len() - 1;
+                    project_changed = true;
+                }
                 ui.separator();
                 if let Some(layer) = self.project.layers.get_mut(self.selected_layer) {
                     project_changed = edit_layer_properties(ui, layer);
@@ -618,6 +631,7 @@ fn edit_layer_properties(ui: &mut egui::Ui, layer: &mut Layer) -> bool {
         LayerKind::Solid { fill } => edit_fill(ui, "塗り", fill),
         LayerKind::Image { .. } => false,
         LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
+        LayerKind::PitchKeyboard(keyboard) => edit_fill(ui, "点灯する鍵の塗り", &mut keyboard.fill),
         LayerKind::ProgressBar(progress) => {
             let mut changed = ui
                 .add(

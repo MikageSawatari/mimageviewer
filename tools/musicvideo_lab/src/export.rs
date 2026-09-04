@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use musicvideo_core::{
-    Assets, Frame, ImageId, Project, RenderReport, ScaledImageCacheStats, Smoothing, SpectrumFrame,
+    Assets, Frame, ImageId, Project, RenderReport, ScaledImageCacheStats, Smoothing,
     SpectrumSource, UnresolvedAsset, evaluate, render_frame,
 };
 
 use crate::decode::AudioData;
 use crate::project::{
-    BACKGROUND_ID, FontData, create_assets, default_project, spectrum_band_count,
-    synthetic_background,
+    BACKGROUND_ID, FontData, create_assets, default_project, new_pitch_keyboard_layer,
+    spectrum_band_count, synthetic_background,
 };
 
 const BENCHMARK_WARMUP_FRAMES: usize = 10;
@@ -99,10 +99,10 @@ pub fn export_png_sequence(
         let time = index as f64 / project.output.fps;
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let bands = spectrum.frame_at(&audio.stereo_pcm, time).to_vec();
+        let spectrum_frame = spectrum.full_frame_at(&audio.stereo_pcm, time, 0.0).clone();
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
-        let scene = evaluate(&project, time, &SpectrumFrame::new(bands));
+        let scene = evaluate(&project, time, &spectrum_frame);
         let report = render_frame(&scene, &assets, &mut frame)
             .map_err(|error| format!("フレーム {} の合成に失敗しました: {error}", index + 1))?;
         let composed_ms = composition_started.elapsed().as_secs_f64() * 1000.0;
@@ -250,7 +250,8 @@ pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String>
         ImageId::new(BACKGROUND_ID),
         synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
     );
-    let project = default_project(10.0);
+    let mut project = default_project(10.0);
+    project.layers.push(new_pitch_keyboard_layer(&project));
     let pcm = synthetic_chirp_pcm(11.0);
     let mut spectrum = SpectrumSource::new(
         BENCHMARK_SAMPLE_RATE,
@@ -259,8 +260,8 @@ pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String>
     )
     .map_err(|error| format!("サンプル用の解析を初期化できません: {error}"))?;
     let time = 5.0;
-    let bands = SpectrumFrame::new(spectrum.frame_at(&pcm, time).to_vec());
-    let scene = evaluate(&project, time, &bands);
+    let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0).clone();
+    let scene = evaluate(&project, time, &spectrum_frame);
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("サンプル画像を確保できません: {error}"))?;
     let report = render_frame(&scene, &assets, &mut frame)
@@ -324,8 +325,8 @@ fn benchmark_once(
 
     for index in 0..BENCHMARK_WARMUP_FRAMES {
         let time = index as f64 / project.output.fps;
-        let bands = SpectrumFrame::new(spectrum.frame_at(&pcm, time).to_vec());
-        let scene = evaluate(&project, time, &bands);
+        let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0).clone();
+        let scene = evaluate(&project, time, &spectrum_frame);
         let report = render_frame(&scene, &assets, &mut frame)
             .map_err(|error| format!("ウォームアップ合成に失敗しました: {error}"))?;
         ensure_resolved(&report, "ウォームアップ")?;
@@ -340,10 +341,10 @@ fn benchmark_once(
         let time = index as f64 / project.output.fps;
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let bands = SpectrumFrame::new(spectrum.frame_at(&pcm, time).to_vec());
+        let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0).clone();
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
-        let scene = evaluate(&project, time, &bands);
+        let scene = evaluate(&project, time, &spectrum_frame);
         let report = render_frame(&scene, &assets, &mut frame)
             .map_err(|error| format!("ベンチマーク合成に失敗しました: {error}"))?;
         let composed_ms = composition_started.elapsed().as_secs_f64() * 1000.0;

@@ -1,7 +1,11 @@
 use std::fmt;
 
-use music_core::SpectrumAnalyzer;
+use music_core::{
+    KeyboardAnimationState, SpectrumAnalysis, SpectrumAnalyzer, prepare_keyboard_frame,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::scene::SpectrumFrame;
 
 pub const MAX_SPECTRUM_BANDS: usize = 128;
 /// A larger discontinuity is a seek rather than sequential frame production.
@@ -46,7 +50,9 @@ pub struct SpectrumSource {
     band_count: usize,
     smoothing: Smoothing,
     analyzer: SpectrumAnalyzer,
-    values: Vec<f32>,
+    analysis: SpectrumAnalysis,
+    keyboard: KeyboardAnimationState,
+    full_frame: Option<SpectrumFrame>,
     last_t: Option<f64>,
 }
 
@@ -72,7 +78,9 @@ impl SpectrumSource {
             band_count,
             smoothing,
             analyzer: SpectrumAnalyzer::new(band_count),
-            values: Vec::new(),
+            analysis: SpectrumAnalysis::default(),
+            keyboard: KeyboardAnimationState::default(),
+            full_frame: None,
             last_t: None,
         })
     }
@@ -81,6 +89,32 @@ impl SpectrumSource {
     /// Backward seeks, non-finite times, and gaps over 250 ms reset both the
     /// analyzer cache and temporal smoothing before the requested frame.
     pub fn frame_at(&mut self, pcm: &[f32], t_secs: f64) -> &[f32] {
+        self.update_analysis(pcm, t_secs);
+        &self.analysis.bands
+    }
+
+    /// Produces bands, notes, and the keyboard animation frame from one FFT analysis.
+    /// Repeating the same time returns the cached result without advancing keyboard decay.
+    pub fn full_frame_at(&mut self, pcm: &[f32], t_secs: f64, norm_gain_db: f32) -> &SpectrumFrame {
+        self.update_analysis(pcm, t_secs);
+        if self.full_frame.is_none() {
+            let keyboard = prepare_keyboard_frame(
+                &self.analysis.notes,
+                self.analysis.note_min_midi,
+                norm_gain_db,
+                &mut self.keyboard,
+            );
+            self.full_frame = Some(SpectrumFrame::from_analysis(
+                self.analysis.bands.clone(),
+                self.analysis.notes.clone(),
+                self.analysis.note_min_midi,
+                keyboard,
+            ));
+        }
+        self.full_frame.as_ref().expect("frame was initialized")
+    }
+
+    fn update_analysis(&mut self, pcm: &[f32], t_secs: f64) {
         let t = if t_secs.is_finite() {
             t_secs.max(0.0)
         } else {
@@ -89,7 +123,7 @@ impl SpectrumSource {
         };
 
         if self.last_t == Some(t) {
-            return &self.values;
+            return;
         }
         if self
             .last_t
@@ -98,26 +132,30 @@ impl SpectrumSource {
             self.reset();
         }
 
-        let analyzed = self.analyzer.analyze(pcm, self.sample_rate, t).bands;
-        if self.values.len() != self.band_count || self.last_t.is_none() {
-            self.values = analyzed;
+        let analyzed = self.analyzer.analyze(pcm, self.sample_rate, t);
+        if self.analysis.bands.len() != self.band_count || self.last_t.is_none() {
+            self.analysis = analyzed;
         } else {
+            self.analysis.notes = analyzed.notes;
+            self.analysis.note_min_midi = analyzed.note_min_midi;
             match self.smoothing {
-                Smoothing::None => self.values = analyzed,
+                Smoothing::None => self.analysis.bands = analyzed.bands,
                 Smoothing::Average { factor } => {
-                    for (previous, current) in self.values.iter_mut().zip(analyzed) {
+                    for (previous, current) in self.analysis.bands.iter_mut().zip(analyzed.bands) {
                         *previous = factor * *previous + (1.0 - factor) * current;
                     }
                 }
             }
         }
         self.last_t = Some(t);
-        &self.values
+        self.full_frame = None;
     }
 
     pub fn reset(&mut self) {
         self.analyzer = SpectrumAnalyzer::new(self.band_count);
-        self.values.clear();
+        self.analysis = SpectrumAnalysis::default();
+        self.keyboard.clear();
+        self.full_frame = None;
         self.last_t = None;
     }
 
@@ -179,5 +217,21 @@ mod tests {
             SpectrumSource::new(48_000, 129, Smoothing::default()),
             Err(SpectrumSourceError::InvalidBandCount)
         ));
+    }
+
+    #[test]
+    fn full_frame_contains_bands_and_notes_from_the_same_analysis() {
+        let pcm = tone();
+        let mut source = SpectrumSource::new(48_000, 64, Smoothing::None).unwrap();
+        let first = source.full_frame_at(&pcm, 0.5, 0.0).clone();
+        assert_eq!(first.bands.len(), 64);
+        assert_eq!(first.notes.len(), music_core::KEYBOARD_NOTE_COUNT);
+        assert_eq!(first.note_min_midi, music_core::SPECTRUM_NOTE_MIN_MIDI);
+        assert_eq!(first.keyboard.note_min_midi, first.note_min_midi);
+        assert!(first.keyboard.levels.iter().any(|level| level.center > 0.0));
+
+        let repeated = source.full_frame_at(&pcm, 0.5, 0.0).clone();
+        assert_eq!(first, repeated);
+        assert_eq!(source.frame_at(&pcm, 0.5), first.bands);
     }
 }
