@@ -29,8 +29,8 @@ use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
     FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
-    build_fs_prefetch_indicator,
+    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, PollPrefetchOrigin,
+    ViewerPresentation, build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -15134,7 +15134,7 @@ impl App {
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
-        self.poll_prefetch(ctx);
+        self.poll_prefetch(ctx, PollPrefetchOrigin::FullscreenViewport);
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::PollPrefetch);
 
         // ── 状態の事前計算 ──
@@ -19460,12 +19460,14 @@ impl App {
 
     /// build_nav_indices の結果をキャッシュして返す。
     fn get_nav_indices(&mut self) -> Vec<usize> {
-        if let Some(ref cached) = self.cached_nav_indices {
-            return cached.clone();
-        }
-        let nav = build_nav_indices(&self.items, self.current_grid_order());
-        self.cached_nav_indices = Some(nav.clone());
-        nav
+        crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
+            if let Some(ref cached) = self.cached_nav_indices {
+                return cached.clone();
+            }
+            let nav = build_nav_indices(&self.items, self.current_grid_order());
+            self.cached_nav_indices = Some(nav.clone());
+            nav
+        })
     }
 
     pub(crate) fn fullscreen_large_jump_target(
@@ -41842,7 +41844,7 @@ mod tests {
             .unwrap();
         }
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         assert!(matches!(app.thumbnails[1], ThumbnailState::Pending));
         assert!(app.fs_cache.contains_key(&0));
@@ -41938,7 +41940,7 @@ mod tests {
             30,
             crate::app::FsLoadPurpose::for_page(false),
         ));
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(!app.fs_cache.contains_key(&0));
         assert_eq!(app.fs_upload_backlog.len(), 1);
     }
@@ -42021,7 +42023,7 @@ mod tests {
         assert!(app.fs_cache.contains_key(&1));
         assert!(!app.fs_cache.contains_key(&0));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
 
         assert!(
             app.fs_cache.contains_key(&0),
@@ -42074,7 +42076,7 @@ mod tests {
         assert!(app.fs_nav_locked_gen.is_none());
 
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::FullscreenViewport);
         assert!(app.fs_upload_backlog.is_empty());
         assert!(app.fs_cache.contains_key(&2));
     }

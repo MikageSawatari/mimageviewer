@@ -2694,6 +2694,91 @@ fn update_perf_stages_plus_unaccounted_equal_total() {
 }
 
 #[test]
+fn poll_prefetch_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = poll_prefetch_perf_start_with(false, PollPrefetchOrigin::TopLevel, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in PollPrefetchPerfStage::ALL {
+        mark_poll_prefetch_perf(&mut recorder, stage);
+    }
+    finish_poll_prefetch_perf(&mut recorder, 0, 0);
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+}
+
+#[test]
+fn poll_prefetch_perf_stages_plus_unaccounted_equal_total() {
+    let started_at = std::time::Instant::now();
+    let mut recorder = PollPrefetchPerfRecorder::new(PollPrefetchOrigin::TopLevel, started_at);
+    let mut elapsed = std::time::Duration::ZERO;
+    for (index, stage) in PollPrefetchPerfStage::ALL.into_iter().enumerate() {
+        elapsed += std::time::Duration::from_millis(index as u64 + 1);
+        recorder.mark_at(stage, started_at + elapsed);
+    }
+    let expected_unaccounted = std::time::Duration::from_millis(7);
+    let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+    let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+
+    assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+    assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+}
+
+#[test]
+fn nav_helper_perf_does_not_read_clock_outside_an_enabled_ui_frame() {
+    begin_nav_helper_perf_frame(false);
+    let clock_called = Cell::new(false);
+    let result = measure_nav_helper_with(
+        NavHelperPerfKind::StillImageDisplayIndices,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || 42,
+    );
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(result, 42);
+    assert!(!clock_called.get());
+    assert_eq!(metrics, NavHelperPerfMetrics::default());
+}
+
+#[test]
+fn nav_helper_perf_accumulates_calls_and_time_then_resets_at_frame_boundary() {
+    let started_at = std::time::Instant::now();
+    let clock_values = [
+        started_at,
+        started_at + std::time::Duration::from_millis(2),
+        started_at + std::time::Duration::from_millis(3),
+        started_at + std::time::Duration::from_millis(8),
+    ];
+    let clock_index = Cell::new(0usize);
+    let now = || {
+        let index = clock_index.get();
+        clock_index.set(index + 1);
+        clock_values[index]
+    };
+
+    begin_nav_helper_perf_frame(true);
+    measure_nav_helper_with(NavHelperPerfKind::StillImageDisplayIndices, now, || ());
+    measure_nav_helper_with(NavHelperPerfKind::GetNavIndices, now, || ());
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(metrics.still_image_display_indices_calls, 1);
+    assert!((metrics.still_image_display_indices_ms - 2.0).abs() < f64::EPSILON);
+    assert_eq!(metrics.get_nav_indices_calls, 1);
+    assert!((metrics.get_nav_indices_ms - 5.0).abs() < f64::EPSILON);
+
+    begin_nav_helper_perf_frame(true);
+    assert_eq!(
+        finish_nav_helper_perf_frame(),
+        NavHelperPerfMetrics::default()
+    );
+}
+
+#[test]
 fn metadata_import_terminal_index_build_is_split_and_compact() {
     let mut app = phase_c_support::setup_app();
     let root = PathBuf::from("C:/Pictures");
@@ -30740,7 +30825,7 @@ mod pipeline_cache_refactor_tests {
             FsLoadPurpose::for_page(true),
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_holdover_tex
@@ -34428,7 +34513,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [2, 2],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_page_load_state(idx),
@@ -35061,7 +35146,7 @@ mod pipeline_cache_refactor_tests {
         let source =
             std::fs::read_to_string(manifest_dir.join("src/app.rs")).expect("read app.rs as UTF-8");
         let body = source
-            .split_once("pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {")
+            .split_once("pub(crate) fn poll_prefetch(")
             .expect("poll_prefetch start")
             .1
             .split_once("    fn update_reading_history_media_progress(")
@@ -35249,7 +35334,7 @@ mod pipeline_cache_refactor_tests {
                 started_at,
             },
         ));
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(app.fs_upload_backlog.is_empty());
         assert!(matches!(
@@ -35285,7 +35370,7 @@ mod pipeline_cache_refactor_tests {
             },
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(matches!(
             app.fs_cache.get(&idx),
@@ -35347,7 +35432,7 @@ mod pipeline_cache_refactor_tests {
         tx.send(FsLoadResult::AnimationExpansionStarted { started_at })
             .unwrap();
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(
             app.fs_pending.contains_key(&idx),
@@ -35426,7 +35511,7 @@ mod pipeline_cache_refactor_tests {
         })
         .unwrap();
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(app.fs_pending.contains_key(&old));
         assert!(
@@ -35516,7 +35601,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [4, 4],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(
             app.ensure_final_composite_texture(&ctx, left).is_some(),

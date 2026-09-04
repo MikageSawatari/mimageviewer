@@ -5547,6 +5547,84 @@ use crate::thumb_loader::{
 
 const UPDATE_PERF_STAGE_COUNT: usize = 23;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct NavHelperPerfMetrics {
+    still_image_display_indices_calls: u64,
+    still_image_display_indices_ms: f64,
+    get_nav_indices_calls: u64,
+    get_nav_indices_ms: f64,
+}
+
+impl NavHelperPerfMetrics {
+    fn record(&mut self, kind: NavHelperPerfKind, elapsed_ms: f64) {
+        match kind {
+            NavHelperPerfKind::StillImageDisplayIndices => {
+                self.still_image_display_indices_calls += 1;
+                self.still_image_display_indices_ms += elapsed_ms;
+            }
+            NavHelperPerfKind::GetNavIndices => {
+                self.get_nav_indices_calls += 1;
+                self.get_nav_indices_ms += elapsed_ms;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavHelperPerfKind {
+    StillImageDisplayIndices,
+    GetNavIndices,
+}
+
+#[derive(Debug, Default)]
+struct NavHelperPerfFrame {
+    active: bool,
+    metrics: NavHelperPerfMetrics,
+}
+
+thread_local! {
+    /// Armed only by `App::update_frame` on the UI thread. Calls made by workers or outside an
+    /// update frame see their own inactive TLS slot and are deliberately not counted.
+    static NAV_HELPER_PERF_FRAME: std::cell::RefCell<NavHelperPerfFrame> =
+        std::cell::RefCell::new(NavHelperPerfFrame::default());
+}
+
+fn begin_nav_helper_perf_frame(active: bool) {
+    NAV_HELPER_PERF_FRAME.with(|frame| {
+        *frame.borrow_mut() = NavHelperPerfFrame {
+            active,
+            metrics: NavHelperPerfMetrics::default(),
+        };
+    });
+}
+
+fn finish_nav_helper_perf_frame() -> NavHelperPerfMetrics {
+    NAV_HELPER_PERF_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        frame.active = false;
+        std::mem::take(&mut frame.metrics)
+    })
+}
+
+fn measure_nav_helper_with<T>(
+    kind: NavHelperPerfKind,
+    mut now: impl FnMut() -> std::time::Instant,
+    measure: impl FnOnce() -> T,
+) -> T {
+    let started_at = NAV_HELPER_PERF_FRAME.with(|frame| frame.borrow().active.then(&mut now));
+    let result = measure();
+    if let Some(started_at) = started_at {
+        let elapsed_ms = now().saturating_duration_since(started_at).as_secs_f64() * 1000.0;
+        NAV_HELPER_PERF_FRAME.with(|frame| frame.borrow_mut().metrics.record(kind, elapsed_ms));
+    }
+    result
+}
+
+#[inline]
+pub(crate) fn measure_nav_helper<T>(kind: NavHelperPerfKind, measure: impl FnOnce() -> T) -> T {
+    measure_nav_helper_with(kind, std::time::Instant::now, measure)
+}
+
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdatePerfStage {
@@ -5615,6 +5693,7 @@ struct UpdatePerfRecorder {
     /// on the grid path, which fullscreen returns before reaching - so it fired once in a
     /// whole session. These carry the same numbers onto the event that does fire.
     fullscreen_split_ms: [f64; 4],
+    nav_helper_metrics: NavHelperPerfMetrics,
 }
 
 impl UpdatePerfRecorder {
@@ -5624,6 +5703,7 @@ impl UpdatePerfRecorder {
             last_mark_at: started_at,
             stage_ms: [0.0; UPDATE_PERF_STAGE_COUNT],
             fullscreen_split_ms: [0.0; 4],
+            nav_helper_metrics: NavHelperPerfMetrics::default(),
             next_stage: 0,
         }
     }
@@ -5664,6 +5744,7 @@ impl UpdatePerfRecorder {
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
             fullscreen_split_ms: self.fullscreen_split_ms,
+            nav_helper_metrics: self.nav_helper_metrics,
         }
     }
 }
@@ -5704,7 +5785,9 @@ fn mark_update_perf(recorder: &mut Option<UpdatePerfRecorder>, stage: UpdatePerf
 
 #[inline]
 fn finish_update_perf(recorder: &mut Option<UpdatePerfRecorder>, frame_number: u64) {
-    if let Some(recorder) = recorder.take() {
+    let nav_helper_metrics = finish_nav_helper_perf_frame();
+    if let Some(mut recorder) = recorder.take() {
+        recorder.nav_helper_metrics = nav_helper_metrics;
         let breakdown = recorder.finish();
         if breakdown.total_ms > 8.0 {
             breakdown.emit(frame_number);
@@ -5718,6 +5801,7 @@ struct UpdatePerfBreakdown {
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
     fullscreen_split_ms: [f64; 4],
+    nav_helper_metrics: NavHelperPerfMetrics,
 }
 
 impl UpdatePerfBreakdown {
@@ -5769,7 +5853,7 @@ impl UpdatePerfBreakdown {
     ];
 
     fn emit(&self, frame_number: u64) {
-        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT + 3);
+        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT + 11);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
         for (field, stage) in Self::EVENT_FIELDS {
@@ -5790,7 +5874,205 @@ impl UpdatePerfBreakdown {
         ] {
             extras.push((field, serde_json::Value::from(value)));
         }
+        extras.extend([
+            (
+                "still_image_display_indices_calls",
+                serde_json::Value::from(self.nav_helper_metrics.still_image_display_indices_calls),
+            ),
+            (
+                "still_image_display_indices_ms",
+                serde_json::Value::from(self.nav_helper_metrics.still_image_display_indices_ms),
+            ),
+            (
+                "get_nav_indices_calls",
+                serde_json::Value::from(self.nav_helper_metrics.get_nav_indices_calls),
+            ),
+            (
+                "get_nav_indices_ms",
+                serde_json::Value::from(self.nav_helper_metrics.get_nav_indices_ms),
+            ),
+        ]);
         crate::perf::event("ui", "update_breakdown", None, 0, &extras);
+    }
+}
+
+const POLL_PREFETCH_PERF_STAGE_COUNT: usize = 8;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollPrefetchPerfStage {
+    FsPendingDrain,
+    FsPendingPostprocess,
+    UploadBacklog,
+    BuildStaticFsCacheEntry,
+    ApplySyncAdjustment,
+    AutoApplySavedMask,
+    UpdatePrefetchWindow,
+    OtherPostprocessing,
+}
+
+impl PollPrefetchPerfStage {
+    #[cfg(test)]
+    const ALL: [Self; POLL_PREFETCH_PERF_STAGE_COUNT] = [
+        Self::FsPendingDrain,
+        Self::FsPendingPostprocess,
+        Self::UploadBacklog,
+        Self::BuildStaticFsCacheEntry,
+        Self::ApplySyncAdjustment,
+        Self::AutoApplySavedMask,
+        Self::UpdatePrefetchWindow,
+        Self::OtherPostprocessing,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollPrefetchOrigin {
+    TopLevel,
+    FullscreenViewport,
+}
+
+impl PollPrefetchOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLevel => "top_level",
+            Self::FullscreenViewport => "fullscreen_viewport",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PollPrefetchPerfRecorder {
+    origin: PollPrefetchOrigin,
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; POLL_PREFETCH_PERF_STAGE_COUNT],
+}
+
+impl PollPrefetchPerfRecorder {
+    fn new(origin: PollPrefetchOrigin, started_at: std::time::Instant) -> Self {
+        Self {
+            origin,
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; POLL_PREFETCH_PERF_STAGE_COUNT],
+        }
+    }
+
+    fn mark(&mut self, stage: PollPrefetchPerfStage) {
+        self.mark_at(stage, std::time::Instant::now());
+    }
+
+    fn mark_at(&mut self, stage: PollPrefetchPerfStage, now: std::time::Instant) {
+        self.stage_ms[stage as usize] +=
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+    }
+
+    fn finish(self) -> PollPrefetchPerfBreakdown {
+        self.finish_at(std::time::Instant::now())
+    }
+
+    fn finish_at(self, finished_at: std::time::Instant) -> PollPrefetchPerfBreakdown {
+        let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
+        let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        PollPrefetchPerfBreakdown {
+            origin: self.origin,
+            total_ms,
+            stage_ms: self.stage_ms,
+            unaccounted_ms: total_ms - accounted_ms,
+        }
+    }
+}
+
+#[inline]
+fn poll_prefetch_perf_start_with(
+    perf_on: bool,
+    origin: PollPrefetchOrigin,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<PollPrefetchPerfRecorder> {
+    perf_on
+        .then(now)
+        .map(|started_at| PollPrefetchPerfRecorder::new(origin, started_at))
+}
+
+#[inline]
+fn mark_poll_prefetch_perf(
+    recorder: &mut Option<PollPrefetchPerfRecorder>,
+    stage: PollPrefetchPerfStage,
+) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[inline]
+fn finish_poll_prefetch_perf(
+    recorder: &mut Option<PollPrefetchPerfRecorder>,
+    frame_number: u64,
+    input_seq: u64,
+) {
+    if let Some(recorder) = recorder.take() {
+        let breakdown = recorder.finish();
+        if breakdown.total_ms > 8.0 {
+            breakdown.emit(frame_number, input_seq);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PollPrefetchPerfBreakdown {
+    origin: PollPrefetchOrigin,
+    total_ms: f64,
+    stage_ms: [f64; POLL_PREFETCH_PERF_STAGE_COUNT],
+    unaccounted_ms: f64,
+}
+
+impl PollPrefetchPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, PollPrefetchPerfStage); POLL_PREFETCH_PERF_STAGE_COUNT] = [
+        ("fs_pending_drain_ms", PollPrefetchPerfStage::FsPendingDrain),
+        (
+            "fs_pending_postprocess_ms",
+            PollPrefetchPerfStage::FsPendingPostprocess,
+        ),
+        ("upload_backlog_ms", PollPrefetchPerfStage::UploadBacklog),
+        (
+            "build_static_fs_cache_entry_ms",
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        ),
+        (
+            "apply_sync_adjustment_ms",
+            PollPrefetchPerfStage::ApplySyncAdjustment,
+        ),
+        (
+            "auto_apply_saved_mask_ms",
+            PollPrefetchPerfStage::AutoApplySavedMask,
+        ),
+        (
+            "update_prefetch_window_ms",
+            PollPrefetchPerfStage::UpdatePrefetchWindow,
+        ),
+        (
+            "other_postprocessing_ms",
+            PollPrefetchPerfStage::OtherPostprocessing,
+        ),
+    ];
+
+    fn emit(&self, frame_number: u64, input_seq: u64) {
+        let mut extras = Vec::with_capacity(POLL_PREFETCH_PERF_STAGE_COUNT + 4);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("caller", serde_json::Value::from(self.origin.as_str())));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        for (field, stage) in Self::EVENT_FIELDS {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+        }
+        extras.push((
+            "unaccounted_ms",
+            serde_json::Value::from(self.unaccounted_ms),
+        ));
+        crate::perf::event("ui", "poll_prefetch_breakdown", None, input_seq, &extras);
     }
 }
 
@@ -41624,7 +41906,7 @@ impl App {
                 let _ = app.poll_detached_physical_folder_open(ctx);
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
-                app.poll_prefetch(ctx);
+                app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
                 // Thumbnail results belong to the context whose worker generation and rx
                 // produced them. Consume them while that detached owner is mounted so image
                 // pixels can become pass-through renditions without leaking state into the main
@@ -65271,7 +65553,8 @@ impl App {
         source_dims: [usize; 2],
         load_seq: u64,
         perf_key_str: Option<String>,
-        upload_t0: std::time::Instant,
+        upload_t0: Option<std::time::Instant>,
+        prefetch_perf: &mut Option<PollPrefetchPerfRecorder>,
         result_kind: &'static str,
         store_retained_pdf_page_raster: bool,
         animation: StaticAnimationState,
@@ -65281,15 +65564,20 @@ impl App {
         }
         let upload = clamp_for_gpu(&pixels);
         let [w, h] = pixels.size;
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
         let handle = ctx.load_texture(
             format!("fs_{key}"),
             upload.into_owned(),
             DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
-        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+        let upload_ms = upload_t0.map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0);
+        mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
         // `load_seq` を使うのは、decode 中に別操作が入っても
         // ready が load_begin と同じシーケンスに紐づくようにするため。
-        if crate::perf::is_enabled() {
+        if let Some(upload_ms) = upload_ms {
             crate::perf::event(
                 "fs",
                 "ready",
@@ -65304,19 +65592,29 @@ impl App {
                 ],
             );
         }
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
         // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
         // 先読み分は表示に入った時点で final pipeline
         // (ensure_final_composite_texture) が処理する。
         if self.fullscreen_idx == Some(key) && animation == StaticAnimationState::Still {
             self.apply_sync_adjustment(ctx, key, &pixels);
+            mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::ApplySyncAdjustment);
         }
-        FsCacheEntry::Static {
+        let entry = FsCacheEntry::Static {
             tex: handle,
             pixels,
             source_dims: Some(source_dims),
             load_seq,
             animation,
-        }
+        };
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
+        entry
     }
 
     /// cache 済み edit result 画素から、許容値に依存しない近モノクロ要約を少しずつ作る。
@@ -65598,7 +65896,12 @@ impl App {
     /// 現在の typed navigation target に属する完成済み result は page-turn suppression 中も
     /// upload し、それ以外の先読みは sequence settle 後まで backlog に保持する。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
-    pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context, origin: PollPrefetchOrigin) {
+        let mut prefetch_perf = poll_prefetch_perf_start_with(
+            crate::perf::is_enabled(),
+            origin,
+            std::time::Instant::now,
+        );
         // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
         // native 解像度判明後の AI 用 native 再レンダは、AI 設定変更も合わせて拾うため
         // `App::update` の `maybe_native_rerender_pdf_for_ai` (sync_upscale_from_preset 直後)
@@ -65629,6 +65932,10 @@ impl App {
         let mut disconnected: Vec<(usize, FsLoadPurpose)> = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
         let mut animation_expansion_updates: Vec<(usize, std::time::Instant, u64)> = Vec::new();
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::OtherPostprocessing,
+        );
         for (&key, items_generation, pending) in self.fs_pending.iter_with_generation() {
             let mut animation_expansion_started_at = pending.animation_expansion_started_at;
             loop {
@@ -65669,6 +65976,7 @@ impl App {
                 }
             }
         }
+        mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::FsPendingDrain);
         let early_dims_repaint = !early_dims_updates.is_empty();
         for (key, dims, items_generation) in early_dims_updates {
             self.fs_early_dims
@@ -65749,6 +66057,10 @@ impl App {
                 animation_expansion_started_at,
             );
         }
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::FsPendingPostprocess,
+        );
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
@@ -65807,6 +66119,7 @@ impl App {
             || early_dims_repaint
             || animation_expansion_repaint
             || has_more_admitted_backlog;
+        mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
         for (items_generation, upload) in to_process {
             let FsUploadResult {
                 idx: key,
@@ -65836,7 +66149,7 @@ impl App {
             // 実害はないが HashMap が膨張しないようクリーンアップする)
             self.fs_early_dims.remove(&key);
             let perf_key_str = self.perf_item_key(key);
-            let upload_t0 = std::time::Instant::now();
+            let upload_t0 = prefetch_perf.as_ref().map(|_| std::time::Instant::now());
             // static source の差し替えでは、この後の `apply_sync_adjustment` が旧世代の
             // final composite を破棄し得る。PDF Z ズーム再描画の完成表示を失わないよう、
             // raw upload / 同期補正より前に display-only holdover を確保する。
@@ -65848,6 +66161,7 @@ impl App {
             ) {
                 self.capture_final_effect_source_reload_holdover(key);
             }
+            mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
             let entry = match result {
                 FsLoadResult::Static {
                     ci,
@@ -65863,6 +66177,7 @@ impl App {
                         load_seq,
                         perf_key_str.clone(),
                         upload_t0,
+                        &mut prefetch_perf,
                         "static",
                         true,
                         animation,
@@ -65879,6 +66194,7 @@ impl App {
                     load_seq,
                     perf_key_str.clone(),
                     upload_t0,
+                    &mut prefetch_perf,
                     "static_cached",
                     false,
                     StaticAnimationState::Still,
@@ -65936,10 +66252,15 @@ impl App {
                         upload.into_owned(),
                         DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     );
-                    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    let upload_ms =
+                        upload_t0.map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0);
+                    mark_poll_prefetch_perf(
+                        &mut prefetch_perf,
+                        PollPrefetchPerfStage::UploadBacklog,
+                    );
                     let (full_w, full_h) = high_res.dims();
                     let source_pixels = (full_w as u64) * (full_h as u64);
-                    if crate::perf::is_enabled() {
+                    if let Some(upload_ms) = upload_ms {
                         crate::perf::event(
                             "fs",
                             "ready",
@@ -65978,8 +66299,16 @@ impl App {
                         };
                         self.pano_quality_state.insert(source_key, state);
                     }
+                    mark_poll_prefetch_perf(
+                        &mut prefetch_perf,
+                        PollPrefetchPerfStage::UploadBacklog,
+                    );
                     if self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels);
+                        mark_poll_prefetch_perf(
+                            &mut prefetch_perf,
+                            PollPrefetchPerfStage::ApplySyncAdjustment,
+                        );
                     }
                     FsCacheEntry::Static {
                         tex: handle,
@@ -65994,6 +66323,7 @@ impl App {
                     unreachable!("non-terminal fs load result reached completion match")
                 }
             };
+            mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
             self.fs_cache
                 .insert_for_generation(key, items_generation, entry);
             self.record_fs_cache_page_dims_for_spread(key);
@@ -66005,8 +66335,16 @@ impl App {
             // NeedsUserConfirmation を立てる。SettleReady の小さい候補は worker tee
             // 経路 (StaticPanorama) で処理されるので、ここに到達するのは tee 不採用ケース。
             self.maybe_update_pano_quality_state_from_static(key);
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::OtherPostprocessing,
+            );
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::AutoApplySavedMask,
+            );
             if self.fullscreen_idx == Some(key) {
                 // 連結表示の keep/prefetch 範囲は viewport 上の可視ページから
                 // ui_fullscreen 側で毎フレーム計算する。ここで通常の前後ページ window を
@@ -66014,12 +66352,20 @@ impl App {
                 if self.reading_flow.is_paged() {
                     self.update_prefetch_window(key);
                 }
+                mark_poll_prefetch_perf(
+                    &mut prefetch_perf,
+                    PollPrefetchPerfStage::UpdatePrefetchWindow,
+                );
                 // 360 候補のトースト補完 (Codex P3 第 19 ラウンド):
                 // ChatGPT 生成画像のような XMP なし 2:1 画像は、`fs_cache.source_dims`
                 // が確定して初めて aspect 判定可能になる。`open_fullscreen` 時点で
                 // 未確定だったケースを fs_cache 完了時にここで救う。
                 self.maybe_show_panorama_hint_toast(key);
             }
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::OtherPostprocessing,
+            );
         }
         if repaint {
             ctx.request_repaint();
@@ -66027,6 +66373,11 @@ impl App {
         if self.reconcile_colorize_mono_summaries() == COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME {
             ctx.request_repaint();
         }
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::OtherPostprocessing,
+        );
+        finish_poll_prefetch_perf(&mut prefetch_perf, self.frame_counter, self.input_seq);
     }
 
     fn update_reading_history_media_progress(
@@ -67812,6 +68163,7 @@ impl App {
     fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_perf_on = crate::perf::is_enabled();
         let mut update_perf = update_perf_start_with(update_perf_on, std::time::Instant::now);
+        begin_nav_helper_perf_frame(update_perf_on);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
@@ -68433,7 +68785,7 @@ impl App {
         // スクロールすると新しく入ってきた idx 分が少しずつキューに積まれる。
         self.enqueue_visible_tag_prewarms();
 
-        self.poll_prefetch(ctx);
+        self.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
         mark_update_perf(&mut update_perf, UpdatePerfStage::PrefetchPoll);
         self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);

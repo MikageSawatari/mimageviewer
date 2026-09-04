@@ -1430,18 +1430,23 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 /// 呼び出し側で raw item index 順を組み直さず、フィルタ・詳細ソート適用後の
 /// `display_order` をそのまま共有すること。
 pub fn still_image_display_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
-    display_order
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect()
+    crate::app::measure_nav_helper(
+        crate::app::NavHelperPerfKind::StillImageDisplayIndices,
+        || {
+            display_order
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    matches!(
+                        items.get(i),
+                        Some(GridItem::Image(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                    )
+                })
+                .collect()
+        },
+    )
 }
 
 fn adjacent_idx_in_order(nav_indices: &[usize], current: usize, delta: i32) -> Option<usize> {
