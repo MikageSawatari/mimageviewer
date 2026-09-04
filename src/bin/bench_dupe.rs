@@ -12,6 +12,7 @@ use std::time::Instant;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage, Rgba, RgbaImage};
 use mimageviewer::dupe::{self, Algo, LumaMetrics, Proxy, Sig, Signature};
 use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
+use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
 use mimageviewer::thumb_loader::{
     DctDecodeError, apply_exif_orientation, apply_exif_orientation_from_bytes,
     decode_jpeg_turbo_scaled_from_bytes,
@@ -219,6 +220,12 @@ struct PreparedScan {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == pdf_loader::PDF_WORKER_ARG) {
+        mimageviewer::data_dir::init();
+        pdf_loader::run_worker_process();
+        return;
+    }
+
     if let Err(error) = run() {
         eprintln!("bench_dupe: {error}");
         std::process::exit(1);
@@ -233,6 +240,7 @@ fn run() -> Result<()> {
     let rest: Vec<String> = args.collect();
     match command.as_str() {
         "scan" => run_scan(&rest),
+        "pdf-selfcheck" => run_pdf_selfcheck(&rest),
         "pairs" => run_pairs(&rest),
         "synth" => run_synth(&rest),
         "report" => run_report(&rest),
@@ -247,6 +255,8 @@ fn run() -> Result<()> {
 fn usage() -> String {
     format!(
         "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE\n  \
+         bench_dupe pdf-selfcheck --dir DIR [--recursive] --out FILE \
+         [--limit-books N] [--max-pages-per-book N]\n  \
          bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
          bench_dupe synth --dir DIR --out FILE [--recursive] [--limit N] \
          [--large-diff-threshold-bin N]\n  \
@@ -346,6 +356,148 @@ fn stride_sample(paths: Vec<PathBuf>, limit: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+fn stride_sample_page_numbers(page_numbers: Vec<u32>, limit: usize) -> Vec<u32> {
+    if limit == 0 || page_numbers.len() <= limit {
+        return page_numbers;
+    }
+    let total = page_numbers.len();
+    (0..limit)
+        .map(|slot| page_numbers[slot * total / limit])
+        .collect()
+}
+
+#[derive(Default)]
+struct PdfSelfcheckStats {
+    selected_books: usize,
+    measured_books: usize,
+    measured_pages: usize,
+    password_required_books: usize,
+    zero_page_books: usize,
+    failed_books: usize,
+    failed_pages: usize,
+    records: usize,
+}
+
+struct RenderedPageSignatures {
+    rgba: RgbaImage,
+    dims: (u32, u32),
+    signatures: PreparedSignatures,
+}
+
+fn run_pdf_selfcheck(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut limit_books = None;
+    let mut max_pages_per_book = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--limit-books" => {
+                limit_books = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            "--max-pages-per-book" => {
+                max_pages_per_book = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            _ => return Err(format!("unknown pdf-selfcheck option {flag:?}")),
+        }
+        index += 1;
+    }
+
+    let dir = dir.ok_or_else(|| "pdf-selfcheck requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "pdf-selfcheck requires --out".to_owned())?;
+    let mut paths = collect_pdf_paths(&dir, recursive)?;
+    if let Some(limit) = limit_books {
+        paths = stride_sample(paths, limit);
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut stats = PdfSelfcheckStats {
+        selected_books: paths.len(),
+        ..PdfSelfcheckStats::default()
+    };
+
+    for path in paths {
+        let entries = match pdf_loader::enumerate_pages(&path, None) {
+            Ok(entries) => entries,
+            Err(error) if pdf_password_required(&error) => {
+                stats.password_required_books += 1;
+                eprintln!(
+                    "pdf-selfcheck: skip password-required PDF {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                stats.failed_books += 1;
+                eprintln!(
+                    "pdf-selfcheck: skip unreadable PDF {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if entries.is_empty() {
+            stats.zero_page_books += 1;
+            eprintln!("pdf-selfcheck: skip zero-page PDF {}", path.display());
+            continue;
+        }
+
+        let page_numbers = entries
+            .into_iter()
+            .map(|entry| entry.page_num)
+            .collect::<Vec<_>>();
+        let page_numbers = max_pages_per_book
+            .map(|limit| stride_sample_page_numbers(page_numbers.clone(), limit))
+            .unwrap_or(page_numbers);
+        let mut measured_this_book = false;
+        for page_num in page_numbers {
+            match selfcheck_pdf_page(&mut writer, &path, page_num) {
+                Ok(record_count) => {
+                    measured_this_book = true;
+                    stats.measured_pages += 1;
+                    stats.records += record_count;
+                }
+                Err(error) => {
+                    stats.failed_pages += 1;
+                    eprintln!(
+                        "pdf-selfcheck: skip page {} of {}: {error}",
+                        page_num + 1,
+                        path.display()
+                    );
+                }
+            }
+        }
+        if measured_this_book {
+            stats.measured_books += 1;
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!(
+        "pdf-selfcheck: selected_books={} measured_books={} measured_pages={} \
+         password_required_books={} zero_page_books={} failed_books={} failed_pages={} records={} out={}",
+        stats.selected_books,
+        stats.measured_books,
+        stats.measured_pages,
+        stats.password_required_books,
+        stats.zero_page_books,
+        stats.failed_books,
+        stats.failed_pages,
+        stats.records,
+        output.display()
+    );
+    Ok(())
+}
+
 fn collect_image_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -373,6 +525,39 @@ fn collect_image_paths_inner(dir: &Path, recursive: bool, paths: &mut Vec<PathBu
                 collect_image_paths_inner(&path, true, paths)?;
             }
         } else if file_type.is_file() && is_supported_image(&path) && !is_apple_double(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_pdf_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
+    }
+    let mut paths = Vec::new();
+    collect_pdf_paths_inner(dir, recursive, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_pdf_paths_inner(dir: &Path, recursive: bool, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("read directory {}: {error}", dir.display()))?;
+    let mut entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("read directory entry in {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("read file type {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if recursive {
+                collect_pdf_paths_inner(&path, true, paths)?;
+            }
+        } else if file_type.is_file() && extension_lower(&path) == "pdf" {
             paths.push(path);
         }
     }
@@ -490,6 +675,88 @@ fn decode_for_scan(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
         scale_den: 1,
         note: (note != "direct decode").then_some(note),
     })
+}
+
+fn selfcheck_pdf_page<W: Write>(writer: &mut W, path: &Path, page_num: u32) -> Result<usize> {
+    let render_512 = render_pdf_page_signatures(path, page_num, 512)?;
+    let render_1024 = render_pdf_page_signatures(path, page_num, 1024)?;
+    let render_2048 = render_pdf_page_signatures(path, page_num, 2048)?;
+    let jpeg_bytes = encode_jpeg(&render_1024.rgba, 95)?;
+    let jpeg_decoded = decode_for_scan(Path::new("pdf-selfcheck.jpg"), &jpeg_bytes)?;
+    let jpeg_dims = jpeg_decoded.source_dims;
+    let jpeg_signatures = signatures_from_rgba(&jpeg_decoded.rgba, jpeg_dims);
+    let source_path = PathBuf::from(format!("{}::page_{}", path.display(), page_num));
+    let mut records = 0;
+
+    for (transformation, left, right) in [
+        ("pdf_render_512_vs_1024", &render_512, &render_1024),
+        ("pdf_render_1024_vs_2048", &render_1024, &render_2048),
+        ("pdf_render_512_vs_2048", &render_512, &render_2048),
+    ] {
+        records += write_synth_comparison(
+            writer,
+            "related",
+            transformation,
+            &source_path,
+            None,
+            left.dims,
+            right.dims,
+            &left.signatures,
+            &right.signatures,
+            DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+        )?;
+    }
+
+    records += write_synth_comparison(
+        writer,
+        "related",
+        "pdf_render_1024_vs_jpeg_q95_scan_path",
+        &source_path,
+        None,
+        render_1024.dims,
+        jpeg_dims,
+        &render_1024.signatures,
+        &jpeg_signatures,
+        DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+    )?;
+    Ok(records)
+}
+
+fn render_pdf_page_signatures(
+    path: &Path,
+    page_num: u32,
+    long_edge: u32,
+) -> Result<RenderedPageSignatures> {
+    let rendered = pdf_loader::render_page(
+        path,
+        page_num,
+        long_edge,
+        None,
+        None,
+        JobPriority::Normal,
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )
+    .map_err(|error| {
+        format!(
+            "render {} page {} at long edge {long_edge}: {error}",
+            path.display(),
+            page_num + 1
+        )
+    })?;
+    let rgba = rendered.image.to_rgba8();
+    let dims = rgba.dimensions();
+    let signatures = signatures_from_rgba(&rgba, dims);
+    Ok(RenderedPageSignatures {
+        rgba,
+        dims,
+        signatures,
+    })
+}
+
+fn pdf_password_required(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.to_string().to_ascii_lowercase().contains("password")
 }
 
 fn decode_full(path: &Path, bytes: &[u8]) -> Result<(DynamicImage, String, String)> {
@@ -1216,7 +1483,7 @@ fn scale_percent(source: &RgbaImage, percent: u32) -> RgbaImage {
     image::imageops::resize(source, width, height, image::imageops::FilterType::Lanczos3)
 }
 
-fn jpeg_round_trip(source: &RgbaImage, quality: u8) -> Result<RgbaImage> {
+fn encode_jpeg(source: &RgbaImage, quality: u8) -> Result<Vec<u8>> {
     let mut rgb = RgbImage::new(source.width(), source.height());
     for (target, pixel) in rgb.pixels_mut().zip(source.pixels()) {
         let alpha = pixel[3] as u16;
@@ -1231,6 +1498,11 @@ fn jpeg_round_trip(source: &RgbaImage, quality: u8) -> Result<RgbaImage> {
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
         .encode_image(&DynamicImage::ImageRgb8(rgb))
         .map_err(|error| format!("encode synthetic JPEG q={quality}: {error}"))?;
+    Ok(encoded)
+}
+
+fn jpeg_round_trip(source: &RgbaImage, quality: u8) -> Result<RgbaImage> {
+    let encoded = encode_jpeg(source, quality)?;
     image::load_from_memory(&encoded)
         .map(|image| image.to_rgba8())
         .map_err(|error| format!("decode synthetic JPEG q={quality}: {error}"))
