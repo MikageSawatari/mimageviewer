@@ -1,8 +1,9 @@
 ﻿# 動画シークバー近傍のストリップ (サムネイル列 ⇄ 音声波形)
 
-backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) と
-[§1.113](next-release-backlog.md) (音声波形への切替) の**共通の正本**。2 件は 1 つの UI の
-モード切替として設計する。着手の経緯とレーン運用は
+backlog §1.102 (YouTube 型のサムネイル列) と §1.113 (音声波形への切替) の**共通の正本**。
+2 件は 1 つの UI のモード切替として設計する。**どちらも完了・出荷済みで、backlog からは
+削除した** (2026-09-04)。着手できない残り 2 点だけを [backlog-on-hold.md](backlog-on-hold.md)
+§1.102 に置いてある。着手の経緯とレーン運用は
 [briefs/session-lane-b-video-strip.md](briefs/session-lane-b-video-strip.md) と
 [next-cycle-work-lanes.md](next-cycle-work-lanes.md)。
 
