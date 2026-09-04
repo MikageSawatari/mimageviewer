@@ -13037,6 +13037,14 @@ pub struct App {
     /// Previous `App::update` frame boundary. Used by perf diagnostics to
     /// catch stalls that happen before the next Rust frame begins.
     pub(crate) perf_last_frame_begin: Option<std::time::Instant>,
+    /// Splits a frame into the part we run and the part eframe runs around it.
+    ///
+    /// Frame-to-frame spacing alone cannot say whether a stall is our own work or the
+    /// render and present that follow it, and on 2026-09-04 that ambiguity cost three
+    /// wrong guesses. These two carry the previous frame's split onto the next
+    /// `frame.begin`, which is the first moment both halves are known.
+    perf_prev_update_ms: Option<f64>,
+    perf_last_update_end: Option<std::time::Instant>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
     /// 全 GPU テクスチャ会計を約 1 秒に 1 回へ間引く perf-log 専用時刻。
@@ -14884,6 +14892,8 @@ impl App {
             colorize_mono_summary_last_reconcile_frame: u64::MAX,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
+            perf_prev_update_ms: None,
+            perf_last_update_end: None,
             last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
@@ -67902,12 +67912,23 @@ impl App {
                 }
             }
             self.perf_last_frame_begin = Some(frame_begin_now);
+            let prev_update_ms = self.perf_prev_update_ms.unwrap_or(0.0);
+            let prev_outside_ms = self
+                .perf_last_update_end
+                .map(|end| frame_begin_now.saturating_duration_since(end).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
             crate::perf::event(
                 "frame",
                 "begin",
                 None,
                 self.input_seq,
-                &[("n", serde_json::Value::from(self.frame_counter))],
+                &[
+                    ("n", serde_json::Value::from(self.frame_counter)),
+                    // The previous frame, split: what App::update spent, and what eframe
+                    // spent rendering and presenting after it returned.
+                    ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
+                    ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
+                ],
             );
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
             // `total_ms` に main() 入口からの累計経過を載せる。creator_exit との差分が
@@ -70061,6 +70082,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         self.update_frame(ctx, frame);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
@@ -70072,6 +70094,12 @@ impl eframe::App for App {
         {
             self.show_external_tool_modals(ctx);
             self.authorize_external_tool_launch_boundaries_after_ui();
+        }
+        if let Some(t0) = update_t0 {
+            let end = std::time::Instant::now();
+            self.perf_prev_update_ms =
+                Some(end.saturating_duration_since(t0).as_secs_f64() * 1000.0);
+            self.perf_last_update_end = Some(end);
         }
     }
 
