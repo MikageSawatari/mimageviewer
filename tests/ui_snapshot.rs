@@ -304,6 +304,28 @@ fn preferences_video_thumbnail_indicator_dark() {
 }
 
 #[test]
+fn metadata_panel_information_tab_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_information_tab_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 260.0),
+        None,
+        |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
+fn metadata_panel_similar_results_dark() {
+    snapshot_with_theme_at_size(
+        "metadata_panel_similar_results_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(400.0, 390.0),
+        None,
+        |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
 fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
     snapshot_with_theme_at_size(
         "video_thumbnail_indicator_modes_and_dense_badges_dark",

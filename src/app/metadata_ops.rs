@@ -55,7 +55,7 @@ pub(super) fn format_details_duration(secs: f64) -> String {
 }
 
 #[cfg(windows)]
-pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -96,7 +96,7 @@ pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String 
 }
 
 #[cfg(not(windows))]
-pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
     if secs <= 0 {
         String::new()
     } else {

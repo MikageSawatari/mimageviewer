@@ -12,7 +12,8 @@ use image::GenericImageView;
 
 use crate::dupe::{self, Algo, Sig};
 use crate::similar_db::{
-    ContainerKind, Freshness, ItemKind, SearchRow, SimilarDb, StoredItem, current_hash_version,
+    CompletedIndexStats, ContainerKind, Freshness, ItemKind, SearchRow, SimilarDb, StoredItem,
+    current_hash_version,
 };
 use crate::similar_image::{
     PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
@@ -82,15 +83,55 @@ pub struct QueryHit {
     pub page_index: Option<u32>,
     pub distance: u32,
     pub band: MatchBand,
+    pub mtime: i64,
+    pub file_size: i64,
+    pub width: u32,
+    pub height: u32,
+    pub format: SimilarImageFormat,
+    pub origin_width: u32,
+    pub origin_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ItemQuery {
+    NoIndex,
     Preparing,
     Ready(Vec<QueryHit>),
     Featureless,
     NotIndexed,
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexSummary {
+    pub completed_at_unix_secs: i64,
+    pub registered_items: u64,
+    pub password_required_pdfs: u64,
+    pub corrupt_containers: u64,
+    pub zero_page_containers: u64,
+    pub decode_failures: u64,
+    pub io_failures: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexSummaryStatus {
+    NoIndex,
+    Preparing,
+    Ready(IndexSummary),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SimilarItemTarget {
+    File(PathBuf),
+    ZipPage {
+        zip_path: PathBuf,
+        entry_name: String,
+    },
+    PdfPage {
+        pdf_path: PathBuf,
+        page_num: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +161,7 @@ pub struct SimilarIndexManager {
     cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     memory: Arc<Mutex<MemoryState>>,
+    summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
     book_query: Arc<Mutex<BookQueryState>>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
@@ -134,6 +176,7 @@ impl SimilarIndexManager {
             cancel: Arc::new(Mutex::new(None)),
             worker: Mutex::new(None),
             memory: Arc::new(Mutex::new(MemoryState::Unloaded)),
+            summary: Arc::new(Mutex::new(SummaryState::Unloaded)),
             memory_epoch: Arc::new(AtomicU64::new(0)),
             book_query: Arc::new(Mutex::new(BookQueryState::Idle)),
             prefill_db: Arc::new(Mutex::new(None)),
@@ -170,6 +213,7 @@ impl SimilarIndexManager {
         let db_path = SimilarDb::db_path_at(&self.data_dir);
         let progress = Arc::clone(&self.progress);
         let memory = Arc::clone(&self.memory);
+        let summary = Arc::clone(&self.summary);
         let memory_epoch = Arc::clone(&self.memory_epoch);
         let book_query = Arc::clone(&self.book_query);
         let prefill_db = Arc::clone(&self.prefill_db);
@@ -199,6 +243,7 @@ impl SimilarIndexManager {
             };
             memory_epoch.fetch_add(1, Ordering::AcqRel);
             *memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Unloaded;
+            *summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
             *book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
             *progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
         }));
@@ -233,9 +278,53 @@ impl SimilarIndexManager {
                 self.start_memory_load(&mut state);
                 ItemQuery::Preparing
             }
+            MemoryState::Missing => ItemQuery::NoIndex,
             MemoryState::Loading => ItemQuery::Preparing,
             MemoryState::Failed(error) => ItemQuery::Failed(error.clone()),
             MemoryState::Ready(index) => query_item_ready(index, item_key),
+        }
+    }
+
+    /// 設定画面用の軽量集計。署名本体は読まず、DB I/O は専用 worker で行う。
+    pub fn summary(&self) -> IndexSummaryStatus {
+        if matches!(self.progress(), IndexProgress::Running(_)) {
+            return IndexSummaryStatus::Preparing;
+        }
+        let mut state = self.summary.lock().unwrap_or_else(|e| e.into_inner());
+        match &*state {
+            SummaryState::Unloaded => {
+                *state = SummaryState::Loading;
+                let db_path = SimilarDb::db_path_at(&self.data_dir);
+                let state = Arc::clone(&self.summary);
+                std::thread::spawn(move || {
+                    let loaded = if !db_path.is_file() {
+                        Ok(None)
+                    } else {
+                        SimilarDb::open_at(&db_path)
+                            .and_then(|db| db.load_index_summary(current_hash_version()))
+                    };
+                    *state.lock().unwrap_or_else(|e| e.into_inner()) = match loaded {
+                        Ok(Some(summary)) => SummaryState::Ready(IndexSummary {
+                            completed_at_unix_secs: summary.completed_at_unix_secs,
+                            registered_items: summary.registered_items,
+                            password_required_pdfs: summary.stats.password_required_pdfs,
+                            corrupt_containers: summary.stats.corrupt_containers,
+                            zero_page_containers: summary.stats.zero_page_containers,
+                            decode_failures: summary.stats.decode_failures,
+                            io_failures: summary.stats.io_failures,
+                        }),
+                        Ok(None) => SummaryState::Missing,
+                        Err(error) => SummaryState::Failed(format!(
+                            "similar index summary load failed: {error}"
+                        )),
+                    };
+                });
+                IndexSummaryStatus::Preparing
+            }
+            SummaryState::Loading => IndexSummaryStatus::Preparing,
+            SummaryState::Missing => IndexSummaryStatus::NoIndex,
+            SummaryState::Ready(summary) => IndexSummaryStatus::Ready(*summary),
+            SummaryState::Failed(error) => IndexSummaryStatus::Failed(error.clone()),
         }
     }
 
@@ -249,6 +338,7 @@ impl SimilarIndexManager {
                 self.start_memory_load(&mut memory);
                 return BookQuery::Preparing;
             }
+            MemoryState::Missing => return BookQuery::NotIndexed,
             MemoryState::Loading => return BookQuery::Preparing,
             MemoryState::Failed(error) => return BookQuery::Failed(error.clone()),
             MemoryState::Ready(index) => Arc::clone(index),
@@ -298,16 +388,23 @@ impl SimilarIndexManager {
         let epoch = self.memory_epoch.load(Ordering::Acquire);
         let epoch_guard = Arc::clone(&self.memory_epoch);
         std::thread::spawn(move || {
-            let loaded = SimilarDb::open_at(&db_path)
-                .and_then(|db| db.load_search_rows(current_hash_version()))
-                .map(MemoryIndex::from_rows)
-                .map(Arc::new)
-                .map_err(|error| format!("similar index load failed: {error}"));
+            let loaded = if !db_path.is_file() {
+                Ok(None)
+            } else {
+                SimilarDb::open_at(&db_path).and_then(|db| {
+                    db.load_search_rows(current_hash_version())
+                        .map(MemoryIndex::from_rows)
+                        .map(Arc::new)
+                        .map(Some)
+                })
+            }
+            .map_err(|error| format!("similar index load failed: {error}"));
             if epoch_guard.load(Ordering::Acquire) != epoch {
                 return;
             }
             *state.lock().unwrap_or_else(|e| e.into_inner()) = match loaded {
-                Ok(index) => MemoryState::Ready(index),
+                Ok(Some(index)) => MemoryState::Ready(index),
+                Ok(None) => MemoryState::Missing,
                 Err(error) => MemoryState::Failed(error),
             };
         });
@@ -323,7 +420,16 @@ impl Drop for SimilarIndexManager {
 enum MemoryState {
     Unloaded,
     Loading,
+    Missing,
     Ready(Arc<MemoryIndex>),
+    Failed(String),
+}
+
+enum SummaryState {
+    Unloaded,
+    Loading,
+    Missing,
+    Ready(IndexSummary),
     Failed(String),
 }
 
@@ -383,9 +489,9 @@ fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
             continue;
         }
         let distance = hamming256(&origin.pdq256, signature);
-        if distance > OTHER_VERSION_MAX_DISTANCE {
+        let Some(band) = match_band(distance) else {
             continue;
-        }
+        };
         let item = &index.rows[row_id];
         hits.push(QueryHit {
             row_id: *row_id,
@@ -394,11 +500,14 @@ fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
             container_key: item.container_key.clone(),
             page_index: item.page_index,
             distance,
-            band: if distance <= NEARLY_IDENTICAL_MAX_DISTANCE {
-                MatchBand::NearlyIdentical
-            } else {
-                MatchBand::OtherVersion
-            },
+            band,
+            mtime: item.mtime,
+            file_size: item.file_size,
+            width: item.width,
+            height: item.height,
+            format: SimilarImageFormat::from_i64(item.format),
+            origin_width: origin.width,
+            origin_height: origin.height,
         });
     }
     hits.sort_by(|left, right| {
@@ -407,6 +516,38 @@ fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
             .then_with(|| left.item_key.cmp(&right.item_key))
     });
     ItemQuery::Ready(hits)
+}
+
+pub const fn match_band(distance: u32) -> Option<MatchBand> {
+    if distance <= NEARLY_IDENTICAL_MAX_DISTANCE {
+        Some(MatchBand::NearlyIdentical)
+    } else if distance <= OTHER_VERSION_MAX_DISTANCE {
+        Some(MatchBand::OtherVersion)
+    } else {
+        None
+    }
+}
+
+pub fn target_for_hit(hit: &QueryHit) -> Option<SimilarItemTarget> {
+    match hit.kind {
+        ItemKind::Image => Some(SimilarItemTarget::File(PathBuf::from(&hit.item_key))),
+        ItemKind::ZipPage => {
+            let (zip_path, entry_name) =
+                hit.item_key.split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
+            Some(SimilarItemTarget::ZipPage {
+                zip_path: PathBuf::from(zip_path),
+                entry_name: entry_name.to_owned(),
+            })
+        }
+        ItemKind::PdfPage => {
+            let (pdf_path, page) = hit.item_key.split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
+            let page_num = page.strip_prefix("pdf:")?.parse().ok()?;
+            Some(SimilarItemTarget::PdfPage {
+                pdf_path: PathBuf::from(pdf_path),
+                page_num,
+            })
+        }
+    }
 }
 
 fn query_book_ready(index: &MemoryIndex, item_key: &str) -> BookQuery {
@@ -626,6 +767,22 @@ fn run_index_job(
             .map_err(|error| format!("stale row prune failed: {error}"))? as u64;
     }
     publish_report(progress, &context.report);
+    let completed_at_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    db.record_completed_index(
+        current_hash_version(),
+        completed_at_unix_secs,
+        CompletedIndexStats {
+            password_required_pdfs: context.report.password_required_pdfs,
+            corrupt_containers: context.report.corrupt_containers,
+            zero_page_containers: context.report.zero_page_containers,
+            decode_failures: context.report.decode_failures,
+            io_failures: context.report.io_failures,
+        },
+    )
+    .map_err(|error| format!("index summary publish failed: {error}"))?;
     Ok(context.report)
 }
 
@@ -1655,6 +1812,15 @@ mod tests {
         assert_eq!(hits[0].distance, 8);
         assert_eq!(hits[1].band, MatchBand::OtherVersion);
         assert_eq!(hits[1].distance, 16);
+    }
+
+    #[test]
+    fn measured_band_boundaries_are_exact() {
+        assert_eq!(match_band(0), Some(MatchBand::NearlyIdentical));
+        assert_eq!(match_band(8), Some(MatchBand::NearlyIdentical));
+        assert_eq!(match_band(9), Some(MatchBand::OtherVersion));
+        assert_eq!(match_band(48), Some(MatchBand::OtherVersion));
+        assert_eq!(match_band(49), None);
     }
 
     #[test]

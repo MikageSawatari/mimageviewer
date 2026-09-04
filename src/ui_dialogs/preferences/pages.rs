@@ -6785,6 +6785,157 @@ pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn page_similar_index(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::similar_index::{IndexProgress, IndexStage, IndexSummaryStatus};
+
+    anchored(ui, state, "similar-index/run", |ui, state| {
+        ui.label(
+            "お気に入りに登録した場所を調べ、表示中の画像と同じ絵の別バージョンを探せるようにします。",
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "初回は時間がかかります。100 万枚では約 11.6 時間かかった実測例があります。\n+                 バックグラウンドで実行され、中断後も次回の作成で続きから再開できます。",
+            )
+            .weak(),
+        );
+        ui.add_space(10.0);
+
+        let running = matches!(state.similar_index_progress, IndexProgress::Running(_));
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("索引を作成"))
+                .clicked()
+            {
+                state.similar_index_start_requested = true;
+                state.similar_index_message = None;
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("キャンセル"))
+                .clicked()
+            {
+                state.similar_index_cancel_requested = true;
+            }
+        });
+
+        if let Some(message) = &state.similar_index_message {
+            ui.label(message);
+        }
+
+        ui.add_space(10.0);
+        match &state.similar_index_progress {
+            IndexProgress::Running(progress) => {
+                let stage = match progress.stage {
+                    IndexStage::Opening => "準備中",
+                    IndexStage::Scanning => "画像を確認中",
+                    IndexStage::Pruning => "更新内容を整理中",
+                };
+                ui.label(egui::RichText::new(stage).strong());
+                ui.label(format!(
+                    "処理済み: {} / {}",
+                    crate::ui_helpers::format_count(progress.report.processed),
+                    crate::ui_helpers::format_count(progress.report.discovered)
+                ));
+                if progress.report.discovered > 0 {
+                    ui.add(
+                        egui::ProgressBar::new(
+                            progress.report.processed as f32 / progress.report.discovered as f32,
+                        )
+                        .show_percentage(),
+                    );
+                }
+                if let Some(path) = &progress.current_path {
+                    ui.label(format!("現在のフォルダ: {}", path.display()));
+                }
+                draw_similar_index_failures(ui, &progress.report);
+            }
+            IndexProgress::Complete(report) => {
+                ui.label(egui::RichText::new("索引の作成が完了しました。").strong());
+                draw_similar_index_failures(ui, report);
+            }
+            IndexProgress::Cancelled(report) => {
+                ui.label("索引の作成を中断しました。次回は確認済みの画像を再利用します。");
+                draw_similar_index_failures(ui, report);
+            }
+            IndexProgress::Failed(error) => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("索引を作成できませんでした: {error}"),
+                );
+            }
+            IndexProgress::Idle => {}
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("現在の索引").strong());
+        match &state.similar_index_summary {
+            IndexSummaryStatus::NoIndex => {
+                ui.label("索引はまだ作成されていません。");
+            }
+            IndexSummaryStatus::Preparing => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("索引の情報を読み込んでいます。");
+                });
+            }
+            IndexSummaryStatus::Ready(summary) => {
+                let updated =
+                    crate::app::format_details_timestamp(summary.completed_at_unix_secs, true);
+                ui.label(format!(
+                    "最終更新: {}",
+                    if updated.is_empty() {
+                        "不明"
+                    } else {
+                        &updated
+                    }
+                ));
+                ui.label(format!(
+                    "登録件数: {}",
+                    crate::ui_helpers::format_count(summary.registered_items)
+                ));
+                draw_similar_summary_failures(ui, *summary);
+            }
+            IndexSummaryStatus::Failed(error) => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("索引の情報を読み込めませんでした: {error}"),
+                );
+            }
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "対象はすべてのお気に入り配下です。この機能は画像を削除せず、どちらを残すかも判断しません。",
+            )
+            .weak(),
+        );
+    });
+}
+
+fn draw_similar_index_failures(ui: &mut egui::Ui, report: &crate::similar_index::IndexReport) {
+    ui.label(format!(
+        "確認できなかった項目: パスワードが必要な PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
+        crate::ui_helpers::format_count(report.password_required_pdfs),
+        crate::ui_helpers::format_count(report.corrupt_containers),
+        crate::ui_helpers::format_count(report.zero_page_containers),
+        crate::ui_helpers::format_count(report.decode_failures),
+        crate::ui_helpers::format_count(report.io_failures),
+    ));
+}
+
+fn draw_similar_summary_failures(ui: &mut egui::Ui, summary: crate::similar_index::IndexSummary) {
+    ui.label(format!(
+        "前回確認できなかった項目: パスワードが必要な PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
+        crate::ui_helpers::format_count(summary.password_required_pdfs),
+        crate::ui_helpers::format_count(summary.corrupt_containers),
+        crate::ui_helpers::format_count(summary.zero_page_containers),
+        crate::ui_helpers::format_count(summary.decode_failures),
+        crate::ui_helpers::format_count(summary.io_failures),
+    ));
+}
+
 /// v0.9: タスクトレイ常駐設定ページ。
 ///
 /// お気に入りダイアログにも同じ項目があるが、環境設定側は「全体設定を探したとき

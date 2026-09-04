@@ -137,6 +137,8 @@ pub(crate) enum PreferencesPage {
     SusiePlugins,
     /// v0.8.0: 検索インデックスの速度プロファイル
     IndexerSpeed,
+    /// お気に入り配下から別バージョンを探す索引
+    SimilarIndex,
     /// v0.9: タスクトレイ常駐 / 常駐中 pause 設定
     TrayResidency,
     /// v0.8.1: レーティング XMP 書き込み設定
@@ -180,6 +182,7 @@ impl PreferencesPage {
         Self::PlaybackResume,
         Self::SusiePlugins,
         Self::IndexerSpeed,
+        Self::SimilarIndex,
         Self::TrayResidency,
         Self::Rating,
         Self::UpdateCheck,
@@ -215,6 +218,7 @@ impl PreferencesPage {
             Self::PlaybackResume => "履歴と復元",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "検索インデックス",
+            Self::SimilarIndex => "別バージョン",
             Self::TrayResidency => "タスクトレイ常駐",
             Self::Rating => "レーティング",
             Self::UpdateCheck => "更新確認",
@@ -459,6 +463,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::PlaybackResume,
             PreferencesPage::Rating,
             PreferencesPage::IndexerSpeed,
+            PreferencesPage::SimilarIndex,
         ],
     },
     TreeCategory {
@@ -643,6 +648,13 @@ pub(crate) struct PreferencesState {
     pub highlight: Option<(&'static str, f64)>,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
+
+    // ── 別バージョン索引ページ ──────────────────────────────────
+    pub similar_index_progress: crate::similar_index::IndexProgress,
+    pub similar_index_summary: crate::similar_index::IndexSummaryStatus,
+    pub similar_index_start_requested: bool,
+    pub similar_index_cancel_requested: bool,
+    pub similar_index_message: Option<String>,
 
     // ── 外部ツールページ ────────────────────────────────────────
     /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
@@ -1169,6 +1181,11 @@ impl PreferencesState {
             pending_anchor: None,
             highlight: None,
             expanded,
+            similar_index_progress: crate::similar_index::IndexProgress::Idle,
+            similar_index_summary: crate::similar_index::IndexSummaryStatus::Preparing,
+            similar_index_start_requested: false,
+            similar_index_cancel_requested: false,
+            similar_index_message: None,
             external_tool_target,
             external_tool_association_ext,
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
@@ -1967,6 +1984,22 @@ impl App {
                 .collect();
         }
 
+        let similar_index_progress = self.similar_index_progress();
+        let similar_index_summary = self.similar_index.summary();
+        if let Some(state) = self.pref_state.as_mut() {
+            state.similar_index_progress = similar_index_progress;
+            state.similar_index_summary = similar_index_summary;
+            if matches!(
+                state.similar_index_progress,
+                crate::similar_index::IndexProgress::Running(_)
+            ) || matches!(
+                state.similar_index_summary,
+                crate::similar_index::IndexSummaryStatus::Preparing
+            ) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -2115,6 +2148,35 @@ impl App {
 
         if let Some(state) = self.pref_state.as_ref() {
             self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
+        }
+        let (start_similar_index, cancel_similar_index) = self
+            .pref_state
+            .as_mut()
+            .map(|state| {
+                (
+                    std::mem::take(&mut state.similar_index_start_requested),
+                    std::mem::take(&mut state.similar_index_cancel_requested),
+                )
+            })
+            .unwrap_or_default();
+        if start_similar_index {
+            let result = self.start_similar_index();
+            if let Some(state) = self.pref_state.as_mut() {
+                state.similar_index_message = Some(match result {
+                    Ok(()) => "索引の作成を開始しました。".to_string(),
+                    Err(crate::similar_index::StartError::AlreadyRunning) => {
+                        "索引はすでに作成中です。".to_string()
+                    }
+                });
+            }
+        }
+        if cancel_similar_index {
+            self.cancel_similar_index();
+            if let Some(state) = self.pref_state.as_mut() {
+                state.similar_index_message = Some(
+                    "中断を要求しました。処理中のファイルが終わるまでお待ちください。".to_string(),
+                );
+            }
         }
         let external_launch = self
             .pref_state
@@ -3134,6 +3196,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
+        PreferencesPage::SimilarIndex => page_similar_index(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),
         PreferencesPage::Rating => page_rating(ui, state),
         PreferencesPage::UpdateCheck => page_update_check(ui, state),

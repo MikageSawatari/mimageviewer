@@ -1595,6 +1595,36 @@ fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
     Some((target_width, target_height))
 }
 
+pub(crate) fn prepare_compare_pin_result(
+    job: crate::capture::CapturePixelJob,
+) -> Result<crate::app::ComparePinResult, String> {
+    crate::capture::run_compare_pixel_job(job).and_then(|(basename, width, height, rgba)| {
+        let source = image::RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| "比較画像のRGBAサイズが不正です".to_string())?;
+        let (indicator_width, indicator_height) = compare_indicator_size(width, height)
+            .ok_or_else(|| "比較画像の寸法が不正です".to_string())?;
+        let indicator = if indicator_width == width && indicator_height == height {
+            source.clone()
+        } else {
+            crate::fast_resize::resize_rgba8_exact(
+                &source,
+                indicator_width,
+                indicator_height,
+                crate::fast_resize::Quality::Lanczos3,
+            )
+        };
+        Ok(crate::app::ComparePinResult {
+            basename,
+            width,
+            height,
+            rgba: source.into_raw(),
+            indicator_width,
+            indicator_height,
+            indicator_rgba: indicator.into_raw(),
+        })
+    })
+}
+
 fn fs_loupe_suppressed_by_edit_mode(
     analysis_mode: bool,
     adjustment_mode: bool,
@@ -34359,34 +34389,7 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("compare-pin".into())
             .spawn(move || {
-                let result = crate::capture::run_compare_pixel_job(job).and_then(
-                    |(basename, width, height, rgba)| {
-                        let source = image::RgbaImage::from_raw(width, height, rgba)
-                            .ok_or_else(|| "比較画像のRGBAサイズが不正です".to_string())?;
-                        let (indicator_width, indicator_height) =
-                            compare_indicator_size(width, height)
-                                .ok_or_else(|| "比較画像の寸法が不正です".to_string())?;
-                        let indicator = if indicator_width == width && indicator_height == height {
-                            source.clone()
-                        } else {
-                            crate::fast_resize::resize_rgba8_exact(
-                                &source,
-                                indicator_width,
-                                indicator_height,
-                                crate::fast_resize::Quality::Lanczos3,
-                            )
-                        };
-                        Ok(crate::app::ComparePinResult {
-                            basename,
-                            width,
-                            height,
-                            rgba: source.into_raw(),
-                            indicator_width,
-                            indicator_height,
-                            indicator_rgba: indicator.into_raw(),
-                        })
-                    },
-                );
+                let result = prepare_compare_pin_result(job);
                 let _ = tx.send(result);
             });
 
@@ -34395,12 +34398,66 @@ impl App {
                 self.compare_pin_load_pending = None;
                 self.compare_preparation.invalidate();
                 self.clear_compare_gpu_pair();
-                self.compare_pin_pending = Some(crate::app::ComparePinPending { source_idx, rx });
+                self.compare_pin_pending = Some(crate::app::ComparePinPending {
+                    source_idx,
+                    external_item_key: None,
+                    rx,
+                });
                 self.show_feedback_toast("比較画像を準備中".to_string());
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             Err(err) => {
                 self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn start_external_compare_pin_job(
+        &mut self,
+        ctx: &egui::Context,
+        item_key: String,
+        job: impl FnOnce() -> Result<crate::app::ComparePinResult, String> + Send + 'static,
+    ) {
+        // `source_idx` is only an opaque equality token once pixels enter the comparison
+        // pipeline. External rows have no index in `self.items`, so reserve an unreachable value
+        // and keep their actual identity separately in `external_item_key`.
+        const EXTERNAL_COMPARE_SOURCE_IDX: usize = usize::MAX;
+
+        if self.compare_pin_pending.is_some() {
+            self.show_feedback_toast("比較画像を準備中です".to_string());
+            return;
+        }
+        if self
+            .pinned_compare_slot
+            .as_ref()
+            .and_then(|slot| slot.external_item_key.as_deref())
+            == Some(item_key.as_str())
+        {
+            self.clear_compare_pin(ctx);
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("similar-compare-pin".into())
+            .spawn(move || {
+                let _ = tx.send(job());
+            });
+        match thread {
+            Ok(_) => {
+                self.compare_pin_load_pending = None;
+                self.compare_preparation.invalidate();
+                self.clear_compare_gpu_pair();
+                self.compare_pin_pending = Some(crate::app::ComparePinPending {
+                    source_idx: EXTERNAL_COMPARE_SOURCE_IDX,
+                    external_item_key: Some(item_key),
+                    rx,
+                });
+                self.show_feedback_toast("比較画像を準備中".to_string());
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                self.show_feedback_toast(format!("比較 worker を開始できません: {error}"));
             }
         }
     }
@@ -45093,6 +45150,7 @@ mod tests {
             indicator_texture: None,
             display_name: "pinned".to_string(),
             source_idx: 2,
+            external_item_key: None,
             source_size: [1, 1],
         });
         let ctx = egui::Context::default();
@@ -45281,6 +45339,7 @@ mod tests {
             indicator_texture: None,
             display_name: "pinned".to_string(),
             source_idx: 2,
+            external_item_key: None,
             source_size: [8, 12],
         });
         app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
@@ -45415,6 +45474,7 @@ mod tests {
             indicator_texture: None,
             display_name: "pinned".to_string(),
             source_idx: 2,
+            external_item_key: None,
             source_size: [2, 3],
         });
         app.fullscreen_idx = Some(7);
@@ -45470,6 +45530,7 @@ mod tests {
             indicator_texture: None,
             display_name: "pinned".to_string(),
             source_idx: 2,
+            external_item_key: None,
             source_size: [2, 3],
         });
         app.fullscreen_idx = Some(7);

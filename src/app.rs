@@ -54,7 +54,7 @@ pub(crate) fn folder_media_sort_order(
     }
 }
 
-fn similar_index_item_key(item: &crate::grid_item::GridItem) -> Option<String> {
+pub(crate) fn similar_index_item_key(item: &crate::grid_item::GridItem) -> Option<String> {
     match item {
         crate::grid_item::GridItem::Image(path) => {
             Some(crate::similar_index::item_key_for_file(path))
@@ -199,14 +199,14 @@ pub(crate) use grid_paint::{
     draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
     primary_grid_tag_for_badge, tq_draw_preview,
 };
-pub(crate) use metadata_ops::FacetField;
 use metadata_ops::{
     DetailsSortPrimary, DetailsSortRow, cmp_option_last, ctrl_f_progress_total,
     details_created_time_path, facet_ai_filter_applies, facet_ext_for_item, facet_kind_for_item,
-    facet_tag_filter_applies, format_details_duration, format_details_timestamp,
-    item_supports_tags, passes_rating_filter, path_extension_lower, path_in_subtree_ci,
-    run_details_meta_load, run_metadata_load, run_metadata_search, stem_lower, tag_item_path,
+    facet_tag_filter_applies, format_details_duration, item_supports_tags, passes_rating_filter,
+    path_extension_lower, path_in_subtree_ci, run_details_meta_load, run_metadata_load,
+    run_metadata_search, stem_lower, tag_item_path,
 };
+pub(crate) use metadata_ops::{FacetField, format_details_timestamp};
 pub(crate) use prefetch_policy::{
     AllowReason, FinalEffectPrefetchAdmission, FsPrefetchIndicator, FsPrefetchPageState,
     FsPrefetchSideDisplay, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD, PrefetchDecision,
@@ -3301,6 +3301,9 @@ pub(crate) struct PinnedCompareSlot {
     pub(crate) indicator_texture: Option<egui::TextureHandle>,
     pub(crate) display_name: String,
     pub(crate) source_idx: usize,
+    /// `items` 外の「類似」結果から設定したときの永続 item identity。
+    /// 通常の grid/fullscreen 経路では `None`。
+    pub(crate) external_item_key: Option<String>,
     pub(crate) source_size: [usize; 2],
 }
 
@@ -3316,6 +3319,7 @@ pub(crate) struct ComparePinResult {
 
 pub(crate) struct ComparePinPending {
     pub(crate) source_idx: usize,
+    pub(crate) external_item_key: Option<String>,
     pub(crate) rx: mpsc::Receiver<Result<ComparePinResult, String>>,
 }
 
@@ -11049,6 +11053,8 @@ pub struct App {
     /// 右情報パネルの表示状態 (明示 open / ロック / ホバー latch)。
     /// **正本は `ViewerContextBundle`**、ここはマウント中 context の投影である。
     pub(crate) fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState,
+    /// 情報パネルのタブと、類似行用の一時サムネイル。パネルを閉じてもタブだけは保持する。
+    pub(crate) similar_panel: crate::ui_metadata_panel::SimilarPanelState,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -14416,6 +14422,7 @@ impl App {
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
+            similar_panel: crate::ui_metadata_panel::SimilarPanelState::default(),
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -29887,6 +29894,7 @@ impl App {
             }
         };
         let source_idx = pending.source_idx;
+        let external_item_key = pending.external_item_key.clone();
         self.compare_pin_pending = None;
         self.compare_pin_load_pending = None;
         match result {
@@ -29921,6 +29929,7 @@ impl App {
                     indicator_texture: None,
                     display_name: display_name.clone(),
                     source_idx,
+                    external_item_key,
                 });
                 self.deactivate_compare_view();
                 self.show_feedback_toast(format!("比較画像を設定: {display_name}"));

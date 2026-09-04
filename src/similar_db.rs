@@ -98,6 +98,22 @@ pub struct SearchRow {
     pub item: StoredItem,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletedIndexStats {
+    pub password_required_pdfs: u64,
+    pub corrupt_containers: u64,
+    pub zero_page_containers: u64,
+    pub decode_failures: u64,
+    pub io_failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredIndexSummary {
+    pub completed_at_unix_secs: i64,
+    pub registered_items: u64,
+    pub stats: CompletedIndexStats,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     Missing,
@@ -557,6 +573,86 @@ impl SimilarDb {
             .collect()
     }
 
+    /// 完走した索引ジョブの表示用集計を、公開済み行数と同じ transaction で記録する。
+    /// キャンセル・失敗したジョブからは呼ばないため、「最終更新」は完走時だけ進む。
+    pub fn record_completed_index(
+        &self,
+        hash_version: i64,
+        completed_at_unix_secs: i64,
+        stats: CompletedIndexStats,
+    ) -> rusqlite::Result<StoredIndexSummary> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let registered_items = transaction.query_row(
+            "SELECT COUNT(*) FROM item i
+             LEFT JOIN container c ON c.container_key = i.container_key
+             WHERE i.hash_version = ?1
+               AND (i.container_key IS NULL OR c.scan_state = ?2)",
+            params![hash_version, ScanState::Complete as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO index_run
+             (singleton, hash_version, completed_at_unix_secs, registered_items,
+              password_required_pdfs, corrupt_containers, zero_page_containers,
+              decode_failures, io_failures)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(singleton) DO UPDATE SET
+               hash_version=excluded.hash_version,
+               completed_at_unix_secs=excluded.completed_at_unix_secs,
+               registered_items=excluded.registered_items,
+               password_required_pdfs=excluded.password_required_pdfs,
+               corrupt_containers=excluded.corrupt_containers,
+               zero_page_containers=excluded.zero_page_containers,
+               decode_failures=excluded.decode_failures,
+               io_failures=excluded.io_failures",
+            params![
+                hash_version,
+                completed_at_unix_secs,
+                registered_items,
+                i64::try_from(stats.password_required_pdfs).unwrap_or(i64::MAX),
+                i64::try_from(stats.corrupt_containers).unwrap_or(i64::MAX),
+                i64::try_from(stats.zero_page_containers).unwrap_or(i64::MAX),
+                i64::try_from(stats.decode_failures).unwrap_or(i64::MAX),
+                i64::try_from(stats.io_failures).unwrap_or(i64::MAX),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(StoredIndexSummary {
+            completed_at_unix_secs,
+            registered_items: u64::try_from(registered_items).unwrap_or(0),
+            stats,
+        })
+    }
+
+    pub fn load_index_summary(
+        &self,
+        hash_version: i64,
+    ) -> rusqlite::Result<Option<StoredIndexSummary>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT completed_at_unix_secs, registered_items,
+                    password_required_pdfs, corrupt_containers, zero_page_containers,
+                    decode_failures, io_failures
+             FROM index_run WHERE singleton = 1 AND hash_version = ?1",
+            [hash_version],
+            |row| {
+                Ok(StoredIndexSummary {
+                    completed_at_unix_secs: row.get(0)?,
+                    registered_items: i64_to_u64(row.get(1)?, 1)?,
+                    stats: CompletedIndexStats {
+                        password_required_pdfs: i64_to_u64(row.get(2)?, 2)?,
+                        corrupt_containers: i64_to_u64(row.get(3)?, 3)?,
+                        zero_page_containers: i64_to_u64(row.get(4)?, 4)?,
+                        decode_failures: i64_to_u64(row.get(5)?, 5)?,
+                        io_failures: i64_to_u64(row.get(6)?, 6)?,
+                    },
+                })
+            },
+        )
+        .optional()
+    }
+
     pub fn load_item(
         &self,
         item_key: &str,
@@ -816,6 +912,17 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
            width INTEGER NOT NULL,
            height INTEGER NOT NULL,
            format INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS index_run (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           hash_version INTEGER NOT NULL,
+           completed_at_unix_secs INTEGER NOT NULL,
+           registered_items INTEGER NOT NULL,
+           password_required_pdfs INTEGER NOT NULL,
+           corrupt_containers INTEGER NOT NULL,
+           zero_page_containers INTEGER NOT NULL,
+           decode_failures INTEGER NOT NULL,
+           io_failures INTEGER NOT NULL
          );",
     )
 }
@@ -957,6 +1064,49 @@ mod tests {
         assert_eq!(
             db.load_search_rows(current_hash_version()).unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn completed_index_summary_counts_only_searchable_rows_and_round_trips_failures() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("loose", None, None, 1)).unwrap();
+        let complete = db
+            .begin_container_build("complete", ContainerKind::Zip, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            complete,
+            &item("complete-page", Some("complete"), Some(0), 2),
+        )
+        .unwrap();
+        db.complete_container("complete", complete).unwrap();
+        let building = db
+            .begin_container_build("building", ContainerKind::Pdf, 1, 1, 10)
+            .unwrap();
+        db.stage_item(
+            building,
+            &item("building-page", Some("building"), Some(0), 3),
+        )
+        .unwrap();
+
+        let stats = CompletedIndexStats {
+            password_required_pdfs: 1,
+            corrupt_containers: 2,
+            zero_page_containers: 3,
+            decode_failures: 4,
+            io_failures: 5,
+        };
+        let stored = db
+            .record_completed_index(current_hash_version(), 1234, stats)
+            .unwrap();
+        assert_eq!(stored.registered_items, 2);
+        assert_eq!(
+            db.load_index_summary(current_hash_version()).unwrap(),
+            Some(stored)
+        );
+        assert_eq!(
+            db.load_index_summary(current_hash_version() + 1).unwrap(),
+            None
         );
     }
 }

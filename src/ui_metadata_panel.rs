@@ -15,6 +15,373 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
+const SIMILAR_THUMB_SIZE: f32 = 72.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MetadataPanelTab {
+    #[default]
+    Info,
+    Similar,
+}
+
+struct SimilarThumbResult {
+    item_key: String,
+    image: Option<egui::ColorImage>,
+}
+
+enum SimilarThumbState {
+    Loading,
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
+pub(crate) struct SimilarPanelState {
+    tab: MetadataPanelTab,
+    origin_key: Option<String>,
+    thumbnails: std::collections::HashMap<String, SimilarThumbState>,
+    thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
+    thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
+}
+
+impl Default for SimilarPanelState {
+    fn default() -> Self {
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        Self {
+            tab: MetadataPanelTab::Info,
+            origin_key: None,
+            thumbnails: std::collections::HashMap::new(),
+            thumb_tx,
+            thumb_rx,
+        }
+    }
+}
+
+impl SimilarPanelState {
+    fn begin_origin(&mut self, origin_key: Option<String>) {
+        if self.origin_key != origin_key {
+            self.origin_key = origin_key;
+            self.thumbnails.clear();
+            while self.thumb_rx.try_recv().is_ok() {}
+        }
+    }
+
+    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.thumb_rx.try_recv() {
+            let state = match result.image {
+                Some(image) => SimilarThumbState::Ready(ctx.load_texture(
+                    format!("similar-thumb:{}", result.item_key),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )),
+                None => SimilarThumbState::Failed,
+            };
+            self.thumbnails.insert(result.item_key, state);
+        }
+    }
+
+    fn ensure_thumbnail(
+        &mut self,
+        hit: &crate::similar_index::QueryHit,
+        thumb_px: u32,
+        thumb_quality: u8,
+        cache_decision: crate::thumb_loader::CacheDecision,
+        pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+        ctx: &egui::Context,
+    ) {
+        if self.thumbnails.contains_key(&hit.item_key) {
+            return;
+        }
+        let Some(target) = crate::similar_index::target_for_hit(hit) else {
+            self.thumbnails
+                .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+            return;
+        };
+        self.thumbnails
+            .insert(hit.item_key.clone(), SimilarThumbState::Loading);
+        let item_key = hit.item_key.clone();
+        let result_tx = self.thumb_tx.clone();
+        let repaint = ctx.clone();
+        let mtime = hit.mtime;
+        let file_size = hit.file_size;
+        let pdf_passwords = pdf_passwords.cloned();
+        let context_epoch = crate::pdf_loader::current_render_context_epoch();
+        let spawned = std::thread::Builder::new()
+            .name("similar-panel-thumb".to_string())
+            .spawn(move || {
+                let (path, zip_entry, pdf_page) = match target {
+                    crate::similar_index::SimilarItemTarget::File(path) => (path, None, None),
+                    crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
+                        (pdf_path, None, Some(page_num))
+                    }
+                    crate::similar_index::SimilarItemTarget::ZipPage {
+                        zip_path,
+                        entry_name: _,
+                    } => {
+                        // DB identity は小文字化済み。ZIP の実エントリ名は大文字小文字を
+                        // 区別するため、worker 上で列挙結果から元の表記へ戻す。
+                        let resolved =
+                            crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
+                                .ok()
+                                .and_then(|entries| {
+                                    entries.entries.into_iter().find(|entry| {
+                                        crate::similar_index::item_key_for_zip_page(
+                                            &zip_path,
+                                            &entry.entry_name,
+                                        ) == item_key
+                                    })
+                                })
+                                .map(|entry| entry.entry_name);
+                        let Some(entry_name) = resolved else {
+                            let _ = result_tx.send(SimilarThumbResult {
+                                item_key,
+                                image: None,
+                            });
+                            repaint.request_repaint();
+                            return;
+                        };
+                        (zip_path, Some(entry_name), None)
+                    }
+                };
+                let pdf_password = pdf_page.and_then(|_| {
+                    pdf_passwords
+                        .as_ref()
+                        .and_then(|passwords| passwords.get(&path))
+                });
+                let (tx, rx) = std::sync::mpsc::channel();
+                let request = crate::thumb_loader::LoadRequest {
+                    path,
+                    zip_entry,
+                    pdf_page,
+                    pdf_password,
+                    mtime,
+                    file_size,
+                    source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
+                    priority: true,
+                    context_epoch,
+                    ..Default::default()
+                };
+                let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+                let generated = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let stats =
+                    std::sync::Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default()));
+                let keep_start = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let keep_end = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+                crate::thumb_loader::process_load_request(
+                    &request,
+                    &cache_map,
+                    &tx,
+                    None,
+                    thumb_px,
+                    thumb_quality,
+                    thumb_px,
+                    cache_decision,
+                    &generated,
+                    &stats,
+                    None,
+                    &keep_start,
+                    &keep_end,
+                    None,
+                    None,
+                    None,
+                );
+                let image = rx.try_iter().find_map(|message| message.image);
+                let _ = result_tx.send(SimilarThumbResult { item_key, image });
+                repaint.request_repaint();
+            });
+        if spawned.is_err() {
+            self.thumbnails
+                .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SimilarPanelModel {
+    NoIndex,
+    Preparing,
+    NotIndexed,
+    Featureless,
+    Empty,
+    Results(Vec<crate::similar_index::QueryHit>),
+    Failed(String),
+}
+
+#[derive(Default)]
+struct SimilarPanelActions {
+    open_preferences: bool,
+    open_hit: Option<crate::similar_index::QueryHit>,
+    hovered_hit: Option<crate::similar_index::QueryHit>,
+}
+
+fn similar_panel_model(query: crate::similar_index::ItemQuery) -> SimilarPanelModel {
+    match query {
+        crate::similar_index::ItemQuery::NoIndex => SimilarPanelModel::NoIndex,
+        crate::similar_index::ItemQuery::Preparing => SimilarPanelModel::Preparing,
+        crate::similar_index::ItemQuery::NotIndexed => SimilarPanelModel::NotIndexed,
+        crate::similar_index::ItemQuery::Featureless => SimilarPanelModel::Featureless,
+        crate::similar_index::ItemQuery::Ready(hits) if hits.is_empty() => SimilarPanelModel::Empty,
+        crate::similar_index::ItemQuery::Ready(hits) => SimilarPanelModel::Results(hits),
+        crate::similar_index::ItemQuery::Failed(error) => SimilarPanelModel::Failed(error),
+    }
+}
+
+fn similar_difference_line(hit: &crate::similar_index::QueryHit) -> String {
+    let size = crate::ui_helpers::format_bytes_small(hit.file_size.max(0) as u64);
+    let size = match hit.kind {
+        crate::similar_db::ItemKind::Image => size,
+        crate::similar_db::ItemKind::ZipPage => format!("書庫 {size}"),
+        crate::similar_db::ItemKind::PdfPage => format!("PDF {size}"),
+    };
+    format!(
+        "{}×{} (この画像は {}×{}) / {} / {}",
+        hit.width,
+        hit.height,
+        hit.origin_width,
+        hit.origin_height,
+        hit.format.display_name(),
+        size
+    )
+}
+
+fn similar_location_line(hit: &crate::similar_index::QueryHit) -> String {
+    let Some(target) = crate::similar_index::target_for_hit(hit) else {
+        return hit.item_key.clone();
+    };
+    match target {
+        crate::similar_index::SimilarItemTarget::File(path) => path
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| path.display().to_string()),
+        crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name,
+        } => format!("{} / {}", zip_path.display(), entry_name),
+        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
+            format!("{} / Page {}", pdf_path.display(), page_num + 1)
+        }
+    }
+}
+
+fn similar_open_target(
+    hit: &crate::similar_index::QueryHit,
+) -> Option<(PathBuf, crate::snapshot::SnapshotTarget)> {
+    match crate::similar_index::target_for_hit(hit)? {
+        crate::similar_index::SimilarItemTarget::File(path) => Some((
+            path.parent()?.to_path_buf(),
+            crate::snapshot::SnapshotTarget::Fs(path),
+        )),
+        crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name,
+        } => Some((
+            zip_path.clone(),
+            crate::snapshot::SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            },
+        )),
+        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => Some((
+            pdf_path.clone(),
+            crate::snapshot::SnapshotTarget::PdfPage { pdf_path, page_num },
+        )),
+    }
+}
+
+fn prepare_similar_compare_result(
+    hit: crate::similar_index::QueryHit,
+    pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+    pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
+) -> Result<crate::app::ComparePinResult, String> {
+    let target = crate::similar_index::target_for_hit(&hit)
+        .ok_or_else(|| "比較画像の場所を解決できません".to_string())?;
+    let (display_name, pixels) = match target {
+        crate::similar_index::SimilarItemTarget::File(path) => {
+            let display_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let decoded = crate::canonical_image_loader::decode_canonical_image(
+                crate::canonical_image_loader::CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: None,
+                },
+                crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
+                    crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
+                return Err("動画は比較画像に設定できません".to_string());
+            };
+            (display_name, image.into_gpu_raster().pixels)
+        }
+        crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name: _,
+        } => {
+            let entry_name = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
+                .map_err(|error| error.to_string())?
+                .entries
+                .into_iter()
+                .find(|entry| {
+                    crate::similar_index::item_key_for_zip_page(&zip_path, &entry.entry_name)
+                        == hit.item_key
+                })
+                .map(|entry| entry.entry_name)
+                .ok_or_else(|| "ZIP内の比較画像が見つかりません".to_string())?;
+            let display_name = crate::zip_loader::entry_basename(&entry_name).to_string();
+            let decoded = crate::canonical_image_loader::decode_canonical_image(
+                crate::canonical_image_loader::CanonicalImageSource::ArchiveEntry {
+                    archive_path: &zip_path,
+                    entry_name: &entry_name,
+                },
+                crate::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
+                    crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            let crate::canonical_image_loader::CanonicalImageDecode::Static(image) = decoded else {
+                return Err("動画は比較画像に設定できません".to_string());
+            };
+            (display_name, image.into_gpu_raster().pixels)
+        }
+        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
+            let pdf_password = pdf_passwords.get(&pdf_path);
+            let display_name = format!(
+                "{} - Page {}",
+                pdf_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("PDF"),
+                page_num + 1
+            );
+            let rendered = crate::pdf_loader::render_page_for_display(
+                &pdf_path,
+                page_num,
+                pdf_viewport,
+                false,
+                pdf_password.as_deref(),
+                None,
+                crate::pdf_loader::JobPriority::Critical,
+                crate::pdf_loader::current_render_context_epoch(),
+                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            )
+            .map_err(|error| error.to_string())?;
+            let image = crate::canonical_image_loader::clamp_dynamic_for_gpu(rendered.image);
+            (
+                display_name,
+                crate::canonical_image_loader::dynamic_image_to_color_image(&image),
+            )
+        }
+    };
+    crate::ui_fullscreen::prepare_compare_pin_result(
+        crate::capture::CapturePixelJob::already_adjusted(
+            display_name,
+            std::sync::Arc::new(pixels),
+        ),
+    )
+}
 
 #[derive(Clone)]
 struct TagPanelRow {
@@ -45,6 +412,49 @@ impl TagPanelRow {
 }
 
 impl App {
+    fn open_similar_hit(&mut self, hit: &crate::similar_index::QueryHit) {
+        if let Some(index) = self.items.iter().position(|item| {
+            crate::app::similar_index_item_key(item).as_deref() == Some(hit.item_key.as_str())
+        }) {
+            self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+            return;
+        }
+        let Some((location, target)) = similar_open_target(hit) else {
+            self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        };
+        if self.is_snapshot_active() {
+            let _ = self.dismiss_snapshot_without_restore();
+        }
+        self.snapshot_load_and_open(
+            location,
+            false,
+            Some(target),
+            crate::app::HistoryTrigger::UserChosen,
+        );
+    }
+
+    fn pin_similar_hit(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &crate::similar_index::QueryHit,
+        full_rect: egui::Rect,
+    ) {
+        let pdf_passwords = self.pdf_passwords.clone();
+        let viewport = self.fs_pdf_display_target.unwrap_or_else(|| {
+            crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                full_rect.width(),
+                full_rect.height(),
+                ctx.pixels_per_point(),
+                crate::pdf_loader::PdfDisplayFitMode::Page,
+            )
+        });
+        let job_hit = hit.clone();
+        self.start_external_compare_pin_job(ctx, hit.item_key.clone(), move || {
+            prepare_similar_compare_result(job_hit, pdf_passwords, viewport)
+        });
+    }
+
     /// Update the transient right-panel hover latch for the current fullscreen frame.
     /// Rendering reads this value but does not own its lifetime, so navigator-consumed image
     /// input cannot freeze the panel at the previous frame's state.
@@ -277,6 +687,7 @@ impl App {
         let tweet_info = self.get_current_tweet_info();
         let sidecar_info = self.get_current_sidecar();
         let current_palette = self.current_fullscreen_color_palette();
+        self.similar_panel.poll_thumbnails(ctx);
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
         let tag_rows = self.collect_fullscreen_tag_panel_rows();
@@ -327,6 +738,7 @@ impl App {
         let mut set_tag: Option<(String, bool, Vec<TagTarget>)> = None;
         let mut searched_tag: Option<String> = None;
         let mut clicked_palette_rgb: Option<[u8; 3]> = None;
+        let mut similar_actions = SimilarPanelActions::default();
         // ★ レーティング (画像/動画/音声で統一。★ → タグ → 内容 の先頭)。レーティング可能な
         // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でページ★を出す。
         let rating_idx = self
@@ -363,6 +775,40 @@ impl App {
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
                 ui.set_width(ui.available_width());
+
+                draw_metadata_panel_tabs(ui, &mut self.similar_panel.tab);
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                if self.similar_panel.tab == MetadataPanelTab::Similar {
+                    let current_item = self
+                        .fullscreen_idx
+                        .and_then(|index| self.items.get(index))
+                        .cloned();
+                    let origin_key = current_item
+                        .as_ref()
+                        .and_then(crate::app::similar_index_item_key);
+                    self.similar_panel.begin_origin(origin_key);
+                    let query = current_item
+                        .as_ref()
+                        .map_or(crate::similar_index::ItemQuery::NotIndexed, |item| {
+                            self.query_similar_item(item)
+                        });
+                    let model = similar_panel_model(query);
+                    draw_similar_panel(
+                        ui,
+                        &model,
+                        &mut self.similar_panel,
+                        self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
+                        self.settings.thumb_quality,
+                        crate::thumb_loader::CacheDecision::from_settings(&self.settings),
+                        Some(&self.pdf_passwords),
+                        ctx,
+                        &mut similar_actions,
+                    );
+                    return;
+                }
 
                 if self.fullscreen_tag_picker_open {
                     draw_fullscreen_tag_picker_panel(
@@ -515,6 +961,22 @@ impl App {
                     draw_no_metadata(ui);
                 }
             });
+
+        if let Some(hit) = similar_actions.hovered_hit.take()
+            && self
+                .keymap
+                .consume_action(ctx, crate::keymap::KeyAction::FsCompareToggle)
+        {
+            self.pin_similar_hit(ctx, &hit, full_rect);
+        }
+        if similar_actions.open_preferences {
+            self.open_preferences_page(
+                crate::ui_dialogs::preferences::PreferencesPage::SimilarIndex,
+            );
+        }
+        if let Some(hit) = similar_actions.open_hit {
+            self.open_similar_hit(&hit);
+        }
 
         // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。
         if let (Some(idx), Some(new_stars)) = (rating_idx, set_rating) {
@@ -1397,6 +1859,263 @@ fn tag_picker_tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui
     )
 }
 
+fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
+    ui.horizontal(|ui| {
+        if tag_picker_tab_button(ui, "情報", *tab == MetadataPanelTab::Info).clicked() {
+            *tab = MetadataPanelTab::Info;
+        }
+        if tag_picker_tab_button(ui, "類似", *tab == MetadataPanelTab::Similar).clicked() {
+            *tab = MetadataPanelTab::Similar;
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_similar_panel(
+    ui: &mut egui::Ui,
+    model: &SimilarPanelModel,
+    state: &mut SimilarPanelState,
+    thumb_px: u32,
+    thumb_quality: u8,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    pdf_passwords: Option<&crate::pdf_passwords::PdfPasswordStore>,
+    ctx: &egui::Context,
+    actions: &mut SimilarPanelActions,
+) {
+    match model {
+        SimilarPanelModel::NoIndex => {
+            ui.label("索引がありません");
+            if ui.button("環境設定で索引を作成").clicked() {
+                actions.open_preferences = true;
+            }
+        }
+        SimilarPanelModel::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("準備中");
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        SimilarPanelModel::NotIndexed => {
+            ui.label("この画像は索引に含まれていません");
+        }
+        SimilarPanelModel::Featureless => {
+            ui.label("この画像は特徴が少ないため判定できません");
+        }
+        SimilarPanelModel::Empty => {
+            ui.label("別バージョンは見つかりませんでした");
+        }
+        SimilarPanelModel::Failed(error) => {
+            ui.label("索引を読み込めませんでした");
+            ui.label(egui::RichText::new(error).color(DIM_COLOR).size(11.0));
+        }
+        SimilarPanelModel::Results(hits) => {
+            let mut previous_band = None;
+            for hit in hits {
+                if previous_band != Some(hit.band) {
+                    if previous_band.is_some() {
+                        ui.add_space(8.0);
+                    }
+                    let heading = match hit.band {
+                        crate::similar_index::MatchBand::NearlyIdentical => "ほぼ同一",
+                        crate::similar_index::MatchBand::OtherVersion => "別バージョン",
+                    };
+                    ui.label(
+                        egui::RichText::new(heading)
+                            .color(egui::Color32::WHITE)
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    previous_band = Some(hit.band);
+                }
+
+                state.ensure_thumbnail(
+                    hit,
+                    thumb_px,
+                    thumb_quality,
+                    cache_decision,
+                    pdf_passwords,
+                    ctx,
+                );
+
+                let response = egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(38, 40, 48, 210))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                    ))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(SIMILAR_THUMB_SIZE, SIMILAR_THUMB_SIZE),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                2.0,
+                                egui::Color32::from_rgb(25, 26, 31),
+                            );
+                            match state.thumbnails.get(&hit.item_key) {
+                                Some(SimilarThumbState::Ready(texture)) => {
+                                    let image_size = texture.size_vec2();
+                                    let scale = (rect.width() / image_size.x)
+                                        .min(rect.height() / image_size.y);
+                                    let size = image_size * scale;
+                                    let image_rect =
+                                        egui::Rect::from_center_size(rect.center(), size);
+                                    ui.painter().image(
+                                        texture.id(),
+                                        image_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::Pos2::ZERO,
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                Some(SimilarThumbState::Loading) => {
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "読込中",
+                                        egui::FontId::proportional(10.0),
+                                        DIM_COLOR,
+                                    );
+                                }
+                                Some(SimilarThumbState::Failed) | None => {
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "画像なし",
+                                        egui::FontId::proportional(10.0),
+                                        DIM_COLOR,
+                                    );
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.set_max_width((ui.available_width() - 2.0).max(20.0));
+                                ui.label(
+                                    egui::RichText::new(similar_difference_line(hit))
+                                        .color(TEXT_COLOR)
+                                        .size(11.0),
+                                );
+                                ui.add_space(3.0);
+                                ui.label(
+                                    egui::RichText::new(similar_location_line(hit))
+                                        .color(DIM_COLOR)
+                                        .size(10.0),
+                                );
+                            });
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                let response = response.on_hover_text("クリックで移動 / X で比較画像に設定");
+                if response.clicked() {
+                    actions.open_hit = Some(hit.clone());
+                }
+                if response.hovered() {
+                    actions.hovered_hit = Some(hit.clone());
+                }
+                ui.add_space(4.0);
+            }
+        }
+    }
+}
+
+/// Visual fixture for the production metadata-panel tabs and similar-result rows.
+#[doc(hidden)]
+pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {
+    ui.set_width(360.0);
+    apply_metadata_panel_dark_widget_style(ui);
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(28, 30, 36))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            let mut tab = if similar_selected {
+                MetadataPanelTab::Similar
+            } else {
+                MetadataPanelTab::Info
+            };
+            draw_metadata_panel_tabs(ui, &mut tab);
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(8.0);
+            if !similar_selected {
+                ui.label(
+                    egui::RichText::new("画像情報")
+                        .color(egui::Color32::WHITE)
+                        .size(16.0)
+                        .strong(),
+                );
+                draw_key_value_wrapped(ui, "ファイル", "sample.jpg");
+                draw_key_value_wrapped(ui, "サイズ", "1200×1600");
+                return;
+            }
+
+            let hits = vec![
+                crate::similar_index::QueryHit {
+                    row_id: 2,
+                    item_key: crate::similar_index::item_key_for_file(Path::new(
+                        r"C:\Pictures\edits\sample.png",
+                    )),
+                    kind: crate::similar_db::ItemKind::Image,
+                    container_key: None,
+                    page_index: None,
+                    distance: 5,
+                    band: crate::similar_index::MatchBand::NearlyIdentical,
+                    mtime: 1,
+                    file_size: 4_404_019,
+                    width: 2400,
+                    height: 3200,
+                    format: crate::similar_image::SimilarImageFormat::Png,
+                    origin_width: 1200,
+                    origin_height: 1600,
+                },
+                crate::similar_index::QueryHit {
+                    row_id: 3,
+                    item_key: crate::similar_index::item_key_for_file(Path::new(
+                        r"D:\Archive\sample.webp",
+                    )),
+                    kind: crate::similar_db::ItemKind::Image,
+                    container_key: None,
+                    page_index: None,
+                    distance: 24,
+                    band: crate::similar_index::MatchBand::OtherVersion,
+                    mtime: 1,
+                    file_size: 921_600,
+                    width: 900,
+                    height: 1200,
+                    format: crate::similar_image::SimilarImageFormat::WebP,
+                    origin_width: 1200,
+                    origin_height: 1600,
+                },
+            ];
+            let mut state = SimilarPanelState::default();
+            for hit in &hits {
+                state
+                    .thumbnails
+                    .insert(hit.item_key.clone(), SimilarThumbState::Failed);
+            }
+            let mut actions = SimilarPanelActions::default();
+            let ctx = ui.ctx().clone();
+            draw_similar_panel(
+                ui,
+                &SimilarPanelModel::Results(hits),
+                &mut state,
+                72,
+                85,
+                crate::thumb_loader::CacheDecision::without_thumbnail(),
+                None,
+                &ctx,
+                &mut actions,
+            );
+        });
+}
+
 fn tag_panel_picker_choices(
     tag_catalog: &[TagPanelChoice],
     query_key: &str,
@@ -2240,6 +2959,86 @@ mod format_datetime_tests {
         // `:` 置換は走るが壊れた文字列はそのまま (日付部 10 文字を超える位置は保持)
         let out = format_xmp_datetime("not a date");
         assert_eq!(out, "not a date");
+    }
+}
+
+#[cfg(test)]
+mod similar_panel_tests {
+    use super::{SimilarPanelModel, similar_difference_line, similar_panel_model};
+    use crate::similar_db::ItemKind;
+    use crate::similar_image::SimilarImageFormat;
+    use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
+
+    fn hit(kind: ItemKind, format: SimilarImageFormat) -> QueryHit {
+        QueryHit {
+            row_id: 2,
+            item_key: "c:/pictures/copy.png".to_string(),
+            kind,
+            container_key: None,
+            page_index: None,
+            distance: 47,
+            band: MatchBand::OtherVersion,
+            mtime: 1,
+            file_size: 4_404_019,
+            width: 2400,
+            height: 3200,
+            format,
+            origin_width: 1200,
+            origin_height: 1600,
+        }
+    }
+
+    #[test]
+    fn five_empty_states_remain_distinct_typed_models() {
+        assert_eq!(
+            similar_panel_model(ItemQuery::NoIndex),
+            SimilarPanelModel::NoIndex
+        );
+        assert_eq!(
+            similar_panel_model(ItemQuery::Preparing),
+            SimilarPanelModel::Preparing
+        );
+        assert_eq!(
+            similar_panel_model(ItemQuery::NotIndexed),
+            SimilarPanelModel::NotIndexed
+        );
+        assert_eq!(
+            similar_panel_model(ItemQuery::Featureless),
+            SimilarPanelModel::Featureless
+        );
+        assert_eq!(
+            similar_panel_model(ItemQuery::Ready(Vec::new())),
+            SimilarPanelModel::Empty
+        );
+    }
+
+    #[test]
+    fn difference_lines_contain_facts_only_and_never_the_raw_distance() {
+        let cases = [
+            (ItemKind::Image, SimilarImageFormat::Png, "PNG", "4.20 MB"),
+            (
+                ItemKind::ZipPage,
+                SimilarImageFormat::Jpeg,
+                "JPEG",
+                "書庫 4.20 MB",
+            ),
+            (
+                ItemKind::PdfPage,
+                SimilarImageFormat::Pdf,
+                "PDF",
+                "PDF 4.20 MB",
+            ),
+        ];
+        for (kind, format, format_label, size_label) in cases {
+            let line = similar_difference_line(&hit(kind, format));
+            assert!(line.contains("2400×3200 (この画像は 1200×1600)"));
+            assert!(line.contains(format_label));
+            assert!(line.contains(size_label));
+            assert!(!line.contains("47"), "raw distance leaked: {line}");
+            for forbidden in ["高画質", "推奨", "おすすめ", "残すべき", "上位"] {
+                assert!(!line.contains(forbidden), "evaluative word leaked: {line}");
+            }
+        }
     }
 }
 

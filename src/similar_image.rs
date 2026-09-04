@@ -72,6 +72,32 @@ impl SimilarImageFormat {
             _ => Self::Other,
         }
     }
+
+    pub const fn from_i64(value: i64) -> Self {
+        match value {
+            1 => Self::Jpeg,
+            2 => Self::Png,
+            3 => Self::Gif,
+            4 => Self::WebP,
+            5 => Self::Bmp,
+            6 => Self::Tiff,
+            7 => Self::Pdf,
+            _ => Self::Other,
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Other => "その他",
+            Self::Jpeg => "JPEG",
+            Self::Png => "PNG",
+            Self::Gif => "GIF",
+            Self::WebP => "WebP",
+            Self::Bmp => "BMP",
+            Self::Tiff => "TIFF",
+            Self::Pdf => "PDF",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

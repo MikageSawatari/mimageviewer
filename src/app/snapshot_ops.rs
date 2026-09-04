@@ -1455,7 +1455,7 @@ impl App {
     ///
     /// `load_folder_with_scan` の snapshot guard を bypass するため、`snapshot_internal_nav`
     /// を true にしてから呼ぶ。flag は呼び出し後に false に戻す (= scope guard pattern)。
-    fn snapshot_load_and_open(
+    pub(crate) fn snapshot_load_and_open(
         &mut self,
         folder_path: std::path::PathBuf,
         resume_slideshow: bool,
@@ -1549,13 +1549,31 @@ impl App {
             SnapshotTarget::ZipImage {
                 zip_path,
                 entry_name,
-            } => self.items.iter().position(|it| match it {
-                GridItem::ZipImage {
-                    zip_path: zp,
-                    entry_name: en,
-                } => zp == zip_path && en == entry_name,
-                _ => false,
-            }),
+            } => self
+                .items
+                .iter()
+                .position(|it| match it {
+                    GridItem::ZipImage {
+                        zip_path: zp,
+                        entry_name: en,
+                    } => zp == zip_path && en == entry_name,
+                    _ => false,
+                })
+                .or_else(|| {
+                    // The similar index stores its Windows/ZIP identity case-folded. Preserve
+                    // exact matching for normal snapshot callers, then accept that canonical
+                    // identity as a fallback for a result-row navigation target.
+                    self.items.iter().position(|it| match it {
+                        GridItem::ZipImage {
+                            zip_path: zp,
+                            entry_name: en,
+                        } => {
+                            crate::similar_index::item_key_for_zip_page(zp, en)
+                                == crate::similar_index::item_key_for_zip_page(zip_path, entry_name)
+                        }
+                        _ => false,
+                    })
+                }),
             SnapshotTarget::PdfPage { pdf_path, page_num } => {
                 self.items.iter().position(|it| match it {
                     GridItem::PdfPage {
@@ -2456,6 +2474,15 @@ mod tests {
             app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
                 zip_path: PathBuf::from(r"E:\test\arc.zip"),
                 entry_name: "sub/img.png".into(),
+            }),
+            Some(2)
+        );
+        // Similar-result identity is case-folded; exact lookup misses but canonical fallback lands
+        // on the enumerated entry without doing filesystem work on the UI thread.
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from(r"e:\TEST\ARC.ZIP"),
+                entry_name: "SUB/IMG.PNG".into(),
             }),
             Some(2)
         );
