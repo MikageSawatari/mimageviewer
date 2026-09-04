@@ -2662,6 +2662,38 @@ fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
 }
 
 #[test]
+fn update_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = update_perf_start_with(false, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in UpdatePerfStage::ALL {
+        mark_update_perf(&mut recorder, stage);
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+}
+
+#[test]
+fn update_perf_stages_plus_unaccounted_equal_total() {
+    let started_at = std::time::Instant::now();
+    let mut recorder = UpdatePerfRecorder::new(started_at);
+    let mut elapsed = std::time::Duration::ZERO;
+    for (index, stage) in UpdatePerfStage::ALL.into_iter().enumerate() {
+        elapsed += std::time::Duration::from_millis(index as u64 + 1);
+        recorder.mark_at(stage, started_at + elapsed);
+    }
+    let expected_unaccounted = std::time::Duration::from_millis(7);
+    let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+    let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+
+    assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+    assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+}
+
+#[test]
 fn metadata_import_terminal_index_build_is_split_and_compact() {
     let mut app = phase_c_support::setup_app();
     let root = PathBuf::from("C:/Pictures");

@@ -83,6 +83,186 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
+const FS_RENDER_PERF_STAGE_COUNT: usize = 11;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsRenderPerfStage {
+    FrameStart,
+    HarvestPageDims,
+    ReconcileFullscreenPageSlice,
+    FsPageTurnDecisionForFrame,
+    PageTurnTargetLoadAndPrefetchWindow,
+    PollPrefetch,
+    NativeVideoBackdrop,
+    StatePrecompute,
+    ViewportPreparation,
+    ViewportRender,
+    Tail,
+}
+
+impl FsRenderPerfStage {
+    const ALL: [Self; FS_RENDER_PERF_STAGE_COUNT] = [
+        Self::FrameStart,
+        Self::HarvestPageDims,
+        Self::ReconcileFullscreenPageSlice,
+        Self::FsPageTurnDecisionForFrame,
+        Self::PageTurnTargetLoadAndPrefetchWindow,
+        Self::PollPrefetch,
+        Self::NativeVideoBackdrop,
+        Self::StatePrecompute,
+        Self::ViewportPreparation,
+        Self::ViewportRender,
+        Self::Tail,
+    ];
+}
+
+#[derive(Debug)]
+struct FsRenderPerfRecorder {
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    next_stage: usize,
+}
+
+impl FsRenderPerfRecorder {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
+            next_stage: 0,
+        }
+    }
+
+    fn mark(&mut self, stage: FsRenderPerfStage) {
+        self.mark_at(stage, std::time::Instant::now());
+    }
+
+    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant) {
+        debug_assert_eq!(
+            FsRenderPerfStage::ALL.get(self.next_stage).copied(),
+            Some(stage)
+        );
+        self.stage_ms[stage as usize] =
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+        self.next_stage += 1;
+    }
+
+    fn finish(self) -> FsRenderPerfBreakdown {
+        self.finish_at(std::time::Instant::now())
+    }
+
+    fn finish_at(mut self, finished_at: std::time::Instant) -> FsRenderPerfBreakdown {
+        // `render_fullscreen_viewport` has intentional early returns. Attribute the interval up
+        // to that return to the currently active stage and leave later stages at zero.
+        if self.next_stage < FS_RENDER_PERF_STAGE_COUNT {
+            self.stage_ms[self.next_stage] =
+                finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.next_stage += 1;
+        }
+        debug_assert!(self.next_stage <= FS_RENDER_PERF_STAGE_COUNT);
+
+        let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
+        let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        FsRenderPerfBreakdown {
+            total_ms,
+            stage_ms: self.stage_ms,
+            unaccounted_ms: total_ms - accounted_ms,
+        }
+    }
+}
+
+#[inline]
+fn fs_render_perf_start_with(
+    perf_on: bool,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<FsRenderPerfRecorder> {
+    perf_on.then(now).map(FsRenderPerfRecorder::new)
+}
+
+#[inline]
+fn mark_fs_render_perf(recorder: &mut Option<FsRenderPerfRecorder>, stage: FsRenderPerfStage) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[inline]
+fn finish_fs_render_perf(
+    recorder: &mut Option<FsRenderPerfRecorder>,
+    frame_number: u64,
+    input_seq: u64,
+    fs_idx: Option<usize>,
+) {
+    if let Some(recorder) = recorder.take() {
+        let breakdown = recorder.finish();
+        if breakdown.total_ms > 8.0 {
+            breakdown.emit(frame_number, input_seq, fs_idx);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FsRenderPerfBreakdown {
+    total_ms: f64,
+    stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    unaccounted_ms: f64,
+}
+
+impl FsRenderPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, FsRenderPerfStage); FS_RENDER_PERF_STAGE_COUNT] = [
+        ("frame_start_ms", FsRenderPerfStage::FrameStart),
+        ("harvest_page_dims_ms", FsRenderPerfStage::HarvestPageDims),
+        (
+            "reconcile_fullscreen_page_slice_ms",
+            FsRenderPerfStage::ReconcileFullscreenPageSlice,
+        ),
+        (
+            "fs_page_turn_decision_for_frame_ms",
+            FsRenderPerfStage::FsPageTurnDecisionForFrame,
+        ),
+        (
+            "page_turn_target_load_and_prefetch_window_ms",
+            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
+        ),
+        ("poll_prefetch_ms", FsRenderPerfStage::PollPrefetch),
+        (
+            "native_video_backdrop_ms",
+            FsRenderPerfStage::NativeVideoBackdrop,
+        ),
+        ("state_precompute_ms", FsRenderPerfStage::StatePrecompute),
+        (
+            "viewport_preparation_ms",
+            FsRenderPerfStage::ViewportPreparation,
+        ),
+        ("viewport_render_ms", FsRenderPerfStage::ViewportRender),
+        ("tail_ms", FsRenderPerfStage::Tail),
+    ];
+
+    fn emit(&self, frame_number: u64, input_seq: u64, fs_idx: Option<usize>) {
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 4);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push((
+            "idx",
+            fs_idx.map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        for (field, stage) in Self::EVENT_FIELDS {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+        }
+        extras.push((
+            "unaccounted_ms",
+            serde_json::Value::from(self.unaccounted_ms),
+        ));
+        crate::perf::event("ui", "fs_render_breakdown", None, input_seq, &extras);
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetachedViewportBuilderVisibility {
@@ -14897,6 +15077,8 @@ impl App {
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
+        let mut fs_render_perf =
+            fs_render_perf_start_with(crate::perf::is_enabled(), std::time::Instant::now);
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -14908,15 +15090,31 @@ impl App {
             if self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active() {
                 self.render_embedded_fs_nav_holdover(ctx);
             }
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                None,
+            );
             return;
         };
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FrameStart);
 
         self.harvest_page_dims();
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HarvestPageDims);
         self.reconcile_fullscreen_page_slice(fs_idx);
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::ReconcileFullscreenPageSlice,
+        );
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
         let stop_page_needs_load =
             matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::FsPageTurnDecisionForFrame,
+        );
         if self
             .ensure_fs_page_turn_target_load(page_turn_decision, fs_idx)
             .is_some()
@@ -14928,11 +15126,16 @@ impl App {
                 self.update_prefetch_window(fs_idx);
             }
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
+        );
 
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
         self.poll_prefetch(ctx);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::PollPrefetch);
 
         // ── 状態の事前計算 ──
         // 動画フルスクリーンの黒 backdrop は **presenter HWND が未確定の起動中だけ**
@@ -14959,8 +15162,15 @@ impl App {
             } else {
                 self.hide_native_video_black_backdrop_if_shown(ctx);
             }
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                Some(fs_idx),
+            );
             return;
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::NativeVideoBackdrop);
 
         self.advance_animation(ctx, fs_idx);
         // 見開きペアを 1 回だけ解決し、以降のフレーム処理で再利用する
@@ -15016,6 +15226,7 @@ impl App {
         let hint_start_before = self.fs_boundary_hint.map(|h| h.started_at());
         let mut had_user_input_in_frame = false;
         let prev_foreground_hwnd = self.fs_prev_foreground_hwnd;
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::StatePrecompute);
 
         // ── ビューポート構築 ──
         #[cfg(windows)]
@@ -15203,6 +15414,7 @@ impl App {
             // window の表示フェード露出を動画 backdrop と同じ手順で避ける。
             fs_builder = fs_builder.with_visible(false);
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::ViewportPreparation);
         let fs_viewport_t0 = std::time::Instant::now();
         let mut fs_setup_ms = 0.0_f64;
         let mut fs_input_ms = 0.0_f64;
@@ -17184,6 +17396,7 @@ impl App {
             }
         }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::ViewportRender);
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
             let fs_outer_ms = (fs_viewport_ms - fs_closure_ms).max(0.0);
             let fs_closure_tracked_ms = fs_setup_ms + fs_central_ms + fs_vst_manager_ms;
@@ -17343,6 +17556,13 @@ impl App {
             }
         }
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::Tail);
+        finish_fs_render_perf(
+            &mut fs_render_perf,
+            self.frame_counter,
+            self.input_seq,
+            Some(fs_idx),
+        );
     }
 
     // ── 状態準備ヘルパー ────────────────────────────────────────────────
@@ -38094,6 +38314,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fs_render_perf_timer_does_not_read_clock_when_disabled() {
+        let clock_called = std::cell::Cell::new(false);
+        let mut recorder = fs_render_perf_start_with(false, || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        });
+        for stage in FsRenderPerfStage::ALL {
+            mark_fs_render_perf(&mut recorder, stage);
+        }
+        finish_fs_render_perf(&mut recorder, 0, 0, None);
+
+        assert!(recorder.is_none());
+        assert!(!clock_called.get());
+    }
+
+    #[test]
+    fn fs_render_perf_stages_plus_unaccounted_equal_total() {
+        let started_at = std::time::Instant::now();
+        let mut recorder = FsRenderPerfRecorder::new(started_at);
+        let mut elapsed = std::time::Duration::ZERO;
+        for (index, stage) in FsRenderPerfStage::ALL.into_iter().enumerate() {
+            elapsed += std::time::Duration::from_millis(index as u64 + 1);
+            recorder.mark_at(stage, started_at + elapsed);
+        }
+        let expected_unaccounted = std::time::Duration::from_millis(7);
+        let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+        let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+
+        assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+        assert!(
+            (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+    }
 
     /// 全画面まわりで「いま居る場所」を聞く側が、復元先の矩形を読んでいないこと。
     ///

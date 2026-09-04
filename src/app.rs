@@ -5565,6 +5565,255 @@ use crate::thumb_loader::{
     read_exif_orientation_from_bytes,
 };
 
+const UPDATE_PERF_STAGE_COUNT: usize = 23;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePerfStage {
+    FrameStart,
+    StartupAndSetup,
+    InitialWorkerPolls,
+    ThumbnailPolls,
+    KeepRangeAndRequests,
+    PrefetchPoll,
+    MediaAndEditPolls,
+    SearchAndMetadataPolls,
+    OtherWorkerPolls,
+    FullscreenWork,
+    TitleAndModifiers,
+    Input,
+    DetachedViewportManagement,
+    FullscreenViewport,
+    ViewportNavigation,
+    NativeVideo,
+    MenusAndDialogs,
+    ToolbarAndInput,
+    PreGrid,
+    Grid,
+    PostGrid,
+    Navigation,
+    Tail,
+}
+
+impl UpdatePerfStage {
+    const ALL: [Self; UPDATE_PERF_STAGE_COUNT] = [
+        Self::FrameStart,
+        Self::StartupAndSetup,
+        Self::InitialWorkerPolls,
+        Self::ThumbnailPolls,
+        Self::KeepRangeAndRequests,
+        Self::PrefetchPoll,
+        Self::MediaAndEditPolls,
+        Self::SearchAndMetadataPolls,
+        Self::OtherWorkerPolls,
+        Self::FullscreenWork,
+        Self::TitleAndModifiers,
+        Self::Input,
+        Self::DetachedViewportManagement,
+        Self::FullscreenViewport,
+        Self::ViewportNavigation,
+        Self::NativeVideo,
+        Self::MenusAndDialogs,
+        Self::ToolbarAndInput,
+        Self::PreGrid,
+        Self::Grid,
+        Self::PostGrid,
+        Self::Navigation,
+        Self::Tail,
+    ];
+}
+
+#[derive(Debug)]
+struct UpdatePerfRecorder {
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
+    next_stage: usize,
+    /// The fullscreen viewport stage split further, because it turned out to hold 57% of a
+    /// stall while the paint closure inside it explained only a quarter of that. The same
+    /// four spans are already computed for `slow_frame_breakdown`, but that event is emitted
+    /// on the grid path, which fullscreen returns before reaching - so it fired once in a
+    /// whole session. These carry the same numbers onto the event that does fire.
+    fullscreen_split_ms: [f64; 4],
+}
+
+impl UpdatePerfRecorder {
+    fn new(started_at: std::time::Instant) -> Self {
+        Self {
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; UPDATE_PERF_STAGE_COUNT],
+            fullscreen_split_ms: [0.0; 4],
+            next_stage: 0,
+        }
+    }
+
+    fn mark(&mut self, stage: UpdatePerfStage) {
+        self.mark_at(stage, std::time::Instant::now());
+    }
+
+    fn mark_at(&mut self, stage: UpdatePerfStage, now: std::time::Instant) {
+        debug_assert_eq!(
+            UpdatePerfStage::ALL.get(self.next_stage).copied(),
+            Some(stage)
+        );
+        self.stage_ms[stage as usize] =
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+        self.next_stage += 1;
+    }
+
+    fn finish(self) -> UpdatePerfBreakdown {
+        self.finish_at(std::time::Instant::now())
+    }
+
+    fn finish_at(mut self, finished_at: std::time::Instant) -> UpdatePerfBreakdown {
+        // `update_frame` has several intentional early returns. Attribute the interval up to
+        // that return to the currently active stage and leave later, unvisited stages at zero.
+        if self.next_stage < UPDATE_PERF_STAGE_COUNT {
+            self.stage_ms[self.next_stage] =
+                finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.next_stage += 1;
+        }
+        debug_assert!(self.next_stage <= UPDATE_PERF_STAGE_COUNT);
+
+        let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
+        let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        UpdatePerfBreakdown {
+            total_ms,
+            stage_ms: self.stage_ms,
+            unaccounted_ms: total_ms - accounted_ms,
+            fullscreen_split_ms: self.fullscreen_split_ms,
+        }
+    }
+}
+
+#[inline]
+fn update_perf_start_with(
+    perf_on: bool,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<UpdatePerfRecorder> {
+    perf_on.then(now).map(UpdatePerfRecorder::new)
+}
+
+/// Records how the fullscreen viewport stage divides, in the order the spans occur.
+#[inline]
+fn note_update_perf_fullscreen_split(
+    recorder: &mut Option<UpdatePerfRecorder>,
+    keep_alive_ms: f64,
+    main_viewport_ms: f64,
+    detached_windows_ms: f64,
+    detached_backstop_ms: f64,
+) {
+    if let Some(recorder) = recorder {
+        recorder.fullscreen_split_ms = [
+            keep_alive_ms,
+            main_viewport_ms,
+            detached_windows_ms,
+            detached_backstop_ms,
+        ];
+    }
+}
+
+#[inline]
+fn mark_update_perf(recorder: &mut Option<UpdatePerfRecorder>, stage: UpdatePerfStage) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[inline]
+fn finish_update_perf(recorder: &mut Option<UpdatePerfRecorder>, frame_number: u64) {
+    if let Some(recorder) = recorder.take() {
+        let breakdown = recorder.finish();
+        if breakdown.total_ms > 8.0 {
+            breakdown.emit(frame_number);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UpdatePerfBreakdown {
+    total_ms: f64,
+    stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
+    unaccounted_ms: f64,
+    fullscreen_split_ms: [f64; 4],
+}
+
+impl UpdatePerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, UpdatePerfStage); UPDATE_PERF_STAGE_COUNT] = [
+        ("frame_start_ms", UpdatePerfStage::FrameStart),
+        ("startup_and_setup_ms", UpdatePerfStage::StartupAndSetup),
+        (
+            "initial_worker_polls_ms",
+            UpdatePerfStage::InitialWorkerPolls,
+        ),
+        ("thumbnail_polls_ms", UpdatePerfStage::ThumbnailPolls),
+        (
+            "keep_range_and_requests_ms",
+            UpdatePerfStage::KeepRangeAndRequests,
+        ),
+        ("prefetch_poll_ms", UpdatePerfStage::PrefetchPoll),
+        (
+            "media_and_edit_polls_ms",
+            UpdatePerfStage::MediaAndEditPolls,
+        ),
+        (
+            "search_and_metadata_polls_ms",
+            UpdatePerfStage::SearchAndMetadataPolls,
+        ),
+        ("other_worker_polls_ms", UpdatePerfStage::OtherWorkerPolls),
+        ("fullscreen_work_ms", UpdatePerfStage::FullscreenWork),
+        ("title_and_modifiers_ms", UpdatePerfStage::TitleAndModifiers),
+        ("input_ms", UpdatePerfStage::Input),
+        (
+            "detached_viewport_management_ms",
+            UpdatePerfStage::DetachedViewportManagement,
+        ),
+        (
+            "fullscreen_viewport_ms",
+            UpdatePerfStage::FullscreenViewport,
+        ),
+        (
+            "viewport_navigation_ms",
+            UpdatePerfStage::ViewportNavigation,
+        ),
+        ("native_video_ms", UpdatePerfStage::NativeVideo),
+        ("menus_and_dialogs_ms", UpdatePerfStage::MenusAndDialogs),
+        ("toolbar_and_input_ms", UpdatePerfStage::ToolbarAndInput),
+        ("pre_grid_ms", UpdatePerfStage::PreGrid),
+        ("grid_ms", UpdatePerfStage::Grid),
+        ("post_grid_ms", UpdatePerfStage::PostGrid),
+        ("navigation_ms", UpdatePerfStage::Navigation),
+        ("tail_ms", UpdatePerfStage::Tail),
+    ];
+
+    fn emit(&self, frame_number: u64) {
+        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT + 3);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        for (field, stage) in Self::EVENT_FIELDS {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+        }
+        extras.push((
+            "unaccounted_ms",
+            serde_json::Value::from(self.unaccounted_ms),
+        ));
+        for (field, value) in [
+            ("fs_keep_alive_ms", self.fullscreen_split_ms[0]),
+            ("fs_main_viewport_ms", self.fullscreen_split_ms[1]),
+            ("fs_detached_windows_ms", self.fullscreen_split_ms[2]),
+            ("fs_detached_backstop_ms", self.fullscreen_split_ms[3]),
+        ] {
+            extras.push((field, serde_json::Value::from(value)));
+        }
+        crate::perf::event("ui", "update_breakdown", None, 0, &extras);
+    }
+}
+
 const PRE_GRID_PERF_STAGE_COUNT: usize = 14;
 
 #[repr(usize)]
@@ -67621,6 +67870,8 @@ impl App {
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
     /// 呼び出し側 (`update`) へ置く。
     fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let update_perf_on = crate::perf::is_enabled();
+        let mut update_perf = update_perf_start_with(update_perf_on, std::time::Instant::now);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
@@ -68019,6 +68270,8 @@ impl App {
             }
         }
 
+        mark_update_perf(&mut update_perf, UpdatePerfStage::FrameStart);
+
         // ===== 起動オーバーレイ =====
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
@@ -68063,6 +68316,7 @@ impl App {
                 self.render_startup_overlay(ctx);
                 self.consume_input_during_startup(ctx);
                 ctx.request_repaint();
+                finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
             // Ready に遷移したフレーム: Loading 中に積もった入力イベントが
@@ -68202,6 +68456,8 @@ impl App {
         // 毎フレームリセット: 選択セルが描画された時に再設定される
         self.selected_cell_rect = None;
 
+        mark_update_perf(&mut update_perf, UpdatePerfStage::StartupAndSetup);
+
         let frame_t0 = std::time::Instant::now();
 
         // late-frame で items が入れ替わった経路を tail で検出して次フレーム repaint を
@@ -68217,24 +68473,28 @@ impl App {
         self.poll_content_identity_restore(ctx);
         self.reconcile_pinned_adjustment_refreshes();
         self.poll_smart_folder_metadata_refresh(ctx);
+        mark_update_perf(&mut update_perf, UpdatePerfStage::InitialWorkerPolls);
         self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
         self.reconcile_edit_preview_refreshes(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。
         self.poll_fs_nav_lock(ctx);
         let t_poll = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::ThumbnailPolls);
 
         self.update_thumbnail_frame_bookkeeping(ctx, frame_t0);
         // 会計はここで出す。update の tail はフルスクリーン中に early return で
         // 飛ばされるため、tail に置くと「測りたいフルスクリーン中」だけ欠測する。
         self.emit_vram_accounting_if_due(std::time::Instant::now());
         let t_keep = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::KeepRangeAndRequests);
 
         // keep_range が確定した直後に可視範囲分のタグ prewarm を push。
         // スクロールすると新しく入ってきた idx 分が少しずつキューに積まれる。
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
+        mark_update_perf(&mut update_perf, UpdatePerfStage::PrefetchPoll);
         self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_final_ai(ctx);
@@ -68244,6 +68504,7 @@ impl App {
         self.poll_local_adjust_prefix_preview(ctx);
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
+        mark_update_perf(&mut update_perf, UpdatePerfStage::MediaAndEditPolls);
         self.poll_search(ctx);
         self.poll_facet_name_debounce(ctx);
         self.poll_facet_name_cache(ctx);
@@ -68258,6 +68519,7 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.poll_metadata_load();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::SearchAndMetadataPolls);
         // スタックスクリプト (ワーカー) の結果を取り込み、完了したら集約ビューへ差し替える。
         self.poll_stack_script(ctx);
         self.poll_subfolder_expansion(ctx);
@@ -68352,6 +68614,7 @@ impl App {
             ctx.request_repaint();
         }
         let t_background_polls = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::OtherWorkerPolls);
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
@@ -68426,6 +68689,7 @@ impl App {
             }
         }
         let t_fullscreen_work = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::FullscreenWork);
 
         // タイトルバーに現在のフォルダパスを表示する。
         // フォルダ未選択時や読み込み途中はアプリ名のみ。
@@ -68462,6 +68726,7 @@ impl App {
         Self::resync_egui_modifiers_from_os(ctx);
 
         let t_title_mods = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::TitleAndModifiers);
 
         // フルスクリーンのキーが main/root 側に届いた場合は、main focus guard より先に
         // 処理する。F11 の window/fullscreen 切替など、main が focused になること自体が
@@ -68518,6 +68783,7 @@ impl App {
             gamepad_outcome = Some(outcome);
         }
         let t_root_input = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::Input);
 
         // ── フルスクリーンビューポート ──────────────────────────────────
         // 非アクティブ時の hidden viewport 維持コストを排除する仕組みは
@@ -68533,6 +68799,10 @@ impl App {
         self.drain_deferred_detached_activation_watcher(ctx);
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
+        mark_update_perf(
+            &mut update_perf,
+            UpdatePerfStage::DetachedViewportManagement,
+        );
         #[cfg(windows)]
         let active_detached_context_updated = {
             let update =
@@ -68650,6 +68920,14 @@ impl App {
         self.render_active_detached_viewport_backstop(ctx);
         let t_detached_backstop = frame_t0.elapsed();
         let t_render_fullscreen_viewport = t_detached_backstop;
+        note_update_perf_fullscreen_split(
+            &mut update_perf,
+            (t_keep_fullscreen_viewport - t_root_input).as_secs_f64() * 1000.0,
+            (t_main_fs_viewport - t_keep_fullscreen_viewport).as_secs_f64() * 1000.0,
+            (t_detached_image_windows - t_main_fs_viewport).as_secs_f64() * 1000.0,
+            (t_detached_backstop - t_detached_image_windows).as_secs_f64() * 1000.0,
+        );
+        mark_update_perf(&mut update_perf, UpdatePerfStage::FullscreenViewport);
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
         // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
@@ -68665,6 +68943,7 @@ impl App {
                 fullscreen_close_nav = Some(nav);
             } else if self.apply_fullscreen_close_nav_immediate(nav) {
                 ctx.request_repaint();
+                finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
         }
@@ -68673,6 +68952,7 @@ impl App {
             embedded_fs_active_before_render || self.fullscreen_embedded_still_active();
         #[cfg(windows)]
         let still_viewport_enter_suppressed = self.still_fullscreen_viewport_enter_suppressed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::ViewportNavigation);
         #[cfg(windows)]
         self.ensure_native_video_front();
         // 音声 VST シェル (Inc 6 ②-3): ensure_native_video_front が presenter HWND を
@@ -68796,6 +69076,7 @@ impl App {
                     "early_return",
                     "reason=native_main_backdrop main_ui=false repaint_after=16ms",
                 );
+                finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
             self.sync_native_video_main_cloak(false);
@@ -68807,6 +69088,7 @@ impl App {
                     "early_return",
                     "reason=still_viewport_enter_suppressed main_ui=holdover",
                 );
+                finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
 
@@ -68830,6 +69112,7 @@ impl App {
                 if let Some(nav) = fullscreen_close_nav.take() {
                     if self.apply_fullscreen_close_nav_immediate(nav) {
                         ctx.request_repaint();
+                        finish_update_perf(&mut update_perf, self.frame_counter);
                         return;
                     }
                 }
@@ -68875,9 +69158,12 @@ impl App {
                         self.fs_nav_deferred_reopen_wait_active()
                     ),
                 );
+                finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
         }
+
+        mark_update_perf(&mut update_perf, UpdatePerfStage::NativeVideo);
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
         // サムネ補正テクスチャを全無効化する (次フレームに visible は同期適用、
@@ -68999,6 +69285,7 @@ impl App {
         // ZIP enumerate worker 結果待ちの repaint 駆動は tail repaint reasons の
         // `zip_enumerate_pending` 経由で行う (PDF と同様)。
         let t_menus_dialogs = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::MenusAndDialogs);
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
@@ -69277,6 +69564,7 @@ impl App {
             }
         }
         let t_toolbar_input = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::ToolbarAndInput);
 
         let perf_on = crate::perf::is_enabled();
         let mut pre_grid_perf = pre_grid_perf_start_with(perf_on, std::time::Instant::now);
@@ -69351,11 +69639,13 @@ impl App {
         let pre_grid_perf = pre_grid_perf.map(|recorder| {
             recorder.finish(details_column_menu_open, folder_pane_blocks_grid_scroll)
         });
+        mark_update_perf(&mut update_perf, UpdatePerfStage::PreGrid);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::Grid);
         self.reconcile_details_lazy_session_after_grid(ctx);
         #[cfg(windows)]
         self.log_main_flash_probe(
@@ -69394,6 +69684,8 @@ impl App {
                 self.reload_current_folder_preserving_override();
             }
         }
+
+        mark_update_perf(&mut update_perf, UpdatePerfStage::PostGrid);
 
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
         // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
@@ -69655,6 +69947,7 @@ impl App {
         }
         #[cfg(windows)]
         self.sync_detached_viewer_to_selected(ctx);
+        mark_update_perf(&mut update_perf, UpdatePerfStage::Navigation);
 
         // 実際に進行中のサムネイル作業がある間だけ repaint を駆動する。
         // 範囲外の `Pending` は「まだ先読み対象に入っていない」正常状態なので、
@@ -70120,6 +70413,8 @@ impl App {
         // 確定してから spawn 境界を ACK する。progress より後に積まれた新要求は
         // UI checkpoint 未通過なので次 frame まで ACK されない。
         self.authorize_external_tool_launch_boundaries_after_ui();
+        mark_update_perf(&mut update_perf, UpdatePerfStage::Tail);
+        finish_update_perf(&mut update_perf, self.frame_counter);
     }
 }
 
