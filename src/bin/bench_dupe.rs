@@ -87,7 +87,8 @@ struct BooksConfigRecord {
     max_books_per_page: u32,
     min_quality: u8,
     coverage_threshold: f32,
-    coverage_is_placeholder: bool,
+    #[serde(default = "legacy_min_matched_pages")]
+    min_matched_pages: u32,
     render_long_edge: Option<u32>,
     book_count: usize,
     page_count: usize,
@@ -350,7 +351,7 @@ fn usage() -> String {
          bench_dupe pdf-scan --dir DIR [--recursive] --out FILE \
          [--render-long-edge N] [--limit-books N] [--max-pages-per-book N]\n  \
          bench_dupe books --in FILE --out FILE [--group-by-directory] [--radius N] [--k N] \
-         [--min-quality N] [--coverage X]\n  \
+         [--min-quality N] [--coverage X] [--min-matched-pages N]\n  \
          bench_dupe books-report --in FILE --out FILE\n  \
          bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
          bench_dupe synth --dir DIR --out FILE [--recursive] [--limit N] \
@@ -976,12 +977,17 @@ fn legacy_book_grouping() -> String {
     "Unspecified grouping from a legacy relations JSONL file.".to_owned()
 }
 
+fn legacy_min_matched_pages() -> u32 {
+    // Before this field existed, every emitted candidate with one aligned page
+    // could be classified by coverage, so legacy relation files imply a floor of 1.
+    1
+}
+
 fn run_books(args: &[String]) -> Result<()> {
     let mut input = None;
     let mut output = None;
     let mut group_by_directory = false;
     let mut params = dupe::book::Params::default();
-    let mut coverage_is_placeholder = true;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -999,7 +1005,9 @@ fn run_books(args: &[String]) -> Result<()> {
             "--coverage" => {
                 params.coverage_threshold =
                     parse_unit_f32(&take_value(args, &mut index, flag)?, flag)?;
-                coverage_is_placeholder = false;
+            }
+            "--min-matched-pages" => {
+                params.min_matched_pages = parse_u32(&take_value(args, &mut index, flag)?, flag)?
             }
             _ => return Err(format!("unknown books option {flag:?}")),
         }
@@ -1036,7 +1044,7 @@ fn run_books(args: &[String]) -> Result<()> {
         max_books_per_page: params.max_books_per_page,
         min_quality: params.min_quality,
         coverage_threshold: params.coverage_threshold,
-        coverage_is_placeholder,
+        min_matched_pages: params.min_matched_pages,
         render_long_edge,
         book_count: book_meta.len(),
         page_count: pages.len(),
@@ -1088,7 +1096,7 @@ fn run_books(args: &[String]) -> Result<()> {
     write_jsonl(&output, &output_records)?;
     eprintln!(
         "books: books={} pages={} candidate_pairs={} group_by_directory={} radius={} k={} min_quality={} \
-         coverage={:.6} coverage_placeholder={} out={}",
+         coverage={:.6} min_matched_pages={} out={}",
         book_meta.len(),
         pages.len(),
         output_records
@@ -1100,7 +1108,7 @@ fn run_books(args: &[String]) -> Result<()> {
         params.max_books_per_page,
         params.min_quality,
         params.coverage_threshold,
-        coverage_is_placeholder,
+        params.min_matched_pages,
         output.display()
     );
     Ok(())
@@ -1451,21 +1459,18 @@ fn run_books_report(args: &[String]) -> Result<()> {
     )
     .map_err(io_error)?;
     writeln!(writer, "- Minimum quality: {}", config.min_quality).map_err(io_error)?;
-    if config.coverage_is_placeholder {
-        writeln!(
-            writer,
-            "- Coverage cut: {:.6} — **placeholder; this value has not been measured**",
-            config.coverage_threshold
-        )
-        .map_err(io_error)?;
-    } else {
-        writeln!(
-            writer,
-            "- Coverage cut: {:.6} — caller supplied",
-            config.coverage_threshold
-        )
-        .map_err(io_error)?;
-    }
+    writeln!(writer, "- Coverage cut: {:.6}", config.coverage_threshold).map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Minimum matched pages: {}",
+        config.min_matched_pages
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Default calibration basis: coverage 0.5 was measured against 37 Contains results from 511 parent-directory groups / 19,306 real pages. Five matched only 1–2 pages; the other 32 were genuine relations and matched at least 10 pages, which set the default minimum matched-page floor to 3."
+    )
+    .map_err(io_error)?;
     writeln!(
         writer,
         "- PDF render long edge: {}",

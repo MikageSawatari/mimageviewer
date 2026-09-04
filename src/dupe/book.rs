@@ -11,8 +11,8 @@ use super::Sig;
 pub const DEFAULT_RADIUS: u32 = 8;
 pub const DEFAULT_MAX_BOOKS_PER_PAGE: u32 = 8;
 pub const DEFAULT_MIN_QUALITY: u8 = 1;
-/// Measurement placeholder, not a calibrated accept/reject rule.
-pub const DEFAULT_COVERAGE_THRESHOLD: f32 = 0.9;
+pub const DEFAULT_COVERAGE_THRESHOLD: f32 = 0.5;
+pub const DEFAULT_MIN_MATCHED_PAGES: u32 = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BookPage {
@@ -28,6 +28,7 @@ pub struct Params {
     pub max_books_per_page: u32,
     pub min_quality: u8,
     pub coverage_threshold: f32,
+    pub min_matched_pages: u32,
 }
 
 impl Default for Params {
@@ -37,6 +38,7 @@ impl Default for Params {
             max_books_per_page: DEFAULT_MAX_BOOKS_PER_PAGE,
             min_quality: DEFAULT_MIN_QUALITY,
             coverage_threshold: DEFAULT_COVERAGE_THRESHOLD,
+            min_matched_pages: DEFAULT_MIN_MATCHED_PAGES,
         }
     }
 }
@@ -370,11 +372,15 @@ impl<'a> PreparedCorpus<'a> {
         let coverage_b = matched as f32 / stats_b.distinctive_pages as f32;
         let covers_a = coverage_a >= self.params.coverage_threshold;
         let covers_b = coverage_b >= self.params.coverage_threshold;
-        let relation = match (covers_a, covers_b) {
-            (true, true) => Relation::Same,
-            (true, false) => Relation::Contains { whole: b },
-            (false, true) => Relation::Contains { whole: a },
-            (false, false) => Relation::Unrelated,
+        let relation = if matched < self.params.min_matched_pages {
+            Relation::Unrelated
+        } else {
+            match (covers_a, covers_b) {
+                (true, true) => Relation::Same,
+                (true, false) => Relation::Contains { whole: b },
+                (false, true) => Relation::Contains { whole: a },
+                (false, false) => Relation::Unrelated,
+            }
         };
         Ok(BookPair {
             a,
@@ -572,6 +578,7 @@ mod tests {
             max_books_per_page,
             min_quality: 1,
             coverage_threshold: 0.9,
+            min_matched_pages: 1,
         }
     }
 
@@ -614,9 +621,38 @@ mod tests {
                 radius: 8,
                 max_books_per_page: 8,
                 min_quality: 1,
-                coverage_threshold: 0.9,
+                coverage_threshold: 0.5,
+                min_matched_pages: 3,
             }
         );
+    }
+
+    #[test]
+    fn one_matching_page_in_a_two_page_book_needs_a_lowered_match_floor() {
+        let mut pages = vec![page(1, 0, 7), page(1, 1, 8)];
+        for index in 0..10 {
+            let content = if index == 0 { 7 } else { 100 + index };
+            pages.push(page(2, index, content));
+        }
+
+        let default_pair = classify_pair(&pages, Params::default(), 1, 2).unwrap();
+        assert_eq!(default_pair.matched, 1);
+        assert_eq!(default_pair.coverage_a, 0.5);
+        assert_eq!(default_pair.coverage_b, 0.1);
+        assert_eq!(default_pair.relation, Relation::Unrelated);
+
+        let lowered_floor = classify_pair(
+            &pages,
+            Params {
+                min_matched_pages: 1,
+                ..Params::default()
+            },
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(lowered_floor.matched, 1);
+        assert_eq!(lowered_floor.relation, Relation::Contains { whole: 2 });
     }
 
     #[test]
