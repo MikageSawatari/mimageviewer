@@ -80,6 +80,8 @@ enum BooksRecord {
 struct BooksConfigRecord {
     schema_version: u32,
     input: PathBuf,
+    #[serde(default = "legacy_book_grouping")]
+    book_grouping: String,
     algorithm: String,
     radius: u32,
     max_books_per_page: u32,
@@ -347,7 +349,7 @@ fn usage() -> String {
          [--limit-books N] [--max-pages-per-book N]\n  \
          bench_dupe pdf-scan --dir DIR [--recursive] --out FILE \
          [--render-long-edge N] [--limit-books N] [--max-pages-per-book N]\n  \
-         bench_dupe books --in FILE --out FILE [--radius N] [--k N] \
+         bench_dupe books --in FILE --out FILE [--group-by-directory] [--radius N] [--k N] \
          [--min-quality N] [--coverage X]\n  \
          bench_dupe books-report --in FILE --out FILE\n  \
          bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
@@ -960,9 +962,24 @@ struct InputBookMeta {
     scanned_page_count: u32,
 }
 
+struct PreparedBooksInput {
+    book_meta: BTreeMap<u32, InputBookMeta>,
+    pages: Vec<dupe::book::BookPage>,
+    render_long_edge: Option<u32>,
+    book_grouping: String,
+}
+
+const PDF_BOOK_GROUPING: &str = "PDF document path (one PDF file per measured book).";
+const PARENT_DIRECTORY_BOOK_GROUPING: &str = "Parent-directory approximation: each image's immediate parent directory is treated as one measured book, with pages ordered by path. This approximates mIV's image-only-book rule (the deepest folder containing only images and no subfolders); it is not the product grouping rule.";
+
+fn legacy_book_grouping() -> String {
+    "Unspecified grouping from a legacy relations JSONL file.".to_owned()
+}
+
 fn run_books(args: &[String]) -> Result<()> {
     let mut input = None;
     let mut output = None;
+    let mut group_by_directory = false;
     let mut params = dupe::book::Params::default();
     let mut coverage_is_placeholder = true;
     let mut index = 0;
@@ -971,6 +988,7 @@ fn run_books(args: &[String]) -> Result<()> {
         match flag {
             "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
             "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--group-by-directory" => group_by_directory = true,
             "--radius" => params.radius = parse_u32(&take_value(args, &mut index, flag)?, flag)?,
             "--k" => {
                 params.max_books_per_page = parse_u32(&take_value(args, &mut index, flag)?, flag)?
@@ -989,8 +1007,107 @@ fn run_books(args: &[String]) -> Result<()> {
     }
     let input = input.ok_or_else(|| "books requires --in".to_owned())?;
     let output = output.ok_or_else(|| "books requires --out".to_owned())?;
-    let page_records: Vec<PdfPageRecord> = read_jsonl(&input)?;
+    let prepared = if group_by_directory {
+        prepare_directory_books_input(&input)?
+    } else {
+        prepare_pdf_books_input(&input)?
+    };
+    let PreparedBooksInput {
+        book_meta,
+        pages,
+        render_long_edge,
+        book_grouping,
+    } = prepared;
 
+    let analysis = dupe::book::analyze(&pages, params)
+        .map_err(|error| format!("analyze books in {}: {error}", input.display()))?;
+    let stats = analysis
+        .books
+        .iter()
+        .map(|stats| (stats.book, stats))
+        .collect::<BTreeMap<_, _>>();
+    let mut output_records = Vec::with_capacity(1 + book_meta.len() + analysis.pairs.len());
+    output_records.push(BooksRecord::Config(BooksConfigRecord {
+        schema_version: SCHEMA_VERSION,
+        input: input.clone(),
+        book_grouping,
+        algorithm: "Pdq256".to_owned(),
+        radius: params.radius,
+        max_books_per_page: params.max_books_per_page,
+        min_quality: params.min_quality,
+        coverage_threshold: params.coverage_threshold,
+        coverage_is_placeholder,
+        render_long_edge,
+        book_count: book_meta.len(),
+        page_count: pages.len(),
+    }));
+    for (&book, meta) in &book_meta {
+        let stats = stats
+            .get(&book)
+            .copied()
+            .expect("every input book has analysis stats");
+        let undecidable_reason = (stats.distinctive_pages == 0).then(|| {
+            format!(
+                "no distinctive pages (featureless={}, common={})",
+                stats.featureless_pages, stats.common_pages
+            )
+        });
+        output_records.push(BooksRecord::Book(BooksBookRecord {
+            schema_version: SCHEMA_VERSION,
+            book,
+            path: meta.path.clone(),
+            declared_page_count: meta.declared_page_count,
+            scanned_page_count: meta.scanned_page_count,
+            distinctive_pages: stats.distinctive_pages,
+            featureless_pages: stats.featureless_pages,
+            common_pages: stats.common_pages,
+            undecidable_reason,
+        }));
+    }
+    for pair in analysis.pairs {
+        let (relation, whole) = match pair.relation {
+            dupe::book::Relation::Same => ("same", None),
+            dupe::book::Relation::Contains { whole } => ("contains", Some(whole)),
+            dupe::book::Relation::Unrelated => ("unrelated", None),
+            dupe::book::Relation::Undecidable => ("undecidable", None),
+        };
+        output_records.push(BooksRecord::Pair(BooksPairRecord {
+            schema_version: SCHEMA_VERSION,
+            a: pair.a,
+            b: pair.b,
+            relation: relation.to_owned(),
+            whole,
+            matched: pair.matched,
+            distinctive_a: pair.distinctive_a,
+            distinctive_b: pair.distinctive_b,
+            coverage_a: pair.coverage_a,
+            coverage_b: pair.coverage_b,
+            alignment: pair.alignment,
+        }));
+    }
+    write_jsonl(&output, &output_records)?;
+    eprintln!(
+        "books: books={} pages={} candidate_pairs={} group_by_directory={} radius={} k={} min_quality={} \
+         coverage={:.6} coverage_placeholder={} out={}",
+        book_meta.len(),
+        pages.len(),
+        output_records
+            .iter()
+            .filter(|record| matches!(record, BooksRecord::Pair(_)))
+            .count(),
+        group_by_directory,
+        params.radius,
+        params.max_books_per_page,
+        params.min_quality,
+        params.coverage_threshold,
+        coverage_is_placeholder,
+        output.display()
+    );
+    Ok(())
+}
+
+fn prepare_pdf_books_input(input: &Path) -> Result<PreparedBooksInput> {
+    let page_records: Vec<PdfPageRecord> = read_jsonl(input)?;
     let paths = page_records
         .iter()
         .map(|record| record.book_path.clone())
@@ -1086,103 +1203,131 @@ fn run_books(args: &[String]) -> Result<()> {
             input.display()
         ));
     }
-
-    let analysis = dupe::book::analyze(&pages, params)
-        .map_err(|error| format!("analyze books in {}: {error}", input.display()))?;
-    let stats = analysis
-        .books
-        .iter()
-        .map(|stats| (stats.book, stats))
-        .collect::<BTreeMap<_, _>>();
-    let mut output_records = Vec::with_capacity(1 + book_meta.len() + analysis.pairs.len());
-    output_records.push(BooksRecord::Config(BooksConfigRecord {
-        schema_version: SCHEMA_VERSION,
-        input: input.clone(),
-        algorithm: "Pdq256".to_owned(),
-        radius: params.radius,
-        max_books_per_page: params.max_books_per_page,
-        min_quality: params.min_quality,
-        coverage_threshold: params.coverage_threshold,
-        coverage_is_placeholder,
+    Ok(PreparedBooksInput {
+        book_meta,
+        pages,
         render_long_edge: render_edges.first().copied(),
-        book_count: book_meta.len(),
-        page_count: pages.len(),
-    }));
-    for (&book, meta) in &book_meta {
-        let stats = stats
-            .get(&book)
-            .copied()
-            .expect("every input book has analysis stats");
-        let undecidable_reason = (stats.distinctive_pages == 0).then(|| {
+        book_grouping: PDF_BOOK_GROUPING.to_owned(),
+    })
+}
+
+fn prepare_directory_books_input(input: &Path) -> Result<PreparedBooksInput> {
+    let scan_records: Vec<ScanRecord> = read_jsonl(input)?;
+    prepare_directory_book_records(&scan_records, input)
+}
+
+fn prepare_directory_book_records(
+    scan_records: &[ScanRecord],
+    input: &Path,
+) -> Result<PreparedBooksInput> {
+    let mut grouped = BTreeMap::<PathBuf, Vec<&ScanRecord>>::new();
+    let mut seen_paths = HashSet::new();
+    for record in scan_records {
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{} has schema version {}, expected {}",
+                record.path.display(),
+                record.schema_version,
+                SCHEMA_VERSION
+            ));
+        }
+        if record.proxy_version != dupe::PROXY_VERSION {
+            return Err(format!(
+                "{} has proxy version {}, expected {}",
+                record.path.display(),
+                record.proxy_version,
+                dupe::PROXY_VERSION
+            ));
+        }
+        if !seen_paths.insert(record.path.clone()) {
+            return Err(format!(
+                "{} contains duplicate image path {}",
+                input.display(),
+                record.path.display()
+            ));
+        }
+        let parent = record.path.parent().ok_or_else(|| {
             format!(
-                "no distinctive pages (featureless={}, common={})",
-                stats.featureless_pages, stats.common_pages
+                "{} has no parent directory for --group-by-directory",
+                record.path.display()
             )
-        });
-        output_records.push(BooksRecord::Book(BooksBookRecord {
-            schema_version: SCHEMA_VERSION,
+        })?;
+        if parent.as_os_str().is_empty() {
+            return Err(format!(
+                "{} has an empty parent directory for --group-by-directory",
+                record.path.display()
+            ));
+        }
+        grouped
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(record);
+    }
+    if grouped.len() > u32::MAX as usize {
+        return Err("books input contains more than u32::MAX parent directories".to_owned());
+    }
+
+    let mut book_meta = BTreeMap::new();
+    let mut pages = Vec::with_capacity(scan_records.len());
+    for (book_index, (directory, mut records)) in grouped.into_iter().enumerate() {
+        records.sort_by(|left, right| left.path.cmp(&right.path));
+        let book = book_index as u32;
+        let page_count = u32::try_from(records.len()).map_err(|_| {
+            format!(
+                "directory {} contains more than u32::MAX scanned images",
+                directory.display()
+            )
+        })?;
+        book_meta.insert(
             book,
-            path: meta.path.clone(),
-            declared_page_count: meta.declared_page_count,
-            scanned_page_count: meta.scanned_page_count,
-            distinctive_pages: stats.distinctive_pages,
-            featureless_pages: stats.featureless_pages,
-            common_pages: stats.common_pages,
-            undecidable_reason,
-        }));
+            InputBookMeta {
+                path: directory,
+                declared_page_count: page_count,
+                scanned_page_count: page_count,
+            },
+        );
+        for (page_index, record) in records.into_iter().enumerate() {
+            let signature = restore_scan_pdq256(record)?;
+            pages.push(dupe::book::BookPage {
+                book,
+                index: page_index as u32,
+                quality: signature.quality,
+                sig: signature.sig,
+            });
+        }
     }
-    for pair in analysis.pairs {
-        let (relation, whole) = match pair.relation {
-            dupe::book::Relation::Same => ("same", None),
-            dupe::book::Relation::Contains { whole } => ("contains", Some(whole)),
-            dupe::book::Relation::Unrelated => ("unrelated", None),
-            dupe::book::Relation::Undecidable => ("undecidable", None),
-        };
-        output_records.push(BooksRecord::Pair(BooksPairRecord {
-            schema_version: SCHEMA_VERSION,
-            a: pair.a,
-            b: pair.b,
-            relation: relation.to_owned(),
-            whole,
-            matched: pair.matched,
-            distinctive_a: pair.distinctive_a,
-            distinctive_b: pair.distinctive_b,
-            coverage_a: pair.coverage_a,
-            coverage_b: pair.coverage_b,
-            alignment: pair.alignment,
-        }));
-    }
-    write_jsonl(&output, &output_records)?;
-    eprintln!(
-        "books: books={} pages={} candidate_pairs={} radius={} k={} min_quality={} \
-         coverage={:.6} coverage_placeholder={} out={}",
-        book_meta.len(),
-        pages.len(),
-        output_records
-            .iter()
-            .filter(|record| matches!(record, BooksRecord::Pair(_)))
-            .count(),
-        params.radius,
-        params.max_books_per_page,
-        params.min_quality,
-        params.coverage_threshold,
-        coverage_is_placeholder,
-        output.display()
-    );
-    Ok(())
+
+    Ok(PreparedBooksInput {
+        book_meta,
+        pages,
+        render_long_edge: None,
+        book_grouping: PARENT_DIRECTORY_BOOK_GROUPING.to_owned(),
+    })
 }
 
 fn restore_pdf_pdq256(record: &PdfPageRecord) -> Result<Signature> {
-    let matches = record
-        .signatures
+    restore_pdq256(
+        &record.signatures,
+        &format!(
+            "{} page {}",
+            record.book_path.display(),
+            record.page_index + 1
+        ),
+    )
+}
+
+fn restore_scan_pdq256(record: &ScanRecord) -> Result<Signature> {
+    restore_pdq256(&record.signatures, &record.path.display().to_string())
+}
+
+fn restore_pdq256(signatures: &[StoredSignature], context: &str) -> Result<Signature> {
+    let matches = signatures
         .iter()
         .filter(|signature| signature.algo == "Pdq256")
         .collect::<Vec<_>>();
     if matches.len() != 1 {
         return Err(format!(
-            "{} page {} contains {} Pdq256 signatures, expected exactly one",
-            record.book_path.display(),
-            record.page_index + 1,
+            "{context} contains {} Pdq256 signatures, expected exactly one",
             matches.len()
         ));
     }
@@ -1287,6 +1432,16 @@ fn run_books_report(args: &[String]) -> Result<()> {
     writeln!(writer, "## Measurement configuration").map_err(io_error)?;
     writeln!(writer).map_err(io_error)?;
     writeln!(writer, "- Input: {}", markdown_path(&config.input)).map_err(io_error)?;
+    writeln!(writer, "- Book grouping: {}", config.book_grouping).map_err(io_error)?;
+    if config.book_grouping == PARENT_DIRECTORY_BOOK_GROUPING {
+        writeln!(writer).map_err(io_error)?;
+        writeln!(
+            writer,
+            "> **Grouping caveat:** Parent-directory grouping is a measurement approximation. It does not call or replace `folder_scan::is_image_only_book_contents`, and must not be read as the product's book-boundary rule."
+        )
+        .map_err(io_error)?;
+        writeln!(writer).map_err(io_error)?;
+    }
     writeln!(writer, "- Algorithm: {}", config.algorithm).map_err(io_error)?;
     writeln!(writer, "- Radius: {}", config.radius).map_err(io_error)?;
     writeln!(
@@ -3116,6 +3271,38 @@ fn io_error(error: std::io::Error) -> String {
 mod tests {
     use super::*;
 
+    fn scan_record(path: &str, marker: u8, quality: u8) -> ScanRecord {
+        let bits = vec![marker; 32];
+        ScanRecord {
+            schema_version: SCHEMA_VERSION,
+            proxy_version: dupe::PROXY_VERSION,
+            path: PathBuf::from(path),
+            width: 100,
+            height: 200,
+            file_size: 1,
+            extension: "jpg".to_owned(),
+            decode: DecodeInfo {
+                method: "test".to_owned(),
+                scale_num: 8,
+                scale_den: 8,
+                decoded_width: 100,
+                decoded_height: 200,
+                note: None,
+            },
+            decode_ms: 0.0,
+            signature_ms: 0.0,
+            total_ms: 0.0,
+            signatures: vec![StoredSignature {
+                algo: "Pdq256".to_owned(),
+                kind: "bits".to_owned(),
+                hex: encode_hex(&bits),
+                bit_width: Some(256),
+                value_count: None,
+                quality,
+            }],
+        }
+    }
+
     fn jpeg_fixture() -> RgbaImage {
         // Twice the target on the long edge, so the canonical path must scale
         // whatever the target is set to. Sizing this to a literal tied the test
@@ -3177,5 +3364,35 @@ mod tests {
             panic!("Pdq256 must have a Hamming distance");
         };
         assert_eq!(value, expected_distance);
+    }
+
+    #[test]
+    fn scan_records_group_by_parent_and_sort_pages_by_path() {
+        let records = vec![
+            scan_record(r"root\book-b\002.jpg", 3, 33),
+            scan_record(r"root\book-a\010.jpg", 2, 22),
+            scan_record(r"root\book-a\001.jpg", 1, 11),
+        ];
+        let prepared =
+            prepare_directory_book_records(&records, Path::new("fixture.scan.jsonl")).unwrap();
+
+        assert_eq!(prepared.book_meta.len(), 2);
+        assert_eq!(prepared.book_meta[&0].path, PathBuf::from(r"root\book-a"));
+        assert_eq!(prepared.book_meta[&0].declared_page_count, 2);
+        assert_eq!(prepared.book_meta[&1].path, PathBuf::from(r"root\book-b"));
+        assert_eq!(prepared.render_long_edge, None);
+        assert_eq!(prepared.book_grouping, PARENT_DIRECTORY_BOOK_GROUPING);
+
+        let page_keys = prepared
+            .pages
+            .iter()
+            .map(|page| {
+                let Sig::Bits(bits) = &page.sig else {
+                    panic!("Pdq256 must use bits");
+                };
+                (page.book, page.index, page.quality, bits[0])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(page_keys, vec![(0, 0, 11, 1), (0, 1, 22, 2), (1, 0, 33, 3)]);
     }
 }
