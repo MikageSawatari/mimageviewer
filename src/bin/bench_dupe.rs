@@ -5,11 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage, Rgba, RgbaImage};
+use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use mimageviewer::dupe::{self, Algo, LumaMetrics, Proxy, Sig, Signature};
 use mimageviewer::folder_tree::{SUPPORTED_EXTENSIONS, is_apple_double};
 use mimageviewer::pdf_loader::{self, CancelWaitPolicy, JobPriority};
@@ -22,9 +22,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u32 = 1;
-// decode-selfcheck over 400 real JPEGs found this was the smallest measured
-// target with a PDQ-256 median of zero against a full 1/1 decode.
-const JPEG_DCT_TARGET_EDGE: u32 = 1024;
+// Chosen by measurement, not preference. decode-selfcheck over 400 real JPEGs
+// compared each DCT target against a full 1/1 decode; a synth re-run then
+// compared whole tables. 1024 reached a median of zero but left a tail of 10
+// bits and lost one core duplicate of 1840, while 2048 reproduced the full
+// decode exactly (core p99 4, max 8, 1840/1840 within distance 8). A target is
+// kept rather than always decoding whole so that peak memory stays bounded on
+// very large sources.
+const JPEG_DCT_TARGET_EDGE: u32 = 2048;
 const DEFAULT_PDF_RENDER_LONG_EDGE: u32 = 1024;
 const DEFAULT_LARGE_DIFF_THRESHOLD_BIN: u8 = 0;
 
@@ -251,6 +256,13 @@ struct DecodedImage {
     scale_num: u32,
     scale_den: u32,
     note: Option<String>,
+}
+
+struct CanonicalFileProxy {
+    decoded: DecodedImage,
+    proxy: Proxy,
+    decode_ms: f64,
+    proxy_ms: f64,
 }
 
 #[derive(Clone)]
@@ -572,7 +584,7 @@ fn decode_selfcheck_variant(
     label: &'static str,
     target_edge: u32,
 ) -> Result<DecodeSelfcheckVariant> {
-    let decoded = decode_jpeg_for_scan_at_target(path, bytes, target_edge)?;
+    let decoded = decode_jpeg_at_target(path, bytes, target_edge)?;
     let signatures = signatures_from_rgba(&decoded.rgba, decoded.source_dims);
     Ok(DecodeSelfcheckVariant {
         label,
@@ -913,7 +925,7 @@ fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<Pdf
     let rgba = rendered.image.to_rgba8();
     let (render_width, render_height) = rgba.dimensions();
     let signature_start = Instant::now();
-    let proxy = dupe::proxy::build(rgba.as_raw(), render_width, render_height);
+    let proxy = proxy_from_rgba(&rgba, (render_width, render_height));
     let computed = dupe::all_algos()
         .iter()
         .map(|&algo| dupe::compute(algo, &proxy))
@@ -1615,54 +1627,72 @@ fn scan_one(path: &Path) -> Result<ScanRecord> {
     let bytes =
         std::fs::read(path).map_err(|error| format!("read image {}: {error}", path.display()))?;
 
-    let decode_start = Instant::now();
-    let decoded = decode_for_scan(path, &bytes)?;
-    let decode_ms = elapsed_ms(decode_start);
-    let decoded_dims = decoded.rgba.dimensions();
+    let canonical = canonical_proxy_from_file_bytes(path, &bytes)?;
+    let decoded_dims = canonical.decoded.rgba.dimensions();
 
     let signature_start = Instant::now();
-    let mut proxy = dupe::proxy::build(
-        decoded.rgba.as_raw(),
-        decoded.rgba.width(),
-        decoded.rgba.height(),
-    );
-    // A JPEG DCT-scaled decode contains fewer pixels than the source. The
-    // canonical samples come from that explicit decode, while the Proxy
-    // metadata continues to describe the EXIF-oriented source dimensions.
-    proxy.src_width = decoded.source_dims.0;
-    proxy.src_height = decoded.source_dims.1;
     let signatures = dupe::all_algos()
         .iter()
-        .map(|&algo| store_signature(dupe::compute(algo, &proxy)))
+        .map(|&algo| store_signature(dupe::compute(algo, &canonical.proxy)))
         .collect();
-    let signature_ms = elapsed_ms(signature_start);
+    let signature_ms = canonical.proxy_ms + elapsed_ms(signature_start);
 
     Ok(ScanRecord {
         schema_version: SCHEMA_VERSION,
         proxy_version: dupe::PROXY_VERSION,
         path: path.to_path_buf(),
-        width: decoded.source_dims.0,
-        height: decoded.source_dims.1,
+        width: canonical.decoded.source_dims.0,
+        height: canonical.decoded.source_dims.1,
         file_size,
         extension: extension_lower(path),
         decode: DecodeInfo {
-            method: decoded.method,
-            scale_num: decoded.scale_num,
-            scale_den: decoded.scale_den,
+            method: canonical.decoded.method,
+            scale_num: canonical.decoded.scale_num,
+            scale_den: canonical.decoded.scale_den,
             decoded_width: decoded_dims.0,
             decoded_height: decoded_dims.1,
-            note: decoded.note,
+            note: canonical.decoded.note,
         },
-        decode_ms,
+        decode_ms: canonical.decode_ms,
         signature_ms,
         total_ms: elapsed_ms(total_start),
         signatures,
     })
 }
 
-fn decode_for_scan(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
+/// The single file-backed path from encoded bytes to the canonical visual proxy.
+///
+/// Measurement modes must use this function for every signature derived from an
+/// image file. Experimental raw pixels (PDF renders and decode-selfcheck's
+/// deliberately varied DCT targets) enter below this boundary by design.
+fn canonical_proxy_from_file_bytes(path: &Path, bytes: &[u8]) -> Result<CanonicalFileProxy> {
+    let decode_start = Instant::now();
+    let decoded = decode_canonical_file(path, bytes)?;
+    let decode_ms = elapsed_ms(decode_start);
+    let proxy_start = Instant::now();
+    let proxy = proxy_from_rgba(&decoded.rgba, decoded.source_dims);
+    let proxy_ms = elapsed_ms(proxy_start);
+    Ok(CanonicalFileProxy {
+        decoded,
+        proxy,
+        decode_ms,
+        proxy_ms,
+    })
+}
+
+fn proxy_from_rgba(rgba: &RgbaImage, source_dims: (u32, u32)) -> Proxy {
+    let mut proxy = dupe::proxy::build(rgba.as_raw(), rgba.width(), rgba.height());
+    // A JPEG DCT-scaled decode contains fewer pixels than the source. The
+    // canonical samples come from that explicit decode, while the Proxy
+    // metadata continues to describe the EXIF-oriented source dimensions.
+    proxy.src_width = source_dims.0;
+    proxy.src_height = source_dims.1;
+    proxy
+}
+
+fn decode_canonical_file(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
     if matches!(extension_lower(path).as_str(), "jpg" | "jpeg") {
-        return decode_jpeg_for_scan_at_target(path, bytes, JPEG_DCT_TARGET_EDGE);
+        return decode_jpeg_at_target(path, bytes, JPEG_DCT_TARGET_EDGE);
     }
 
     let (image, method, note) = decode_full(path, bytes)?;
@@ -1678,11 +1708,7 @@ fn decode_for_scan(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
     })
 }
 
-fn decode_jpeg_for_scan_at_target(
-    path: &Path,
-    bytes: &[u8],
-    target_edge: u32,
-) -> Result<DecodedImage> {
+fn decode_jpeg_at_target(path: &Path, bytes: &[u8], target_edge: u32) -> Result<DecodedImage> {
     match decode_jpeg_turbo_scaled_from_bytes(bytes, target_edge) {
         Ok((image, stats)) => {
             let orientation = read_exif_orientation_for_source_dims(bytes);
@@ -1724,9 +1750,10 @@ fn selfcheck_pdf_page<W: Write>(writer: &mut W, path: &Path, page_num: u32) -> R
     let render_1024 = render_pdf_page_signatures(path, page_num, 1024)?;
     let render_2048 = render_pdf_page_signatures(path, page_num, 2048)?;
     let jpeg_bytes = encode_jpeg(&render_1024.rgba, 95)?;
-    let jpeg_decoded = decode_for_scan(Path::new("pdf-selfcheck.jpg"), &jpeg_bytes)?;
-    let jpeg_dims = jpeg_decoded.source_dims;
-    let jpeg_signatures = signatures_from_rgba(&jpeg_decoded.rgba, jpeg_dims);
+    let jpeg_canonical =
+        canonical_proxy_from_file_bytes(Path::new("pdf-selfcheck.jpg"), &jpeg_bytes)?;
+    let jpeg_dims = jpeg_canonical.decoded.source_dims;
+    let jpeg_signatures = PreparedSignatures::compute(&jpeg_canonical.proxy);
     let source_path = PathBuf::from(format!("{}::page_{}", path.display(), page_num));
     let mut records = 0;
 
@@ -2307,9 +2334,13 @@ fn run_synth(args: &[String]) -> Result<()> {
     for path in &paths {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("read image {}: {error}", path.display()))?;
-        let rgba = decode_full_oriented(path, &bytes)?;
-        let dims = rgba.dimensions();
-        let original_signatures = signatures_from_rgba(&rgba, dims);
+        let canonical = canonical_proxy_from_file_bytes(path, &bytes)?;
+        let dims = canonical.decoded.source_dims;
+        let original_signatures = PreparedSignatures::compute(&canonical.proxy);
+
+        // This full-resolution decode only supplies pixels from which synthetic
+        // files are generated. It is never used to compute a signature.
+        let rgba = decode_full_oriented_for_synthesis(path, &bytes)?;
 
         for (label, numerator) in [
             ("scale_50pct", 50),
@@ -2329,14 +2360,14 @@ fn run_synth(args: &[String]) -> Result<()> {
         }
 
         for quality in [95u8, 85, 70] {
-            let transformed = jpeg_round_trip(&rgba, quality)?;
-            record_count += emit_related_transform(
+            record_count += emit_jpeg_transform(
                 &mut writer,
                 path,
                 dims,
                 &original_signatures,
                 &format!("jpeg_q{quality}"),
-                &transformed,
+                &rgba,
+                quality,
                 large_diff_threshold_bin,
             )?;
         }
@@ -2344,14 +2375,14 @@ fn run_synth(args: &[String]) -> Result<()> {
         if extension_lower(path) == "png" {
             // The conversion reuses q=95 from the explicitly specified JPEG
             // recompression levels; it does not introduce another quality value.
-            let transformed = jpeg_round_trip(&rgba, 95)?;
-            record_count += emit_related_transform(
+            record_count += emit_jpeg_transform(
                 &mut writer,
                 path,
                 dims,
                 &original_signatures,
                 "png_to_jpeg_q95",
-                &transformed,
+                &rgba,
+                95,
                 large_diff_threshold_bin,
             )?;
         }
@@ -2416,7 +2447,7 @@ fn run_synth(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn decode_full_oriented(path: &Path, bytes: &[u8]) -> Result<RgbaImage> {
+fn decode_full_oriented_for_synthesis(path: &Path, bytes: &[u8]) -> Result<RgbaImage> {
     let image = if matches!(extension_lower(path).as_str(), "jpg" | "jpeg") {
         match decode_jpeg_turbo_scaled_from_bytes(bytes, u32::MAX) {
             Ok((image, _)) => apply_exif_orientation_from_bytes(image, bytes),
@@ -2439,9 +2470,7 @@ fn decode_full_oriented(path: &Path, bytes: &[u8]) -> Result<RgbaImage> {
 }
 
 fn signatures_from_rgba(rgba: &RgbaImage, source_dims: (u32, u32)) -> PreparedSignatures {
-    let mut proxy = dupe::proxy::build(rgba.as_raw(), rgba.width(), rgba.height());
-    proxy.src_width = source_dims.0;
-    proxy.src_height = source_dims.1;
+    let proxy = proxy_from_rgba(rgba, source_dims);
     PreparedSignatures::compute(&proxy)
 }
 
@@ -2454,8 +2483,60 @@ fn emit_related_transform<W: Write>(
     transformed: &RgbaImage,
     large_diff_threshold_bin: u8,
 ) -> Result<usize> {
-    let transformed_dims = transformed.dimensions();
-    let transformed_signatures = signatures_from_rgba(transformed, transformed_dims);
+    // Pixel-only transforms are materialized losslessly so their named change
+    // is not conflated with an invented compression quality.
+    let encoded = encode_png(transformed)?;
+    emit_encoded_related_transform(
+        writer,
+        source_path,
+        original_dims,
+        original_signatures,
+        transformation,
+        "png",
+        &encoded,
+        large_diff_threshold_bin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_jpeg_transform<W: Write>(
+    writer: &mut W,
+    source_path: &Path,
+    original_dims: (u32, u32),
+    original_signatures: &PreparedSignatures,
+    transformation: &str,
+    transformed: &RgbaImage,
+    quality: u8,
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    let encoded = encode_jpeg(transformed, quality)?;
+    emit_encoded_related_transform(
+        writer,
+        source_path,
+        original_dims,
+        original_signatures,
+        transformation,
+        "jpg",
+        &encoded,
+        large_diff_threshold_bin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_encoded_related_transform<W: Write>(
+    writer: &mut W,
+    source_path: &Path,
+    original_dims: (u32, u32),
+    original_signatures: &PreparedSignatures,
+    transformation: &str,
+    extension: &str,
+    encoded: &[u8],
+    large_diff_threshold_bin: u8,
+) -> Result<usize> {
+    let synthetic_path = source_path.with_extension(extension);
+    let canonical = canonical_proxy_from_file_bytes(&synthetic_path, encoded)?;
+    let transformed_dims = canonical.decoded.source_dims;
+    let transformed_signatures = PreparedSignatures::compute(&canonical.proxy);
     write_synth_comparison(
         writer,
         "related",
@@ -2543,11 +2624,12 @@ fn encode_jpeg(source: &RgbaImage, quality: u8) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn jpeg_round_trip(source: &RgbaImage, quality: u8) -> Result<RgbaImage> {
-    let encoded = encode_jpeg(source, quality)?;
-    image::load_from_memory(&encoded)
-        .map(|image| image.to_rgba8())
-        .map_err(|error| format!("decode synthetic JPEG q={quality}: {error}"))
+fn encode_png(source: &RgbaImage) -> Result<Vec<u8>> {
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(source.clone())
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| format!("encode lossless synthetic PNG: {error}"))?;
+    Ok(encoded.into_inner())
 }
 
 fn add_bottom_right_logo(source: &RgbaImage, area_fraction: f64) -> RgbaImage {
@@ -3028,4 +3110,72 @@ fn write_json_line<W: Write, T: Serialize>(writer: &mut W, record: &T) -> Result
 
 fn io_error(error: std::io::Error) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jpeg_fixture() -> RgbaImage {
+        // Twice the target on the long edge, so the canonical path must scale
+        // whatever the target is set to. Sizing this to a literal tied the test
+        // to one value of the constant.
+        RgbaImage::from_fn(JPEG_DCT_TARGET_EDGE * 2, JPEG_DCT_TARGET_EDGE, |x, y| {
+            let checker = (((x / 31) + (y / 29)) & 1) as u8 * 73;
+            Rgba([
+                (x.wrapping_mul(17) as u8).wrapping_add(checker),
+                (y.wrapping_mul(29) as u8).wrapping_sub(checker),
+                ((x ^ y).wrapping_mul(11) as u8).wrapping_add(checker),
+                255,
+            ])
+        })
+    }
+
+    #[test]
+    fn canonical_jpeg_file_proxy_uses_configured_dct_target() {
+        let image = jpeg_fixture();
+        let encoded = encode_jpeg(&image, 95).unwrap();
+        let canonical =
+            canonical_proxy_from_file_bytes(Path::new("fixture.jpg"), &encoded).unwrap();
+
+        assert!(canonical.decoded.scale_num < canonical.decoded.scale_den);
+        assert_eq!(canonical.decoded.rgba.width(), JPEG_DCT_TARGET_EDGE);
+        assert_eq!(canonical.decoded.source_dims, image.dimensions());
+    }
+
+    #[test]
+    fn synth_jpeg_variant_is_measured_through_canonical_file_proxy() {
+        let image = jpeg_fixture();
+        let original = signatures_from_rgba(&image, image.dimensions());
+        let encoded = encode_jpeg(&image, 70).unwrap();
+        let canonical =
+            canonical_proxy_from_file_bytes(Path::new("fixture.jpg"), &encoded).unwrap();
+        let expected = PreparedSignatures::compute(&canonical.proxy);
+        let expected_distance =
+            required_hamming(&original.pdq256.sig, &expected.pdq256.sig, "Pdq256").unwrap();
+
+        let mut output = Vec::new();
+        emit_jpeg_transform(
+            &mut output,
+            Path::new("fixture.png"),
+            image.dimensions(),
+            &original,
+            "jpeg_q70",
+            &image,
+            70,
+            DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+        )
+        .unwrap();
+        let pdq_record = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<SynthRecord>(line).unwrap())
+            .find(|record| record.algo == "Pdq256")
+            .unwrap();
+
+        let SynthDistance::Hamming { value } = pdq_record.distance else {
+            panic!("Pdq256 must have a Hamming distance");
+        };
+        assert_eq!(value, expected_distance);
+    }
 }
