@@ -143,6 +143,8 @@ pub struct ExternalTool {
     pub launch: ExternalToolLaunch,
     pub arguments: String,
     pub working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub show_console: bool,
     pub payload: PayloadPolicy,
     pub video: VideoPolicy,
     pub spread: SpreadPolicy,
@@ -387,6 +389,7 @@ pub(crate) struct ExternalLaunchRequest {
     pub launch: ExternalToolLaunch,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
+    pub show_console: bool,
     pub files: Vec<PathBuf>,
 }
 
@@ -783,6 +786,7 @@ impl ExternalTool {
             launch: ExternalToolLaunch::OsDefault,
             arguments: "{files}".to_string(),
             working_directory: None,
+            show_console: false,
             payload: PayloadPolicy::TempEdited,
             video: VideoPolicy::File,
             spread: SpreadPolicy::Merged,
@@ -1214,53 +1218,99 @@ fn evaluate_target_count(
     }
 }
 
+/// Rust の `Command::args` と同じ規則で、通常引数 1 個を実際に quote / escape する。
 #[cfg(windows)]
-fn windows_regular_argument_utf16_len(argument: &OsStr) -> usize {
-    use std::os::windows::ffi::OsStrExt;
+fn windows_quote_regular_argument(argument: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     let units: Vec<u16> = argument.encode_wide().collect();
     let quoted = units.is_empty()
         || units
             .iter()
             .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16);
-    let mut length = units.len().saturating_add(usize::from(quoted) * 2);
-    let mut preceding_backslashes = 0usize;
-    for unit in &units {
-        if *unit == b'\\' as u16 {
-            preceding_backslashes = preceding_backslashes.saturating_add(1);
-        } else {
-            if *unit == b'"' as u16 {
-                // `Command::args` は quote の直前にある n 個の backslash を 2n+1 個へ
-                // するので、元の文字列に n+1 個ぶんが加わる。
-                length = length.saturating_add(preceding_backslashes.saturating_add(1));
-            }
-            preceding_backslashes = 0;
-        }
-    }
+    let mut output = Vec::with_capacity(units.len().saturating_add(2));
     if quoted {
-        // 引用された引数末尾の n 個は、閉じ quote の前で 2n 個になる。
-        length = length.saturating_add(preceding_backslashes);
+        output.push(b'"' as u16);
     }
-    length
+    let mut preceding_backslashes = 0usize;
+    for unit in units {
+        if unit == b'\\' as u16 {
+            preceding_backslashes = preceding_backslashes.saturating_add(1);
+            continue;
+        }
+        let count = if unit == b'"' as u16 {
+            preceding_backslashes.saturating_mul(2).saturating_add(1)
+        } else {
+            preceding_backslashes
+        };
+        output.extend(std::iter::repeat_n(b'\\' as u16, count));
+        output.push(unit);
+        preceding_backslashes = 0;
+    }
+    let trailing_count = if quoted {
+        preceding_backslashes.saturating_mul(2)
+    } else {
+        preceding_backslashes
+    };
+    output.extend(std::iter::repeat_n(b'\\' as u16, trailing_count));
+    if quoted {
+        output.push(b'"' as u16);
+    }
+    OsString::from_wide(&output)
+}
+
+#[cfg(all(windows, test))]
+fn windows_regular_argument_utf16_len(argument: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    windows_quote_regular_argument(argument)
+        .encode_wide()
+        .count()
+}
+
+/// `ShellExecuteExW::lpParameters` へ渡す、quoted argument list。
+#[cfg(windows)]
+fn windows_create_process_parameters(arguments: &[OsString]) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let mut output = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            output.push(b' ' as u16);
+        }
+        output.extend(windows_quote_regular_argument(argument).encode_wide());
+    }
+    OsString::from_wide(&output)
+}
+
+/// Rust の `Command::args` が `CreateProcessW` へ渡す command line。
+///
+/// argv[0] の常時引用、引数間の空白、通常引数の引用・escape、終端 NUL をすべて含む。
+#[cfg(windows)]
+fn windows_create_process_command_line(executable: &OsStr, arguments: &[OsString]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut command_line = Vec::new();
+    command_line.push(b'"' as u16);
+    command_line.extend(executable.encode_wide());
+    command_line.push(b'"' as u16);
+    if !arguments.is_empty() {
+        command_line.push(b' ' as u16);
+        command_line.extend(windows_create_process_parameters(arguments).encode_wide());
+    }
+    command_line.push(0);
+    command_line
 }
 
 /// Rust の `Command::args` が `CreateProcessW` へ渡す command line の UTF-16 長。
 ///
-/// argv[0] の常時引用、引数間の空白、通常引数の引用・escape、終端 NUL をすべて含む。
+/// 実際の command line と長さ計算で quoting の実装が分かれないよう、上の結果から求める。
 #[cfg(windows)]
 fn windows_create_process_command_line_utf16_len(
     executable: &OsStr,
     arguments: &[OsString],
 ) -> usize {
-    use std::os::windows::ffi::OsStrExt;
-
-    let mut length = executable.encode_wide().count().saturating_add(2); // quoted argv[0]
-    for argument in arguments {
-        length = length
-            .saturating_add(1) // separator
-            .saturating_add(windows_regular_argument_utf16_len(argument));
-    }
-    length.saturating_add(1) // terminating NUL
+    windows_create_process_command_line(executable, arguments).len()
 }
 
 fn build_request_for_files(
@@ -1299,6 +1349,7 @@ fn build_request_for_files(
             .uses_process_options()
             .then(|| tool.working_directory.clone())
             .flatten(),
+        show_console: tool.launch.uses_process_options() && tool.show_console,
         files,
     })
 }
@@ -1383,6 +1434,7 @@ fn build_open_with_launch_request(
         launch,
         arguments,
         working_directory: None,
+        show_console: false,
         files: vec![file],
     }
 }
@@ -1751,6 +1803,12 @@ impl ExternalLaunchOutcome {
     }
 }
 
+/// `CreateProcessW` が対象を実行形式として読み込めず、何も起動していない失敗か。
+#[cfg(any(windows, test))]
+fn is_bad_exe_format(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(193)
+}
+
 fn launch_request(
     request: ExternalLaunchRequest,
     owner_hwnd: Option<isize>,
@@ -1760,6 +1818,7 @@ fn launch_request(
         launch,
         arguments,
         working_directory,
+        show_console,
         files,
     } = request;
     match launch {
@@ -1769,22 +1828,44 @@ fn launch_request(
                 files.len(),
                 arguments
             ));
-            let mut command = Command::new(executable);
+            let mut command = Command::new(&executable);
             command
-                .args(arguments)
+                .args(&arguments)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            if let Some(directory) = working_directory {
+            if let Some(directory) = &working_directory {
                 command.current_dir(directory);
             }
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                command.creation_flags(CREATE_NO_WINDOW);
+                if !show_console {
+                    command.creation_flags(CREATE_NO_WINDOW);
+                }
             }
-            command
-                .spawn()
+            let result = command.spawn();
+            #[cfg(windows)]
+            if let Err(error) = &result
+                && is_bad_exe_format(error)
+            {
+                let parameters = windows_create_process_parameters(&arguments);
+                let fallback = crate::open_with::shell_execute_open(
+                    &executable,
+                    (!arguments.is_empty()).then_some(parameters.as_os_str()),
+                    working_directory.as_deref(),
+                    show_console,
+                    owner_hwnd,
+                );
+                crate::logger::log(format!(
+                    "external_tool: ShellExecuteEx open fallback {tool_name:?} file={executable:?} result={:?}",
+                    fallback.as_ref().map(|_| ())
+                ));
+                return fallback.map(|_| ExternalLaunchOutcome::all_launched(None));
+            }
+            #[cfg(not(windows))]
+            let _ = show_console;
+            result
                 .map(|_| ExternalLaunchOutcome::all_launched(None))
                 .map_err(|error| error.to_string())
         }
@@ -2853,6 +2934,7 @@ mod tests {
         assert_eq!(tool.confirmation_threshold, DEFAULT_CONFIRMATION_THRESHOLD);
         assert_eq!(tool.max_targets, DEFAULT_MAX_TARGETS);
         assert_eq!(tool.launch, ExternalToolLaunch::OsDefault);
+        assert!(!tool.show_console);
         assert!(!tool.keep_temp);
         assert_eq!(tool.pdf_render_long_edge, DEFAULT_PDF_RENDER_LONG_EDGE);
     }
@@ -3647,6 +3729,7 @@ mod tests {
         );
         tool.arguments = "--ignored {file}".to_string();
         tool.working_directory = Some(PathBuf::from(r"C:\ignored"));
+        tool.show_console = true;
         let target = LaunchTarget::RealFile(PathBuf::from(r"C:\image.png"));
 
         for launch in [
@@ -3660,6 +3743,7 @@ mod tests {
             assert_eq!(request.launch, launch);
             assert!(request.arguments.is_empty());
             assert!(request.working_directory.is_none());
+            assert!(!request.show_console);
         }
 
         tool.launch = ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\viewer.exe"));
@@ -3673,6 +3757,7 @@ mod tests {
             request.working_directory,
             Some(PathBuf::from(r"C:\ignored"))
         );
+        assert!(request.show_console);
     }
 
     fn real_targets(count: usize) -> Vec<LaunchTarget> {
@@ -3951,12 +4036,38 @@ mod tests {
     fn windows_command_line_length_matches_rust_regular_argument_quoting() {
         use std::os::windows::ffi::OsStrExt;
 
+        assert_eq!(
+            windows_quote_regular_argument(OsStr::new("")),
+            OsString::from(r#""""#)
+        );
+        assert_eq!(
+            windows_quote_regular_argument(OsStr::new("plain")),
+            OsString::from("plain")
+        );
+        assert_eq!(
+            windows_quote_regular_argument(OsStr::new("two words")),
+            OsString::from(r#""two words""#)
+        );
+        assert_eq!(
+            windows_quote_regular_argument(OsStr::new("a\"b")),
+            OsString::from(r#"a\"b"#)
+        );
+        let trailing_backslash = OsStr::new("C:\\two words\\");
+        assert_eq!(
+            windows_quote_regular_argument(trailing_backslash),
+            OsString::from(r#""C:\two words\\""#)
+        );
+        let consecutive_backslashes = OsString::from(format!("a{}\"b", "\\".repeat(3)));
+        assert_eq!(
+            windows_quote_regular_argument(&consecutive_backslashes),
+            OsString::from(format!("a{}\"b", "\\".repeat(7)))
+        );
+
         assert_eq!(windows_regular_argument_utf16_len(OsStr::new("plain")), 5);
         assert_eq!(
             windows_regular_argument_utf16_len(OsStr::new("two words")),
             "two words".encode_utf16().count() + 2
         );
-        let trailing_backslash = OsStr::new("C:\\two words\\");
         assert_eq!(
             windows_regular_argument_utf16_len(trailing_backslash),
             trailing_backslash.encode_wide().count() + 3
@@ -3968,6 +4079,15 @@ mod tests {
             windows_create_process_command_line_utf16_len(OsStr::new("x"), &[]),
             4 // "x" + NUL
         );
+    }
+
+    #[test]
+    fn bad_exe_format_is_only_windows_error_193() {
+        assert!(is_bad_exe_format(&std::io::Error::from_raw_os_error(193)));
+        assert!(!is_bad_exe_format(&std::io::Error::from_raw_os_error(2)));
+        assert!(!is_bad_exe_format(&std::io::Error::other(
+            "not an OS error"
+        )));
     }
 
     #[cfg(windows)]

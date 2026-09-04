@@ -581,7 +581,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("実行ファイルを選んで追加").clicked() {
+            if ui.button("プログラム / スクリプトを選んで追加").clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Executable);
             }
             let selected_index = state.external_tool_selected.and_then(|id| {
@@ -672,7 +672,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             });
             ui.end_row();
 
-            ui.label("実行ファイル");
+            ui.label("プログラム / スクリプト");
             if tool.launch.uses_process_options() {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
@@ -727,6 +727,24 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     state.external_tool_working_directory_status = ExternalToolPathStatus::Checking;
                 }
             });
+            ui.end_row();
+
+            ui.label("");
+            ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
+                ui.checkbox(&mut tool.show_console, "コンソール窓を表示する");
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "スクリプトの出力を読みたいときに使います。GUI を自分で開くツールには関係しません。",
+                    )
+                    .weak(),
+                )
+                .wrap(),
+            );
             ui.end_row();
 
             ui.label("渡すもの");
@@ -962,7 +980,11 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         state.schedule_external_tool_path_check(std::time::Duration::from_millis(300));
     }
 
-    draw_external_tool_path_status(ui, "実行ファイル", &state.external_tool_executable_status);
+    draw_external_tool_path_status(
+        ui,
+        "プログラム / スクリプト",
+        &state.external_tool_executable_status,
+    );
     draw_external_tool_path_status(
         ui,
         "作業フォルダー",

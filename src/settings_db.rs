@@ -45,14 +45,6 @@ use crate::settings::{
 
 const SCHEMA_VERSION: &str = "1";
 const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
-/// 未リリースの `external_tools` の**形**の版。列だけでなく**列に入る値の綴り**も含む。
-///
-/// 列の有無だけを見ていると、`payload` の値名を変えたときに検出できない。古い綴りが
-/// 残った DB は読み込みで `Incompatible` になり、**設定全体が保存されなくなる**
-/// (`classify_settings_deserialization_error`)。形か綴りを変えたらこの版を上げる。
-/// 出荷済みの版にこのテーブルは存在しないので、作り直してよい。
-const EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY: &str = "external_tools_unreleased_shape";
-const EXTERNAL_TOOLS_UNRELEASED_SHAPE: &str = "2026-09-02-temp-edited";
 const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_launch_classified";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
@@ -80,9 +72,9 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
 ///
 /// のどちらかを行うこと。**何もせず追加すると初回起動でユーザー設定が消える。**
 ///
-/// `external_tools` は新規キーで、旧版が `settings_kv` に書いたことはない。したがって
-/// legacy JSON の上書き問題は起きず、リリース済みデータは専用の
-/// `custom_open_with_apps` → `external_tools` migration で保護する。
+/// `external_tools` は v3.5.0 から専用テーブルが正本。旧 `settings_kv` にこのキーを
+/// 書いた版は無く、それ以前の登録は専用の `custom_open_with_apps` →
+/// `external_tools` migration で保護する。
 const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
@@ -1557,6 +1549,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             launch_value         TEXT,
             arguments            TEXT NOT NULL,
             working_directory    TEXT,
+            show_console         INTEGER NOT NULL DEFAULT 0,
             payload              TEXT NOT NULL,
             video                TEXT NOT NULL,
             spread               TEXT NOT NULL,
@@ -1576,7 +1569,15 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
-    reset_unreleased_external_tools_schema_if_needed(conn)?;
+    // `external_tools` は v3.5.0 で出荷済み。登録を保持したまま列だけを追加する。
+    // 開発中に使っていた shape marker による DROP TABLE 経路へ戻してはならない。
+    if !table_has_column(conn, "external_tools", "show_console")? {
+        conn.execute(
+            "ALTER TABLE external_tools
+             ADD COLUMN show_console INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     migrate_tags_table(conn)?;
 
     // schema_version は schema migration 後の現行値へ更新する。新しい版の DB は
@@ -1595,57 +1596,6 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         params![app_version],
     )?;
     Ok(())
-}
-
-/// `external_tools` は未出荷なので、開発中の旧 schema はその場で作り直す。
-/// released source の `custom_open_with_apps` と migration marker は残っているため、
-/// marker を外して通常の一度きり移行を再実行すれば登録元は失われない。
-fn reset_unreleased_external_tools_schema_if_needed(conn: &Connection) -> rusqlite::Result<()> {
-    let stored_shape: Option<String> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = ?1",
-            params![EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if stored_shape.as_deref() == Some(EXTERNAL_TOOLS_UNRELEASED_SHAPE) {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
-        "DROP TABLE external_tools;
-         CREATE TABLE external_tools (
-            id                   INTEGER PRIMARY KEY,
-            name                 TEXT NOT NULL,
-            launch_kind          TEXT NOT NULL,
-            launch_value         TEXT,
-            arguments            TEXT NOT NULL,
-            working_directory    TEXT,
-            payload              TEXT NOT NULL,
-            video                TEXT NOT NULL,
-            spread               TEXT NOT NULL,
-            selection            TEXT NOT NULL,
-            confirmation_threshold INTEGER NOT NULL,
-            max_targets          INTEGER NOT NULL,
-            pdf_render_long_edge INTEGER NOT NULL,
-            keep_temp            INTEGER NOT NULL,
-            sort_index           INTEGER NOT NULL
-         );
-         CREATE INDEX external_tools_sort ON external_tools(sort_index);",
-    )?;
-    tx.execute(
-        "DELETE FROM schema_meta WHERE key = ?1",
-        params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
-    )?;
-    tx.execute(
-        "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![
-            EXTERNAL_TOOLS_UNRELEASED_SHAPE_KEY,
-            EXTERNAL_TOOLS_UNRELEASED_SHAPE
-        ],
-    )?;
-    tx.commit()
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -2433,9 +2383,9 @@ fn write_external_tools(
     let mut stmt = tx.prepare(
         "INSERT INTO external_tools (
             id, name, launch_kind, launch_value, arguments, working_directory,
-            payload, video, spread, selection, confirmation_threshold, max_targets,
-            pdf_render_long_edge, keep_temp, sort_index
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            show_console, payload, video, spread, selection, confirmation_threshold,
+            max_targets, pdf_render_long_edge, keep_temp, sort_index
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )?;
     // パスは既存の recent/custom テーブルと同じく TEXT (UTF-8) で持つ。Windows の
     // ファイルダイアログが返すパスは有効な UTF-16 なので、ここで lossy になるのは
@@ -2454,6 +2404,7 @@ fn write_external_tools(
             launch_value,
             tool.arguments,
             working_directory,
+            i64::from(tool.show_console),
             payload_policy_text(tool.payload),
             video_policy_text(tool.video),
             spread_policy_text(tool.spread),
@@ -2475,6 +2426,7 @@ struct ExternalToolRow {
     launch_value: Option<String>,
     arguments: String,
     working_directory: Option<String>,
+    show_console: i64,
     payload: String,
     video: String,
     spread: String,
@@ -2495,8 +2447,8 @@ where
 fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsDbError> {
     let mut stmt = conn.prepare(
         "SELECT id, name, launch_kind, launch_value, arguments, working_directory,
-                payload, video, spread, selection, confirmation_threshold, max_targets,
-                pdf_render_long_edge, keep_temp
+                show_console, payload, video, spread, selection, confirmation_threshold,
+                max_targets, pdf_render_long_edge, keep_temp
          FROM external_tools
          ORDER BY sort_index ASC",
     )?;
@@ -2508,14 +2460,15 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             launch_value: row.get(3)?,
             arguments: row.get(4)?,
             working_directory: row.get(5)?,
-            payload: row.get(6)?,
-            video: row.get(7)?,
-            spread: row.get(8)?,
-            selection: row.get(9)?,
-            confirmation_threshold: row.get(10)?,
-            max_targets: row.get(11)?,
-            pdf_render_long_edge: row.get(12)?,
-            keep_temp: row.get(13)?,
+            show_console: row.get(6)?,
+            payload: row.get(7)?,
+            video: row.get(8)?,
+            spread: row.get(9)?,
+            selection: row.get(10)?,
+            confirmation_threshold: row.get(11)?,
+            max_targets: row.get(12)?,
+            pdf_render_long_edge: row.get(13)?,
+            keep_temp: row.get(14)?,
         })
     })?;
     let mut tools = Vec::new();
@@ -2553,6 +2506,7 @@ fn read_external_tools(conn: &Connection) -> Result<Vec<ExternalTool>, SettingsD
             launch: external_tool_launch_from_storage(&row.launch_kind, row.launch_value)?,
             arguments: row.arguments,
             working_directory: row.working_directory.map(PathBuf::from),
+            show_console: row.show_console != 0,
             payload: parse_external_tool_enum(row.payload)?,
             video: parse_external_tool_enum(row.video)?,
             spread: parse_external_tool_enum(row.spread)?,
@@ -4051,6 +4005,7 @@ mod tests {
                 launch: ExternalToolLaunch::Executable(PathBuf::from(r"C:\Tools\a.exe")),
                 arguments: "--edit {file}".to_string(),
                 working_directory: Some(PathBuf::from(r"C:\Work A")),
+                show_console: true,
                 payload: PayloadPolicy::OriginalFile,
                 video: VideoPolicy::File,
                 spread: SpreadPolicy::BothPages,
@@ -4068,6 +4023,7 @@ mod tests {
                 },
                 arguments: "--pre-edit {file}".to_string(),
                 working_directory: None,
+                show_console: false,
                 payload: PayloadPolicy::TempOriginal,
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::MainPageOnly,
@@ -4083,6 +4039,7 @@ mod tests {
                 launch: ExternalToolLaunch::OsDefault,
                 arguments: "{file} --readonly".to_string(),
                 working_directory: Some(PathBuf::from(r"D:\Viewer")),
+                show_console: false,
                 payload: PayloadPolicy::TempEdited,
                 video: VideoPolicy::CurrentFrame,
                 spread: SpreadPolicy::BothPages,
@@ -4371,12 +4328,25 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_recreates_the_unreleased_p2b_external_tools_table() {
-        let conn = Connection::open_in_memory().unwrap();
+    fn released_external_tools_gain_show_console_without_losing_registrations() {
+        let dir = TempDir::new().unwrap();
+        let mut expected = ExternalTool::defaults_for_viewing();
+        expected.id = ExternalToolId(41);
+        expected.name = "Shipped Script".to_string();
+        expected.launch = ExternalToolLaunch::Executable(PathBuf::from("script.py"));
+        expected.arguments = "--read-only {files}".to_string();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            let mut settings = Settings::default();
+            settings.external_tools = vec![expected.clone()];
+            db.save_full(&settings).unwrap();
+        }
+
+        // v3.5.0 の列構成へ戻し、開発中 shape marker も残した状態を再現する。
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO schema_meta(key, value)
-               VALUES ('external_tools_migrated_from_custom_open_with', '1');
+            "DROP INDEX external_tools_sort;
+             ALTER TABLE external_tools RENAME TO external_tools_current;
              CREATE TABLE external_tools (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -4388,40 +4358,44 @@ mod tests {
                 video TEXT NOT NULL,
                 spread TEXT NOT NULL,
                 selection TEXT NOT NULL,
+                confirmation_threshold INTEGER NOT NULL,
+                max_targets INTEGER NOT NULL,
                 pdf_render_long_edge INTEGER NOT NULL,
-                for_editing INTEGER NOT NULL,
-                show_in_context_menu INTEGER NOT NULL,
                 keep_temp INTEGER NOT NULL,
                 sort_index INTEGER NOT NULL
              );
-             INSERT INTO external_tools
-               VALUES (1, 'Unreleased', 'Executable', 'C:\\old.exe', '{file}', NULL,
-                       'AsDisplayed', 'File', 'Merged', 'Single', 4096, 0, 1, 0, 0);",
+             INSERT INTO external_tools (
+                id, name, launch_kind, launch_value, arguments, working_directory,
+                payload, video, spread, selection, confirmation_threshold, max_targets,
+                pdf_render_long_edge, keep_temp, sort_index
+             )
+             SELECT id, name, launch_kind, launch_value, arguments, working_directory,
+                    payload, video, spread, selection, confirmation_threshold, max_targets,
+                    pdf_render_long_edge, keep_temp, sort_index
+             FROM external_tools_current;
+             DROP TABLE external_tools_current;
+             CREATE INDEX external_tools_sort ON external_tools(sort_index);
+             INSERT INTO schema_meta(key, value)
+               VALUES ('external_tools_unreleased_shape', 'stale-development-marker')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
         )
         .unwrap();
+        drop(conn);
 
-        init_schema(&conn).unwrap();
-
-        assert!(table_has_column(&conn, "external_tools", "launch_kind").unwrap());
-        assert!(table_has_column(&conn, "external_tools", "launch_value").unwrap());
-        assert!(table_has_column(&conn, "external_tools", "confirmation_threshold").unwrap());
-        assert!(table_has_column(&conn, "external_tools", "max_targets").unwrap());
-        assert!(!table_has_column(&conn, "external_tools", "show_in_context_menu").unwrap());
-        assert!(!table_has_column(&conn, "external_tools", "executable").unwrap());
-        assert!(!table_has_column(&conn, "external_tools", "for_editing").unwrap());
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM external_tools", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-        let marker = conn
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.external_tools, [expected]);
+        let inner = db.inner.lock().unwrap();
+        assert!(table_has_column(&inner.conn, "external_tools", "show_console").unwrap());
+        let stored: i64 = inner
+            .conn
             .query_row(
-                "SELECT 1 FROM schema_meta WHERE key = ?1",
-                params![EXTERNAL_TOOLS_MIGRATION_META_KEY],
-                |_| Ok(()),
+                "SELECT show_console FROM external_tools WHERE id = 41",
+                [],
+                |row| row.get(0),
             )
-            .optional()
             .unwrap();
-        assert!(marker.is_none());
+        assert_eq!(stored, 0);
     }
 
     #[test]
