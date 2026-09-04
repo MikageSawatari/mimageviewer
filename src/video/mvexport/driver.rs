@@ -49,6 +49,7 @@ pub(super) fn export(
     let wall_started = Instant::now();
 
     let mut partial = PartialOutput::new(&request.output_path)?;
+    let audio_decode_started = Instant::now();
     let mut decoded =
         crate::audio_decode::decode_audio_file_to_stereo_f32(&request.audio_path, cancel).map_err(
             |error| {
@@ -59,6 +60,7 @@ pub(super) fn export(
                 }
             },
         )?;
+    let audio_decode_secs = audio_decode_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
     fit_audio_to_duration(
         &mut decoded.stereo_samples,
@@ -85,19 +87,23 @@ pub(super) fn export(
         .map_err(|error| ExportError::Encoder(format!("音声タイムラインが不正です: {error}")))?;
     let mut audio = open_aac_encoder(decoded.info.sample_rate, AUDIO_BITRATE_BPS, 0, timeline)
         .map_err(|error| ExportError::Encoder(format!("AAC エンコーダを開けません: {error}")))?;
+    let mux_started = Instant::now();
     let mut muxer = Mp4Muxer::new(
         partial.path(),
         &video,
         &audio,
         (plan.frame_rate.numerator, plan.frame_rate.denominator),
     )?;
+    let mut mux_secs = mux_started.elapsed().as_secs_f64();
 
+    let aac_encode_started = Instant::now();
     let mut audio_packets = VecDeque::from(encode_audio(
         &mut audio,
         &decoded.stereo_samples,
         decoded.info.sample_rate,
         cancel,
     )?);
+    let aac_encode_secs = aac_encode_started.elapsed().as_secs_f64();
     let mut spectrum = SpectrumSource::new(
         decoded.info.sample_rate,
         plan.spectrum_bands,
@@ -117,6 +123,7 @@ pub(super) fn export(
     let mut render_ms = Vec::with_capacity(plan.frames as usize);
     let mut convert_total_secs = 0.0;
     let mut encode_total_secs = 0.0;
+    let mut frame_hash_secs = 0.0;
 
     for frame_index in 0..plan.frames {
         check_cancel(cancel)?;
@@ -136,7 +143,9 @@ pub(super) fn export(
         render_ms.push(render_started.elapsed().as_secs_f64() * 1000.0);
 
         if let Some(hasher) = hasher.as_mut() {
+            let hash_started = Instant::now();
             hasher.update(&rgba.rgba);
+            frame_hash_secs += hash_started.elapsed().as_secs_f64();
         }
 
         let convert_started = Instant::now();
@@ -150,7 +159,9 @@ pub(super) fn export(
         })?;
         let packets = drain_h264_packets(&mut video.encoder)?;
         encode_total_secs += encode_started.elapsed().as_secs_f64();
+        let mux_started = Instant::now();
         write_video_packets(&mut muxer, &mut audio_packets, packets)?;
+        mux_secs += mux_started.elapsed().as_secs_f64();
 
         progress(frame_index + 1, plan.frames);
     }
@@ -162,16 +173,37 @@ pub(super) fn export(
     })?;
     let final_video_packets = drain_h264_packets(&mut video.encoder)?;
     encode_total_secs += flush_started.elapsed().as_secs_f64();
+    let mux_started = Instant::now();
     write_video_packets(&mut muxer, &mut audio_packets, final_video_packets)?;
     while let Some(packet) = audio_packets.pop_front() {
         muxer.write_audio(packet)?;
     }
+    mux_secs += mux_started.elapsed().as_secs_f64();
+    let faststart_started = Instant::now();
     muxer.finish()?;
+    let faststart_secs = faststart_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
+    let rename_started = Instant::now();
     partial.commit(&request.output_path)?;
+    let rename_secs = rename_started.elapsed().as_secs_f64();
+    let hash_finalize_started = Instant::now();
+    let rgba_sha256 = hasher.map(|hasher| format!("{:x}", hasher.finalize()));
+    if rgba_sha256.is_some() {
+        frame_hash_secs += hash_finalize_started.elapsed().as_secs_f64();
+    }
 
     let wall_secs = wall_started.elapsed().as_secs_f64();
     let frames = plan.frames as f64;
+    let render_total_secs = render_ms.iter().sum::<f64>() / 1000.0;
+    let accounted_secs = render_total_secs
+        + convert_total_secs
+        + encode_total_secs
+        + audio_decode_secs
+        + aac_encode_secs
+        + mux_secs
+        + faststart_secs
+        + rename_secs
+        + frame_hash_secs;
     let duration_secs =
         frames * plan.frame_rate.denominator as f64 / plan.frame_rate.numerator as f64;
     Ok(ExportSummary {
@@ -182,13 +214,20 @@ pub(super) fn export(
         render_p95_ms: percentile(&render_ms, 0.95),
         convert_mean_ms: convert_total_secs * 1000.0 / frames,
         encode_mean_ms: encode_total_secs * 1000.0 / frames,
+        audio_decode_secs,
+        aac_encode_secs,
+        mux_secs,
+        faststart_secs,
+        rename_secs,
+        frame_hash_secs,
+        other_secs: (wall_secs - accounted_secs).max(0.0),
         wall_secs,
         realtime_ratio: if wall_secs > 0.0 {
             duration_secs / wall_secs
         } else {
             0.0
         },
-        rgba_sha256: hasher.map(|hasher| format!("{:x}", hasher.finalize())),
+        rgba_sha256,
     })
 }
 

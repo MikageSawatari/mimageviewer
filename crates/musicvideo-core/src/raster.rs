@@ -1685,6 +1685,49 @@ fn composite_rotated_body(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GlowRasterPlan {
+    scale: usize,
+    spread_radius: usize,
+    blur_radius: usize,
+    pad: usize,
+}
+
+impl GlowRasterPlan {
+    fn new(glow: Glow) -> Result<Self, RasterError> {
+        let spread_px = glow.spread_px.ceil().max(0.0) as usize;
+        let blur_px = glow.radius_px.ceil().max(1.0) as usize;
+        let scale = if blur_px >= 16 {
+            8
+        } else if blur_px >= 8 {
+            4
+        } else if blur_px >= 4 {
+            2
+        } else {
+            1
+        };
+        let spread_radius = spread_px.div_ceil(scale);
+        let blur_radius = blur_px.div_ceil(scale);
+        let filter_radius = spread_radius
+            .checked_add(blur_radius)
+            .ok_or(RasterError::DimensionsOverflow)?;
+        // The reduced-space filters reach `filter_radius * scale` pixels. One further
+        // block covers the max-downsample expansion (`scale - 1`) plus a zero-valued
+        // guard pixel. Keeping pad aligned to scale also makes both source edges safe
+        // regardless of the source dimensions.
+        let pad = filter_radius
+            .checked_add(1)
+            .and_then(|radius| radius.checked_mul(scale))
+            .ok_or(RasterError::DimensionsOverflow)?;
+        Ok(Self {
+            scale,
+            spread_radius,
+            blur_radius,
+            pad,
+        })
+    }
+}
+
 fn draw_glow(frame: &mut Frame, source: &MaskSurface, glow: Glow) -> Result<(), RasterError> {
     if glow.radius_px <= 0.0 || glow.color.a == 0 {
         return Ok(());
@@ -1692,75 +1735,50 @@ fn draw_glow(frame: &mut Frame, source: &MaskSurface, glow: Glow) -> Result<(), 
     let Some(bounds) = mask_bounds(source) else {
         return Ok(());
     };
-    let spread = glow.spread_px.ceil().max(0.0) as usize;
-    let blur = glow.radius_px.ceil().max(1.0) as usize;
-    let pad = spread.saturating_add(blur);
+    let plan = GlowRasterPlan::new(glow)?;
     let source_width = bounds.width();
     let source_height = bounds.height();
+    let padding = plan
+        .pad
+        .checked_mul(2)
+        .ok_or(RasterError::DimensionsOverflow)?;
     let width = source_width
-        .checked_add(pad.saturating_mul(2))
+        .checked_add(padding)
         .ok_or(RasterError::DimensionsOverflow)?;
     let height = source_height
-        .checked_add(pad.saturating_mul(2))
+        .checked_add(padding)
         .ok_or(RasterError::DimensionsOverflow)?;
     let len = width
         .checked_mul(height)
         .ok_or(RasterError::DimensionsOverflow)?;
     let mut alpha = vec![0; len];
     for y in 0..source_height {
-        let destination = (y + pad) * width + pad;
+        let destination = (y + plan.pad) * width + plan.pad;
         let source_offset = (bounds.y0 + y) * source.width + bounds.x0;
         alpha[destination..destination + source_width]
             .copy_from_slice(&source.alpha[source_offset..source_offset + source_width]);
     }
-    let scale = if blur >= 16 {
-        8
-    } else if blur >= 8 {
-        4
-    } else if blur >= 4 {
-        2
+    let (mut reduced, reduced_width, reduced_height) = if plan.scale > 1 {
+        downsample_max(&alpha, width, height, plan.scale)
     } else {
-        1
+        (alpha, width, height)
     };
-    let (blurred, blurred_width, blurred_height) = if scale > 1 {
-        let (mut reduced, reduced_width, reduced_height) =
-            downsample_max(&alpha, width, height, scale);
-        if spread > 0 {
-            reduced = max_filter(
-                &reduced,
-                reduced_width,
-                reduced_height,
-                spread.div_ceil(scale),
-            );
-        }
-        (
-            box_blur(
-                &reduced,
-                reduced_width,
-                reduced_height,
-                blur.div_ceil(scale),
-            ),
-            reduced_width,
-            reduced_height,
-        )
-    } else {
-        if spread > 0 {
-            alpha = max_filter(&alpha, width, height, spread);
-        }
-        (box_blur(&alpha, width, height, blur), width, height)
-    };
-    let origin_x = source.origin_x + bounds.x0 as i32 - pad as i32;
-    let origin_y = source.origin_y + bounds.y0 as i32 - pad as i32;
+    if plan.spread_radius > 0 {
+        reduced = max_filter(&reduced, reduced_width, reduced_height, plan.spread_radius);
+    }
+    let blurred = box_blur(&reduced, reduced_width, reduced_height, plan.blur_radius);
+    let origin_x = source.origin_x + bounds.x0 as i32 - plan.pad as i32;
+    let origin_y = source.origin_y + bounds.y0 as i32 - plan.pad as i32;
     composite_glow_mask(
         frame,
         &blurred,
-        blurred_width,
-        blurred_height,
+        reduced_width,
+        reduced_height,
         width,
         height,
         origin_x,
         origin_y,
-        scale,
+        plan.scale,
         glow.color,
     );
     Ok(())
@@ -2443,6 +2461,61 @@ mod tests {
         let mut no_glow = Frame::new(1, 1).unwrap();
         let _ = render_frame(&scene(50, 50, glowing), &Assets::default(), &mut no_glow).unwrap();
         assert_eq!(zero_radius, no_glow);
+    }
+
+    #[test]
+    fn glow_tail_uses_actual_filter_support_at_scale_boundaries() {
+        let source = MaskSurface {
+            origin_x: 70,
+            origin_y: 70,
+            width: 40,
+            height: 20,
+            alpha: vec![255; 40 * 20],
+        };
+        let center_x = source.origin_x as usize + source.width / 2;
+
+        for radius in [3_usize, 4, 8, 16, 20] {
+            let scale = if radius >= 16 {
+                8
+            } else if radius >= 8 {
+                4
+            } else if radius >= 4 {
+                2
+            } else {
+                1
+            };
+            let actual_pad = (radius.div_ceil(scale) + 1) * scale;
+            let mut frame = Frame::new(180, 180).unwrap();
+            draw_glow(
+                &mut frame,
+                &source,
+                Glow {
+                    color: Rgba8::WHITE,
+                    radius_px: radius as f32,
+                    spread_px: 0.0,
+                },
+            )
+            .unwrap();
+
+            let tail = (1..=actual_pad)
+                .rev()
+                .map(|distance| pixel(&frame, center_x, source.origin_y as usize - distance)[0])
+                .collect::<Vec<_>>();
+            assert_eq!(tail[0], 0, "radius={radius}, scale={scale}");
+            assert!(
+                tail.windows(2).all(|pair| pair[0] <= pair[1]),
+                "glow tail is clipped or non-monotonic: radius={radius}, scale={scale}, tail={tail:?}"
+            );
+            assert!(tail.last().copied().unwrap_or_default() > 0);
+            if scale > 1 {
+                assert!(
+                    ((radius + 1)..actual_pad).any(|distance| {
+                        pixel(&frame, center_x, source.origin_y as usize - distance)[0] > 0
+                    }),
+                    "downsampled glow was cut at its nominal radius: radius={radius}, scale={scale}"
+                );
+            }
+        }
     }
 
     fn image_scene(width: u32, height: u32, id: &str, fit: Fit) -> Scene {

@@ -64,6 +64,16 @@ pub struct ExportSummary {
     pub render_p95_ms: f64,
     pub convert_mean_ms: f64,
     pub encode_mean_ms: f64,
+    pub audio_decode_secs: f64,
+    pub aac_encode_secs: f64,
+    pub mux_secs: f64,
+    /// `av_write_trailer` による MP4 確定と `+faststart` の moov 移動。
+    pub faststart_secs: f64,
+    pub rename_secs: f64,
+    /// `compute_frame_hash` が有効な検証時だけ発生する RGBA SHA-256 の計算。
+    pub frame_hash_secs: f64,
+    /// 上記区間とフレーム単位の 3 区間に含まれない初期化等。
+    pub other_secs: f64,
     pub wall_secs: f64,
     pub realtime_ratio: f64,
     pub rgba_sha256: Option<String>,
