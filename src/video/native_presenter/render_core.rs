@@ -47,6 +47,7 @@ use crate::video::native_window_host::{
     NativeWindowObservation,
 };
 use crate::video::window_host_contract::HostWindowTopology;
+use crate::video::zoom_view::{VideoZoomSourceGeometry, VideoZoomSourceRect};
 use crate::video::{VideoAnime4kFallbackNotice, VideoScaleFallbackNotice};
 
 // 音楽ビュー (Inc 5c-A) がジャンプ/ブックマークパネル本体・一括登録ダイアログを共有するため
@@ -1385,6 +1386,7 @@ struct VideoScalePreparationSignature {
     target_height: u32,
     target_content: VideoSurfaceContent,
     panorama_active: bool,
+    video_zoom_active: bool,
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
@@ -1418,6 +1420,7 @@ fn video_scale_signature_changed_fields(
     changed!(target_height);
     changed!(target_content);
     changed!(panorama_active);
+    changed!(video_zoom_active);
     changed!(grade_active);
     changed!(filter);
     changed!(smoothing_percent);
@@ -1513,6 +1516,7 @@ struct DisplaySurfaceRequestKey {
     sar_den: u32,
     orientation: VideoOrientation,
     panorama_active: bool,
+    video_zoom_active: bool,
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
@@ -1528,6 +1532,17 @@ struct ActiveVideoScaleFallback {
 enum VideoSurfaceSwapError {
     DisplayCreation(VideoScaleFallbackReason),
     Other(String),
+}
+
+fn effective_video_scale_filter(
+    filter: VideoScaleFilter,
+    video_zoom_active: bool,
+) -> VideoScaleFilter {
+    if video_zoom_active && filter == VideoScaleFilter::OsDefault {
+        VideoScaleFilter::Standard
+    } else {
+        filter
+    }
 }
 
 impl From<String> for VideoSurfaceSwapError {
@@ -3815,7 +3830,9 @@ impl NativeRenderCore {
         // Consume the edge before performing GPU work. A failure is logged by
         // the caller and is not converted into an unbounded retry loop.
         self.resize_settle = VideoResizeSettleState::Settled;
-        self.panorama_pose.is_some() || self.selected_scale_filter != VideoScaleFilter::OsDefault
+        self.panorama_pose.is_some()
+            || self.video_zoom_state.is_some()
+            || self.selected_scale_filter != VideoScaleFilter::OsDefault
     }
 
     pub fn set_video_compact(&mut self, compact: bool) -> Result<(), String> {
@@ -3876,6 +3893,7 @@ impl NativeRenderCore {
         let decision = decide_video_surface_size(VideoSurfaceSizeInput {
             filter: self.selected_scale_filter,
             panorama_active: self.panorama_pose.is_some(),
+            video_zoom_active: self.video_zoom_state.is_some(),
             source_width,
             source_height,
             sar_num: new_sar_num,
@@ -3909,6 +3927,7 @@ impl NativeRenderCore {
                         sar_den: new_sar_den,
                         orientation: new_orientation,
                         panorama_active: self.panorama_pose.is_some(),
+                        video_zoom_active: self.video_zoom_state.is_some(),
                         grade_active,
                         filter: self.selected_scale_filter,
                         smoothing_percent: self.downscale_smoothing_percent,
@@ -3919,8 +3938,11 @@ impl NativeRenderCore {
                         source_height,
                         current_width,
                         current_height,
+                        new_sar_num,
+                        new_sar_den,
                         new_orientation,
                         self.panorama_pose.is_some(),
+                        self.video_zoom_state.is_some(),
                         grade_active,
                         self.selected_scale_filter,
                         self.downscale_smoothing_percent,
@@ -3997,6 +4019,7 @@ impl NativeRenderCore {
                     sar_den: new_sar_den,
                     orientation: new_orientation,
                     panorama_active: self.panorama_pose.is_some(),
+                    video_zoom_active: self.video_zoom_state.is_some(),
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
@@ -4024,6 +4047,7 @@ impl NativeRenderCore {
                     sar_den: new_sar_den,
                     orientation: new_orientation,
                     panorama_active: self.panorama_pose.is_some(),
+                    video_zoom_active: self.video_zoom_state.is_some(),
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
@@ -4049,8 +4073,11 @@ impl NativeRenderCore {
                     source_height,
                     width,
                     height,
+                    new_sar_num,
+                    new_sar_den,
                     new_orientation,
                     self.panorama_pose.is_some(),
+                    self.video_zoom_state.is_some(),
                     grade_active,
                     self.selected_scale_filter,
                     self.downscale_smoothing_percent,
@@ -4104,6 +4131,7 @@ impl NativeRenderCore {
         if result.is_ok()
             && !kept_current_during_resize
             && (self.panorama_pose.is_some()
+                || self.video_zoom_state.is_some()
                 || self.selected_scale_filter != VideoScaleFilter::OsDefault)
         {
             self.resize_settle = VideoResizeSettleState::Settled;
@@ -4179,8 +4207,11 @@ impl NativeRenderCore {
                 signature.source_height,
                 signature.target_width,
                 signature.target_height,
+                signature.sar_num,
+                signature.sar_den,
                 signature.orientation,
                 signature.panorama_active,
+                signature.video_zoom_active,
                 signature.grade_active,
                 signature.filter,
                 smoothing_percent,
@@ -4255,6 +4286,7 @@ impl NativeRenderCore {
         let decision = decide_video_surface_size(VideoSurfaceSizeInput {
             filter,
             panorama_active: self.panorama_pose.is_some(),
+            video_zoom_active: self.video_zoom_state.is_some(),
             source_width,
             source_height,
             sar_num,
@@ -4303,6 +4335,7 @@ impl NativeRenderCore {
                 target_height,
                 target_content,
                 panorama_active: self.panorama_pose.is_some(),
+                video_zoom_active: self.video_zoom_state.is_some(),
                 grade_active: !self.video_grade.adjustments.is_identity(),
                 filter,
                 smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
@@ -4361,6 +4394,7 @@ impl NativeRenderCore {
             sar_den: signature.sar_den,
             orientation: signature.orientation,
             panorama_active: signature.panorama_active,
+            video_zoom_active: signature.video_zoom_active,
             grade_active: signature.grade_active,
             filter: signature.filter,
             smoothing_percent: signature.smoothing_percent,
@@ -4635,21 +4669,17 @@ impl NativeRenderCore {
 
     fn resample_mode(
         &self,
-        source_width: u32,
-        source_height: u32,
+        source_rect: VideoZoomSourceRect,
         target_width: u32,
         target_height: u32,
-        orientation: VideoOrientation,
     ) -> Option<VideoResampleMode> {
-        let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
-            (source_height, source_width)
-        } else {
-            (source_width, source_height)
-        };
         select_video_resample_mode(
-            self.selected_scale_filter,
-            source_axis_width,
-            source_axis_height,
+            effective_video_scale_filter(
+                self.selected_scale_filter,
+                self.video_zoom_state.is_some(),
+            ),
+            source_rect.extent[0],
+            source_rect.extent[1],
             target_width,
             target_height,
             self.downscale_smoothing_percent,
@@ -4663,8 +4693,11 @@ impl NativeRenderCore {
         source_height: u32,
         target_width: u32,
         target_height: u32,
+        sar_num: u32,
+        sar_den: u32,
         orientation: VideoOrientation,
         panorama_active: bool,
+        video_zoom_active: bool,
         grade_active: bool,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
@@ -4706,15 +4739,19 @@ impl NativeRenderCore {
             }
             return Ok(());
         }
-        let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
-            (source_height, source_width)
-        } else {
-            (source_width, source_height)
-        };
+        let source_rect = self.video_zoom_source_rect(
+            source_width,
+            source_height,
+            sar_num,
+            sar_den,
+            orientation,
+            target_width,
+            target_height,
+        );
         let mode = select_video_resample_mode(
-            filter,
-            source_axis_width,
-            source_axis_height,
+            effective_video_scale_filter(filter, video_zoom_active),
+            source_rect.extent[0],
+            source_rect.extent[1],
             target_width,
             target_height,
             smoothing_percent,
@@ -4785,6 +4822,37 @@ impl NativeRenderCore {
                 )?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn video_zoom_source_rect(
+        &self,
+        source_width: u32,
+        source_height: u32,
+        sar_num: u32,
+        sar_den: u32,
+        orientation: VideoOrientation,
+        target_width: u32,
+        target_height: u32,
+    ) -> VideoZoomSourceRect {
+        let source = VideoZoomSourceGeometry::new(
+            source_width,
+            source_height,
+            sar_num,
+            sar_den,
+            orientation,
+        );
+        self.video_zoom_state
+            .and_then(|state| {
+                state.source_rect(
+                    [target_width.max(1) as f32, target_height.max(1) as f32],
+                    source,
+                )
+            })
+            .unwrap_or(VideoZoomSourceRect {
+                origin: [0.0, 0.0],
+                extent: source.oriented_size,
+            })
     }
 
     fn record_scale_fallback(
@@ -5339,15 +5407,18 @@ impl NativeRenderCore {
         };
         let panorama_active = panorama_pose.is_some();
         let resample_active = surface_content == VideoSurfaceContent::DisplayResolved;
+        let source_rect = self.video_zoom_source_rect(
+            frame.width,
+            frame.height,
+            frame.sar_num,
+            frame.sar_den,
+            frame.orientation,
+            target_width,
+            target_height,
+        );
         let resample_mode = resample_active.then(|| {
-            self.resample_mode(
-                frame.width,
-                frame.height,
-                target_width,
-                target_height,
-                frame.orientation,
-            )
-            .expect("display-resolution surface always has a resample owner")
+            self.resample_mode(source_rect, target_width, target_height)
+                .expect("display-resolution surface always has a resample owner")
         });
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
@@ -5438,6 +5509,7 @@ impl NativeRenderCore {
                                 target_width,
                                 target_height,
                                 frame.orientation,
+                                source_rect,
                                 resample_mode.expect("display resample mode"),
                             )?;
                     } else if grade_active {
@@ -5618,6 +5690,7 @@ impl NativeRenderCore {
                                 target_width,
                                 target_height,
                                 frame.orientation,
+                                source_rect,
                                 resample_mode.expect("display resample mode"),
                             )?;
                     } else if grade_active {
@@ -14320,6 +14393,7 @@ mod tests {
             target_height: 2160,
             target_content: VideoSurfaceContent::DisplayResolved,
             panorama_active: false,
+            video_zoom_active: false,
             grade_active: false,
             filter: crate::settings::VideoScaleFilter::Sharp,
             smoothing_percent: 30,

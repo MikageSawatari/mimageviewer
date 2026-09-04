@@ -3,6 +3,7 @@ Texture2D<float4> source_tex : register(t0);
 cbuffer ResampleConstants : register(b0) {
     float4 source_target;  // raw source width/height, final target width/height
     float4 axis_filter;    // oriented source axis lengths, horizontal/vertical stretch
+    float4 source_region;  // oriented source origin x/y and extent x/y
     float4 inverse_axes;   // d(raw xy)/d(oriented x), d(raw xy)/d(oriented y)
     float4 inverse_offset; // raw xy at oriented (0,0), unused
 };
@@ -35,7 +36,11 @@ float4 ps_horizontal(VsOut input) : SV_Target {
     float source_axis_x = axis_filter.x;
     float source_axis_y = axis_filter.y;
     float target_width = source_target.z;
-    float source_position = input.position.x * source_axis_x / target_width - 0.5;
+    float source_position = source_region.x
+        + input.position.x * source_region.z / target_width - 0.5;
+    if (source_position < -0.5 || source_position >= source_axis_x - 0.5) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
     float oriented_y = clamp(input.position.y - 0.5, 0.0, source_axis_y - 1.0);
     float stretch = axis_filter.z;
     int radius = (int)ceil(3.0 * stretch);
@@ -61,7 +66,11 @@ float4 ps_horizontal(VsOut input) : SV_Target {
 float4 ps_vertical(VsOut input) : SV_Target {
     float source_axis_y = axis_filter.y;
     float target_height = source_target.w;
-    float source_position = input.position.y * source_axis_y / target_height - 0.5;
+    float source_position = source_region.y
+        + input.position.y * source_region.w / target_height - 0.5;
+    if (source_position < -0.5 || source_position >= source_axis_y - 0.5) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
     float stretch = axis_filter.w;
     int radius = (int)ceil(3.0 * stretch);
     int first = (int)floor(source_position) - radius;
@@ -81,8 +90,12 @@ float4 ps_vertical(VsOut input) : SV_Target {
 }
 
 float4 ps_nearest(VsOut input) : SV_Target {
-    float2 oriented_position =
-        input.position.xy * axis_filter.xy / source_target.zw - 0.5;
+    float2 oriented_position = source_region.xy
+        + input.position.xy * source_region.zw / source_target.zw - 0.5;
+    if (any(oriented_position < float2(-0.5, -0.5))
+        || any(oriented_position >= axis_filter.xy - float2(0.5, 0.5))) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
     float2 raw_position =
         round(oriented_position.x) * inverse_axes.xy
         + round(oriented_position.y) * inverse_axes.zw

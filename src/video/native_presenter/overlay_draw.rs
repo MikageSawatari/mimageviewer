@@ -4428,8 +4428,11 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ResetVideoZoom,
                     commands,
                 );
-                let scale_rect =
-                    egui::Rect::from_min_size(egui::pos2(x - 4.0, y), egui::vec2(48.0, btn_size));
+                let scale_width = 48.0;
+                let scale_rect = egui::Rect::from_min_size(
+                    egui::pos2(x + btn_size - scale_width, y),
+                    egui::vec2(scale_width, btn_size),
+                );
                 painter.text(
                     scale_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -4437,7 +4440,7 @@ pub(super) fn draw_native_top_bar(
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
-                x -= scale_rect.width() + gap;
+                x -= scale_width + gap;
             }
             let side_panel_mode = side_panel_mode.normalized();
             let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
