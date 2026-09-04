@@ -143,6 +143,25 @@ egui 非依存で既にある（§2.1）。テキストのためだけに GPU �
 - 副次効果として書き出しがハードウェア非依存で**ビット再現**する（D3 の受け入れ基準が
   同一機に限定されなくなる）。
 
+#### 決着（2026-09-04、P1a の実測）
+
+**CPU ラスタライザのまま進める。GPU 化はしない。** 1920x1080 / 60fps、背景 3000x1687 を
+`Fit::Cover`、実 PCM を `SpectrumSource` に通した 900 フレームの実測（Core Ultra 9 285 / 24 論理コア、release）:
+
+| 区間 | 平均 | p95 |
+| --- | ---: | ---: |
+| スペクトラム解析（music-core の FFT） | 0.189 ms | 0.405 ms |
+| シーン評価 + CPU 合成 | 1.219 ms | 1.635 ms |
+| **合計** | **1.408 ms** | **1.890 ms** |
+
+実時間比 11.8 倍。予算 8.3ms/frame に対して約 6 倍の余裕がある。P1b で加わる
+RGBA→YUV 変換と H.264 / AAC エンコードを載せても目標（実時間の 2 倍）を大きく上回る見込み。
+
+この数字は最初の測定を 1 度差し戻して取り直したもの。初回は背景画像がちょうど出力解像度で
+`copy_from_slice` の速い経路しか通らず、スペクトラム解析も合成値で、**書き出しに必ず含まれる
+コストが 2 つ抜けていた**。拡縮結果は `Assets` のキャッシュ（キー = 画像 ID + 出力先寸法 + Fit）で
+1 回だけ計算する。
+
 グロー自体は `(blur radius, spread, 色)` を各レイヤのプロパティとして持ち、CSS の
 `box-shadow` / `text-shadow` と同じ意味論で描く。シーン全体のブルームは v1 では作らない。
 
@@ -290,8 +309,10 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | # | 内容 | 受け入れ基準 |
 | --- | --- | --- |
 | **P0** | §1.4 の実測インベントリ確定（済）＋本書のユーザー承認 | 承認 |
-| **P1a** | レンダラ: `crates/musicvideo-core`（純ロジック + CPU ラスタライザ）と `tools/musicvideo_lab`（プレビュー + 連番 PNG）。FFmpeg 非依存で `vendor/` 不要 | `cargo test -p musicvideo-core` が緑。ラボで既定プロジェクトの絵が出て時刻スライダで動く。連番 PNG が出る。**合成の ms/frame と実時間比を実測して記録する** |
+| **P1a** ✅ | レンダラ: `crates/musicvideo-core`（純ロジック + CPU ラスタライザ）と `tools/musicvideo_lab`（プレビュー + 連番 PNG）。FFmpeg 非依存で `vendor/` 不要 | **完了**（2026-09-04、`681c7e84a`）。テスト 19 件緑。合成 1.408 ms/frame・実時間比 11.8 倍（D4 の決着を参照） |
 | **P1b** | 書き出し完走: 本体パッケージに `src/video/mvexport/` を足し、既存 H.264/AAC エンコーダ + 新規 MP4 muxer へ P1a のフレームを流す | 5 分の曲が 1920x1080 / 60fps の MP4 になり、音ズレ無く再生でき、投稿できる。2 回書き出してフレームがビット一致する |
+
+> P1b は本体パッケージをビルドするので、この worktree にも `vendor/` が要る。**junction を張らず実コピーする**（CLAUDE.md「worktree + Windows junction の地雷」）。必要なのは `pdfium` / `ort` / `susie-worker` / `ffmpeg` / `models` / `vst3-host` / `twemoji` の 325MB 分だけで、`vst3sdk`（490MB）と `tensorrt-cache` は要らない。`eframe` / `egui-wgpu` は git 追跡済みなので既にある。
 | **P2** | 見栄え: オブジェクト単位グロー / グラデーション / 円形スペアナ / 鍵盤表示 | **§1.4 のプロジェクトを mIV 上で再現できる**（並べて見比べて遜色が無い）。ただし**スペクトラムの周波数軸は一致対象から外す**（D5 — mIV の音楽的な軸で良い） |
 | **P3** | キーフレーム: 画像切替・フェード・色変化・ON/OFF | 既存の楽曲 1 本を Wav2Bar を使わずに最初から最後まで作り切れる |
 | **P4** | 本体統合: mIV の編集モードとして載せる。プロジェクト保存 / 読み込み、書き出しダイアログ、keymap | [docs/ui-responsiveness.md](ui-responsiveness.md) §4 を通過。閲覧側の退行が無い |
