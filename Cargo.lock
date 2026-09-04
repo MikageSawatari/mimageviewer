@@ -4148,6 +4148,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "musicvideo-core"
+version = "0.1.0"
+dependencies = [
+ "comic-core",
+ "music-core",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "musicvideo_lab"
+version = "0.1.0"
+dependencies = [
+ "comic-core",
+ "eframe",
+ "egui",
+ "image",
+ "music-core",
+ "musicvideo-core",
+ "rfd",
+ "serde",
+ "serde_json",
+ "symphonia",
+]
+
+[[package]]
 name = "mutate_once"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
