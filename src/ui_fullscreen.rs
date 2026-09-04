@@ -13856,6 +13856,9 @@ impl App {
         };
         if response.dragged() {
             self.fs_seek_drag_active = true;
+            // A drag sweeps the keep range the way scrolling does, so hold thumbnail
+            // prefetch back for the same reason. See note_fullscreen_seek_activity.
+            self.note_fullscreen_seek_activity();
         }
         if let Some(pointer_pos) = seek_pointer {
             let fraction = fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);

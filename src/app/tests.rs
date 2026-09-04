@@ -59586,6 +59586,7 @@ mod ctrl_f_structural_filter_tests {
 #[cfg(test)]
 mod prefetch_gate_tests {
     use super::*;
+    use crate::app::tests::phase_c_support::setup_app;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -59616,6 +59617,55 @@ mod prefetch_gate_tests {
                 reason: BlockReason::VisibleStillLoading { pending: 5 },
             }
         );
+    }
+
+    /// A seek-bar drag has to reach this gate, or thumbnail prefetch never pauses.
+    ///
+    /// The gate itself was already right; nothing was telling it that a drag had happened,
+    /// because a pointer drag is not a wheel, a key, or a grid touch. Without this the
+    /// decision below is `Allow`, and prefetch floods while the user drags - measured at
+    /// 1,410 prefetch enqueues in twelve seconds on 2026-09-04.
+    ///
+    /// This covers the contract, not the wiring: it calls the helper directly, so it would
+    /// still pass if the seek bar stopped calling it. Driving the drag itself needs the UI
+    /// harness; until then that half is checked on a real machine.
+    #[test]
+    fn a_fullscreen_seek_drag_counts_as_scroll_for_the_prefetch_gate() {
+        let mut app = setup_app();
+        assert!(
+            app.last_prefetch_scroll_at.is_none(),
+            "precondition: nothing has scrolled yet, so the gate would allow"
+        );
+        assert!(matches!(
+            decide_prefetch_allowed(Instant::now(), app.last_prefetch_scroll_at, 0),
+            PrefetchDecision::Allow { .. }
+        ));
+
+        app.note_fullscreen_seek_activity();
+
+        let marked = app
+            .last_prefetch_scroll_at
+            .expect("the drag must reach the prefetch gate's clock");
+        assert!(matches!(
+            decide_prefetch_allowed(marked, Some(marked), 0),
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { .. }
+            }
+        ));
+    }
+
+    /// The drag must not reset the grid's own scroll bookkeeping, which the grid owns.
+    #[test]
+    fn a_fullscreen_seek_drag_leaves_grid_scroll_state_alone() {
+        let mut app = setup_app();
+        app.scroll_settle_state = None;
+        let before_offset = app.last_scroll_offset_y_tracked;
+        let before_event = app.last_scroll_event_at;
+
+        app.note_fullscreen_seek_activity();
+
+        assert_eq!(app.last_scroll_offset_y_tracked, before_offset);
+        assert_eq!(app.last_scroll_event_at, before_event);
     }
 
     #[test]

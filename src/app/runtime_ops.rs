@@ -47,6 +47,22 @@ impl App {
         }
     }
 
+    /// Records a fullscreen seek-bar drag as scroll-like intent.
+    ///
+    /// Dragging the seek bar sweeps the keep range across the book exactly the way
+    /// scrolling sweeps it across the grid, but it arrives as a pointer drag, so none of
+    /// the conditions above see it and thumbnail prefetch is never held back. Measured on
+    /// 2026-09-04: during a drag, 1,410 of 1,968 thumbnail enqueues in twelve seconds were
+    /// prefetch, and every fullscreen frame over 100ms had that work in flight. Paging with
+    /// the keyboard did not have the problem because arrow and page keys are already
+    /// counted here - which is why the report was specific to the seek bar.
+    ///
+    /// Only the prefetch gate's clock is touched. The grid's own scroll bookkeeping
+    /// (offset tracking, settle state) belongs to the grid and is not ours to reset.
+    pub(crate) fn note_fullscreen_seek_activity(&mut self) {
+        self.last_prefetch_scroll_at = Some(std::time::Instant::now());
+    }
+
     /// Records grid touch-scroll activity even when only the fractional
     /// drawing remainder moved and the canonical row anchor stayed unchanged.
     /// Keeping all scroll/idle clocks on this explicit boundary prevents
