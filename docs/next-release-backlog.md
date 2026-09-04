@@ -205,9 +205,33 @@ ViewportId の新しい viewport に届き、利用者が × を押したのと�
 **v3.3.1 で修正済み** (`edf1c5ed`)。方針は Codex と合意 ([review §10.7](review-v3.3.0/README.md)、ブリーフ = [close-identity-brief.md](review-v3.3.0/close-identity-brief.md))。私が出した 2 案はどちらも Codex が証拠つきで否定した (egui では内部 Close と利用者の × が同じイベントになり照合不能 / incarnation と ViewportId の採番順が循環)。採るのは **内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない** 第三案。
 
 **(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
-利用者報告。**v3.2.0 / v3.3.0 でも同じなので退行ではない。** 別ウィンドウ側にキー入力が
-届いていないか、動画面の分岐に入っていない。§1.0d の R-02 と同じ「gamepad の配り先」
-まわりだが、静止画では動くので別の原因。
+利用者報告 (2026-08-30、v3.2.0 / v3.3.0 で同じなので退行ではない)。静止画では動く。
+
+- **当初の見立て「動画面の分岐に入っていない」は否定済み** (`75cdfd9b0`、v3.4.0)。十字キーの
+  配り先を `DpadRoute` の 1 値へ集約したうえで計装したところ、mount 済みの detached context が
+  動画を `fullscreen_idx` に持つ状態では、判定は正しく `Video` を返していた。
+  **この前提で調べると空振りする。**
+- **2026-09-04 の実機ログでは、右キーでシークできている**。利用者が「今は効く」と報告し、
+  `mimageviewer.log` に裏付けがあった:
+
+  ```
+  [gamepad] dpad route: Video(10) surface=Viewer fs_idx=Some(10) is_music=false
+            detached_context_at_rest=false session_detached_or_switching=true
+  [native-video-key] seq=1 virtual_key=0x27 ... fs_idx=10 presentation=detached
+            outcome=action:seek_forward_5s
+  ```
+
+  **`session_detached_or_switching=true` かつ `at_rest=false`** — root projection が
+  `fullscreen_idx` を持ったまま detached 表示している側では、配り先も下流も通っている。
+- **残る疑いは `at_rest=true` の側**。active viewer context が AtRest のとき、batch は root では
+  配られず、`gamepad_batch_goes_to_active_context()` (= `at_rest && surface == Viewer`) を通って
+  `update_active_viewer_context` が mount した中で配られる。**この経路を通ったときの
+  `dpad route:` 行は、まだ 1 度も記録されていない。**
+- **次にやること**: 効かない状況を再現し、`[gamepad] dpad route:` を見る。Video 行が出なければ
+  batch が mount 済み context へ届いていない (行に並ぶ述語が、どれで落ちたかを示す)。Video 行が
+  出ていれば下流で、`[native-video-key]` の `outcome=` が続きを語る。**どちらか分かるまで
+  直さない。** 窓が 2 つ以上あるとき / 直前にメインを触ったとき / F12 直後かどうかで
+  `at_rest` は変わるので、再現時はその条件も記録する。
 
 **(c) R-02 の症状は利用者環境では再現しなかった。** 別ウィンドウを開いたままメインを
 前面にして十字キーを押すと、**v3.3.0 でもメイン一覧が動いて見えた**との報告。
@@ -1192,11 +1216,14 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
   **ハンドラが自分で死ぬので `panic.log` に何も残らない。**
 
 - ⚠ **(B) を直しても (A) は直らない。だが (B) を直さないと (A) は永久に見えない。**
-  今は例外ハンドラが証拠ごと消している。**(B) を先に直す。**
-- (B) の直し方: 例外ハンドラの内側では **TLS に触れる API を使わない**。
-  スレッド ID は `std::thread::current().id()` ではなく **`GetCurrentThreadId()`** を使う。
-  ハンドラ経路が通るログ整形すべてを同じ基準で見直す (`format!` の allocator も
-  ヒープ破損時は危険なので、固定バッファ + `write!` が望ましい)。
+  例外ハンドラが証拠ごと消していたため、**(B) を先に直した。**
+- **(B) は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
+  Windows では `GetCurrentThreadId()` を直接呼ぶ (`std::thread::current()` は非 Windows 枝だけ)。
+  ハンドラが TLS に触れて自分で死ぬことはなくなり、(A) が起きればログに残る。
+- **(B) の残り**: ハンドラ経路はまだヒープを使う。[lib.rs](../src/lib.rs) の
+  `native_exception_handler` は `format!` と `append_panic_log_entry` を通り、同ファイルの
+  コメントがこれを残存リスクとして自認している。ヒープ破損の最中に走る以上、
+  **固定バッファ + `write!` + 起動時に開いた handle へ書く**のが本来の姿。
 - (A) の手掛かり: 一次例外は `RtlFreeHeap` の中。`Application Verifier` の page heap か
   `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
   ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
@@ -2062,6 +2089,43 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - サムネイル pipeline を fullscreen ページ読み込みと同じ予算に入れるかは別途判断する。
   入れると一覧の応答が落ちる可能性があるので、実測してから決める。
 
+### 1.182 静止画・漫画のページシークバーにサムネイル列を追加する
+
+- 出典: 専用スレ >>346 (2026-09-04)。「シークバーにサムネイルを出す機能を漫画でも
+  使いたい」という要望。対応予定として扱う。
+- **動画より実装条件は軽い。** 動画のように任意時刻を seek / decode して画像を新規生成する
+  必要はなく、静止画側にはページ順 (`FsSeekInfo.image_indices`)、既存サムネイルキャッシュ、
+  非同期 thumbnail worker、ページシークの入口が既にある。動画 native HUD のストリップを
+  そのまま流用はできないが、既存部品を組み合わせられるため新規デコーダや DB は不要。
+- 初期仕様は、静止画 / 本の下部ページシークバー上へ**現在ページを中心にした近傍ページ**を
+  横一列で表示する。サムネイルをクリックすると既存のページシーク契約でそのページへ移動する。
+  通常画像フォルダ、ZIP / CBZ、PDF、変換済みアーカイブを同じ対象にする。
+- シークバーに表示切替ボタンを追加し、既定は非表示とする。固定時はサムネイル列と既存
+  38pt シークバーの合計高を画像表示領域から除き、画像へ重ねない。非固定時は従来どおり
+  下端ホバーの overlay とする。別の固定 bool を増やさず、ページシークバーの固定状態に従う。
+- ページは source page 単位で並べる。LTR / RTL の読み方向、見開きで現在表示中の 1〜2 ページ、
+  連結読みの現在ページを正しく強調し、クリック後は既存の見開き unit / 連結読みの着地処理を
+  通す。分割表示は元ページのサムネイル 1 枚のままとする。
+- **全ページを先に読み込まない。** 帯の幅から求めた可視セルと小さい前後余白だけを
+  `ensure_navigation_target_thumbnail_requests` 相当の優先経路へ載せ、Pending は placeholder、
+  Ready になったセルから差し替える。数万ページでも要求数と GPU texture 数を表示幅に対して
+  有界にする。アニメーションページは一覧と同じ先頭フレームのサムネイルでよい。
+- **§1.181 と同時に設計する。** 現状は fullscreen 位置へ一覧の保持帯が追随し、シーク操作で
+  サムネイル要求・texture backlog が大量に積まれて表示を引っかける。サムネイル列のために
+  この経路をさらに広げてはならない。fullscreen 中の thumbnail keep set を「一覧の仮想ページ
+  数」ではなく、現在表示とストリップの可視セルから作るか、専用の bounded consumer として
+  分離し、§1.181 の引っかかりも悪化させないことを perf log で確認する。
+- レイアウトは 1 つの resolved geometry から、描画、hit-test、下端 hover、タッチ除外領域、
+  固定時の media rect、左右パネルの下端を解く。動画ストリップの高さ設定を共有するか、
+  静止画用の高さを固定するかは実装時に UI 全体を見て決めるが、動画専用の状態や worker は
+  静止画側へ持ち込まない。
+- 回帰確認: 単ページ / 見開き LTR / 見開き RTL / 連結読み、通常画像 / ZIP / PDF、
+  Pending→Loaded、数万ページで要求数が有界、固定 / 非固定、クリック着地、サイドパネル・
+  ナビゲータ・タッチ領域との非重複を pure logic / UI snapshot で固定する。実機では cold cache
+  と warm cache のシークを `--perf-log` で比較し、§1.181 の frame gap を増やさない。
+- 規模 / 優先度: Medium / P2。動画のフレーム抽出より簡単だが、固定バーの動的高さと
+  サムネイル保持予算を同時に扱うため、メニュー項目追加だけの Small 変更ではない。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -2140,9 +2204,13 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   §1.4 として着手したが、範囲を超えると判断して停止条件どおり切り出した。**v3.1.2 で閉じたのは
   「全件判定を待つ表示遅延」であって、判定そのものの重複ではない。**
 - 機構: フォルダ一覧の eligibility 判定が `inspect_for_direct_read_cancelable` で RAR の
-  header を全走査した後、thumbnail worker の代表画像選択が
+  header を全走査した後、**書庫を開くときの `zip-enumerate` worker** が
   `enumerate_image_entries_detailed` で**同じ RAR の header をもう一度全部**列挙する。
   30,000 entry 級の RAR が多いフォルダでは、この 2 回目がそのまま体感時間に乗る。
+- **訂正 (2026-09-04)**: 元の記述は 2 回目の主体を thumbnail worker としていたが、**現在の
+  thumbnail 経路は全走査していない** — `zip_loader::read_first_image_bytes` →
+  `rar_loader::read_first_image_bytes` で最初の画像エントリを見つけた時点で打ち切る。
+  同じ header を 2 回読む事実は残るが、2 回目は open 側。着手時はここを見に行くこと。
 - なぜ今回入れなかったか: 1 回へ統合するには `RarInspection` が entry / 代表情報を保持し、
   thumbnail と open 双方の列挙契約を変える必要がある。逐次公開とは独立した変更で、
   同じ commit に混ぜると切り分けられなくなる。
@@ -2570,8 +2638,8 @@ v3.5.0 ぶんは記載済み (必読 3 件 = 右クリックの Windows 項目�
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
-| PDFium | v2.12.0 サイクルで `chromium/7988` へ更新済み (§5.0) | 更新後は通常 / パスワード付き PDF の表示とページ数を実機確認 |
-| FFmpeg | v2.12.0 サイクルで `n7.1.5-12-g1fdbca85aa` へ更新済み (§5.0) | DLL・VERSION・LGPL 対応ソース・製品ページの FFmpeg 節を同じ commit に揃えて動画 / 音声を実機確認 |
+| PDFium | v3.4.0 サイクルで `chromium/8035` へ更新済み (`vendor/pdfium/VERSION` が正) | 更新後は通常 / パスワード付き PDF の表示とページ数を実機確認 |
+| FFmpeg | v3.4.0 サイクルで `n7.1.5-16-g9a4bb2c579` へ更新済み (**DLL の ProductVersion が正**。`vendor/ffmpeg/VERSION` はローリング名を掴んで腐る) | DLL・VERSION・LGPL 対応ソース・製品ページの FFmpeg 節を同じ commit に揃えて動画 / 音声を実機確認 |
 
 ### 5.2 Rust クレート
 
@@ -2651,14 +2719,15 @@ v3.5.0 ぶんは記載済み (必読 3 件 = 右クリックの Windows 項目�
 - 出典: v3.0.0 出荷前の holdover 調査 (2026-08-14) で Codex が併せて指摘。
   **今回の不具合 (`docs/briefs/pdf-page-turn-and-stale-composite-plan.md`) の原因ではない**
   が、同じ調査で見つかった同型の穴。
-- フルスクリーン表示チェーンの以下が **`idx` だけ**、または item 文脈を含まない世代だけで
-  引いている:
-  - `current_edit_result_texture` — `idx` で走査し他の `EditResultKey` 世代を無視 (src/app.rs 53781)
-  - `current_comic_composite_texture` — `idx` 直引き。コメントに「世代チェックなし」と明記 (src/app.rs 56470)
-  - `current_final_composite_texture` — `key.edit_key.idx` のみ (src/app.rs 55823)
-  - `conceal_cache` — `idx` + global conceal 世代のみ、`items_generation` を見ない (src/ui_fullscreen.rs 4297)
-  - `EditResultKey` / `FinalCompositeKey` に item-context 世代のフィールドが無い
-    (src/app.rs 5550 / 6032)
+- **5 項目のうち 3 つは済んでいる** (2026-08-14、`4ee159439` / `4c0779be6`、v3.0.0 で出荷)。
+  `EditResultKey` は `item_id` と `items_generation` を持ち、`FinalCompositeKey` はそれを内包する。
+  `current_edit_result_texture` は `idx` / `items_generation` / `item_id` の 3 条件で照合し、
+  `current_final_composite_texture` は `edit_key_describes_current_page` を通る。
+- **残っているのは 2 つ**。どちらも `idx` だけで引いており、item 文脈を持たない:
+  - `current_comic_composite_texture` — `comic_cache.get(&idx)` の直引き。裏も
+    `HashMap<usize, ComicCacheEntry>` のまま (`ItemsGenerationMap` ではない)
+  - `conceal_cache` — `HashMap<usize, ConcealCacheEntry>`。`ConcealCacheEntry` が持つのは
+    global な conceal 世代だけで、読み側も `idx` + その世代しか見ない
 - **今は `close_fullscreen` が各キャッシュをクリアするので救われているだけ**
   (src/app.rs 49757)。軽量な items 差し替え経路がそのクリアを通らないと ABA になる。
 - **意図された正しい形が同じファイルにある**: `ContinuousPageTransition` は
