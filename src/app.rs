@@ -6893,6 +6893,121 @@ impl FsOpenMaterialization {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsOpenPerfSpan {
+    Total,
+    RecordReadingHistory,
+    RecordBookResume,
+    StartMetadataLoad,
+    StartFsLoad,
+    UpdatePrefetchWindow,
+    RefreshFullscreenVideoMarkerCache,
+    RefreshFullscreenPdfPromotion,
+    ResetFileRuntime,
+    ViewerPresentation,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FsOpenPerfRecorder {
+    total: std::time::Duration,
+    record_reading_history: std::time::Duration,
+    record_book_resume: std::time::Duration,
+    start_metadata_load: std::time::Duration,
+    start_fs_load: std::time::Duration,
+    update_prefetch_window: std::time::Duration,
+    refresh_fullscreen_video_marker_cache: std::time::Duration,
+    refresh_fullscreen_pdf_promotion: std::time::Duration,
+    reset_file_runtime: std::time::Duration,
+    viewer_presentation: std::time::Duration,
+}
+
+impl FsOpenPerfRecorder {
+    pub(crate) fn add(&mut self, span: FsOpenPerfSpan, elapsed: std::time::Duration) {
+        let target = match span {
+            FsOpenPerfSpan::Total => &mut self.total,
+            FsOpenPerfSpan::RecordReadingHistory => &mut self.record_reading_history,
+            FsOpenPerfSpan::RecordBookResume => &mut self.record_book_resume,
+            FsOpenPerfSpan::StartMetadataLoad => &mut self.start_metadata_load,
+            FsOpenPerfSpan::StartFsLoad => &mut self.start_fs_load,
+            FsOpenPerfSpan::UpdatePrefetchWindow => &mut self.update_prefetch_window,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache => {
+                &mut self.refresh_fullscreen_video_marker_cache
+            }
+            FsOpenPerfSpan::RefreshFullscreenPdfPromotion => {
+                &mut self.refresh_fullscreen_pdf_promotion
+            }
+            FsOpenPerfSpan::ResetFileRuntime => &mut self.reset_file_runtime,
+            FsOpenPerfSpan::ViewerPresentation => &mut self.viewer_presentation,
+        };
+        *target += elapsed;
+    }
+
+    pub(crate) fn elapsed(&self, span: FsOpenPerfSpan) -> std::time::Duration {
+        match span {
+            FsOpenPerfSpan::Total => self.total,
+            FsOpenPerfSpan::RecordReadingHistory => self.record_reading_history,
+            FsOpenPerfSpan::RecordBookResume => self.record_book_resume,
+            FsOpenPerfSpan::StartMetadataLoad => self.start_metadata_load,
+            FsOpenPerfSpan::StartFsLoad => self.start_fs_load,
+            FsOpenPerfSpan::UpdatePrefetchWindow => self.update_prefetch_window,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache => {
+                self.refresh_fullscreen_video_marker_cache
+            }
+            FsOpenPerfSpan::RefreshFullscreenPdfPromotion => self.refresh_fullscreen_pdf_promotion,
+            FsOpenPerfSpan::ResetFileRuntime => self.reset_file_runtime,
+            FsOpenPerfSpan::ViewerPresentation => self.viewer_presentation,
+        }
+    }
+
+    pub(crate) fn categorized(&self) -> std::time::Duration {
+        self.record_reading_history
+            + self.record_book_resume
+            + self.start_metadata_load
+            + self.start_fs_load
+            + self.update_prefetch_window
+            + self.refresh_fullscreen_video_marker_cache
+            + self.refresh_fullscreen_pdf_promotion
+            + self.reset_file_runtime
+            + self.viewer_presentation
+    }
+}
+
+#[inline]
+pub(crate) fn start_fs_open_perf_span_with(
+    recorder: &Option<&mut FsOpenPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<std::time::Instant> {
+    recorder.as_ref().map(|_| now())
+}
+
+#[inline]
+fn start_fs_open_perf_span(
+    recorder: &Option<&mut FsOpenPerfRecorder>,
+) -> Option<std::time::Instant> {
+    start_fs_open_perf_span_with(recorder, std::time::Instant::now)
+}
+
+#[inline]
+pub(crate) fn finish_fs_open_perf_span_with(
+    recorder: &mut Option<&mut FsOpenPerfRecorder>,
+    span: FsOpenPerfSpan,
+    started_at: Option<std::time::Instant>,
+    now: impl FnOnce() -> std::time::Instant,
+) {
+    if let (Some(recorder), Some(started_at)) = (recorder.as_deref_mut(), started_at) {
+        recorder.add(span, now().duration_since(started_at));
+    }
+}
+
+#[inline]
+fn finish_fs_open_perf_span(
+    recorder: &mut Option<&mut FsOpenPerfRecorder>,
+    span: FsOpenPerfSpan,
+    started_at: Option<std::time::Instant>,
+) {
+    finish_fs_open_perf_span_with(recorder, span, started_at, std::time::Instant::now);
+}
+
 impl FsPageLoadState {
     fn needs_load_request(self) -> bool {
         matches!(self, Self::NeedsLoad)
@@ -44776,6 +44891,7 @@ impl App {
             history_trigger,
             requested_materialization,
             FsPageLoadContract::Sequential,
+            None,
         );
     }
 
@@ -44785,9 +44901,23 @@ impl App {
         history_trigger: HistoryTrigger,
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
+        mut perf: Option<&mut FsOpenPerfRecorder>,
     ) {
+        let total_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
-        if self.route_materialized_physical_still_open_to_active_context(idx) {
+        let route_materialized_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
+        let routed_materialized_physical_still =
+            self.route_materialized_physical_still_open_to_active_context(idx);
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            route_materialized_perf_t0,
+        );
+        #[cfg(windows)]
+        if routed_materialized_physical_still {
+            finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
             return;
         }
 
@@ -44820,7 +44950,13 @@ impl App {
         }
         // 明示 open の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
         // ファイル移動が集約されるこの境界で、前ファイルの owner を引き継がない。
+        let reset_side_panel_perf_t0 = start_fs_open_perf_span(&perf);
         self.reset_fs_side_panel_runtime_for_file_change();
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ResetFileRuntime,
+            reset_side_panel_perf_t0,
+        );
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
         // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
@@ -44845,6 +44981,8 @@ impl App {
         // を立てている場合はそれを尊重する (is_none 判定)。この判定は `fullscreen_idx` を idx へ
         // 更新する前・`prepare_viewer_presentation_open` が presentation を書き換える前に行う。
         #[cfg(windows)]
+        let detached_presentation_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
         if self.fs_media_open_forced_presentation.is_none()
             && !self.fs_open_intent_from_grid
             && self.fullscreen_idx.is_some()
@@ -44859,6 +44997,12 @@ impl App {
         if !reuse_detached_window_for_folder_nav {
             self.prepare_detached_image_windows_for_open(idx);
         }
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            detached_presentation_perf_t0,
+        );
         #[cfg(windows)]
         if self.vst3_deferred_media_open.is_some() && self.vst3_deferred_media_open != Some(idx) {
             self.vst3_deferred_media_open = None;
@@ -44887,14 +45031,34 @@ impl App {
         }
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
+        let record_book_resume_perf_t0 = start_fs_open_perf_span(&perf);
         self.record_book_resume(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RecordBookResume,
+            record_book_resume_perf_t0,
+        );
+        let record_reading_history_perf_t0 = start_fs_open_perf_span(&perf);
         self.record_reading_history(idx, history_trigger);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RecordReadingHistory,
+            record_reading_history_perf_t0,
+        );
         self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
         #[cfg(windows)]
+        let prepare_presentation_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
         self.prepare_viewer_presentation_open(idx, entering_native_video_fullscreen);
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            prepare_presentation_perf_t0,
+        );
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
@@ -44904,7 +45068,13 @@ impl App {
         // `open_fullscreen_from_fs_navigation` のようなラッパーを通すこと。
         self.cursor_last_activity = Some(std::time::Instant::now());
         self.cursor_hide_reason = None;
+        let refresh_video_markers_perf_t0 = start_fs_open_perf_span(&perf);
         self.refresh_fullscreen_video_marker_cache(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache,
+            refresh_video_markers_perf_t0,
+        );
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
@@ -44920,7 +45090,13 @@ impl App {
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
         self.fs_primary_suppression = Default::default();
+        let reset_erase_perf_t0 = start_fs_open_perf_span(&perf);
         self.reset_erase_mode();
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ResetFileRuntime,
+            reset_erase_perf_t0,
+        );
 
         // 360 度パノラマビュー: 別画像へナビ時は GPU リソースを解放する
         // (Arc + LRU 1 設計、§4.1)。state は保持して同セッションで equirect に
@@ -45030,12 +45206,24 @@ impl App {
                     if materialization.admits_non_target_full_resolution_work()
                         && self.reading_flow.is_paged()
                     {
+                        let update_prefetch_perf_t0 = start_fs_open_perf_span(&perf);
                         self.update_prefetch_window(idx);
+                        finish_fs_open_perf_span(
+                            &mut perf,
+                            FsOpenPerfSpan::UpdatePrefetchWindow,
+                            update_prefetch_perf_t0,
+                        );
                     }
                 }
                 // `ensure_fs_page_load` 後に見開き partner の prefetch が追加された場合も、
                 // 同じ page-change frame で pending set の増加を拾って pool へ昇格を依頼する。
+                let refresh_pdf_promotion_perf_t0 = start_fs_open_perf_span(&perf);
                 self.refresh_fullscreen_pdf_promotion();
+                finish_fs_open_perf_span(
+                    &mut perf,
+                    FsOpenPerfSpan::RefreshFullscreenPdfPromotion,
+                    refresh_pdf_promotion_perf_t0,
+                );
             }
             Some(GridItem::Video(_)) => {
                 // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
@@ -45088,11 +45276,18 @@ impl App {
                         ));
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
+                        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
                         return;
                     }
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
                     self.fs_open_intent_from_grid = grid_open_intent;
+                    let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
                     self.start_fs_load(idx);
+                    finish_fs_open_perf_span(
+                        &mut perf,
+                        FsOpenPerfSpan::StartFsLoad,
+                        start_fs_load_perf_t0,
+                    );
                 }
             }
             Some(GridItem::Audio(_)) => {
@@ -45122,6 +45317,7 @@ impl App {
                         ));
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
+                        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
                         return;
                     }
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));
@@ -45129,7 +45325,13 @@ impl App {
                     // 音声分岐が再度 take するので、動画分岐 (25987) と同じく戻してから呼ぶ。
                     // これで「音声 × 一覧から開く」設定 (music_open_resume) が効く (Codex P2)。
                     self.fs_open_intent_from_grid = grid_open_intent;
+                    let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
                     self.start_fs_load(idx);
+                    finish_fs_open_perf_span(
+                        &mut perf,
+                        FsOpenPerfSpan::StartFsLoad,
+                        start_fs_load_perf_t0,
+                    );
                 }
             }
             _ => {}
@@ -45138,7 +45340,14 @@ impl App {
         // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
         // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
         // 100ms 級にブロックする。メタデータパネルは値到着まで空表示。
+        let start_metadata_load_perf_t0 = start_fs_open_perf_span(&perf);
         self.start_metadata_load(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::StartMetadataLoad,
+            start_metadata_load_perf_t0,
+        );
+        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
     }
 
     /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。

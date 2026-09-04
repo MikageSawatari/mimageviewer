@@ -28,9 +28,9 @@ use crate::ai::ModelKind;
 use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
-    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, PollPrefetchOrigin,
-    ViewerPresentation, build_fs_prefetch_indicator,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOpenPerfRecorder, FsOpenPerfSpan,
+    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, PollPrefetchOrigin, ViewerPresentation, build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -83,7 +83,7 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
-const FS_RENDER_PERF_STAGE_COUNT: usize = 23;
+const FS_RENDER_PERF_STAGE_COUNT: usize = 35;
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +104,19 @@ enum FsRenderPerfStage {
     FsNavigationCtrlSiblingMouse,
     FsNavigationPageOther,
     FsNavigationBeginSequence,
-    FsNavigationLandTarget,
+    FsNavigationLandSeekContinuous,
+    FsNavigationLandOpenOther,
+    FsNavigationLandOpenRecordReadingHistory,
+    FsNavigationLandOpenRecordBookResume,
+    FsNavigationLandOpenStartMetadataLoad,
+    FsNavigationLandOpenStartFsLoad,
+    FsNavigationLandOpenUpdatePrefetchWindow,
+    FsNavigationLandOpenRefreshVideoMarkerCache,
+    FsNavigationLandOpenRefreshPdfPromotion,
+    FsNavigationLandOpenResetFileRuntime,
+    FsNavigationLandOpenViewerPresentation,
+    FsNavigationLandOpenRemainder,
+    FsNavigationLandRemainder,
     FsNavigationSlideshowAdvance,
     FsNavigationSlideshowOther,
     FsNavigationRemainder,
@@ -131,7 +143,19 @@ impl FsRenderPerfStage {
         Self::FsNavigationCtrlSiblingMouse,
         Self::FsNavigationPageOther,
         Self::FsNavigationBeginSequence,
-        Self::FsNavigationLandTarget,
+        Self::FsNavigationLandSeekContinuous,
+        Self::FsNavigationLandOpenOther,
+        Self::FsNavigationLandOpenRecordReadingHistory,
+        Self::FsNavigationLandOpenRecordBookResume,
+        Self::FsNavigationLandOpenStartMetadataLoad,
+        Self::FsNavigationLandOpenStartFsLoad,
+        Self::FsNavigationLandOpenUpdatePrefetchWindow,
+        Self::FsNavigationLandOpenRefreshVideoMarkerCache,
+        Self::FsNavigationLandOpenRefreshPdfPromotion,
+        Self::FsNavigationLandOpenResetFileRuntime,
+        Self::FsNavigationLandOpenViewerPresentation,
+        Self::FsNavigationLandOpenRemainder,
+        Self::FsNavigationLandRemainder,
         Self::FsNavigationSlideshowAdvance,
         Self::FsNavigationSlideshowOther,
         Self::FsNavigationRemainder,
@@ -148,6 +172,8 @@ enum FsNavigationPerfSpan {
     Page,
     BeginSequence,
     LandTarget,
+    LandSeekContinuous,
+    LandOpen,
     Slideshow,
     SlideshowAdvance,
 }
@@ -159,6 +185,9 @@ struct FsNavigationPerfRecorder {
     page: std::time::Duration,
     begin_sequence: std::time::Duration,
     land_target: std::time::Duration,
+    land_seek_continuous: std::time::Duration,
+    land_open: std::time::Duration,
+    open_fullscreen: FsOpenPerfRecorder,
     slideshow: std::time::Duration,
     slideshow_advance: std::time::Duration,
 }
@@ -171,6 +200,8 @@ impl FsNavigationPerfRecorder {
             FsNavigationPerfSpan::Page => &mut self.page,
             FsNavigationPerfSpan::BeginSequence => &mut self.begin_sequence,
             FsNavigationPerfSpan::LandTarget => &mut self.land_target,
+            FsNavigationPerfSpan::LandSeekContinuous => &mut self.land_seek_continuous,
+            FsNavigationPerfSpan::LandOpen => &mut self.land_open,
             FsNavigationPerfSpan::Slideshow => &mut self.slideshow,
             FsNavigationPerfSpan::SlideshowAdvance => &mut self.slideshow_advance,
         };
@@ -216,14 +247,25 @@ impl FsRenderPerfRecorder {
         navigation: FsNavigationPerfRecorder,
         now: std::time::Instant,
     ) {
-        // Page and slideshow totals contain their explicitly timed child calls. Publish only
-        // each total's residual alongside those child stages so the render total counts every
-        // navigation interval exactly once.
+        // Parent totals contain their explicitly timed child calls. Publish only each parent's
+        // residual alongside leaf stages so the render total counts every interval exactly once.
         debug_assert!(navigation.begin_sequence + navigation.land_target <= navigation.page);
+        debug_assert!(
+            navigation.land_seek_continuous + navigation.land_open <= navigation.land_target
+        );
         debug_assert!(navigation.slideshow_advance <= navigation.slideshow);
         let page_other = navigation
             .page
             .saturating_sub(navigation.begin_sequence + navigation.land_target);
+        let open_total = navigation.open_fullscreen.elapsed(FsOpenPerfSpan::Total);
+        let open_categorized = navigation.open_fullscreen.categorized();
+        debug_assert!(open_categorized <= open_total);
+        debug_assert!(open_total <= navigation.land_open);
+        let land_open_other = navigation.land_open.saturating_sub(open_total);
+        let open_remainder = open_total.saturating_sub(open_categorized);
+        let land_remainder = navigation
+            .land_target
+            .saturating_sub(navigation.land_seek_continuous + navigation.land_open);
         let slideshow_other = navigation
             .slideshow
             .saturating_sub(navigation.slideshow_advance);
@@ -246,9 +288,72 @@ impl FsRenderPerfRecorder {
                 navigation.begin_sequence,
             ),
             (
-                FsRenderPerfStage::FsNavigationLandTarget,
-                navigation.land_target,
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                navigation.land_seek_continuous,
             ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOther,
+                land_open_other,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder,
+            ),
+            (FsRenderPerfStage::FsNavigationLandRemainder, land_remainder),
             (
                 FsRenderPerfStage::FsNavigationSlideshowAdvance,
                 navigation.slideshow_advance,
@@ -438,8 +543,56 @@ impl FsRenderPerfBreakdown {
             FsRenderPerfStage::FsNavigationBeginSequence,
         ),
         (
-            "handle_fs_navigation_land_target_ms",
-            FsRenderPerfStage::FsNavigationLandTarget,
+            "handle_fs_navigation_land_target_seek_continuous_ms",
+            FsRenderPerfStage::FsNavigationLandSeekContinuous,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOther,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_reading_history_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_book_resume_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_metadata_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_fs_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_update_prefetch_window_ms",
+            FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_video_marker_cache_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_pdf_promotion_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_reset_file_runtime_ms",
+            FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_viewer_presentation_ms",
+            FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandRemainder,
         ),
         (
             "handle_fs_navigation_slideshow_advance_ms",
@@ -14435,19 +14588,36 @@ impl App {
         current_idx: usize,
         target_idx: usize,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         if self.continuous_reading_active_for_idx(current_idx)
             && self.continuous_reading_supported_idx(target_idx)
         {
             // A discrete page-unit command inside one continuous stream changes
             // its anchor; it is not a fresh fullscreen file open.
+            let seek_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.seek_to_continuous_page_with_contract(ctx, target_idx, load_contract);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandSeekContinuous,
+                seek_perf_t0,
+            );
         } else {
+            let open_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+            let open_fullscreen_perf = fs_navigation_perf
+                .as_mut()
+                .map(|perf| &mut perf.open_fullscreen);
             self.open_fullscreen_from_fs_navigation_with_contract(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 load_contract,
+                open_fullscreen_perf,
+            );
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpen,
+                open_perf_t0,
             );
         }
     }
@@ -26118,6 +26288,7 @@ impl App {
             idx,
             history_trigger,
             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            None,
         );
     }
 
@@ -26127,6 +26298,7 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        mut open_fullscreen_perf: Option<&mut FsOpenPerfRecorder>,
     ) {
         #[cfg(windows)]
         if self.should_block_detached_independent_still_navigation_to_video(idx) {
@@ -26190,7 +26362,13 @@ impl App {
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
                 );
             }
-            self.open_fullscreen(idx, history_trigger);
+            self.open_fullscreen_with_materialization_and_contract(
+                idx,
+                history_trigger,
+                FsOpenMaterialization::Eager,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                open_fullscreen_perf.as_deref_mut(),
+            );
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
             return;
         }
@@ -26227,6 +26405,7 @@ impl App {
             history_trigger,
             materialization,
             load_contract,
+            open_fullscreen_perf.as_deref_mut(),
         );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
@@ -26930,6 +27109,7 @@ impl App {
                         fs_idx,
                         new_idx,
                         crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                        &mut fs_navigation_perf,
                     );
                     finish_fs_navigation_perf_span(
                         &mut fs_navigation_perf,
@@ -26969,6 +27149,7 @@ impl App {
                             fs_idx,
                             step.source_idx,
                             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            &mut fs_navigation_perf,
                         );
                         finish_fs_navigation_perf_span(
                             &mut fs_navigation_perf,
@@ -27030,6 +27211,7 @@ impl App {
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
                             );
                             finish_fs_navigation_perf_span(
                                 &mut fs_navigation_perf,
@@ -27107,6 +27289,7 @@ impl App {
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
                             );
                             finish_fs_navigation_perf_span(
                                 &mut fs_navigation_perf,
@@ -38870,6 +39053,20 @@ mod tests {
                 std::time::Instant::now()
             },
         );
+        let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
+        let open_span = crate::app::start_fs_open_perf_span_with(&open_perf, || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        });
+        crate::app::finish_fs_open_perf_span_with(
+            &mut open_perf,
+            FsOpenPerfSpan::RecordReadingHistory,
+            open_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+        );
         finish_fs_navigation_perf_with(&mut navigation, &mut recorder, || {
             clock_called.set(true);
             std::time::Instant::now()
@@ -38914,21 +39111,39 @@ mod tests {
             marked_at += std::time::Duration::from_millis(1);
             recorder.mark_at(stage, marked_at);
         }
+        let mut open_fullscreen = FsOpenPerfRecorder::default();
+        for (span, ms) in [
+            (FsOpenPerfSpan::Total, 25),
+            (FsOpenPerfSpan::RecordReadingHistory, 2),
+            (FsOpenPerfSpan::RecordBookResume, 3),
+            (FsOpenPerfSpan::StartMetadataLoad, 1),
+            (FsOpenPerfSpan::StartFsLoad, 2),
+            (FsOpenPerfSpan::UpdatePrefetchWindow, 4),
+            (FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache, 1),
+            (FsOpenPerfSpan::RefreshFullscreenPdfPromotion, 2),
+            (FsOpenPerfSpan::ResetFileRuntime, 2),
+            (FsOpenPerfSpan::ViewerPresentation, 3),
+        ] {
+            open_fullscreen.add(span, std::time::Duration::from_millis(ms));
+        }
         let navigation = FsNavigationPerfRecorder {
             close: std::time::Duration::from_millis(2),
             ctrl_sibling_mouse: std::time::Duration::from_millis(3),
-            page: std::time::Duration::from_millis(11),
+            page: std::time::Duration::from_millis(50),
             begin_sequence: std::time::Duration::from_millis(4),
-            land_target: std::time::Duration::from_millis(5),
+            land_target: std::time::Duration::from_millis(30),
+            land_seek_continuous: std::time::Duration::ZERO,
+            land_open: std::time::Duration::from_millis(29),
+            open_fullscreen,
             slideshow: std::time::Duration::from_millis(7),
             slideshow_advance: std::time::Duration::from_millis(6),
         };
-        marked_at += std::time::Duration::from_millis(31);
+        marked_at += std::time::Duration::from_millis(70);
         recorder.mark_navigation_at(navigation, marked_at);
 
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationPageOther as usize],
-            2.0
+            16.0
         );
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationSlideshowOther as usize],
@@ -38938,20 +39153,33 @@ mod tests {
             recorder.stage_ms[FsRenderPerfStage::FsNavigationRemainder as usize],
             8.0
         );
-        let navigation_ms = [
-            FsRenderPerfStage::FsNavigationClose,
-            FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
-            FsRenderPerfStage::FsNavigationPageOther,
-            FsRenderPerfStage::FsNavigationBeginSequence,
-            FsRenderPerfStage::FsNavigationLandTarget,
-            FsRenderPerfStage::FsNavigationSlideshowAdvance,
-            FsRenderPerfStage::FsNavigationSlideshowOther,
-            FsRenderPerfStage::FsNavigationRemainder,
-        ]
-        .into_iter()
-        .map(|stage| recorder.stage_ms[stage as usize])
-        .sum::<f64>();
-        assert_eq!(navigation_ms, 31.0);
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenOther as usize],
+            4.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
+            5.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandRemainder as usize],
+            1.0
+        );
+        let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
+            as usize
+            ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(land_ms, 30.0);
+        let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+            ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(navigation_ms, 70.0);
         assert_eq!(
             FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
             Some(FsRenderPerfStage::FsBoundaryHint)
