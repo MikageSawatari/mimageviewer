@@ -766,6 +766,8 @@ worker のルール:
   worker が snapshot した対象フィールドも変わるため、受信側 pending を破棄して revision も進め、
   変更前 worker の `Finished` が新しい列構成を `Ready` に確定できないようにする。
 - `GlobalIoSemaphore` を使う。可視行優先、画面外は低優先。
+  すべての permit 取得は `acquire_cancellable` を通し、待機中の cancel は失敗件数や
+  `Finished` を送らない取消終端として、I/O 段階を含む理由を perf / log に残す。
 - 高速スクロールで可視範囲が Normal 優先集合から離れても、既存 prefetch と同じ
   100 ms のスクロール静止判定を通過するまでは priority を更新しない。静止後は worker を
   cancel / respawn せず、現在の可視 target だけを `priority_tx` へ追加する。

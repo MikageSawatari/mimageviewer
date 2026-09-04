@@ -200,6 +200,12 @@ impl GlobalIoSemaphore {
         let st = mu.lock().unwrap();
         (st.available, st.total)
     }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_for_test(&self, priority: IoPriority) -> usize {
+        let (mu, _cv) = &*self.inner;
+        mu.lock().unwrap().waiting[priority as usize]
+    }
 }
 
 /// RAII permit。Drop で available を元に戻し、Condvar で待機者を起床させる。

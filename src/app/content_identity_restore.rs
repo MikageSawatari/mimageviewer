@@ -397,7 +397,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         for idx in rotation_indices {
-            self.rotation_cache.remove(&idx);
+            self.remove_rotation_cache_entry_for_reload(idx);
         }
 
         // edit_preview_cache.db も worker が App service の event を通らず更新する。すでに raw / old

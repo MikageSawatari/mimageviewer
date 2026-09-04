@@ -999,7 +999,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
 }
 
 #[test]
-fn spread_units_rebuild_after_saved_rotation_changes() {
+fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     app.items = (0..5)
@@ -1023,9 +1023,14 @@ fn spread_units_rebuild_after_saved_rotation_changes() {
         .collect();
     let nav = (0..app.items.len()).collect::<Vec<_>>();
 
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
     assert_eq!(
         app.spread_display_unit_pages_for_test(&nav),
         vec![vec![0, 1], vec![2, 3], vec![4]]
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
     );
 
     app.rotate_image_cw(0);
@@ -1034,12 +1039,191 @@ fn spread_units_rebuild_after_saved_rotation_changes() {
         vec![vec![0], vec![1, 2], vec![3, 4]],
         "R 回転後は更新済み rotation_cache から同じフレームの再構築へ反映する"
     );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
 
-    app.rotate_image_ccw(0);
+    let _ = app.set_image_rotation(0, crate::rotation_db::Rotation::Cw270);
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0], vec![1, 2], vec![3, 4]]
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "90° から 270° は横長性が変わらないため再構築しない"
+    );
+
+    let _ = app.set_image_rotation(0, crate::rotation_db::Rotation::Cw180);
     assert_eq!(
         app.spread_display_unit_pages_for_test(&nav),
         vec![vec![0, 1], vec![2, 3], vec![4]],
-        "L 回転で縦長へ戻した後も固定した表示ユニットを再利用しない"
+        "回転で縦長へ戻した後は表示単位を再構築する"
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3
+    );
+}
+
+#[test]
+fn spread_display_units_are_built_once_for_repeated_pair_resolution() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.cached_nav_indices = None;
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    for _ in 0..3 {
+        assert_eq!(
+            app.resolve_spread_pair(2),
+            crate::ui_fullscreen::SpreadPair::Double { left: 2, right: 3 }
+        );
+    }
+
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1,
+        "同じ token では表示単位列を一度だけ構築する"
+    );
+}
+
+#[test]
+fn spread_dimension_discovery_rebuilds_only_for_landscape() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.spread_mode = crate::settings::SpreadMode::LtrCover;
+    let nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    let initial = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        initial,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
+    );
+
+    app.record_page_dims_for_spread(1, (900, 1600));
+    let after_portrait = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_portrait,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(after_portrait, initial);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1,
+        "寸法不明から縦長の判明は仮定どおりなので再構築しない"
+    );
+
+    app.record_page_dims_for_spread(3, (1600, 900));
+    let after_landscape = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_landscape,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_ne!(after_landscape, initial);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "寸法不明から横長の判明は同じフレーム内でも再構築する"
+    );
+
+    app.record_page_dims_for_spread(3, (1600, 900));
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        after_landscape
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "同じ横長寸法の再記録では epoch を進めない"
+    );
+
+    let ctx = egui::Context::default();
+    app.fs_cache.insert(
+        5,
+        FsCacheEntry::Static {
+            tex: ctx.load_texture(
+                "spread_cache_fs_landscape",
+                egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+            pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
+            source_dims: Some([1600, 900]),
+            load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.harvest_page_dims();
+    let after_fs_landscape = app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        after_fs_landscape,
+        app.uncached_spread_display_unit_pages_for_test(&nav)
+    );
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3,
+        "fs_cache で横長寸法が確定した場合も次の参照で再構築する"
+    );
+}
+
+#[test]
+fn spread_cache_token_tracks_every_pairing_input() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    app.spread_display_unit_pages_for_test(&nav);
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        1
+    );
+
+    app.spread_mode = crate::settings::SpreadMode::Rtl;
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
+
+    app.spread_shift_anchor_idx = Some(2);
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        3
+    );
+
+    app.bump_items_generation();
+    app.spread_display_unit_pages_for_test(&nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        4
+    );
+
+    let reordered_nav = vec![0, 2, 1, 3, 4, 5];
+    app.spread_display_unit_pages_for_test(&reordered_nav);
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        5,
+        "items_generation が同じでも nav index 列が違えば再構築する"
     );
 }
 
@@ -1071,6 +1255,62 @@ fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
         assert_eq!(detached.page_dims_cache.get(5, 0), Some((900, 1400)));
     })
     .expect("detached bundle remains parked");
+}
+
+#[test]
+#[cfg(windows)]
+fn spread_cache_does_not_cross_viewer_bundles() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..4)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/main/{page}.png"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.cached_nav_indices = None;
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let main_nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&main_nav),
+        vec![vec![0, 1], vec![2, 3]]
+    );
+
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = (0..3)
+            .map(|page| GridItem::Image(PathBuf::from(format!("C:/detached/{page}.png"))))
+            .collect();
+        detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
+        detached.visible_indices = (0..detached.items.len()).collect();
+        detached.cached_nav_indices = None;
+        detached.spread_mode = crate::settings::SpreadMode::LtrCover;
+        assert_eq!(
+            detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
+            vec![vec![0], vec![1, 2]]
+        );
+    });
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2
+    );
+
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&main_nav),
+        vec![vec![0, 1], vec![2, 3]],
+        "detached 構築後も main の cache を再構築しない"
+    );
+    app.with_active_viewer_context(|detached| {
+        assert_eq!(
+            detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
+            vec![vec![0], vec![1, 2]]
+        );
+    })
+    .expect("detached bundle remains parked");
+    assert_eq!(
+        crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+        2,
+        "main と detached はそれぞれの viewer context cache を再利用する"
+    );
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
@@ -19006,6 +19246,7 @@ mod favorite_adjustment_defaults_tests {
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::LtrCover;
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
         assert_eq!(
             app.resolve_spread_pair(1),
@@ -19020,6 +19261,11 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             app.resolve_spread_pair(5),
             SpreadPair::Double { left: 4, right: 5 }
+        );
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            1,
+            "表紙・横長を含む同一 token の相方解決でも表示単位列を再利用する"
         );
     }
 
@@ -19288,6 +19534,7 @@ mod favorite_adjustment_defaults_tests {
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::SplitLtr;
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         // 縦長 -> 横長の左半分。
         app.fullscreen_idx = Some(0);
         app.fullscreen_page_slice = PageSlice::Full;
@@ -19345,6 +19592,11 @@ mod favorite_adjustment_defaults_tests {
                 source_idx: 1,
                 slice: PageSlice::Right
             })
+        );
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            0,
+            "分割モードは従来どおり presentation step 経路を使う"
         );
     }
 
@@ -34746,6 +34998,7 @@ mod pipeline_cache_refactor_tests {
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fullscreen_idx = Some(left);
 
+        crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
         // 通常 (ページ送り) では動画も並びに入るので、左の相方は動画側。
         app.reading_flow = crate::settings::ReadingFlow::Paged;
         assert_ne!(
@@ -34760,6 +35013,39 @@ mod pipeline_cache_refactor_tests {
             app.displayed_spread_partner(left),
             Some(right),
             "連結読みなのに動画を含む並びで相方を解いている"
+        );
+        assert_eq!(app.displayed_spread_partner(left), Some(right));
+        assert_eq!(
+            crate::ui_fullscreen::spread_display_units_build_count_for_test(),
+            2,
+            "通常 nav と連結読みの静止画 nav は別 token だが、各列は再利用する"
+        );
+    }
+
+    /// `poll_prefetch` の二つのループは、相方を要素ごとに解き直さない。
+    #[test]
+    fn poll_prefetch_resolves_the_displayed_spread_once_before_its_loops() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source =
+            std::fs::read_to_string(manifest_dir.join("src/app.rs")).expect("read app.rs as UTF-8");
+        let body = source
+            .split_once("pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {")
+            .expect("poll_prefetch start")
+            .1
+            .split_once("    fn update_reading_history_media_progress(")
+            .expect("function after poll_prefetch")
+            .0;
+
+        assert_eq!(body.matches("displayed_spread_partner(").count(), 1);
+        assert_eq!(
+            body.matches("page_is_displayed_now(").count(),
+            0,
+            "ループ内で相方解決を含むラッパーを呼ばない"
+        );
+        assert_eq!(
+            body.matches("Self::page_is_displayed(").count(),
+            3,
+            "pending drain / 完了 / 切断の全経路が唯一の共有述語を使う"
         );
     }
 

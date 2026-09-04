@@ -19,6 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8785,7 +8786,7 @@ fn is_landscape(
         .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
 }
 
-fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
+pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
     fn from_usize(dims: [usize; 2]) -> Option<(u32, u32)> {
         Some((u32::try_from(dims[0]).ok()?, u32::try_from(dims[1]).ok()?))
     }
@@ -8814,6 +8815,169 @@ fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
 struct SpreadDisplayUnit {
     nav_start: usize,
     pages: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SpreadDisplayUnitsToken {
+    items_generation: u64,
+    spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
+    landscape_epoch: u64,
+    nav: Vec<usize>,
+}
+
+impl SpreadDisplayUnitsToken {
+    fn matches(
+        &self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+        landscape_epoch: u64,
+    ) -> bool {
+        self.items_generation == items_generation
+            && self.spread_mode == spread_mode
+            && self.shift_anchor_idx == shift_anchor_idx
+            && self.landscape_epoch == landscape_epoch
+            && self.nav == nav
+    }
+
+    fn identifies_nav(&self, nav: &[usize], items_generation: u64) -> bool {
+        self.items_generation == items_generation && self.nav == nav
+    }
+}
+
+/// 見開き表示単位列を所有する viewer context 単位のキャッシュ。
+///
+/// nav は index 列そのものを token に保持し、並べ替え・絞り込み・連結読みの列切替を
+/// `items_generation` とは独立に識別する。`landscape_epoch` は、cached nav 上で
+/// 「縦長扱い」と「横長」が反転した場合だけ進む。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpreadDisplayUnitsCache {
+    token: Option<SpreadDisplayUnitsToken>,
+    units: Arc<Vec<SpreadDisplayUnit>>,
+    tracked_indices: HashSet<usize>,
+    landscape_indices: HashSet<usize>,
+    landscape_epoch: u64,
+    rotation_recheck_all: bool,
+    rotation_recheck_indices: HashSet<usize>,
+}
+
+impl SpreadDisplayUnitsCache {
+    fn get(
+        &self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+    ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
+        self.token
+            .as_ref()
+            .is_some_and(|token| {
+                token.matches(
+                    nav,
+                    items_generation,
+                    spread_mode,
+                    shift_anchor_idx,
+                    self.landscape_epoch,
+                )
+            })
+            .then(|| Arc::clone(&self.units))
+    }
+
+    fn install(
+        &mut self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+        landscape_flags: &[bool],
+        units: Vec<SpreadDisplayUnit>,
+    ) -> Arc<Vec<SpreadDisplayUnit>> {
+        self.token = Some(SpreadDisplayUnitsToken {
+            items_generation,
+            spread_mode,
+            shift_anchor_idx,
+            landscape_epoch: self.landscape_epoch,
+            nav: nav.to_vec(),
+        });
+        self.tracked_indices = nav.iter().copied().collect();
+        self.landscape_indices = nav
+            .iter()
+            .zip(landscape_flags)
+            .filter_map(|(&idx, &landscape)| landscape.then_some(idx))
+            .collect();
+        self.rotation_recheck_all = false;
+        self.rotation_recheck_indices.clear();
+        self.units = Arc::new(units);
+        Arc::clone(&self.units)
+    }
+
+    fn tracks(&self, items_generation: u64, idx: usize) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| token.items_generation == items_generation)
+            && self.tracked_indices.contains(&idx)
+    }
+
+    fn reconcile_landscape(&mut self, items_generation: u64, idx: usize, landscape: bool) {
+        if !self.tracks(items_generation, idx) {
+            return;
+        }
+        let was_landscape = self.landscape_indices.contains(&idx);
+        if was_landscape == landscape {
+            return;
+        }
+        if landscape {
+            self.landscape_indices.insert(idx);
+        } else {
+            self.landscape_indices.remove(&idx);
+        }
+        self.landscape_epoch = self.landscape_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn mark_rotation_for_recheck(&mut self, items_generation: u64, idx: usize) {
+        if self.tracks(items_generation, idx) {
+            self.rotation_recheck_indices.insert(idx);
+        }
+    }
+
+    pub(crate) fn mark_all_rotations_for_recheck(&mut self, items_generation: u64) {
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.items_generation == items_generation)
+        {
+            self.rotation_recheck_all = true;
+            self.rotation_recheck_indices.clear();
+        }
+    }
+
+    fn take_rotation_rechecks(&mut self, nav: &[usize], items_generation: u64) -> Vec<usize> {
+        if !self
+            .token
+            .as_ref()
+            .is_some_and(|token| token.identifies_nav(nav, items_generation))
+        {
+            self.rotation_recheck_all = false;
+            self.rotation_recheck_indices.clear();
+            return Vec::new();
+        }
+        if self.rotation_recheck_all {
+            self.rotation_recheck_all = false;
+            self.rotation_recheck_indices.clear();
+            return nav.to_vec();
+        }
+        self.rotation_recheck_indices.drain().collect()
+    }
+
+    fn tracked_indices(&self, items_generation: u64) -> Vec<usize> {
+        self.token
+            .as_ref()
+            .filter(|token| token.items_generation == items_generation)
+            .map(|token| token.nav.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl SpreadDisplayUnit {
@@ -8883,6 +9047,20 @@ fn build_spread_display_units(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static SPREAD_DISPLAY_UNITS_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_spread_display_units_build_count_for_test() {
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn spread_display_units_build_count_for_test() -> usize {
+    SPREAD_DISPLAY_UNITS_BUILD_COUNT.get()
+}
 #[cfg(test)]
 fn build_spread_display_units_with_landscape(
     nav: &[usize],
@@ -10224,11 +10402,13 @@ impl App {
     /// (PDF を開き直して items 世代が変わると `page_dims_cache` も失効するため、
     /// サムネイル未読込と重なると供給源がゼロになる)。
     pub(crate) fn harvest_page_dims(&mut self) {
-        let generation = self.items_generation;
-        for (&idx, entry) in &self.fs_cache {
-            if let Some(dims) = fs_cache_entry_page_dims(entry) {
-                self.page_dims_cache.record(generation, idx, dims);
-            }
+        let live_dims = self
+            .fs_cache
+            .iter()
+            .filter_map(|(&idx, entry)| fs_cache_entry_page_dims(entry).map(|dims| (idx, dims)))
+            .collect::<Vec<_>>();
+        for (idx, dims) in live_dims {
+            self.record_page_dims_for_spread(idx, dims);
         }
         // retained composite は現在ページを表示するための経路なので、そのページだけ見る。
         let retained = self.fullscreen_idx.and_then(|idx| {
@@ -10236,27 +10416,146 @@ impl App {
                 .map(|dims| (idx, dims))
         });
         if let Some((idx, dims)) = retained {
-            self.page_dims_cache.record(generation, idx, dims);
+            self.record_page_dims_for_spread(idx, dims);
         }
     }
 
-    fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Vec<SpreadDisplayUnit> {
-        // `get_rotations_for_indices` が mutable なのは DB 未読分を idx cache へ memoize するため。
-        // fs_cache / thumbnails の借用より先に nav 全体を一括取得して借用を分離する。
-        let rotations = self.get_rotations_for_indices(nav);
-        build_spread_display_units(
-            nav,
-            &rotations,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        )
+    /// `fs_cache` へ静止画を挿入した直後に呼び、同じ frame 内で寸法確定を token へ反映する。
+    pub(crate) fn record_fs_cache_page_dims_for_spread(&mut self, idx: usize) {
+        let dims = self.fs_cache.get(&idx).and_then(fs_cache_entry_page_dims);
+        if let Some(dims) = dims {
+            self.record_page_dims_for_spread(idx, dims);
+        }
     }
 
+    /// 判明した pixel 寸法を保持し、cached nav 上の横長性が変わった場合だけ epoch を進める。
+    pub(crate) fn record_page_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
+        self.page_dims_cache
+            .record(self.items_generation, idx, dims);
+        self.reconcile_spread_landscape_for_idx(idx);
+    }
+
+    /// PDF page box 等の layout 寸法版。pixel 寸法と同じ失効境界を通す。
+    pub(crate) fn record_page_layout_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
+        self.page_dims_cache
+            .record_layout(self.items_generation, idx, dims);
+        self.reconcile_spread_landscape_for_idx(idx);
+    }
+
+    /// 現在 cache 済みの回転を使って、1 ページの横長性だけを再照合する。
+    pub(crate) fn reconcile_spread_landscape_for_idx(&mut self, idx: usize) {
+        if !self
+            .spread_display_units_cache
+            .tracks(self.items_generation, idx)
+        {
+            return;
+        }
+        let Some(&rotation) = self.rotation_cache.get(&idx) else {
+            // 外部 DB 更新のため回転 cache を捨てた直後は、次の表示単位参照で一括再読込する。
+            self.spread_display_units_cache
+                .mark_rotation_for_recheck(self.items_generation, idx);
+            return;
+        };
+        self.reconcile_spread_landscape_with_rotation(idx, rotation);
+    }
+
+    pub(crate) fn reconcile_spread_landscape_with_rotation(
+        &mut self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) {
+        let landscape = is_spread_pairable_item(self.items.get(idx))
+            && is_landscape(
+                idx,
+                rotation,
+                &self.fs_cache,
+                &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
+            );
+        self.spread_display_units_cache
+            .reconcile_landscape(self.items_generation, idx, landscape);
+    }
+
+    /// worker が現在の rotation cache 全体を差し替えた経路、および全回転リセット用。
+    pub(crate) fn reconcile_spread_landscapes_from_rotation_cache(&mut self) {
+        let tracked = self
+            .spread_display_units_cache
+            .tracked_indices(self.items_generation);
+        for idx in tracked {
+            let rotation = self
+                .rotation_cache
+                .get(&idx)
+                .copied()
+                .unwrap_or(crate::rotation_db::Rotation::None);
+            self.reconcile_spread_landscape_with_rotation(idx, rotation);
+        }
+    }
+
+    fn refresh_spread_rotation_rechecks(&mut self, nav: &[usize]) {
+        let mut indices = self
+            .spread_display_units_cache
+            .take_rotation_rechecks(nav, self.items_generation);
+        if indices.is_empty() {
+            return;
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        let rotations = self.get_rotations_for_indices(&indices);
+        for (&idx, rotation) in indices.iter().zip(rotations) {
+            self.reconcile_spread_landscape_with_rotation(idx, rotation);
+        }
+    }
+
+    fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Arc<Vec<SpreadDisplayUnit>> {
+        self.refresh_spread_rotation_rechecks(nav);
+        if let Some(units) = self.spread_display_units_cache.get(
+            nav,
+            self.items_generation,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+        ) {
+            return units;
+        }
+
+        // DB 未読の回転は nav 全体で一括取得し、idx cache へ memoize する。
+        let rotations = self.get_rotations_for_indices(nav);
+        let landscape_flags = nav
+            .iter()
+            .enumerate()
+            .map(|(nav_pos, &idx)| {
+                is_spread_pairable_item(self.items.get(idx))
+                    && is_landscape(
+                        idx,
+                        rotations
+                            .get(nav_pos)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                        &self.fs_cache,
+                        &self.thumbnails,
+                        &self.page_dims_cache,
+                        self.items_generation,
+                    )
+            })
+            .collect::<Vec<_>>();
+        let units = build_spread_display_units_with_predicates(
+            nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
+            |idx| is_spread_pairable_item(self.items.get(idx)),
+        );
+        #[cfg(test)]
+        SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
+        self.spread_display_units_cache.install(
+            nav,
+            self.items_generation,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &landscape_flags,
+            units,
+        )
+    }
     /// 分割を織り込んだ表示ステップ列。分割モードでなければ `None`。
     ///
     /// 分割するのは「静止画」かつ「保存回転を反映して横長」のページ。**縦横比の判定は
@@ -10476,9 +10775,31 @@ impl App {
     #[cfg(test)]
     pub(crate) fn spread_display_unit_pages_for_test(&mut self, nav: &[usize]) -> Vec<Vec<usize>> {
         self.build_spread_display_units_for_nav(nav)
-            .into_iter()
+            .iter()
             .map(|unit| unit.screen_pages(self.spread_mode))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uncached_spread_display_unit_pages_for_test(
+        &mut self,
+        nav: &[usize],
+    ) -> Vec<Vec<usize>> {
+        let rotations = self.get_rotations_for_indices(nav);
+        build_spread_display_units(
+            nav,
+            &rotations,
+            &self.items,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        )
+        .into_iter()
+        .map(|unit| unit.screen_pages(self.spread_mode))
+        .collect()
     }
 
     pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
@@ -27246,7 +27567,7 @@ impl App {
             let spread_mode = self.spread_mode;
             image_units.extend(
                 self.build_spread_display_units_for_nav(&image_indices)
-                    .into_iter()
+                    .iter()
                     .map(|unit| {
                         ContinuousReadingUnitSpec::pages(
                             unit.anchor_idx(),

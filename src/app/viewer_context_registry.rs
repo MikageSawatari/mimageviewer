@@ -797,6 +797,7 @@ pub(in crate::app) struct ViewerContextBundle {
     checked: std::collections::HashSet<usize>,
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     page_dims_cache: crate::page_dims::PageDimsCache,
+    spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
     /// 現在の viewer context だけに効く評価 filter の一時解除 anchor。
     ///
@@ -1375,6 +1376,7 @@ impl ViewerContextBundle {
             checked: std::collections::HashSet::new(),
             rotation_cache: std::collections::HashMap::new(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
+            spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
             rating_session_write_seen_generation: 0,
@@ -1702,6 +1704,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,
@@ -1939,6 +1942,7 @@ impl App {
         swap_field!(checked);
         swap_field!(rotation_cache);
         swap_field!(page_dims_cache);
+        swap_field!(spread_display_units_cache);
         swap_field!(rating_cache);
         swap_field!(rating_session_write_seen_generation);
         swap_field!(metadata_import_refresh_index);
@@ -2224,6 +2228,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,
@@ -2418,6 +2423,7 @@ impl App {
             checked,
             rotation_cache,
             page_dims_cache,
+            spread_display_units_cache,
             rating_cache,
             rating_filter_suppressed_at,
             rating_session_write_seen_generation,

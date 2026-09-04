@@ -11073,6 +11073,8 @@ pub struct App {
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     /// 一度判明したページ寸法をテクスチャの退去後も保持する per-context cache。
     pub(crate) page_dims_cache: crate::page_dims::PageDimsCache,
+    /// 見開き表示単位列と、nav・横長性・回転の context-local invalidation 状態。
+    pub(crate) spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache,
 
     // ── 音量ノーマライズ ──────────────────────────────────────────
     /// 動画音量の per-file 測定値キャッシュ (整 LUFS / true peak / 算出ゲイン)。
@@ -13035,6 +13037,14 @@ pub struct App {
     /// Previous `App::update` frame boundary. Used by perf diagnostics to
     /// catch stalls that happen before the next Rust frame begins.
     pub(crate) perf_last_frame_begin: Option<std::time::Instant>,
+    /// Splits a frame into the part we run and the part eframe runs around it.
+    ///
+    /// Frame-to-frame spacing alone cannot say whether a stall is our own work or the
+    /// render and present that follow it, and on 2026-09-04 that ambiguity cost three
+    /// wrong guesses. These two carry the previous frame's split onto the next
+    /// `frame.begin`, which is the first moment both halves are known.
+    perf_prev_update_ms: Option<f64>,
+    perf_last_update_end: Option<std::time::Instant>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
     /// 全 GPU テクスチャ会計を約 1 秒に 1 回へ間引く perf-log 専用時刻。
@@ -14227,6 +14237,7 @@ impl App {
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
+            spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             audio_normalize_db,
             normalize_state: None,
             normalize_ui_states: std::collections::HashMap::new(),
@@ -14881,6 +14892,8 @@ impl App {
             colorize_mono_summary_last_reconcile_frame: u64::MAX,
             last_edit_materialize_upload_frame: u64::MAX,
             perf_last_frame_begin: None,
+            perf_prev_update_ms: None,
+            perf_last_update_end: None,
             last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
@@ -18721,7 +18734,7 @@ impl App {
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
         self.clear_tags_cache();
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.rating_cache.clear();
         self.reset_folder_rating_counts();
         self.adjustment_cache.clear();
@@ -24164,7 +24177,7 @@ impl App {
         self.xmp_panorama_info.clear();
         self.clear_tags_cache();
         self.checked.clear();
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.rating_cache.clear();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -26795,7 +26808,7 @@ impl App {
         // 注: `adjustment_page_params` / `mask_pages` は DB ロード済みの「ユーザーが付けた」
         // idx-keyed 状態なので、ここでは触らない。削除経路では呼び出し元が idx shift し、
         // 差し替え経路 (Ctrl+G) では呼び出し元が明示的に clear する。
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.page_dims_cache.clear();
         self.rating_cache.clear();
         self.adjustment_cache.clear();
@@ -27694,7 +27707,7 @@ impl App {
         let matches_key = removed_path_key_matcher(removed);
 
         self.rating_cache.clear();
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.current_folder_rating_cache = None;
         self.invalidate_rating_counts_cache();
         self.reset_folder_rating_counts();
@@ -28492,6 +28505,7 @@ impl App {
             self.conceal_pages = page.conceal_pages;
             self.comic_pages = page.comic_pages;
             self.rotation_cache = page.rotation_cache;
+            self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
             self.thumb_adjust_tex.clear();
             self.erase_result_cache.clear();
@@ -32703,11 +32717,10 @@ impl App {
                         if let Some(dims) = source_dims
                             .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
                         {
-                            self.page_dims_cache.record(self.items_generation, i, dims);
+                            self.record_page_dims_for_spread(i, dims);
                         }
                         if let Some(dims) = layout_dims {
-                            self.page_dims_cache
-                                .record_layout(self.items_generation, i, dims);
+                            self.record_page_layout_dims_for_spread(i, dims);
                         }
                         // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
@@ -48167,6 +48180,20 @@ impl App {
         rot
     }
 
+    /// DB や items の外部更新により回転 memo を捨てる。cached nav が同じなら、次の参照で
+    /// 回転を一括再取得し、横長性が実際に変わったページがある場合だけ epoch を進める。
+    pub(crate) fn clear_rotation_cache_for_reload(&mut self) {
+        self.rotation_cache.clear();
+        self.spread_display_units_cache
+            .mark_all_rotations_for_recheck(self.items_generation);
+    }
+
+    pub(crate) fn remove_rotation_cache_entry_for_reload(&mut self, idx: usize) {
+        self.rotation_cache.remove(&idx);
+        self.spread_display_units_cache
+            .mark_rotation_for_recheck(self.items_generation, idx);
+    }
+
     /// 指定した item index 群の回転を、DB 未読分だけ一括取得して入力順で返す。
     ///
     /// 見開き構築は nav 全体を読むため、ページごとの `get_rotation` で同期 SELECT を
@@ -48269,6 +48296,7 @@ impl App {
                     .map_err(|error| format!("回転を保存できませんでした: {error}"))
             });
         self.rotation_cache.insert(idx, rot);
+        self.reconcile_spread_landscape_with_rotation(idx, rot);
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
@@ -65332,6 +65360,7 @@ impl App {
             }
         }
 
+        // 完了 / 切断ループは同じ表示 snapshot と共有述語を使う。相方解決を要素ごとに繰り返さない。
         let displayed_page = self.fullscreen_idx.map(|current| {
             let partner = self.displayed_spread_partner(current);
             (current, partner)
@@ -65417,7 +65446,9 @@ impl App {
                 // しない終端状態なので、画面から外れて cancel した昇格をここへ落とすと、
                 // 戻ってきても二度と動かない (§1.157: 見開きの相方が止まったままになる)。
                 // 表示中のまま送信側が消えたときだけ、本当の失敗として扱う。
-                if self.page_is_displayed_now(key) {
+                if displayed_page.is_some_and(|(current, partner)| {
+                    Self::page_is_displayed(key, current, partner)
+                }) {
                     self.mark_animation_promotion_failed(key);
                 }
             }
@@ -65541,7 +65572,9 @@ impl App {
             if purpose.promotion_started_at_for(key).is_some() {
                 // 見開きでは相方も表示中。ここで捨てると、昇格が完了しても
                 // 第 1 フレームのままになる (§1.157)。
-                if !self.page_is_displayed_now(key) {
+                if !displayed_page.is_some_and(|(current, partner)| {
+                    Self::page_is_displayed(key, current, partner)
+                }) {
                     continue;
                 }
                 if !matches!(result, FsLoadResult::Animated(_)) {
@@ -65714,6 +65747,7 @@ impl App {
             };
             self.fs_cache
                 .insert_for_generation(key, items_generation, entry);
+            self.record_fs_cache_page_dims_for_spread(key);
             self.fs_margin_bbox_cache.remove(&key);
             self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
@@ -67878,12 +67912,23 @@ impl App {
                 }
             }
             self.perf_last_frame_begin = Some(frame_begin_now);
+            let prev_update_ms = self.perf_prev_update_ms.unwrap_or(0.0);
+            let prev_outside_ms = self
+                .perf_last_update_end
+                .map(|end| frame_begin_now.saturating_duration_since(end).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
             crate::perf::event(
                 "frame",
                 "begin",
                 None,
                 self.input_seq,
-                &[("n", serde_json::Value::from(self.frame_counter))],
+                &[
+                    ("n", serde_json::Value::from(self.frame_counter)),
+                    // The previous frame, split: what App::update spent, and what eframe
+                    // spent rendering and presenting after it returned.
+                    ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
+                    ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
+                ],
             );
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
             // `total_ms` に main() 入口からの累計経過を載せる。creator_exit との差分が
@@ -70037,6 +70082,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         self.update_frame(ctx, frame);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
@@ -70048,6 +70094,12 @@ impl eframe::App for App {
         {
             self.show_external_tool_modals(ctx);
             self.authorize_external_tool_launch_boundaries_after_ui();
+        }
+        if let Some(t0) = update_t0 {
+            let end = std::time::Instant::now();
+            self.perf_prev_update_ms =
+                Some(end.saturating_duration_since(t0).as_secs_f64() * 1000.0);
+            self.perf_last_update_end = Some(end);
         }
     }
 
