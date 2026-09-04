@@ -142,6 +142,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "open with",
             "関連付け",
             "実行ファイル",
+            "スクリプト",
+            "コンソール",
             "引数",
             "複数選択",
             "確認",

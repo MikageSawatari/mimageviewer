@@ -2675,7 +2675,7 @@ impl crate::app::App {
                     ui.label(format!("{count} 件を外部ツールへ渡します。"));
                 }
                 if !executable.is_empty() {
-                    ui.label(format!("実行ファイル: {executable}"));
+                    ui.label(format!("プログラム / スクリプト: {executable}"));
                 }
                 ui.add_space(8.0);
                 if !executable.is_empty() {
