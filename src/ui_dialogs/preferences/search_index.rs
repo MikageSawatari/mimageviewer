@@ -757,7 +757,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "similar-index/run",
         SimilarIndex,
-        "索引を作成",
+        "現在の索引",
         ["別バージョン", "類似画像", "お気に入り", "バックグラウンド"]
     ),
     entry!(

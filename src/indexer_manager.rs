@@ -2,7 +2,8 @@
 //!
 //! 全お気に入りの `SupervisorHandle` を束ねて、以下を提供する:
 //!
-//! - 起動時: `auto_index_metadata = true` のお気に入りに対して Supervisor を spawn
+//! - 起動時: `auto_index_metadata` / `auto_index_similar` のどちらかが true の
+//!   お気に入りに対して Supervisor を spawn
 //! - お気に入り変更時: `sync_with_favorites` で追加/削除/フラグ変更を反映
 //! - 起動時 reconciliation (§5.6.3): pending/failed/tombstone を supervisor 起動前に掃除
 //! - Ctrl+G 検索: `spawn_search` で global_search::run を別スレッド実行
@@ -16,7 +17,7 @@
 //!     └── IndexerManager::new(settings.favorites)
 //!           ├── FtsMetaDb + FtsIndex を開く
 //!           ├── 起動時 reconciliation (status != ok を整理)
-//!           └── auto_index_metadata=true のお気に入りに Supervisor を spawn
+//!           └── 自動索引が有効なお気に入りに共有 Supervisor を spawn
 //!   ...
 //!   App::update ループ:
 //!     - all_stats() で進捗取得 (軽量な lock)
@@ -90,11 +91,13 @@ pub struct IndexerManager {
     activity_gate: Arc<ActivityGate>,
     /// アプリ管理下で生成する派生コンテンツなど、検索索引から除外する root。
     excluded_roots: Vec<std::path::PathBuf>,
+    /// 別バージョン索引へ、同じ favorite watcher の変更通知を渡す。
+    similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
     /// お気に入り UUID → Supervisor ハンドル
     supervisors: HashMap<Uuid, SupervisorHandle>,
     /// 有効化されていないお気に入りでも、お気に入り UUID → (name, path) を記憶しておく
     /// (stats UI で name を出すため)
-    favorite_info: HashMap<Uuid, (String, std::path::PathBuf)>,
+    favorite_info: HashMap<Uuid, (String, std::path::PathBuf, bool, bool)>,
     /// reconciliation が進行中なら true (UI に "DB 初期化中" 表示用)
     pub reconciliation_in_progress: Arc<AtomicBool>,
     /// 起動時 reconciliation の診断情報 (UI 表示用)
@@ -245,8 +248,8 @@ fn open_stores_with_rebuild_sync(
 }
 
 impl IndexerManager {
-    /// DB/index を開き、起動時 reconciliation → auto_index_metadata=true のお気に入りに
-    /// Supervisor を spawn する。
+    /// DB/index を開き、起動時 reconciliation → 自動索引が有効なお気に入りに
+    /// 共有 Supervisor を spawn する。
     ///
     /// DB 初期化に失敗したら None (App 側は fts 機能なしで動作継続する)。
     ///
@@ -264,6 +267,7 @@ impl IndexerManager {
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
         excluded_roots: Vec<std::path::PathBuf>,
+        similar_notifier: crate::similar_index::SimilarIndexNotifier,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         let data_dir = crate::data_dir::get();
@@ -279,6 +283,7 @@ impl IndexerManager {
             speed,
             activity_gate,
             excluded_roots,
+            Some(similar_notifier),
             progress,
         )
     }
@@ -309,6 +314,7 @@ impl IndexerManager {
             activity_gate,
             excluded_roots,
             None,
+            None,
         )
     }
 
@@ -320,6 +326,7 @@ impl IndexerManager {
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
         excluded_roots: Vec<std::path::PathBuf>,
+        similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
@@ -375,6 +382,7 @@ impl IndexerManager {
             io_sem,
             activity_gate,
             excluded_roots,
+            similar_notifier,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
@@ -407,41 +415,54 @@ impl IndexerManager {
     }
 
     /// 現在のお気に入り一覧と supervisors を同期。
-    /// - 新規 `auto_index_metadata = true` → spawn
+    /// - 新規 `auto_index_metadata = true` または `auto_index_similar = true` → spawn
     /// - 既存で OFF に切り替わった / 削除された → drop
     /// - 既存で ON のまま **かつ path 不変** → 維持
     /// - 既存で ON のまま **かつ path 変更** → drop + respawn (Codex round-8 Must-fix #2)
     ///
-    /// **UI スレッドから呼ぶ時の注意**: Supervisor の drop は内部で thread join を伴うため、
-    /// 多数の stop が発生する場面 (例: 全 OFF) ではブロックする可能性がある。
-    /// 環境設定ダイアログの OK 押下時のような、ユーザが待ってもよいタイミングで呼ぶこと。
+    /// **UI スレッドから呼ぶ時の注意**: 停止対象には先に cancel を通知し、join は専用
+    /// thread に逃がす。お気に入り編集画面の即時トグルから呼んでも待たない。
     pub fn sync_with_favorites(&mut self, favorites: &[FavoriteEntry]) {
         // path 変更の検出は favorite_info 更新 **前** に行う (旧 path と比較するため)
-        let path_changed: std::collections::HashSet<Uuid> = favorites
+        let config_changed: std::collections::HashSet<Uuid> = favorites
             .iter()
             .filter_map(|f| {
-                let old_path = self.favorite_info.get(&f.id).map(|(_, p)| p.clone())?;
-                if old_path != f.path { Some(f.id) } else { None }
+                let (_, old_path, old_metadata, old_similar) = self.favorite_info.get(&f.id)?;
+                if old_path != &f.path
+                    || *old_metadata != f.auto_index_metadata
+                    || *old_similar != f.auto_index_similar
+                {
+                    Some(f.id)
+                } else {
+                    None
+                }
             })
             .collect();
 
         // favorite_info を最新化
         self.favorite_info.clear();
         for f in favorites {
-            self.favorite_info
-                .insert(f.id, (f.name.clone(), f.path.clone()));
+            self.favorite_info.insert(
+                f.id,
+                (
+                    f.name.clone(),
+                    f.path.clone(),
+                    f.auto_index_metadata,
+                    f.auto_index_similar,
+                ),
+            );
         }
 
         // 削除 / OFF 化 / **path 変更** されたものを drop 対象に含める
         let current_on_ids: std::collections::HashSet<Uuid> = favorites
             .iter()
-            .filter(|f| f.auto_index_metadata)
+            .filter(|f| f.auto_index_metadata || f.auto_index_similar)
             .map(|f| f.id)
             .collect();
         let to_stop: Vec<Uuid> = self
             .supervisors
             .keys()
-            .filter(|id| !current_on_ids.contains(id) || path_changed.contains(id))
+            .filter(|id| !current_on_ids.contains(id) || config_changed.contains(id))
             .copied()
             .collect();
         // dispatcher 化後 (commit 30338a3) も signal_stop → drain パターンを維持する:
@@ -493,7 +514,7 @@ impl IndexerManager {
 
         // 新規 ON を spawn (path 変更で drop したものも新 path で respawn される)
         for f in favorites {
-            if !f.auto_index_metadata {
+            if !f.auto_index_metadata && !f.auto_index_similar {
                 continue;
             }
             if self.supervisors.contains_key(&f.id) {
@@ -504,7 +525,12 @@ impl IndexerManager {
                     favorite_id: f.id,
                     favorite_root: f.path.clone(),
                     excluded_roots: self.excluded_roots.clone(),
-                    enable_metadata_index: true,
+                    enable_metadata_index: f.auto_index_metadata,
+                    similar_notifier: if f.auto_index_similar {
+                        self.similar_notifier.clone()
+                    } else {
+                        None
+                    },
                 },
                 Arc::clone(&self.meta_db),
                 Arc::clone(&self.fts),
@@ -525,8 +551,13 @@ impl IndexerManager {
                 let info = self.favorite_info.get(id).cloned();
                 SupervisorStatsView {
                     favorite_id: *id,
-                    favorite_name: info.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
-                    favorite_path: info.map(|(_, p)| p).unwrap_or_else(std::path::PathBuf::new),
+                    favorite_name: info
+                        .as_ref()
+                        .map(|(name, _, _, _)| name.clone())
+                        .unwrap_or_default(),
+                    favorite_path: info
+                        .map(|(_, path, _, _)| path)
+                        .unwrap_or_else(std::path::PathBuf::new),
                     stats: handle.snapshot_stats(),
                 }
             })
@@ -534,7 +565,7 @@ impl IndexerManager {
     }
 
     /// 指定 favorite の Supervisor に手動 full-rescan を要求する。
-    /// 見つからない (auto_index_metadata = false の) favorite は no-op。
+    /// 対応する Supervisor がない favorite は no-op。
     pub fn request_full_rescan(&self, favorite_id: Uuid) {
         if let Some(h) = self.supervisors.get(&favorite_id) {
             h.request_full_rescan();
@@ -576,7 +607,7 @@ impl IndexerManager {
     }
 
     /// 全 supervisor が初期スキャンを完了しており、現在 full scan を実行していないか。
-    /// supervisor 数 0 (auto_index_metadata=true のお気に入りなし) でも true を返す。
+    /// supervisor 数 0 (自動索引が有効なお気に入りなし) でも true を返す。
     /// `spawn_housekeeping` の起動タイミングを「初回 ingest が落ち着いてから」に揃える
     /// ために使う (Codex 指摘)。
     pub fn all_supervisors_idle(&self) -> bool {
@@ -1044,6 +1075,7 @@ mod tests {
             io_sem: Arc::clone(&io_sem),
             activity_gate: Arc::new(ActivityGate::new(1000)),
             excluded_roots: Vec::new(),
+            similar_notifier: None,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
@@ -1074,6 +1106,122 @@ mod tests {
 
         // 明示 drop で clean shutdown
         drop(mgr);
+    }
+
+    #[test]
+    fn similar_only_favorite_uses_existing_supervisor_watcher() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("similar-only");
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
+        let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            Arc::clone(&fts),
+        );
+        let similar_data = tmp.path().join("similar");
+        let similar = crate::similar_index::SimilarIndexManager::new(similar_data.clone());
+        let activity_gate = Arc::new(ActivityGate::new(0));
+        let mut manager = IndexerManager {
+            meta_db: meta,
+            fts,
+            writer,
+            io_sem: Arc::new(GlobalIoSemaphore::new(1)),
+            activity_gate: Arc::clone(&activity_gate),
+            excluded_roots: Vec::new(),
+            similar_notifier: Some(similar.notifier()),
+            supervisors: HashMap::new(),
+            favorite_info: HashMap::new(),
+            reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
+            startup_diag: StartupDiag::default(),
+        };
+        let mut favorite = mk_fav("similar", &root, false);
+        favorite.auto_index_similar = true;
+
+        manager.sync_with_favorites(&[favorite.clone()]);
+        similar.configure(
+            &[favorite],
+            crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            Some(activity_gate),
+        );
+
+        assert_eq!(manager.supervisor_count(), 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.all_supervisors_idle() {
+            assert!(
+                Instant::now() < deadline,
+                "similar-only watcher did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !matches!(
+            similar.progress(),
+            crate::similar_index::IndexProgress::Complete(_)
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "initial similar reconciliation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 同じ supervisor の watcher が追加と変更を類似索引へ渡すことを確認する。
+        // 類似索引用の watcher を別に作る実装では、この結合テストを満たせない。
+        let image_path = root.join("watched.png");
+        image::RgbImage::from_fn(24, 24, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 11) as u8, ((x + y) * 5) as u8])
+        })
+        .save(&image_path)
+        .unwrap();
+        let db_path = crate::similar_db::SimilarDb::db_path_at(&similar_data);
+        let db = crate::similar_db::SimilarDb::open_at(&db_path).unwrap();
+        let item_key = crate::similar_index::item_key_for_file(&image_path);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let rows = db
+                .load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap();
+            if rows
+                .iter()
+                .any(|row| row.item.item_key == item_key && row.item.width == 24)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shared watcher did not reconcile an added image"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        image::RgbImage::from_fn(37, 31, |x, y| {
+            image::Rgb([
+                ((x * 17 + y * 3) % 251) as u8,
+                ((y * 19 + x * 5) % 253) as u8,
+                ((x * 13 + y * 23) % 255) as u8,
+            ])
+        })
+        .save(&image_path)
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let rows = db
+                .load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap();
+            if rows
+                .iter()
+                .any(|row| row.item.item_key == item_key && row.item.width == 37)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shared watcher did not reconcile a changed image"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

@@ -6786,7 +6786,7 @@ pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState
 }
 
 pub(super) fn page_similar_index(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    use crate::similar_index::{IndexProgress, IndexStage, IndexSummaryStatus};
+    use crate::similar_index::IndexSummaryStatus;
 
     anchored(ui, state, "similar-index/run", |ui, state| {
         ui.label(
@@ -6795,76 +6795,19 @@ pub(super) fn page_similar_index(ui: &mut egui::Ui, state: &mut PreferencesState
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "初回は時間がかかります。100 万枚では約 11.6 時間かかった実測例があります。\n+                 バックグラウンドで実行され、中断後も次回の作成で続きから再開できます。",
+                "最初の索引作成には長い時間がかかります。バックグラウンドで実行され、\
+                 中断した場合も次回に続きから更新します。",
             )
             .weak(),
         );
-        ui.add_space(10.0);
-
-        let running = matches!(state.similar_index_progress, IndexProgress::Running(_));
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!running, egui::Button::new("索引を作成"))
-                .clicked()
-            {
-                state.similar_index_start_requested = true;
-                state.similar_index_message = None;
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("キャンセル"))
-                .clicked()
-            {
-                state.similar_index_cancel_requested = true;
-            }
-        });
-
-        if let Some(message) = &state.similar_index_message {
-            ui.label(message);
-        }
-
-        ui.add_space(10.0);
-        match &state.similar_index_progress {
-            IndexProgress::Running(progress) => {
-                let stage = match progress.stage {
-                    IndexStage::Opening => "準備中",
-                    IndexStage::Scanning => "画像を確認中",
-                    IndexStage::Pruning => "更新内容を整理中",
-                };
-                ui.label(egui::RichText::new(stage).strong());
-                ui.label(format!(
-                    "処理済み: {} / {}",
-                    crate::ui_helpers::format_count(progress.report.processed),
-                    crate::ui_helpers::format_count(progress.report.discovered)
-                ));
-                if progress.report.discovered > 0 {
-                    ui.add(
-                        egui::ProgressBar::new(
-                            progress.report.processed as f32 / progress.report.discovered as f32,
-                        )
-                        .show_percentage(),
-                    );
-                }
-                if let Some(path) = &progress.current_path {
-                    ui.label(format!("現在のフォルダ: {}", path.display()));
-                }
-                draw_similar_index_failures(ui, &progress.report);
-            }
-            IndexProgress::Complete(report) => {
-                ui.label(egui::RichText::new("索引の作成が完了しました。").strong());
-                draw_similar_index_failures(ui, report);
-            }
-            IndexProgress::Cancelled(report) => {
-                ui.label("索引の作成を中断しました。次回は確認済みの画像を再利用します。");
-                draw_similar_index_failures(ui, report);
-            }
-            IndexProgress::Failed(error) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("索引を作成できませんでした: {error}"),
-                );
-            }
-            IndexProgress::Idle => {}
-        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "対象は「お気に入り」で場所ごとに選びます。作成状況も「お気に入り」の\
+                 バックグラウンドインデクサに表示されます。",
+            )
+            .weak(),
+        );
 
         ui.add_space(10.0);
         ui.separator();
@@ -6906,23 +6849,9 @@ pub(super) fn page_similar_index(ui: &mut egui::Ui, state: &mut PreferencesState
         }
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new(
-                "対象はすべてのお気に入り配下です。この機能は画像を削除せず、どちらを残すかも判断しません。",
-            )
-            .weak(),
+            egui::RichText::new("この機能は画像を削除せず、どちらを残すかも判断しません。").weak(),
         );
     });
-}
-
-fn draw_similar_index_failures(ui: &mut egui::Ui, report: &crate::similar_index::IndexReport) {
-    ui.label(format!(
-        "確認できなかった項目: パスワードが必要な PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
-        crate::ui_helpers::format_count(report.password_required_pdfs),
-        crate::ui_helpers::format_count(report.corrupt_containers),
-        crate::ui_helpers::format_count(report.zero_page_containers),
-        crate::ui_helpers::format_count(report.decode_failures),
-        crate::ui_helpers::format_count(report.io_failures),
-    ));
 }
 
 fn draw_similar_summary_failures(ui: &mut egui::Ui, summary: crate::similar_index::IndexSummary) {

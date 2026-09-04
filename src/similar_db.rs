@@ -707,10 +707,9 @@ impl SimilarDb {
             .collect()
     }
 
-    /// 完走した favorites snapshot に存在しなかった公開行を削除する。
-    pub fn prune_under_roots(
+    /// 完走した、有効な favorites 全体の snapshot に存在しなかった公開行を削除する。
+    pub fn prune_except_seen(
         &self,
-        normalized_roots: &[String],
         seen_items: &HashSet<String>,
         seen_containers: &HashSet<String>,
     ) -> rusqlite::Result<usize> {
@@ -730,12 +729,12 @@ impl SimilarDb {
         };
         let mut removed = 0;
         for key in item_keys {
-            if key_is_under_any(&key, normalized_roots) && !seen_items.contains(&key) {
+            if !seen_items.contains(&key) {
                 removed += transaction.execute("DELETE FROM item WHERE item_key = ?1", [&key])?;
             }
         }
         for key in container_keys {
-            if key_is_under_any(&key, normalized_roots) && !seen_containers.contains(&key) {
+            if !seen_containers.contains(&key) {
                 removed +=
                     transaction.execute("DELETE FROM item WHERE container_key = ?1", [&key])?;
                 removed += transaction
@@ -927,15 +926,6 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn key_is_under_any(key: &str, roots: &[String]) -> bool {
-    roots.iter().any(|root| {
-        key == root
-            || key
-                .strip_prefix(root)
-                .is_some_and(|suffix| root.ends_with('/') || suffix.starts_with('/'))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,5 +1098,23 @@ mod tests {
             db.load_index_summary(current_hash_version() + 1).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn completed_scope_snapshot_prunes_rows_from_disabled_roots() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("c:/enabled/a.jpg", None, None, 1))
+            .unwrap();
+        db.upsert_loose_item(&item("c:/disabled/b.jpg", None, None, 2))
+            .unwrap();
+
+        let seen_items = HashSet::from(["c:/enabled/a.jpg".to_owned()]);
+        assert_eq!(
+            db.prune_except_seen(&seen_items, &HashSet::new()).unwrap(),
+            1
+        );
+        let rows = db.load_search_rows(current_hash_version()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item.item_key, "c:/enabled/a.jpg");
     }
 }

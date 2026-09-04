@@ -206,8 +206,10 @@ pub struct SupervisorParams {
     pub favorite_root: PathBuf,
     pub excluded_roots: Vec<PathBuf>,
     /// metadata インデックスが有効か (auto_index_metadata)。
-    /// false の場合、Supervisor は起動しない (呼び出し側が spawn を呼ばない想定)。
+    /// false でも similar_notifier があれば watcher の共有だけを担う。
     pub enable_metadata_index: bool,
+    /// 同じ watcher のイベントで別バージョン索引の再照合も要求する。
+    pub similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
 }
 
 /// Supervisor を起動する。`Arc<FtsMetaDb>` と `Arc<FtsIndex>` はアプリ全体で 1 本を共有する。
@@ -227,8 +229,8 @@ pub fn spawn(
     activity_gate: Arc<crate::activity_gate::ActivityGate>,
 ) -> SupervisorHandle {
     assert!(
-        params.enable_metadata_index,
-        "Supervisor は metadata index 有効時のみ起動する"
+        params.enable_metadata_index || params.similar_notifier.is_some(),
+        "Supervisor は少なくとも 1 種類の索引が有効なときだけ起動する"
     );
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -241,6 +243,8 @@ pub fn spawn(
     let fav_id = params.favorite_id;
     let root = params.favorite_root.clone();
     let excluded_roots = params.excluded_roots.clone();
+    let enable_metadata_index = params.enable_metadata_index;
+    let similar_notifier = params.similar_notifier.clone();
     let cancel_cl = Arc::clone(&cancel);
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
@@ -257,6 +261,8 @@ pub fn spawn(
                 fav_id,
                 root,
                 excluded_roots,
+                enable_metadata_index,
+                similar_notifier,
                 meta_db,
                 fts,
                 writer,
@@ -290,6 +296,8 @@ fn supervisor_loop(
     favorite_id: Uuid,
     favorite_root: PathBuf,
     excluded_roots: Vec<PathBuf>,
+    enable_metadata_index: bool,
+    similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
@@ -314,18 +322,20 @@ fn supervisor_loop(
     }
 
     // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
-    run_initial_scan(
-        favorite_id,
-        &favorite_root,
-        &session,
-        &writer,
-        &io_sem,
-        &excluded_roots,
-        Arc::clone(&cancel),
-        &stats,
-        &progress,
-    );
-    mark_activity(&stats);
+    if enable_metadata_index {
+        run_initial_scan(
+            favorite_id,
+            &favorite_root,
+            &session,
+            &writer,
+            &io_sem,
+            &excluded_roots,
+            Arc::clone(&cancel),
+            &stats,
+            &progress,
+        );
+        mark_activity(&stats);
+    }
     let initial_scan_duration_ms = {
         let mut stats = stats.lock().unwrap();
         stats.initial_scan_done = true;
@@ -364,18 +374,23 @@ fn supervisor_loop(
                         if cancel.load(Ordering::SeqCst) {
                             break;
                         }
-                        run_initial_scan(
-                            favorite_id,
-                            &favorite_root,
-                            &session,
-                            &writer,
-                            &io_sem,
-                            &excluded_roots,
-                            Arc::clone(&cancel),
-                            &stats,
-                            &progress,
-                        );
-                        mark_activity(&stats);
+                        if enable_metadata_index {
+                            run_initial_scan(
+                                favorite_id,
+                                &favorite_root,
+                                &session,
+                                &writer,
+                                &io_sem,
+                                &excluded_roots,
+                                Arc::clone(&cancel),
+                                &stats,
+                                &progress,
+                            );
+                            mark_activity(&stats);
+                        }
+                        if let Some(notifier) = &similar_notifier {
+                            notifier.request_reconcile();
+                        }
                         progress.clear();
                     }
                     Err(_) => break, // Sender dropped
@@ -399,33 +414,43 @@ fn supervisor_loop(
                                 "indexer[{favorite_id}]: watcher overflow, running full rescan"
                             ));
                             stats.lock().unwrap().overflowed = true;
-                            run_initial_scan(
-                                favorite_id,
-                                &favorite_root,
+                            if enable_metadata_index {
+                                run_initial_scan(
+                                    favorite_id,
+                                    &favorite_root,
+                                    &session,
+                                    &writer,
+                                    &io_sem,
+                                    &excluded_roots,
+                                    Arc::clone(&cancel),
+                                    &stats,
+                                    &progress,
+                                );
+                                mark_activity(&stats);
+                            }
+                            if let Some(notifier) = &similar_notifier {
+                                notifier.request_reconcile();
+                            }
+                            progress.clear();
+                            continue;
+                        }
+                        if enable_metadata_index {
+                            apply_single_change(
                                 &session,
                                 &writer,
                                 &io_sem,
                                 &excluded_roots,
-                                Arc::clone(&cancel),
+                                &cancel,
                                 &stats,
                                 &progress,
+                                path,
+                                kind,
                             );
                             mark_activity(&stats);
-                            progress.clear();
-                            continue;
                         }
-                        apply_single_change(
-                            &session,
-                            &writer,
-                            &io_sem,
-                            &excluded_roots,
-                            &cancel,
-                            &stats,
-                            &progress,
-                            path,
-                            kind,
-                        );
-                        mark_activity(&stats);
+                        if let Some(notifier) = &similar_notifier {
+                            notifier.request_reconcile();
+                        }
                         progress.clear();
                     }
                     Err(_) => break, // watcher ended
@@ -929,6 +954,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
@@ -973,6 +999,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             meta,
             fts,
@@ -1002,6 +1029,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             meta,
             fts,
@@ -1048,6 +1076,7 @@ mod tests {
                 favorite_root: root_a,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
@@ -1061,6 +1090,7 @@ mod tests {
                 favorite_root: root_b,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
@@ -1103,6 +1133,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
@@ -1166,6 +1197,7 @@ mod tests {
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             Arc::clone(&meta),
             Arc::clone(&fts),
@@ -1225,6 +1257,7 @@ mod tests {
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
                 enable_metadata_index: true,
+                similar_notifier: None,
             },
             meta,
             fts,

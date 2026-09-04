@@ -273,7 +273,8 @@ CREATE TABLE favorites (
     sort_index            INTEGER NOT NULL,
     auto_index_structure  INTEGER NOT NULL DEFAULT 0,
     auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
-    auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+    auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
+    auto_index_similar    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX favorites_sort ON favorites(sort_index);
 

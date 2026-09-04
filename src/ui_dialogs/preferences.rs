@@ -650,11 +650,7 @@ pub(crate) struct PreferencesState {
     pub expanded: HashSet<&'static str>,
 
     // ── 別バージョン索引ページ ──────────────────────────────────
-    pub similar_index_progress: crate::similar_index::IndexProgress,
     pub similar_index_summary: crate::similar_index::IndexSummaryStatus,
-    pub similar_index_start_requested: bool,
-    pub similar_index_cancel_requested: bool,
-    pub similar_index_message: Option<String>,
 
     // ── 外部ツールページ ────────────────────────────────────────
     /// 環境設定を開いた時点の現在項目。P1 のプレビュー / 試験起動は実ファイルだけを受ける。
@@ -1181,11 +1177,7 @@ impl PreferencesState {
             pending_anchor: None,
             highlight: None,
             expanded,
-            similar_index_progress: crate::similar_index::IndexProgress::Idle,
             similar_index_summary: crate::similar_index::IndexSummaryStatus::Preparing,
-            similar_index_start_requested: false,
-            similar_index_cancel_requested: false,
-            similar_index_message: None,
             external_tool_target,
             external_tool_association_ext,
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
@@ -1984,15 +1976,10 @@ impl App {
                 .collect();
         }
 
-        let similar_index_progress = self.similar_index_progress();
         let similar_index_summary = self.similar_index.summary();
         if let Some(state) = self.pref_state.as_mut() {
-            state.similar_index_progress = similar_index_progress;
             state.similar_index_summary = similar_index_summary;
             if matches!(
-                state.similar_index_progress,
-                crate::similar_index::IndexProgress::Running(_)
-            ) || matches!(
                 state.similar_index_summary,
                 crate::similar_index::IndexSummaryStatus::Preparing
             ) {
@@ -2148,35 +2135,6 @@ impl App {
 
         if let Some(state) = self.pref_state.as_ref() {
             self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
-        }
-        let (start_similar_index, cancel_similar_index) = self
-            .pref_state
-            .as_mut()
-            .map(|state| {
-                (
-                    std::mem::take(&mut state.similar_index_start_requested),
-                    std::mem::take(&mut state.similar_index_cancel_requested),
-                )
-            })
-            .unwrap_or_default();
-        if start_similar_index {
-            let result = self.start_similar_index();
-            if let Some(state) = self.pref_state.as_mut() {
-                state.similar_index_message = Some(match result {
-                    Ok(()) => "索引の作成を開始しました。".to_string(),
-                    Err(crate::similar_index::StartError::AlreadyRunning) => {
-                        "索引はすでに作成中です。".to_string()
-                    }
-                });
-            }
-        }
-        if cancel_similar_index {
-            self.cancel_similar_index();
-            if let Some(state) = self.pref_state.as_mut() {
-                state.similar_index_message = Some(
-                    "中断を要求しました。処理中のファイルが終わるまでお待ちください。".to_string(),
-                );
-            }
         }
         let external_launch = self
             .pref_state

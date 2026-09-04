@@ -6,7 +6,6 @@ use std::sync::{
     Arc, Mutex, OnceLock, RwLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::thread::JoinHandle;
 
 use image::GenericImageView;
 
@@ -150,114 +149,71 @@ pub enum BookQuery {
     Failed(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartError {
-    AlreadyRunning,
-}
-
 pub struct SimilarIndexManager {
     data_dir: PathBuf,
     progress: Arc<Mutex<IndexProgress>>,
-    cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
     book_query: Arc<Mutex<BookQueryState>>,
-    prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
+    enabled_roots: Arc<RwLock<Vec<String>>>,
+    scheduler: Arc<SimilarIndexScheduler>,
 }
 
 impl SimilarIndexManager {
     /// DB を開かない軽量 constructor。起動時 I/O を増やさない。
     pub fn new(data_dir: PathBuf) -> Self {
+        let progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        let memory = Arc::new(Mutex::new(MemoryState::Unloaded));
+        let summary = Arc::new(Mutex::new(SummaryState::Unloaded));
+        let memory_epoch = Arc::new(AtomicU64::new(0));
+        let book_query = Arc::new(Mutex::new(BookQueryState::Idle));
+        let enabled_roots = Arc::new(RwLock::new(Vec::new()));
+        let scheduler = Arc::new(SimilarIndexScheduler {
+            data_dir: data_dir.clone(),
+            progress: Arc::clone(&progress),
+            memory: Arc::clone(&memory),
+            summary: Arc::clone(&summary),
+            memory_epoch: Arc::clone(&memory_epoch),
+            book_query: Arc::clone(&book_query),
+            prefill_db: Arc::new(Mutex::new(None)),
+            enabled_roots: Arc::clone(&enabled_roots),
+            active_cancel: Mutex::new(None),
+            state: Mutex::new(SchedulerState::default()),
+        });
         Self {
             data_dir,
-            progress: Arc::new(Mutex::new(IndexProgress::Idle)),
-            cancel: Arc::new(Mutex::new(None)),
-            worker: Mutex::new(None),
-            memory: Arc::new(Mutex::new(MemoryState::Unloaded)),
-            summary: Arc::new(Mutex::new(SummaryState::Unloaded)),
-            memory_epoch: Arc::new(AtomicU64::new(0)),
-            book_query: Arc::new(Mutex::new(BookQueryState::Idle)),
-            prefill_db: Arc::new(Mutex::new(None)),
+            progress,
+            memory,
+            summary,
+            memory_epoch,
+            book_query,
+            enabled_roots,
+            scheduler,
         }
     }
 
-    /// 明示操作からだけ開始する。お気に入りフラグには連動しない。
-    pub fn start(
+    /// `auto_index_similar` が有効なお気に入りを、索引の完全な対象 snapshot として反映する。
+    /// I/O は scheduler worker 内だけで行い、この呼び出しは UI スレッドをブロックしない。
+    pub fn configure(
         &self,
-        favorite_roots: Vec<PathBuf>,
+        favorites: &[crate::settings::FavoriteEntry],
         pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
-    ) -> Result<(), StartError> {
-        let mut worker_slot = self.worker.lock().unwrap_or_else(|e| e.into_inner());
-        if worker_slot
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
-            return Err(StartError::AlreadyRunning);
-        }
-        if let Some(worker) = worker_slot.take() {
-            let _ = worker.join();
-        }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cancel));
-        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
-            IndexProgress::Running(RunningProgress {
-                stage: IndexStage::Opening,
-                current_path: None,
-                report: IndexReport::default(),
-            });
-
-        let db_path = SimilarDb::db_path_at(&self.data_dir);
-        let progress = Arc::clone(&self.progress);
-        let memory = Arc::clone(&self.memory);
-        let summary = Arc::clone(&self.summary);
-        let memory_epoch = Arc::clone(&self.memory_epoch);
-        let book_query = Arc::clone(&self.book_query);
-        let prefill_db = Arc::clone(&self.prefill_db);
-        *worker_slot = Some(std::thread::spawn(move || {
-            let db = match SimilarDb::open_at(&db_path) {
-                Ok(db) => Arc::new(db),
-                Err(error) => {
-                    *progress.lock().unwrap_or_else(|e| e.into_inner()) =
-                        IndexProgress::Failed(format!("similar.db open failed: {error}"));
-                    return;
-                }
-            };
-            *prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
-            register_prefill_db(&db);
-            let outcome = run_index_job(
-                &db,
-                &favorite_roots,
-                &pdf_passwords,
-                activity_gate.as_deref(),
-                &cancel,
-                &progress,
-            );
-            let next = match outcome {
-                Ok(report) if cancel.load(Ordering::Relaxed) => IndexProgress::Cancelled(report),
-                Ok(report) => IndexProgress::Complete(report),
-                Err(error) => IndexProgress::Failed(error),
-            };
-            memory_epoch.fetch_add(1, Ordering::AcqRel);
-            *memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Unloaded;
-            *summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
-            *book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
-            *progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
-        }));
-        Ok(())
+    ) {
+        let roots = favorites
+            .iter()
+            .filter(|favorite| favorite.auto_index_similar)
+            .map(|favorite| favorite.path.clone())
+            .collect();
+        self.scheduler
+            .configure(roots, pdf_passwords, activity_gate);
     }
 
-    pub fn cancel(&self) {
-        if let Some(cancel) = self
-            .cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            cancel.store(true, Ordering::Relaxed);
+    /// メタデータ索引 supervisor の watcher から再照合を要求する軽量 notifier。
+    pub fn notifier(&self) -> SimilarIndexNotifier {
+        SimilarIndexNotifier {
+            scheduler: Arc::downgrade(&self.scheduler),
         }
     }
 
@@ -269,27 +225,37 @@ impl SimilarIndexManager {
     }
 
     pub fn query_item(&self, item_key: &str) -> ItemQuery {
-        if matches!(self.progress(), IndexProgress::Running(_)) {
-            return ItemQuery::Preparing;
+        if !self.item_is_enabled(item_key) {
+            return ItemQuery::NotIndexed;
         }
+        let running = matches!(self.progress(), IndexProgress::Running(_));
         let mut state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
             MemoryState::Unloaded => {
                 self.start_memory_load(&mut state);
                 ItemQuery::Preparing
             }
+            MemoryState::Missing if running => ItemQuery::Preparing,
             MemoryState::Missing => ItemQuery::NoIndex,
             MemoryState::Loading => ItemQuery::Preparing,
             MemoryState::Failed(error) => ItemQuery::Failed(error.clone()),
-            MemoryState::Ready(index) => query_item_ready(index, item_key),
+            MemoryState::Ready(index) => {
+                let mut result = query_item_ready(index, item_key);
+                if let ItemQuery::Ready(hits) = &mut result {
+                    let roots = self.enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+                    hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
+                }
+                if running && matches!(result, ItemQuery::NotIndexed) {
+                    ItemQuery::Preparing
+                } else {
+                    result
+                }
+            }
         }
     }
 
     /// 設定画面用の軽量集計。署名本体は読まず、DB I/O は専用 worker で行う。
     pub fn summary(&self) -> IndexSummaryStatus {
-        if matches!(self.progress(), IndexProgress::Running(_)) {
-            return IndexSummaryStatus::Preparing;
-        }
         let mut state = self.summary.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
             SummaryState::Unloaded => {
@@ -329,21 +295,26 @@ impl SimilarIndexManager {
     }
 
     pub fn query_book(&self, item_key: &str) -> BookQuery {
-        if matches!(self.progress(), IndexProgress::Running(_)) {
-            return BookQuery::Preparing;
+        if !self.item_is_enabled(item_key) {
+            return BookQuery::NotIndexed;
         }
+        let running = matches!(self.progress(), IndexProgress::Running(_));
         let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         let index = match &*memory {
             MemoryState::Unloaded => {
                 self.start_memory_load(&mut memory);
                 return BookQuery::Preparing;
             }
+            MemoryState::Missing if running => return BookQuery::Preparing,
             MemoryState::Missing => return BookQuery::NotIndexed,
             MemoryState::Loading => return BookQuery::Preparing,
             MemoryState::Failed(error) => return BookQuery::Failed(error.clone()),
             MemoryState::Ready(index) => Arc::clone(index),
         };
         drop(memory);
+        if running && !index.row_for_key.contains_key(item_key) {
+            return BookQuery::Preparing;
+        }
 
         let mut query = self.book_query.lock().unwrap_or_else(|e| e.into_inner());
         match &*query {
@@ -360,11 +331,16 @@ impl SimilarIndexManager {
             item_key: item_key.to_owned(),
         };
         let query_state = Arc::clone(&self.book_query);
+        let enabled_roots = Arc::clone(&self.enabled_roots);
         let query_key = item_key.to_owned();
         let epoch = self.memory_epoch.load(Ordering::Acquire);
         let epoch_guard = Arc::clone(&self.memory_epoch);
         std::thread::spawn(move || {
-            let result = query_book_ready(&index, &query_key);
+            let mut result = query_book_ready(&index, &query_key);
+            if let BookQuery::Ready(hits) = &mut result {
+                let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+                hits.retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
+            }
             if epoch_guard.load(Ordering::Acquire) == epoch {
                 let mut state = query_state.lock().unwrap_or_else(|e| e.into_inner());
                 if matches!(
@@ -409,12 +385,264 @@ impl SimilarIndexManager {
             };
         });
     }
+
+    fn item_is_enabled(&self, item_key: &str) -> bool {
+        key_is_under_any(
+            item_key,
+            &self.enabled_roots.read().unwrap_or_else(|e| e.into_inner()),
+        )
+    }
 }
 
 impl Drop for SimilarIndexManager {
     fn drop(&mut self) {
-        self.cancel();
+        self.scheduler.shutdown();
     }
+}
+
+#[derive(Clone)]
+struct SchedulerConfig {
+    roots: Vec<PathBuf>,
+    pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+    activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    config: Option<SchedulerConfig>,
+    revision: u64,
+    worker_running: bool,
+    shutdown: bool,
+}
+
+struct SimilarIndexScheduler {
+    data_dir: PathBuf,
+    progress: Arc<Mutex<IndexProgress>>,
+    memory: Arc<Mutex<MemoryState>>,
+    summary: Arc<Mutex<SummaryState>>,
+    memory_epoch: Arc<AtomicU64>,
+    book_query: Arc<Mutex<BookQueryState>>,
+    prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
+    enabled_roots: Arc<RwLock<Vec<String>>>,
+    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    state: Mutex<SchedulerState>,
+}
+
+/// 既存の favorite watcher が所有する通知口。ファイル監視は増やさない。
+#[derive(Clone)]
+pub struct SimilarIndexNotifier {
+    scheduler: Weak<SimilarIndexScheduler>,
+}
+
+impl SimilarIndexNotifier {
+    pub fn request_reconcile(&self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.request_reconcile();
+        }
+    }
+}
+
+impl SimilarIndexScheduler {
+    fn configure(
+        self: &Arc<Self>,
+        mut roots: Vec<PathBuf>,
+        pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
+        activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
+    ) {
+        roots.sort();
+        roots.dedup();
+        let normalized = roots
+            .iter()
+            .map(|root| crate::search_index_db::normalize_path(root))
+            .collect::<Vec<_>>();
+        *self
+            .enabled_roots
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = normalized;
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.shutdown {
+            return;
+        }
+        let had_roots = state
+            .config
+            .as_ref()
+            .is_some_and(|config| !config.roots.is_empty());
+        let roots_changed = state
+            .config
+            .as_ref()
+            .is_none_or(|config| config.roots != roots);
+        let has_roots = !roots.is_empty();
+        state.config = Some(SchedulerConfig {
+            roots,
+            pdf_passwords,
+            activity_gate,
+        });
+        if !roots_changed {
+            return;
+        }
+        self.invalidate_loaded_state();
+        // 対象変更時だけ現在の旧 snapshot 走査を止める。watcher 通知は coalesce し、
+        // 進行中の一巡を完了させてから最新状態をもう一度照合する。
+        if let Some(cancel) = self
+            .active_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let should_start = !state.worker_running && (had_roots || has_roots);
+        if should_start {
+            state.worker_running = true;
+        }
+        drop(state);
+        if should_start {
+            self.spawn_worker();
+        }
+    }
+
+    fn request_reconcile(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.shutdown
+            || state
+                .config
+                .as_ref()
+                .is_none_or(|config| config.roots.is_empty())
+        {
+            return;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let should_start = !state.worker_running;
+        if should_start {
+            state.worker_running = true;
+        }
+        drop(state);
+        if should_start {
+            self.spawn_worker();
+        }
+    }
+
+    fn spawn_worker(self: &Arc<Self>) {
+        let scheduler = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("similar-index".to_owned())
+            .spawn(move || scheduler.worker_loop())
+        {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .worker_running = false;
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                IndexProgress::Failed(format!("similar index worker start failed: {error}"));
+        }
+    }
+
+    fn worker_loop(self: Arc<Self>) {
+        let db_path = SimilarDb::db_path_at(&self.data_dir);
+        let db = match SimilarDb::open_at(&db_path) {
+            Ok(db) => Arc::new(db),
+            Err(error) => {
+                self.finish_worker(IndexProgress::Failed(format!(
+                    "similar.db open failed: {error}"
+                )));
+                return;
+            }
+        };
+        *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
+        register_prefill_db(&db, &self.enabled_roots);
+
+        loop {
+            let (revision, config, cancel) = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.shutdown {
+                    return;
+                }
+                let Some(config) = state.config.clone() else {
+                    drop(state);
+                    self.finish_worker(IndexProgress::Idle);
+                    return;
+                };
+                let cancel = Arc::new(AtomicBool::new(false));
+                *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Arc::clone(&cancel));
+                (state.revision, config, cancel)
+            };
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) =
+                IndexProgress::Running(RunningProgress {
+                    stage: IndexStage::Opening,
+                    current_path: None,
+                    report: IndexReport::default(),
+                });
+            let outcome = run_index_job(
+                &db,
+                &config.roots,
+                &config.pdf_passwords,
+                config.activity_gate.as_deref(),
+                &cancel,
+                &self.progress,
+            );
+            self.invalidate_loaded_state();
+
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.shutdown {
+                return;
+            }
+            let dirty = state.revision != revision;
+            if dirty {
+                drop(state);
+                continue;
+            }
+            let next = match outcome {
+                Ok(report) if cancel.load(Ordering::Relaxed) => IndexProgress::Cancelled(report),
+                Ok(report) => IndexProgress::Complete(report),
+                Err(error) => IndexProgress::Failed(error),
+            };
+            state.worker_running = false;
+            *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
+            return;
+        }
+    }
+
+    fn invalidate_loaded_state(&self) {
+        self.memory_epoch.fetch_add(1, Ordering::AcqRel);
+        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Unloaded;
+        *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
+        *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
+    }
+
+    fn finish_worker(&self, progress: IndexProgress) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        state.worker_running = false;
+        *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+    }
+
+    fn shutdown(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown = true;
+        if let Some(cancel) = self
+            .active_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn key_is_under_any(key: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        key == root
+            || key
+                .strip_prefix(root)
+                .is_some_and(|suffix| root.ends_with('/') || suffix.starts_with('/'))
+    })
 }
 
 enum MemoryState {
@@ -753,18 +981,10 @@ fn run_index_job(
         return Ok(context.report);
     }
     set_stage(progress, IndexStage::Pruning, None);
-    let normalized_roots = roots
-        .iter()
-        .map(|root| crate::search_index_db::normalize_path(root))
-        .collect::<Vec<_>>();
     if context.prune_safe {
         context.report.removed =
-            db.prune_under_roots(
-                &normalized_roots,
-                &context.seen_items,
-                &context.seen_containers,
-            )
-            .map_err(|error| format!("stale row prune failed: {error}"))? as u64;
+            db.prune_except_seen(&context.seen_items, &context.seen_containers)
+                .map_err(|error| format!("stale row prune failed: {error}"))? as u64;
     }
     publish_report(progress, &context.report);
     let completed_at_unix_secs = std::time::SystemTime::now()
@@ -1618,27 +1838,34 @@ fn pdf_page_key(normalized_pdf_path: &str, page_num: u32) -> String {
     )
 }
 
-static PREFILL_DB: OnceLock<RwLock<Option<Weak<SimilarDb>>>> = OnceLock::new();
+struct PrefillRegistration {
+    db: Weak<SimilarDb>,
+    enabled_roots: Weak<RwLock<Vec<String>>>,
+}
 
-fn register_prefill_db(db: &Arc<SimilarDb>) {
+static PREFILL_DB: OnceLock<RwLock<Option<PrefillRegistration>>> = OnceLock::new();
+
+fn register_prefill_db(db: &Arc<SimilarDb>, enabled_roots: &Arc<RwLock<Vec<String>>>) {
     *PREFILL_DB
         .get_or_init(|| RwLock::new(None))
         .write()
-        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(db));
+        .unwrap_or_else(|e| e.into_inner()) = Some(PrefillRegistration {
+        db: Arc::downgrade(db),
+        enabled_roots: Arc::downgrade(enabled_roots),
+    });
 }
 
 #[cfg(test)]
 pub(crate) fn register_prefill_db_for_test(db: &Arc<SimilarDb>) {
-    register_prefill_db(db);
+    // decode target 不変条件のテスト用。scope owner を保持しないため prefill 自体は無効。
+    register_prefill_db(db, &Arc::new(RwLock::new(Vec::new())));
 }
 
-fn prefill_db() -> Option<Arc<SimilarDb>> {
-    PREFILL_DB
-        .get()?
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()?
-        .upgrade()
+fn prefill_target() -> Option<(Arc<SimilarDb>, Arc<RwLock<Vec<String>>>)> {
+    let registration = PREFILL_DB.get()?.read().unwrap_or_else(|e| e.into_inner());
+    let registration = registration.as_ref()?;
+    let enabled_roots = registration.enabled_roots.upgrade()?;
+    Some((registration.db.upgrade()?, enabled_roots))
 }
 
 /// 保存済み thumbnail ではなく、元 source の oriented decode buffer を再利用する。
@@ -1651,9 +1878,16 @@ pub(crate) fn offer_thumbnail_raster(
     image: &image::DynamicImage,
     source_dims: (u32, u32),
 ) {
-    let Some(db) = prefill_db() else {
+    let Some((db, enabled_roots)) = prefill_target() else {
         return;
     };
+    // scope の read lock を put 完了まで保持する。OFF 切替側は write lock の取得後に
+    // prune を予約するため、無効化済み root が prefill で後から復活しない。
+    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+    let normalized_path = crate::search_index_db::normalize_path(path);
+    if !key_is_under_any(&normalized_path, &roots) {
+        return;
+    }
     let (item_key, kind, format) = if let Some(entry) = zip_entry {
         (
             item_key_for_zip_page(path, entry),
@@ -1787,6 +2021,15 @@ mod tests {
             (1024, 768),
             (1024, 768),
         ));
+    }
+
+    #[test]
+    fn favorite_scope_matches_descendants_but_not_prefix_siblings() {
+        let roots = vec!["c:/library/keep".to_owned()];
+        assert!(key_is_under_any("c:/library/keep", &roots));
+        assert!(key_is_under_any("c:/library/keep/page.jpg", &roots));
+        assert!(!key_is_under_any("c:/library/keep-old/page.jpg", &roots));
+        assert!(!key_is_under_any("c:/library/other/page.jpg", &roots));
     }
 
     #[test]

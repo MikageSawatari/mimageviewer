@@ -1493,7 +1493,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             sort_index            INTEGER NOT NULL,
             auto_index_structure  INTEGER NOT NULL DEFAULT 0,
             auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
-            auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+            auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
+            auto_index_similar    INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS favorites_sort ON favorites(sort_index);
 
@@ -1576,6 +1577,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    migrate_favorites_table(conn)?;
     reset_unreleased_external_tools_schema_if_needed(conn)?;
     migrate_tags_table(conn)?;
 
@@ -1594,6 +1596,19 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('app_version', ?1)",
         params![app_version],
     )?;
+    Ok(())
+}
+
+/// `FavoriteEntry` はリリース済みの永続型なので、列追加は既存行を保つ ALTER で行う。
+/// JSON 側の serde default だけでは SQLite の複合テーブルを移行できない。
+fn migrate_favorites_table(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "favorites", "auto_index_similar")? {
+        conn.execute(
+            "ALTER TABLE favorites
+             ADD COLUMN auto_index_similar INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1869,8 +1884,9 @@ fn write_favorites(
     let mut stmt = tx.prepare(
         "INSERT INTO favorites
             (id, name, path, sort_index,
-             auto_index_structure, auto_index_metadata, auto_index_thumbs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             auto_index_structure, auto_index_metadata, auto_index_thumbs,
+             auto_index_similar)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (idx, fav) in favorites.iter().enumerate() {
         stmt.execute(params![
@@ -1881,6 +1897,7 @@ fn write_favorites(
             fav.auto_index_structure as i64,
             fav.auto_index_metadata as i64,
             fav.auto_index_thumbs as i64,
+            fav.auto_index_similar as i64,
         ])?;
     }
     Ok(())
@@ -1888,7 +1905,8 @@ fn write_favorites(
 
 fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, path, auto_index_structure, auto_index_metadata, auto_index_thumbs
+        "SELECT id, name, path, auto_index_structure, auto_index_metadata, auto_index_thumbs,
+                auto_index_similar
          FROM favorites
          ORDER BY sort_index ASC",
     )?;
@@ -1899,6 +1917,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
         let auto_index_structure: i64 = row.get(3)?;
         let auto_index_metadata: i64 = row.get(4)?;
         let auto_index_thumbs: i64 = row.get(5)?;
+        let auto_index_similar: i64 = row.get(6)?;
         Ok((
             id_bytes,
             name,
@@ -1906,11 +1925,12 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_structure != 0,
             auto_index_metadata != 0,
             auto_index_thumbs != 0,
+            auto_index_similar != 0,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id_bytes, name, path, ais, aim, ait) = row?;
+        let (id_bytes, name, path, ais, aim, ait, aiv) = row?;
         // Codex P2 v8 (2026-05-13): UUID 長が 16 でないなら row 破損。silently nil に
         // fallback すると save_full 後に「ユーザーが個別 favorite を編集していた状態」
         // が消える。Corrupted で上層に伝え、bak / JSON migration へ倒す。
@@ -1927,6 +1947,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_structure: ais,
             auto_index_metadata: aim,
             auto_index_thumbs: ait,
+            auto_index_similar: aiv,
         });
     }
     Ok(out)
@@ -2011,6 +2032,7 @@ fn favorite_entries_equal(left: &[FavoriteEntry], right: &[FavoriteEntry]) -> bo
                 && left.auto_index_structure == right.auto_index_structure
                 && left.auto_index_metadata == right.auto_index_metadata
                 && left.auto_index_thumbs == right.auto_index_thumbs
+                && left.auto_index_similar == right.auto_index_similar
         })
 }
 
@@ -3940,6 +3962,7 @@ mod tests {
                 auto_index_structure: true,
                 auto_index_metadata: false,
                 auto_index_thumbs: true,
+                auto_index_similar: true,
             },
             FavoriteEntry {
                 id: Uuid::new_v4(),
@@ -3948,6 +3971,7 @@ mod tests {
                 auto_index_structure: false,
                 auto_index_metadata: true,
                 auto_index_thumbs: false,
+                auto_index_similar: false,
             },
         ];
         s.tags = vec![
@@ -4901,6 +4925,7 @@ mod tests {
             auto_index_structure: false,
             auto_index_metadata: false,
             auto_index_thumbs: false,
+            auto_index_similar: false,
         };
         settings.favorites = vec![favorite.clone()];
         settings.global_preset.brightness = 11.0;
@@ -5069,6 +5094,63 @@ mod tests {
         assert_eq!(outcome.source, BootSource::LoadedExistingDb);
         assert!(!outcome.settings.touch_still_chrome_learned);
         assert!(!outcome.settings.touch_video_chrome_learned);
+        assert!(
+            !std::fs::read_dir(guard.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+        );
+    }
+
+    #[test]
+    fn released_favorites_table_without_similar_flag_migrates_without_quarantine() {
+        let guard = DataDirOverrideGuard::new();
+        let db = SettingsDb::create_new(guard.path()).unwrap();
+        let mut settings = Settings::default();
+        let mut favorite = FavoriteEntry::new(
+            "既存のお気に入り".to_owned(),
+            PathBuf::from(r"C:\Pictures\old"),
+        );
+        favorite.auto_index_structure = true;
+        favorite.auto_index_metadata = true;
+        favorite.auto_index_similar = true;
+        settings.favorites.push(favorite);
+        db.save_full(&settings).unwrap();
+        drop(db);
+
+        // リリース済みの旧 favorites schema を実ファイル上に再現する。
+        let conn = Connection::open(guard.path().join("settings.db")).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE favorites RENAME TO favorites_legacy;
+             DROP INDEX favorites_sort;
+             CREATE TABLE favorites (
+                id                    BLOB PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                path                  TEXT NOT NULL,
+                sort_index            INTEGER NOT NULL,
+                auto_index_structure  INTEGER NOT NULL DEFAULT 0,
+                auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
+                auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO favorites
+                (id, name, path, sort_index, auto_index_structure,
+                 auto_index_metadata, auto_index_thumbs)
+             SELECT id, name, path, sort_index, auto_index_structure,
+                    auto_index_metadata, auto_index_thumbs
+             FROM favorites_legacy;
+             DROP TABLE favorites_legacy;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::LoadedExistingDb);
+        assert!(outcome.db.is_some());
+        assert_eq!(outcome.settings.favorites.len(), 1);
+        let loaded = &outcome.settings.favorites[0];
+        assert!(loaded.auto_index_structure);
+        assert!(loaded.auto_index_metadata);
+        assert!(!loaded.auto_index_similar);
         assert!(
             !std::fs::read_dir(guard.path())
                 .unwrap()

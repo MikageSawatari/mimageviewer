@@ -139,6 +139,8 @@ pub struct FavoriteEntry {
     pub auto_index_metadata: bool,
     /// サムネイル事前キャッシュを自動生成するか。
     pub auto_index_thumbs: bool,
+    /// 現在の画像の別バージョンを探す索引の対象にするか。
+    pub auto_index_similar: bool,
 }
 
 // -----------------------------------------------------------------------
@@ -314,6 +316,8 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata: bool,
                 #[serde(default)]
                 auto_index_thumbs: bool,
+                #[serde(default)]
+                auto_index_similar: bool,
             },
         }
 
@@ -331,6 +335,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                     auto_index_structure: false,
                     auto_index_metadata: false,
                     auto_index_thumbs: false,
+                    auto_index_similar: false,
                 })
             }
             Raw::Full {
@@ -340,6 +345,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_structure,
                 auto_index_metadata,
                 auto_index_thumbs,
+                auto_index_similar,
             } => Ok(FavoriteEntry {
                 id: id.unwrap_or_else(Uuid::nil),
                 name,
@@ -347,6 +353,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_structure,
                 auto_index_metadata,
                 auto_index_thumbs,
+                auto_index_similar,
             }),
         }
     }
@@ -358,13 +365,14 @@ impl serde::Serialize for FavoriteEntry {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("FavoriteEntry", 6)?;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 7)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("auto_index_structure", &self.auto_index_structure)?;
         s.serialize_field("auto_index_metadata", &self.auto_index_metadata)?;
         s.serialize_field("auto_index_thumbs", &self.auto_index_thumbs)?;
+        s.serialize_field("auto_index_similar", &self.auto_index_similar)?;
         s.end()
     }
 }
@@ -379,6 +387,7 @@ impl FavoriteEntry {
             auto_index_structure: false,
             auto_index_metadata: false,
             auto_index_thumbs: false,
+            auto_index_similar: false,
         }
     }
 }
@@ -12666,6 +12675,7 @@ mod tests {
         assert!(json.contains("\"auto_index_structure\""));
         assert!(json.contains("\"auto_index_metadata\""));
         assert!(json.contains("\"auto_index_thumbs\""));
+        assert!(json.contains("\"auto_index_similar\""));
     }
 
     #[test]
@@ -12678,6 +12688,7 @@ mod tests {
         assert!(!entry.auto_index_structure);
         assert!(!entry.auto_index_metadata);
         assert!(!entry.auto_index_thumbs);
+        assert!(!entry.auto_index_similar);
     }
 
     #[test]
@@ -12689,6 +12700,7 @@ mod tests {
         assert!(!entry.auto_index_structure);
         assert!(!entry.auto_index_metadata);
         assert!(!entry.auto_index_thumbs);
+        assert!(!entry.auto_index_similar);
     }
 
     #[test]
@@ -12697,6 +12709,7 @@ mod tests {
         e.auto_index_structure = true;
         e.auto_index_metadata = true;
         e.auto_index_thumbs = false;
+        e.auto_index_similar = true;
         let json = serde_json::to_string(&e).unwrap();
         let back: FavoriteEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, e.id);
@@ -12704,6 +12717,7 @@ mod tests {
         assert!(back.auto_index_structure);
         assert!(back.auto_index_metadata);
         assert!(!back.auto_index_thumbs);
+        assert!(back.auto_index_similar);
     }
 
     #[test]

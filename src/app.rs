@@ -10697,6 +10697,7 @@ pub struct App {
     pub(crate) fav_add_auto_index_structure: bool,
     pub(crate) fav_add_auto_index_metadata: bool,
     pub(crate) fav_add_auto_index_thumbs: bool,
+    pub(crate) fav_add_auto_index_similar: bool,
 
     // ── 全文検索インデクサ (Ctrl+G グローバルメタ検索用) ────────────
     // auto_index_metadata=true のお気に入り毎に Supervisor を持ち、Tantivy index
@@ -10705,8 +10706,9 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_manager: Option<crate::indexer_manager::IndexerManager>,
 
-    // ── 別バージョン索引 (明示開始・UI は Step 3) ─────────────────
-    // constructor は DB を開かず、開始／初回 query の worker だけが I/O する。
+    // ── 別バージョン索引 ─────────────────────────────────────────
+    // auto_index_similar=true のお気に入りだけを対象にし、既存 favorite watcher の
+    // 通知を共有してバックグラウンドで差分を照合する。
     pub(crate) similar_index: crate::similar_index::SimilarIndexManager,
 
     /// 名前索引 Supervisor のアクティブ handle (favorite_id → handle)。
@@ -14270,6 +14272,7 @@ impl App {
             fav_add_auto_index_structure: false,
             fav_add_auto_index_metadata: false,
             fav_add_auto_index_thumbs: false,
+            fav_add_auto_index_similar: false,
             indexer_manager,
             similar_index: crate::similar_index::SimilarIndexManager::new(crate::data_dir::get()),
             name_index_supervisors: std::collections::HashMap::new(),
@@ -19967,21 +19970,16 @@ impl App {
         }
     }
 
-    /// お気に入り全体の別バージョン索引を明示開始する。UI から自動では呼ばない。
-    pub(crate) fn start_similar_index(&self) -> Result<(), crate::similar_index::StartError> {
-        self.similar_index.start(
-            self.settings
-                .favorites
-                .iter()
-                .map(|favorite| favorite.path.clone())
-                .collect(),
+    /// 別バージョン索引フラグの変更を、対象 snapshot と共有 watcher の両方へ即時反映する。
+    pub(crate) fn apply_favorite_similar_index_change(&mut self) {
+        self.similar_index.configure(
+            &self.settings.favorites,
             self.pdf_passwords.clone(),
             Some(Arc::clone(&self.activity_gate)),
-        )
-    }
-
-    pub(crate) fn cancel_similar_index(&self) {
-        self.similar_index.cancel();
+        );
+        if let Some(manager) = self.indexer_manager.as_mut() {
+            manager.sync_with_favorites(&self.settings.favorites);
+        }
     }
 
     pub(crate) fn similar_index_progress(&self) -> crate::similar_index::IndexProgress {
@@ -20011,6 +20009,12 @@ impl App {
         #[cfg(windows)]
         self.kick_off_vst3_startup_load();
         let favorites = self.settings.favorites.clone();
+        self.similar_index.configure(
+            &favorites,
+            self.pdf_passwords.clone(),
+            Some(Arc::clone(&self.activity_gate)),
+        );
+        let similar_notifier = self.similar_index.notifier();
         let speed = self.settings.indexer_speed_profile;
         let excluded_roots = vec![self.settings.books_root_path()];
         let activity_gate = Arc::clone(&self.activity_gate);
@@ -20029,6 +20033,7 @@ impl App {
                         speed,
                         activity_gate,
                         excluded_roots,
+                        similar_notifier,
                         Some(hook),
                     );
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
@@ -20046,6 +20051,7 @@ impl App {
                 self.settings.indexer_speed_profile,
                 Arc::clone(&self.activity_gate),
                 vec![self.settings.books_root_path()],
+                self.similar_index.notifier(),
                 Some(hook),
             );
             self.startup_done = true;
@@ -20746,7 +20752,7 @@ impl App {
     }
 
     /// タイトルバーの「(インデックス更新中)」表示用。
-    /// 名前索引 / メタ索引のいずれかが `in_full_scan=true` を返しているなら true。
+    /// 名前索引 / メタ索引 / 別バージョン索引のいずれかが走査中なら true。
     /// notify-rs の watcher で待機中 (監視中) は false。
     pub(crate) fn any_indexer_in_full_scan(&self) -> bool {
         // 名前索引
@@ -20762,6 +20768,12 @@ impl App {
                     return true;
                 }
             }
+        }
+        if matches!(
+            self.similar_index.progress(),
+            crate::similar_index::IndexProgress::Running(_)
+        ) {
+            return true;
         }
         false
     }
