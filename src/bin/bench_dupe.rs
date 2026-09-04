@@ -3,7 +3,7 @@
 //! This binary deliberately reports distributions and caller-selected bins. It
 //! does not contain an accept/reject threshold for duplicate detection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u32 = 1;
-const JPEG_DCT_TARGET_EDGE: u32 = 64;
+// decode-selfcheck over 400 real JPEGs found this was the smallest measured
+// target with a PDQ-256 median of zero against a full 1/1 decode.
+const JPEG_DCT_TARGET_EDGE: u32 = 1024;
+const DEFAULT_PDF_RENDER_LONG_EDGE: u32 = 1024;
 const DEFAULT_LARGE_DIFF_THRESHOLD_BIN: u8 = 0;
 
 type Result<T> = std::result::Result<T, String>;
@@ -41,6 +44,74 @@ struct ScanRecord {
     signature_ms: f64,
     total_ms: f64,
     signatures: Vec<StoredSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PdfPageRecord {
+    schema_version: u32,
+    proxy_version: u32,
+    book_path: PathBuf,
+    page_index: u32,
+    page_count: u32,
+    quality: u8,
+    render_long_edge: u32,
+    render_width: u32,
+    render_height: u32,
+    render_ms: f64,
+    signature_ms: f64,
+    total_ms: f64,
+    signatures: Vec<StoredSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "record_type", rename_all = "snake_case")]
+enum BooksRecord {
+    Config(BooksConfigRecord),
+    Book(BooksBookRecord),
+    Pair(BooksPairRecord),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksConfigRecord {
+    schema_version: u32,
+    input: PathBuf,
+    algorithm: String,
+    radius: u32,
+    max_books_per_page: u32,
+    min_quality: u8,
+    coverage_threshold: f32,
+    coverage_is_placeholder: bool,
+    render_long_edge: Option<u32>,
+    book_count: usize,
+    page_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksBookRecord {
+    schema_version: u32,
+    book: u32,
+    path: PathBuf,
+    declared_page_count: u32,
+    scanned_page_count: u32,
+    distinctive_pages: u32,
+    featureless_pages: u32,
+    common_pages: u32,
+    undecidable_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BooksPairRecord {
+    schema_version: u32,
+    a: u32,
+    b: u32,
+    relation: String,
+    whole: Option<u32>,
+    matched: u32,
+    distinctive_a: u32,
+    distinctive_b: u32,
+    coverage_a: f32,
+    coverage_b: f32,
+    alignment: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +311,11 @@ fn run() -> Result<()> {
     let rest: Vec<String> = args.collect();
     match command.as_str() {
         "scan" => run_scan(&rest),
+        "decode-selfcheck" => run_decode_selfcheck(&rest),
         "pdf-selfcheck" => run_pdf_selfcheck(&rest),
+        "pdf-scan" => run_pdf_scan(&rest),
+        "books" => run_books(&rest),
+        "books-report" => run_books_report(&rest),
         "pairs" => run_pairs(&rest),
         "synth" => run_synth(&rest),
         "report" => run_report(&rest),
@@ -255,8 +330,14 @@ fn run() -> Result<()> {
 fn usage() -> String {
     format!(
         "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE\n  \
+         bench_dupe decode-selfcheck --dir DIR [--recursive] --out FILE [--limit N]\n  \
          bench_dupe pdf-selfcheck --dir DIR [--recursive] --out FILE \
          [--limit-books N] [--max-pages-per-book N]\n  \
+         bench_dupe pdf-scan --dir DIR [--recursive] --out FILE \
+         [--render-long-edge N] [--limit-books N] [--max-pages-per-book N]\n  \
+         bench_dupe books --in FILE --out FILE [--radius N] [--k N] \
+         [--min-quality N] [--coverage X]\n  \
+         bench_dupe books-report --in FILE --out FILE\n  \
          bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
          bench_dupe synth --dir DIR --out FILE [--recursive] [--limit N] \
          [--large-diff-threshold-bin N]\n  \
@@ -292,6 +373,15 @@ fn parse_u32(value: &str, flag: &str) -> Result<u32> {
         .map_err(|_| format!("invalid {flag} value {value:?}"))
 }
 
+fn parse_positive_u32(value: &str, flag: &str) -> Result<u32> {
+    let parsed = parse_u32(value, flag)?;
+    if parsed > 0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be greater than zero"))
+    }
+}
+
 fn parse_u8(value: &str, flag: &str) -> Result<u8> {
     value
         .parse()
@@ -306,6 +396,15 @@ fn parse_nonnegative_f32(value: &str, flag: &str) -> Result<f32> {
         Ok(parsed)
     } else {
         Err(format!("{flag} must be finite and non-negative"))
+    }
+}
+
+fn parse_unit_f32(value: &str, flag: &str) -> Result<f32> {
+    let parsed = parse_nonnegative_f32(value, flag)?;
+    if parsed <= 1.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{flag} must be in 0..=1"))
     }
 }
 
@@ -364,6 +463,122 @@ fn stride_sample_page_numbers(page_numbers: Vec<u32>, limit: usize) -> Vec<u32> 
     (0..limit)
         .map(|slot| page_numbers[slot * total / limit])
         .collect()
+}
+
+struct DecodeSelfcheckVariant {
+    label: &'static str,
+    source_dims: (u32, u32),
+    signatures: PreparedSignatures,
+}
+
+fn run_decode_selfcheck(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            _ => return Err(format!("unknown decode-selfcheck option {flag:?}")),
+        }
+        index += 1;
+    }
+
+    let dir = dir.ok_or_else(|| "decode-selfcheck requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "decode-selfcheck requires --out".to_owned())?;
+    let mut paths = collect_image_paths(&dir, recursive)?;
+    paths.retain(|path| matches!(extension_lower(path).as_str(), "jpg" | "jpeg"));
+    if let Some(limit) = limit {
+        paths = stride_sample(paths, limit);
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    let selected = paths.len();
+    let mut measured = 0usize;
+    let mut failed = 0usize;
+    let mut record_count = 0usize;
+    for path in paths {
+        let result: Result<usize> = (|| {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("read JPEG {}: {error}", path.display()))?;
+            let variants = [
+                decode_selfcheck_variant(&path, &bytes, "target_64", 64)?,
+                decode_selfcheck_variant(&path, &bytes, "target_128", 128)?,
+                decode_selfcheck_variant(&path, &bytes, "target_256", 256)?,
+                decode_selfcheck_variant(&path, &bytes, "target_512", 512)?,
+                decode_selfcheck_variant(&path, &bytes, "target_1024", 1024)?,
+                decode_selfcheck_variant(&path, &bytes, "full", u32::MAX)?,
+            ];
+
+            let mut emitted = 0usize;
+            for left in 0..variants.len() {
+                for right in left + 1..variants.len() {
+                    let a = &variants[left];
+                    let b = &variants[right];
+                    let transformation = format!("jpeg_dct_{}_vs_{}", a.label, b.label);
+                    emitted += write_synth_comparison(
+                        &mut writer,
+                        "related",
+                        &transformation,
+                        &path,
+                        None,
+                        a.source_dims,
+                        b.source_dims,
+                        &a.signatures,
+                        &b.signatures,
+                        DEFAULT_LARGE_DIFF_THRESHOLD_BIN,
+                    )?;
+                }
+            }
+            Ok(emitted)
+        })();
+
+        match result {
+            Ok(emitted) => {
+                measured += 1;
+                record_count += emitted;
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("decode-selfcheck: skip {}: {error}", path.display());
+            }
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!(
+        "decode-selfcheck: selected={} measured={} failed={} records={} out={}",
+        selected,
+        measured,
+        failed,
+        record_count,
+        output.display()
+    );
+    Ok(())
+}
+
+fn decode_selfcheck_variant(
+    path: &Path,
+    bytes: &[u8],
+    label: &'static str,
+    target_edge: u32,
+) -> Result<DecodeSelfcheckVariant> {
+    let decoded = decode_jpeg_for_scan_at_target(path, bytes, target_edge)?;
+    let signatures = signatures_from_rgba(&decoded.rgba, decoded.source_dims);
+    Ok(DecodeSelfcheckVariant {
+        label,
+        source_dims: decoded.source_dims,
+        signatures,
+    })
 }
 
 #[derive(Default)]
@@ -498,6 +713,827 @@ fn run_pdf_selfcheck(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+struct PdfBookTask {
+    path: PathBuf,
+    page_count: u32,
+    page_numbers: Vec<u32>,
+}
+
+struct PdfPageTask {
+    path: PathBuf,
+    page_count: u32,
+    page_index: u32,
+}
+
+enum PdfEnumerateOutcome {
+    Ready(PdfBookTask),
+    PasswordRequired { path: PathBuf, error: String },
+    ZeroPages { path: PathBuf },
+    Failed { path: PathBuf, error: String },
+}
+
+fn run_pdf_scan(args: &[String]) -> Result<()> {
+    let mut dir = None;
+    let mut output = None;
+    let mut recursive = false;
+    let mut render_long_edge = DEFAULT_PDF_RENDER_LONG_EDGE;
+    let mut limit_books = None;
+    let mut max_pages_per_book = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--recursive" => recursive = true,
+            "--render-long-edge" => {
+                render_long_edge = parse_positive_u32(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--limit-books" => {
+                limit_books = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            "--max-pages-per-book" => {
+                max_pages_per_book = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?)
+            }
+            _ => return Err(format!("unknown pdf-scan option {flag:?}")),
+        }
+        index += 1;
+    }
+    let dir = dir.ok_or_else(|| "pdf-scan requires --dir".to_owned())?;
+    let output = output.ok_or_else(|| "pdf-scan requires --out".to_owned())?;
+    let mut paths = collect_pdf_paths(&dir, recursive)?;
+    if let Some(limit) = limit_books {
+        paths = stride_sample(paths, limit);
+    }
+    let selected_books = paths.len();
+
+    let outcomes = paths
+        .par_iter()
+        .map(|path| match pdf_loader::enumerate_pages(path, None) {
+            Ok(entries) if entries.is_empty() => {
+                PdfEnumerateOutcome::ZeroPages { path: path.clone() }
+            }
+            Ok(entries) => {
+                let page_count = entries.len() as u32;
+                let page_numbers = entries
+                    .into_iter()
+                    .map(|entry| entry.page_num)
+                    .collect::<Vec<_>>();
+                let page_numbers = max_pages_per_book
+                    .map(|limit| stride_sample_page_numbers(page_numbers.clone(), limit))
+                    .unwrap_or(page_numbers);
+                PdfEnumerateOutcome::Ready(PdfBookTask {
+                    path: path.clone(),
+                    page_count,
+                    page_numbers,
+                })
+            }
+            Err(error) if pdf_password_required(&error) => PdfEnumerateOutcome::PasswordRequired {
+                path: path.clone(),
+                error: error.to_string(),
+            },
+            Err(error) => PdfEnumerateOutcome::Failed {
+                path: path.clone(),
+                error: error.to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let mut password_required_books = 0usize;
+    let mut zero_page_books = 0usize;
+    let mut failed_enumerate_books = 0usize;
+    let mut book_tasks = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            PdfEnumerateOutcome::Ready(task) => book_tasks.push(task),
+            PdfEnumerateOutcome::PasswordRequired { path, error } => {
+                password_required_books += 1;
+                eprintln!(
+                    "pdf-scan: skip password-required PDF {}: {error}",
+                    path.display()
+                );
+            }
+            PdfEnumerateOutcome::ZeroPages { path } => {
+                zero_page_books += 1;
+                eprintln!("pdf-scan: skip zero-page PDF {}", path.display());
+            }
+            PdfEnumerateOutcome::Failed { path, error } => {
+                failed_enumerate_books += 1;
+                eprintln!("pdf-scan: skip unreadable PDF {}: {error}", path.display());
+            }
+        }
+    }
+    book_tasks.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let page_tasks = book_tasks
+        .iter()
+        .flat_map(|book| {
+            book.page_numbers
+                .iter()
+                .copied()
+                .map(|page_index| PdfPageTask {
+                    path: book.path.clone(),
+                    page_count: book.page_count,
+                    page_index,
+                })
+        })
+        .collect::<Vec<_>>();
+    let render_results = page_tasks
+        .par_iter()
+        .map(|task| render_pdf_scan_page(task, render_long_edge))
+        .collect::<Vec<_>>();
+
+    let mut failed_render_books = BTreeSet::new();
+    let mut records = Vec::with_capacity(render_results.len());
+    for (task, result) in page_tasks.iter().zip(render_results) {
+        match result {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                failed_render_books.insert(task.path.clone());
+                eprintln!(
+                    "pdf-scan: discard book after page {} failed in {}: {error}",
+                    task.page_index + 1,
+                    task.path.display()
+                );
+            }
+        }
+    }
+    records.retain(|record| !failed_render_books.contains(&record.book_path));
+    records.sort_by(|left, right| {
+        left.book_path
+            .cmp(&right.book_path)
+            .then(left.page_index.cmp(&right.page_index))
+    });
+    write_jsonl(&output, &records)?;
+    let completed_books = book_tasks.len().saturating_sub(failed_render_books.len());
+    eprintln!(
+        "pdf-scan: selected_books={} completed_books={} pages={} render_long_edge={} \
+         password_required_books={} zero_page_books={} failed_enumerate_books={} \
+         failed_render_books={} out={}",
+        selected_books,
+        completed_books,
+        records.len(),
+        render_long_edge,
+        password_required_books,
+        zero_page_books,
+        failed_enumerate_books,
+        failed_render_books.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<PdfPageRecord> {
+    let total_start = Instant::now();
+    let render_start = Instant::now();
+    let rendered = pdf_loader::render_page(
+        &task.path,
+        task.page_index,
+        render_long_edge,
+        None,
+        None,
+        JobPriority::Normal,
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )
+    .map_err(|error| {
+        format!(
+            "render {} page {}: {error}",
+            task.path.display(),
+            task.page_index + 1
+        )
+    })?;
+    let render_ms = elapsed_ms(render_start);
+    if rendered.page_count != task.page_count {
+        return Err(format!(
+            "page count changed during scan: enumerated {}, render reported {}",
+            task.page_count, rendered.page_count
+        ));
+    }
+    let rgba = rendered.image.to_rgba8();
+    let (render_width, render_height) = rgba.dimensions();
+    let signature_start = Instant::now();
+    let proxy = dupe::proxy::build(rgba.as_raw(), render_width, render_height);
+    let computed = dupe::all_algos()
+        .iter()
+        .map(|&algo| dupe::compute(algo, &proxy))
+        .collect::<Vec<_>>();
+    let quality = computed
+        .iter()
+        .find(|signature| signature.algo == Algo::Pdq256)
+        .expect("all algorithms includes Pdq256")
+        .quality;
+    let signatures = computed.into_iter().map(store_signature).collect();
+    let signature_ms = elapsed_ms(signature_start);
+    Ok(PdfPageRecord {
+        schema_version: SCHEMA_VERSION,
+        proxy_version: dupe::PROXY_VERSION,
+        book_path: task.path.clone(),
+        page_index: task.page_index,
+        page_count: task.page_count,
+        quality,
+        render_long_edge,
+        render_width,
+        render_height,
+        render_ms,
+        signature_ms,
+        total_ms: elapsed_ms(total_start),
+        signatures,
+    })
+}
+
+struct InputBookMeta {
+    path: PathBuf,
+    declared_page_count: u32,
+    scanned_page_count: u32,
+}
+
+fn run_books(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut params = dupe::book::Params::default();
+    let mut coverage_is_placeholder = true;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--radius" => params.radius = parse_u32(&take_value(args, &mut index, flag)?, flag)?,
+            "--k" => {
+                params.max_books_per_page = parse_u32(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--min-quality" => {
+                params.min_quality = parse_u8(&take_value(args, &mut index, flag)?, flag)?
+            }
+            "--coverage" => {
+                params.coverage_threshold =
+                    parse_unit_f32(&take_value(args, &mut index, flag)?, flag)?;
+                coverage_is_placeholder = false;
+            }
+            _ => return Err(format!("unknown books option {flag:?}")),
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| "books requires --in".to_owned())?;
+    let output = output.ok_or_else(|| "books requires --out".to_owned())?;
+    let page_records: Vec<PdfPageRecord> = read_jsonl(&input)?;
+
+    let paths = page_records
+        .iter()
+        .map(|record| record.book_path.clone())
+        .collect::<BTreeSet<_>>();
+    if paths.len() > u32::MAX as usize {
+        return Err("books input contains more than u32::MAX books".to_owned());
+    }
+    let book_ids = paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| (path, index as u32))
+        .collect::<BTreeMap<_, _>>();
+    let mut book_meta = book_ids
+        .iter()
+        .map(|(path, &book)| {
+            (
+                book,
+                InputBookMeta {
+                    path: path.clone(),
+                    declared_page_count: 0,
+                    scanned_page_count: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut render_edges = BTreeSet::new();
+    let mut seen_pages = HashSet::new();
+    let mut pages = Vec::with_capacity(page_records.len());
+    for record in &page_records {
+        if record.schema_version != SCHEMA_VERSION {
+            return Err(format!(
+                "{} page {} has schema version {}, expected {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.schema_version,
+                SCHEMA_VERSION
+            ));
+        }
+        if record.proxy_version != dupe::PROXY_VERSION {
+            return Err(format!(
+                "{} page {} has proxy version {}, expected {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.proxy_version,
+                dupe::PROXY_VERSION
+            ));
+        }
+        let book = *book_ids
+            .get(&record.book_path)
+            .expect("every page path has an assigned book id");
+        if !seen_pages.insert((book, record.page_index)) {
+            return Err(format!(
+                "{} contains duplicate page index {}",
+                record.book_path.display(),
+                record.page_index
+            ));
+        }
+        let meta = book_meta
+            .get_mut(&book)
+            .expect("every assigned book id has metadata");
+        if meta.declared_page_count == 0 {
+            meta.declared_page_count = record.page_count;
+        } else if meta.declared_page_count != record.page_count {
+            return Err(format!(
+                "{} mixes declared page counts {} and {}",
+                record.book_path.display(),
+                meta.declared_page_count,
+                record.page_count
+            ));
+        }
+        meta.scanned_page_count += 1;
+        render_edges.insert(record.render_long_edge);
+        let signature = restore_pdf_pdq256(record)?;
+        if signature.quality != record.quality {
+            return Err(format!(
+                "{} page {} has top-level quality {}, Pdq256 stores {}",
+                record.book_path.display(),
+                record.page_index + 1,
+                record.quality,
+                signature.quality
+            ));
+        }
+        pages.push(dupe::book::BookPage {
+            book,
+            index: record.page_index,
+            quality: record.quality,
+            sig: signature.sig,
+        });
+    }
+    if render_edges.len() > 1 {
+        return Err(format!(
+            "{} mixes PDF render long edges; scan each configuration separately",
+            input.display()
+        ));
+    }
+
+    let analysis = dupe::book::analyze(&pages, params)
+        .map_err(|error| format!("analyze books in {}: {error}", input.display()))?;
+    let stats = analysis
+        .books
+        .iter()
+        .map(|stats| (stats.book, stats))
+        .collect::<BTreeMap<_, _>>();
+    let mut output_records = Vec::with_capacity(1 + book_meta.len() + analysis.pairs.len());
+    output_records.push(BooksRecord::Config(BooksConfigRecord {
+        schema_version: SCHEMA_VERSION,
+        input: input.clone(),
+        algorithm: "Pdq256".to_owned(),
+        radius: params.radius,
+        max_books_per_page: params.max_books_per_page,
+        min_quality: params.min_quality,
+        coverage_threshold: params.coverage_threshold,
+        coverage_is_placeholder,
+        render_long_edge: render_edges.first().copied(),
+        book_count: book_meta.len(),
+        page_count: pages.len(),
+    }));
+    for (&book, meta) in &book_meta {
+        let stats = stats
+            .get(&book)
+            .copied()
+            .expect("every input book has analysis stats");
+        let undecidable_reason = (stats.distinctive_pages == 0).then(|| {
+            format!(
+                "no distinctive pages (featureless={}, common={})",
+                stats.featureless_pages, stats.common_pages
+            )
+        });
+        output_records.push(BooksRecord::Book(BooksBookRecord {
+            schema_version: SCHEMA_VERSION,
+            book,
+            path: meta.path.clone(),
+            declared_page_count: meta.declared_page_count,
+            scanned_page_count: meta.scanned_page_count,
+            distinctive_pages: stats.distinctive_pages,
+            featureless_pages: stats.featureless_pages,
+            common_pages: stats.common_pages,
+            undecidable_reason,
+        }));
+    }
+    for pair in analysis.pairs {
+        let (relation, whole) = match pair.relation {
+            dupe::book::Relation::Same => ("same", None),
+            dupe::book::Relation::Contains { whole } => ("contains", Some(whole)),
+            dupe::book::Relation::Unrelated => ("unrelated", None),
+            dupe::book::Relation::Undecidable => ("undecidable", None),
+        };
+        output_records.push(BooksRecord::Pair(BooksPairRecord {
+            schema_version: SCHEMA_VERSION,
+            a: pair.a,
+            b: pair.b,
+            relation: relation.to_owned(),
+            whole,
+            matched: pair.matched,
+            distinctive_a: pair.distinctive_a,
+            distinctive_b: pair.distinctive_b,
+            coverage_a: pair.coverage_a,
+            coverage_b: pair.coverage_b,
+            alignment: pair.alignment,
+        }));
+    }
+    write_jsonl(&output, &output_records)?;
+    eprintln!(
+        "books: books={} pages={} candidate_pairs={} radius={} k={} min_quality={} \
+         coverage={:.6} coverage_placeholder={} out={}",
+        book_meta.len(),
+        pages.len(),
+        output_records
+            .iter()
+            .filter(|record| matches!(record, BooksRecord::Pair(_)))
+            .count(),
+        params.radius,
+        params.max_books_per_page,
+        params.min_quality,
+        params.coverage_threshold,
+        coverage_is_placeholder,
+        output.display()
+    );
+    Ok(())
+}
+
+fn restore_pdf_pdq256(record: &PdfPageRecord) -> Result<Signature> {
+    let matches = record
+        .signatures
+        .iter()
+        .filter(|signature| signature.algo == "Pdq256")
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "{} page {} contains {} Pdq256 signatures, expected exactly one",
+            record.book_path.display(),
+            record.page_index + 1,
+            matches.len()
+        ));
+    }
+    let stored = matches[0];
+    validate_stored_shape(stored, "bits", Some(256), None, 32)?;
+    Ok(Signature {
+        algo: Algo::Pdq256,
+        sig: Sig::Bits(decode_hex(&stored.hex)?.into_boxed_slice()),
+        quality: stored.quality,
+    })
+}
+
+fn run_books_report(args: &[String]) -> Result<()> {
+    let mut input = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--in" => input = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
+            _ => return Err(format!("unknown books-report option {flag:?}")),
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| "books-report requires --in".to_owned())?;
+    let output = output.ok_or_else(|| "books-report requires --out".to_owned())?;
+    let records: Vec<BooksRecord> = read_jsonl(&input)?;
+    let mut config = None;
+    let mut books = Vec::new();
+    let mut pairs = Vec::new();
+    for record in records {
+        match record {
+            BooksRecord::Config(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                if config.replace(record).is_some() {
+                    return Err(format!(
+                        "{} contains more than one config record",
+                        input.display()
+                    ));
+                }
+            }
+            BooksRecord::Book(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                books.push(record);
+            }
+            BooksRecord::Pair(record) => {
+                validate_books_schema(record.schema_version, &input)?;
+                pairs.push(record);
+            }
+        }
+    }
+    let config = config.ok_or_else(|| format!("{} contains no config record", input.display()))?;
+    books.sort_by_key(|book| book.book);
+    pairs.sort_by_key(|pair| (pair.a, pair.b));
+    if books.len() != config.book_count {
+        return Err(format!(
+            "{} config declares {} books but contains {} book records",
+            input.display(),
+            config.book_count,
+            books.len()
+        ));
+    }
+    let book_paths = books
+        .iter()
+        .map(|book| (book.book, &book.path))
+        .collect::<BTreeMap<_, _>>();
+    for pair in &pairs {
+        if !book_paths.contains_key(&pair.a) || !book_paths.contains_key(&pair.b) {
+            return Err(format!(
+                "{} pair ({}, {}) refers to an unknown book",
+                input.display(),
+                pair.a,
+                pair.b
+            ));
+        }
+        if pair.relation == "contains"
+            && !pair
+                .whole
+                .is_some_and(|whole| whole == pair.a || whole == pair.b)
+        {
+            return Err(format!(
+                "{} contains pair ({}, {}) without a valid whole book",
+                input.display(),
+                pair.a,
+                pair.b
+            ));
+        }
+    }
+
+    let file =
+        File::create(&output).map_err(|error| format!("create {}: {error}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "# Book-version relationship measurement report").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(
+        writer,
+        "> This report describes measured overlap. It does not recommend deletion, cleanup, or which version to keep."
+    )
+    .map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Measurement configuration").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "- Input: {}", markdown_path(&config.input)).map_err(io_error)?;
+    writeln!(writer, "- Algorithm: {}", config.algorithm).map_err(io_error)?;
+    writeln!(writer, "- Radius: {}", config.radius).map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Maximum books per distinctive page (K): {}",
+        config.max_books_per_page
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "- Minimum quality: {}", config.min_quality).map_err(io_error)?;
+    if config.coverage_is_placeholder {
+        writeln!(
+            writer,
+            "- Coverage cut: {:.6} — **placeholder; this value has not been measured**",
+            config.coverage_threshold
+        )
+        .map_err(io_error)?;
+    } else {
+        writeln!(
+            writer,
+            "- Coverage cut: {:.6} — caller supplied",
+            config.coverage_threshold
+        )
+        .map_err(io_error)?;
+    }
+    writeln!(
+        writer,
+        "- PDF render long edge: {}",
+        config
+            .render_long_edge
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string())
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "- Books: {}; scanned pages: {}",
+        config.book_count, config.page_count
+    )
+    .map_err(io_error)?;
+
+    let mut relation_counts = BTreeMap::<&str, usize>::new();
+    for name in ["same", "contains", "unrelated", "undecidable"] {
+        relation_counts.insert(name, 0);
+    }
+    for pair in &pairs {
+        *relation_counts.entry(&pair.relation).or_default() += 1;
+    }
+    let undecidable_books = books
+        .iter()
+        .filter(|book| book.undecidable_reason.is_some())
+        .count();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Relationship counts").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Relation | Count |").map_err(io_error)?;
+    writeln!(writer, "|---|---:|").map_err(io_error)?;
+    for name in ["same", "contains", "unrelated", "undecidable"] {
+        writeln!(writer, "| {name} | {} |", relation_counts[name]).map_err(io_error)?;
+    }
+    writeln!(writer, "| undecidable books | {undecidable_books} |").map_err(io_error)?;
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Contains relationships").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    let contains = pairs
+        .iter()
+        .filter(|pair| pair.relation == "contains")
+        .collect::<Vec<_>>();
+    if contains.is_empty() {
+        writeln!(writer, "No Contains relationship was measured.").map_err(io_error)?;
+    } else {
+        writeln!(
+            writer,
+            "| Contained book | Whole book | Matched | Contained coverage | Whole coverage | Aligned page bands |"
+        )
+        .map_err(io_error)?;
+        writeln!(writer, "|---|---|---:|---:|---:|---|").map_err(io_error)?;
+        for pair in contains {
+            let whole = pair.whole.expect("validated contains whole");
+            let subset = if whole == pair.a { pair.b } else { pair.a };
+            let subset_coverage = if subset == pair.a {
+                pair.coverage_a
+            } else {
+                pair.coverage_b
+            };
+            let whole_coverage = if whole == pair.a {
+                pair.coverage_a
+            } else {
+                pair.coverage_b
+            };
+            writeln!(
+                writer,
+                "| {} | {} | {} | {:.4} | {:.4} | {} |",
+                markdown_path(book_paths[&subset]),
+                markdown_path(book_paths[&whole]),
+                pair.matched,
+                subset_coverage,
+                whole_coverage,
+                format_alignment_bands(pair, subset == pair.a)
+            )
+            .map_err(io_error)?;
+        }
+    }
+
+    let coverage_values = pairs
+        .iter()
+        .flat_map(|pair| [pair.coverage_a as f64, pair.coverage_b as f64])
+        .collect::<Vec<_>>();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Coverage distribution").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Directions | min | p50 | p90 | p99 | max |").map_err(io_error)?;
+    writeln!(writer, "|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| {} | {} | {} | {} | {} | {} |",
+        coverage_values.len(),
+        format_decimal(minimum(&coverage_values)),
+        format_decimal(percentile(&coverage_values, 50.0)),
+        format_decimal(percentile(&coverage_values, 90.0)),
+        format_decimal(percentile(&coverage_values, 99.0)),
+        format_decimal(maximum(&coverage_values))
+    )
+    .map_err(io_error)?;
+
+    let distinctive_values = books
+        .iter()
+        .map(|book| book.distinctive_pages as f64)
+        .collect::<Vec<_>>();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Distinctive-page distribution").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Books | min | p50 | p90 | p99 | max |").map_err(io_error)?;
+    writeln!(writer, "|---:|---:|---:|---:|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| {} | {} | {} | {} | {} | {} |",
+        distinctive_values.len(),
+        format_integer(minimum(&distinctive_values)),
+        format_integer(percentile(&distinctive_values, 50.0)),
+        format_integer(percentile(&distinctive_values, 90.0)),
+        format_integer(percentile(&distinctive_values, 99.0)),
+        format_integer(maximum(&distinctive_values))
+    )
+    .map_err(io_error)?;
+
+    let featureless_pages: u64 = books.iter().map(|book| book.featureless_pages as u64).sum();
+    let common_pages: u64 = books.iter().map(|book| book.common_pages as u64).sum();
+    let books_with_featureless = books
+        .iter()
+        .filter(|book| book.featureless_pages > 0)
+        .count();
+    let books_with_common = books.iter().filter(|book| book.common_pages > 0).count();
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Excluded pages").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "| Reason | Pages | Books affected |").map_err(io_error)?;
+    writeln!(writer, "|---|---:|---:|").map_err(io_error)?;
+    writeln!(
+        writer,
+        "| quality below min_quality | {featureless_pages} | {books_with_featureless} |"
+    )
+    .map_err(io_error)?;
+    writeln!(
+        writer,
+        "| direct radius neighborhood spans more than K books | {common_pages} | {books_with_common} |"
+    )
+    .map_err(io_error)?;
+
+    writeln!(writer).map_err(io_error)?;
+    writeln!(writer, "## Undecidable books").map_err(io_error)?;
+    writeln!(writer).map_err(io_error)?;
+    if undecidable_books == 0 {
+        writeln!(writer, "No book was undecidable.").map_err(io_error)?;
+    } else {
+        writeln!(writer, "| Book | Reason | Scanned / declared pages |").map_err(io_error)?;
+        writeln!(writer, "|---|---|---:|").map_err(io_error)?;
+        for book in books
+            .iter()
+            .filter(|book| book.undecidable_reason.is_some())
+        {
+            writeln!(
+                writer,
+                "| {} | {} | {} / {} |",
+                markdown_path(&book.path),
+                book.undecidable_reason.as_deref().unwrap_or_default(),
+                book.scanned_page_count,
+                book.declared_page_count
+            )
+            .map_err(io_error)?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", output.display()))?;
+    eprintln!("books-report: wrote {}", output.display());
+    Ok(())
+}
+
+fn validate_books_schema(schema_version: u32, input: &Path) -> Result<()> {
+    if schema_version == SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} contains schema version {}, expected {}",
+            input.display(),
+            schema_version,
+            SCHEMA_VERSION
+        ))
+    }
+}
+
+fn markdown_path(path: &Path) -> String {
+    path.display().to_string().replace('|', "\\|")
+}
+
+fn format_decimal(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}"))
+}
+
+fn format_integer(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.0}"))
+}
+
+fn format_alignment_bands(pair: &BooksPairRecord, subset_is_a: bool) -> String {
+    let mut coordinates = pair
+        .alignment
+        .iter()
+        .map(|&(a, b)| if subset_is_a { (a, b) } else { (b, a) })
+        .collect::<Vec<_>>();
+    if coordinates.is_empty() {
+        return "none".to_owned();
+    }
+    coordinates.sort_unstable();
+    let mut bands = Vec::new();
+    let mut start = coordinates[0];
+    let mut end = start;
+    for coordinate in coordinates.into_iter().skip(1) {
+        if coordinate.0 == end.0 + 1 && coordinate.1 == end.1 + 1 {
+            end = coordinate;
+        } else {
+            bands.push(format_page_band(start, end));
+            start = coordinate;
+            end = coordinate;
+        }
+    }
+    bands.push(format_page_band(start, end));
+    bands.join("; ")
+}
+
+fn format_page_band(start: (u32, u32), end: (u32, u32)) -> String {
+    format!(
+        "contained {}-{} -> whole {}-{}",
+        start.0 + 1,
+        end.0 + 1,
+        start.1 + 1,
+        end.1 + 1
+    )
+}
+
 fn collect_image_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -626,42 +1662,7 @@ fn scan_one(path: &Path) -> Result<ScanRecord> {
 
 fn decode_for_scan(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
     if matches!(extension_lower(path).as_str(), "jpg" | "jpeg") {
-        match decode_jpeg_turbo_scaled_from_bytes(bytes, JPEG_DCT_TARGET_EDGE) {
-            Ok((image, stats)) => {
-                let orientation = read_exif_orientation_for_source_dims(bytes);
-                let image = apply_exif_orientation_from_bytes(image, bytes);
-                let source_dims = stats.source_dims_after_exif(orientation);
-                return Ok(DecodedImage {
-                    rgba: image.to_rgba8(),
-                    source_dims,
-                    method: "turbojpeg_dct".to_owned(),
-                    scale_num: stats.scale_num,
-                    scale_den: 8,
-                    note: None,
-                });
-            }
-            Err(DctDecodeError::TerminalRejection(error)) => {
-                return Err(format!(
-                    "terminal JPEG rejection for {}: {error}",
-                    path.display()
-                ));
-            }
-            Err(DctDecodeError::Fallback(turbo_error)) => {
-                let (image, method, fallback_note) = decode_full(path, bytes)?;
-                let image = apply_exif_orientation(image, path);
-                let source_dims = image.dimensions();
-                return Ok(DecodedImage {
-                    rgba: image.to_rgba8(),
-                    source_dims,
-                    method,
-                    scale_num: 8,
-                    scale_den: 8,
-                    note: Some(format!(
-                        "TurboJPEG fallback: {turbo_error}; {fallback_note}"
-                    )),
-                });
-            }
-        }
+        return decode_jpeg_for_scan_at_target(path, bytes, JPEG_DCT_TARGET_EDGE);
     }
 
     let (image, method, note) = decode_full(path, bytes)?;
@@ -675,6 +1676,47 @@ fn decode_for_scan(path: &Path, bytes: &[u8]) -> Result<DecodedImage> {
         scale_den: 1,
         note: (note != "direct decode").then_some(note),
     })
+}
+
+fn decode_jpeg_for_scan_at_target(
+    path: &Path,
+    bytes: &[u8],
+    target_edge: u32,
+) -> Result<DecodedImage> {
+    match decode_jpeg_turbo_scaled_from_bytes(bytes, target_edge) {
+        Ok((image, stats)) => {
+            let orientation = read_exif_orientation_for_source_dims(bytes);
+            let image = apply_exif_orientation_from_bytes(image, bytes);
+            let source_dims = stats.source_dims_after_exif(orientation);
+            Ok(DecodedImage {
+                rgba: image.to_rgba8(),
+                source_dims,
+                method: "turbojpeg_dct".to_owned(),
+                scale_num: stats.scale_num,
+                scale_den: 8,
+                note: None,
+            })
+        }
+        Err(DctDecodeError::TerminalRejection(error)) => Err(format!(
+            "terminal JPEG rejection for {}: {error}",
+            path.display()
+        )),
+        Err(DctDecodeError::Fallback(turbo_error)) => {
+            let (image, method, fallback_note) = decode_full(path, bytes)?;
+            let image = apply_exif_orientation(image, path);
+            let source_dims = image.dimensions();
+            Ok(DecodedImage {
+                rgba: image.to_rgba8(),
+                source_dims,
+                method,
+                scale_num: 8,
+                scale_den: 8,
+                note: Some(format!(
+                    "TurboJPEG fallback: {turbo_error}; {fallback_note}"
+                )),
+            })
+        }
+    }
 }
 
 fn selfcheck_pdf_page<W: Write>(writer: &mut W, path: &Path, page_num: u32) -> Result<usize> {

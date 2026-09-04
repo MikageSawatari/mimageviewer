@@ -4,6 +4,7 @@
 //! persistence. Callers supply decoded, EXIF-oriented pixels to [`proxy`].
 
 pub mod blockhash;
+pub mod book;
 pub mod dct_phash;
 pub mod luma;
 pub mod pdq;
