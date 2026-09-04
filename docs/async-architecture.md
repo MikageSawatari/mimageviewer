@@ -461,15 +461,14 @@ GIF / APNG / Animated WebP の各 frame 境界にある。PDFium と Susie IPC �
 中断可能であるように見せず、応答まで permit 内で待つ。待機数、実行数、取消中数、
 cancel から実終了までの時間は `fs.scheduler_*` perf event で観測できる。
 
-> ⚠️ **上限制御と重複したまま残っている旧規則がある。** `update_prefetch_window` は今も
-> 「現在ページが表示可能になるまで、他の pending を全部キャンセルする」を続けている
-> (`current_loading` の分岐)。これはスケジューラが無かった頃に、現在ページへ CPU を
-> 独占させるために置かれたもので、**High 予約枠と同じ目的を二重に果たしている**。
-> 残したままだと、高速ページ送り中は先読みが毎フレーム取り消されて Normal レーンが
-> 事実上使われず、「取消と再投入を繰り返さない」という設計方針
-> ([archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) §3.4) にも反する。
-> 撤去の可否は S1 の再計測後に判断する。**どちらか一方に寄せるまで、この節の記述は
-> 実装の一部しか説明していない。**
+`update_prefetch_window` が止めるのは **KEEP 範囲外**と、**表示から外れた昇格**だけになった。
+かつては「現在ページがロード中なら他の pending を全部キャンセルする」規則があり、
+現在ページへ CPU を独占させる役目を負っていたが、その役目は High 予約枠が担う。
+**2026-09-04 に撤去した** — 取消済みでも実行枠は worker の実終了まで空かないので、毎フレーム
+巻き込みキャンセルすると予算全体が「もう要らないと分かっている仕事」で埋まる。実機計測では
+取消中が常時 5/6 枠を占め、6 枠すべてが取消中になった 16 回では表示中ページ自身が最大 201ms
+待たされていた。先読みの新規開始を現在ページの完了まで見送る点 (early return) は残している。
+
 
 ページ送りの unresolved rendition sequence 中も、worker の完成結果は同じ viewer context /
 `items_generation` の `fs_upload_backlog` に集約する。UI 側の admission は paint source に

@@ -34542,8 +34542,18 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// Loading the current page must not cancel prefetch that is still in range.
+    ///
+    /// This used to assert the opposite: while the current page was loading, every other
+    /// pending load was cancelled so the current one could have the CPU to itself. The
+    /// page-load scheduler now reserves permits for the displayed page, so that job is
+    /// done by admission rather than by mass cancellation. Keeping both was actively
+    /// harmful - a cancelled request holds its permit until the worker really exits, so
+    /// cancelling every frame filled the whole budget with work already known to be
+    /// unwanted (measured 2026-09-04: 5 of 6 permits held by cancelling workers, and the
+    /// displayed page itself waiting up to 201ms behind them).
     #[test]
-    fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
+    fn paged_prefetch_starts_current_and_keeps_in_range_siblings() {
         let mut app = setup_app();
         let current = push_image(&mut app, r"C:\missing\current.png");
         let sibling = push_image(&mut app, r"C:\missing\sibling.png");
@@ -34567,13 +34577,54 @@ mod pipeline_cache_refactor_tests {
 
         app.update_prefetch_window(current);
 
-        assert!(sibling_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !sibling_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "an in-range prefetch must keep running while the current page loads",
+        );
+        assert!(app.fs_pending.contains_key(&sibling));
         assert!(app.fs_pending.contains_key(&current));
         assert_eq!(
             app.fs_page_load_state(current),
             FsPageLoadState::LoadPending,
             "the paged twin must re-assert the current producer before returning",
         );
+    }
+
+    /// Out-of-range prefetch is still cancelled. Dropping the mass-cancel rule must not
+    /// turn the keep window into a leak.
+    #[test]
+    fn paged_prefetch_still_cancels_siblings_outside_the_keep_window() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\missing\current.png");
+        let mut far = current;
+        for n in 0..40 {
+            far = push_image(&mut app, &format!(r"C:\missingar{n}.png"));
+        }
+        let order: Vec<usize> = (0..=far).collect();
+        app.visible_indices = order.clone();
+        app.details_order = order;
+        app.fullscreen_idx = Some(current);
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let far_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            far,
+            FsPendingValue::new(
+                Arc::clone(&far_cancel),
+                rx,
+                input_seq,
+                FsLoadPurpose::Prefetch,
+            ),
+        );
+
+        app.update_prefetch_window(current);
+
+        assert!(
+            far_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "a prefetch outside the keep window must still be cancelled",
+        );
+        assert!(!app.fs_pending.contains_key(&far));
     }
 
     fn insert_animation_first_frame(

@@ -52126,12 +52126,16 @@ impl App {
 
         self.start_animation_promotion_if_needed(current_idx);
 
-        // 現在表示中の画像がまだ表示可能な状態へ到達していないなら、
-        // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
-        // 現在画像が完了したあと poll_prefetch から再度 update_prefetch_window が
-        // 呼ばれ、そこで先読みが開始される。これにより 1→2 遷移 (サムネ → フル解像度) が
-        // 先読みスレッドに待たされなくなる。retained PDF final-AI は raw fs_cache が無くても
-        // 表示可能なので、typed state では loading に分類しない。
+        // 現在ページがまだ表示可能でない間は、先読みの新規開始を見送る (下の early return)。
+        // retained PDF final-AI は raw fs_cache が無くても表示可能なので loading に含めない。
+        //
+        // **ここで他の pending を巻き込んでキャンセルしない。** かつては現在ページへ CPU を
+        // 独占させるため「ロード中なら全部キャンセル」していたが、その役目は
+        // `FsPageLoadScheduler` の High 予約枠が担う (docs/archive-page-load-scheduler-plan.md §3.3)。
+        // 取消済みでも worker が実際に終わるまで実行枠は空かないので、毎フレーム巻き込み
+        // キャンセルすると **予算全体が「もう要らないと分かっている仕事」で埋まる**。
+        // 2026-09-04 の実機計測では取消中が常時 5/6 枠を占め、6 枠すべてが取消中になった
+        // 16 回では表示中ページ自身が最大 201ms 待たされていた。
         let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
 
         let to_cancel: Vec<usize> = self
@@ -52141,11 +52145,9 @@ impl App {
                 if k == current_idx {
                     return None;
                 }
-                // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
-                // 昇格は表示中のページのぶんだけ生かす。ここを「current 以外は全部」に
+                // KEEP 範囲外と、表示から外れた昇格だけを止める。ここを「current 以外は全部」に
                 // すると、見開きの相方が開始と同時にキャンセルされ続ける (§1.157)。
-                (current_loading
-                    || !keep_set.contains(&k)
+                (!keep_set.contains(&k)
                     || (pending.purpose.promotion_started_at_for(k).is_some()
                         && !Self::page_is_displayed(k, current_idx, displayed_partner)))
                 .then_some(k)
