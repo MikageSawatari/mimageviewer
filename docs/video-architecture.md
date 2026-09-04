@@ -47,6 +47,10 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 
 ### Native presenter の表示解像度 scaling
 
+通常動画を V で拡大・パンするモードの source 部分矩形、入力所有、surface policy、shader の
+設計正本は [video-zoom-pan-plan.md](video-zoom-pan-plan.md)。このモードも native presenter の
+表示解像度 scaling を使い、倍率変更は swap chain resize ではなく draw 定数だけを更新する。
+
 `Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
 chain を DComp transform で拡大・縮小する。shader を使う 4 方式は映像表示矩形の物理 pixel 寸法で
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
