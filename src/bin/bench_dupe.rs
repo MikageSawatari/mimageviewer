@@ -248,7 +248,7 @@ fn usage() -> String {
     format!(
         "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE\n  \
          bench_dupe pairs --in FILE --out FILE [--max-pairs N] [--loose | BIN OPTIONS]\n  \
-         bench_dupe synth --dir DIR --out FILE [--limit N] \
+         bench_dupe synth --dir DIR --out FILE [--recursive] [--limit N] \
          [--large-diff-threshold-bin N]\n  \
          bench_dupe report --synth FILE [--pairs FILE] --out FILE\n\n\
          Pair BIN OPTIONS (the union of every supplied bin is emitted):\n  \
@@ -328,6 +328,22 @@ fn run_scan(args: &[String]) -> Result<()> {
         output.display()
     );
     Ok(())
+}
+
+/// Picks `limit` paths spread evenly across `paths` instead of the first `limit`.
+///
+/// Collection order is directory order, so a prefix of a recursive walk is every
+/// page of the first few works rather than a sample of the library, and a distance
+/// distribution measured from it would describe those works instead of the corpus.
+/// Selection is by integer stride, so one input always yields the same sample.
+fn stride_sample(paths: Vec<PathBuf>, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 || paths.len() <= limit {
+        return paths;
+    }
+    let total = paths.len();
+    (0..limit)
+        .map(|slot| paths[slot * total / limit].clone())
+        .collect()
 }
 
 fn collect_image_paths(dir: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
@@ -949,6 +965,7 @@ fn run_synth(args: &[String]) -> Result<()> {
     let mut dir = None;
     let mut output = None;
     let mut limit = None;
+    let mut recursive = false;
     let mut large_diff_threshold_bin = DEFAULT_LARGE_DIFF_THRESHOLD_BIN;
     let mut index = 0;
     while index < args.len() {
@@ -957,6 +974,7 @@ fn run_synth(args: &[String]) -> Result<()> {
             "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
             "--out" => output = Some(PathBuf::from(take_value(args, &mut index, flag)?)),
             "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            "--recursive" => recursive = true,
             "--large-diff-threshold-bin" => {
                 large_diff_threshold_bin = parse_u8(&take_value(args, &mut index, flag)?, flag)?
             }
@@ -966,9 +984,9 @@ fn run_synth(args: &[String]) -> Result<()> {
     }
     let dir = dir.ok_or_else(|| "synth requires --dir".to_owned())?;
     let output = output.ok_or_else(|| "synth requires --out".to_owned())?;
-    let mut paths = collect_image_paths(&dir, false)?;
+    let mut paths = collect_image_paths(&dir, recursive)?;
     if let Some(limit) = limit {
-        paths.truncate(limit);
+        paths = stride_sample(paths, limit);
     }
 
     let file =
