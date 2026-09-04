@@ -74,6 +74,143 @@ impl ExportFormat {
 mod composite_tests {
     use super::*;
 
+    fn perf_identity_edits() -> crate::books::BakedEditSnapshot {
+        crate::books::BakedEditSnapshot {
+            params: crate::adjustment::AdjustParams::default(),
+            rotation: crate::rotation_db::Rotation::None,
+            conceal: None,
+            erase: None,
+            local_adjust: None,
+            comic: None,
+            comic_source_dims: None,
+            export_crop: None,
+            crop_legacy_writeback: None,
+            format: crate::capture::CaptureFormat::Png,
+            jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::DisplayAdjust,
+            creative_lut: None,
+            ai: None,
+        }
+    }
+
+    #[test]
+    fn owned_identity_export_preserves_the_decoded_pixel_buffer() {
+        let page = ExportPageComposite {
+            source: crate::books::CompositeSource::File {
+                path: PathBuf::from("unused.png"),
+            },
+            edits: perf_identity_edits(),
+            pdf_render_long_edge: 4096,
+            predicted_size: [2, 1],
+            has_conceal_mask: false,
+        };
+        let image = egui::ColorImage::new([2, 1], vec![egui::Color32::RED, egui::Color32::BLUE]);
+        let decoded_pixels = image.pixels.as_ptr();
+        let decoded = DecodedExportComposite::Single(DecodedExportPage { page: &page, image });
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let rendered = render_export_composite_owned(decoded, None, None, &cancel).unwrap();
+
+        assert_eq!(rendered.pixels.as_ptr(), decoded_pixels);
+        assert_eq!(
+            rendered.pixels,
+            vec![egui::Color32::RED, egui::Color32::BLUE]
+        );
+    }
+
+    /// 15126x5795 の単枚 `_0` PNG を、実際の Ctrl+E と同じ主要段に分けて測る。
+    /// 大量メモリと時間を使うため通常テストからは外し、性能修正時に明示実行する。
+    #[test]
+    #[ignore = "90 MP Ctrl+E performance measurement"]
+    fn export_single_90mp_stage_timings() {
+        use image::ImageEncoder;
+        use std::time::Instant;
+
+        const WIDTH: usize = 15_126;
+        const HEIGHT: usize = 5_795;
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source-90mp.png");
+
+        // 圧縮が極端に軽い単色にはせず、規則的な色変化で 90 MP の通常 PNG を作る。
+        // source 作成時間は測定区間に含めない。
+        let mut source_rgba = vec![0_u8; WIDTH * HEIGHT * 4];
+        for (index, pixel) in source_rgba.chunks_exact_mut(4).enumerate() {
+            let x = index % WIDTH;
+            let y = index / WIDTH;
+            pixel.copy_from_slice(&[
+                ((x / 17 + y / 31) & 0xff) as u8,
+                ((x / 47 + y / 13) & 0xff) as u8,
+                ((x / 7 + y / 61) & 0xff) as u8,
+                255,
+            ]);
+        }
+        let source_file = std::fs::File::create(&source_path).unwrap();
+        image::codecs::png::PngEncoder::new(source_file)
+            .write_image(
+                &source_rgba,
+                WIDTH as u32,
+                HEIGHT as u32,
+                image::ColorType::Rgba8.into(),
+            )
+            .unwrap();
+        drop(source_rgba);
+
+        let composite = ExportComposite::Single(ExportPageComposite {
+            source: crate::books::CompositeSource::File { path: source_path },
+            edits: perf_identity_edits(),
+            pdf_render_long_edge: 4096,
+            predicted_size: [WIDTH, HEIGHT],
+            has_conceal_mask: false,
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let started = Instant::now();
+        let decoded = decode_export_composite(&composite, &cancel).unwrap();
+        let decode = started.elapsed();
+
+        let started = Instant::now();
+        let composed = render_export_composite_owned(decoded, None, None, &cancel).unwrap();
+        let compose = started.elapsed();
+
+        let started = Instant::now();
+        let scaled = scale_export_pixels(Cow::Owned(composed), ExportScale::Full)
+            .unwrap()
+            .into_owned();
+        let scale = started.elapsed();
+
+        let started = Instant::now();
+        let rgba = crate::capture::color_image_to_rgba(&scaled);
+        let rgba_conversion = started.elapsed();
+
+        let started = Instant::now();
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(
+                &rgba,
+                WIDTH as u32,
+                HEIGHT as u32,
+                image::ColorType::Rgba8.into(),
+            )
+            .unwrap();
+        let encode = started.elapsed();
+
+        let millis = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        println!(
+            "ctrl_e_90mp width={WIDTH} height={HEIGHT} pixels={} decode_ms={:.3} \
+             compose_ms={:.3} scale_ms={:.3} rgba_ms={:.3} encode_ms={:.3} total_ms={:.3} \
+             encoded_bytes={}",
+            WIDTH * HEIGHT,
+            millis(decode),
+            millis(compose),
+            millis(scale),
+            millis(rgba_conversion),
+            millis(encode),
+            millis(decode + compose + scale + rgba_conversion + encode),
+            encoded.len(),
+        );
+        assert_eq!(scaled.size, [WIDTH, HEIGHT]);
+    }
+
     #[test]
     fn sns_entry_plan_keeps_authoring_coordinates_for_the_worker() {
         let frames = vec![
@@ -657,7 +794,9 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         }
     };
 
-    for entry in request.entries {
+    let entry_count = request.entries.len();
+    let mut decoded = Some(decoded);
+    for (entry_index, entry) in request.entries.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(ExportEvent::Cancelled);
             return;
@@ -671,12 +810,29 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             entry.suffix,
             extension,
         );
-        let pixels = match render_export_composite(
-            &decoded,
-            entry.conceal_preset.as_ref(),
-            entry.crop_override,
-            &cancel,
-        ) {
+        // 複数バリエーションでは前の entry のために decode 結果を残す必要があるが、
+        // 最後（通常は `_0` だけの最初の 1 件）は所有権をそのまま compositor へ渡せる。
+        // 90 MP 級で約 350 MB になる ColorImage の無条件 clone を通常経路から外す。
+        let render_result = if entry_index + 1 == entry_count {
+            render_export_composite_owned(
+                decoded
+                    .take()
+                    .expect("decoded composite must remain until the final export entry"),
+                entry.conceal_preset.as_ref(),
+                entry.crop_override,
+                &cancel,
+            )
+        } else {
+            render_export_composite(
+                decoded
+                    .as_ref()
+                    .expect("decoded composite must remain before the final export entry"),
+                entry.conceal_preset.as_ref(),
+                entry.crop_override,
+                &cancel,
+            )
+        };
+        let pixels = match render_result {
             Ok(pixels) => pixels,
             // プリセット再合成は AI 推論を含み分単位になりうるので、合成の途中で
             // cancel が立ったら失敗ではなくキャンセルとして畳む。
@@ -823,13 +979,41 @@ fn render_export_composite(
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, ExportRenderError> {
     match decoded {
+        DecodedExportComposite::Single(decoded) => render_export_page(
+            decoded.page,
+            decoded.image.clone(),
+            preset,
+            crop_override,
+            cancel,
+        ),
+        DecodedExportComposite::Spread { left, right } => {
+            let left =
+                render_export_page(left.page, left.image.clone(), preset, crop_override, cancel)?;
+            let right = render_export_page(
+                right.page,
+                right.image.clone(),
+                preset,
+                crop_override,
+                cancel,
+            )?;
+            Ok(crate::capture::combine_spread_color_images(&left, &right)?)
+        }
+    }
+}
+
+fn render_export_composite_owned(
+    decoded: DecodedExportComposite<'_>,
+    preset: Option<&ConcealPreset>,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, ExportRenderError> {
+    match decoded {
         DecodedExportComposite::Single(decoded) => {
-            render_export_page(decoded.page, &decoded.image, preset, crop_override, cancel)
+            render_export_page(decoded.page, decoded.image, preset, crop_override, cancel)
         }
         DecodedExportComposite::Spread { left, right } => {
-            let left = render_export_page(left.page, &left.image, preset, crop_override, cancel)?;
-            let right =
-                render_export_page(right.page, &right.image, preset, crop_override, cancel)?;
+            let left = render_export_page(left.page, left.image, preset, crop_override, cancel)?;
+            let right = render_export_page(right.page, right.image, preset, crop_override, cancel)?;
             Ok(crate::capture::combine_spread_color_images(&left, &right)?)
         }
     }
@@ -837,13 +1021,13 @@ fn render_export_composite(
 
 fn render_export_page(
     page: &ExportPageComposite,
-    decoded: &egui::ColorImage,
+    decoded: egui::ColorImage,
     preset: Option<&ConcealPreset>,
     crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, ExportRenderError> {
     crate::books::compose_export_entry(
-        decoded.clone(),
+        decoded,
         &page.edits,
         preset,
         crop_override,

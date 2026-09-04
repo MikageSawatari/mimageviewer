@@ -2231,6 +2231,19 @@ CPU の submit は 0.9ms しかないので「GPU 実行が重い」と考えた
 
 **推測で直しにいかない。** この 1 件だけで既に 3 回外している。
 
+### 1.184 同じフォルダーへファイルが増えるとフルスクリーン閲覧が閉じる
+
+- 症状: フルスクリーンで読んでいる最中に、現在のフォルダーへ別のファイルが増えると、
+  閲覧が閉じて一覧へ戻る。
+- 経路: `current_folder_watch` の変更検知から `check_external_folder_changes` →
+  `apply_external_rescan` → `load_folder_with_scan` → `start_loading_items_inner` →
+  `close_fullscreen` へ進む。
+- 食い違い: Ctrl+E 完了後の `consume_export_folder_refresh_pending` は、`load_folder` が
+  閲覧を閉じることを理由にフルスクリーン中の再読み込みを先送りしている。一方、監視由来の
+  再走査には同じ guard がなく、この先送り機構を迂回している。
+- v3.5.0 以前からある不具合。監視停止や debounce 延長ではなく、フルスクリーン中の外部変更を
+  いつ・どの所有文脈へ適用するかを整理して直す。**未着手。**
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断

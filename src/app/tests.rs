@@ -15379,6 +15379,26 @@ mod favorite_adjustment_defaults_tests {
         app.items.len() - 1
     }
 
+    fn insert_export_static_source(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        size: [usize; 2],
+        label: &str,
+    ) {
+        let pixels = egui::ColorImage::filled(size, egui::Color32::WHITE);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+
     fn mask_2x2() -> Vec<bool> {
         vec![true, false, false, true]
     }
@@ -25524,6 +25544,290 @@ mod favorite_adjustment_defaults_tests {
                 panic!("right-page entry should still prepare the visible spread")
             }
         }
+    }
+
+    #[test]
+    fn export_dialog_plans_current_and_all_four_conceal_presets_from_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("conceal-presets.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        insert_export_static_source(&mut app, &ctx, idx, [4, 4], "export_conceal_presets");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let mut bitmap = vec![false; 16];
+        bitmap[5] = true;
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &bitmap, &[], 4, 4)
+            .expect("save conceal mask");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+        app.settings.conceal_presets = std::array::from_fn(|slot| {
+            Some(crate::conceal::ConcealPreset {
+                name: format!("preset {}", slot + 1),
+                ..Default::default()
+            })
+        });
+        app.settings.export_batch_selection = [true; 5];
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(state.has_conceal_mask);
+        match &state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+        assert_eq!(state.selection, [true; 5]);
+        let entries = crate::export_dialog::plan_export_entries(
+            &state.sns_split_frames,
+            state.sns_split_source_size,
+            &state.selection,
+            state.has_conceal_mask,
+            &app.settings.conceal_presets,
+        )
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn export_dialog_ignores_shapes_that_cover_no_pixel_after_mask_resize() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("outside-conceal-shape.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        // 保存時 4x4 の図形を 8x8 の source へ拡大しても、画像外のままで 1 px も塗られない。
+        insert_export_static_source(&mut app, &ctx, idx, [8, 8], "export_empty_conceal_shape");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let shape = crate::mask_db::Shape::Rect {
+            op: crate::mask_db::ShapeOp::Add,
+            center: (100.0, 100.0),
+            half_w: 1.0,
+            half_h: 1.0,
+            rotation_rad: 0.0,
+        };
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &[false; 16], &[shape], 4, 4)
+            .expect("save conceal shape");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(!state.has_conceal_mask);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(!page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+    }
+
+    #[test]
+    fn close_fullscreen_keeps_running_export_and_closes_prestart_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("export-source.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([40, 80, 120, 255]))
+            .save(&source)
+            .expect("write export source");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        insert_export_static_source(&mut app, &ctx, idx, [2, 1], "running_export_source");
+        app.open_export_dialog_for_current(&ctx, idx);
+        assert!(
+            app.export_dialog.is_some(),
+            "pre-start dialog should be open"
+        );
+
+        // 2 件目の合成を止め、worker が _0 を保存した後に fullscreen teardown が
+        // 割り込む状況を決定的に作る。worker が所有する source / snapshot だけで
+        // 残り 4 件まで継続できることを App の close 経路と一緒に固定する。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = std::sync::Arc::clone(&calls);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut edits = crate::books::BakedEditSnapshot {
+            params: crate::adjustment::AdjustParams::default(),
+            rotation: crate::rotation_db::Rotation::None,
+            conceal: None,
+            erase: None,
+            local_adjust: None,
+            comic: None,
+            comic_source_dims: None,
+            export_crop: None,
+            crop_legacy_writeback: None,
+            format: crate::capture::CaptureFormat::Png,
+            jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::Ai,
+            creative_lut: None,
+            ai: None,
+        };
+        edits.params.upscale_model = Some("test-upscale".to_string());
+        edits.ai = Some(crate::books::BookAiSnapshot {
+            run: Box::new(move |image, _| {
+                if worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    entered_tx.send(()).expect("signal second entry");
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .expect("release second entry");
+                }
+                Ok(crate::books::BookAiResult {
+                    image: image.clone(),
+                    used_upscale: false,
+                })
+            }),
+        });
+        let entries = (0..5)
+            .map(|suffix| crate::export_dialog::ExportEntry {
+                label: format!("preset {suffix}"),
+                suffix,
+                conceal_preset: None,
+                crop_override: None,
+            })
+            .collect();
+        let pending =
+            crate::export_dialog::spawn_export_worker(crate::export_dialog::ExportRequest {
+                source: crate::export_dialog::ExportSource::File {
+                    path: source.clone(),
+                },
+                original_format: crate::save_with_metadata::SrcFormat::Png,
+                output_format: crate::export_dialog::ExportFormat::Png,
+                output_dir: app.tmp.path().to_path_buf(),
+                basename: "continued-export".to_string(),
+                composite: crate::export_dialog::ExportComposite::Single(
+                    crate::export_dialog::ExportPageComposite {
+                        source: crate::books::CompositeSource::File {
+                            path: source.clone(),
+                        },
+                        edits,
+                        pdf_render_long_edge: 4096,
+                        predicted_size: [2, 1],
+                        has_conceal_mask: false,
+                    },
+                ),
+                scale: crate::export_dialog::ExportScale::Full,
+                entries,
+                include_metadata: false,
+                local_ai_activity: None,
+            })
+            .expect("start export worker");
+        let cancel = std::sync::Arc::clone(&pending.cancel);
+        app.export_pending = Some(pending);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("worker should reach second entry after saving _0");
+        assert!(app.tmp.path().join("continued-export_0.png").exists());
+
+        app.close_fullscreen();
+
+        assert!(app.export_dialog.is_none(), "pre-start dialog must close");
+        assert!(
+            app.export_pending.is_some(),
+            "running export must remain owned"
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            app.main_window_should_draw_export_dialogs(),
+            "the main window must take over progress and cancel controls"
+        );
+        release_tx.send(()).expect("resume export worker");
+
+        let mut completed = 0;
+        loop {
+            let event = app
+                .export_pending
+                .as_ref()
+                .expect("running export should remain")
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("worker event");
+            match event {
+                crate::export_dialog::ExportEvent::Completed(_) => completed += 1,
+                crate::export_dialog::ExportEvent::Cancelled => {
+                    panic!("fullscreen teardown must not cancel the export")
+                }
+                crate::export_dialog::ExportEvent::AllDone => break,
+                crate::export_dialog::ExportEvent::Started { .. }
+                | crate::export_dialog::ExportEvent::Failed(_) => {}
+            }
+        }
+        assert_eq!(completed, 5);
+        for suffix in 0..5 {
+            assert!(
+                app.tmp
+                    .path()
+                    .join(format!("continued-export_{suffix}.png"))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_export_refresh_is_consumed_after_returning_to_grid() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("images");
+        std::fs::create_dir_all(&folder).expect("create image folder");
+        app.settings.book_root = Some(app.tmp.path().join("books"));
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        let output = folder.join("finished_0.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&output)
+            .expect("write completed export");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.export_pending = Some(crate::export_dialog::ExportPending {
+            cancel,
+            rx,
+            total: 1,
+            done: 0,
+            last_message: "準備中".to_string(),
+            successes: Vec::new(),
+            errors: Vec::new(),
+            finished: false,
+            cancel_requested: false,
+        });
+        tx.send(crate::export_dialog::ExportEvent::Completed(
+            crate::export_dialog::ExportSuccess {
+                label: "current".to_string(),
+                path: output.clone(),
+            },
+        ))
+        .unwrap();
+        tx.send(crate::export_dialog::ExportEvent::AllDone).unwrap();
+
+        app.poll_export_pending(&ctx);
+
+        assert_eq!(app.export_folder_refresh_pending.as_ref(), Some(&folder));
+        app.consume_export_folder_refresh_pending();
+        assert!(app.export_folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(|item| {
+            matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
+        }));
     }
 
     /// GitHub issue #1 (app 配線): native は AI 範囲内なのに 4096px レンダで現行が native

@@ -1362,7 +1362,30 @@ pub(crate) fn compose_export_entry(
     crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
     cancel: Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, String> {
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
+    if !export_entry_requires_composite(edits, conceal_preset, crop_override) {
+        return Ok(image);
+    }
     Ok(compose_book_page_with_cancel(image, edits, conceal_preset, crop_override, cancel)?.image)
+}
+
+fn export_entry_requires_composite(
+    edits: &BakedEditSnapshot,
+    conceal_preset: Option<&crate::conceal::ConcealPreset>,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
+) -> bool {
+    conceal_preset.is_some()
+        || crop_override.is_some()
+        || page_requires_full_composite(
+            &edits.params,
+            edits.rotation,
+            edits.conceal.is_some(),
+            edits.erase.is_some(),
+            edits.local_adjust.is_some(),
+            edits.comic.is_some(),
+            edits.export_crop.is_some(),
+            edits.stage,
+        )
 }
 
 /// 表示用補正の段。
@@ -2499,6 +2522,53 @@ mod tests {
             predicted_export_entry_size([4, 1], &edits, Some((entry_crop, [4, 1]))).unwrap(),
             [1, 1]
         );
+    }
+
+    #[test]
+    fn identity_export_bypass_matches_forced_composition() {
+        let source = egui::ColorImage::new(
+            [3, 2],
+            vec![
+                egui::Color32::from_rgb(1, 2, 3),
+                egui::Color32::from_rgb(40, 50, 60),
+                egui::Color32::from_rgb(70, 80, 90),
+                egui::Color32::from_rgb(100, 110, 120),
+                egui::Color32::from_rgb(130, 140, 150),
+                egui::Color32::from_rgb(250, 240, 230),
+            ],
+        );
+        let mut edits = empty_baked_edits();
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+        assert!(!export_entry_requires_composite(&edits, None, None));
+
+        let bypass_source = source.clone();
+        let source_pixels = bypass_source.pixels.as_ptr();
+        let bypassed = compose_export_entry(
+            bypass_source,
+            &edits,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            bypassed.pixels.as_ptr(),
+            source_pixels,
+            "identity entry must move the decoded pixels without allocating a replacement"
+        );
+
+        let preset = crate::conceal::ConcealPreset::default();
+        assert!(export_entry_requires_composite(&edits, Some(&preset), None));
+        let composed = compose_export_entry(
+            source,
+            &edits,
+            Some(&preset),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(bypassed, composed);
     }
 
     #[test]

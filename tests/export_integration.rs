@@ -218,6 +218,9 @@ fn failed(events: &[ExportEvent]) -> usize {
 
 fn staged_edits(stage: BakeStage) -> BakedEditSnapshot {
     let mut edits = edits(stage);
+    // App は AI を要求する params のときだけ runner を snapshot へ載せる。
+    // `page_requires_full_composite` と同じ実運用の不変条件で段の切り替えを検証する。
+    edits.params.upscale_model = Some("test-upscale".to_string());
     edits.params.post_filter = mimageviewer::adjustment::PostFilter::Sepia;
     edits.ai = Some(BookAiSnapshot {
         run: Box::new(|image, _| {

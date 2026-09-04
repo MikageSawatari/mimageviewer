@@ -18243,6 +18243,16 @@ impl App {
                 GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
                 _ => None,
             });
+        if self
+            .export_pending
+            .as_ref()
+            .is_some_and(|pending| !pending.finished)
+        {
+            crate::logger::log(format!(
+                "external_rescan: reloading current folder while Ctrl+E export continues ({})",
+                folder.display()
+            ));
+        }
         crate::logger::log(format!(
             "auto-refresh: folder content changed ({}), reloading",
             folder.display()
@@ -52727,17 +52737,11 @@ impl App {
         if cf_was_open && self.items_are_bookmark_view {
             self.refresh_bookmark_browser();
         }
-        // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
-        // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
-        // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
-        // 完了まで残るが、後続エントリは drop される)。
+        // 開始前の Ctrl+E ダイアログは表示中ページの文脈に属するので閉じる。
+        // 開始済みの worker は source と編集 snapshot を完全に所有しており、viewer を
+        // 閉じても継続できる。進捗とキャンセル操作も一覧側のダイアログへ引き継がれるため、
+        // `export_pending` と cancel フラグには触れない。
         self.export_dialog = None;
-        if let Some(pending) = self.export_pending.as_ref() {
-            pending
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.export_pending = None;
         // **`export_folder_refresh_pending` は触らない**: これは「一覧に戻ったら
         // サムネ更新」の dirty フラグ (commit 1cdf9c53 で導入) で、`consume_*` が
         // 同フレ末で取り出す前提。close_fullscreen 内で None に戻すと取り出す前に
