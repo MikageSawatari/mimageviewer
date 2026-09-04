@@ -2141,7 +2141,16 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 - 出典: 利用者報告 (2026-09-04)「見開きだとまだちょっと遅い感じがします」
   「見開きでカーソルキー押しっぱなしでページを捲ると、ときどき少しの間だけひっかかる」。
-- **未着手。**
+- **実装済み (2026-09-04)。** `SpreadDisplayUnitsCache` を viewer context ごとに持ち、組んだ
+  `Vec<SpreadDisplayUnit>` を再利用する。token は `items_generation`、`spread_mode`、
+  `spread_shift_anchor_idx`、`landscape_epoch` に加え、同じ世代内の絞り込み・並べ替え・
+  連結読み切替も区別するため **nav index 列そのもの**を保持して比較する。
+- 未知寸法は従来どおり縦長扱いであるため、未知→縦長では epoch を進めない。cached nav 上の
+  未知 / 縦長→横長、または回転・訂正寸法による横長性の反転だけを同じ frame 内で失効させる。
+  `fs_cache` 完了挿入、thumbnail `Loaded` の source / layout 寸法記録、live / retained 寸法回収、
+  保存回転の変更・一括差し替え・reset・外部更新後の再読込をこの境界へ通す。
+- `poll_prefetch` はループ前に `(current, partner)` を 1 回だけ解き、完了 / 切断の両ループでは
+  共通の `page_is_displayed` だけを使う。ペアリング規則自体は変更していない。
 
 #### 何が起きているか
 

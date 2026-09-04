@@ -753,7 +753,7 @@ impl App {
         // 「★バッジが全部消える」「★一時解除中が発動しない」原因になる)。
         // 既存の load_folder 経路 (= self.start_loading_items) と同様に invalidate する。
         self.rating_cache.clear();
-        self.rotation_cache.clear();
+        self.clear_rotation_cache_for_reload();
         self.clear_tags_cache();
         self.mark_color_filter_scope_dirty();
 

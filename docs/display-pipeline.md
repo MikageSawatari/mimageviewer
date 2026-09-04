@@ -1492,6 +1492,19 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 横長ページの次の縦長ページから通常の見開きペアリングを再開する。
 2 ページのペア化対象は `GridItem::Image` / `ZipImage` / `PdfPage` だけである。
 `Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
+
+組んだ `Vec<SpreadDisplayUnit>` は viewer context ごとの `SpreadDisplayUnitsCache` で再利用する。
+token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`landscape_epoch` と、
+**nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
+ページ読みと連結読みの列切替を混同しない。
+
+未知寸法は従来どおり縦長と同じ `false` に分類する。`fs_cache`、thumbnail の source / layout 寸法、
+`page_dims_cache` への記録で cached nav 上の実効的な横長性が反転した場合だけ
+`landscape_epoch` を進める。したがって未知→縦長では再構築せず、未知 / 縦長→横長では
+同じ frame の後続参照から再構築する。訂正寸法や保存回転により横長→縦長となる場合も反転として
+失効する。回転 cache の一括破棄 / 部分破棄は、次の参照で対象 nav の回転を一括再取得してから
+同じ分類を照合する。cache と epoch は main / detached 間で共有しない。
+
 前後移動も同じ表示ユニット列を使い、`FsPageNav::Target(index)` または
 `FsPageNav::Boundary` として解決する。見開き末尾から次へ進む入力を raw page delta に戻さないため、
 内部 index が同じ見開きの片側へ移ることはなく、最初の入力で末尾ヒントを表示する。キー、ホイール、

@@ -27,6 +27,7 @@ impl crate::app::App {
                         if let Some(ref db) = self.rotation_db {
                             let deleted = db.clear_all().unwrap_or(0);
                             self.rotation_cache.clear();
+                            self.reconcile_spread_landscapes_from_rotation_cache();
                             crate::logger::log(format!(
                                 "[rotation] Reset: {deleted} entries cleared"
                             ));
