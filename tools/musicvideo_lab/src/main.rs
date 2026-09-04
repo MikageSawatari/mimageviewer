@@ -67,6 +67,13 @@ fn main() {
         }
         return;
     }
+    if command.as_deref() == Some("--stationary-note-response") {
+        if let Err(error) = export::run_stationary_note_response() {
+            eprintln!("定常正弦波応答の測定に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(error) = run_gui() {
         eprintln!("musicvideo_lab を起動できません: {error}");

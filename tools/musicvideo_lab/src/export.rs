@@ -26,6 +26,8 @@ const DISTRIBUTION_DURATION_SECS: f64 = 18.0;
 const DISTRIBUTION_FPS: f64 = 60.0;
 const DISTRIBUTION_SIGNAL_AMPLITUDE: f64 = 0.0035;
 const DISTRIBUTION_GAINS_DB: [f32; 3] = [0.0, 6.0, 12.0];
+const STATIONARY_TONE_DURATION_SECS: f64 = 2.0;
+const STATIONARY_TONE_CENTER_SECS: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimingStats {
@@ -465,6 +467,10 @@ struct KeyboardDistribution {
     keyboard_peaks: Vec<Vec<f32>>,
 }
 
+struct StationaryNoteResponse {
+    values: Vec<f32>,
+}
+
 pub fn run_keyboard_distribution() -> Result<(), String> {
     let distribution = measure_keyboard_distribution(DISTRIBUTION_DURATION_SECS, DISTRIBUTION_FPS)?;
     println!(
@@ -499,6 +505,97 @@ pub fn run_keyboard_distribution() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+pub fn run_stationary_note_response() -> Result<(), String> {
+    let response = measure_stationary_note_response(
+        STATIONARY_TONE_DURATION_SECS,
+        STATIONARY_TONE_CENTER_SECS,
+        DISTRIBUTION_SIGNAL_AMPLITUDE,
+    )?;
+    println!(
+        "stationary note response: signal=independent_constant_amplitude_sine sample_rate={} tone_duration_secs={:.1} center_secs={:.1} amplitude={:.4} longest_window_secs={:.6} metric=target_note_display_value",
+        BENCHMARK_SAMPLE_RATE,
+        STATIONARY_TONE_DURATION_SECS,
+        STATIONARY_TONE_CENTER_SECS,
+        DISTRIBUTION_SIGNAL_AMPLITUDE,
+        32_768.0 / BENCHMARK_SAMPLE_RATE as f64,
+    );
+    for (offset, value) in response.values.iter().enumerate() {
+        let midi = SPECTRUM_NOTE_MIN_MIDI + offset as u8;
+        println!(
+            "stationary note midi={midi} note={} hz={:.3} value={value:.6}",
+            midi_note_label(midi),
+            midi_frequency(midi),
+        );
+    }
+    for (label, first_midi, last_midi) in keyboard_distribution_ranges() {
+        let stats = summarize_note_range(&response.values, first_midi, last_midi);
+        println!(
+            "stationary range={label} midi={first_midi}-{last_midi} notes={} mean={:.6} min={:.6} max={:.6}",
+            stats.count, stats.mean, stats.min, stats.max,
+        );
+    }
+    Ok(())
+}
+
+fn measure_stationary_note_response(
+    tone_duration_secs: f64,
+    center_secs: f64,
+    amplitude: f64,
+) -> Result<StationaryNoteResponse, String> {
+    let longest_window_secs = 32_768.0 / BENCHMARK_SAMPLE_RATE as f64;
+    let half_window_secs = longest_window_secs * 0.5;
+    if !tone_duration_secs.is_finite() || tone_duration_secs < 1.0 {
+        return Err("定常正弦波は 1 秒以上にしてください".to_owned());
+    }
+    if !center_secs.is_finite()
+        || center_secs < half_window_secs
+        || center_secs + half_window_secs > tone_duration_secs
+    {
+        return Err("測定位置の前後に最長 FFT 窓の半分以上の余裕が必要です".to_owned());
+    }
+    if !amplitude.is_finite() || !(0.0..=1.0).contains(&amplitude) {
+        return Err("正弦波の振幅は 0 以上 1 以下の有限値にしてください".to_owned());
+    }
+
+    let mut analyzer = SpectrumAnalyzer::new(musicvideo_core::DEFAULT_SPECTRUM_BANDS);
+    let mut values = Vec::with_capacity(KEYBOARD_NOTE_COUNT);
+    for midi in SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI {
+        let pcm = synthetic_stationary_sine_pcm(midi, tone_duration_secs, amplitude);
+        let analysis = analyzer.analyze_moving_window(&pcm, BENCHMARK_SAMPLE_RATE, center_secs);
+        let index = usize::from(midi - analysis.note_min_midi);
+        values.push(analysis.notes.get(index).copied().unwrap_or(0.0));
+    }
+    Ok(StationaryNoteResponse { values })
+}
+
+fn synthetic_stationary_sine_pcm(midi: u8, duration_secs: f64, amplitude: f64) -> Vec<f32> {
+    let sample_frames = (duration_secs * BENCHMARK_SAMPLE_RATE as f64).ceil() as usize;
+    let frequency = midi_frequency(midi);
+    let mut pcm = Vec::with_capacity(sample_frames * 2);
+    for sample in 0..sample_frames {
+        let phase =
+            std::f64::consts::TAU * frequency * sample as f64 / BENCHMARK_SAMPLE_RATE as f64;
+        let value = (phase.sin() * amplitude) as f32;
+        pcm.extend_from_slice(&[value, value]);
+    }
+    pcm
+}
+
+fn midi_frequency(midi: u8) -> f64 {
+    440.0 * 2.0_f64.powf((midi as f64 - 69.0) / 12.0)
+}
+
+fn midi_note_label(midi: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!(
+        "{}{}",
+        NAMES[usize::from(midi % 12)],
+        i16::from(midi) / 12 - 1
+    )
 }
 
 fn measure_keyboard_distribution(
@@ -653,5 +750,21 @@ mod tests {
         assert!(high_without_gain.max > 0.05);
         assert!(high_with_gain.mean > high_without_gain.mean);
         assert!(high_with_gain.lit >= high_without_gain.lit);
+    }
+
+    #[test]
+    fn stationary_note_response_uses_fully_filled_windows_and_covers_the_keyboard() {
+        let response = measure_stationary_note_response(1.2, 0.6, 0.0035).unwrap();
+        let c4 = summarize_note_range(&response.values, 60, 71);
+        let c5 = summarize_note_range(&response.values, 72, 83);
+        let c6 = summarize_note_range(&response.values, 84, 95);
+        assert_eq!(response.values.len(), KEYBOARD_NOTE_COUNT);
+        assert!(response.values.iter().all(|value| value.is_finite()));
+        assert!(response.values.iter().all(|value| *value > 0.01));
+        assert!(c5.mean >= c4.mean * 0.9, "C5-B5 should not dip below C4-B4");
+        assert!(
+            c5.mean >= c6.mean * 0.85,
+            "C5-B5 should not dip below C6-B6"
+        );
     }
 }
