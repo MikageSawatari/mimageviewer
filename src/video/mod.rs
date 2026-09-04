@@ -76,6 +76,7 @@ pub mod tile_thumbnails;
 pub mod upscale;
 #[allow(dead_code)]
 pub(crate) mod window_host_contract;
+pub mod zoom_view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
