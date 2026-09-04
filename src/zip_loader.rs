@@ -65,6 +65,19 @@ fn interrupted_error() -> std::io::Error {
     )
 }
 
+/// 取消を `Read` / `Seek` の実装から返すときの error。
+///
+/// **`ErrorKind::Interrupted` を使ってはならない。** `Read::read` の契約では
+/// `Interrupted` は「中断した」ではなく **「やり直してよい」** を意味し、
+/// `std::io::default_read_to_end` は `is_interrupted()` を見て `continue` する。
+/// 実際にこれで 6 本すべての worker が `read_to_end` の中で永久にリトライし続け、
+/// 実行枠を返さないまま CPU を焼いた (2026-09-04 の実機ハング、cdb で全スレッドの
+/// スタックを採取して確定)。関数の戻り値としての `interrupted_error` は、
+/// リトライループに載らないのでこれまでどおり使ってよい。
+fn cancelled_read_error() -> std::io::Error {
+    std::io::Error::other("ZIP source read was cancelled")
+}
+
 fn zip_error_to_io(error: impl ToString, cancel: Option<&AtomicBool>) -> std::io::Error {
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         interrupted_error()
@@ -106,13 +119,14 @@ impl PositionedFileReader {
         )
     }
 
+    /// `Read` / `Seek` から返るので `cancelled_read_error` を使う (retry 契約を踏まない)。
     fn check_cancel(&self) -> std::io::Result<()> {
         if self
             .cancel
             .as_ref()
             .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
         {
-            Err(interrupted_error())
+            Err(cancelled_read_error())
         } else {
             Ok(())
         }
@@ -187,9 +201,10 @@ impl<R> CancellableReader<R> {
         Self { inner, cancel }
     }
 
+    /// `Read` / `Seek` から返るので `cancelled_read_error` を使う (retry 契約を踏まない)。
     fn check_cancel(&self) -> std::io::Result<()> {
         if is_cancelled(self.cancel.as_ref()) {
-            Err(interrupted_error())
+            Err(cancelled_read_error())
         } else {
             Ok(())
         }
@@ -1583,8 +1598,14 @@ mod tests {
         read_by_name(&mut archive, entry_name, None, cancel.map(Arc::as_ref))
     }
 
+    /// A cancelled read must not report `Interrupted`.
+    ///
+    /// `Read::read` defines `Interrupted` as "nothing was read, try again", so returning it
+    /// for cancellation tells every std adapter to retry forever. This test used to assert
+    /// the opposite and so pinned the defect in place: on 2026-09-04 all six permits ended
+    /// up spinning inside `read_to_end`, never returning and never releasing their slot.
     #[test]
-    fn positioned_reader_returns_interrupted_from_read_and_seek() {
+    fn cancelled_reader_error_is_not_the_retry_signal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reader.bin");
         std::fs::write(&path, b"abcdef").unwrap();
@@ -1593,13 +1614,75 @@ mod tests {
             PositionedFileReader::new(Arc::new(File::open(path).unwrap()), Some(cancel));
 
         let mut byte = [0_u8; 1];
+        let read_error = reader.read(&mut byte).unwrap_err();
+        assert_ne!(read_error.kind(), std::io::ErrorKind::Interrupted);
+        let seek_error = reader.seek(SeekFrom::Start(0)).unwrap_err();
+        assert_ne!(seek_error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    /// Drive the real consumer, not just `read` on its own.
+    ///
+    /// The reader is only ever used through the zip crate, which reads entries with
+    /// `read_to_end`. Testing `read` directly cannot see a retry loop, which is why the
+    /// hang reached a real machine. A regression fails this by timing out rather than
+    /// hanging the suite.
+    #[test]
+    fn a_cancelled_read_to_end_returns_instead_of_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader.bin");
+        std::fs::write(&path, vec![7_u8; 64 * 1024]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let (mut reader, _) =
+            PositionedFileReader::new(Arc::new(File::open(path).unwrap()), Some(cancel));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = tx.send(reader.read_to_end(&mut sink).is_err());
+        });
+        let errored = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a cancelled read_to_end must return rather than retry forever");
+        assert!(errored, "the cancelled read must surface as an error");
+    }
+
+    /// Cancelling after the archive is open stops the read and leaves the archive intact.
+    ///
+    /// This covers the classification, not the retry loop: the cancelled seek inside
+    /// `by_index` fails before `read_to_end` is reached, so this test passes either way.
+    /// The retry loop is covered by `a_cancelled_read_to_end_returns_instead_of_retrying`
+    /// and `cancelled_reader_error_is_not_the_retry_signal`, both of which fail if the
+    /// cancellation error goes back to `Interrupted`.
+    #[test]
+    fn cancelling_during_an_entry_read_stops_and_is_not_reported_as_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midread.zip");
+        write_test_zip(&path, &[("page.jpg", &vec![9_u8; 4 * 1024 * 1024])]);
+        let cache = ArchiveDirectoryCache::new(2);
+        // Warm the directory so the cancellation lands in the entry read, not the parse.
+        read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut archive = cache.open_archive(&path, Some(&cancel)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let result = read_by_name(&mut archive, "page.jpg", None, Some(flag.as_ref()));
+            let _ = tx.send(result.is_err());
+        });
+        let errored = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a mid-read cancellation must return rather than retry forever");
+        assert!(errored);
+
+        // The archive is intact: with no cancellation the same entry still reads.
         assert_eq!(
-            reader.read(&mut byte).unwrap_err().kind(),
-            std::io::ErrorKind::Interrupted
-        );
-        assert_eq!(
-            reader.seek(SeekFrom::Start(0)).unwrap_err().kind(),
-            std::io::ErrorKind::Interrupted
+            read_with_directory_cache(&cache, &path, "page.jpg", None)
+                .unwrap()
+                .len(),
+            4 * 1024 * 1024
         );
     }
 
