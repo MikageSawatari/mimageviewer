@@ -23,8 +23,9 @@ pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};
 pub use keyboard::{
     BassMarkerPlacement, KEYBOARD_NOTE_COUNT, KeyPlacement, KeyboardAnimationState, KeyboardFrame,
-    KeyboardLayout, KeyboardLevels, KeyboardPoint, KeyboardRect, layout_bass_markers,
-    layout_keyboard, prepare_keyboard_frame,
+    KeyboardLayout, KeyboardLayoutCache, KeyboardLevels, KeyboardPoint, KeyboardRect,
+    layout_bass_markers, layout_bass_markers_into, layout_keyboard, layout_keyboard_cached,
+    prepare_keyboard_frame, prepare_keyboard_frame_into,
 };
 pub use playback::{PlaybackIntent, PlaybackSnapshot};
 pub use timeline::{MediaVisualMode, MusicBookmark, MusicModeSource, MusicTimelineLayout};

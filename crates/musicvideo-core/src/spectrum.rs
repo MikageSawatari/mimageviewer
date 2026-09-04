@@ -1,7 +1,7 @@
 use std::fmt;
 
 use music_core::{
-    KeyboardAnimationState, SpectrumAnalysis, SpectrumAnalyzer, prepare_keyboard_frame,
+    KeyboardAnimationState, SpectrumAnalysis, SpectrumAnalyzer, prepare_keyboard_frame_into,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +52,8 @@ pub struct SpectrumSource {
     analyzer: SpectrumAnalyzer,
     analysis: SpectrumAnalysis,
     keyboard: KeyboardAnimationState,
-    full_frame: Option<SpectrumFrame>,
+    full_frame: SpectrumFrame,
+    full_frame_valid: bool,
     last_t: Option<f64>,
 }
 
@@ -80,7 +81,8 @@ impl SpectrumSource {
             analyzer: SpectrumAnalyzer::new(band_count),
             analysis: SpectrumAnalysis::default(),
             keyboard: KeyboardAnimationState::default(),
-            full_frame: None,
+            full_frame: SpectrumFrame::default(),
+            full_frame_valid: false,
             last_t: None,
         })
     }
@@ -97,21 +99,20 @@ impl SpectrumSource {
     /// Repeating the same time returns the cached result without advancing keyboard decay.
     pub fn full_frame_at(&mut self, pcm: &[f32], t_secs: f64, norm_gain_db: f32) -> &SpectrumFrame {
         self.update_analysis(pcm, t_secs);
-        if self.full_frame.is_none() {
-            let keyboard = prepare_keyboard_frame(
+        if !self.full_frame_valid {
+            self.full_frame.bands.clone_from(&self.analysis.bands);
+            self.full_frame.notes.clone_from(&self.analysis.notes);
+            self.full_frame.note_min_midi = self.analysis.note_min_midi;
+            prepare_keyboard_frame_into(
                 &self.analysis.notes,
                 self.analysis.note_min_midi,
                 norm_gain_db,
                 &mut self.keyboard,
+                &mut self.full_frame.keyboard,
             );
-            self.full_frame = Some(SpectrumFrame::from_analysis(
-                self.analysis.bands.clone(),
-                self.analysis.notes.clone(),
-                self.analysis.note_min_midi,
-                keyboard,
-            ));
+            self.full_frame_valid = true;
         }
-        self.full_frame.as_ref().expect("frame was initialized")
+        &self.full_frame
     }
 
     fn update_analysis(&mut self, pcm: &[f32], t_secs: f64) {
@@ -148,14 +149,14 @@ impl SpectrumSource {
             }
         }
         self.last_t = Some(t);
-        self.full_frame = None;
+        self.full_frame_valid = false;
     }
 
     pub fn reset(&mut self) {
         self.analyzer = SpectrumAnalyzer::new(self.band_count);
         self.analysis = SpectrumAnalysis::default();
         self.keyboard.clear();
-        self.full_frame = None;
+        self.full_frame_valid = false;
         self.last_t = None;
     }
 

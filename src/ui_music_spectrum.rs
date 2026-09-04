@@ -26,9 +26,10 @@ use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use music_core::{
-    KeyboardAnimationState, KeyboardRect, SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI,
-    SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
-    layout_bass_markers, layout_keyboard, prepare_keyboard_frame,
+    BassMarkerPlacement, KeyboardAnimationState, KeyboardFrame, KeyboardLayoutCache, KeyboardRect,
+    SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI,
+    SpectrumAnalysis, SpectrumAnalyzer, layout_bass_markers_into, layout_keyboard_cached,
+    prepare_keyboard_frame_into,
 };
 
 // ── レイアウト・解析定数 (ラボと同値) ──
@@ -199,6 +200,9 @@ pub struct MusicSpectrumState {
     prev_bands: Vec<f32>,
     onsets: Vec<f32>,
     keyboard: KeyboardAnimationState,
+    keyboard_frame: KeyboardFrame,
+    keyboard_layout: KeyboardLayoutCache,
+    bass_markers: Vec<BassMarkerPlacement>,
     /// 直近 `update` で PCM (`Arc<MusicPcm>`) が渡っていたか。false = まだ解析ワーカー起動待ち。
     source_present: bool,
     /// 直近 `update` で PCM のデコードが完了していたか。バンドが空でこれが false の間は
@@ -222,6 +226,9 @@ impl Default for MusicSpectrumState {
             prev_bands: Vec::new(),
             onsets: Vec::new(),
             keyboard: KeyboardAnimationState::default(),
+            keyboard_frame: KeyboardFrame::default(),
+            keyboard_layout: KeyboardLayoutCache::default(),
+            bass_markers: Vec::new(),
             source_present: false,
             source_complete: false,
         }
@@ -245,6 +252,8 @@ impl MusicSpectrumState {
         self.prev_bands.clear();
         self.onsets.clear();
         self.keyboard.clear();
+        self.keyboard_layout.clear();
+        self.bass_markers.clear();
         self.pending = false;
         self.last_request = None;
         self.last_center = f64::NEG_INFINITY;
@@ -419,6 +428,8 @@ impl MusicSpectrumState {
                 &self.notes,
                 self.note_min_midi,
                 &mut self.keyboard,
+                &mut self.keyboard_frame,
+                &mut self.keyboard_layout,
                 norm_gain_db,
             );
             // まだデコード中 (窓が取れない) 間はプロット領域に「解析中」を出し、無反応に見せない。
@@ -513,6 +524,8 @@ impl MusicSpectrumState {
             &self.notes,
             self.note_min_midi,
             &mut self.keyboard,
+            &mut self.keyboard_frame,
+            &mut self.keyboard_layout,
             norm_gain_db,
         );
         // 上の Bass グラフと同じ推定を鍵盤上の ▼ で示す (afterglow 減衰、明るさ=信頼度)。
@@ -522,6 +535,9 @@ impl MusicSpectrumState {
             &self.notes,
             self.note_min_midi,
             &mut self.keyboard,
+            &self.keyboard_frame,
+            &mut self.keyboard_layout,
+            &mut self.bass_markers,
             bass_marker,
         );
     }
@@ -654,18 +670,21 @@ fn draw_pitch_keyboard(
     notes: &[f32],
     note_min_midi: u8,
     keyboard: &mut KeyboardAnimationState,
+    keyboard_frame: &mut KeyboardFrame,
+    keyboard_layout: &mut KeyboardLayoutCache,
     norm_gain_db: f32,
 ) {
     // 鍵盤矩形でクリップし、均等幅で描いた鍵の軸外はみ出しを表示上でカットする。
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-    let frame = prepare_keyboard_frame(notes, note_min_midi, norm_gain_db, keyboard);
-    let layout = layout_keyboard(
-        &frame,
+    prepare_keyboard_frame_into(notes, note_min_midi, norm_gain_db, keyboard, keyboard_frame);
+    let layout = layout_keyboard_cached(
+        keyboard_frame,
         KeyboardRect::new(rect.left(), rect.top(), rect.right(), rect.bottom()),
+        keyboard_layout,
     );
 
-    for x in layout.octave_guides_x {
+    for &x in &layout.octave_guides_x {
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(
@@ -675,7 +694,7 @@ fn draw_pitch_keyboard(
         );
     }
 
-    for key in layout.keys {
+    for &key in &layout.keys {
         let key_rect = egui::Rect::from_min_max(
             egui::pos2(key.rect.left, key.rect.top),
             egui::pos2(key.rect.right, key.rect.bottom),
@@ -711,21 +730,28 @@ fn draw_bass_marker(
     notes: &[f32],
     note_min_midi: u8,
     keyboard: &mut KeyboardAnimationState,
+    keyboard_frame: &KeyboardFrame,
+    keyboard_layout: &mut KeyboardLayoutCache,
+    markers: &mut Vec<BassMarkerPlacement>,
     bass_marker: Option<(u8, f32)>,
 ) {
-    let markers = layout_bass_markers(
+    let rect = KeyboardRect::new(
+        keyboard_rect.left(),
+        keyboard_rect.top(),
+        keyboard_rect.right(),
+        keyboard_rect.bottom(),
+    );
+    let layout = layout_keyboard_cached(keyboard_frame, rect, keyboard_layout);
+    layout_bass_markers_into(
         notes,
         note_min_midi,
-        KeyboardRect::new(
-            keyboard_rect.left(),
-            keyboard_rect.top(),
-            keyboard_rect.right(),
-            keyboard_rect.bottom(),
-        ),
+        rect,
         keyboard,
         bass_marker,
+        Some(layout),
+        markers,
     );
-    for marker in markers {
+    for marker in markers.iter().copied() {
         let m = marker.intensity.clamp(0.0, 1.0);
         let base = key_color(60 + marker.midi % 12, 0.75 + 0.25 * m);
         let alpha =

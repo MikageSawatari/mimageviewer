@@ -1,16 +1,22 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use music_core::{KeyboardFrame, KeyboardRect, layout_keyboard};
+use music_core::{KeyboardFrame, KeyboardLayoutCache, KeyboardRect, layout_keyboard_cached};
 
 use crate::assets::{AssetError, Assets, ImageAsset};
 use crate::model::{
     Fill, Fit, Glow, ImageId, NormRect, Rgba8, SpectrumDirection, SpectrumShape, TextAlign,
 };
 use crate::scene::{Scene, SceneItem, SceneItemKind};
+
+thread_local! {
+    static KEYBOARD_LAYOUT_CACHE: RefCell<KeyboardLayoutCache> =
+        RefCell::new(KeyboardLayoutCache::default());
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelRect {
@@ -880,22 +886,26 @@ fn draw_pitch_keyboard(
         return;
     }
 
-    let layout = layout_keyboard(
-        keyboard,
-        KeyboardRect::new(
-            rect.x0 as f32,
-            rect.y0 as f32,
-            rect.x1 as f32,
-            rect.y1 as f32,
-        ),
-    );
-    for x in layout.octave_guides_x {
-        draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px);
-    }
     let sampler = FillSampler::new(fill, rect);
-    for key in layout.keys {
-        draw_keyboard_key(frame, rect, key, &sampler, opacity, corner_radius_px);
-    }
+    KEYBOARD_LAYOUT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let layout = layout_keyboard_cached(
+            keyboard,
+            KeyboardRect::new(
+                rect.x0 as f32,
+                rect.y0 as f32,
+                rect.x1 as f32,
+                rect.y1 as f32,
+            ),
+            &mut cache,
+        );
+        for &x in &layout.octave_guides_x {
+            draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px);
+        }
+        for &key in &layout.keys {
+            draw_keyboard_key(frame, rect, key, &sampler, opacity, corner_radius_px);
+        }
+    });
 }
 
 fn draw_keyboard_guide(
@@ -2004,7 +2014,9 @@ mod tests {
     use super::*;
     use crate::MAX_SCALED_IMAGE_CACHE_ENTRIES;
     use crate::model::{Fit, GradientStop, GradientStops};
-    use music_core::{KeyboardAnimationState, SPECTRUM_NOTE_MIN_MIDI, prepare_keyboard_frame};
+    use music_core::{
+        KeyboardAnimationState, SPECTRUM_NOTE_MIN_MIDI, layout_keyboard, prepare_keyboard_frame,
+    };
 
     fn item(kind: SceneItemKind) -> SceneItem {
         SceneItem {
@@ -2201,6 +2213,43 @@ mod tests {
                 coverage > 0.0 && coverage < 1.0
             })
         }));
+    }
+
+    #[test]
+    fn parallel_box_blur_matches_serial_passes_bit_for_bit() {
+        let width = 79_usize;
+        let height = 53_usize;
+        let radius = 7;
+        let input = (0..width * height)
+            .map(|index| {
+                let x = index % width;
+                let y = index / width;
+                (x.wrapping_mul(29) ^ y.wrapping_mul(17)) as u8
+            })
+            .collect::<Vec<_>>();
+
+        let mut horizontal = vec![0; input.len()];
+        for (y, output) in horizontal.chunks_exact_mut(width).enumerate() {
+            sliding_average(&input[y * width..(y + 1) * width], output, radius);
+        }
+        let mut transposed = vec![0; input.len()];
+        for x in 0..width {
+            for y in 0..height {
+                transposed[x * height + y] = horizontal[y * width + x];
+            }
+        }
+        let mut vertical = vec![0; input.len()];
+        for (x, output) in vertical.chunks_exact_mut(height).enumerate() {
+            sliding_average(&transposed[x * height..(x + 1) * height], output, radius);
+        }
+        let mut expected = vec![0; input.len()];
+        for x in 0..height {
+            for y in 0..width {
+                expected[x * width + y] = vertical[y * height + x];
+            }
+        }
+
+        assert_eq!(box_blur(&input, width, height, radius), expected);
     }
 
     #[test]

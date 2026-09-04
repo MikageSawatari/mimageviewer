@@ -4,6 +4,8 @@
 //! 鍵と Bass マーカーの配置・表示強度だけを返す。本体の音楽ビューと音楽ビデオ書き出しは
 //! この同じ結果をそれぞれの描画 API へ渡す。
 
+use std::collections::VecDeque;
+
 use crate::{SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, apply_display_gain_db};
 
 const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
@@ -112,18 +114,34 @@ impl Default for KeyboardFrame {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KeyboardAnimationState {
     sustain: Vec<f32>,
+    sustained: Vec<f32>,
     trail: Vec<f32>,
     even: Vec<f32>,
     odd: Vec<f32>,
+    raw: Vec<f32>,
+    even_energy: Vec<f32>,
+    odd_energy: Vec<f32>,
+    boosted: Vec<f32>,
+    visual_center: Vec<f32>,
+    visual_even: Vec<f32>,
+    visual_odd: Vec<f32>,
     bass_marker_trail: Vec<f32>,
 }
 
 impl KeyboardAnimationState {
     pub fn clear(&mut self) {
         self.sustain.clear();
+        self.sustained.clear();
         self.trail.clear();
         self.even.clear();
         self.odd.clear();
+        self.raw.clear();
+        self.even_energy.clear();
+        self.odd_energy.clear();
+        self.boosted.clear();
+        self.visual_center.clear();
+        self.visual_even.clear();
+        self.visual_odd.clear();
         self.bass_marker_trail.clear();
     }
 }
@@ -145,6 +163,61 @@ pub struct KeyboardLayout {
     pub keys: Vec<KeyPlacement>,
 }
 
+const MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyboardLayoutCacheKey {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    note_min_midi: u8,
+    note_count: usize,
+}
+
+impl KeyboardLayoutCacheKey {
+    fn new(frame: &KeyboardFrame, rect: KeyboardRect) -> Self {
+        Self {
+            left: rect.left.to_bits(),
+            top: rect.top.to_bits(),
+            right: rect.right.to_bits(),
+            bottom: rect.bottom.to_bits(),
+            note_min_midi: frame.note_min_midi,
+            note_count: frame.levels.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct KeyboardLayoutCacheEntry {
+    key: KeyboardLayoutCacheKey,
+    layout: KeyboardLayout,
+}
+
+/// 呼び出し側所有の小さな鍵盤レイアウト LRU。
+///
+/// 同じ矩形と解析音域なら、対数軸・鍵形状は再計算せず、フレームごとの輝度だけを
+/// 既存の配置バッファへ反映する。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyboardLayoutCache {
+    entries: VecDeque<KeyboardLayoutCacheEntry>,
+    rebuilds: u64,
+}
+
+impl KeyboardLayoutCache {
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
+    pub fn entries(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BassMarkerPlacement {
     pub midi: u8,
@@ -162,39 +235,70 @@ pub fn prepare_keyboard_frame(
     norm_gain_db: f32,
     state: &mut KeyboardAnimationState,
 ) -> KeyboardFrame {
+    let mut frame = KeyboardFrame::default();
+    prepare_keyboard_frame_into(notes, note_min_midi, norm_gain_db, state, &mut frame);
+    frame
+}
+
+/// 1 描画フレーム分の鍵盤輝度を既存バッファへ書き込み、フレームごとの確保を避ける。
+pub fn prepare_keyboard_frame_into(
+    notes: &[f32],
+    note_min_midi: u8,
+    norm_gain_db: f32,
+    state: &mut KeyboardAnimationState,
+    frame: &mut KeyboardFrame,
+) {
     let note_count = KEYBOARD_NOTE_COUNT;
     for slot in [
         &mut state.sustain,
+        &mut state.sustained,
         &mut state.trail,
         &mut state.even,
         &mut state.odd,
+        &mut state.raw,
+        &mut state.even_energy,
+        &mut state.odd_energy,
+        &mut state.boosted,
+        &mut state.visual_center,
+        &mut state.visual_even,
+        &mut state.visual_odd,
     ] {
         if slot.len() != note_count {
             slot.clear();
             slot.resize(note_count, 0.0);
         }
     }
-    let sustained_notes = update_keyboard_sustain(notes, &mut state.sustain);
-    let visuals =
-        compute_keyboard_visuals(&sustained_notes, note_count, note_min_midi, norm_gain_db);
-    for idx in 0..note_count {
-        state.trail[idx] = (state.trail[idx] * KEY_HIGHLIGHT_DECAY).max(visuals.center[idx]);
-        state.even[idx] =
-            state.even[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.even[idx] * KEY_HARMONIC_SMOOTH;
-        state.odd[idx] =
-            state.odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.odd[idx] * KEY_HARMONIC_SMOOTH;
+    if frame.levels.len() != note_count {
+        frame.levels.clear();
+        frame.levels.resize(note_count, KeyboardLevels::default());
     }
-
-    KeyboardFrame {
+    update_keyboard_sustain(notes, &mut state.sustain, &mut state.sustained);
+    compute_keyboard_visuals(
+        &state.sustained,
+        note_count,
         note_min_midi,
-        levels: (0..note_count)
-            .map(|idx| KeyboardLevels {
-                center: state.trail[idx],
-                even: state.even[idx].clamp(0.0, KEY_GRADIENT_SPREAD),
-                odd: state.odd[idx].clamp(0.0, KEY_GRADIENT_SPREAD),
-            })
-            .collect(),
+        norm_gain_db,
+        &mut state.raw,
+        &mut state.even_energy,
+        &mut state.odd_energy,
+        &mut state.boosted,
+        &mut state.visual_center,
+        &mut state.visual_even,
+        &mut state.visual_odd,
+    );
+    for idx in 0..note_count {
+        state.trail[idx] = (state.trail[idx] * KEY_HIGHLIGHT_DECAY).max(state.visual_center[idx]);
+        state.even[idx] = state.even[idx] * (1.0 - KEY_HARMONIC_SMOOTH)
+            + state.visual_even[idx] * KEY_HARMONIC_SMOOTH;
+        state.odd[idx] = state.odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH)
+            + state.visual_odd[idx] * KEY_HARMONIC_SMOOTH;
+        frame.levels[idx] = KeyboardLevels {
+            center: state.trail[idx],
+            even: state.even[idx].clamp(0.0, KEY_GRADIENT_SPREAD),
+            odd: state.odd[idx].clamp(0.0, KEY_GRADIENT_SPREAD),
+        };
     }
+    frame.note_min_midi = note_min_midi;
 }
 
 /// 鍵盤の座標と描画順を計算する。座標は `rect` と同じ座標系で返す。
@@ -239,6 +343,44 @@ pub fn layout_keyboard(frame: &KeyboardFrame, rect: KeyboardRect) -> KeyboardLay
     }
 }
 
+/// キャッシュ済みの鍵盤座標へ当該フレームの輝度を反映して返す。
+pub fn layout_keyboard_cached<'a>(
+    frame: &KeyboardFrame,
+    rect: KeyboardRect,
+    cache: &'a mut KeyboardLayoutCache,
+) -> &'a KeyboardLayout {
+    let key = KeyboardLayoutCacheKey::new(frame, rect);
+    let index = cache.entries.iter().position(|entry| entry.key == key);
+    let mut entry = if let Some(index) = index {
+        cache.entries.remove(index).expect("cache index is valid")
+    } else {
+        cache.rebuilds = cache.rebuilds.saturating_add(1);
+        KeyboardLayoutCacheEntry {
+            key,
+            layout: layout_keyboard(frame, rect),
+        }
+    };
+    update_layout_levels(frame, &mut entry.layout);
+    if cache.entries.len() >= MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES {
+        cache.entries.pop_front();
+    }
+    cache.entries.push_back(entry);
+    &cache.entries.back().expect("layout was inserted").layout
+}
+
+fn update_layout_levels(frame: &KeyboardFrame, layout: &mut KeyboardLayout) {
+    for key in &mut layout.keys {
+        let index = key.midi.checked_sub(frame.note_min_midi).map(usize::from);
+        key.levels = index
+            .and_then(|idx| frame.levels.get(idx).copied())
+            .unwrap_or_default();
+        key.real_key = index.is_some_and(|idx| idx < frame.levels.len());
+        key.note_position = index
+            .filter(|idx| *idx < frame.levels.len())
+            .map(|idx| idx as f32 / frame.levels.len().saturating_sub(1).max(1) as f32);
+    }
+}
+
 /// Bass 推定のピッチクラスを鍵盤上の ▼ 配置へ変換し、残光状態を更新する。
 pub fn layout_bass_markers(
     notes: &[f32],
@@ -247,6 +389,30 @@ pub fn layout_bass_markers(
     state: &mut KeyboardAnimationState,
     bass_marker: Option<(u8, f32)>,
 ) -> Vec<BassMarkerPlacement> {
+    let mut markers = Vec::new();
+    layout_bass_markers_into(
+        notes,
+        note_min_midi,
+        keyboard_rect,
+        state,
+        bass_marker,
+        None,
+        &mut markers,
+    );
+    markers
+}
+
+/// Bass マーカーを既存バッファへ書き込む。layout があれば鍵座標も再利用する。
+#[allow(clippy::too_many_arguments)]
+pub fn layout_bass_markers_into(
+    notes: &[f32],
+    note_min_midi: u8,
+    keyboard_rect: KeyboardRect,
+    state: &mut KeyboardAnimationState,
+    bass_marker: Option<(u8, f32)>,
+    layout: Option<&KeyboardLayout>,
+    markers: &mut Vec<BassMarkerPlacement>,
+) {
     let note_count = KEYBOARD_NOTE_COUNT;
     let trail = &mut state.bass_marker_trail;
     if trail.len() != note_count {
@@ -282,7 +448,7 @@ pub fn layout_bass_markers(
         }
     }
 
-    let mut markers = Vec::new();
+    markers.clear();
     for (idx, intensity) in trail.iter().copied().enumerate() {
         if intensity < BASS_MARKER_DRAW_MIN {
             continue;
@@ -293,7 +459,16 @@ pub fn layout_bass_markers(
         else {
             continue;
         };
-        let Some(key_rect) = conventional_key_rect(keyboard_rect, midi, is_black_key(midi)) else {
+        let key_rect = if let Some(layout) = layout {
+            layout
+                .keys
+                .iter()
+                .find(|key| key.midi == midi)
+                .map(|key| key.rect)
+        } else {
+            conventional_key_rect(keyboard_rect, midi, is_black_key(midi))
+        };
+        let Some(key_rect) = key_rect else {
             continue;
         };
         let cx = key_rect.center_x();
@@ -308,11 +483,9 @@ pub fn layout_bass_markers(
             ],
         });
     }
-    markers
 }
 
-fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32]) -> Vec<f32> {
-    let mut sustained = Vec::with_capacity(sustain.len());
+fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32], sustained: &mut [f32]) {
     let raw_peak = (0..sustain.len())
         .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
         .fold(0.0_f32, f32::max);
@@ -327,7 +500,7 @@ fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32]) -> Vec<f32> {
     let broad_ratio = broad_count as f32 / sustain.len().max(1) as f32;
     let attack_scale = if broad_ratio > 0.34 { 0.35 } else { 1.0 };
 
-    for (idx, slot) in sustain.iter_mut().enumerate() {
+    for (idx, (slot, output)) in sustain.iter_mut().zip(sustained).enumerate() {
         let current = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         if current >= *slot {
             let attack = KEY_SUSTAIN_ATTACK * attack_scale;
@@ -335,45 +508,41 @@ fn update_keyboard_sustain(notes: &[f32], sustain: &mut [f32]) -> Vec<f32> {
         } else {
             *slot = (*slot * KEY_SUSTAIN_RELEASE).max(current);
         }
-        sustained.push(*slot);
+        *output = *slot;
     }
-    sustained
 }
 
-struct KeyboardVisuals {
-    center: Vec<f32>,
-    even: Vec<f32>,
-    odd: Vec<f32>,
-}
-
+#[allow(clippy::too_many_arguments)]
 fn compute_keyboard_visuals(
     notes: &[f32],
     note_count: usize,
     note_min_midi: u8,
     norm_gain_db: f32,
-) -> KeyboardVisuals {
-    let flat = || KeyboardVisuals {
-        center: vec![0.0; note_count],
-        even: vec![0.0; note_count],
-        odd: vec![0.0; note_count],
-    };
-    let raw: Vec<f32> = (0..note_count)
-        .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
-        .collect();
+    raw: &mut [f32],
+    even_energy: &mut [f32],
+    odd_energy: &mut [f32],
+    boosted: &mut [f32],
+    center: &mut [f32],
+    even: &mut [f32],
+    odd: &mut [f32],
+) {
+    for (idx, value) in raw.iter_mut().enumerate() {
+        *value = notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+    }
     let peak = raw.iter().copied().fold(0.0_f32, f32::max);
     if peak < KEY_HIGHLIGHT_MIN_PEAK {
-        return flat();
+        center.fill(0.0);
+        even.fill(0.0);
+        odd.fill(0.0);
+        return;
     }
 
-    let mut even_energy = vec![0.0_f32; note_count];
-    let mut odd_energy = vec![0.0_f32; note_count];
     for idx in 0..note_count {
-        let (even, odd) = harmonic_energies(&raw, idx);
-        even_energy[idx] = even;
-        odd_energy[idx] = odd;
+        let (even_value, odd_value) = harmonic_energies(raw, idx);
+        even_energy[idx] = even_value;
+        odd_energy[idx] = odd_value;
     }
 
-    let mut boosted = vec![0.0_f32; note_count];
     for idx in 0..note_count {
         let support = ((even_energy[idx] + odd_energy[idx]) / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
         boosted[idx] = raw[idx] * (1.0 + KEY_HARMONIC_BOOST * support);
@@ -384,34 +553,29 @@ fn compute_keyboard_visuals(
     let presence = ((presence_peak - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
         .clamp(0.0, 1.0)
         .powf(0.7);
-    let center = (0..note_count)
-        .map(|idx| {
-            let lo = idx.saturating_sub(KEY_LOCAL_WINDOW);
-            let hi = (idx + KEY_LOCAL_WINDOW).min(note_count - 1);
-            let local_ref = kth_largest(&boosted[lo..=hi], KEY_LOCAL_TARGET);
-            let ratio = boosted[idx] / (local_ref + 1.0e-4);
-            let prominence = smoothstep(KEY_LOCAL_RATIO_LO, KEY_LOCAL_RATIO_HI, ratio);
-            let local_factor = KEY_LOCAL_FLOOR + (1.0 - KEY_LOCAL_FLOOR) * prominence;
-            let hz = midi_to_hz(note_min_midi + idx as u8);
-            let strength = local_declutter_strength(hz);
-            let eff = 1.0 - strength * (1.0 - local_factor);
-            ((boosted[idx] / boosted_peak) * presence * eff).clamp(0.0, 1.0)
-        })
-        .collect();
-    let even = (0..note_count)
-        .map(|idx| (even_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
-    let odd = (0..note_count)
-        .map(|idx| (odd_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
-    KeyboardVisuals { center, even, odd }
+    for idx in 0..note_count {
+        let lo = idx.saturating_sub(KEY_LOCAL_WINDOW);
+        let hi = (idx + KEY_LOCAL_WINDOW).min(note_count - 1);
+        let local_ref = kth_largest(&boosted[lo..=hi], KEY_LOCAL_TARGET);
+        let ratio = boosted[idx] / (local_ref + 1.0e-4);
+        let prominence = smoothstep(KEY_LOCAL_RATIO_LO, KEY_LOCAL_RATIO_HI, ratio);
+        let local_factor = KEY_LOCAL_FLOOR + (1.0 - KEY_LOCAL_FLOOR) * prominence;
+        let hz = midi_to_hz(note_min_midi + idx as u8);
+        let strength = local_declutter_strength(hz);
+        let eff = 1.0 - strength * (1.0 - local_factor);
+        center[idx] = ((boosted[idx] / boosted_peak) * presence * eff).clamp(0.0, 1.0);
+        even[idx] = (even_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+        odd[idx] = (odd_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+    }
 }
 
 fn kth_largest(values: &[f32], k: usize) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
-    let mut buf: Vec<f32> = values.to_vec();
+    let mut buf = [0.0_f32; KEY_LOCAL_WINDOW * 2 + 1];
+    buf[..values.len()].copy_from_slice(values);
+    let buf = &mut buf[..values.len()];
     buf.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     buf[k.clamp(1, buf.len()) - 1]
 }
@@ -581,6 +745,108 @@ mod tests {
         assert!((key.levels.center - 0.516_639_9).abs() < 1.0e-6);
         assert!((key.levels.even - 0.182_685_63).abs() < 1.0e-6);
         assert!((key.levels.odd - 0.065_572_895).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn hot_path_reuses_frame_scratch_and_layout_buffers() {
+        let mut notes = vec![0.0; KEYBOARD_NOTE_COUNT];
+        notes[24] = 0.8;
+        let mut state = KeyboardAnimationState::default();
+        let mut frame = KeyboardFrame::default();
+        prepare_keyboard_frame_into(&notes, SPECTRUM_NOTE_MIN_MIDI, 0.0, &mut state, &mut frame);
+        let frame_levels = frame.levels.as_ptr();
+        let scratch = [
+            state.sustain.as_ptr(),
+            state.sustained.as_ptr(),
+            state.raw.as_ptr(),
+            state.even_energy.as_ptr(),
+            state.odd_energy.as_ptr(),
+            state.boosted.as_ptr(),
+            state.visual_center.as_ptr(),
+            state.visual_even.as_ptr(),
+            state.visual_odd.as_ptr(),
+        ];
+        prepare_keyboard_frame_into(&notes, SPECTRUM_NOTE_MIN_MIDI, 0.0, &mut state, &mut frame);
+        assert_eq!(frame.levels.as_ptr(), frame_levels);
+        assert_eq!(
+            scratch,
+            [
+                state.sustain.as_ptr(),
+                state.sustained.as_ptr(),
+                state.raw.as_ptr(),
+                state.even_energy.as_ptr(),
+                state.odd_energy.as_ptr(),
+                state.boosted.as_ptr(),
+                state.visual_center.as_ptr(),
+                state.visual_even.as_ptr(),
+                state.visual_odd.as_ptr(),
+            ]
+        );
+
+        let rect = KeyboardRect::new(18.0, 240.0, 1902.0, 274.0);
+        let mut cache = KeyboardLayoutCache::default();
+        let keys = layout_keyboard_cached(&frame, rect, &mut cache)
+            .keys
+            .as_ptr();
+        assert_eq!(cache.rebuilds(), 1);
+        assert_eq!(cache.entries(), 1);
+        assert_eq!(
+            layout_keyboard_cached(&frame, rect, &mut cache)
+                .keys
+                .as_ptr(),
+            keys
+        );
+        assert_eq!(cache.rebuilds(), 1);
+    }
+
+    #[test]
+    fn cached_layout_stays_identical_to_fresh_layout_when_levels_change() {
+        let rect = KeyboardRect::new(18.0, 240.0, 1902.0, 274.0);
+        let mut frame = KeyboardFrame {
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            levels: vec![KeyboardLevels::default(); KEYBOARD_NOTE_COUNT],
+        };
+        frame.levels[24] = KeyboardLevels {
+            center: 0.75,
+            even: 0.2,
+            odd: 0.4,
+        };
+        let mut cache = KeyboardLayoutCache::default();
+        assert_eq!(
+            layout_keyboard_cached(&frame, rect, &mut cache),
+            &layout_keyboard(&frame, rect)
+        );
+
+        frame.levels[24] = KeyboardLevels::default();
+        frame.levels[51] = KeyboardLevels {
+            center: 0.3,
+            even: 0.9,
+            odd: 0.1,
+        };
+        assert_eq!(
+            layout_keyboard_cached(&frame, rect, &mut cache),
+            &layout_keyboard(&frame, rect)
+        );
+        assert_eq!(cache.rebuilds(), 1);
+    }
+
+    #[test]
+    fn layout_cache_has_a_fixed_entry_bound() {
+        let frame = KeyboardFrame {
+            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            levels: vec![KeyboardLevels::default(); KEYBOARD_NOTE_COUNT],
+        };
+        let mut cache = KeyboardLayoutCache::default();
+        for offset in 0..MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES * 2 {
+            let left = offset as f32;
+            let _ = layout_keyboard_cached(
+                &frame,
+                KeyboardRect::new(left, 10.0, left + 800.0, 80.0),
+                &mut cache,
+            );
+            assert!(cache.entries() <= MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES);
+        }
+        assert_eq!(cache.entries(), MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES);
     }
 
     #[test]

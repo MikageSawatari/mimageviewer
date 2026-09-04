@@ -9,6 +9,7 @@ use musicvideo_core::{
     Frame, LayerKind, RenderReport, Smoothing, SpectrumSource, UnresolvedAsset, evaluate,
     render_frame,
 };
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::video::audio::ProcessedChunk;
@@ -29,6 +30,7 @@ use super::{
 const AUDIO_BITRATE_BPS: u32 = 192_000;
 const AUDIO_CHUNK_SAMPLES_PER_CHANNEL: usize = 16_384;
 const FFMPEG_EAGAIN: i32 = 11;
+const CONVERTER_HALO_ROWS: u32 = 8;
 
 struct ExportPlan {
     frames: u64,
@@ -122,10 +124,8 @@ pub(super) fn export(
             / plan.frame_rate.numerator as f64;
 
         let render_started = Instant::now();
-        let spectrum_frame = spectrum
-            .full_frame_at(&decoded.stereo_samples, t_secs, 0.0)
-            .clone();
-        let scene = evaluate(&request.project, t_secs, &spectrum_frame);
+        let spectrum_frame = spectrum.full_frame_at(&decoded.stereo_samples, t_secs, 0.0);
+        let scene = evaluate(&request.project, t_secs, spectrum_frame);
         let report = render_frame(&scene, &request.assets, &mut rgba).map_err(|error| {
             ExportError::Render(format!(
                 "フレーム {} の合成に失敗しました: {error}",
@@ -140,12 +140,12 @@ pub(super) fn export(
         }
 
         let convert_started = Instant::now();
-        let mut converted = converter.convert(&rgba)?;
+        let converted = converter.convert(&rgba)?;
         converted.set_pts(Some(frame_index as i64));
         convert_total_secs += convert_started.elapsed().as_secs_f64();
 
         let encode_started = Instant::now();
-        video.encoder.send_frame(&converted).map_err(|error| {
+        video.encoder.send_frame(converted).map_err(|error| {
             ExportError::Encoder(format!("H.264 フレームを送れません: {error}"))
         })?;
         let packets = drain_h264_packets(&mut video.encoder)?;
@@ -359,81 +359,259 @@ fn encode_audio(
 }
 
 struct RgbaConverter {
+    bands: Vec<RgbaConverterBand>,
+    output: Video,
+    input_format: H264InputFormat,
+    width: u32,
+}
+
+struct RgbaConverterBand {
+    y0: u32,
+    height: u32,
+    source_y0: u32,
+    source_height: u32,
     scaler: ffmpeg::software::scaling::Context,
     input: Video,
-    output_format: ffmpeg::format::Pixel,
+    output: Video,
     width: u32,
-    height: u32,
 }
+
+// SAFETY: each band exclusively owns its SwsContext and AVFrames. Rayon only receives a
+// distinct mutable band for each job, so neither swscale state nor frame storage is accessed
+// concurrently. FFmpeg scaling contexts are not thread-affine and may be moved between calls;
+// they merely must not be used by two threads at the same time.
+unsafe impl Send for RgbaConverterBand {}
 
 impl RgbaConverter {
     fn new(width: u32, height: u32, format: H264InputFormat) -> Result<Self, ExportError> {
+        Self::with_parallelism(width, height, format, rayon::current_num_threads())
+    }
+
+    fn with_parallelism(
+        width: u32,
+        height: u32,
+        format: H264InputFormat,
+        requested_bands: usize,
+    ) -> Result<Self, ExportError> {
         let output_format = format.ffmpeg_pixel();
-        let mut scaler = ffmpeg::software::scaling::Context::get(
-            ffmpeg::format::Pixel::RGBA,
-            width,
-            height,
-            output_format,
-            width,
-            height,
-            ffmpeg::software::scaling::flag::Flags::BILINEAR,
-        )
-        .map_err(|error| {
-            ExportError::Encoder(format!("RGBA→YUV 変換を初期化できません: {error}"))
-        })?;
-        let coefficients = unsafe { ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_ITU709) };
-        if coefficients.is_null() {
-            return Err(ExportError::Encoder(
-                "BT.709 の色変換係数を取得できません".to_owned(),
-            ));
-        }
-        let result = unsafe {
-            ffmpeg::ffi::sws_setColorspaceDetails(
-                scaler.as_mut_ptr(),
-                coefficients,
-                1,
-                coefficients,
-                0,
-                0,
-                1 << 16,
-                1 << 16,
-            )
-        };
-        if result < 0 {
-            return Err(ExportError::Encoder(format!(
-                "BT.709 の色変換を設定できません: {}",
-                ffmpeg::Error::from(result)
-            )));
-        }
+        let bands = converter_band_ranges(height, requested_bands)
+            .into_iter()
+            .map(|(y0, band_height)| {
+                RgbaConverterBand::new(width, height, y0, band_height, output_format)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            scaler,
-            input: Video::new(ffmpeg::format::Pixel::RGBA, width, height),
-            output_format,
+            bands,
+            output: Video::new(output_format, width, height),
+            input_format: format,
             width,
-            height,
         })
     }
 
-    fn convert(&mut self, frame: &Frame) -> Result<Video, ExportError> {
+    fn convert(&mut self, frame: &Frame) -> Result<&mut Video, ExportError> {
+        self.bands
+            .par_iter_mut()
+            .try_for_each(|band| band.convert(frame))
+            .map_err(|error| {
+                ExportError::Encoder(format!("RGBA→YUV 変換に失敗しました: {error}"))
+            })?;
+
+        make_frame_writable(&mut self.output)?;
+        for band in &self.bands {
+            copy_converted_band(&mut self.output, band, self.input_format, self.width);
+        }
+        set_bt709_metadata(&mut self.output);
+        Ok(&mut self.output)
+    }
+}
+
+fn make_frame_writable(frame: &mut Video) -> Result<(), ExportError> {
+    // The encoder may retain an AVBufferRef after send_frame returns. Asking FFmpeg for a
+    // writable frame here preserves that reference via copy-on-write before band stitching.
+    let result = unsafe { ffmpeg::ffi::av_frame_make_writable(frame.as_mut_ptr()) };
+    if result < 0 {
+        return Err(ExportError::Encoder(format!(
+            "YUV フレームを書き込み可能にできません: {}",
+            ffmpeg::Error::from(result)
+        )));
+    }
+    Ok(())
+}
+
+impl RgbaConverterBand {
+    fn new(
+        width: u32,
+        full_height: u32,
+        y0: u32,
+        height: u32,
+        output_format: ffmpeg::format::Pixel,
+    ) -> Result<Self, ExportError> {
+        let source_y0 = y0.saturating_sub(CONVERTER_HALO_ROWS);
+        let source_y1 = y0
+            .saturating_add(height)
+            .saturating_add(CONVERTER_HALO_ROWS)
+            .min(full_height);
+        let source_height = source_y1 - source_y0;
+        let scaler = create_bt709_scaler(width, source_height, output_format)?;
+        Ok(Self {
+            y0,
+            height,
+            source_y0,
+            source_height,
+            scaler,
+            input: Video::new(ffmpeg::format::Pixel::RGBA, width, source_height),
+            output: Video::new(output_format, width, source_height),
+            width,
+        })
+    }
+
+    fn convert(&mut self, frame: &Frame) -> Result<(), ffmpeg::Error> {
         let source_row_bytes = self.width as usize * 4;
+        let source_start = self.source_y0 as usize * source_row_bytes;
+        let source_end = source_start + self.source_height as usize * source_row_bytes;
         let stride = self.input.stride(0);
-        for (source, destination) in frame
-            .rgba
+        for (source, destination) in frame.rgba[source_start..source_end]
             .chunks_exact(source_row_bytes)
             .zip(self.input.data_mut(0).chunks_exact_mut(stride))
         {
             destination[..source_row_bytes].copy_from_slice(source);
         }
-        let mut output = Video::new(self.output_format, self.width, self.height);
-        self.scaler.run(&self.input, &mut output).map_err(|error| {
-            ExportError::Encoder(format!("RGBA→YUV 変換に失敗しました: {error}"))
-        })?;
-        output.set_color_space(ffmpeg::color::Space::BT709);
-        output.set_color_range(ffmpeg::color::Range::MPEG);
-        output.set_color_primaries(ffmpeg::color::Primaries::BT709);
-        output.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
-        Ok(output)
+        self.scaler.run(&self.input, &mut self.output)
     }
+}
+
+fn create_bt709_scaler(
+    width: u32,
+    height: u32,
+    output_format: ffmpeg::format::Pixel,
+) -> Result<ffmpeg::software::scaling::Context, ExportError> {
+    let mut scaler = ffmpeg::software::scaling::Context::get(
+        ffmpeg::format::Pixel::RGBA,
+        width,
+        height,
+        output_format,
+        width,
+        height,
+        ffmpeg::software::scaling::flag::Flags::BILINEAR,
+    )
+    .map_err(|error| ExportError::Encoder(format!("RGBA→YUV 変換を初期化できません: {error}")))?;
+    let coefficients = unsafe { ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_ITU709) };
+    if coefficients.is_null() {
+        return Err(ExportError::Encoder(
+            "BT.709 の色変換係数を取得できません".to_owned(),
+        ));
+    }
+    let result = unsafe {
+        ffmpeg::ffi::sws_setColorspaceDetails(
+            scaler.as_mut_ptr(),
+            coefficients,
+            1,
+            coefficients,
+            0,
+            0,
+            1 << 16,
+            1 << 16,
+        )
+    };
+    if result < 0 {
+        return Err(ExportError::Encoder(format!(
+            "BT.709 の色変換を設定できません: {}",
+            ffmpeg::Error::from(result)
+        )));
+    }
+    Ok(scaler)
+}
+
+fn converter_band_ranges(height: u32, requested_bands: usize) -> Vec<(u32, u32)> {
+    let chroma_rows = height as usize / 2;
+    let band_count = requested_bands.max(1).min(chroma_rows.max(1));
+    (0..band_count)
+        .map(|index| {
+            let chroma_y0 = index * chroma_rows / band_count;
+            let chroma_y1 = (index + 1) * chroma_rows / band_count;
+            ((chroma_y0 * 2) as u32, ((chroma_y1 - chroma_y0) * 2) as u32)
+        })
+        .collect()
+}
+
+fn copy_converted_band(
+    destination: &mut Video,
+    band: &RgbaConverterBand,
+    format: H264InputFormat,
+    width: u32,
+) {
+    copy_plane_rows(
+        destination,
+        0,
+        band.y0 as usize,
+        &band.output,
+        (band.y0 - band.source_y0) as usize,
+        width as usize,
+        band.height as usize,
+    );
+    let chroma_y0 = band.y0 as usize / 2;
+    let source_chroma_y0 = (band.y0 - band.source_y0) as usize / 2;
+    let chroma_height = band.height as usize / 2;
+    match format {
+        H264InputFormat::Nv12 => copy_plane_rows(
+            destination,
+            1,
+            chroma_y0,
+            &band.output,
+            source_chroma_y0,
+            width as usize,
+            chroma_height,
+        ),
+        H264InputFormat::Yuv420p => {
+            let chroma_width = width as usize / 2;
+            copy_plane_rows(
+                destination,
+                1,
+                chroma_y0,
+                &band.output,
+                source_chroma_y0,
+                chroma_width,
+                chroma_height,
+            );
+            copy_plane_rows(
+                destination,
+                2,
+                chroma_y0,
+                &band.output,
+                source_chroma_y0,
+                chroma_width,
+                chroma_height,
+            );
+        }
+    }
+}
+
+fn copy_plane_rows(
+    destination: &mut Video,
+    plane: usize,
+    destination_y0: usize,
+    source: &Video,
+    source_y0: usize,
+    active_row_bytes: usize,
+    rows: usize,
+) {
+    let destination_stride = destination.stride(plane);
+    let source_stride = source.stride(plane);
+    let source_data = source.data(plane);
+    let destination_data = destination.data_mut(plane);
+    for row in 0..rows {
+        let source_offset = (source_y0 + row) * source_stride;
+        let destination_offset = (destination_y0 + row) * destination_stride;
+        destination_data[destination_offset..destination_offset + active_row_bytes]
+            .copy_from_slice(&source_data[source_offset..source_offset + active_row_bytes]);
+    }
+}
+
+fn set_bt709_metadata(output: &mut Video) {
+    output.set_color_space(ffmpeg::color::Space::BT709);
+    output.set_color_range(ffmpeg::color::Range::MPEG);
+    output.set_color_primaries(ffmpeg::color::Primaries::BT709);
+    output.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
 }
 
 fn drain_h264_packets(
@@ -747,6 +925,62 @@ fn drain_audio_decoder(
 mod tests {
     use super::*;
 
+    fn serial_reference_convert(frame: &Frame, format: H264InputFormat) -> Video {
+        let mut scaler =
+            create_bt709_scaler(frame.width, frame.height, format.ffmpeg_pixel()).unwrap();
+        let mut input = Video::new(ffmpeg::format::Pixel::RGBA, frame.width, frame.height);
+        let source_row_bytes = frame.width as usize * 4;
+        let stride = input.stride(0);
+        for (source, destination) in frame
+            .rgba
+            .chunks_exact(source_row_bytes)
+            .zip(input.data_mut(0).chunks_exact_mut(stride))
+        {
+            destination[..source_row_bytes].copy_from_slice(source);
+        }
+        let mut output = Video::new(format.ffmpeg_pixel(), frame.width, frame.height);
+        scaler.run(&input, &mut output).unwrap();
+        set_bt709_metadata(&mut output);
+        output
+    }
+
+    fn assert_active_video_eq(
+        expected: &Video,
+        actual: &Video,
+        format: H264InputFormat,
+        width: usize,
+        height: usize,
+    ) {
+        let planes: &[(usize, usize, usize)] = match format {
+            H264InputFormat::Nv12 => &[(0, width, height), (1, width, height / 2)],
+            H264InputFormat::Yuv420p => &[
+                (0, width, height),
+                (1, width / 2, height / 2),
+                (2, width / 2, height / 2),
+            ],
+        };
+        for &(plane, active_row_bytes, rows) in planes {
+            let expected_stride = expected.stride(plane);
+            let actual_stride = actual.stride(plane);
+            for row in 0..rows {
+                assert_eq!(
+                    &expected.data(plane)
+                        [row * expected_stride..row * expected_stride + active_row_bytes],
+                    &actual.data(plane)
+                        [row * actual_stride..row * actual_stride + active_row_bytes],
+                    "format={format:?}, plane={plane}, row={row}"
+                );
+            }
+        }
+        assert_eq!(actual.color_space(), expected.color_space());
+        assert_eq!(actual.color_range(), expected.color_range());
+        assert_eq!(actual.color_primaries(), expected.color_primaries());
+        assert_eq!(
+            actual.color_transfer_characteristic(),
+            expected.color_transfer_characteristic()
+        );
+    }
+
     #[test]
     fn frame_rate_is_reduced_without_changing_common_values() {
         assert_eq!(
@@ -790,6 +1024,98 @@ mod tests {
         assert!(has_mp4_extension(Path::new("video.mp4")));
         assert!(has_mp4_extension(Path::new("video.MP4")));
         assert!(!has_mp4_extension(Path::new("video.mov")));
+    }
+
+    #[test]
+    fn converter_bands_cover_each_even_row_exactly_once() {
+        let ranges = converter_band_ranges(362, 7);
+        assert_eq!(ranges.len(), 7);
+        let mut next_y = 0;
+        for (y0, height) in ranges {
+            assert_eq!(y0, next_y);
+            assert_eq!(y0 % 2, 0);
+            assert_eq!(height % 2, 0);
+            assert!(height > 0);
+            next_y += height;
+        }
+        assert_eq!(next_y, 362);
+    }
+
+    #[test]
+    fn parallel_rgba_conversion_matches_single_swscale_context_bit_for_bit() {
+        for (width, height, bands) in [(642, 362, 7), (1920, 1080, rayon::current_num_threads())] {
+            let mut frame = Frame::new(width, height).unwrap();
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let offset = (y * width as usize + x) * 4;
+                    frame.rgba[offset] = (x.wrapping_mul(13) ^ y.wrapping_mul(7)) as u8;
+                    frame.rgba[offset + 1] =
+                        (x.wrapping_mul(3).wrapping_add(y.wrapping_mul(11))) as u8;
+                    frame.rgba[offset + 2] =
+                        (x.wrapping_mul(17).wrapping_add(y.wrapping_mul(5))) as u8;
+                    frame.rgba[offset + 3] = (x ^ y) as u8;
+                }
+            }
+
+            for format in [H264InputFormat::Nv12, H264InputFormat::Yuv420p] {
+                let expected = serial_reference_convert(&frame, format);
+                let mut converter =
+                    RgbaConverter::with_parallelism(width, height, format, bands).unwrap();
+                let actual = converter.convert(&frame).unwrap();
+                assert_active_video_eq(&expected, &actual, format, width as usize, height as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn reused_output_preserves_encoder_held_buffer_references() {
+        let (width, height) = (642, 362);
+        let mut first = Frame::new(width, height).unwrap();
+        let mut second = Frame::new(width, height).unwrap();
+        for (index, pixel) in first.rgba.chunks_exact_mut(4).enumerate() {
+            pixel.copy_from_slice(&[
+                index.wrapping_mul(7) as u8,
+                index.wrapping_mul(13) as u8,
+                index.wrapping_mul(29) as u8,
+                255,
+            ]);
+        }
+        for (source, destination) in first
+            .rgba
+            .chunks_exact(4)
+            .zip(second.rgba.chunks_exact_mut(4))
+        {
+            destination.copy_from_slice(&[255 - source[0], source[2], source[1], 255]);
+        }
+
+        let format = H264InputFormat::Nv12;
+        let expected_first = serial_reference_convert(&first, format);
+        let expected_second = serial_reference_convert(&second, format);
+        let mut converter = RgbaConverter::with_parallelism(width, height, format, 7).unwrap();
+        let retained = {
+            let converted = converter.convert(&first).unwrap();
+            let mut reference = unsafe { ffmpeg::Frame::empty() };
+            let result =
+                unsafe { ffmpeg::ffi::av_frame_ref(reference.as_mut_ptr(), converted.as_ptr()) };
+            assert_eq!(result, 0);
+            Video::from(reference)
+        };
+
+        let actual_second = converter.convert(&second).unwrap();
+        assert_active_video_eq(
+            &expected_second,
+            actual_second,
+            format,
+            width as usize,
+            height as usize,
+        );
+        assert_active_video_eq(
+            &expected_first,
+            &retained,
+            format,
+            width as usize,
+            height as usize,
+        );
     }
 
     #[test]
