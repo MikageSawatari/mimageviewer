@@ -2,7 +2,7 @@
 
 作成: 2026-09-04  
 対象: backlog §1.167  
-状態: 実装中。本書を本機能の設計・実装状況の正本とする。
+状態: 実装済み、Windows 実機表示の確認待ち。本書を本機能の設計・実装状況の正本とする。
 
 ## 1. 目的と不変条件
 
@@ -65,11 +65,13 @@ zoom を選ぶ。両入口を handler-level test で同じ表に対して確認�
 wheel は presenter が `NativeVideoMouseWheelEvent.x/y` と実際の video target rect から
 pointer の領域内位置・領域寸法を作り、zoom 専用 command/event に載せる。drag は既存の
 `NativeVideoPointerDown::PanoramaDrag` と兄弟の `ZoomPan` を使い、再生クリックへ落とさない。
-App は state 更新ごとに現在の source rect を player の `set_native_video_zoom` 系 setter へ同期する。
+App は state 更新ごとに値 snapshot を `set_native_video_zoom_state` setter へ同期し、render thread が
+現在 frame の geometry と表示領域から source rect を導出する。
 
 ## 4. native presenter と描画
 
-render thread は `panorama_pose` の隣に zoom の source rect を持つ。`src/video/mod.rs` の typed
+render thread は `panorama_pose` の隣に `VideoZoomState` の値 snapshot を持ち、frame の geometry と
+表示領域から draw 時の source rect を導出する。`src/video/mod.rs` の typed
 command と `VideoPlayer` setter を通して App から同期し、source switch では新 source の state を
 持ち越さない。
 
@@ -126,6 +128,17 @@ action 名と既定 V は変えない。
 mimageviewer-core`、`cargo test -p mimageviewer --lib`、`cargo fmt --check`、UI 文言変更に対する
 `python scripts/check_ui_glyphs.py` を実行し、利用者確認用に `scripts/build-dev.ps1` を実行する。
 D3D11 の見え方は利用者が通常 profile の検証 binary で確認する。
+
+実装では `video_zoom_active` だけを surface / preparation signature に含め、scale と center は
+定数更新に留めた。通常表示の `OsDefault`、物理 1:1、既存 filter の選択規則は変えず、拡大モード中の
+`OsDefault` だけ標準 resample へ送る。Lanczos の中間 texture は従来どおり source 行数基準である。
+Anime4K は生成スクリプトの共通 resolve template を正本として全 variant を再生成した。
+
+2026-09-04 の最終自動確認では、`cargo check -p mimageviewer --bin mimageviewer-core`、
+`cargo test -p mimageviewer --lib`（7,349 tests）、`cargo fmt --all -- --check`、
+`git diff --check`、`python scripts/check_ui_glyphs.py`、Anime4K 生成物の `--check` がすべて
+成功した。通常 feature set の `scripts/build-dev.ps1` も完了し、`target/dev-runtime/` に
+実機確認用 core / remote service と FFmpeg DLL を配置した。
 
 ## 7. 実機で確認する項目
 

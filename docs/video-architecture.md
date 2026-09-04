@@ -51,10 +51,27 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 設計正本は [video-zoom-pan-plan.md](video-zoom-pan-plan.md)。このモードも native presenter の
 表示解像度 scaling を使い、倍率変更は swap chain resize ではなく draw 定数だけを更新する。
 
-`Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
+通常動画の拡大状態は `App::video_zoom_state` が項目単位で所有し、
+`VideoPlayer::set_native_video_zoom_state` → `SetVideoZoomState` の typed command で render thread の
+`NativeRenderCore::video_zoom_state` へ値 snapshot を渡す。render core は frame の source 寸法、SAR、
+orientation と現在の video target 寸法から、向き補正後 source 座標の origin / extent を draw ごとに
+導出する。activation だけが surface / preparation signature に入り、倍率と中心は入らないため、
+wheel / drag ごとに swap chain を作り直さない。項目変更、fullscreen 終了、park、動画→音声、
+音楽 VST shell への遷移では App state と presenter snapshot を破棄し、次項目へ持ち越さない。
+
+入力可否の共通境界は `native_video_view_input_available` が所有する。fullscreen の対象項目であり、
+動画→音声モードでも同項目の音楽 VST shell でもないことを 360 / 通常動画拡大で共有し、各モードの
+active 条件だけを後段で重ねる。detached 専用 predicate は追加せず、既存 placement の意味を変えない。
+通常動画拡大の wheel は presenter が確定した video target rect 内のポインタ座標を App へ渡し、
+`pointer_region_owns_wheel` が示すシークストリップ、端パネル、モーダルの領域では取得しない。
+左押下は `ZoomPan` がドラッグ終了まで所有する。
+
+通常表示での `Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
 chain を DComp transform で拡大・縮小する。shader を使う 4 方式は映像表示矩形の物理 pixel 寸法で
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
-video visual transform は等倍 + 中央寄せだけになる。
+video visual transform は等倍 + 中央寄せだけになる。通常動画拡大中は `OS に任せる` も標準
+resample を強制し、表示領域全体の surface へ source 部分矩形を resolve する。範囲外は最終 target の
+clear や背面 visual に任せず、Lanczos / nearest / NIS / Anime4K の各 resolve が不透明黒を返す。
 
 ```
 decoder の BGRA frame

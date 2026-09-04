@@ -115,7 +115,7 @@
 | [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) | `tags.db`、タグ facet、メタデータ転送を含む現行タグ機能の正本 |
 | [sidecar-metadata-ingest.md](sidecar-metadata-ingest.md) | サイドカー経由のメタデータ取り込み。**`tags.db` 移行前の記述が残っており内容更新待ち**。現行のタグ正本は上の tag-catalog-redesign-plan.md |
 | [video-architecture.md](video-architecture.md) | 動画サブシステムの恒久正本。D3D11VA + native presenter、channel/pacing、current module responsibility、ownership 負債を記載。行数 snapshot は監査記録へ分離 |
-| [video-zoom-pan-plan.md](video-zoom-pan-plan.md) | **実装中**。通常動画を V で拡大・パンするモード。純粋な source 矩形、入力所有、native presenter の表示領域 surface と各 resample shader の契約 |
+| [video-zoom-pan-plan.md](video-zoom-pan-plan.md) | **実装済み・Windows 実機確認待ち**。通常動画を V で拡大・パンするモード。純粋な source 矩形、入力所有、native presenter の表示領域 surface と各 resample shader の契約 |
 | [brief-seek-thumbnail-measurement.md](brief-seek-thumbnail-measurement.md) | シークバーのプレビュー待ち時間の実測。4K AV1 での seek / decode / scale 内訳と、「シーク時のズレ許容 (秒)」の既定値・効果を決めた根拠 |
 | [video-upscale-shader-plan.md](video-upscale-shader-plan.md) | **設計確定 / 未実装**。動画の拡大縮小を DWM/DComp から mIV のシェーダへ移す設計。表示解像度サーフェス、Phase A (Lanczos3/NIS/ニアレスト+縮小) と Phase B (Anime4K)、変種の一般化、実測によるモデル選択、切替で固まらせない不変条件 |
 | [playback-speed-design.md](playback-speed-design.md) | 動画倍速再生機能の仕様。Signalsmith Stretch、音声 PTS/PDC/queue 秒数、native-only 速度 HUD、検証計画 |

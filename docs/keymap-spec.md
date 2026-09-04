@@ -278,13 +278,14 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | Shell / クリップボード / D&D | Shell コピー / 切り取り / 貼り付け、Shell 右クリックメニュー、外部アプリへのドラッグ送出 | Windows Shell やクリップボードイベントの経路を優先するため、キーボードコマンドとは分ける |
 | 編集ツール内のドラッグ状態 | 消しゴム / 隠蔽加工 / 補正レイヤーの選択後の矢印 / <kbd>Ctrl</kbd>+矢印、<kbd>[</kbd> / <kbd>]</kbd>、<kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd>、ハンドル操作中の <kbd>Shift</kbd> / <kbd>Alt</kbd>、テキスト注釈の四隅ハンドルドラッグ中の <kbd>Ctrl</kbd> / <kbd>Shift</kbd>、切り取り / テキスト注釈のドラッグやホイールなど | 選択中オブジェクト、ドラッグ中の形状、パネルフォーカスに依存するモード内操作。テキスト注釈の <kbd>Ctrl</kbd>（中心対称）と <kbd>Shift</kbd>（縦横比固定）は離散ショートカットではなく、マウスドラッグ中だけ幾何制約を切り替える修飾なので keymap 対象外。フルスクリーンキャンバスでは egui の修飾状態が stale になり得るため、両方ともドラッグ中の各フレームで OS から直接読む。操作カスタマイズ画面では消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤーの通常コマンドは「編集モード」としてまとめるが、これらの微調整キーは固定入力のまま |
 | マスク筆の半径 | 消しゴム / 隠蔽加工 / 補正レイヤーで、筆系ツール選択中のキャンバス上 <kbd>Shift</kbd>+ホイール | 1 ノッチごとに半径を約 1.1 倍 / 1.1 分の 1 とし、小さい側でも最低 1px 動かす。筆系ツールかつキャンバス上のときだけ消費し、筆以外やパネル上では従来のホイール経路へ残す。バックログ §4.1 の一般的な Shift / Alt+ホイールのペアバインド再設計はグリッド / 画像 / 動画を横断する別課題であり、今回は動画へ到達しない編集モード限定の固定入力なので `KeyAction` や `Settings.ring_shortcuts` の対象にしない |
-| 360 度パノラマ表示中 | 左ドラッグの yaw/pitch、ホイールの FOV、上バーの 360 解除ボタン、上バーの投影方式 / 視点リセット | 静止画と動画のパノラマ表示中だけの連続操作 / 表示中限定のボタン。動画のタッチは開始領域の ownership を接触列の最後まで保持し、12 logical pt を越えたら見回しへ latch する。ダブルタップはリセットに使わない。<kbd>V</kbd> の 360 度パノラマモード切替 (`FsPanorama`) と <kbd>Shift</kbd>+<kbd>V</kbd> の投影方式順送り (`FsPanoramaProjection`) は `FsCommon` の `KeyAction` であり、画像 / 動画の両方でコマンド設定から変更できる |
+| 360 度パノラマ / 通常動画の拡大表示中 | 360 は左ドラッグの yaw/pitch、ホイールの FOV、上バーの解除・投影方式・視点リセット。通常動画は左ドラッグの表示位置移動、ホイールの拡大縮小、上バーの解除・位置と倍率のリセット | 表示中だけの連続操作 / ボタンなので keymap 対象外。通常動画のホイールはシークストリップ、端パネル、モーダルの領域から奪わず、タッチのピンチは使わない。<kbd>V</kbd> の表示モード切替 (`FsPanorama`) は `FsCommon` の 1 Action で、360 候補ならパノラマ、それ以外の通常動画なら拡大表示を切り替える。<kbd>Shift</kbd>+<kbd>V</kbd> の投影方式順送り (`FsPanoramaProjection`) は 360 専用。どちらも画像 / 動画のコマンド設定から変更できる |
 | 動画の修飾なし左右 | <kbd>←</kbd> / <kbd>→</kbd> の 5 秒シーク、およびタイル中の左右カーソル移動 | 修飾なし矢印は固定ナビゲーションとして残す。<kbd>Alt</kbd> 付き左右は固定シーク扱いにせず、割り当てた `KeyAction` を優先する。<kbd>Shift</kbd> / <kbd>Ctrl</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd> 付きの動画シーク / フレーム送りは `KeyAction` 化済み |
 | 動画のタッチシーク | 物理的な左 / 右の単発タップ = 5 秒戻る / 進む | 静止画と同じ位置分類と presenter / HUD の source ownership に依存する固定タッチ操作なので `TouchAction` を `KeyAction` に合流させず、実行時だけキーボードと同じ相対シーク helper を共有する。読み方向では反転せず、シーク時に HUD 表示状態を変えない |
 
 補足: 画像分析モード起動の既定 <kbd>Shift</kbd>+<kbd>Z</kbd> は `FsImageAnalysis`、ルーペの
 <kbd>Shift</kbd> 押しっぱなしは `FsLoupeHold`、元画像表示の右 <kbd>Ctrl</kbd> 押しっぱなしは
-`FsOriginalPreviewHold`、360 度パノラマ切替の <kbd>V</kbd> は `FsPanorama`、その投影方式の
+`FsOriginalPreviewHold`、360 度パノラマ / 通常動画拡大の切替に使う <kbd>V</kbd> は
+`FsPanorama`、360 の投影方式の
 順送り <kbd>Shift</kbd>+<kbd>V</kbd> は `FsPanoramaProjection` として `KeyAction` 化済み。
 これらは固定入力ではなく、操作カスタマイズで変更または解除できる。
 
@@ -660,6 +661,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
+| <kbd>V</kbd> | 表示モードを切り替える | Action: `FsPanorama`。360 候補の動画では 360 度表示、それ以外の通常動画では拡大表示を ON / OFF にする。拡大表示中はホイールで拡大縮小、左ドラッグで移動し、上バーに倍率とリセットボタンを表示する。項目を切り替えると拡大表示を終了する |
 | <kbd>T</kbd> | 動画の拡大方法を OS に任せる → 標準（補間あり）→ ニアレスト（補間なし）→ シャープ拡大 → アニメ塗り拡大の順に切り替える | Action: `VideoScaleFilterNext`。一時停止中も現在フレームへ即時反映し、設定へ保存する。反映完了後に右上へ選択を表示し、表示サイズの上限で適用できない場合は「OS に任せる」で表示することも併記する |
 | 割り当てなし | 動画のアニメ塗り拡大の性能をもう一度測定する | Action: `VideoAnime4kRemeasure`。再生位置と現在表示を維持し、完了後だけモデルを再選択する |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 動画補正保存スロット 1〜10 を読み込む | Action: `VideoAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにする。映像が隠れた通常の音声モードでは無効、VST GUI で映像が見えている間は有効 |
@@ -681,8 +683,8 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>P</kbd> | 現在再生位置をピン留め (= HUD 📌 ボタンと同等)。タイル中はタイルカーソル位置をピン留め | v0.9.x、グリッドの P (folder_thumb_pin toggle) と統一した「P = Pin」 |
 | <kbd>F</kbd> | Perf / フレームレート オーバーレイ トグル | v0.9.x、以前は P。P を Pin に再割り当てしたため F (Frames) へ移動 |
 | <kbd>Esc</kbd> (タイル中) | タイルモード解除 | |
-| マウス左クリック | 再生 / 一時停止トグル (HUD/パネル除く) | |
-| マウスホイール | 前 / 次のファイル | 画像と同じ |
+| マウス左クリック / 左ドラッグ | 通常時は再生 / 一時停止トグル。通常動画の拡大表示中は表示位置を移動 | HUD / パネルを除く |
+| マウスホイール | 通常時は前 / 次のファイル。通常動画の拡大表示中はポインタ位置を固定して拡大 / 縮小 | シークストリップ、端パネル、モーダルが所有する領域では拡大表示が奪わない |
 | <kbd>Ctrl</kbd>+ホイール (タイル中) | 列数切替 (4/6/10/16/20/26/30) | 上部バーの 3x3 / 5x5 アイコンボタンでも同じ操作可 |
 
 ## 不整合の解消 (Phase 7.H 適用後)

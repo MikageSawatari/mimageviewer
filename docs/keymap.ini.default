@@ -276,7 +276,7 @@
 # FsCtrlNavNext = Ctrl+Down ; 次のフォルダまたは検索結果へ移動する
 # FsSiblingPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
 # FsSiblingNext = Ctrl+PageDown ; 次の兄弟フォルダへ移動する
-# FsPanorama = V ; 360度パノラマモードを切り替える
+# FsPanorama = V ; 360度表示または通常動画の拡大表示を切り替える
 # FsPanoramaProjection = Shift+V ; 360度パノラマの投影方式を切り替える
 
 [Rating] ; レーティング
