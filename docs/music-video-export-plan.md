@@ -330,7 +330,8 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 > テストが 1 件も走らずに落ちる）。release の CLI を直接叩く場合は `target/release/` にも要る。
 >
 > P1b は本体パッケージをビルドするので、この worktree にも `vendor/` が要る。**junction を張らず実コピーする**（CLAUDE.md「worktree + Windows junction の地雷」）。必要なのは `pdfium` / `ort` / `susie-worker` / `ffmpeg` / `models` / `vst3-host` / `twemoji` の 325MB 分だけで、`vst3sdk`（490MB）と `tensorrt-cache` は要らない。`eframe` / `egui-wgpu` は git 追跡済みなので既にある。
-| **P2** | 見栄え: オブジェクト単位グロー / グラデーション / 円形スペアナ / 鍵盤表示 | **§1.4 のプロジェクトを mIV 上で再現できる**（並べて見比べて遜色が無い）。ただし**スペクトラムの周波数軸は一致対象から外す**（D5 — mIV の音楽的な軸で良い） |
+| **P2a** | 見栄え（`musicvideo-core` 内で完結）: オブジェクト単位グロー / グラデーション / 円形スペアナ / 角丸・枠・回転 | **§1.4 のプロジェクトを再現できる**（周波数軸は対象外、D5）。合成の平均が 3.5ms 以内（グロー 3 箇所 + 円形 200 点のシーンで実測） |
+| **P2b** | 鍵盤表示: `draw_pitch_keyboard` のロジックを純関数として `music-core` へ切り出し、**本体の音楽ビューと書き出しが同じ関数を呼ぶ**（D6 / Q5 決着） | 書き出しに鍵盤が出る。**かつ本体の音楽ビューの見た目が変わらない**（切り出し前後で確認する） |
 | **P3** | キーフレーム: 画像切替・フェード・色変化・ON/OFF | 既存の楽曲 1 本を Wav2Bar を使わずに最初から最後まで作り切れる |
 | **P4** | 本体統合: mIV の編集モードとして載せる。プロジェクト保存 / 読み込み、書き出しダイアログ、keymap | [docs/ui-responsiveness.md](ui-responsiveness.md) §4 を通過。閲覧側の退行が無い |
 
@@ -359,7 +360,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | ~~Q2~~ | ~~テキストのグリフラスタライズ方式~~ → **解決**: `comic-core` を使う（D4、2026-09-04） | — |
 | ~~Q3~~ | ~~任意バンド境界 API~~ → **先送り**: 既定は半音軸（D5、2026-09-04） | 将来のオプション実装時 |
 | Q4 | プロジェクトファイルのパス保存（絶対 / 相対 / 埋め込み） | P3 |
-| Q5 | 鍵盤ロジックの切り出し先（`music-core` か `musicvideo-core` か） | P2 着手前 |
+| ~~Q5~~ | ~~鍵盤ロジックの切り出し先~~ → **決着**: `music-core` に置く（2026-09-04）。鍵盤は「音楽の可視化」であって書き出し固有ではなく、本体の音楽ビューと `musicvideo-core` の両方が既に `music-core` に依存している。逆向き（本体が `musicvideo-core` に依存）にしない | — |
 | Q6 | Wav2Bar の `SVG Filters` 相当（任意フィルタ）を持つか | P3 以降・現行未使用なので後回し |
 | Q7 | フォント選択 UI を `comic-core` の `FontSet` にどう繋ぐか（mIV のテキスト注釈と同じフォント一覧を使うか） | P2 |
 | Q8 | 周波数軸オプション（線形 / 対数 / 重み無し）をいつ足すか | P3 以降 |
