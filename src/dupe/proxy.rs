@@ -68,23 +68,26 @@ fn resize_rgba_to_gray64(
             let first_x = src_x0.floor() as usize;
             let last_x = (src_x1.ceil() as usize).min(src_width);
 
-            let mut weighted_sum = 0.0f32;
-            let mut area = 0.0f32;
+            let mut weighted_sum = 0.0f64;
+            let mut area = 0.0f64;
             for src_y in first_y..last_y {
                 let y_overlap =
                     (src_y1.min((src_y + 1) as f32) - src_y0.max(src_y as f32)).max(0.0);
                 for src_x in first_x..last_x {
                     let x_overlap =
                         (src_x1.min((src_x + 1) as f32) - src_x0.max(src_x as f32)).max(0.0);
-                    let weight = x_overlap * y_overlap;
+                    let weight = x_overlap as f64 * y_overlap as f64;
                     let offset = (src_y * src_width + src_x) * 4;
-                    weighted_sum += composited_luma(&rgba[offset..offset + 4]) * weight;
+                    weighted_sum += composited_luma(&rgba[offset..offset + 4]) as f64 * weight;
                     area += weight;
                 }
             }
 
-            debug_assert!(area > 0.0);
-            out[out_y * GRAY64_SIDE + out_x] = round_u8(weighted_sum / area);
+            assert!(
+                area > 0.0,
+                "proxy output pixel must cover positive source area"
+            );
+            out[out_y * GRAY64_SIDE + out_x] = round_u8((weighted_sum / area) as f32);
         }
     }
 
