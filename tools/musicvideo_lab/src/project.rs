@@ -136,15 +136,15 @@ pub fn default_project(duration_secs: f64) -> Project {
     }
 }
 
-pub fn synthetic_background() -> ImageAsset {
-    let mut rgba = Vec::with_capacity(OUTPUT_WIDTH as usize * OUTPUT_HEIGHT as usize * 4);
-    for y in 0..OUTPUT_HEIGHT {
-        for x in 0..OUTPUT_WIDTH {
-            let r = 28 + (x * 52 / OUTPUT_WIDTH) as u8;
-            let g = 38 + (y * 48 / OUTPUT_HEIGHT) as u8;
-            let b = 70 + ((x + y) * 72 / (OUTPUT_WIDTH + OUTPUT_HEIGHT)) as u8;
+pub fn synthetic_background(width: u32, height: u32) -> ImageAsset {
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let r = 28 + (x * 52 / width) as u8;
+            let g = 38 + (y * 48 / height) as u8;
+            let b = 70 + ((x + y) * 72 / (width + height)) as u8;
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
-    ImageAsset::new(OUTPUT_WIDTH, OUTPUT_HEIGHT, rgba).expect("fixed synthetic image dimensions")
+    ImageAsset::new(width, height, rgba).expect("fixed synthetic image dimensions")
 }

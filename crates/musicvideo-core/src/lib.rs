@@ -14,13 +14,17 @@ pub mod spectrum;
 mod text;
 
 pub use anim::{Interpolate, easing_amount, evaluate_track};
-pub use assets::{AssetError, Assets, ImageAsset};
+pub use assets::{
+    AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,
+};
 pub use model::{
     Animatable, Fill, Fit, ImageId, Interp, Keyframe, Layer, LayerId, LayerKind, NormRect, Output,
     ProgressBarLayer, Project, Rgba8, SpectrumLayer, TextAlign, TimeFormat, TimeTextLayer, Track,
     TrackError,
 };
-pub use raster::{Frame, PixelRect, RasterError, norm_rect_to_pixels, render_frame};
+pub use raster::{
+    Frame, PixelRect, RasterError, RenderReport, UnresolvedAsset, norm_rect_to_pixels, render_frame,
+};
 pub use scene::{Scene, SceneItem, SceneItemKind, SpectrumFrame, evaluate, format_time};
 pub use spectrum::{
     MAX_SEQUENTIAL_GAP_SECS, MAX_SPECTRUM_BANDS, Smoothing, SpectrumSource, SpectrumSourceError,

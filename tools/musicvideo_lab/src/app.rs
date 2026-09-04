@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use musicvideo_core::{
-    Assets, Frame, ImageAsset, ImageId, Project, Smoothing, SpectrumFrame, SpectrumSource,
-    evaluate, render_frame,
+    Assets, Frame, ImageAsset, ImageId, Project, RenderReport, Smoothing, SpectrumFrame,
+    SpectrumSource, UnresolvedAsset, evaluate, render_frame,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -30,6 +30,7 @@ struct PreviewResult {
     revision: u64,
     image: egui::ColorImage,
     render_ms: f64,
+    report: RenderReport,
 }
 
 struct PreviewPending {
@@ -59,6 +60,7 @@ pub struct MusicVideoLabApp {
     preview_revision: u64,
     preview_texture: Option<egui::TextureHandle>,
     preview_render_ms: f64,
+    preview_report: RenderReport,
     export_pending: Option<ExportPending>,
     last_export: Option<ExportOutcome>,
 }
@@ -85,6 +87,7 @@ impl MusicVideoLabApp {
             preview_revision: 1,
             preview_texture: None,
             preview_render_ms: 0.0,
+            preview_report: RenderReport::default(),
             export_pending: None,
             last_export: None,
         }
@@ -247,7 +250,7 @@ impl MusicVideoLabApp {
                     let mut frame = Frame::new(project.output.width, project.output.height)
                         .map_err(|error| format!("プレビューを確保できません: {error}"))?;
                     let started = Instant::now();
-                    render_frame(&scene, &assets, &mut frame)
+                    let report = render_frame(&scene, &assets, &mut frame)
                         .map_err(|error| format!("プレビュー合成に失敗しました: {error}"))?;
                     let render_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -258,6 +261,7 @@ impl MusicVideoLabApp {
                         revision,
                         image,
                         render_ms,
+                        report,
                     })
                 });
                 if !worker_cancel.load(Ordering::Relaxed) {
@@ -284,6 +288,7 @@ impl MusicVideoLabApp {
                 self.preview_pending = None;
                 if result.revision == self.preview_revision {
                     self.preview_render_ms = result.render_ms;
+                    self.preview_report = result.report;
                     if let Some(texture) = &mut self.preview_texture {
                         texture.set(result.image, egui::TextureOptions::LINEAR);
                     } else {
@@ -452,6 +457,12 @@ impl eframe::App for MusicVideoLabApp {
 
             ui.separator();
             ui.label(&self.status);
+            if !self.preview_report.unresolved_assets.is_empty() {
+                ui.label(format!(
+                    "未解決素材: {}",
+                    unresolved_assets_text(&self.preview_report)
+                ));
+            }
             if let Some(path) = &self.audio_path {
                 ui.label(format!("音声: {}", path.display()));
             }
@@ -471,8 +482,16 @@ impl eframe::App for MusicVideoLabApp {
                 match outcome {
                     ExportOutcome::Completed { stats, .. } => {
                         ui.label(format!(
-                            "合成: 平均 {:.3} ms / p95 {:.3} ms / 実時間比 {:.3}x",
-                            stats.mean_ms, stats.p95_ms, stats.realtime_ratio
+                            "解析: 平均 {:.3} ms / p95 {:.3} ms",
+                            stats.analysis.mean_ms, stats.analysis.p95_ms
+                        ));
+                        ui.label(format!(
+                            "合成: 平均 {:.3} ms / p95 {:.3} ms",
+                            stats.composition.mean_ms, stats.composition.p95_ms
+                        ));
+                        ui.label(format!(
+                            "合計: 平均 {:.3} ms / p95 {:.3} ms / 実時間比 {:.3}x",
+                            stats.total.mean_ms, stats.total.p95_ms, stats.realtime_ratio
                         ));
                     }
                     ExportOutcome::Cancelled {
@@ -541,6 +560,18 @@ impl eframe::App for MusicVideoLabApp {
 fn format_clock(seconds: f64) -> String {
     let seconds = seconds.max(0.0).floor() as u64;
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn unresolved_assets_text(report: &RenderReport) -> String {
+    report
+        .unresolved_assets
+        .iter()
+        .map(|asset| match asset {
+            UnresolvedAsset::Image(id) => format!("画像 {}", id.0),
+            UnresolvedAsset::Font(key) => format!("フォント {key}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Drop for MusicVideoLabApp {

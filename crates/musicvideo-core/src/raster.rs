@@ -2,8 +2,8 @@ use std::fmt;
 
 use rayon::prelude::*;
 
-use crate::assets::{Assets, ImageAsset};
-use crate::model::{Fit, NormRect, Rgba8, TextAlign};
+use crate::assets::{AssetError, Assets, ImageAsset};
+use crate::model::{ImageId, NormRect, Rgba8, TextAlign};
 use crate::scene::{Scene, SceneItemKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,26 @@ pub struct PixelRect {
     pub y0: usize,
     pub x1: usize,
     pub y1: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UnresolvedAsset {
+    Image(ImageId),
+    Font(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use]
+pub struct RenderReport {
+    pub unresolved_assets: Vec<UnresolvedAsset>,
+}
+
+impl RenderReport {
+    fn record_unresolved(&mut self, asset: UnresolvedAsset) {
+        if !self.unresolved_assets.contains(&asset) {
+            self.unresolved_assets.push(asset);
+        }
+    }
 }
 
 impl PixelRect {
@@ -84,21 +104,36 @@ fn frame_len(width: u32, height: u32) -> Result<usize, RasterError> {
         .ok_or(RasterError::DimensionsOverflow)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RasterError {
     DimensionsOverflow,
+    Asset(AssetError),
 }
 
 impl fmt::Display for RasterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Asset(error) = self {
+            return error.fmt(f);
+        }
         f.write_str("frame dimensions overflow address space")
     }
 }
 
 impl std::error::Error for RasterError {}
 
-pub fn render_frame(scene: &Scene, assets: &Assets, frame: &mut Frame) -> Result<(), RasterError> {
+impl From<AssetError> for RasterError {
+    fn from(error: AssetError) -> Self {
+        Self::Asset(error)
+    }
+}
+
+pub fn render_frame(
+    scene: &Scene,
+    assets: &Assets,
+    frame: &mut Frame,
+) -> Result<RenderReport, RasterError> {
     frame.prepare(scene.width, scene.height)?;
+    let mut report = RenderReport::default();
     for item in &scene.items {
         let rect = norm_rect_to_pixels(item.rect, scene.width, scene.height);
         if rect.is_empty() {
@@ -107,8 +142,12 @@ pub fn render_frame(scene: &Scene, assets: &Assets, frame: &mut Frame) -> Result
         match &item.kind {
             SceneItemKind::Solid { color } => fill_rect(frame, rect, *color, item.opacity),
             SceneItemKind::Image { image, fit } => {
-                if let Some(image) = assets.image(image) {
-                    draw_image(frame, rect, &image, *fit, item.opacity);
+                if let Some(image) =
+                    assets.scaled_image(image, rect.width() as u32, rect.height() as u32, *fit)?
+                {
+                    draw_image(frame, rect, &image, item.opacity);
+                } else {
+                    report.record_unresolved(UnresolvedAsset::Image(image.clone()));
                 }
             }
             SceneItemKind::Spectrum {
@@ -147,20 +186,24 @@ pub fn render_frame(scene: &Scene, assets: &Assets, frame: &mut Frame) -> Result
                 size_px,
                 align,
                 color,
-            } => draw_text(
-                frame,
-                rect,
-                assets,
-                text,
-                font_key,
-                *size_px,
-                *align,
-                *color,
-                item.opacity,
-            ),
+            } => {
+                if !draw_text(
+                    frame,
+                    rect,
+                    assets,
+                    text,
+                    font_key,
+                    *size_px,
+                    *align,
+                    *color,
+                    item.opacity,
+                ) {
+                    report.record_unresolved(UnresolvedAsset::Font(font_key.clone()));
+                }
+            }
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 fn blend_pixel(destination: &mut [u8], source: Rgba8, opacity: f32) {
@@ -209,16 +252,16 @@ fn fill_rect_sequential(frame: &mut Frame, rect: PixelRect, color: Rgba8, opacit
     }
 }
 
-fn draw_image(frame: &mut Frame, rect: PixelRect, image: &ImageAsset, fit: Fit, opacity: f32) {
+fn draw_image(frame: &mut Frame, rect: PixelRect, image: &ImageAsset, opacity: f32) {
     if rect.is_empty() || opacity <= 0.0 {
         return;
     }
+    debug_assert_eq!(image.width as usize, rect.width());
+    debug_assert_eq!(image.height as usize, rect.height());
     if rect.x0 == 0
         && rect.y0 == 0
         && rect.x1 == frame.width as usize
         && rect.y1 == frame.height as usize
-        && image.width == frame.width
-        && image.height == frame.height
         && image.opaque
         && opacity >= 1.0
     {
@@ -226,61 +269,34 @@ fn draw_image(frame: &mut Frame, rect: PixelRect, image: &ImageAsset, fit: Fit, 
         return;
     }
 
-    let destination_w = rect.width() as f32;
-    let destination_h = rect.height() as f32;
-    let source_w = image.width as f32;
-    let source_h = image.height as f32;
-    let (draw_rect, origin_x, origin_y, scale_x, scale_y) = match fit {
-        Fit::Stretch => (
-            rect,
-            rect.x0 as f32,
-            rect.y0 as f32,
-            destination_w / source_w,
-            destination_h / source_h,
-        ),
-        Fit::Contain => {
-            let scale = (destination_w / source_w).min(destination_h / source_h);
-            let draw_w = (source_w * scale).round().max(1.0) as usize;
-            let draw_h = (source_h * scale).round().max(1.0) as usize;
-            let x0 = rect.x0 + rect.width().saturating_sub(draw_w) / 2;
-            let y0 = rect.y0 + rect.height().saturating_sub(draw_h) / 2;
-            let draw = PixelRect {
-                x0,
-                y0,
-                x1: (x0 + draw_w).min(rect.x1),
-                y1: (y0 + draw_h).min(rect.y1),
-            };
-            (
-                draw,
-                draw.x0 as f32,
-                draw.y0 as f32,
-                draw.width() as f32 / source_w,
-                draw.height() as f32 / source_h,
-            )
-        }
-        Fit::Cover => {
-            let scale = (destination_w / source_w).max(destination_h / source_h);
-            (
-                rect,
-                rect.x0 as f32 + (destination_w - source_w * scale) * 0.5,
-                rect.y0 as f32 + (destination_h - source_h * scale) * 0.5,
-                scale,
-                scale,
-            )
-        }
-    };
+    let frame_row_bytes = frame.width as usize * 4;
+    let image_row_bytes = image.width as usize * 4;
+    if image.opaque && opacity >= 1.0 {
+        frame
+            .rgba
+            .par_chunks_exact_mut(frame_row_bytes)
+            .enumerate()
+            .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
+            .for_each(|(y, row)| {
+                let source_y = y - rect.y0;
+                let source =
+                    &image.rgba[source_y * image_row_bytes..(source_y + 1) * image_row_bytes];
+                row[rect.x0 * 4..rect.x1 * 4].copy_from_slice(source);
+            });
+        return;
+    }
 
-    let row_bytes = frame.width as usize * 4;
     frame
         .rgba
-        .par_chunks_exact_mut(row_bytes)
+        .par_chunks_exact_mut(frame_row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= draw_rect.y0 && *y < draw_rect.y1)
+        .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
         .for_each(|(y, row)| {
-            let source_y = (y as f32 + 0.5 - origin_y) / scale_y - 0.5;
-            for x in draw_rect.x0..draw_rect.x1 {
-                let source_x = (x as f32 + 0.5 - origin_x) / scale_x - 0.5;
-                let pixel = sample_bilinear(image, source_x, source_y);
+            let source_y = y - rect.y0;
+            for x in rect.x0..rect.x1 {
+                let source_x = x - rect.x0;
+                let source_offset = source_y * image_row_bytes + source_x * 4;
+                let pixel = &image.rgba[source_offset..source_offset + 4];
                 blend_pixel(
                     &mut row[x * 4..x * 4 + 4],
                     Rgba8::new(pixel[0], pixel[1], pixel[2], pixel[3]),
@@ -288,27 +304,6 @@ fn draw_image(frame: &mut Frame, rect: PixelRect, image: &ImageAsset, fit: Fit, 
                 );
             }
         });
-}
-
-fn sample_bilinear(image: &ImageAsset, x: f32, y: f32) -> [u8; 4] {
-    let x = x.clamp(0.0, image.width.saturating_sub(1) as f32);
-    let y = y.clamp(0.0, image.height.saturating_sub(1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(image.width as usize - 1);
-    let y1 = (y0 + 1).min(image.height as usize - 1);
-    let tx = x - x0 as f32;
-    let ty = y - y0 as f32;
-    let pixel = |px: usize, py: usize, channel: usize| {
-        image.rgba[(py * image.width as usize + px) * 4 + channel] as f32
-    };
-    let mut result = [0; 4];
-    for (channel, output) in result.iter_mut().enumerate() {
-        let top = pixel(x0, y0, channel) * (1.0 - tx) + pixel(x1, y0, channel) * tx;
-        let bottom = pixel(x0, y1, channel) * (1.0 - tx) + pixel(x1, y1, channel) * tx;
-        *output = (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8;
-    }
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -439,9 +434,9 @@ fn draw_text(
     align: TextAlign,
     color: Rgba8,
     opacity: f32,
-) {
+) -> bool {
     let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, color) else {
-        return;
+        return false;
     };
     let logical_x = match align {
         TextAlign::Start => rect.x0 as f32,
@@ -477,11 +472,14 @@ fn draw_text(
             );
         }
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_SCALED_IMAGE_CACHE_ENTRIES;
+    use crate::model::Fit;
     use crate::scene::SceneItem;
 
     #[test]
@@ -549,8 +547,14 @@ mod tests {
         let assets = Assets::default();
         let mut first = Frame::new(1, 1).unwrap();
         let mut second = Frame::new(80, 40).unwrap();
-        render_frame(&scene, &assets, &mut first).unwrap();
-        render_frame(&scene, &assets, &mut second).unwrap();
+        assert_eq!(
+            render_frame(&scene, &assets, &mut first).unwrap(),
+            RenderReport::default()
+        );
+        assert_eq!(
+            render_frame(&scene, &assets, &mut second).unwrap(),
+            RenderReport::default()
+        );
         assert_eq!(first, second);
     }
 
@@ -558,12 +562,168 @@ mod tests {
     fn solid_layer_lands_on_expected_small_canvas_pixels() {
         let scene = positioned_scene();
         let mut frame = Frame::new(64, 36).unwrap();
-        render_frame(&scene, &Assets::default(), &mut frame).unwrap();
+        assert_eq!(
+            render_frame(&scene, &Assets::default(), &mut frame).unwrap(),
+            RenderReport::default()
+        );
 
         assert_eq!(pixel(&frame, 16, 9), &[200, 30, 40, 255]);
         assert_eq!(pixel(&frame, 47, 26), &[200, 30, 40, 255]);
         assert_eq!(pixel(&frame, 15, 9), &[0, 0, 0, 255]);
         assert_eq!(pixel(&frame, 48, 26), &[0, 0, 0, 255]);
         assert!(frame.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    fn image_scene(width: u32, height: u32, id: &str, fit: Fit) -> Scene {
+        Scene {
+            width,
+            height,
+            items: vec![SceneItem {
+                rect: NormRect::FULL,
+                opacity: 1.0,
+                kind: SceneItemKind::Image {
+                    image: ImageId::new(id),
+                    fit,
+                },
+            }],
+        }
+    }
+
+    fn patterned_image(width: u32, height: u32, seed: u8) -> ImageAsset {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    seed.wrapping_add((x * 17) as u8),
+                    seed.wrapping_add((y * 29) as u8),
+                    seed.wrapping_add(((x + y) * 11) as u8),
+                    255,
+                ]);
+            }
+        }
+        ImageAsset::new(width, height, rgba).unwrap()
+    }
+
+    #[test]
+    fn scaled_image_is_bit_exact_and_reused_after_first_render() {
+        let id = ImageId::new("background");
+        let scene = image_scene(19, 11, &id.0, Fit::Cover);
+        let assets = Assets::default();
+        assets.insert_image(id.clone(), patterned_image(31, 17, 7));
+        let mut first = Frame::new(1, 1).unwrap();
+        let mut second = Frame::new(1, 1).unwrap();
+
+        assert_eq!(
+            render_frame(&scene, &assets, &mut first).unwrap(),
+            RenderReport::default()
+        );
+        let after_first = assets.scaled_image_cache_stats();
+        assert_eq!(after_first.scale_operations, 1);
+        assert_eq!(after_first.misses, 1);
+
+        assert_eq!(
+            render_frame(&scene, &assets, &mut second).unwrap(),
+            RenderReport::default()
+        );
+        let after_second = assets.scaled_image_cache_stats();
+        assert_eq!(after_second.scale_operations, 1);
+        assert_eq!(after_second.hits, 1);
+        assert_eq!(first, second);
+
+        let cold_assets = Assets::default();
+        cold_assets.insert_image(id, patterned_image(31, 17, 7));
+        let mut cold = Frame::new(1, 1).unwrap();
+        assert_eq!(
+            render_frame(&scene, &cold_assets, &mut cold).unwrap(),
+            RenderReport::default()
+        );
+        assert_eq!(first, cold);
+    }
+
+    #[test]
+    fn scaled_image_cache_has_a_fixed_entry_bound() {
+        let id = ImageId::new("background");
+        let assets = Assets::default();
+        assets.insert_image(id.clone(), patterned_image(13, 7, 3));
+        let mut frame = Frame::new(1, 1).unwrap();
+        for index in 0..MAX_SCALED_IMAGE_CACHE_ENTRIES + 3 {
+            let scene = image_scene(20 + index as u32, 12, &id.0, Fit::Stretch);
+            assert_eq!(
+                render_frame(&scene, &assets, &mut frame).unwrap(),
+                RenderReport::default()
+            );
+        }
+
+        let stats = assets.scaled_image_cache_stats();
+        assert_eq!(stats.entries, MAX_SCALED_IMAGE_CACHE_ENTRIES);
+        assert_eq!(stats.evictions, 3);
+    }
+
+    #[test]
+    fn scaled_image_cache_key_separates_fit_modes() {
+        let id = ImageId::new("background");
+        let assets = Assets::default();
+        assets.insert_image(id.clone(), patterned_image(8, 4, 11));
+        let mut contain = Frame::new(1, 1).unwrap();
+        let mut cover = Frame::new(1, 1).unwrap();
+
+        let contain_scene = image_scene(8, 8, &id.0, Fit::Contain);
+        let cover_scene = image_scene(8, 8, &id.0, Fit::Cover);
+        assert_eq!(
+            render_frame(&contain_scene, &assets, &mut contain).unwrap(),
+            RenderReport::default()
+        );
+        assert_eq!(
+            render_frame(&cover_scene, &assets, &mut cover).unwrap(),
+            RenderReport::default()
+        );
+
+        let stats = assets.scaled_image_cache_stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.scale_operations, 2);
+        assert_ne!(contain, cover);
+    }
+
+    #[test]
+    fn replacing_an_image_invalidates_its_scaled_entries() {
+        let id = ImageId::new("background");
+        let scene = image_scene(19, 11, &id.0, Fit::Cover);
+        let assets = Assets::default();
+        let mut before = Frame::new(1, 1).unwrap();
+        let mut after = Frame::new(1, 1).unwrap();
+        assets.insert_image(id.clone(), patterned_image(31, 17, 7));
+        assert_eq!(
+            render_frame(&scene, &assets, &mut before).unwrap(),
+            RenderReport::default()
+        );
+
+        assets.insert_image(id, patterned_image(31, 17, 91));
+        assert_eq!(assets.scaled_image_cache_stats().entries, 0);
+        assert_eq!(
+            render_frame(&scene, &assets, &mut after).unwrap(),
+            RenderReport::default()
+        );
+
+        assert_eq!(assets.scaled_image_cache_stats().scale_operations, 2);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn unresolved_assets_are_reported_without_failing_the_frame() {
+        let scene = image_scene(8, 6, "missing-background", Fit::Cover);
+        let mut frame = Frame::new(1, 1).unwrap();
+
+        let report = render_frame(&scene, &Assets::default(), &mut frame).unwrap();
+
+        assert_eq!(
+            report.unresolved_assets,
+            vec![UnresolvedAsset::Image(ImageId::new("missing-background"))]
+        );
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel == [0, 0, 0, 255])
+        );
     }
 }
