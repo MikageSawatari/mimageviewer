@@ -193,7 +193,10 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musicvideo_core::{AudioRef, ImageId, ImageRef, default_project};
+    use musicvideo_core::{
+        Animatable, AudioRef, ImageId, ImageRef, Interp, Keyframe, Track, default_project,
+        new_image_layer,
+    };
 
     #[test]
     fn project_round_trip_preserves_project_and_stores_relative_asset_paths() {
@@ -222,6 +225,80 @@ mod tests {
         project.duration_secs = 20.0;
         save_project(&project_path, &project).unwrap();
         assert_eq!(load_project(&project_path).unwrap(), project);
+    }
+
+    #[test]
+    fn keyframe_round_trip_preserves_order_interpolation_and_duplicate_times() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("keyframes.mivmv.json");
+        let mut project = default_project(12.0);
+        let second_image = ImageId::new("image-1");
+        project.layers.push(new_image_layer(&project, second_image));
+        project.layers[0].opacity = Animatable::Track(
+            Track::new(vec![
+                Keyframe {
+                    t: 0.0,
+                    value: 1.0,
+                    interp: Interp::Linear,
+                },
+                Keyframe {
+                    t: 6.0,
+                    value: 1.0,
+                    interp: Interp::EaseOut,
+                },
+                Keyframe {
+                    t: 6.0,
+                    value: 0.75,
+                    interp: Interp::Step,
+                },
+                Keyframe {
+                    t: 8.0,
+                    value: 0.0,
+                    interp: Interp::EaseInOut,
+                },
+            ])
+            .unwrap(),
+        );
+        project.layers[4].opacity = Animatable::Track(
+            Track::new(vec![
+                Keyframe {
+                    t: 0.0,
+                    value: 0.0,
+                    interp: Interp::Linear,
+                },
+                Keyframe {
+                    t: 6.0,
+                    value: 0.0,
+                    interp: Interp::EaseIn,
+                },
+                Keyframe {
+                    t: 8.0,
+                    value: 1.0,
+                    interp: Interp::Linear,
+                },
+            ])
+            .unwrap(),
+        );
+
+        save_project(&project_path, &project).unwrap();
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored, project);
+        let Animatable::Track(track) = &restored.layers[0].opacity else {
+            panic!("opacity track was not restored");
+        };
+        assert_eq!(
+            track
+                .keys()
+                .iter()
+                .map(|key| (key.t, key.interp, key.value))
+                .collect::<Vec<_>>(),
+            [
+                (0.0, Interp::Linear, 1.0),
+                (6.0, Interp::EaseOut, 1.0),
+                (6.0, Interp::Step, 0.75),
+                (8.0, Interp::EaseInOut, 0.0),
+            ]
+        );
     }
 
     #[test]

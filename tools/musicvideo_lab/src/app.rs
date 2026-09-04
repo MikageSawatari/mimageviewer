@@ -5,12 +5,15 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
     Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, Project, RenderReport,
-    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate, render_frame,
+    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate, new_image_layer,
+    render_frame,
 };
 use musicvideo_ui::{
-    EditorState, MissingImageNotice, draw_editor, draw_missing_images, draw_preview,
+    EditorState, MissingImageNotice, TimelineWaveform, draw_editor, draw_missing_images,
+    draw_preview, draw_timeline,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -19,7 +22,7 @@ use crate::playback::AudioPlayer;
 use crate::project::{BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, spectrum_band_count};
 use crate::project_file::{ensure_project_extension, load_project, save_project};
 
-type AudioLoadResult = Result<(PathBuf, Arc<AudioData>), String>;
+type AudioLoadResult = Result<(PathBuf, Arc<AudioData>, TimelineWaveform), String>;
 type ImageLoadResult = Result<(ImageId, PathBuf, ImageAsset), (ImageId, String)>;
 
 struct AudioPending {
@@ -143,6 +146,7 @@ struct LoadedProject {
     path: PathBuf,
     project: Project,
     audio: Option<Arc<AudioData>>,
+    waveform: Option<TimelineWaveform>,
     images: Vec<(ImageId, ImageAsset)>,
     image_errors: HashMap<ImageId, String>,
     audio_error: Option<String>,
@@ -174,6 +178,7 @@ pub struct MusicVideoLabApp {
     project: Project,
     position_secs: f64,
     audio: Option<Arc<AudioData>>,
+    waveform: Option<TimelineWaveform>,
     audio_player: Option<AudioPlayer>,
     audio_error: Option<String>,
     project_path: Option<PathBuf>,
@@ -209,6 +214,7 @@ impl MusicVideoLabApp {
             project: default_project(DEFAULT_DURATION_SECS),
             position_secs: 0.0,
             audio: None,
+            waveform: None,
             audio_player: None,
             audio_error: None,
             project_path: None,
@@ -275,6 +281,17 @@ impl MusicVideoLabApp {
         self.preview_dirty = true;
     }
 
+    fn seek_to(&mut self, position_secs: f64) {
+        let requested = position_secs.clamp(0.0, self.project.duration_secs.max(0.0));
+        self.position_secs = if let Some(player) = &self.audio_player {
+            player.seek(requested).position_secs
+        } else {
+            requested
+        };
+        self.preview_spectrum = None;
+        self.mark_preview_dirty();
+    }
+
     fn start_audio_load(&mut self, path: PathBuf, ctx: &egui::Context) {
         if let Some(pending) = self.audio_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -287,9 +304,10 @@ impl MusicVideoLabApp {
         let spawned = std::thread::Builder::new()
             .name("musicvideo-audio-load".to_owned())
             .spawn(move || {
-                let result = decode_audio(&worker_path, &worker_cancel)
-                    .map(Arc::new)
-                    .map(|audio| (worker_path, audio));
+                let result = decode_audio(&worker_path, &worker_cancel).and_then(|audio| {
+                    let waveform = analyze_waveform(&audio, &worker_cancel)?;
+                    Ok((worker_path, Arc::new(audio), waveform))
+                });
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(result);
                     worker_ctx.request_repaint();
@@ -340,7 +358,7 @@ impl MusicVideoLabApp {
             .as_ref()
             .map(|pending| pending.rx.try_recv());
         match audio_result {
-            Some(Ok(Ok((path, audio)))) => {
+            Some(Ok(Ok((path, audio, waveform)))) => {
                 self.audio_pending = None;
                 self.project.duration_secs = audio.duration_secs;
                 self.position_secs = self.position_secs.min(audio.duration_secs);
@@ -356,6 +374,7 @@ impl MusicVideoLabApp {
                     }
                 };
                 self.audio = Some(audio);
+                self.waveform = Some(waveform);
                 if self.audio_player.is_some() {
                     self.status = "音声を読み込みました".to_owned();
                 }
@@ -720,6 +739,7 @@ impl MusicVideoLabApp {
                 self.project_path = Some(loaded.path);
                 self.position_secs = 0.0;
                 self.audio = loaded.audio;
+                self.waveform = loaded.waveform;
                 self.audio_error = loaded.audio_error.clone();
                 self.preview_spectrum = None;
                 self.image_errors = loaded.image_errors;
@@ -796,21 +816,63 @@ fn load_project_bundle(path: PathBuf, cancel: &AtomicBool) -> Result<LoadedProje
             }
         }
     }
-    let (audio, audio_error) = match &project.audio {
+    let (audio, waveform, audio_error) = match &project.audio {
         Some(reference) => match decode_audio(&reference.path, cancel) {
-            Ok(audio) => (Some(Arc::new(audio)), None),
-            Err(error) => (None, Some(error)),
+            Ok(audio) => match analyze_waveform(&audio, cancel) {
+                Ok(waveform) => (Some(Arc::new(audio)), Some(waveform), None),
+                Err(error) => (None, None, Some(error)),
+            },
+            Err(error) => (None, None, Some(error)),
         },
-        None => (None, None),
+        None => (None, None, None),
     };
     Ok(LoadedProject {
         path,
         project,
         audio,
+        waveform,
         images,
         image_errors,
         audio_error,
     })
+}
+
+fn analyze_waveform(audio: &AudioData, cancel: &AtomicBool) -> Result<TimelineWaveform, String> {
+    let analysis = analyze_stereo_waveform_cancellable(
+        &audio.stereo_pcm,
+        audio.sample_rate,
+        AnalysisConfig::default(),
+        &|| cancel.load(Ordering::Relaxed),
+    )
+    .ok_or_else(|| "音声波形の解析をキャンセルしました".to_owned())?;
+    let peaks = analysis
+        .bins
+        .iter()
+        .map(|bin| [bin.peak_l, bin.peak_r])
+        .collect();
+    Ok(TimelineWaveform::new(audio.duration_secs, peaks))
+}
+
+fn next_image_id(project: &Project) -> ImageId {
+    for number in 1_u64.. {
+        let candidate = ImageId::new(format!("image-{number}"));
+        let in_references = project.images.iter().any(|image| image.id == candidate);
+        let in_layers = project.layers.iter().any(
+            |layer| matches!(&layer.kind, LayerKind::Image { image, .. } if image == &candidate),
+        );
+        if !in_references && !in_layers {
+            return candidate;
+        }
+    }
+    unreachable!("u64 image ID space is exhausted")
+}
+
+fn image_layer_insertion_index(project: &Project) -> usize {
+    project
+        .layers
+        .iter()
+        .rposition(|layer| matches!(&layer.kind, LayerKind::Image { .. }))
+        .map_or(0, |index| index + 1)
 }
 
 fn load_image(path: &std::path::Path) -> Result<ImageAsset, String> {
@@ -876,6 +938,7 @@ impl eframe::App for MusicVideoLabApp {
         }
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
         let mut replacement_request = None;
+        let mut add_image_layer_requested = false;
         let mut reset_preview_perf = false;
 
         let egui_layout_started = Instant::now();
@@ -1079,11 +1142,7 @@ impl eframe::App for MusicVideoLabApp {
                     )
                     .changed();
                 if changed {
-                    if let Some(player) = &self.audio_player {
-                        self.position_secs = player.seek(self.position_secs).position_secs;
-                    }
-                    self.preview_spectrum = None;
-                    self.mark_preview_dirty();
+                    self.seek_to(self.position_secs);
                 }
                 ui.label(format!("合成 {:.2} ms", self.preview_render_ms));
                 if ui.small_button("計測をリセット").clicked() {
@@ -1132,13 +1191,56 @@ impl eframe::App for MusicVideoLabApp {
             .show(ctx, |ui| {
                 let response = ui
                     .add_enabled_ui(self.project_load_pending.is_none(), |ui| {
-                        draw_editor(ui, &mut self.project, &mut self.editor_state)
+                        draw_editor(
+                            ui,
+                            &mut self.project,
+                            &mut self.editor_state,
+                            self.position_secs,
+                        )
                     })
                     .inner;
+                add_image_layer_requested = response.add_image_layer_requested;
                 if response.project_changed {
                     self.mark_preview_dirty();
                 }
             });
+
+        if add_image_layer_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file()
+        {
+            let image_id = next_image_id(&self.project);
+            let mut layer = new_image_layer(&self.project, image_id.clone());
+            if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
+                layer.name = name.to_owned();
+            }
+            let insertion_index = image_layer_insertion_index(&self.project);
+            self.project.layers.insert(insertion_index, layer);
+            self.editor_state.select_layer(insertion_index);
+            self.mark_preview_dirty();
+            self.start_image_load(image_id, path, ctx);
+        }
+
+        let timeline_response = egui::TopBottomPanel::bottom("musicvideo-timeline")
+            .resizable(true)
+            .default_height(320.0)
+            .min_height(150.0)
+            .show(ctx, |ui| {
+                draw_timeline(
+                    ui,
+                    &mut self.project,
+                    &mut self.editor_state,
+                    self.position_secs,
+                    self.waveform.as_ref(),
+                )
+            })
+            .inner;
+        if let Some(position_secs) = timeline_response.seek_to {
+            self.seek_to(position_secs);
+        } else if timeline_response.project_changed {
+            self.mark_preview_dirty();
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
@@ -1245,6 +1347,49 @@ mod tests {
 
         app.mark_preview_dirty();
         assert_eq!(app.preview_revision, revision.wrapping_add(1));
+    }
+
+    #[test]
+    fn waveform_comes_from_the_shared_music_core_analysis() {
+        let audio = AudioData {
+            stereo_pcm: vec![0.25; 4_800 * 2],
+            sample_rate: 48_000,
+            duration_secs: 0.1,
+        };
+        let cancel = AtomicBool::new(false);
+        let waveform = analyze_waveform(&audio, &cancel).unwrap();
+        assert_eq!(waveform.duration_secs, 0.1);
+        assert_eq!(waveform.stereo_peaks.len(), 4);
+        assert!(
+            waveform
+                .stereo_peaks
+                .iter()
+                .all(|peak| *peak == [0.25, 0.25])
+        );
+    }
+
+    #[test]
+    fn added_image_ids_do_not_collide_with_references_or_layers() {
+        let mut project = default_project(1.0);
+        project.images.push(ImageRef {
+            id: ImageId::new("image-1"),
+            path: PathBuf::from("first.png"),
+        });
+        project
+            .layers
+            .push(new_image_layer(&project, ImageId::new("image-2")));
+        assert_eq!(next_image_id(&project), ImageId::new("image-3"));
+    }
+
+    #[test]
+    fn added_images_stay_behind_visualization_layers() {
+        let mut project = default_project(10.0);
+        assert_eq!(image_layer_insertion_index(&project), 1);
+        let layer = new_image_layer(&project, ImageId::new("image-1"));
+        let index = image_layer_insertion_index(&project);
+        project.layers.insert(index, layer);
+        assert_eq!(image_layer_insertion_index(&project), 2);
+        assert!(matches!(&project.layers[2].kind, LayerKind::Spectrum(_)));
     }
 
     #[test]

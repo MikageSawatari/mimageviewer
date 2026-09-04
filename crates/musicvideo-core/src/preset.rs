@@ -127,13 +127,7 @@ pub fn default_project(duration_secs: f64) -> Project {
 }
 
 pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
-    let next_id = project
-        .layers
-        .iter()
-        .map(|layer| layer.id.0)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
+    let next_id = next_layer_id(project);
     Layer {
         id: LayerId(next_id),
         name: "ピッチ鍵盤".to_owned(),
@@ -149,6 +143,33 @@ pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
             fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 220, 255, 255))),
         }),
     }
+}
+
+pub fn new_image_layer(project: &Project, image: ImageId) -> Layer {
+    Layer {
+        id: LayerId(next_layer_id(project)),
+        name: format!("画像 {}", image.0),
+        visible: Animatable::Const(true),
+        opacity: Animatable::Const(1.0),
+        rect: Animatable::Const(NormRect::FULL),
+        rotation: Animatable::Const(0.0),
+        corner_radius: Animatable::Const(0.0),
+        glow: Animatable::Const(None),
+        kind: LayerKind::Image {
+            image,
+            fit: Fit::Cover,
+        },
+    }
+}
+
+fn next_layer_id(project: &Project) -> u64 {
+    project
+        .layers
+        .iter()
+        .map(|layer| layer.id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 #[cfg(test)]
@@ -189,5 +210,19 @@ mod tests {
             Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0)))
         );
         assert_eq!(keyboard.color_mode, MusicColorMode::Custom);
+    }
+
+    #[test]
+    fn new_image_layer_is_full_frame_and_uses_a_unique_layer_id() {
+        let project = default_project(10.0);
+        let image = ImageId::new("image-1");
+        let layer = new_image_layer(&project, image.clone());
+        assert_eq!(layer.id, LayerId(5));
+        assert_eq!(layer.rect, Animatable::Const(NormRect::FULL));
+        assert_eq!(layer.opacity, Animatable::Const(1.0));
+        assert!(matches!(
+            layer.kind,
+            LayerKind::Image { image: stored, fit: Fit::Cover } if stored == image
+        ));
     }
 }

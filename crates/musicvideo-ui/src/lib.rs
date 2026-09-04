@@ -4,20 +4,42 @@
 
 use std::path::PathBuf;
 
+mod keyframes;
+mod timeline;
+
+pub use keyframes::{
+    AnimProperty, AnimationValue, CommandResult, EditorCommand, EditorCommandError,
+    apply_editor_command,
+};
+pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
+
 use egui::TextureHandle;
 use musicvideo_core::{
-    Animatable, Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerKind, MusicColorMode,
+    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, MusicColorMode,
     Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeySelection {
+    layer: LayerId,
+    property: AnimProperty,
+    key_index: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorState {
     selected_layer: usize,
+    selected_key: Option<KeySelection>,
+    dragging_key: Option<KeySelection>,
 }
 
 impl Default for EditorState {
     fn default() -> Self {
-        Self { selected_layer: 1 }
+        Self {
+            selected_layer: 1,
+            selected_key: None,
+            dragging_key: None,
+        }
     }
 }
 
@@ -34,12 +56,60 @@ impl EditorState {
         self.selected_layer = self
             .selected_layer
             .min(project.layers.len().saturating_sub(1));
+        let selection_exists = self.selected_key.is_some_and(|selection| {
+            project
+                .layers
+                .iter()
+                .find(|layer| layer.id == selection.layer)
+                .and_then(|layer| keyframes::animation_keys(layer, selection.property))
+                .is_some_and(|keys| selection.key_index < keys.len())
+        });
+        if !selection_exists {
+            self.selected_key = None;
+            self.dragging_key = None;
+        }
+    }
+
+    fn select_layer_id(&mut self, project: &Project, id: LayerId) {
+        if let Some(index) = project.layers.iter().position(|layer| layer.id == id) {
+            self.selected_layer = index;
+        }
+    }
+
+    fn apply_command(&mut self, project: &mut Project, command: &EditorCommand) -> bool {
+        let (layer, property) = command.target();
+        let Ok(result) = apply_editor_command(project, command) else {
+            return false;
+        };
+        if result.clear_selection
+            && self
+                .selected_key
+                .is_some_and(|selected| selected.layer == layer && selected.property == property)
+        {
+            self.selected_key = None;
+            self.dragging_key = None;
+        } else if let Some(key_index) = result.selected_key {
+            let selection = KeySelection {
+                layer,
+                property,
+                key_index,
+            };
+            self.selected_key = Some(selection);
+            if self
+                .dragging_key
+                .is_some_and(|dragging| dragging.layer == layer && dragging.property == property)
+            {
+                self.dragging_key = Some(selection);
+            }
+        }
+        result.changed
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EditorResponse {
     pub project_changed: bool,
+    pub add_image_layer_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +125,7 @@ pub fn draw_editor(
     ui: &mut egui::Ui,
     project: &mut Project,
     state: &mut EditorState,
+    current_time_secs: f64,
 ) -> EditorResponse {
     state.reconcile(project);
     let mut project_changed = ui
@@ -75,19 +146,45 @@ pub fn draw_editor(
             .clicked()
         {
             state.selected_layer = index;
+            if state
+                .selected_key
+                .is_some_and(|selected| selected.layer != layer.id)
+            {
+                state.selected_key = None;
+                state.dragging_key = None;
+            }
         }
     }
 
     if ui.button("＋ ピッチ鍵盤を追加").clicked() {
         project.layers.push(new_pitch_keyboard_layer(project));
         state.selected_layer = project.layers.len() - 1;
+        state.selected_key = None;
         project_changed = true;
     }
+    let add_image_layer_requested = ui.button("＋ 画像レイヤーを追加").clicked();
     ui.separator();
+    let mut commands = Vec::new();
+    let output = project.output;
     if let Some(layer) = project.layers.get_mut(state.selected_layer) {
-        project_changed |= edit_layer_properties(ui, layer);
+        let result = edit_layer_properties(
+            ui,
+            layer,
+            state.selected_key,
+            current_time_secs,
+            output.width,
+            output.height,
+        );
+        project_changed |= result.changed;
+        commands = result.commands;
     }
-    EditorResponse { project_changed }
+    for command in commands {
+        project_changed |= state.apply_command(project, &command);
+    }
+    EditorResponse {
+        project_changed,
+        add_image_layer_requested,
+    }
 }
 
 /// Draws the already-composited frame. Texture creation and updates stay with the caller.
@@ -135,78 +232,182 @@ pub fn draw_missing_images(ui: &mut egui::Ui, notices: &[MissingImageNotice]) ->
     replacement
 }
 
-fn edit_layer_properties(ui: &mut egui::Ui, layer: &mut Layer) -> bool {
+struct LayerEditResult {
+    changed: bool,
+    commands: Vec<EditorCommand>,
+}
+
+fn edit_layer_properties(
+    ui: &mut egui::Ui,
+    layer: &mut Layer,
+    selected_key: Option<KeySelection>,
+    current_time_secs: f64,
+    output_width: u32,
+    output_height: u32,
+) -> LayerEditResult {
     let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
-    if let Some(visible) = const_mut(&mut layer.visible) {
-        changed |= ui.checkbox(visible, "表示する").changed();
+    let mut commands = Vec::new();
+    for property in keyframes::animation_properties(layer) {
+        edit_animatable_property(
+            ui,
+            layer,
+            property,
+            selected_key,
+            current_time_secs,
+            output_width,
+            output_height,
+            &mut commands,
+        );
     }
-    if let Some(opacity) = const_mut(&mut layer.opacity) {
-        changed |= ui
-            .add(egui::Slider::new(opacity, 0.0..=1.0).text("不透明度"))
-            .changed();
-    }
-    if let Some(rotation) = const_mut(&mut layer.rotation) {
-        changed |= ui
-            .add(
-                egui::DragValue::new(rotation)
-                    .range(-180.0..=180.0)
-                    .prefix("回転 ")
-                    .suffix("°"),
-            )
-            .changed();
-    }
-    if let Some(radius) = const_mut(&mut layer.corner_radius) {
-        changed |= ui
-            .add(
-                egui::DragValue::new(radius)
-                    .range(0.0..=1000.0)
-                    .suffix(" px 角丸"),
-            )
-            .changed();
-    }
-    changed |= edit_glow(ui, &mut layer.glow);
     ui.separator();
     changed |= match &mut layer.kind {
-        LayerKind::Solid { fill } => edit_fill(ui, "塗り", fill),
-        LayerKind::Image { .. } => false,
+        LayerKind::Solid { .. } | LayerKind::Image { .. } | LayerKind::TimeText(_) => false,
         LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
-        LayerKind::PitchKeyboard(keyboard) => {
-            let mut changed = edit_fill(ui, "鍵盤の背景", &mut keyboard.background);
-            changed |= edit_music_color_mode(ui, &mut keyboard.color_mode);
-            if keyboard.color_mode == MusicColorMode::Custom {
-                changed |= edit_fill(ui, "点灯する鍵の塗り", &mut keyboard.fill);
-            }
-            changed
-        }
-        LayerKind::ProgressBar(progress) => {
-            let mut changed = ui
-                .add(
-                    egui::DragValue::new(&mut progress.border_thickness_px)
-                        .range(0.0..=100.0)
-                        .suffix(" px 枠"),
-                )
-                .changed();
-            changed |= edit_fill(ui, "進捗の塗り", &mut progress.fill);
-            changed |= edit_fill(ui, "枠の塗り", &mut progress.border_fill);
-            changed
-        }
-        LayerKind::TimeText(text) => edit_fill(ui, "文字の塗り", &mut text.fill),
+        LayerKind::PitchKeyboard(keyboard) => edit_music_color_mode(ui, &mut keyboard.color_mode),
+        LayerKind::ProgressBar(progress) => ui
+            .add(
+                egui::DragValue::new(&mut progress.border_thickness_px)
+                    .range(0.0..=100.0)
+                    .suffix(" px 枠"),
+            )
+            .changed(),
     };
+    LayerEditResult { changed, commands }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_animatable_property(
+    ui: &mut egui::Ui,
+    layer: &Layer,
+    property: AnimProperty,
+    selected_key: Option<KeySelection>,
+    current_time_secs: f64,
+    output_width: u32,
+    output_height: u32,
+    commands: &mut Vec<EditorCommand>,
+) {
+    let keys = keyframes::animation_keys(layer, property).unwrap_or_default();
+    let selected_index = selected_key
+        .filter(|selected| selected.layer == layer.id && selected.property == property)
+        .map(|selected| selected.key_index);
+    let Some(mut value) =
+        keyframes::animation_value(layer, property, current_time_secs, selected_index)
+    else {
+        return;
+    };
+    egui::CollapsingHeader::new(property.label())
+        .id_salt(("animatable-property", layer.id.0, property))
+        .default_open(matches!(
+            property,
+            AnimProperty::Visible | AnimProperty::Opacity | AnimProperty::Rect
+        ))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(if keys.is_empty() {
+                    "定数".to_owned()
+                } else {
+                    format!("トラック ({} キー)", keys.len())
+                });
+                if ui.button("◆ 現在にキー").clicked() {
+                    commands.push(EditorCommand::AddKey {
+                        layer: layer.id,
+                        property,
+                        t: current_time_secs,
+                    });
+                }
+                if !keys.is_empty() && ui.button("定数に戻す").clicked() {
+                    commands.push(EditorCommand::CollapseToConst {
+                        layer: layer.id,
+                        property,
+                        t: current_time_secs,
+                    });
+                }
+                if let Some(index) = selected_index {
+                    ui.label(format!("選択キー #{}", index + 1));
+                }
+            });
+            if edit_animation_value(ui, property, &mut value, output_width, output_height) {
+                commands.push(EditorCommand::SetValue {
+                    layer: layer.id,
+                    property,
+                    t: current_time_secs,
+                    key_index: selected_index,
+                    value,
+                });
+            }
+        });
+}
+
+fn edit_animation_value(
+    ui: &mut egui::Ui,
+    property: AnimProperty,
+    value: &mut AnimationValue,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    match (property, value) {
+        (AnimProperty::Visible, AnimationValue::Bool(value)) => {
+            ui.checkbox(value, "表示する").changed()
+        }
+        (AnimProperty::Opacity, AnimationValue::Float(value)) => ui
+            .add(egui::Slider::new(value, 0.0..=1.0).text("不透明度"))
+            .changed(),
+        (AnimProperty::Rotation, AnimationValue::Float(value)) => ui
+            .add(
+                egui::DragValue::new(value)
+                    .range(-180.0..=180.0)
+                    .suffix("°"),
+            )
+            .changed(),
+        (AnimProperty::CornerRadius, AnimationValue::Float(value)) => {
+            drag_pixels(ui, "半径", value, 0.0..=1000.0)
+        }
+        (AnimProperty::Rect, AnimationValue::Rect(rect)) => {
+            edit_rect(ui, rect, output_width, output_height)
+        }
+        (AnimProperty::Glow, AnimationValue::Glow(glow)) => edit_glow(ui, glow),
+        (_, AnimationValue::Fill(fill)) => edit_fill(ui, fill),
+        _ => false,
+    }
+}
+
+fn edit_rect(
+    ui: &mut egui::Ui,
+    rect: &mut musicvideo_core::NormRect,
+    width: u32,
+    height: u32,
+) -> bool {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let mut pixels = [
+        rect.x * width,
+        rect.y * height,
+        rect.width * width,
+        rect.height * height,
+    ];
+    let mut changed = false;
+    for (label, value) in ["X", "Y", "幅", "高さ"].into_iter().zip(&mut pixels) {
+        changed |= ui
+            .add(
+                egui::DragValue::new(value)
+                    .speed(1.0)
+                    .prefix(format!("{label} "))
+                    .suffix(" px"),
+            )
+            .changed();
+    }
+    if changed {
+        *rect = musicvideo_core::NormRect::new(
+            pixels[0] / width,
+            pixels[1] / height,
+            (pixels[2] / width).max(0.0),
+            (pixels[3] / height).max(0.0),
+        );
+    }
     changed
 }
 
-fn const_mut<T>(value: &mut Animatable<T>) -> Option<&mut T> {
-    match value {
-        Animatable::Const(value) => Some(value),
-        Animatable::Track(_) => None,
-    }
-}
-
-fn edit_glow(ui: &mut egui::Ui, value: &mut Animatable<Option<Glow>>) -> bool {
-    let Some(glow) = const_mut(value) else {
-        ui.label("グローのキーフレーム編集は P3 で対応します");
-        return false;
-    };
+fn edit_glow(ui: &mut egui::Ui, glow: &mut Option<Glow>) -> bool {
     let mut enabled = glow.is_some();
     let mut changed = ui.checkbox(&mut enabled, "グロー").changed();
     if enabled && glow.is_none() {
@@ -334,9 +535,6 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
         }
     }
     changed |= edit_music_color_mode(ui, &mut spectrum.color_mode);
-    if spectrum.color_mode == MusicColorMode::Custom {
-        changed |= edit_fill(ui, "スペクトラムの塗り", &mut spectrum.fill);
-    }
     changed
 }
 
@@ -380,61 +578,53 @@ enum FillKind {
     Band,
 }
 
-fn edit_fill(ui: &mut egui::Ui, label: &str, value: &mut Animatable<Fill>) -> bool {
-    let Some(fill) = const_mut(value) else {
-        ui.label(format!("{label}: キーフレーム編集は P3 で対応します"));
-        return false;
+fn edit_fill(ui: &mut egui::Ui, fill: &mut Fill) -> bool {
+    let mut kind = match fill {
+        Fill::Solid(_) => FillKind::Solid,
+        Fill::LinearGradient { .. } => FillKind::Linear,
+        Fill::RadialGradient { .. } => FillKind::Radial,
+        Fill::BandGradient { .. } => FillKind::Band,
     };
-    ui.collapsing(label, |ui| {
-        let mut kind = match fill {
-            Fill::Solid(_) => FillKind::Solid,
-            Fill::LinearGradient { .. } => FillKind::Linear,
-            Fill::RadialGradient { .. } => FillKind::Radial,
-            Fill::BandGradient { .. } => FillKind::Band,
-        };
-        let previous = kind;
-        egui::ComboBox::from_id_salt(("fill-kind", label))
-            .selected_text(fill_kind_label(kind))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut kind, FillKind::Solid, "単色");
-                ui.selectable_value(&mut kind, FillKind::Linear, "線形グラデーション");
-                ui.selectable_value(&mut kind, FillKind::Radial, "放射グラデーション");
-                ui.selectable_value(&mut kind, FillKind::Band, "バンドグラデーション");
-            });
-        let mut changed = kind != previous;
-        if changed {
-            *fill = default_fill(kind);
+    let previous = kind;
+    egui::ComboBox::from_id_salt("fill-kind")
+        .selected_text(fill_kind_label(kind))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut kind, FillKind::Solid, "単色");
+            ui.selectable_value(&mut kind, FillKind::Linear, "線形グラデーション");
+            ui.selectable_value(&mut kind, FillKind::Radial, "放射グラデーション");
+            ui.selectable_value(&mut kind, FillKind::Band, "バンドグラデーション");
+        });
+    let mut changed = kind != previous;
+    if changed {
+        *fill = default_fill(kind);
+    }
+    match fill {
+        Fill::Solid(color) => changed |= edit_color(ui, "色", color),
+        Fill::LinearGradient { stops, angle_deg } => {
+            changed |= ui
+                .add(egui::DragValue::new(angle_deg).suffix("° 角度"))
+                .changed();
+            changed |= edit_gradient_stops(ui, stops);
         }
-        match fill {
-            Fill::Solid(color) => changed |= edit_color(ui, "色", color),
-            Fill::LinearGradient { stops, angle_deg } => {
-                changed |= ui
-                    .add(egui::DragValue::new(angle_deg).suffix("° 角度"))
-                    .changed();
-                changed |= edit_gradient_stops(ui, stops);
-            }
-            Fill::RadialGradient {
-                stops,
-                center,
-                radius,
-            } => {
-                changed |= ui
-                    .add(egui::Slider::new(&mut center.0, 0.0..=1.0).text("中心 X "))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut center.1, 0.0..=1.0).text("中心 Y "))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(radius, 0.01..=2.0).text("半径"))
-                    .changed();
-                changed |= edit_gradient_stops(ui, stops);
-            }
-            Fill::BandGradient { stops } => changed |= edit_gradient_stops(ui, stops),
+        Fill::RadialGradient {
+            stops,
+            center,
+            radius,
+        } => {
+            changed |= ui
+                .add(egui::Slider::new(&mut center.0, 0.0..=1.0).text("中心 X "))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut center.1, 0.0..=1.0).text("中心 Y "))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(radius, 0.01..=2.0).text("半径"))
+                .changed();
+            changed |= edit_gradient_stops(ui, stops);
         }
-        changed
-    })
-    .body_returned
-    .unwrap_or(false)
+        Fill::BandGradient { stops } => changed |= edit_gradient_stops(ui, stops),
+    }
+    changed
 }
 
 fn fill_kind_label(kind: FillKind) -> &'static str {
@@ -520,7 +710,7 @@ fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musicvideo_core::default_project;
+    use musicvideo_core::{Animatable, default_project};
 
     #[test]
     fn new_keyboard_layer_uses_a_transparent_background_and_unique_id() {
