@@ -19,14 +19,14 @@ pub use assets::{
     AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,
 };
 pub use model::{
-    Animatable, Fill, Fit, Glow, GradientStop, GradientStops, GradientStopsError, ImageId, Interp,
-    Keyframe, Layer, LayerId, LayerKind, NormRect, Output, PitchKeyboardLayer, ProgressBarLayer,
-    Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TimeFormat,
-    TimeTextLayer, Track, TrackError,
+    Animatable, AudioRef, Fill, Fit, Glow, GradientStop, GradientStops, GradientStopsError,
+    ImageId, ImageRef, Interp, Keyframe, Layer, LayerId, LayerKind, NormRect, Output,
+    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    SpectrumShape, TextAlign, TimeFormat, TimeTextLayer, Track, TrackError,
 };
 pub use preset::{
     DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, DEFAULT_OUTPUT, DEFAULT_SPECTRUM_BANDS,
-    default_project,
+    PROJECT_VERSION, default_project, new_pitch_keyboard_layer,
 };
 pub use raster::{
     Frame, PixelRect, RasterError, RenderReport, UnresolvedAsset, norm_rect_to_pixels, render_frame,

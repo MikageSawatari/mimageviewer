@@ -71,6 +71,7 @@ pub enum SceneItemKind {
     },
     PitchKeyboard {
         keyboard: KeyboardFrame,
+        background: Fill,
         fill: Fill,
     },
     ProgressBar {
@@ -141,6 +142,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             }
             LayerKind::PitchKeyboard(layer) => SceneItemKind::PitchKeyboard {
                 keyboard: spectrum.keyboard.clone(),
+                background: layer.background.evaluate(time),
                 fill: layer.fill.evaluate(time),
             },
             LayerKind::ProgressBar(layer) => SceneItemKind::ProgressBar {

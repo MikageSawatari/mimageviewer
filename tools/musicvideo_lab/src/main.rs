@@ -11,7 +11,9 @@ use musicvideo_core::Assets;
 mod app;
 mod decode;
 mod export;
+mod playback;
 mod project;
+mod project_file;
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -342,10 +342,15 @@ fn draw_item(
             item.corner_radius_px,
             mask_mode,
         ),
-        SceneItemKind::PitchKeyboard { keyboard, fill } => draw_pitch_keyboard(
+        SceneItemKind::PitchKeyboard {
+            keyboard,
+            background,
+            fill,
+        } => draw_pitch_keyboard(
             frame,
             rect,
             keyboard,
+            background,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -864,27 +869,20 @@ fn draw_pitch_keyboard(
     frame: &mut Frame,
     rect: PixelRect,
     keyboard: &KeyboardFrame,
+    background: &Fill,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
     mask_mode: bool,
 ) {
-    let background = if mask_mode {
-        Rgba8::WHITE
-    } else {
-        Rgba8::BLACK
-    };
     draw_filled_rect(
         frame,
         rect,
-        &Fill::Solid(background),
+        background,
         opacity,
         corner_radius_px,
         mask_mode,
     );
-    if mask_mode {
-        return;
-    }
 
     let sampler = FillSampler::new(fill, rect);
     KEYBOARD_LAYOUT_CACHE.with(|cache| {
@@ -900,10 +898,18 @@ fn draw_pitch_keyboard(
             &mut cache,
         );
         for &x in &layout.octave_guides_x {
-            draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px);
+            draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px, mask_mode);
         }
         for &key in &layout.keys {
-            draw_keyboard_key(frame, rect, key, &sampler, opacity, corner_radius_px);
+            draw_keyboard_key(
+                frame,
+                rect,
+                key,
+                &sampler,
+                opacity,
+                corner_radius_px,
+                mask_mode,
+            );
         }
     });
 }
@@ -914,11 +920,16 @@ fn draw_keyboard_guide(
     x: f32,
     opacity: f32,
     corner_radius_px: f32,
+    mask_mode: bool,
 ) {
     let min_x = (x - 1.0).floor().max(clip.x0 as f32) as usize;
     let max_x = (x + 1.0).ceil().min(clip.x1 as f32) as usize;
     let width = frame.width as usize;
-    let color = Rgba8::new(120, 134, 148, 82);
+    let color = if mask_mode {
+        Rgba8::WHITE
+    } else {
+        Rgba8::new(120, 134, 148, 82)
+    };
     for y in clip.y0..clip.y1 {
         for pixel_x in min_x..max_x {
             let px = pixel_x as f32 + 0.5;
@@ -945,6 +956,7 @@ fn draw_keyboard_key(
     sampler: &FillSampler<'_>,
     opacity: f32,
     corner_radius_px: f32,
+    mask_mode: bool,
 ) {
     let min_x = key.rect.left.floor().max(clip.x0 as f32) as usize;
     let min_y = key.rect.top.floor().max(clip.y0 as f32) as usize;
@@ -970,7 +982,9 @@ fn draw_keyboard_key(
             if coverage <= 0.0 {
                 continue;
             }
-            let color = if key.real_key {
+            let color = if mask_mode {
+                Rgba8::WHITE
+            } else if key.real_key {
                 let level = keyboard_vertical_level(key, py);
                 let active = sampler.sample(px, py, band_position, false);
                 let amount = (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
@@ -984,6 +998,10 @@ fn draw_keyboard_key(
                 color,
                 opacity * coverage,
             );
+
+            if mask_mode {
+                continue;
+            }
 
             let inner = KeyboardRect::new(
                 key.rect.left + stroke_width,
@@ -2148,6 +2166,7 @@ mod tests {
             glow,
             kind: SceneItemKind::PitchKeyboard {
                 keyboard: keyboard.clone(),
+                background: Fill::Solid(Rgba8::BLACK),
                 fill: Fill::Solid(fill),
             },
         };
@@ -2231,6 +2250,48 @@ mod tests {
                 coverage > 0.0 && coverage < 1.0
             })
         }));
+    }
+
+    #[test]
+    fn transparent_keyboard_background_preserves_pixels_behind_the_layer() {
+        let base = Rgba8::new(17, 33, 65, 255);
+        let render = |background| {
+            let keyboard_rect = NormRect::new(0.1, 0.2, 0.8, 0.6);
+            let scene = Scene {
+                width: 320,
+                height: 80,
+                items: vec![
+                    item(SceneItemKind::Solid {
+                        fill: Fill::Solid(base),
+                    }),
+                    SceneItem {
+                        rect: keyboard_rect,
+                        opacity: 1.0,
+                        rotation_deg: 0.0,
+                        corner_radius_px: 0.0,
+                        glow: None,
+                        kind: SceneItemKind::PitchKeyboard {
+                            keyboard: KeyboardFrame::default(),
+                            background: Fill::Solid(background),
+                            fill: Fill::Solid(Rgba8::WHITE),
+                        },
+                    },
+                ],
+            };
+            let rect = norm_rect_to_pixels(keyboard_rect, scene.width, scene.height);
+            let mut frame = Frame::new(1, 1).unwrap();
+            let _ = render_frame(&scene, &Assets::default(), &mut frame).unwrap();
+            (frame, rect)
+        };
+
+        let (transparent, rect) = render(Rgba8::new(0, 0, 0, 0));
+        let (opaque, _) = render(Rgba8::BLACK);
+        assert!((rect.y0..rect.y1).any(|y| {
+            (rect.x0..rect.x1).any(|x| pixel(&transparent, x, y) != pixel(&opaque, x, y))
+        }));
+        let transparent_energy: u64 = transparent.rgba.iter().map(|value| u64::from(*value)).sum();
+        let opaque_energy: u64 = opaque.rgba.iter().map(|value| u64::from(*value)).sum();
+        assert!(transparent_energy > opaque_energy);
     }
 
     #[test]

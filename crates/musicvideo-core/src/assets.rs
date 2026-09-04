@@ -160,6 +160,22 @@ impl Assets {
             .contains_key(id)
     }
 
+    /// Removes an image and every prepared size derived from it.
+    pub fn remove_image(&self, id: &ImageId) -> bool {
+        let removed = self
+            .images
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id)
+            .is_some();
+        self.scaled_images
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .retain(|entry| &entry.key.image != id);
+        removed
+    }
+
     /// Returns an image rasterized for this ID, destination size, and fit mode.
     pub(crate) fn scaled_image(
         &self,

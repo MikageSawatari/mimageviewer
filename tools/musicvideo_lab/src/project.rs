@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use comic_core::{FontSet, LoadedFont};
 use eframe::egui;
-use musicvideo_core::{
-    Animatable, Assets, Fill, ImageAsset, Layer, LayerId, LayerKind, NormRect, PitchKeyboardLayer,
-    Project, Rgba8,
-};
+use musicvideo_core::{Assets, ImageAsset, LayerKind, Project};
 
 pub use musicvideo_core::{
     DEFAULT_BACKGROUND_IMAGE_ID as BACKGROUND_ID, DEFAULT_FONT_KEY, default_project,
+    new_pitch_keyboard_layer,
 };
 
 pub const DEFAULT_DURATION_SECS: f64 = 10.0;
@@ -23,29 +21,6 @@ pub fn spectrum_band_count(project: &Project) -> usize {
         })
         .max()
         .unwrap_or(1)
-}
-
-pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
-    let next_id = project
-        .layers
-        .iter()
-        .map(|layer| layer.id.0)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    Layer {
-        id: LayerId(next_id),
-        name: "ピッチ鍵盤".to_owned(),
-        visible: Animatable::Const(true),
-        opacity: Animatable::Const(1.0),
-        rect: Animatable::Const(NormRect::new(0.05, 0.72, 0.9, 0.08)),
-        rotation: Animatable::Const(0.0),
-        corner_radius: Animatable::Const(4.0),
-        glow: Animatable::Const(None),
-        kind: LayerKind::PitchKeyboard(PitchKeyboardLayer {
-            fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 220, 255, 255))),
-        }),
-    }
 }
 
 #[derive(Clone)]

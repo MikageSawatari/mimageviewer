@@ -1,7 +1,7 @@
 use crate::model::{
     Animatable, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind, NormRect, Output,
-    ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign,
-    TimeFormat, TimeTextLayer,
+    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    SpectrumShape, TextAlign, TimeFormat, TimeTextLayer,
 };
 
 pub const DEFAULT_BACKGROUND_IMAGE_ID: &str = "background";
@@ -12,6 +12,7 @@ pub const DEFAULT_OUTPUT: Output = Output {
     fps: 60.0,
 };
 pub const DEFAULT_SPECTRUM_BANDS: usize = 96;
+pub const PROJECT_VERSION: u32 = 1;
 
 /// Builds the shared §1.4 reference scene used by preview and MP4 export.
 pub fn default_project(duration_secs: f64) -> Project {
@@ -45,7 +46,9 @@ pub fn default_project(duration_secs: f64) -> Project {
         0.0
     };
     Project {
-        version: 1,
+        version: PROJECT_VERSION,
+        audio: None,
+        images: Vec::new(),
         output: DEFAULT_OUTPUT,
         duration_secs,
         layers: vec![
@@ -121,6 +124,30 @@ pub fn default_project(duration_secs: f64) -> Project {
     }
 }
 
+pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
+    let next_id = project
+        .layers
+        .iter()
+        .map(|layer| layer.id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    Layer {
+        id: LayerId(next_id),
+        name: "ピッチ鍵盤".to_owned(),
+        visible: Animatable::Const(true),
+        opacity: Animatable::Const(1.0),
+        rect: Animatable::Const(NormRect::new(0.05, 0.72, 0.9, 0.08)),
+        rotation: Animatable::Const(0.0),
+        corner_radius: Animatable::Const(4.0),
+        glow: Animatable::Const(None),
+        kind: LayerKind::PitchKeyboard(PitchKeyboardLayer {
+            background: Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0))),
+            fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 220, 255, 255))),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +169,19 @@ mod tests {
         assert!(matches!(spectrum.shape, SpectrumShape::Radial { .. }));
         assert_eq!(project.layers[2].corner_radius, Animatable::Const(20.0));
         assert_eq!(project.layers[3].glow.evaluate(0.0).unwrap().radius_px, 5.0);
+    }
+
+    #[test]
+    fn new_pitch_keyboard_background_is_transparent() {
+        let project = default_project(10.0);
+        let layer = new_pitch_keyboard_layer(&project);
+        assert_eq!(layer.id, LayerId(5));
+        let LayerKind::PitchKeyboard(keyboard) = layer.kind else {
+            panic!("追加レイヤはピッチ鍵盤である必要があります");
+        };
+        assert_eq!(
+            keyboard.background,
+            Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0)))
+        );
     }
 }

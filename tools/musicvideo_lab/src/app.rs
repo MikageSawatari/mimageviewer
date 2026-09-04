@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -5,20 +6,21 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use musicvideo_core::{
-    Animatable, Assets, Fill, Frame, Glow, GradientStop, GradientStops, ImageAsset, ImageId, Layer,
-    LayerKind, Project, RenderReport, Rgba8, Smoothing, SpectrumDirection, SpectrumFrame,
-    SpectrumLayer, SpectrumShape, SpectrumSource, UnresolvedAsset, evaluate, render_frame,
+    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, Project, RenderReport,
+    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate, render_frame,
+};
+use musicvideo_ui::{
+    EditorState, MissingImageNotice, draw_editor, draw_missing_images, draw_preview,
 };
 
 use crate::decode::{AudioData, decode_audio};
 use crate::export::{ExportOutcome, export_png_sequence, frame_count};
-use crate::project::{
-    BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, new_pitch_keyboard_layer,
-    spectrum_band_count,
-};
+use crate::playback::AudioPlayer;
+use crate::project::{BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, spectrum_band_count};
+use crate::project_file::{ensure_project_extension, load_project, save_project};
 
 type AudioLoadResult = Result<(PathBuf, Arc<AudioData>), String>;
-type ImageLoadResult = Result<(PathBuf, ImageAsset), String>;
+type ImageLoadResult = Result<(ImageId, PathBuf, ImageAsset), (ImageId, String)>;
 
 struct AudioPending {
     cancel: Arc<AtomicBool>,
@@ -35,6 +37,25 @@ struct PreviewResult {
     image: egui::ColorImage,
     render_ms: f64,
     report: RenderReport,
+    spectrum: Option<SpectrumSource>,
+}
+
+struct LoadedProject {
+    path: PathBuf,
+    project: Project,
+    audio: Option<Arc<AudioData>>,
+    images: Vec<(ImageId, ImageAsset)>,
+    image_errors: HashMap<ImageId, String>,
+    audio_error: Option<String>,
+}
+
+struct ProjectLoadPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Result<LoadedProject, String>>,
+}
+
+struct ProjectSavePending {
+    rx: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
 struct PreviewPending {
@@ -54,8 +75,10 @@ pub struct MusicVideoLabApp {
     project: Project,
     position_secs: f64,
     audio: Option<Arc<AudioData>>,
-    audio_path: Option<PathBuf>,
-    image_path: Option<PathBuf>,
+    audio_player: Option<AudioPlayer>,
+    audio_error: Option<String>,
+    project_path: Option<PathBuf>,
+    image_errors: HashMap<ImageId, String>,
     status: String,
     audio_pending: Option<AudioPending>,
     image_pending: Option<ImagePending>,
@@ -65,9 +88,12 @@ pub struct MusicVideoLabApp {
     preview_texture: Option<egui::TextureHandle>,
     preview_render_ms: f64,
     preview_report: RenderReport,
+    preview_spectrum: Option<SpectrumSource>,
     export_pending: Option<ExportPending>,
     last_export: Option<ExportOutcome>,
-    selected_layer: usize,
+    editor_state: EditorState,
+    project_load_pending: Option<ProjectLoadPending>,
+    project_save_pending: Option<ProjectSavePending>,
 }
 
 impl MusicVideoLabApp {
@@ -82,8 +108,10 @@ impl MusicVideoLabApp {
             project: default_project(DEFAULT_DURATION_SECS),
             position_secs: 0.0,
             audio: None,
-            audio_path: None,
-            image_path: None,
+            audio_player: None,
+            audio_error: None,
+            project_path: None,
+            image_errors: HashMap::new(),
             status,
             audio_pending: None,
             image_pending: None,
@@ -93,9 +121,12 @@ impl MusicVideoLabApp {
             preview_texture: None,
             preview_render_ms: 0.0,
             preview_report: RenderReport::default(),
+            preview_spectrum: None,
             export_pending: None,
             last_export: None,
-            selected_layer: 1,
+            editor_state: EditorState::default(),
+            project_load_pending: None,
+            project_save_pending: None,
         }
     }
 
@@ -105,6 +136,11 @@ impl MusicVideoLabApp {
         if let Some(pending) = &self.preview_pending {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    fn schedule_playback_preview(&mut self) {
+        self.preview_revision = self.preview_revision.wrapping_add(1);
+        self.preview_dirty = true;
     }
 
     fn start_audio_load(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -136,7 +172,7 @@ impl MusicVideoLabApp {
         }
     }
 
-    fn start_image_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+    fn start_image_load(&mut self, id: ImageId, path: PathBuf, ctx: &egui::Context) {
         if let Some(pending) = self.image_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -144,18 +180,14 @@ impl MusicVideoLabApp {
         let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let worker_path = path.clone();
+        let worker_id = id.clone();
         let worker_ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("musicvideo-image-load".to_owned())
             .spawn(move || {
-                let result = image::open(&worker_path)
-                    .map_err(|error| format!("背景画像を読み込めません: {error}"))
-                    .and_then(|image| {
-                        let image = image.to_rgba8();
-                        ImageAsset::new(image.width(), image.height(), image.into_raw())
-                            .map_err(|error| format!("背景画像を保持できません: {error}"))
-                    })
-                    .map(|image| (worker_path, image));
+                let result = load_image(&worker_path)
+                    .map(|image| (worker_id.clone(), worker_path, image))
+                    .map_err(|error| (worker_id, error));
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(result);
                     worker_ctx.request_repaint();
@@ -163,7 +195,7 @@ impl MusicVideoLabApp {
             });
         match spawned {
             Ok(_) => {
-                self.status = format!("背景画像を読み込んでいます: {}", path.display());
+                self.status = format!("画像を読み込んでいます: {}", path.display());
                 self.image_pending = Some(ImagePending { cancel, rx });
             }
             Err(error) => self.status = format!("画像読み込みワーカーを開始できません: {error}"),
@@ -180,9 +212,21 @@ impl MusicVideoLabApp {
                 self.audio_pending = None;
                 self.project.duration_secs = audio.duration_secs;
                 self.position_secs = self.position_secs.min(audio.duration_secs);
-                self.audio_path = Some(path);
+                self.project.audio = Some(AudioRef { path });
+                self.audio_error = None;
+                self.preview_spectrum = None;
+                self.audio_player = match AudioPlayer::new(Arc::clone(&audio)) {
+                    Ok(player) => Some(player),
+                    Err(error) => {
+                        self.status =
+                            format!("音声は読み込みましたが再生を開始できません: {error}");
+                        None
+                    }
+                };
                 self.audio = Some(audio);
-                self.status = "音声を読み込みました".to_owned();
+                if self.audio_player.is_some() {
+                    self.status = "音声を読み込みました".to_owned();
+                }
                 self.mark_preview_dirty();
             }
             Some(Ok(Err(error))) => {
@@ -200,15 +244,24 @@ impl MusicVideoLabApp {
             .as_ref()
             .map(|pending| pending.rx.try_recv());
         match image_result {
-            Some(Ok(Ok((path, image)))) => {
+            Some(Ok(Ok((id, path, image)))) => {
                 self.image_pending = None;
-                self.assets.insert_image(ImageId::new(BACKGROUND_ID), image);
-                self.image_path = Some(path);
-                self.status = "背景画像を読み込みました".to_owned();
+                self.assets.insert_image(id.clone(), image);
+                if let Some(reference) = self.project.images.iter_mut().find(|item| item.id == id) {
+                    reference.path = path;
+                } else {
+                    self.project.images.push(ImageRef {
+                        id: id.clone(),
+                        path,
+                    });
+                }
+                self.image_errors.remove(&id);
+                self.status = "画像を読み込みました".to_owned();
                 self.mark_preview_dirty();
             }
-            Some(Ok(Err(error))) => {
+            Some(Ok(Err((id, error)))) => {
                 self.image_pending = None;
+                self.image_errors.insert(id, error.clone());
                 self.status = error;
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -227,6 +280,7 @@ impl MusicVideoLabApp {
         let project = self.project.clone();
         let position_secs = self.position_secs;
         let audio = self.audio.clone();
+        let previous_spectrum = self.preview_spectrum.take();
         let assets = Arc::clone(&self.assets);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -240,20 +294,26 @@ impl MusicVideoLabApp {
                 }
                 let band_count = spectrum_band_count(&project);
                 let spectrum_frame = match audio {
-                    Some(audio) => SpectrumSource::new(
-                        audio.sample_rate,
-                        band_count,
-                        Smoothing::Average { factor: 0.7 },
-                    )
-                    .map(|mut source| {
-                        source
+                    Some(audio) => (|| {
+                        let mut source = match previous_spectrum
+                            .filter(|source| source.band_count() == band_count)
+                        {
+                            Some(source) => source,
+                            None => SpectrumSource::new(
+                                audio.sample_rate,
+                                band_count,
+                                Smoothing::Average { factor: 0.7 },
+                            )
+                            .map_err(|error| format!("スペクトラム解析に失敗しました: {error}"))?,
+                        };
+                        let frame = source
                             .full_frame_at(&audio.stereo_pcm, position_secs, 0.0)
-                            .clone()
-                    })
-                    .map_err(|error| format!("スペクトラム解析に失敗しました: {error}")),
-                    None => Ok(SpectrumFrame::new(vec![0.0; band_count])),
+                            .clone();
+                        Ok((frame, Some(source)))
+                    })(),
+                    None => Ok((SpectrumFrame::new(vec![0.0; band_count]), None)),
                 };
-                let result = spectrum_frame.and_then(|spectrum_frame| {
+                let result = spectrum_frame.and_then(|(spectrum_frame, spectrum)| {
                     if worker_cancel.load(Ordering::Relaxed) {
                         return Err("プレビューをキャンセルしました".to_owned());
                     }
@@ -273,6 +333,7 @@ impl MusicVideoLabApp {
                         image,
                         render_ms,
                         report,
+                        spectrum,
                     })
                 });
                 if !worker_cancel.load(Ordering::Relaxed) {
@@ -298,6 +359,7 @@ impl MusicVideoLabApp {
             Some(Ok(Ok(result))) => {
                 self.preview_pending = None;
                 if result.revision == self.preview_revision {
+                    self.preview_spectrum = result.spectrum;
                     self.preview_render_ms = result.render_ms;
                     self.preview_report = result.report;
                     if let Some(texture) = &mut self.preview_texture {
@@ -410,6 +472,221 @@ impl MusicVideoLabApp {
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
     }
+
+    fn start_project_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if let Some(pending) = self.project_load_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_ctx = ctx.clone();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("musicvideo-project-load".to_owned())
+            .spawn(move || {
+                let result = load_project_bundle(worker_path, &worker_cancel);
+                if !worker_cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                    worker_ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.status = format!("プロジェクトを読み込んでいます: {}", path.display());
+                self.project_load_pending = Some(ProjectLoadPending { cancel, rx });
+            }
+            Err(error) => {
+                self.status = format!("プロジェクト読込ワーカーを開始できません: {error}");
+            }
+        }
+    }
+
+    fn start_project_save(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.project_save_pending.is_some() {
+            return;
+        }
+        let project = self.project.clone();
+        let worker_ctx = ctx.clone();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("musicvideo-project-save".to_owned())
+            .spawn(move || {
+                let result = save_project(&worker_path, &project).map(|()| worker_path);
+                let _ = tx.send(result);
+                worker_ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.status = format!("プロジェクトを保存しています: {}", path.display());
+                self.project_save_pending = Some(ProjectSavePending { rx });
+            }
+            Err(error) => {
+                self.status = format!("プロジェクト保存ワーカーを開始できません: {error}");
+            }
+        }
+    }
+
+    fn poll_projects(&mut self) {
+        let load_result = self
+            .project_load_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv());
+        match load_result {
+            Some(Ok(Ok(loaded))) => {
+                self.project_load_pending = None;
+                if let Some(pending) = self.audio_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(pending) = self.image_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(player) = &self.audio_player {
+                    player.pause();
+                }
+                for image in self.project.images.iter().chain(&loaded.project.images) {
+                    self.assets.remove_image(&image.id);
+                }
+                for (id, image) in loaded.images {
+                    self.assets.insert_image(id, image);
+                }
+                self.project = loaded.project;
+                self.project_path = Some(loaded.path);
+                self.position_secs = 0.0;
+                self.audio = loaded.audio;
+                self.audio_error = loaded.audio_error.clone();
+                self.preview_spectrum = None;
+                self.image_errors = loaded.image_errors;
+                self.audio_player = self
+                    .audio
+                    .clone()
+                    .map(AudioPlayer::new)
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        self.status =
+                            format!("プロジェクトは開きましたが音声を再生できません: {error}");
+                        None
+                    });
+                self.editor_state.reconcile(&self.project);
+                self.preview_report = RenderReport::default();
+                let issue_count =
+                    self.image_errors.len() + usize::from(loaded.audio_error.is_some());
+                if let Some(error) = loaded.audio_error {
+                    self.status = format!("プロジェクトを開きました。音声素材の問題: {error}");
+                } else if issue_count > 0 {
+                    self.status =
+                        format!("プロジェクトを開きました。未解決素材が {issue_count} 件あります");
+                } else if self.audio_player.is_some() || self.audio.is_none() {
+                    self.status = "プロジェクトを開きました".to_owned();
+                }
+                self.mark_preview_dirty();
+            }
+            Some(Ok(Err(error))) => {
+                self.project_load_pending = None;
+                self.status = error;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.project_load_pending = None;
+                self.status = "プロジェクト読込ワーカーが終了しました".to_owned();
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        let save_result = self
+            .project_save_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv());
+        match save_result {
+            Some(Ok(Ok(path))) => {
+                self.project_save_pending = None;
+                self.project_path = Some(path.clone());
+                self.status = format!("プロジェクトを保存しました: {}", path.display());
+            }
+            Some(Ok(Err(error))) => {
+                self.project_save_pending = None;
+                self.status = error;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.project_save_pending = None;
+                self.status = "プロジェクト保存ワーカーが終了しました".to_owned();
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+}
+
+fn load_project_bundle(path: PathBuf, cancel: &AtomicBool) -> Result<LoadedProject, String> {
+    let project = load_project(&path)?;
+    let mut images = Vec::new();
+    let mut image_errors = HashMap::new();
+    for reference in &project.images {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("プロジェクトの読み込みをキャンセルしました".to_owned());
+        }
+        match load_image(&reference.path) {
+            Ok(image) => images.push((reference.id.clone(), image)),
+            Err(error) => {
+                image_errors.insert(reference.id.clone(), error);
+            }
+        }
+    }
+    let (audio, audio_error) = match &project.audio {
+        Some(reference) => match decode_audio(&reference.path, cancel) {
+            Ok(audio) => (Some(Arc::new(audio)), None),
+            Err(error) => (None, Some(error)),
+        },
+        None => (None, None),
+    };
+    Ok(LoadedProject {
+        path,
+        project,
+        audio,
+        images,
+        image_errors,
+        audio_error,
+    })
+}
+
+fn load_image(path: &std::path::Path) -> Result<ImageAsset, String> {
+    let image = image::open(path)
+        .map_err(|error| format!("画像を読み込めません ({}): {error}", path.display()))?
+        .to_rgba8();
+    ImageAsset::new(image.width(), image.height(), image.into_raw())
+        .map_err(|error| format!("画像を保持できません ({}): {error}", path.display()))
+}
+
+fn unresolved_image_notices(
+    project: &Project,
+    report: &RenderReport,
+    image_errors: &HashMap<ImageId, String>,
+) -> Vec<MissingImageNotice> {
+    let mut notices = Vec::new();
+    for asset in &report.unresolved_assets {
+        let UnresolvedAsset::Image(id) = asset else {
+            continue;
+        };
+        let path = project
+            .images
+            .iter()
+            .find(|reference| &reference.id == id)
+            .map(|reference| reference.path.clone());
+        let reason = image_errors
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "画像を解決できません".to_owned());
+        for layer in &project.layers {
+            if matches!(&layer.kind, LayerKind::Image { image, .. } if image == id) {
+                notices.push(MissingImageNotice {
+                    id: id.clone(),
+                    layer_name: layer.name.clone(),
+                    path: path.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
+    notices
 }
 
 impl eframe::App for MusicVideoLabApp {
@@ -417,12 +694,79 @@ impl eframe::App for MusicVideoLabApp {
         self.poll_loads();
         self.poll_preview(ctx);
         self.poll_export();
+        self.poll_projects();
+
+        let playback = self
+            .audio_player
+            .as_ref()
+            .map(AudioPlayer::snapshot)
+            .unwrap_or_default();
+        if self.audio_player.is_some()
+            && (playback.position_secs - self.position_secs).abs() > 0.000_001
+        {
+            self.position_secs = playback.position_secs.min(self.project.duration_secs);
+            self.schedule_playback_preview();
+        }
+        let mut replacement_request = None;
 
         egui::TopBottomPanel::top("musicvideo-controls").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
-                        self.audio_pending.is_none(),
+                        self.project_load_pending.is_none()
+                            && self.export_pending.is_none()
+                            && self.audio_pending.is_none()
+                            && self.image_pending.is_none(),
+                        egui::Button::new("プロジェクトを開く"),
+                    )
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("mIV 音楽ビデオ", &["json"])
+                        .pick_file()
+                {
+                    self.start_project_load(path, ctx);
+                }
+                if ui
+                    .add_enabled(
+                        self.project_save_pending.is_none()
+                            && self.project_load_pending.is_none()
+                            && self.audio_pending.is_none()
+                            && self.image_pending.is_none(),
+                        egui::Button::new("プロジェクトを保存"),
+                    )
+                    .clicked()
+                {
+                    let path = self.project_path.clone().or_else(|| {
+                        rfd::FileDialog::new()
+                            .add_filter("mIV 音楽ビデオ", &["json"])
+                            .set_file_name("project.mivmv.json")
+                            .save_file()
+                    });
+                    if let Some(path) = path {
+                        self.start_project_save(ensure_project_extension(path), ctx);
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.project_save_pending.is_none()
+                            && self.project_load_pending.is_none()
+                            && self.audio_pending.is_none()
+                            && self.image_pending.is_none(),
+                        egui::Button::new("名前を付けて保存"),
+                    )
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("mIV 音楽ビデオ", &["json"])
+                        .set_file_name("project.mivmv.json")
+                        .save_file()
+                {
+                    self.start_project_save(ensure_project_extension(path), ctx);
+                }
+                if ui
+                    .add_enabled(
+                        self.audio_pending.is_none()
+                            && self.project_load_pending.is_none()
+                            && self.export_pending.is_none(),
                         egui::Button::new("音声を開く"),
                     )
                     .clicked()
@@ -437,7 +781,9 @@ impl eframe::App for MusicVideoLabApp {
                 }
                 if ui
                     .add_enabled(
-                        self.image_pending.is_none(),
+                        self.image_pending.is_none()
+                            && self.project_load_pending.is_none()
+                            && self.export_pending.is_none(),
                         egui::Button::new("背景画像を開く"),
                     )
                     .clicked()
@@ -445,11 +791,12 @@ impl eframe::App for MusicVideoLabApp {
                         .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
                         .pick_file()
                 {
-                    self.start_image_load(path, ctx);
+                    self.start_image_load(ImageId::new(BACKGROUND_ID), path, ctx);
                 }
 
                 let ready_to_export = self.audio.is_some()
                     && self.assets.has_image(&ImageId::new(BACKGROUND_ID))
+                    && self.project_load_pending.is_none()
                     && self.export_pending.is_none();
                 if ui
                     .add_enabled(ready_to_export, egui::Button::new("連番 PNG を書き出す"))
@@ -469,16 +816,35 @@ impl eframe::App for MusicVideoLabApp {
             ui.separator();
             ui.label(&self.status);
             if !self.preview_report.unresolved_assets.is_empty() {
-                ui.label(format!(
-                    "未解決素材: {}",
-                    unresolved_assets_text(&self.preview_report)
-                ));
+                let notices = unresolved_image_notices(
+                    &self.project,
+                    &self.preview_report,
+                    &self.image_errors,
+                );
+                replacement_request = draw_missing_images(ui, &notices);
+                for asset in &self.preview_report.unresolved_assets {
+                    if let UnresolvedAsset::Font(key) = asset {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("未解決素材: フォント {key}"),
+                        );
+                    }
+                }
             }
-            if let Some(path) = &self.audio_path {
-                ui.label(format!("音声: {}", path.display()));
+            if let Some(path) = self.project_path.as_ref() {
+                ui.label(format!("プロジェクト: {}", path.display()));
             }
-            if let Some(path) = &self.image_path {
-                ui.label(format!("背景: {}", path.display()));
+            if let Some(audio) = &self.project.audio {
+                ui.label(format!("音声: {}", audio.path.display()));
+            }
+            if let Some(error) = &self.audio_error {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("未解決の音声素材: {error}"),
+                );
+            }
+            for image in &self.project.images {
+                ui.label(format!("画像 {}: {}", image.id.0, image.path.display()));
             }
             if let Some(pending) = &self.export_pending {
                 let completed = pending.progress.load(Ordering::Relaxed);
@@ -515,6 +881,18 @@ impl eframe::App for MusicVideoLabApp {
 
             ui.separator();
             ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.audio_player.is_some(),
+                        egui::Button::new(if playback.playing { "一時停止" } else { "再生" }),
+                    )
+                    .clicked()
+                    && let Some(player) = &self.audio_player
+                {
+                    let snapshot = player.toggle();
+                    self.position_secs = snapshot.position_secs;
+                    self.schedule_playback_preview();
+                }
                 ui.label(format!(
                     "{} / {}",
                     format_clock(self.position_secs),
@@ -530,59 +908,44 @@ impl eframe::App for MusicVideoLabApp {
                     )
                     .changed();
                 if changed {
+                    if let Some(player) = &self.audio_player {
+                        self.position_secs = player.seek(self.position_secs).position_secs;
+                    }
+                    self.preview_spectrum = None;
                     self.mark_preview_dirty();
                 }
                 ui.label(format!("合成 {:.2} ms", self.preview_render_ms));
             });
+            ui.small(
+                "シーク時はスペクトラムの履歴をリセットします。連続再生中は書き出しと同じ解析順です。",
+            );
         });
 
-        let mut project_changed = false;
+        if let Some(id) = replacement_request
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file()
+        {
+            self.start_image_load(id, path, ctx);
+        }
+
         egui::SidePanel::right("musicvideo-properties")
             .default_width(330.0)
             .show(ctx, |ui| {
-                ui.heading("レイヤー");
-                for (index, layer) in self.project.layers.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.selected_layer == index, &layer.name)
-                        .clicked()
-                    {
-                        self.selected_layer = index;
-                    }
-                }
-                if ui.button("＋ ピッチ鍵盤を追加").clicked() {
-                    let layer = new_pitch_keyboard_layer(&self.project);
-                    self.project.layers.push(layer);
-                    self.selected_layer = self.project.layers.len() - 1;
-                    project_changed = true;
-                }
-                ui.separator();
-                if let Some(layer) = self.project.layers.get_mut(self.selected_layer) {
-                    project_changed = edit_layer_properties(ui, layer);
+                let response = ui
+                    .add_enabled_ui(self.project_load_pending.is_none(), |ui| {
+                        draw_editor(ui, &mut self.project, &mut self.editor_state)
+                    })
+                    .inner;
+                if response.project_changed {
+                    self.mark_preview_dirty();
                 }
             });
-        if project_changed {
-            self.mark_preview_dirty();
-        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(texture) = &self.preview_texture {
-                    let source = texture.size_vec2();
-                    let available = ui.available_size();
-                    let scale = (available.x / source.x)
-                        .min(available.y / source.y)
-                        .max(0.01);
-                    let size = source * scale;
-                    ui.centered_and_justified(|ui| {
-                        ui.image((texture.id(), size));
-                    });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.spinner();
-                        ui.label("プレビューを準備しています");
-                    });
-                }
+                draw_preview(ui, self.preview_texture.as_ref(), &mut self.editor_state);
             });
 
         self.start_preview_if_needed(ctx);
@@ -590,382 +953,20 @@ impl eframe::App for MusicVideoLabApp {
             || self.image_pending.is_some()
             || self.preview_pending.is_some()
             || self.export_pending.is_some()
+            || self.project_load_pending.is_some()
+            || self.project_save_pending.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-    }
-}
-
-fn edit_layer_properties(ui: &mut egui::Ui, layer: &mut Layer) -> bool {
-    let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
-    if let Some(visible) = const_mut(&mut layer.visible) {
-        changed |= ui.checkbox(visible, "表示する").changed();
-    }
-    if let Some(opacity) = const_mut(&mut layer.opacity) {
-        changed |= ui
-            .add(egui::Slider::new(opacity, 0.0..=1.0).text("不透明度"))
-            .changed();
-    }
-    if let Some(rotation) = const_mut(&mut layer.rotation) {
-        changed |= ui
-            .add(
-                egui::DragValue::new(rotation)
-                    .range(-180.0..=180.0)
-                    .prefix("回転 ")
-                    .suffix("°"),
-            )
-            .changed();
-    }
-    if let Some(radius) = const_mut(&mut layer.corner_radius) {
-        changed |= ui
-            .add(
-                egui::DragValue::new(radius)
-                    .range(0.0..=1000.0)
-                    .suffix(" px 角丸"),
-            )
-            .changed();
-    }
-    changed |= edit_glow(ui, &mut layer.glow);
-    ui.separator();
-    changed |= match &mut layer.kind {
-        LayerKind::Solid { fill } => edit_fill(ui, "塗り", fill),
-        LayerKind::Image { .. } => false,
-        LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
-        LayerKind::PitchKeyboard(keyboard) => edit_fill(ui, "点灯する鍵の塗り", &mut keyboard.fill),
-        LayerKind::ProgressBar(progress) => {
-            let mut changed = ui
-                .add(
-                    egui::DragValue::new(&mut progress.border_thickness_px)
-                        .range(0.0..=100.0)
-                        .suffix(" px 枠"),
-                )
-                .changed();
-            changed |= edit_fill(ui, "進捗の塗り", &mut progress.fill);
-            changed |= edit_fill(ui, "枠の塗り", &mut progress.border_fill);
-            changed
-        }
-        LayerKind::TimeText(text) => edit_fill(ui, "文字の塗り", &mut text.fill),
-    };
-    changed
-}
-
-fn const_mut<T>(value: &mut Animatable<T>) -> Option<&mut T> {
-    match value {
-        Animatable::Const(value) => Some(value),
-        Animatable::Track(_) => None,
-    }
-}
-
-fn edit_glow(ui: &mut egui::Ui, value: &mut Animatable<Option<Glow>>) -> bool {
-    let Some(glow) = const_mut(value) else {
-        ui.label("グローのキーフレーム編集は P3 で対応します");
-        return false;
-    };
-    let mut enabled = glow.is_some();
-    let mut changed = ui.checkbox(&mut enabled, "グロー").changed();
-    if enabled && glow.is_none() {
-        *glow = Some(Glow {
-            color: Rgba8::WHITE,
-            radius_px: 12.0,
-            spread_px: 0.0,
-        });
-        changed = true;
-    } else if !enabled && glow.is_some() {
-        *glow = None;
-        changed = true;
-    }
-    if let Some(glow) = glow {
-        changed |= edit_color(ui, "グロー色", &mut glow.color);
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut glow.radius_px)
-                    .range(0.0..=128.0)
-                    .suffix(" px 半径"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut glow.spread_px)
-                    .range(0.0..=128.0)
-                    .suffix(" px 広がり"),
-            )
-            .changed();
-    }
-    changed
-}
-
-fn edit_color(ui: &mut egui::Ui, label: &str, color: &mut Rgba8) -> bool {
-    let mut value = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        changed = ui.color_edit_button_srgba(&mut value).changed();
-    });
-    if changed {
-        *color = Rgba8::new(value.r(), value.g(), value.b(), value.a());
-    }
-    changed
-}
-
-fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
-    let mut changed = ui
-        .add(
-            egui::DragValue::new(&mut spectrum.band_count)
-                .range(1..=128)
-                .prefix("解析バンド "),
-        )
-        .changed();
-    changed |= ui
-        .add(
-            egui::DragValue::new(&mut spectrum.point_count)
-                .range(1..=4096)
-                .prefix("描画点 "),
-        )
-        .changed();
-    let mut radial = matches!(spectrum.shape, SpectrumShape::Radial { .. });
-    let was_radial = radial;
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut radial, false, "直線");
-        ui.radio_value(&mut radial, true, "円形");
-    });
-    if radial != was_radial {
-        spectrum.shape = if radial {
-            SpectrumShape::Radial {
-                radius_px: 380.0,
-                thickness_px: 4.0,
-                start_angle_deg: -90.0,
-                sweep_deg: 360.0,
-                direction: SpectrumDirection::Clockwise,
-            }
-        } else {
-            SpectrumShape::Bars {
-                gap_ratio: 0.3,
-                min_height_px: 3.0,
-                thickness_px: 12.0,
-            }
-        };
-        changed = true;
-    }
-    match &mut spectrum.shape {
-        SpectrumShape::Bars {
-            gap_ratio,
-            min_height_px,
-            thickness_px,
-        } => {
-            changed |= ui
-                .add(egui::Slider::new(gap_ratio, 0.0..=1.0).text("隙間"))
-                .changed();
-            changed |= drag_pixels(ui, "最小高さ", min_height_px, 0.0..=1000.0);
-            changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
-        }
-        SpectrumShape::Radial {
-            radius_px,
-            thickness_px,
-            start_angle_deg,
-            sweep_deg,
-            direction,
-        } => {
-            changed |= drag_pixels(ui, "半径", radius_px, 0.0..=2000.0);
-            changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
-            changed |= ui
-                .add(egui::DragValue::new(start_angle_deg).suffix("° 開始"))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::DragValue::new(sweep_deg)
-                        .range(0.0..=360.0)
-                        .suffix("° 範囲"),
-                )
-                .changed();
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .radio_value(direction, SpectrumDirection::Clockwise, "時計回り")
-                    .changed();
-                changed |= ui
-                    .radio_value(direction, SpectrumDirection::CounterClockwise, "反時計回り")
-                    .changed();
-            });
+        if playback.playing {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
-    changed |= edit_fill(ui, "スペクトラムの塗り", &mut spectrum.fill);
-    changed
-}
-
-fn drag_pixels(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut f32,
-    range: std::ops::RangeInclusive<f32>,
-) -> bool {
-    ui.add(
-        egui::DragValue::new(value)
-            .range(range)
-            .prefix(format!("{label} "))
-            .suffix(" px"),
-    )
-    .changed()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FillKind {
-    Solid,
-    Linear,
-    Radial,
-    Band,
-}
-
-fn edit_fill(ui: &mut egui::Ui, label: &str, value: &mut Animatable<Fill>) -> bool {
-    let Some(fill) = const_mut(value) else {
-        ui.label(format!("{label}: キーフレーム編集は P3 で対応します"));
-        return false;
-    };
-    ui.collapsing(label, |ui| {
-        let mut kind = match fill {
-            Fill::Solid(_) => FillKind::Solid,
-            Fill::LinearGradient { .. } => FillKind::Linear,
-            Fill::RadialGradient { .. } => FillKind::Radial,
-            Fill::BandGradient { .. } => FillKind::Band,
-        };
-        let previous = kind;
-        egui::ComboBox::from_id_salt(("fill-kind", label))
-            .selected_text(fill_kind_label(kind))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut kind, FillKind::Solid, "単色");
-                ui.selectable_value(&mut kind, FillKind::Linear, "線形グラデーション");
-                ui.selectable_value(&mut kind, FillKind::Radial, "放射グラデーション");
-                ui.selectable_value(&mut kind, FillKind::Band, "バンドグラデーション");
-            });
-        let mut changed = kind != previous;
-        if changed {
-            *fill = default_fill(kind);
-        }
-        match fill {
-            Fill::Solid(color) => changed |= edit_color(ui, "色", color),
-            Fill::LinearGradient { stops, angle_deg } => {
-                changed |= ui
-                    .add(egui::DragValue::new(angle_deg).suffix("° 角度"))
-                    .changed();
-                changed |= edit_gradient_stops(ui, stops);
-            }
-            Fill::RadialGradient {
-                stops,
-                center,
-                radius,
-            } => {
-                changed |= ui
-                    .add(egui::Slider::new(&mut center.0, 0.0..=1.0).text("中心 X "))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut center.1, 0.0..=1.0).text("中心 Y "))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(radius, 0.01..=2.0).text("半径"))
-                    .changed();
-                changed |= edit_gradient_stops(ui, stops);
-            }
-            Fill::BandGradient { stops } => changed |= edit_gradient_stops(ui, stops),
-        }
-        changed
-    })
-    .body_returned
-    .unwrap_or(false)
-}
-
-fn fill_kind_label(kind: FillKind) -> &'static str {
-    match kind {
-        FillKind::Solid => "単色",
-        FillKind::Linear => "線形",
-        FillKind::Radial => "放射",
-        FillKind::Band => "バンド",
-    }
-}
-
-fn default_fill(kind: FillKind) -> Fill {
-    match kind {
-        FillKind::Solid => Fill::Solid(Rgba8::WHITE),
-        FillKind::Linear => Fill::LinearGradient {
-            stops: default_gradient_stops(),
-            angle_deg: 0.0,
-        },
-        FillKind::Radial => Fill::RadialGradient {
-            stops: default_gradient_stops(),
-            center: (0.5, 0.5),
-            radius: 0.5,
-        },
-        FillKind::Band => Fill::BandGradient {
-            stops: default_gradient_stops(),
-        },
-    }
-}
-
-fn default_gradient_stops() -> GradientStops {
-    GradientStops::new(vec![
-        GradientStop {
-            position: 0.0,
-            color: Rgba8::new(120, 255, 35, 255),
-        },
-        GradientStop {
-            position: 1.0,
-            color: Rgba8::new(255, 136, 255, 255),
-        },
-    ])
-    .expect("fixed gradient stops are valid")
-}
-
-fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
-    let mut values = stops.to_vec();
-    let mut changed = false;
-    let mut remove = None;
-    let can_remove = values.len() > 1;
-    for (index, stop) in values.iter_mut().enumerate() {
-        ui.push_id(index, |ui| {
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut stop.position)
-                            .range(0.0..=1.0)
-                            .speed(0.01),
-                    )
-                    .changed();
-                changed |= edit_color(ui, "色", &mut stop.color);
-                if can_remove && ui.small_button("削除").clicked() {
-                    remove = Some(index);
-                }
-            });
-        });
-    }
-    if let Some(index) = remove {
-        values.remove(index);
-        changed = true;
-    }
-    if ui.small_button("ストップを追加").clicked() {
-        values.push(GradientStop {
-            position: 1.0,
-            color: Rgba8::WHITE,
-        });
-        changed = true;
-    }
-    if changed {
-        *stops = GradientStops::new(values).expect("UI restricts gradient stop positions");
-    }
-    changed
 }
 
 fn format_clock(seconds: f64) -> String {
     let seconds = seconds.max(0.0).floor() as u64;
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
-}
-
-fn unresolved_assets_text(report: &RenderReport) -> String {
-    report
-        .unresolved_assets
-        .iter()
-        .map(|asset| match asset {
-            UnresolvedAsset::Image(id) => format!("画像 {}", id.0),
-            UnresolvedAsset::Font(key) => format!("フォント {key}"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 impl Drop for MusicVideoLabApp {
@@ -982,5 +983,106 @@ impl Drop for MusicVideoLabApp {
         if let Some(pending) = &self.export_pending {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(pending) = &self.project_load_pending {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_image_notice_names_the_layer_and_saved_path() {
+        let mut project = default_project(1.0);
+        project.images.push(ImageRef {
+            id: ImageId::new(BACKGROUND_ID),
+            path: PathBuf::from("media").join("missing.png"),
+        });
+        let mut report = RenderReport::default();
+        report
+            .unresolved_assets
+            .push(UnresolvedAsset::Image(ImageId::new(BACKGROUND_ID)));
+        let errors = HashMap::from([(
+            ImageId::new(BACKGROUND_ID),
+            "ファイルがありません".to_owned(),
+        )]);
+
+        let notices = unresolved_image_notices(&project, &report, &errors);
+        assert_eq!(
+            notices,
+            vec![MissingImageNotice {
+                id: ImageId::new(BACKGROUND_ID),
+                layer_name: "背景画像".to_owned(),
+                path: Some(PathBuf::from("media").join("missing.png")),
+                reason: "ファイルがありません".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn project_bundle_restores_image_pixels_from_the_saved_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("media").join("cover.png");
+        std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
+            .save(&image_path)
+            .unwrap();
+        let project_path = temp.path().join("project.mivmv.json");
+        let mut project = default_project(1.0);
+        project.images.push(ImageRef {
+            id: ImageId::new(BACKGROUND_ID),
+            path: image_path.clone(),
+        });
+        let original_assets = Assets::default();
+        original_assets.insert_image(
+            ImageId::new(BACKGROUND_ID),
+            load_image(&image_path).unwrap(),
+        );
+        let spectrum = SpectrumFrame::new(vec![0.25; spectrum_band_count(&project)]);
+        let scene = evaluate(&project, 0.5, &spectrum);
+        let mut expected = Frame::new(project.output.width, project.output.height).unwrap();
+        let _ = render_frame(&scene, &original_assets, &mut expected).unwrap();
+        save_project(&project_path, &project).unwrap();
+
+        let loaded =
+            load_project_bundle(project_path, &AtomicBool::new(false)).expect("project loads");
+        assert_eq!(loaded.project, project);
+        assert!(loaded.image_errors.is_empty());
+        assert_eq!(loaded.images.len(), 1);
+        assert_eq!(loaded.images[0].1.rgba, [12, 34, 56, 255].repeat(6));
+
+        let restored_assets = Assets::default();
+        for (id, image) in loaded.images {
+            restored_assets.insert_image(id, image);
+        }
+        let scene = evaluate(&loaded.project, 0.5, &spectrum);
+        let mut actual =
+            Frame::new(loaded.project.output.width, loaded.project.output.height).unwrap();
+        let _ = render_frame(&scene, &restored_assets, &mut actual).unwrap();
+        assert_eq!(actual.rgba, expected.rgba);
+    }
+
+    #[test]
+    fn project_bundle_keeps_missing_image_as_an_explicit_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("project.mivmv.json");
+        let mut project = default_project(1.0);
+        project.images.push(ImageRef {
+            id: ImageId::new(BACKGROUND_ID),
+            path: temp.path().join("missing.png"),
+        });
+        save_project(&project_path, &project).unwrap();
+
+        let loaded =
+            load_project_bundle(project_path, &AtomicBool::new(false)).expect("project loads");
+        assert!(loaded.images.is_empty());
+        assert!(
+            loaded
+                .image_errors
+                .get(&ImageId::new(BACKGROUND_ID))
+                .is_some_and(|error| error.contains("missing.png"))
+        );
     }
 }

@@ -4160,19 +4160,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "musicvideo-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "musicvideo-core",
+]
+
+[[package]]
 name = "musicvideo_lab"
 version = "0.1.0"
 dependencies = [
  "comic-core",
+ "cpal",
  "eframe",
  "egui",
  "image",
  "music-core",
  "musicvideo-core",
+ "musicvideo-ui",
  "rfd",
  "serde",
  "serde_json",
  "symphonia",
+ "tempfile",
 ]
 
 [[package]]

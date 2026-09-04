@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
@@ -17,10 +18,23 @@ impl ImageId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
+    pub audio: Option<AudioRef>,
+    pub images: Vec<ImageRef>,
     pub output: Output,
     pub duration_secs: f64,
     /// Drawing order. The first layer is the backmost layer.
     pub layers: Vec<Layer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioRef {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub id: ImageId,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -78,6 +92,8 @@ pub struct SpectrumLayer {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PitchKeyboardLayer {
+    /// 鍵盤レイヤ全体の背景。書き出し側の既定は透明。
+    pub background: Animatable<Fill>,
     /// 点灯している鍵に使う塗り。消灯色と枠は本体鍵盤と同じ規則で決まる。
     pub fill: Animatable<Fill>,
 }

@@ -38,6 +38,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
+| [music-video-export-plan.md](music-video-export-plan.md) | **実装中**。音楽ビデオの共有シーンモデル、CPU ラスタライザ、MP4 書き出し、共有編集 UI、プロジェクト JSON と音付きプレビューの正本 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
