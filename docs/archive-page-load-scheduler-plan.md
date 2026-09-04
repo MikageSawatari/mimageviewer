@@ -152,32 +152,140 @@ UI スレッドでは待たない。
 
 ---
 
-## 4. ZIP 目次の再利用
+## 4. 書庫読み出しを「短く」して「中断できる」ようにする (S2)
+
+中断不能区間が制約である以上、手は 2 つある。**①その仕事をしない (目次の再利用)** と
+**②中断できるようにする (reader ラッパー)**。①が主で②が補完。両方とも `zip_loader` を
+触るので 1 つの作業にまとめる。
+
+### 4.0 中断可能性の区間別まとめ (2026-09-04 確定)
+
+| 区間 | 現状 | 方針 |
+| --- | --- | --- |
+| ZIP 目次の解析 (56ms〜、支配的) | 中断不可 | **S2 で消す** + reader ラッパーで中断可能に |
+| ZIP エントリ読み出し (1.7〜2.8ms) | 中断不可 | 同じ reader ラッパー |
+| 画像デコード (25ms) | 中断不可 | `image` クレート内部にフックが無い。25ms なので許容 |
+| PDFium レンダ | 中断不可 | **§4.3 で対応する (ZIP の後)** |
+| Susie プラグイン | 中断不可 | **中断しないまま据え置き (確定)**。§4.4 |
+
+### 4.1 ZIP 目次の再利用 — 位置指定読みの clone 可能 reader
+
+**S2 実装済み (2026-09-04)。** `zip_loader::ArchiveDirectoryCache` が外側 ZIP の
+`ZipArchive<PositionedFileReader>` template を所有する。cache 全体の lock は
+`(path, mtime, size)` の照合と per-key slot 取得だけ、初回解析は lock 外で行う。同じ key の
+cold miss だけを `Condvar` で single-flight にし、ready 後は request 用 clone の一瞬だけ
+slot lock を握る。エントリ I/O は lock 外で並行する。上限は 8 書庫で、既存の
+`clear_nested_cache` (= フォルダ / 外側コンテナ切替境界) がこの cache も破棄する。
+
+同日の `bench_zip_seek` (10,000 entries / 30 pages) では、本番経路 [2] の合計 p50 が
+**60.06ms → 1.98ms**、比較対象 [3] は 1.97ms だった。後測定の mean 3.91ms / max 60.74ms は
+cold 初回の解析 1 回を含む。cold cache の並列 [5] でも解析回数は 1 / 4 / 6 / 8 / 16 / 32 /
+51 worker の全ケースで **1 回**。wall は 8 worker で 183.0ms → 99.6ms、51 worker で
+1,221.9ms → 176.5ms になり、目次解析時間の同時数比例を解消した。
 
 `zip` 2.4.2 の `ZipArchive<R>` は `Clone` で、解析結果を `shared: Arc<Shared>` として持つ。
-**reader が `Clone` なら、目次を再解析せずに読み出しハンドルを増やせる。**
+**reader を `Clone` にすれば、clone は目次を共有し、再解析なしで読み出し口を増やせる。**
 
-採る形 (どちらかを実測で選ぶ):
+**採る形は (a) 位置指定読みの reader。** 1 つの `File` を `Arc` で共有し、読み出し位置は
+clone ごとに独立に持つ。`ZipArchive` の clone は「`Arc` 2 本 + `u64`」で済むので、
+**ロックを握るのは clone の一瞬だけ**、I/O 中は誰も待たせない。目次のメモリも 1 冊分。
+有界ハンドルプール案 ((b)) は目次を枠数ぶん複製する (10,000 エントリ × 6) ので採らない。
 
-- **(a) 位置指定読みの reader**: 1 つの `File` を `Arc` で共有し、`seek` 位置を
-  clone ごとに独立に持つ reader を書く。`ZipArchive` を clone すれば目次は共有され、
-  メモリは 1 冊分で済む。並列読み出しとシーク位置の独立性を型で保証できる。
-- **(b) 有界ハンドルプール**: `ZipArchive<BufReader<File>>` を上限つきで使い回す。
-  実装は単純だが、目次のメモリを枠数ぶん持つ (10,000 エントリ × 6 枠)。
+- キャッシュは `(パス, mtime, サイズ)` を鍵にし、**引くたびに `metadata` で照合して失効させる**
+  (数十 µs なので 56ms に対して無視できる)。書庫数で有界にし、フォルダ移動で捨てる。
+- **`std::os::windows::fs::FileExt::seek_read` は現在位置を動かさず offset 指定で読む**ので、
+  同じ `File` を複数 clone が同時に使っても読む内容は競合しない。
+  **`cfg(not(windows))` でもビルドが通ること** (CI の ubuntu `cargo check` が番人)。
+  非 Windows では `std::os::unix::fs::FileExt::read_at` を使う。
 
-いずれの場合も保つもの:
+保つもの:
 
-- **失効**: ファイルの更新 (`mtime` + サイズ) が変わったら捨てる。
 - **名前解決の段は複製しない**。`resolve_entry_index` (正確名 → `\` 区切り → 復号名) が
   唯一の出所である ([zip_loader.rs](../src/zip_loader.rs) の doc コメント参照。
   過去に別経路で書いて日本語書庫の寸法が 1 件も取れなくなった)。
 - 入れ子 ZIP (`NESTED_CACHE`)、CRC、エラー処理、RAR 経路の挙動。
 - **全処理を 1 本のロックで直列化しない**。表示待ちが増える。
 
-キャッシュの上限は書庫数で有界にし、フォルダ移動・書庫切り替えで捨てる。
-
 > 効果はエントリ数に比例する。27〜669 エントリの通常の書庫では 0.15〜4ms しかないので、
-> **これは大きい書庫のための改善であり、詰まりの主因ではない** (主因は §3)。
+> **単体では大きい書庫のための改善**。ただし §8.1 のとおり、**中断不能区間を短くするという
+> 意味では書庫の大小によらず効く**。
+
+### 4.2 中断できる reader
+
+**S2 実装済み (2026-09-04)。** `PositionedFileReader` とメモリ上の入れ子 ZIP 用
+`CancellableReader` は `read` / `seek` の各入口で request 固有 `Arc<AtomicBool>` を確認する。
+cache template の reader は cancel を持たず、`ZipArchive::clone` で作る request 側 reader に
+だけ付ける。cold miss の最初の解析にも request reader を使い、成功後に cancel を外した clone を
+template として保存する。
+
+zip クレートの `ZipError` を `io::Error` へ変換する箇所では cancel flag を再確認し、立って
+いれば `Interrupted`、立っていなければ従来どおり `InvalidData` にする。canonical decoder は
+前者を `CanonicalDecodeError::Cancelled(CanonicalCancelStage::SourceRead)`、後者を
+`CanonicalDecodeError::SourceRead` として扱う。成功直後に cancel が立った従来の境界は
+`SourceReadComplete` のまま残す。
+
+同じ reader に **cancel フラグを持たせ、`read` / `seek` が立っていたらエラーを返す**。
+
+> ⚠️ **`io::ErrorKind::Interrupted` を返してはならない。** 本計画の初版はこれを指示しており、
+> **実機で全 worker が固まった** (2026-09-04)。`Read::read` の契約では `Interrupted` は
+> 「中断した」ではなく **「何も読めなかった。もう一度呼んでよい」** を意味し、
+> `std::io::default_read_to_end` は `is_interrupted()` を見て `continue` する。
+> zip クレートはエントリを `read_to_end` で読むので、cancel が立った瞬間から
+> **6 枠すべての worker が永久にリトライし続け、枠を返さないまま CPU を焼いた**
+> (cdb で全スレッドのスタックを採取して確定)。取消は `io::Error::other` で返す。
+> **関数の戻り値としての `Interrupted` は、リトライループに載らないので従来どおり使ってよい**
+> (本体の他の worker はこの規約で書かれている)。区別すべきは「`Read` / `Seek` の実装から
+> 返すかどうか」であって、取消かどうかではない。
+
+`ZipArchive::new` はファイルを直接開かず
+**こちらが渡した `Read + Seek` を通して読む**ので、zip クレートを一切変えずに
+I/O 呼び出しの粒度で中断できる。10,000 エントリの目次解析は reader を何度も叩くので
+粒度は足りる。
+
+**唯一の注意点は「中断」を「書庫が壊れている」と誤認しないこと。** zip クレートは io エラーを
+`InvalidData` などに包み直すので、エラーを変換する場所で **cancel フラグを見て区別**し、
+中断は既存の `CanonicalDecodeError::Cancelled` 系へ、それ以外は従来どおりのエラーへ落とす。
+**壊れた書庫を「中断」と報告してはならないし、その逆も同じ。**
+
+キャッシュの template には cancel を持たせず、**clone した側にだけ付ける** (template は
+どの要求のものでもないため)。
+
+### 4.3 PDFium はプログレッシブ描画で中断できる (ZIP の後に着手)
+
+**PDFium 自体に専用の仕組みがある。** 同梱している `pdfium-render` 0.8.37 のバインディングにも
+入っていることを確認済み:
+
+```
+IFSDK_PAUSE::NeedToPauseNow  -- "Non-zero for pause now, 0 for continue."
+FPDF_RenderPageBitmap_Start(..., pause: *mut IFSDK_PAUSE)
+FPDF_RenderPage_Continue(page, pause)
+FPDF_RenderPage_Close(page)
+```
+
+いまの一発完結 `FPDF_RenderPageBitmap` をプログレッシブ版に替えると、PDFium が処理段の合間に
+`NeedToPauseNow` を呼ぶ。ワーカーは「親から中断が届いていたら非ゼロを返す」だけでよく、
+届いていれば `FPDF_RenderPage_Close` で畳んで枠を返す。親 → 子の通知は、現行の stdin/stdout
+プロトコルにワーカー側の読み取りスレッドを 1 本足して `AtomicBool` を立てる
+(レンダリング中に stdin をブロックせず読むため)。
+
+留保:
+
+- **粒度は PDFium が決める。** 内部の処理段の切れ目でしか呼ばれないので「即座」ではない。
+- 高レベルの安全な API には無く、bindings trait 経由で生の FFI を呼ぶ。
+  `FPDF_RenderPageBitmapWithColorScheme_Start` は "Experimental API" 表記。
+- **描画経路が変わる**ので、一発版との描画結果の同一性を確認する。
+- **PDF は今回の主因ではない**。温まったレンダは約 10ms で、重いのは文書オープン
+  (コールド 1441ms)。効く場面が ZIP とは別。
+
+### 4.4 Susie は中断しない (確定、2026-09-04)
+
+32bit の別プロセスにプラグイン DLL をロードして呼ぶ形で、**プラグイン側に中断の口が無い**。
+待つのをやめても相手は走り続けるので、枠を返せない区間として残る。
+
+**据え置きでよいと判断した**: Susie はレトロ形式向けで、対象画像が小さく処理がほぼ瞬時に
+終わるケースがほとんどのため、中断できないことが実害になる場面が想定しにくい。
+実害の報告が出たら再検討する。
+
 
 ---
 
@@ -204,8 +312,16 @@ UI スレッドでは待たない。
 
 **直し方**: 「一般の画像読み込み」と「形式を確認した後のアニメーション展開」を分ける。
 拡張子は候補の絞り込みにしか使えないので、**worker が実際に複数フレームだと判定してから**
-通知する。既存の `fs_early_dims` と同じ形で、worker から早期に「これはアニメーションで
-N フレーム」を伝える経路を足す。判定材料が来るまでは通常の読み込み表示にする。
+通知する。既存の `FsLoadResult::DimsOnly` と同じチャネル / drain 経路へ非終端の
+`AnimationExpansionStarted` を流す。確認時刻は世代付き `fs_pending` が所有し、終端結果と
+一緒に世代付き `fs_upload_backlog` へ移す。ページを離れる、cancel、items 世代変更、終端 upload
+の各境界で捨てる。判定材料が来るまでは通常の読み込み表示にする。
+
+確認地点は APNG の `decoder.is_apng() == true` 直後、Animated WebP の
+`decoder.has_animation() == true` 直後、GIF の 2 枚目のフレーム追加直後。各 decoder は
+一度だけ消費できる callback wrapper を使い、1 decode あたり高々 1 通知にする。
+`AnimationPromotion` は既にアニメーションと判明した entry から始まるため、従来どおり request
+開始時刻を進捗表示に使う。
 
 §3 で詰まり自体が解消すると 150ms を超える頻度は下がるが、**誤りは残る**ので別に直す。
 
@@ -249,7 +365,8 @@ Remote 側 §1.0i で「近傍だけ + 非同期補完」を不採用とした�
 | 段階 | 内容 | 完了の条件 |
 | --- | --- | --- |
 | S1 | `FsPageLoadScheduler` 新設と `start_fs_load` の接続 (§3) | **実装・自動テスト済み**。実機 smoke / 再計測待ち |
-| S2 | ZIP 目次の再利用 (§4) | 10,000 エントリ書庫の 1 ページが実測で短縮。名前解決・入れ子・RAR の回帰なし |
+| S2 | 書庫読み出しの短縮と中断 (§4.1 / §4.2) | **実装・自動テスト・単体 bench 済み**。実機セッションでの cancel → 実終了再計測待ち |
+| S2b | PDFium のプログレッシブ描画 (§4.3) | 描画結果が一発版と一致し、レンダ中に中断が効く |
 | S3 | アニメーション通知の分離 (§6) | 静止 PNG/WebP で通知が出ず、GIF/APNG/Animated WebP では出る |
 | S4 | 目盛りの単体テスト (§7.2) | 寸法判明で単位数が変わることが固定される |
 
@@ -327,6 +444,19 @@ zip クレートを変えずに I/O 呼び出しの粒度で中断できる。10
 ---
 
 ## 9. 回帰確認
+
+### 9.0 中断のテストは「実際の消費者」を通す
+
+`read` を単体で呼ぶテストは**リトライループを観測できない**。zip クレートはエントリを
+`read_to_end` で読むので、**その経路を通すテストでなければ意味がない**。2026-09-04 の
+ハングは、`read` 単体のテストが緑のまま実機で起きた。
+
+また、**cancel を最初から立てるテストは入口の早期 return で弾かれて読み出しに到達しない**。
+`open_archive` が先頭で `is_cancelled` を見るためで、これも当時のテストが素通りした理由。
+**書庫を開いた後に cancel を立てる**こと。
+
+回帰テストは「バグを戻すと落ちる」ことを確認してから採用する。上記 2 点を満たさない
+テストは、戻しても緑のままだった。
 
 ### 9.1 状態テスト (スケジューラ)
 

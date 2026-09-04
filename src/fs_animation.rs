@@ -10,11 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// フルスクリーン読み込みスレッドからUIスレッドへ送るメッセージ。
 ///
-/// デコードは時間がかかるので、メッセージは **2 段階** で送られることがある:
+/// デコードは時間がかかるので、本体より前に非終端メッセージが送られることがある:
 /// 1. `DimsOnly`  (任意)  — ファイルヘッダから寸法だけ取り出して先行送信。
 ///    ホバーバーにサイズと⚠ダウンスケール警告を即座に出すためのヒント。
 ///    受信しても fs_pending からは抜かない (本デコードが続く)。
-/// 2. 本体 (`Static` / `Animated` / `Failed`) — 終端メッセージ。受信したら
+/// 2. `AnimationExpansionStarted` (任意) — worker が複数フレーム形式だと確認した時刻。
+///    受信しても fs_pending からは抜かない (全フレーム展開が続く)。
+/// 3. 本体 (`Static` / `Animated` / `Failed`) — 終端メッセージ。受信したら
 ///    fs_pending から該当エントリを削除する。
 ///
 /// `DimsOnly` が送られずに `Static` がいきなり来るケースもある (PDF や
@@ -23,6 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub enum FsLoadResult {
     /// ヘッダ解析だけで取れた EXIF 後相当の表示向き寸法。終端ではない。
     DimsOnly { source_dims: [usize; 2] },
+    /// GIF / APNG / Animated WebP と確認でき、全フレーム展開を始めた。終端ではない。
+    AnimationExpansionStarted { started_at: std::time::Instant },
     /// 静止画（GIF・APNG・WebP の1フレーム目のみを含む）。
     /// `source_dims` はワーカーがデコードした直後・GPU 上限 clamp 前の寸法で、
     /// ホバーバーに原寸を表示したり「ダウンスケール表示中」警告を出すために使う。
@@ -272,35 +276,52 @@ fn animation_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
 }
 
+/// `notify` が callback を消費することで、1 decode からの確認通知を高々 1 回にする。
+struct AnimationConfirmedCallback<'a>(Option<&'a dyn Fn()>);
+
+impl AnimationConfirmedCallback<'_> {
+    fn notify(self) {
+        if let Some(callback) = self.0 {
+            callback();
+        }
+    }
+}
+
 /// GIF をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）や失敗時は None を返す。
 pub fn decode_gif_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_gif_frames_cancellable(path, None).into_option()
+    decode_gif_frames_cancellable(path, None, None).into_option()
 }
 
 pub(crate) fn decode_gif_frames_cancellable(
     path: &Path,
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
     let Ok(file) = std::fs::File::open(path) else {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     };
     let reader = std::io::BufReader::new(file);
-    decode_gif_frames_from_reader(reader, cancel)
+    decode_gif_frames_from_reader(reader, cancel, on_animation_confirmed)
 }
 
 pub fn decode_gif_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_gif_frames_from_bytes_cancellable(bytes, None).into_option()
+    decode_gif_frames_from_bytes_cancellable(bytes, None, None).into_option()
 }
 
 pub(crate) fn decode_gif_frames_from_bytes_cancellable(
     bytes: &[u8],
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
-    decode_gif_frames_from_reader(std::io::Cursor::new(bytes), cancel)
+    decode_gif_frames_from_reader(std::io::Cursor::new(bytes), cancel, on_animation_confirmed)
 }
 
-fn decode_gif_frames_from_reader<R>(reader: R, cancel: Option<&AtomicBool>) -> AnimationDecodeResult
+fn decode_gif_frames_from_reader<R>(
+    reader: R,
+    cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
+) -> AnimationDecodeResult
 where
     R: std::io::BufRead + std::io::Seek,
 {
@@ -311,6 +332,7 @@ where
         return AnimationDecodeResult::NotAnimatedOrFailed;
     };
     let mut frames = Vec::new();
+    let mut confirmation = Some(AnimationConfirmedCallback(on_animation_confirmed));
     for frame in decoder.into_frames() {
         if animation_cancelled(cancel) {
             return AnimationDecodeResult::Cancelled;
@@ -323,6 +345,9 @@ where
         }
         let delay = frame_delay_secs("GIF", frame.delay());
         frames.push((rgba_frame_to_color_image(frame.into_buffer()), delay));
+        if frames.len() == 2 {
+            confirmation.take().unwrap().notify();
+        }
     }
     if frames.len() <= 1 {
         return AnimationDecodeResult::NotAnimatedOrFailed;
@@ -333,34 +358,37 @@ where
 /// APNG をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）・非 APNG・失敗時は None を返す。
 pub fn decode_apng_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_apng_frames_cancellable(path, None).into_option()
+    decode_apng_frames_cancellable(path, None, None).into_option()
 }
 
 pub(crate) fn decode_apng_frames_cancellable(
     path: &Path,
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
     let Ok(file) = std::fs::File::open(path) else {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     };
     let reader = std::io::BufReader::new(file);
-    decode_apng_frames_from_reader(reader, cancel)
+    decode_apng_frames_from_reader(reader, cancel, on_animation_confirmed)
 }
 
 pub fn decode_apng_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_apng_frames_from_bytes_cancellable(bytes, None).into_option()
+    decode_apng_frames_from_bytes_cancellable(bytes, None, None).into_option()
 }
 
 pub(crate) fn decode_apng_frames_from_bytes_cancellable(
     bytes: &[u8],
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
-    decode_apng_frames_from_reader(std::io::Cursor::new(bytes), cancel)
+    decode_apng_frames_from_reader(std::io::Cursor::new(bytes), cancel, on_animation_confirmed)
 }
 
 fn decode_apng_frames_from_reader<R>(
     reader: R,
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult
 where
     R: std::io::BufRead + std::io::Seek,
@@ -374,6 +402,7 @@ where
     if !matches!(decoder.is_apng(), Ok(true)) {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     }
+    AnimationConfirmedCallback(on_animation_confirmed).notify();
     let Ok(decoder) = decoder.apng() else {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     };
@@ -400,35 +429,38 @@ where
 /// Animated WebP をデコードしてアニメーションフレーム列を返す。
 /// 静止画（1フレーム）・失敗時は None を返す。
 pub fn decode_webp_frames(path: &Path) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_webp_frames_cancellable(path, None).into_option()
+    decode_webp_frames_cancellable(path, None, None).into_option()
 }
 
 pub(crate) fn decode_webp_frames_cancellable(
     path: &Path,
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
     let Ok(file) = std::fs::File::open(path) else {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     };
     let reader = std::io::BufReader::new(file);
-    decode_webp_frames_from_reader(reader, cancel)
+    decode_webp_frames_from_reader(reader, cancel, on_animation_confirmed)
 }
 
 /// ZIP 内 WebP など、実ファイルパスを持たない入力用。
 pub fn decode_webp_frames_from_bytes(bytes: &[u8]) -> Option<Vec<(egui::ColorImage, f64)>> {
-    decode_webp_frames_from_bytes_cancellable(bytes, None).into_option()
+    decode_webp_frames_from_bytes_cancellable(bytes, None, None).into_option()
 }
 
 pub(crate) fn decode_webp_frames_from_bytes_cancellable(
     bytes: &[u8],
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult {
-    decode_webp_frames_from_reader(std::io::Cursor::new(bytes), cancel)
+    decode_webp_frames_from_reader(std::io::Cursor::new(bytes), cancel, on_animation_confirmed)
 }
 
 fn decode_webp_frames_from_reader<R>(
     mut reader: R,
     cancel: Option<&AtomicBool>,
+    on_animation_confirmed: Option<&dyn Fn()>,
 ) -> AnimationDecodeResult
 where
     R: std::io::BufRead + std::io::Seek,
@@ -443,6 +475,7 @@ where
     if !decoder.has_animation() {
         return AnimationDecodeResult::NotAnimatedOrFailed;
     }
+    AnimationConfirmedCallback(on_animation_confirmed).notify();
     if decoder
         .set_background_color(image::Rgba(background))
         .is_err()
@@ -749,7 +782,7 @@ mod tests {
         let bytes = animated_webp_fixture();
         let cancel = AtomicBool::new(true);
         assert!(matches!(
-            decode_webp_frames_from_bytes_cancellable(&bytes, Some(&cancel)),
+            decode_webp_frames_from_bytes_cancellable(&bytes, Some(&cancel), None),
             AnimationDecodeResult::Cancelled
         ));
     }

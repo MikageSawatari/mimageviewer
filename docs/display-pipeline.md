@@ -422,10 +422,10 @@ App-global な `FsPageLoadScheduler` の permit を取得してから以下へ�
 ```
 
 待機中の要求は cancel されると source を読まずに終了する。実行中の cancel は permit を
-即時返却せず、worker が実際に終了するまで `Cancelling` として数える。書庫読み出し直後・
-decode 前と animation frame 境界で cancel を確認し、PDFium / Susie IPC は開始後の応答まで
-permit 内で待つ。先読みから表示対象への遷移は同じ ticket の High 昇格であり、
-cancel + 再投入は行わない。
+即時返却せず、worker が実際に終了するまで `Cancelling` として数える。ZIP は位置指定 reader の
+`read` / `seek` 境界、書庫読み出し直後・decode 前、animation frame 境界で cancel を確認する。
+PDFium / Susie IPC は開始後の応答まで permit 内で待つ。先読みから表示対象への遷移は同じ
+ticket の High 昇格であり、cancel + 再投入は行わない。
 
 Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示時は常に
 `current_frame` の raw テクスチャを直接選び、`edit_result_cache` /
@@ -2414,10 +2414,12 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 昇格 worker / upload backlog は load purpose、items generation、target idx を保持する。別ページへ
 移動した昇格は cancel し、完了が遅れても target idx が現在ページでなければ適用しない。昇格失敗は
 `Failed` entry にせず第1フレームを `PromotionFailed` の static として残す。進行表示は、現ページの
-全フレーム展開を所有する typed load purpose から導く。一覧から直接開いた初回 `Display` と、
-先読み第1フレームからの `AnimationPromotion` のどちらも同じ述語で扱い、150ms 以上続いたときだけ
-右上3段目へ表示する。この150msは競合を吸収する時間窓ではなく、短時間処理を提示するかどうかだけの
-UI ゲートである。
+全フレーム展開を所有する状態から導く。一覧から直接開いた初回 `Display` はそれだけでは表示条件に
+せず、worker が GIF の2枚目、APNG の `is_apng()`、Animated WebP の `has_animation()` で複数
+フレーム形式を確認した非終端信号が届いた後だけ対象にする。先読み第1フレームからの
+`AnimationPromotion` は既に形式確認済みなので、従来どおり typed purpose の開始時刻を使う。
+どちらも確認 / 開始から150ms以上続いたときだけ右上3段目へ表示する。この150msは競合を吸収する
+時間窓ではなく、短時間処理を提示するかどうかだけの UI ゲートである。
 
 ### 4.2 サムネイル / フルスクリーンの整合性
 

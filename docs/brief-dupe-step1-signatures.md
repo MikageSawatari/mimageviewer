@@ -310,8 +310,12 @@ cargo run ... -- report --synth synth.jsonl [--pairs pairs.jsonl] --out report.m
 - `cargo test -p mimageviewer --lib dupe::` が緑
 - `cargo build --release --features dev-tools --bin bench_dupe` が通る
 - 上の 5.1〜5.4 の 4 モードが動き、利用者が自分のフォルダに対して実行できる
-- **本体 (`App` / UI / 設定 / DB) に一切変更が入っていないこと**。
-  `git diff --stat` が `src/dupe/`、`src/bin/bench_dupe.rs`、`Cargo.toml` に収まっている
+- **本体の既存挙動 (`App` / UI / 設定 / DB / 既存コード経路) に一切変更が入っていないこと**。
+  `git diff --stat` が `src/dupe/`、`src/bin/bench_dupe.rs`、`Cargo.toml`、
+  および `src/lib.rs` の `pub mod dupe;` 1 行に収まっている。
+  新規モジュールの宣言行と `Cargo.toml` の bin 定義は、モジュールを作る以上必然なので範囲内。
+  禁じているのは**既存の挙動を変えること**であって、配線そのものではない
+  (初版のブリーフはここが自己矛盾していた。2026-09-03 修正)
 
 ## 9. 判断に迷ったとき
 
