@@ -4271,7 +4271,7 @@ impl KeyAction {
             FsRotateCcw => "現在の画像を左に90度回転する",
             FsImageAnalysis => "画像分析モードを開く",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
-            FsPanorama => "360度パノラマモードを切り替える",
+            FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",

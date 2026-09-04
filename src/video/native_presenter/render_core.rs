@@ -379,6 +379,11 @@ fn panorama_takes_the_wheel(panorama_active: bool, region_owns_wheel: bool) -> b
     panorama_active && !region_owns_wheel
 }
 
+/// 通常動画の拡大モードがホイールを所有するか。360 と同じ overlay 除外規則を使う。
+fn video_zoom_takes_the_wheel(video_zoom_active: bool, region_owns_wheel: bool) -> bool {
+    video_zoom_active && !region_owns_wheel
+}
+
 fn immediate_native_wheel_command(
     delta: i16,
     ctrl: bool,
@@ -1285,6 +1290,7 @@ pub struct NativeRenderCore {
     panorama_pipeline: Option<VideoPanoramaPipeline>,
     panorama_pipeline_error: Option<String>,
     panorama_pose: Option<(PanoPose, PanoUvTransform)>,
+    video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     resample_pipeline: Option<VideoResamplePipeline>,
     resample_pipeline_error: Option<String>,
     selected_scale_filter: VideoScaleFilter,
@@ -1612,6 +1618,7 @@ struct NativeEguiOverlay {
     pending_events: Vec<egui::Event>,
     native_touch: crate::video::native_touch::NativeTouchAdapter,
     panorama_pose: Option<PanoPose>,
+    video_zoom_scale: Option<f32>,
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
@@ -2129,6 +2136,7 @@ pub struct NativeOverlayShortcutLabels {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NativeOverlayShortcutHelp {
     pub sections: Vec<NativeOverlayShortcutHelpSection>,
+    pub video_zoom_rows: Vec<NativeOverlayShortcutHelpRow>,
     pub touch_rows: Vec<NativeOverlayShortcutHelpRow>,
     pub fixed_rows: Vec<NativeOverlayShortcutHelpRow>,
 }
@@ -2449,7 +2457,7 @@ impl Drop for KeyedMutexReadGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
@@ -2470,6 +2478,15 @@ pub struct NativeOverlayInputRouting {
     ///   / B キーで個別ブックマーク追加などを誘発するのを防ぐ)。
     /// Codex レビュー C1/C2/C3 反映、2026-05-24。
     pub modal_dialog_active: bool,
+    /// 現在の動画 visual が占める表示領域 (overlay points)。通常動画のホイール固定点と
+    /// ドラッグ量を、描画側と同じ領域で解釈するための presenter 観測値。
+    pub video_region: Option<NativeVideoInputRegion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeVideoInputRegion {
+    pub origin_points: [f32; 2],
+    pub size_points: [f32; 2],
 }
 
 pub struct NativeOverlayInputOutcome {
@@ -2797,10 +2814,15 @@ pub enum NativeOverlayCommand {
     PanoramaWheel {
         delta: i32,
     },
+    VideoZoomWheel {
+        delta: i32,
+        pointer_points: [f32; 2],
+    },
     TogglePanorama,
     CyclePanoramaProjection,
     SetPanoramaProjection(crate::panorama::PanoProjection),
     ResetPanorama,
+    ResetVideoZoom,
     TileSeek {
         target_secs: f64,
     },
@@ -3642,6 +3664,7 @@ impl NativeRenderCore {
                 panorama_pipeline,
                 panorama_pipeline_error,
                 panorama_pose: None,
+                video_zoom_state: None,
                 resample_pipeline,
                 resample_pipeline_error,
                 selected_scale_filter: config.scale_filter,
@@ -5976,7 +5999,7 @@ impl NativeRenderCore {
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) -> Result<NativeOverlayInputOutcome, String> {
-        let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
+        let mut outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             let modal_dialog_active_before_events = overlay.modal_dialog_active_for_routing();
             overlay.push_native_events(events);
             let mut outcome = overlay.render_if_dirty()?;
@@ -5986,6 +6009,7 @@ impl NativeRenderCore {
             NativeOverlayInputOutcome::empty()
         };
         self.reconcile_info_panel_reservation()?;
+        outcome.routing.video_region = Some(self.video_input_region());
         Ok(outcome)
     }
 
@@ -6139,6 +6163,18 @@ impl NativeRenderCore {
         self.panorama_pose = panorama_pose;
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_panorama_pose(panorama_pose.map(|(pose, _)| pose));
+        }
+        self.sync_overlay_video_scale_state();
+        Ok(())
+    }
+
+    pub fn set_video_zoom_state(
+        &mut self,
+        state: Option<crate::video::zoom_view::VideoZoomState>,
+    ) -> Result<(), String> {
+        self.video_zoom_state = state;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_video_zoom_scale(state.map(|state| state.scale()));
         }
         self.sync_overlay_video_scale_state();
         Ok(())
@@ -6392,7 +6428,7 @@ impl NativeRenderCore {
         is_seeking: bool,
         seek_serial: u64,
     ) -> Result<NativeOverlayInputOutcome, String> {
-        let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
+        let mut outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render =
                 overlay.wants_periodic_tick() || overlay.repaint_due(Instant::now());
             overlay.update_video_state(
@@ -6415,6 +6451,7 @@ impl NativeRenderCore {
             NativeOverlayInputOutcome::empty()
         };
         self.reconcile_info_panel_reservation()?;
+        outcome.routing.video_region = Some(self.video_input_region());
         // Codex CP5 P1 反映: tick 経路でも overlay UI が時間経過で表示/非表示に変わるので、
         // 必ず HUD region に反映する。漏らすと periodic 表示状態 (= toast / hover preview /
         // tile overlay refresh 等) と region がズレて VST にクリックが奪われる。
@@ -6612,6 +6649,16 @@ impl NativeRenderCore {
                 .map_or(0.0, |overlay| overlay.seek_strip_visible_points()),
             fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
             info_panel_reserved: self.video_info_panel_reserved,
+        }
+    }
+
+    fn video_input_region(&self) -> NativeVideoInputRegion {
+        let layout = self.video_visual_layout();
+        let ppp = layout.pixels_per_point.max(f32::MIN_POSITIVE);
+        let rect = compute_video_visual_target_rect(self.width, self.height, layout);
+        NativeVideoInputRegion {
+            origin_points: [rect.x / ppp, rect.y / ppp],
+            size_points: [rect.width / ppp, rect.height / ppp],
         }
     }
 
@@ -7099,6 +7146,7 @@ impl NativeEguiOverlay {
             pending_events: Vec::new(),
             native_touch: crate::video::native_touch::NativeTouchAdapter::default(),
             panorama_pose: None,
+            video_zoom_scale: None,
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
@@ -7794,10 +7842,20 @@ impl NativeEguiOverlay {
                     self.panorama_pose.is_some() && !self.audio_only,
                     region_owns_wheel,
                 );
+                let video_zoom_wheel = video_zoom_takes_the_wheel(
+                    self.video_zoom_scale.is_some() && !self.audio_only,
+                    region_owns_wheel,
+                );
                 if panorama_wheel {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::PanoramaWheel {
                             delta: i32::from(wheel.delta),
+                        });
+                } else if video_zoom_wheel {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::VideoZoomWheel {
+                            delta: i32::from(wheel.delta),
+                            pointer_points: [pos.x, pos.y],
                         });
                 } else if let Some(command) = immediate_native_wheel_command(
                     wheel.delta,
@@ -7808,7 +7866,7 @@ impl NativeEguiOverlay {
                     self.pending_overlay_commands.push(command);
                 }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
-                if !panorama_wheel {
+                if !panorama_wheel && !video_zoom_wheel {
                     self.pending_events.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
@@ -8082,6 +8140,14 @@ impl NativeEguiOverlay {
             .native_touch
             .configure_panorama(self.panorama_pose.is_some());
         self.dirty |= changed || popup_closed || touch_changed;
+    }
+
+    fn set_video_zoom_scale(&mut self, scale: Option<f32>) {
+        if self.video_zoom_scale == scale {
+            return;
+        }
+        self.video_zoom_scale = scale;
+        self.dirty = true;
     }
 
     fn set_video_anime4k_state(
@@ -9854,6 +9920,7 @@ impl NativeEguiOverlay {
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
         let panorama_pose = self.panorama_pose;
+        let video_zoom_scale = self.video_zoom_scale;
         let shortcut_labels = video_metadata.as_ref().map(|metadata| &metadata.shortcuts);
         let mut shortcut_help_open = self.shortcut_help_open;
         let fallback_file_name = self.fallback_file_name.clone();
@@ -10134,6 +10201,7 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            video_zoom_scale.is_some(),
                             !audio_only,
                             &mut shortcut_help_open,
                         );
@@ -10188,6 +10256,7 @@ impl NativeEguiOverlay {
                             overlay_width_points,
                             overlay_height_points,
                             metadata.shortcut_help.as_ref(),
+                            video_zoom_scale.is_some(),
                             !audio_only,
                             &mut shortcut_help_open,
                         );
@@ -10246,6 +10315,7 @@ impl NativeEguiOverlay {
                     duration_secs,
                     video_metadata.as_ref(),
                     panorama_pose,
+                    video_zoom_scale,
                     &mut panorama_projection_popup_open,
                     &mut last_drawn_panorama_projection_popup_rect,
                     &fallback_file_name,
@@ -10417,6 +10487,7 @@ impl NativeEguiOverlay {
                         overlay_width_points,
                         overlay_height_points,
                         metadata.shortcut_help.as_ref(),
+                        video_zoom_scale.is_some(),
                         !audio_only,
                         &mut shortcut_help_open,
                     );
@@ -13035,6 +13106,7 @@ mod tests {
         native_video_fullscreen_shortcut_key, panorama_takes_the_wheel, pointer_region_owns_wheel,
         sample_cpu_rgba_pixel, seek_strip_reserves_space, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
+        video_zoom_takes_the_wheel,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
     use crate::settings::{FsSidePanelMode, VideoBottomLock};
@@ -13335,6 +13407,10 @@ mod tests {
                 "360 が領域からホイールを奪っている"
             );
             assert!(
+                !video_zoom_takes_the_wheel(true, owns),
+                "拡大表示が領域からホイールを奪っている"
+            );
+            assert!(
                 immediate_native_wheel_command(120, false, false, owns).is_none(),
                 "領域の上なのに前後アイテム送りへ化けている"
             );
@@ -13345,6 +13421,8 @@ mod tests {
         assert!(!owns);
         assert!(panorama_takes_the_wheel(true, owns));
         assert!(!panorama_takes_the_wheel(false, owns));
+        assert!(video_zoom_takes_the_wheel(true, owns));
+        assert!(!video_zoom_takes_the_wheel(false, owns));
         assert!(matches!(
             immediate_native_wheel_command(120, false, false, owns),
             Some(crate::video::native_presenter::NativeOverlayCommand::NavigateItem { .. })

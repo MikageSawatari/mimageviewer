@@ -5,6 +5,44 @@ use crate::keymap::{
 };
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoDisplayModeToggle {
+    Panorama,
+    VideoZoom,
+    NoOp,
+}
+
+#[cfg(windows)]
+fn select_native_video_display_mode_toggle(
+    panorama_detected: bool,
+    video_zoom_available: bool,
+) -> NativeVideoDisplayModeToggle {
+    if panorama_detected {
+        NativeVideoDisplayModeToggle::Panorama
+    } else if video_zoom_available {
+        NativeVideoDisplayModeToggle::VideoZoom
+    } else {
+        NativeVideoDisplayModeToggle::NoOp
+    }
+}
+
+#[cfg(windows)]
+fn native_video_key_display_mode_toggle(
+    panorama_detected: bool,
+    video_zoom_available: bool,
+) -> NativeVideoDisplayModeToggle {
+    select_native_video_display_mode_toggle(panorama_detected, video_zoom_available)
+}
+
+#[cfg(windows)]
+fn native_video_event_display_mode_toggle(
+    panorama_detected: bool,
+    video_zoom_available: bool,
+) -> NativeVideoDisplayModeToggle {
+    select_native_video_display_mode_toggle(panorama_detected, video_zoom_available)
+}
+
+#[cfg(windows)]
 pub(super) enum VideoSeekStripAxisState {
     Resolving { initial_time_secs: f64 },
     Ready(std::sync::Arc<crate::video::seek_strip::StripAxis>),
@@ -4018,7 +4056,8 @@ impl App {
             | Ev::ClearSeekThumbnail
             | Ev::RequestSeekStripWindow { .. }
             | Ev::VideoScaleSettingsCommitted { .. }
-            | Ev::PanoramaWheel { .. } => false,
+            | Ev::PanoramaWheel { .. }
+            | Ev::VideoZoomWheel { .. } => false,
             // Emitted both when the user finishes dragging the VST panel and when a saved position
             // is clamped back inside changed bounds. The drag already requests activation through
             // the left-button path above, so the renderer half must not add a second request.
@@ -4044,6 +4083,7 @@ impl App {
             | Ev::CyclePanoramaProjection
             | Ev::SetPanoramaProjection(_)
             | Ev::ResetPanorama
+            | Ev::ResetVideoZoom
             | Ev::TileSeek { .. }
             | Ev::OpenSeekStrip
             | Ev::MoveSeekStrip { .. }
@@ -4471,12 +4511,18 @@ impl App {
             crate::video::NativeVideoOutputEvent::PanoramaWheel { delta } => {
                 self.apply_native_video_panorama_wheel(ctx, fs_idx, delta);
             }
+            crate::video::NativeVideoOutputEvent::VideoZoomWheel {
+                delta,
+                pointer_points,
+            } => {
+                self.apply_native_video_zoom_wheel(ctx, fs_idx, delta, pointer_points);
+            }
             crate::video::NativeVideoOutputEvent::TogglePanorama => {
-                if self.detect_panorama(fs_idx).is_some() {
-                    self.toggle_panorama_mode(fs_idx);
-                    self.sync_native_video_metadata(fs_idx);
-                    self.request_native_video_hud_repaint(ctx);
-                }
+                let target = native_video_event_display_mode_toggle(
+                    self.detect_panorama(fs_idx).is_some(),
+                    self.native_video_zoom_available(fs_idx),
+                );
+                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
             }
             crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
                 if self.native_video_panorama_input_active(fs_idx)
@@ -4496,6 +4542,9 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ResetPanorama => {
                 self.reset_native_video_panorama(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::ResetVideoZoom => {
+                self.reset_native_video_zoom(ctx, fs_idx);
             }
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
@@ -5087,6 +5136,35 @@ impl App {
                     }
                     self.native_video_pointer_down = None;
                 }
+                if let Some(NativeVideoPointerDown::ZoomPan {
+                    fs_idx: drag_fs_idx,
+                    last_position_points,
+                    region_size_points,
+                    pixels_per_point,
+                }) = self.native_video_pointer_down
+                {
+                    if drag_fs_idx == fs_idx && self.native_video_zoom_input_active(fs_idx) {
+                        let current = egui::pos2(
+                            mouse.x as f32 / pixels_per_point,
+                            mouse.y as f32 / pixels_per_point,
+                        );
+                        self.apply_native_video_zoom_drag(
+                            ctx,
+                            fs_idx,
+                            current - last_position_points,
+                            region_size_points,
+                        );
+                        self.native_video_pointer_down = Some(NativeVideoPointerDown::ZoomPan {
+                            fs_idx,
+                            last_position_points: current,
+                            region_size_points,
+                            pixels_per_point,
+                        });
+                        self.mark_native_video_hud_activity(ctx);
+                        return;
+                    }
+                    self.native_video_pointer_down = None;
+                }
                 if self.mouse_ring_flick.is_some() {
                     let _ = self.update_native_mouse_ring_flick(
                         ctx,
@@ -5133,6 +5211,20 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
                 if self.apply_native_video_panorama_wheel(ctx, fs_idx, i32::from(wheel.delta)) {
+                    return;
+                }
+                if let Some((_, pixels_per_point)) =
+                    self.native_video_overlay_geometry_points(fs_idx)
+                    && self.apply_native_video_zoom_wheel(
+                        ctx,
+                        fs_idx,
+                        i32::from(wheel.delta),
+                        [
+                            wheel.x as f32 / pixels_per_point,
+                            wheel.y as f32 / pixels_per_point,
+                        ],
+                    )
+                {
                     return;
                 }
                 if wheel.ctrl && self.video_tile_mode_active {
@@ -6816,6 +6908,22 @@ impl App {
             })
             .collect();
 
+        let video_zoom_rows = [
+            ("マウスホイール".to_string(), "拡大 / 縮小".to_string()),
+            ("左ドラッグ".to_string(), "表示位置を移動".to_string()),
+            (
+                self.keymap.chord_labels(KeyAction::FsPanorama).join(" / "),
+                "拡大表示を終了".to_string(),
+            ),
+            (
+                "上バーのリセット".to_string(),
+                "表示位置と倍率を戻す".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(keys, description)| NativeOverlayShortcutHelpRow { keys, description })
+        .collect();
+
         let touch_rows = [
             ("中央をタップ", "HUD を表示 / 非表示"),
             ("左をタップ", "5 秒戻る"),
@@ -6830,6 +6938,7 @@ impl App {
 
         NativeOverlayShortcutHelp {
             sections,
+            video_zoom_rows,
             touch_rows,
             fixed_rows,
         }
@@ -6845,6 +6954,81 @@ impl App {
         let built = std::sync::Arc::new(self.build_native_overlay_shortcut_help());
         self.native_overlay_shortcut_help_cache = Some(built.clone());
         built
+    }
+
+    #[cfg(windows)]
+    fn native_video_view_input_available(&self, fs_idx: usize) -> bool {
+        self.fullscreen_idx == Some(fs_idx)
+            && self.video_audio_mode != Some(fs_idx)
+            && self
+                .music_vst_shell
+                .as_ref()
+                .is_none_or(|shell| shell.fs_idx != fs_idx)
+    }
+
+    #[cfg(windows)]
+    fn native_video_zoom_available(&self, fs_idx: usize) -> bool {
+        if !self.native_video_view_input_available(fs_idx) || self.detect_panorama(fs_idx).is_some()
+        {
+            return false;
+        }
+        matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. })
+                if player.info().is_some() && player.panorama_detection().is_some()
+        )
+    }
+
+    #[cfg(windows)]
+    fn native_video_zoom_source_geometry(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::video::zoom_view::VideoZoomSourceGeometry> {
+        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        let info = player.info()?;
+        Some(crate::video::zoom_view::VideoZoomSourceGeometry::new(
+            info.width,
+            info.height,
+            info.sar_num,
+            info.sar_den,
+            info.orientation,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn native_video_zoom_input_region(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::video::native_presenter::NativeVideoInputRegion> {
+        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        player
+            .native_overlay_input_routing_snapshot()
+            .video_region
+            .or_else(|| {
+                self.native_video_overlay_geometry_points(fs_idx)
+                    .map(
+                        |(size, _)| crate::video::native_presenter::NativeVideoInputRegion {
+                            origin_points: [0.0, 0.0],
+                            size_points: [size.x, size.y],
+                        },
+                    )
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_native_video_zoom_state(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let state = self
+            .native_video_zoom_input_active(fs_idx)
+            .then_some(self.video_zoom_state)
+            .flatten();
+        player.set_native_video_zoom_state(state);
     }
 
     #[cfg(windows)]
@@ -6865,13 +7049,14 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn native_video_panorama_input_active(&self, fs_idx: usize) -> bool {
-        self.fullscreen_idx == Some(fs_idx)
-            && self.video_audio_mode != Some(fs_idx)
-            && self
-                .music_vst_shell
-                .as_ref()
-                .is_none_or(|shell| shell.fs_idx != fs_idx)
-            && self.is_panorama_mode_active(fs_idx)
+        self.native_video_view_input_available(fs_idx) && self.is_panorama_mode_active(fs_idx)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_zoom_input_active(&self, fs_idx: usize) -> bool {
+        self.native_video_view_input_available(fs_idx)
+            && self.detect_panorama(fs_idx).is_none()
+            && self.video_zoom_state.is_some()
     }
 
     #[cfg(windows)]
@@ -6931,6 +7116,114 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn apply_native_video_zoom_wheel(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        wheel_delta: i32,
+        pointer_points: [f32; 2],
+    ) -> bool {
+        if !self.native_video_zoom_input_active(fs_idx) {
+            return false;
+        }
+        let Some(source) = self.native_video_zoom_source_geometry(fs_idx) else {
+            return true;
+        };
+        let Some(region) = self.native_video_zoom_input_region(fs_idx) else {
+            return true;
+        };
+        let pointer_in_region = [
+            pointer_points[0] - region.origin_points[0],
+            pointer_points[1] - region.origin_points[1],
+        ];
+        let changed = self.video_zoom_state.as_mut().is_some_and(|state| {
+            state.apply_wheel(
+                wheel_delta as f32,
+                pointer_in_region,
+                region.size_points,
+                source,
+            )
+        });
+        if changed {
+            self.sync_native_video_zoom_state(fs_idx);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn apply_native_video_zoom_drag(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        delta_points: egui::Vec2,
+        region_size_points: egui::Vec2,
+    ) -> bool {
+        if !self.native_video_zoom_input_active(fs_idx) {
+            return false;
+        }
+        let Some(source) = self.native_video_zoom_source_geometry(fs_idx) else {
+            return true;
+        };
+        let changed = self.video_zoom_state.as_mut().is_some_and(|state| {
+            state.apply_drag(
+                [delta_points.x, delta_points.y],
+                [region_size_points.x, region_size_points.y],
+                source,
+            )
+        });
+        if changed {
+            self.sync_native_video_zoom_state(fs_idx);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn reset_native_video_zoom(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if !self.native_video_zoom_input_active(fs_idx) {
+            return;
+        }
+        if let Some(state) = self.video_zoom_state.as_mut() {
+            state.reset();
+        }
+        self.sync_native_video_zoom_state(fs_idx);
+        self.request_native_video_hud_repaint(ctx);
+    }
+
+    #[cfg(windows)]
+    fn apply_native_video_display_mode_toggle(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        target: NativeVideoDisplayModeToggle,
+    ) {
+        match target {
+            NativeVideoDisplayModeToggle::Panorama => {
+                if self.video_zoom_state.take().is_some() {
+                    self.sync_native_video_zoom_state(fs_idx);
+                }
+                self.toggle_panorama_mode(fs_idx);
+            }
+            NativeVideoDisplayModeToggle::VideoZoom => {
+                if self.video_zoom_state.is_some() {
+                    self.video_zoom_state = None;
+                } else {
+                    self.close_video_tile_mode();
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_native_tile_overlay(None);
+                    }
+                    self.video_zoom_state = Some(crate::video::zoom_view::VideoZoomState::new());
+                }
+                self.sync_native_video_zoom_state(fs_idx);
+            }
+            NativeVideoDisplayModeToggle::NoOp => return,
+        }
+        self.sync_native_video_metadata(fs_idx);
+        self.request_native_video_hud_repaint(ctx);
+    }
+
+    #[cfg(windows)]
     /// 上下バーの固定状態を設定から読む唯一の場所。presenter の生成時 (config) と
     /// 生成後の同期 (`SetBarLockState`) が同じ値を見ることを、この 1 か所で保証する。
     #[cfg(windows)]
@@ -6945,6 +7238,7 @@ impl App {
 
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
         self.sync_native_video_panorama_state(fs_idx);
+        self.sync_native_video_zoom_state(fs_idx);
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => Some(player.path().clone()),
             _ => None,
@@ -9894,10 +10188,11 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
             }
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
-                if self.detect_panorama(fs_idx).is_some() {
-                    self.toggle_panorama_mode(fs_idx);
-                    self.sync_native_video_metadata(fs_idx);
-                }
+                let target = native_video_key_display_mode_toggle(
+                    self.detect_panorama(fs_idx).is_some(),
+                    self.native_video_zoom_available(fs_idx),
+                );
+                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanorama)
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
@@ -10725,6 +11020,7 @@ impl App {
         };
         match attach {
             Ok(()) => {
+                self.video_zoom_state = None;
                 self.music_vst_shell = Some(super::MusicVstShell {
                     fs_idx,
                     activated: false,
@@ -11023,6 +11319,9 @@ impl App {
                 "別ウィンドウの準備中です。少し待ってからもう一度お試しください".to_string(),
             );
             return VideoAudioEnterOutcome::Rejected(reason);
+        }
+        if self.video_zoom_state.take().is_some() {
+            self.sync_native_video_zoom_state(fs_idx);
         }
         // ── VST/owner/HUD teardown (exit_music_vst_shell と同じ順序、presenter HWND 生存中に) ──
         self.dsp_bridge.set_existing_guis_owner_to_main();
@@ -11989,6 +12288,8 @@ impl App {
             None,
         );
         new_player.attach_native_output(native_output);
+        self.video_zoom_state = None;
+        new_player.set_native_video_zoom_state(None);
         let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
 
@@ -12680,6 +12981,38 @@ impl App {
             return;
         }
 
+        let zoom_pan_in_progress = matches!(
+            self.native_video_pointer_down,
+            Some(NativeVideoPointerDown::ZoomPan { fs_idx: drag_idx, .. })
+                if drag_idx == fs_idx
+        );
+        if self.native_video_zoom_input_active(fs_idx) || zoom_pan_in_progress {
+            if event.down {
+                if let (Some((_, pixels_per_point)), Some(region)) = (
+                    self.native_video_overlay_geometry_points(fs_idx),
+                    self.native_video_zoom_input_region(fs_idx),
+                ) {
+                    self.native_video_pointer_down = Some(NativeVideoPointerDown::ZoomPan {
+                        fs_idx,
+                        last_position_points: egui::pos2(
+                            event.x as f32 / pixels_per_point,
+                            event.y as f32 / pixels_per_point,
+                        ),
+                        region_size_points: egui::vec2(
+                            region.size_points[0],
+                            region.size_points[1],
+                        ),
+                        pixels_per_point,
+                    });
+                } else {
+                    self.native_video_pointer_down = None;
+                }
+            } else {
+                self.native_video_pointer_down = None;
+            }
+            return;
+        }
+
         if event.down {
             self.native_video_pointer_down = Some(NativeVideoPointerDown::PlaybackClick {
                 fs_idx,
@@ -12824,6 +13157,30 @@ mod iconic_thumbnail_tests {
         assert!(!main_iconic_video_source_enabled(true, true, false));
         assert!(!main_iconic_video_source_enabled(false, false, false));
         assert!(!main_iconic_video_source_enabled(false, true, true));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod native_video_display_mode_toggle_tests {
+    use super::*;
+
+    fn assert_three_way_dispatch(dispatch: impl Fn(bool, bool) -> NativeVideoDisplayModeToggle) {
+        assert_eq!(dispatch(true, true), NativeVideoDisplayModeToggle::Panorama);
+        assert_eq!(
+            dispatch(false, true),
+            NativeVideoDisplayModeToggle::VideoZoom
+        );
+        assert_eq!(dispatch(false, false), NativeVideoDisplayModeToggle::NoOp);
+    }
+
+    #[test]
+    fn v_key_dispatches_panorama_zoom_or_no_op() {
+        assert_three_way_dispatch(native_video_key_display_mode_toggle);
+    }
+
+    #[test]
+    fn overlay_event_dispatches_panorama_zoom_or_no_op() {
+        assert_three_way_dispatch(native_video_event_display_mode_toggle);
     }
 }
 

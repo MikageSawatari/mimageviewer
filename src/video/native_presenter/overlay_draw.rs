@@ -1748,6 +1748,7 @@ pub(super) fn draw_native_shortcut_help_dialog(
     overlay_width_points: f32,
     overlay_height_points: f32,
     help: &NativeOverlayShortcutHelp,
+    show_video_zoom_rows: bool,
     show_touch_rows: bool,
     open: &mut bool,
 ) -> Option<egui::Rect> {
@@ -1834,6 +1835,27 @@ pub(super) fn draw_native_shortcut_help_dialog(
                                         ui.end_row();
                                     }
                                 });
+                            }
+
+                            if show_video_zoom_rows && !help.video_zoom_rows.is_empty() {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("拡大表示中")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(232, 232, 236)),
+                                );
+                                ui.add_space(2.0);
+                                egui::Grid::new("native_video_shortcut_help_zoom")
+                                    .num_columns(2)
+                                    .spacing([18.0, 4.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for row in &help.video_zoom_rows {
+                                            ui.monospace(&row.keys);
+                                            ui.label(&row.description);
+                                            ui.end_row();
+                                        }
+                                    });
                             }
 
                             if show_touch_rows && !help.touch_rows.is_empty() {
@@ -2199,6 +2221,7 @@ pub(super) enum NativeTopButtonGlyph {
     /// 音符 (♪): 動画→音声モードのトグルボタン (Inc 7)。
     AudioMode,
     Panorama,
+    VideoZoom,
     PanoramaReset,
 }
 
@@ -2350,6 +2373,7 @@ fn draw_native_top_button_enabled(
                 rect.width().min(rect.height()) * 0.28,
             )
         }
+        NativeTopButtonGlyph::VideoZoom => draw_overlay_video_zoom_icon(painter, rect, enabled),
         NativeTopButtonGlyph::PanoramaReset => {
             draw_overlay_panorama_reset_icon(painter, rect, enabled)
         }
@@ -2359,6 +2383,20 @@ fn draw_native_top_button_enabled(
         commands.push(command);
     }
     *x -= width + gap;
+}
+
+fn draw_overlay_video_zoom_icon(painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
+    let color = if enabled {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(110)
+    };
+    let center = rect.center() - egui::vec2(2.0, 2.0);
+    painter.circle_stroke(center, 6.0, egui::Stroke::new(1.8, color));
+    painter.line_segment(
+        [center + egui::vec2(4.5, 4.5), center + egui::vec2(9.0, 9.0)],
+        egui::Stroke::new(2.0, color),
+    );
 }
 
 fn draw_overlay_panorama_reset_icon(painter: &egui::Painter, rect: egui::Rect, enabled: bool) {
@@ -4132,6 +4170,7 @@ pub(super) fn draw_native_top_bar(
     duration_secs: f64,
     metadata: Option<&NativeOverlayMetadata>,
     panorama_pose: Option<crate::panorama::PanoPose>,
+    video_zoom_scale: Option<f32>,
     panorama_projection_popup_open: &mut bool,
     panorama_projection_popup_rect_out: &mut Option<egui::Rect>,
     fallback_file_name: &str,
@@ -4264,10 +4303,12 @@ pub(super) fn draw_native_top_bar(
             let panorama_detection = metadata.and_then(|metadata| metadata.panorama_detection);
             let panorama_enabled = matches!(panorama_detection, Some(Ok(_)));
             let panorama_active = panorama_enabled && panorama_pose.is_some();
+            let video_zoom_available = matches!(panorama_detection, Some(Err(_))) && !audio_only;
+            let video_zoom_active = video_zoom_available && video_zoom_scale.is_some();
             if !panorama_active {
                 *panorama_projection_popup_open = false;
             }
-            let panorama_tooltip = match panorama_detection {
+            let display_mode_tooltip = match panorama_detection {
                 None => "360 度動画の情報を読み込み中".to_owned(),
                 Some(Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto)) => {
                     native_label_with_shortcut(
@@ -4281,17 +4322,10 @@ pub(super) fn draw_native_top_bar(
                         shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
                     )
                 }
-                Some(Err(
-                    crate::video::spherical_metadata::VideoPanoramaRejection::UnsupportedProjection(
-                        _,
-                    ),
-                )) => "この球面投影方式には対応していません".to_owned(),
-                Some(Err(
-                    crate::video::spherical_metadata::VideoPanoramaRejection::Stereoscopic(_),
-                )) => "立体視 360 度動画には対応していません".to_owned(),
-                Some(Err(
-                    crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic,
-                )) => "360 度動画ではありません".to_owned(),
+                Some(Err(_)) => native_label_with_shortcut(
+                    "拡大表示",
+                    shortcuts.and_then(|shortcuts| shortcuts.panorama.as_deref()),
+                ),
             };
             draw_native_top_button_enabled(
                 ui,
@@ -4302,10 +4336,14 @@ pub(super) fn draw_native_top_bar(
                 btn_size,
                 gap,
                 "native_top_panorama",
-                NativeTopButtonGlyph::Panorama,
-                panorama_active,
-                panorama_enabled,
-                &panorama_tooltip,
+                if video_zoom_available {
+                    NativeTopButtonGlyph::VideoZoom
+                } else {
+                    NativeTopButtonGlyph::Panorama
+                },
+                panorama_active || video_zoom_active,
+                panorama_enabled || video_zoom_available,
+                &display_mode_tooltip,
                 NativeOverlayCommand::TogglePanorama,
                 commands,
             );
@@ -4373,6 +4411,34 @@ pub(super) fn draw_native_top_bar(
                     commands,
                 );
             }
+            if let Some(scale) = video_zoom_scale.filter(|_| video_zoom_active) {
+                draw_native_top_button_enabled(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    btn_size,
+                    btn_size,
+                    gap,
+                    "native_top_video_zoom_reset",
+                    NativeTopButtonGlyph::PanoramaReset,
+                    false,
+                    true,
+                    "表示位置と倍率をリセット",
+                    NativeOverlayCommand::ResetVideoZoom,
+                    commands,
+                );
+                let scale_rect =
+                    egui::Rect::from_min_size(egui::pos2(x - 4.0, y), egui::vec2(48.0, btn_size));
+                painter.text(
+                    scale_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{:.0}%", scale * 100.0),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                );
+                x -= scale_rect.width() + gap;
+            }
             let side_panel_mode = side_panel_mode.normalized();
             let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
             let info_tip = format!(
@@ -4428,9 +4494,9 @@ pub(super) fn draw_native_top_bar(
                     "native_top_tile",
                     NativeTopButtonGlyph::TileGrid,
                     false,
-                    panorama_pose.is_none(),
-                    if panorama_pose.is_some() {
-                        "360 度表示中はサムネイル一覧を開けません".to_owned()
+                    panorama_pose.is_none() && video_zoom_scale.is_none(),
+                    if panorama_pose.is_some() || video_zoom_scale.is_some() {
+                        "表示モード中はサムネイル一覧を開けません".to_owned()
                     } else {
                         native_label_with_shortcut(
                             "サムネイル一覧",

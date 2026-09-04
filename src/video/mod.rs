@@ -688,10 +688,15 @@ pub enum NativeVideoOutputEvent {
     PanoramaWheel {
         delta: i32,
     },
+    VideoZoomWheel {
+        delta: i32,
+        pointer_points: [f32; 2],
+    },
     TogglePanorama,
     CyclePanoramaProjection,
     SetPanoramaProjection(crate::panorama::PanoProjection),
     ResetPanorama,
+    ResetVideoZoom,
     TileSeek {
         target_secs: f64,
     },
@@ -1099,6 +1104,9 @@ enum NativeVideoOutputCommand {
     },
     SetPanoramaPose {
         panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    },
+    SetVideoZoomState {
+        state: Option<crate::video::zoom_view::VideoZoomState>,
     },
     StartAnime4kMeasurement,
     SetAnime4kState {
@@ -1575,7 +1583,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 32;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 33;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1612,6 +1620,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
         NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
+        NativeVideoOutputCommand::SetVideoZoomState { .. } => Some(32),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2429,6 +2438,13 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetPanoramaPose { panorama_pose });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    fn set_video_zoom_state(&self, state: Option<zoom_view::VideoZoomState>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoZoomState { state });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
@@ -3979,12 +3995,20 @@ fn send_native_overlay_command(
             viewport_height_points,
         },
         Command::PanoramaWheel { delta } => NativeVideoOutputEvent::PanoramaWheel { delta },
+        Command::VideoZoomWheel {
+            delta,
+            pointer_points,
+        } => NativeVideoOutputEvent::VideoZoomWheel {
+            delta,
+            pointer_points,
+        },
         Command::TogglePanorama => NativeVideoOutputEvent::TogglePanorama,
         Command::CyclePanoramaProjection => NativeVideoOutputEvent::CyclePanoramaProjection,
         Command::SetPanoramaProjection(projection) => {
             NativeVideoOutputEvent::SetPanoramaProjection(projection)
         }
         Command::ResetPanorama => NativeVideoOutputEvent::ResetPanorama,
+        Command::ResetVideoZoom => NativeVideoOutputEvent::ResetVideoZoom,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
@@ -4455,6 +4479,7 @@ fn run_native_video_output(
         crate::panorama::PanoPose,
         crate::panorama::PanoUvTransform,
     )> = None;
+    let mut cur_video_zoom_state: Option<zoom_view::VideoZoomState> = None;
     let mut cur_scale_filter = config.scale_filter;
     // presenter を作り直す経路 (F12 の placement 切替) でも固定状態を持ち越す。
     // open 時の config 値のまま作ると、切替のたびに固定なしの 1 枚が出る。
@@ -4482,6 +4507,7 @@ fn run_native_video_output(
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_video_grade(cur_video_grade.clone())?;
     presenter.set_panorama_pose(cur_panorama_pose)?;
+    presenter.set_video_zoom_state(cur_video_zoom_state)?;
     presenter.set_overlay_audio_only(config.audio_only);
     presenter.set_overlay_checked(config.checked);
     presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
@@ -4949,6 +4975,48 @@ fn run_native_video_output(
                         }
                         Err(error) => crate::logger::log(format!(
                             "[native-video] panorama pose update failed: {error}"
+                        )),
+                    }
+                }
+                NativeVideoOutputCommand::SetVideoZoomState { state } => {
+                    let changed = cur_video_zoom_state != state;
+                    let activation_changed = cur_video_zoom_state.is_some() != state.is_some();
+                    cur_video_zoom_state = state;
+                    match presenter.set_video_zoom_state(cur_video_zoom_state) {
+                        Ok(()) => {
+                            if activation_changed
+                                && source
+                                    .video_scale_state
+                                    .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
+                            if frame_output.should_represent_for_visual_change(changed)
+                                && !source.video_scale_state.has_desired()
+                            {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] zoom refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "[native-video] zoom state update failed: {error}"
                         )),
                     }
                 }
@@ -5635,6 +5703,7 @@ fn run_native_video_output(
                         );
                         new_presenter.set_video_grade(cur_video_grade.clone())?;
                         new_presenter.set_panorama_pose(cur_panorama_pose)?;
+                        new_presenter.set_video_zoom_state(cur_video_zoom_state)?;
                         new_presenter.set_overlay_audio_only(config.audio_only);
                         new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
                         new_presenter.set_overlay_checked(cur_checked);
@@ -6063,6 +6132,19 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::PanoramaWheel { delta },
                                 );
                             }
+                            crate::video::native_presenter::NativeOverlayCommand::VideoZoomWheel {
+                                delta,
+                                pointer_points,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::VideoZoomWheel {
+                                        delta,
+                                        pointer_points,
+                                    },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePanorama => {
                                 send_native_output_event(
                                     &ui_event_tx,
@@ -6089,6 +6171,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ResetPanorama,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ResetVideoZoom => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ResetVideoZoom,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
@@ -9583,6 +9672,13 @@ impl VideoPlayer {
     ) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_panorama_pose(panorama_pose);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_video_zoom_state(&self, state: Option<zoom_view::VideoZoomState>) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_zoom_state(state);
         }
     }
 

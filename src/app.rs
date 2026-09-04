@@ -3140,6 +3140,12 @@ enum NativeVideoPointerDown {
         viewport_height_points: f32,
         pixels_per_point: f32,
     },
+    ZoomPan {
+        fs_idx: usize,
+        last_position_points: egui::Pos2,
+        region_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    },
 }
 
 #[cfg(windows)]
@@ -10802,6 +10808,9 @@ pub struct App {
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
     pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 通常動画の拡大・パン。360 と違いセッション意図は持たず、項目や表示コンテキストが
+    /// 変わるたびに `None` へ戻す。
+    pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
     /// 「360 で見ていた」という事実はこちらが覚える。次に開いたものが 360 素材なら
@@ -14148,6 +14157,7 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             panorama_state: None,
+            video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
@@ -38368,6 +38378,9 @@ impl App {
             // 残さないと parked 側が resume したときに 360 が戻らない (backlog §1.145)。
             self.apply_panorama_mode_toggle(fs_idx);
         }
+        if self.video_zoom_state.take().is_some() {
+            self.sync_native_video_zoom_state(fs_idx);
+        }
         self.pano_toast_shown_for_current_fs = false;
         if self.analysis_mode {
             self.toggle_analysis_mode();
@@ -44260,6 +44273,11 @@ impl App {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
+        }
+
+        #[cfg(windows)]
+        if self.fullscreen_idx != Some(idx) {
+            self.video_zoom_state = None;
         }
 
         let sequence_is_awaiting_folder_target = self
@@ -52748,6 +52766,7 @@ impl App {
         // docs/panorama-360-view-plan.md §5.1 / §6.3。CallbackResources からも
         // UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
         self.panorama_state = None;
+        self.video_zoom_state = None;
         self.clear_pano_upload();
         self.pano_toast_shown_for_current_fs = false;
         // Phase 2a (§4.6.3 step 8): フル RGBA (最大 2.15 GB) を drop + 進行中 worker を cancel。
@@ -67091,6 +67110,7 @@ impl App {
         }
         self.sync_main_selection_from_viewer_idx(next_idx);
         self.fullscreen_idx = Some(next_idx);
+        self.video_zoom_state = None;
         self.video_audio_mode = None;
         self.video_audio_vst = None;
         self.video_audio_mode_entry_target = None;
