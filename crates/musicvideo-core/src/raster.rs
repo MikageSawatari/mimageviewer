@@ -6,12 +6,15 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use music_core::{
-    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, layout_keyboard_cached,
+    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, VisualizationColor,
+    key_fill as miv_key_fill, layout_keyboard_cached, lerp_color as miv_lerp_color,
+    spectrum_color as miv_spectrum_color, unlit_key_base as miv_unlit_key_base,
 };
 
 use crate::assets::{AssetError, Assets, ImageAsset};
 use crate::model::{
-    Fill, Fit, Glow, ImageId, NormRect, Rgba8, SpectrumDirection, SpectrumShape, TextAlign,
+    Fill, Fit, Glow, ImageId, MusicColorMode, NormRect, Rgba8, SpectrumDirection, SpectrumShape,
+    TextAlign,
 };
 use crate::scene::{Scene, SceneItem, SceneItemKind};
 
@@ -249,6 +252,7 @@ fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem)
             fill: Fill::Solid(color),
         }
         | SceneItemKind::Spectrum {
+            color_mode: MusicColorMode::Custom,
             fill: Fill::Solid(color),
             ..
         }
@@ -332,6 +336,7 @@ fn draw_item(
             values,
             point_count,
             shape,
+            color_mode,
             fill,
         } => draw_spectrum(
             frame,
@@ -339,6 +344,7 @@ fn draw_item(
             values,
             *point_count,
             *shape,
+            *color_mode,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -347,12 +353,14 @@ fn draw_item(
         SceneItemKind::PitchKeyboard {
             keyboard,
             background,
+            color_mode,
             fill,
         } => draw_pitch_keyboard(
             frame,
             rect,
             keyboard,
             background,
+            *color_mode,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -617,6 +625,9 @@ struct SpectrumBar {
     end: (f32, f32),
     thickness: f32,
     band_position: f32,
+    index: usize,
+    total: usize,
+    value: f32,
     round_caps: bool,
 }
 
@@ -675,6 +686,9 @@ fn spectrum_bars(
                         end: (x, rect.y1 as f32 - height),
                         thickness: width,
                         band_position: band_position(index, count),
+                        index,
+                        total: count,
+                        value,
                         round_caps: false,
                     }
                 })
@@ -753,6 +767,9 @@ fn radial_spectrum_bars(
                 ),
                 thickness,
                 band_position: position,
+                index,
+                total: count,
+                value,
                 round_caps: true,
             }
         })
@@ -766,6 +783,7 @@ fn draw_spectrum(
     values: &[f32],
     point_count: usize,
     shape: SpectrumShape,
+    color_mode: MusicColorMode,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
@@ -779,6 +797,7 @@ fn draw_spectrum(
             rect,
             bar,
             &sampler,
+            color_mode,
             opacity,
             corner_radius_px,
             mask_mode,
@@ -791,10 +810,13 @@ fn draw_spectrum_bar(
     clip_rect: PixelRect,
     bar: SpectrumBar,
     sampler: &FillSampler,
+    color_mode: MusicColorMode,
     opacity: f32,
     corner_radius_px: f32,
     mask_mode: bool,
 ) {
+    let miv_color = (color_mode == MusicColorMode::Miv)
+        .then(|| rgba8(miv_spectrum_color(bar.index, bar.total, bar.value)));
     let pad = bar.thickness * 0.5 + 1.0;
     let min_x = (bar.start.0.min(bar.end.0) - pad)
         .floor()
@@ -818,7 +840,11 @@ fn draw_spectrum_bar(
             if coverage <= 0.0 {
                 continue;
             }
-            let color = sampler.sample(px, py, Some(bar.band_position), mask_mode);
+            let color = match miv_color {
+                None => sampler.sample(px, py, Some(bar.band_position), mask_mode),
+                Some(color) if mask_mode => Rgba8::new(255, 255, 255, color.a),
+                Some(color) => color,
+            };
             let offset = (y * width + x) * 4;
             blend_pixel(
                 &mut frame.rgba[offset..offset + 4],
@@ -872,6 +898,7 @@ fn draw_pitch_keyboard(
     rect: PixelRect,
     keyboard: &KeyboardFrame,
     background: &Fill,
+    color_mode: MusicColorMode,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
@@ -913,6 +940,7 @@ fn draw_pitch_keyboard(
             rect,
             &layout.keys,
             &sampler,
+            color_mode,
             opacity,
             mask_mode,
             &clip_coverage,
@@ -1006,10 +1034,20 @@ fn draw_keyboard_keys(
     clip: PixelRect,
     keys: &[KeyPlacement],
     sampler: &FillSampler<'_>,
+    color_mode: MusicColorMode,
     opacity: f32,
     mask_mode: bool,
     clip_coverage: &KeyboardClipCoverage,
 ) {
+    let miv_gradients = (color_mode == MusicColorMode::Miv).then(|| {
+        keys.iter()
+            .map(|key| MivKeyGradient {
+                top: miv_key_fill(key.midi, key.levels.center * key.levels.odd, key.black),
+                center: miv_key_fill(key.midi, key.levels.center, key.black),
+                bottom: miv_key_fill(key.midi, key.levels.center * key.levels.even, key.black),
+            })
+            .collect::<Vec<_>>()
+    });
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
@@ -1018,7 +1056,7 @@ fn draw_keyboard_keys(
         .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
         .for_each(|(y, row)| {
             let py = y as f32 + 0.5;
-            for &key in keys {
+            for (key_index, &key) in keys.iter().enumerate() {
                 let min_y = key.rect.top.floor().max(clip.y0 as f32) as usize;
                 let max_y = key.rect.bottom.ceil().min(clip.y1 as f32) as usize;
                 if y < min_y || y >= max_y {
@@ -1033,7 +1071,7 @@ fn draw_keyboard_keys(
                 } else {
                     Rgba8::new(0, 0, 0, 155)
                 };
-                let base = unlit_keyboard_key(key.black, key.real_key);
+                let base = rgba8(miv_unlit_key_base(key.black, key.real_key));
                 let band_position = key.note_position;
                 for x in min_x..max_x {
                     let px = x as f32 + 0.5;
@@ -1046,10 +1084,22 @@ fn draw_keyboard_keys(
                     let color = if mask_mode {
                         Rgba8::WHITE
                     } else if key.real_key {
-                        let level = keyboard_vertical_level(key, py);
-                        let active = sampler.sample(px, py, band_position, false);
-                        let amount = (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
-                        mix_rgba(base, active, amount)
+                        match color_mode {
+                            MusicColorMode::Custom => {
+                                let level = keyboard_vertical_level(key, py);
+                                let active = sampler.sample(px, py, band_position, false);
+                                let amount =
+                                    (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
+                                mix_rgba(base, active, amount)
+                            }
+                            MusicColorMode::Miv => miv_keyboard_vertical_color(
+                                miv_gradients
+                                    .as_ref()
+                                    .expect("mIV 配色では鍵ごとの色が計算済みです")[key_index],
+                                key,
+                                py,
+                            ),
+                        }
                     } else {
                         base
                     };
@@ -1147,7 +1197,7 @@ fn draw_keyboard_key_serial(
     } else {
         Rgba8::new(0, 0, 0, 155)
     };
-    let base = unlit_keyboard_key(key.black, key.real_key);
+    let base = rgba8(miv_unlit_key_base(key.black, key.real_key));
     let band_position = key.note_position;
     let width = frame.width as usize;
     for y in min_y..max_y {
@@ -1217,13 +1267,31 @@ fn keyboard_vertical_level(key: music_core::KeyPlacement, y: f32) -> f32 {
     }
 }
 
-fn unlit_keyboard_key(black: bool, real: bool) -> Rgba8 {
-    match (black, real) {
-        (false, true) => Rgba8::new(208, 214, 219, 255),
-        (false, false) => Rgba8::new(58, 64, 70, 255),
-        (true, true) => Rgba8::new(13, 16, 19, 255),
-        (true, false) => Rgba8::new(34, 39, 44, 255),
-    }
+#[derive(Clone, Copy)]
+struct MivKeyGradient {
+    top: VisualizationColor,
+    center: VisualizationColor,
+    bottom: VisualizationColor,
+}
+
+fn miv_keyboard_vertical_color(
+    gradient: MivKeyGradient,
+    key: music_core::KeyPlacement,
+    y: f32,
+) -> Rgba8 {
+    let middle = (key.rect.top + key.rect.bottom) * 0.5;
+    let color = if y <= middle {
+        let amount = ((y - key.rect.top) / (middle - key.rect.top).max(1.0e-6)).clamp(0.0, 1.0);
+        miv_lerp_color(gradient.top, gradient.center, amount)
+    } else {
+        let amount = ((y - middle) / (key.rect.bottom - middle).max(1.0e-6)).clamp(0.0, 1.0);
+        miv_lerp_color(gradient.center, gradient.bottom, amount)
+    };
+    rgba8(color)
+}
+
+fn rgba8(color: VisualizationColor) -> Rgba8 {
+    Rgba8::new(color.r, color.g, color.b, color.a)
 }
 
 fn mix_rgba(from: Rgba8, to: Rgba8, amount: f32) -> Rgba8 {
@@ -1393,6 +1461,7 @@ fn render_item_mask(
             values,
             point_count,
             shape,
+            color_mode,
             fill,
         } => draw_spectrum_mask(
             &mut alpha,
@@ -1401,6 +1470,7 @@ fn render_item_mask(
             values,
             *point_count,
             *shape,
+            *color_mode,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -1501,6 +1571,7 @@ fn draw_spectrum_mask(
     values: &[f32],
     point_count: usize,
     shape: SpectrumShape,
+    color_mode: MusicColorMode,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
@@ -1521,6 +1592,8 @@ fn draw_spectrum_mask(
         .par_iter()
         .map(|bar| {
             let bar = *bar;
+            let miv_alpha = (color_mode == MusicColorMode::Miv)
+                .then(|| miv_spectrum_color(bar.index, bar.total, bar.value).a);
             let mut operations = Vec::new();
             let pad = bar.thickness * 0.5 + 1.0;
             let min_x = (bar.start.0.min(bar.end.0) - pad).floor().max(0.0) as usize;
@@ -1536,8 +1609,12 @@ fn draw_spectrum_mask(
                     if coverage <= 0.0 {
                         continue;
                     }
-                    let source_alpha = solid_alpha
-                        .unwrap_or_else(|| sampler.sample(px, py, Some(bar.band_position), true).a);
+                    let source_alpha = match miv_alpha {
+                        None => solid_alpha.unwrap_or_else(|| {
+                            sampler.sample(px, py, Some(bar.band_position), true).a
+                        }),
+                        Some(alpha) => alpha,
+                    };
                     let alpha = (source_alpha as f32 * opacity * coverage)
                         .round()
                         .clamp(0.0, 255.0) as u8;
@@ -2345,6 +2422,7 @@ mod tests {
             kind: SceneItemKind::PitchKeyboard {
                 keyboard: keyboard.clone(),
                 background: Fill::Solid(Rgba8::BLACK),
+                color_mode: MusicColorMode::Custom,
                 fill: Fill::Solid(fill),
             },
         };
@@ -2413,6 +2491,62 @@ mod tests {
     }
 
     #[test]
+    fn miv_palette_is_deterministic_and_does_not_use_the_custom_fill() {
+        let mut notes = vec![0.0; music_core::KEYBOARD_NOTE_COUNT];
+        notes[(60 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.9;
+        notes[(64 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.65;
+        notes[(67 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.7;
+        let mut state = KeyboardAnimationState::default();
+        let keyboard = prepare_keyboard_frame(&notes, SPECTRUM_NOTE_MIN_MIDI, 6.0, &mut state);
+        let make_scene = |fill| Scene {
+            width: 320,
+            height: 160,
+            items: vec![
+                item(SceneItemKind::Spectrum {
+                    values: vec![0.1, 0.8, 0.3, 1.0],
+                    point_count: 24,
+                    shape: SpectrumShape::Bars {
+                        gap_ratio: 0.25,
+                        min_height_px: 2.0,
+                        thickness_px: 8.0,
+                    },
+                    color_mode: MusicColorMode::Miv,
+                    fill: Fill::Solid(fill),
+                }),
+                SceneItem {
+                    rect: NormRect::new(0.05, 0.65, 0.9, 0.25),
+                    opacity: 1.0,
+                    rotation_deg: 0.0,
+                    corner_radius_px: 0.0,
+                    glow: None,
+                    kind: SceneItemKind::PitchKeyboard {
+                        keyboard: keyboard.clone(),
+                        background: Fill::Solid(Rgba8::new(0, 0, 0, 0)),
+                        color_mode: MusicColorMode::Miv,
+                        fill: Fill::Solid(fill),
+                    },
+                },
+            ],
+        };
+        let first_scene = make_scene(Rgba8::new(255, 0, 0, 255));
+        let second_scene = make_scene(Rgba8::new(0, 255, 0, 255));
+        let mut first = Frame::new(1, 1).unwrap();
+        let mut repeated = Frame::new(1, 1).unwrap();
+        let mut other_fill = Frame::new(1, 1).unwrap();
+        let _ = render_frame(&first_scene, &Assets::default(), &mut first).unwrap();
+        let _ = render_frame(&first_scene, &Assets::default(), &mut repeated).unwrap();
+        let _ = render_frame(&second_scene, &Assets::default(), &mut other_fill).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first, other_fill);
+        assert!(
+            first
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| { pixel[0] != pixel[1] || pixel[1] != pixel[2] })
+        );
+    }
+
+    #[test]
     fn parallel_keyboard_matches_the_serial_pixel_order_bit_for_bit() {
         let mut notes = vec![0.0; music_core::KEYBOARD_NOTE_COUNT];
         for (index, level) in notes.iter_mut().enumerate() {
@@ -2458,6 +2592,7 @@ mod tests {
                     rect,
                     &keyboard,
                     &background,
+                    MusicColorMode::Custom,
                     &fill,
                     0.73,
                     corner_radius_px,
@@ -2541,6 +2676,7 @@ mod tests {
                         kind: SceneItemKind::PitchKeyboard {
                             keyboard: KeyboardFrame::default(),
                             background: Fill::Solid(background),
+                            color_mode: MusicColorMode::Custom,
                             fill: Fill::Solid(Rgba8::WHITE),
                         },
                     },
@@ -2622,6 +2758,7 @@ mod tests {
                 sweep_deg: 360.0,
                 direction: SpectrumDirection::Clockwise,
             },
+            color_mode: MusicColorMode::Custom,
             fill: Fill::BandGradient { stops },
         });
         layer.rotation_deg = 7.0;
@@ -2663,6 +2800,7 @@ mod tests {
                 sweep_deg: 360.0,
                 direction: SpectrumDirection::Clockwise,
             },
+            color_mode: MusicColorMode::Custom,
             fill: Fill::Solid(Rgba8::WHITE),
         });
         let mut frame = Frame::new(1, 1).unwrap();
@@ -2710,6 +2848,7 @@ mod tests {
                 sweep_deg: 360.0,
                 direction: SpectrumDirection::Clockwise,
             },
+            color_mode: MusicColorMode::Custom,
             fill: Fill::Solid(Rgba8::WHITE),
         });
         let mut radial_frame = Frame::new(1, 1).unwrap();

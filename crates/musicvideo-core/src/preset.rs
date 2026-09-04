@@ -1,6 +1,6 @@
 use crate::model::{
-    Animatable, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind, NormRect, Output,
-    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    Animatable, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind, MusicColorMode, NormRect,
+    Output, PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
     SpectrumShape, TextAlign, TimeFormat, TimeTextLayer,
 };
 
@@ -51,6 +51,7 @@ pub fn default_project(duration_secs: f64) -> Project {
         images: Vec::new(),
         output: DEFAULT_OUTPUT,
         duration_secs,
+        display_gain_db: 0.0,
         layers: vec![
             layer(
                 1,
@@ -83,6 +84,7 @@ pub fn default_project(duration_secs: f64) -> Project {
                         sweep_deg: 360.0,
                         direction: SpectrumDirection::Clockwise,
                     },
+                    color_mode: MusicColorMode::Custom,
                     fill: Animatable::Const(Fill::Solid(Rgba8::new(120, 255, 35, 255))),
                 }),
             ),
@@ -143,6 +145,7 @@ pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
         glow: Animatable::Const(None),
         kind: LayerKind::PitchKeyboard(PitchKeyboardLayer {
             background: Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0))),
+            color_mode: MusicColorMode::Custom,
             fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 220, 255, 255))),
         }),
     }
@@ -156,6 +159,7 @@ mod tests {
     fn shared_default_project_has_the_reference_scene() {
         let project = default_project(10.0);
         assert_eq!(project.output, DEFAULT_OUTPUT);
+        assert_eq!(project.display_gain_db, 0.0);
         assert_eq!(project.layers.len(), 4);
         assert_eq!(project.layers[0].name, "背景画像");
         assert_eq!(project.layers[1].name, "円形スペクトラム");
@@ -166,6 +170,7 @@ mod tests {
         };
         assert_eq!(spectrum.band_count, DEFAULT_SPECTRUM_BANDS);
         assert_eq!(spectrum.point_count, 200);
+        assert_eq!(spectrum.color_mode, MusicColorMode::Custom);
         assert!(matches!(spectrum.shape, SpectrumShape::Radial { .. }));
         assert_eq!(project.layers[2].corner_radius, Animatable::Const(20.0));
         assert_eq!(project.layers[3].glow.evaluate(0.0).unwrap().radius_px, 5.0);
@@ -183,5 +188,6 @@ mod tests {
             keyboard.background,
             Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0)))
         );
+        assert_eq!(keyboard.color_mode, MusicColorMode::Custom);
     }
 }

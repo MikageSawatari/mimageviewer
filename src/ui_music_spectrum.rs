@@ -17,8 +17,8 @@
 //!   (§5.6、長尺ファイルの出現遅延対策)。`RwLock` は解析 read と窓コピー read を並行させ spectrum を
 //!   固まらせないため (詳細は `MusicPcm` の doc)。
 //!
-//! 鍵盤の輝度・低域整理・配置と Bass ▼ の判断は `music-core::keyboard` にあり、音楽ビデオ
-//! 書き出しと共有する。このモジュールには、その結果を egui の描画 API へ渡す処理だけを置く。
+//! 鍵盤の輝度・低域整理・配置・配色と Bass ▼ の判断、スペクトラムの配色は `music-core` にあり、
+//! 音楽ビデオ書き出しと共有する。このモジュールには、その結果を egui の描画 API へ渡す処理だけを置く。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -28,8 +28,9 @@ use std::time::{Duration, Instant};
 use music_core::{
     BassMarkerPlacement, KeyboardAnimationState, KeyboardFrame, KeyboardLayoutCache, KeyboardRect,
     SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI,
-    SpectrumAnalysis, SpectrumAnalyzer, layout_bass_markers_into, layout_keyboard_cached,
-    prepare_keyboard_frame_into,
+    SpectrumAnalysis, SpectrumAnalyzer, VisualizationColor, brighten_color, key_color, key_fill,
+    layout_bass_markers_into, layout_keyboard_cached, prepare_keyboard_frame_into, spectrum_color,
+    unlit_key_base, with_alpha,
 };
 
 // ── レイアウト・解析定数 (ラボと同値) ──
@@ -478,7 +479,7 @@ impl MusicSpectrumState {
                     egui::pos2((x1 + 0.45).min(plot.right()), plot.bottom() - 2.0),
                 ),
                 band_corner,
-                color_with_alpha(spectrum_color(i, band_len, self.trail[i]), 48),
+                egui_color(with_alpha(spectrum_color(i, band_len, self.trail[i]), 48)),
             );
             let trail_h = (plot.height() - 3.0) * self.trail[i].max(0.015);
             painter.rect_filled(
@@ -487,7 +488,7 @@ impl MusicSpectrumState {
                     egui::pos2((x1 + 0.2).min(plot.right()), plot.bottom() - 2.0),
                 ),
                 band_corner,
-                color_with_alpha(spectrum_color(i, band_len, self.trail[i]), 100),
+                egui_color(with_alpha(spectrum_color(i, band_len, self.trail[i]), 100)),
             );
             let h = (plot.height() - 3.0) * value.max(0.015);
             painter.rect_filled(
@@ -496,7 +497,7 @@ impl MusicSpectrumState {
                     egui::pos2(x1, plot.bottom() - 2.0),
                 ),
                 band_corner,
-                spectrum_color(i, band_len, value),
+                egui_color(spectrum_color(i, band_len, value)),
             );
             let onset = self.onsets[i].clamp(0.0, 1.0);
             if onset > 0.025 {
@@ -507,7 +508,7 @@ impl MusicSpectrumState {
                         egui::pos2(x1, plot.bottom() - 2.0),
                     ),
                     band_corner,
-                    color_with_alpha(accent, (24.0 + onset * 68.0) as u8),
+                    egui_color(with_alpha(accent, (24.0 + onset * 68.0) as u8)),
                 );
             }
         }
@@ -702,12 +703,17 @@ fn draw_pitch_keyboard(
         let corner = if key.black { 1.0 } else { 0.0 };
         if key.real_key {
             let center_val = key.levels.center;
-            let mid_color = key_fill(key.midi, center_val, key.black);
-            let top_color = key_fill(key.midi, center_val * key.levels.odd, key.black);
-            let bottom_color = key_fill(key.midi, center_val * key.levels.even, key.black);
+            let mid_color = egui_color(key_fill(key.midi, center_val, key.black));
+            let top_color = egui_color(key_fill(key.midi, center_val * key.levels.odd, key.black));
+            let bottom_color =
+                egui_color(key_fill(key.midi, center_val * key.levels.even, key.black));
             fill_key_gradient(&painter, key_rect, top_color, mid_color, bottom_color);
         } else {
-            painter.rect_filled(key_rect, corner, unlit_key_base(key.black, false));
+            painter.rect_filled(
+                key_rect,
+                corner,
+                egui_color(unlit_key_base(key.black, false)),
+            );
         }
         let stroke = if key.black {
             egui::Stroke::new(
@@ -756,7 +762,7 @@ fn draw_bass_marker(
         let base = key_color(60 + marker.midi % 12, 0.75 + 0.25 * m);
         let alpha =
             (BASS_MARKER_ALPHA_MIN + (BASS_MARKER_ALPHA_MAX - BASS_MARKER_ALPHA_MIN) * m) as u8;
-        let color = color_with_alpha(base, alpha);
+        let color = egui_color(with_alpha(base, alpha));
         let triangle = marker
             .triangle
             .into_iter()
@@ -768,24 +774,6 @@ fn draw_bass_marker(
             egui::Stroke::NONE,
         ));
     }
-}
-
-/// 消灯時の鍵ベース色 (黒/白 × real/非表示レンジ)。
-fn unlit_key_base(black: bool, real: bool) -> egui::Color32 {
-    match (black, real) {
-        (false, true) => egui::Color32::from_rgb(208, 214, 219),
-        (false, false) => egui::Color32::from_rgb(58, 64, 70),
-        (true, true) => egui::Color32::from_rgb(13, 16, 19),
-        (true, false) => egui::Color32::from_rgb(34, 39, 44),
-    }
-}
-
-/// 鍵の点灯色。色相 (ピッチクラス) は `key_color` が保持し、`value` で消灯ベースから blend する。
-fn key_fill(midi: u8, value: f32, black: bool) -> egui::Color32 {
-    let base = unlit_key_base(black, true);
-    let active = key_color(midi, value);
-    let blend = (value * if black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
-    lerp_color(base, active, blend)
 }
 
 /// 鍵を縦グラデ (上端 → 中央 → 下端) の頂点カラー付き mesh で塗る。中央が最も明るい基音アンカー。
@@ -882,95 +870,8 @@ fn note_name_from_midi(midi: i32) -> String {
     format!("{}{}", NAMES[pitch_class], octave)
 }
 
-fn key_color(midi: u8, value: f32) -> egui::Color32 {
-    let pitch_class = midi % 12;
-    let fifth_index = ((pitch_class as usize * 7) % 12) as f32;
-    let hue = (fifth_index / 12.0 + 0.57) % 1.0;
-    let saturation = 0.62 + value.clamp(0.0, 1.0) * 0.28;
-    let brightness = 0.38 + value.clamp(0.0, 1.0) * 0.58;
-    hsv_to_rgb(hue, saturation, brightness)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    egui::Color32::from_rgb(
-        (r.clamp(0.0, 1.0) * 255.0) as u8,
-        (g.clamp(0.0, 1.0) * 255.0) as u8,
-        (b.clamp(0.0, 1.0) * 255.0) as u8,
-    )
-}
-
-fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {
-    let t = if total <= 1 {
-        0.0
-    } else {
-        index as f32 / (total - 1) as f32
-    };
-    let base = if t < 0.20 {
-        lerp_color(
-            egui::Color32::from_rgb(188, 58, 34),
-            egui::Color32::from_rgb(236, 132, 34),
-            t / 0.20,
-        )
-    } else if t < 0.52 {
-        lerp_color(
-            egui::Color32::from_rgb(255, 216, 28),
-            egui::Color32::from_rgb(70, 232, 76),
-            (t - 0.20) / 0.32,
-        )
-    } else if t < 0.78 {
-        lerp_color(
-            egui::Color32::from_rgb(38, 230, 190),
-            egui::Color32::from_rgb(44, 138, 255),
-            (t - 0.52) / 0.26,
-        )
-    } else {
-        lerp_color(
-            egui::Color32::from_rgb(44, 138, 255),
-            egui::Color32::from_rgb(245, 82, 210),
-            (t - 0.78) / 0.22,
-        )
-    };
-    let alpha = (92.0 + 150.0 * value.clamp(0.0, 1.0)) as u8;
-    color_with_alpha(
-        brighten_color(base, 0.55 + value.clamp(0.0, 1.0) * 0.65),
-        alpha,
-    )
-}
-
-fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |av: u8, bv: u8| av as f32 + (bv as f32 - av as f32) * t;
-    egui::Color32::from_rgb(
-        lerp(a.r(), b.r()) as u8,
-        lerp(a.g(), b.g()) as u8,
-        lerp(a.b(), b.b()) as u8,
-    )
-}
-
-fn brighten_color(color: egui::Color32, scale: f32) -> egui::Color32 {
-    egui::Color32::from_rgb(
-        ((color.r() as f32 * scale).min(255.0)) as u8,
-        ((color.g() as f32 * scale).min(255.0)) as u8,
-        ((color.b() as f32 * scale).min(255.0)) as u8,
-    )
-}
-
-fn color_with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+fn egui_color(color: VisualizationColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
 }
 
 #[cfg(test)]

@@ -22,6 +22,9 @@ pub struct Project {
     pub images: Vec<ImageRef>,
     pub output: Output,
     pub duration_secs: f64,
+    /// 鍵盤表示へ適用する追加の表示ゲイン。音声そのものの音量は変えない。
+    #[serde(default)]
+    pub display_gain_db: f32,
     /// Drawing order. The first layer is the backmost layer.
     pub layers: Vec<Layer>,
 }
@@ -87,6 +90,8 @@ pub struct SpectrumLayer {
     pub band_count: usize,
     pub point_count: usize,
     pub shape: SpectrumShape,
+    #[serde(default)]
+    pub color_mode: MusicColorMode,
     pub fill: Animatable<Fill>,
 }
 
@@ -94,8 +99,17 @@ pub struct SpectrumLayer {
 pub struct PitchKeyboardLayer {
     /// 鍵盤レイヤ全体の背景。書き出し側の既定は透明。
     pub background: Animatable<Fill>,
+    #[serde(default)]
+    pub color_mode: MusicColorMode,
     /// 点灯している鍵に使う塗り。消灯色と枠は本体鍵盤と同じ規則で決まる。
     pub fill: Animatable<Fill>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MusicColorMode {
+    #[default]
+    Custom,
+    Miv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -340,6 +354,7 @@ impl NormRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preset::default_project;
 
     fn stop(position: f32, color: Rgba8) -> GradientStop {
         GradientStop { position, color }
@@ -386,6 +401,35 @@ mod tests {
     #[test]
     fn deserialization_cannot_construct_an_empty_gradient() {
         assert!(serde_json::from_str::<GradientStops>("[]").is_err());
+    }
+
+    #[test]
+    fn older_project_json_defaults_display_gain_and_music_color_modes() {
+        let mut project = default_project(10.0);
+        project
+            .layers
+            .push(crate::preset::new_pitch_keyboard_layer(&project));
+        let mut value = serde_json::to_value(project).unwrap();
+        value.as_object_mut().unwrap().remove("display_gain_db");
+        for layer in value["layers"].as_array_mut().unwrap() {
+            let kind = &mut layer["kind"];
+            if let Some(spectrum) = kind.get_mut("Spectrum") {
+                spectrum.as_object_mut().unwrap().remove("color_mode");
+            }
+            if let Some(keyboard) = kind.get_mut("PitchKeyboard") {
+                keyboard.as_object_mut().unwrap().remove("color_mode");
+            }
+        }
+        let restored: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.display_gain_db, 0.0);
+        let LayerKind::Spectrum(spectrum) = &restored.layers[1].kind else {
+            panic!("既定シーンの 2 番目はスペクトラムです");
+        };
+        assert_eq!(spectrum.color_mode, MusicColorMode::Custom);
+        let LayerKind::PitchKeyboard(keyboard) = &restored.layers[4].kind else {
+            panic!("既定シーンへ追加した 5 番目は鍵盤です");
+        };
+        assert_eq!(keyboard.color_mode, MusicColorMode::Custom);
     }
 }
 

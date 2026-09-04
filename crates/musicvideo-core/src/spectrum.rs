@@ -54,6 +54,7 @@ pub struct SpectrumSource {
     keyboard: KeyboardAnimationState,
     full_frame: SpectrumFrame,
     full_frame_valid: bool,
+    full_frame_gain_bits: Option<u32>,
     last_t: Option<f64>,
 }
 
@@ -83,6 +84,7 @@ impl SpectrumSource {
             keyboard: KeyboardAnimationState::default(),
             full_frame: SpectrumFrame::default(),
             full_frame_valid: false,
+            full_frame_gain_bits: None,
             last_t: None,
         })
     }
@@ -99,6 +101,11 @@ impl SpectrumSource {
     /// Repeating the same time returns the cached result without advancing keyboard decay.
     pub fn full_frame_at(&mut self, pcm: &[f32], t_secs: f64, norm_gain_db: f32) -> &SpectrumFrame {
         self.update_analysis(pcm, t_secs);
+        let gain_bits = norm_gain_db.to_bits();
+        if self.full_frame_gain_bits != Some(gain_bits) {
+            self.keyboard.clear();
+            self.full_frame_valid = false;
+        }
         if !self.full_frame_valid {
             self.full_frame.bands.clone_from(&self.analysis.bands);
             self.full_frame.notes.clone_from(&self.analysis.notes);
@@ -111,6 +118,7 @@ impl SpectrumSource {
                 &mut self.full_frame.keyboard,
             );
             self.full_frame_valid = true;
+            self.full_frame_gain_bits = Some(gain_bits);
         }
         &self.full_frame
     }
@@ -157,6 +165,7 @@ impl SpectrumSource {
         self.analysis = SpectrumAnalysis::default();
         self.keyboard.clear();
         self.full_frame_valid = false;
+        self.full_frame_gain_bits = None;
         self.last_t = None;
     }
 
@@ -234,5 +243,18 @@ mod tests {
         let repeated = source.full_frame_at(&pcm, 0.5, 0.0).clone();
         assert_eq!(first, repeated);
         assert_eq!(source.frame_at(&pcm, 0.5), first.bands);
+    }
+
+    #[test]
+    fn changing_display_gain_at_the_same_time_rebuilds_the_keyboard_frame() {
+        let pcm = tone();
+        let mut source = SpectrumSource::new(48_000, 64, Smoothing::None).unwrap();
+        let without_gain = source.full_frame_at(&pcm, 0.5, 0.0).keyboard.clone();
+        let with_gain = source.full_frame_at(&pcm, 0.5, 12.0).keyboard.clone();
+        assert_ne!(without_gain, with_gain);
+
+        source.reset();
+        let fresh_with_gain = source.full_frame_at(&pcm, 0.5, 12.0).keyboard.clone();
+        assert_eq!(with_gain, fresh_with_gain);
     }
 }

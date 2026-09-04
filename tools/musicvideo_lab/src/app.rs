@@ -441,7 +441,11 @@ impl MusicVideoLabApp {
                             .map_err(|error| format!("スペクトラム解析に失敗しました: {error}"))?,
                         };
                         let frame = source
-                            .full_frame_at(&audio.stereo_pcm, position_secs, 0.0)
+                            .full_frame_at(
+                                &audio.stereo_pcm,
+                                position_secs,
+                                project.display_gain_db,
+                            )
                             .clone();
                         Ok((frame, Some(source)))
                     })(),

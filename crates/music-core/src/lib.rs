@@ -6,6 +6,7 @@
 
 pub mod analysis;
 pub mod beat;
+pub mod color;
 pub mod effects;
 pub mod keyboard;
 pub mod playback;
@@ -20,6 +21,10 @@ pub use analysis::{
     spectrum_analysis_from_stereo_window, spectrum_bands_from_stereo_window,
 };
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
+pub use color::{
+    VisualizationColor, brighten_color, hsv_to_rgb, key_color, key_fill, lerp_color,
+    spectrum_color, unlit_key_base, with_alpha,
+};
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};
 pub use keyboard::{
     BassMarkerPlacement, KEYBOARD_NOTE_COUNT, KeyPlacement, KeyboardAnimationState, KeyboardFrame,

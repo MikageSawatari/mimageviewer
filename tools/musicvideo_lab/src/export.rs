@@ -3,6 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use music_core::{
+    KEYBOARD_NOTE_COUNT, KeyboardAnimationState, KeyboardFrame, SPECTRUM_NOTE_MAX_MIDI,
+    SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalyzer, prepare_keyboard_frame_into,
+};
 use musicvideo_core::{
     Assets, Frame, ImageId, Project, RenderReport, ScaledImageCacheStats, Smoothing,
     SpectrumSource, UnresolvedAsset, evaluate, render_frame,
@@ -18,6 +22,10 @@ const BENCHMARK_WARMUP_FRAMES: usize = 10;
 const BENCHMARK_BACKGROUND_WIDTH: u32 = 3000;
 const BENCHMARK_BACKGROUND_HEIGHT: u32 = 1687;
 const BENCHMARK_SAMPLE_RATE: u32 = 48_000;
+const DISTRIBUTION_DURATION_SECS: f64 = 18.0;
+const DISTRIBUTION_FPS: f64 = 60.0;
+const DISTRIBUTION_SIGNAL_AMPLITUDE: f64 = 0.0035;
+const DISTRIBUTION_GAINS_DB: [f32; 3] = [0.0, 6.0, 12.0];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimingStats {
@@ -55,6 +63,9 @@ pub fn frame_count(project: &Project) -> Result<usize, String> {
     }
     if !project.duration_secs.is_finite() || project.duration_secs <= 0.0 {
         return Err("書き出し時間が 0 秒です".to_owned());
+    }
+    if !project.display_gain_db.is_finite() {
+        return Err("表示ゲインは有限値にしてください".to_owned());
     }
     let count = (project.duration_secs * project.output.fps).ceil();
     if count > usize::MAX as f64 {
@@ -99,7 +110,8 @@ pub fn export_png_sequence(
         let time = index as f64 / project.output.fps;
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let spectrum_frame = spectrum.full_frame_at(&audio.stereo_pcm, time, 0.0);
+        let spectrum_frame =
+            spectrum.full_frame_at(&audio.stereo_pcm, time, project.display_gain_db);
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
         let scene = evaluate(&project, time, spectrum_frame);
@@ -260,7 +272,7 @@ pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String>
     )
     .map_err(|error| format!("サンプル用の解析を初期化できません: {error}"))?;
     let time = 5.0;
-    let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0);
+    let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
     let scene = evaluate(&project, time, spectrum_frame);
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("サンプル画像を確保できません: {error}"))?;
@@ -320,7 +332,7 @@ fn benchmark_once(
 
     for index in 0..BENCHMARK_WARMUP_FRAMES {
         let time = index as f64 / project.output.fps;
-        let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0);
+        let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
         let scene = evaluate(&project, time, spectrum_frame);
         let report = render_frame(&scene, &assets, &mut frame)
             .map_err(|error| format!("ウォームアップ合成に失敗しました: {error}"))?;
@@ -336,7 +348,7 @@ fn benchmark_once(
         let time = index as f64 / project.output.fps;
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let spectrum_frame = spectrum.full_frame_at(&pcm, time, 0.0);
+        let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
         let scene = evaluate(&project, time, spectrum_frame);
@@ -448,6 +460,174 @@ fn synthetic_chirp_pcm(duration_secs: f64) -> Vec<f32> {
     pcm
 }
 
+struct KeyboardDistribution {
+    raw_peaks: Vec<f32>,
+    keyboard_peaks: Vec<Vec<f32>>,
+}
+
+pub fn run_keyboard_distribution() -> Result<(), String> {
+    let distribution = measure_keyboard_distribution(DISTRIBUTION_DURATION_SECS, DISTRIBUTION_FPS)?;
+    println!(
+        "keyboard distribution: signal=constant_amplitude_log_sweep sample_rate={} duration_secs={:.1} analysis_fps={:.1} min_hz=27.5 max_hz=4186.0 amplitude={:.4} gains_db=0,6,12 metric=mean_of_per_note_peak lit_threshold=0.20",
+        BENCHMARK_SAMPLE_RATE,
+        DISTRIBUTION_DURATION_SECS,
+        DISTRIBUTION_FPS,
+        DISTRIBUTION_SIGNAL_AMPLITUDE,
+    );
+    for (label, first_midi, last_midi) in keyboard_distribution_ranges() {
+        let raw = summarize_note_range(&distribution.raw_peaks, first_midi, last_midi);
+        let gain_0 = summarize_note_range(&distribution.keyboard_peaks[0], first_midi, last_midi);
+        let gain_6 = summarize_note_range(&distribution.keyboard_peaks[1], first_midi, last_midi);
+        let gain_12 = summarize_note_range(&distribution.keyboard_peaks[2], first_midi, last_midi);
+        println!(
+            "keyboard distribution range={label} midi={first_midi}-{last_midi} notes={} raw_mean={:.4} raw_min={:.4} raw_max={:.4} gain_0_mean={:.4} gain_0_min={:.4} gain_0_max={:.4} gain_6_mean={:.4} gain_12_mean={:.4} lit_0={}/{} lit_6={}/{} lit_12={}/{}",
+            raw.count,
+            raw.mean,
+            raw.min,
+            raw.max,
+            gain_0.mean,
+            gain_0.min,
+            gain_0.max,
+            gain_6.mean,
+            gain_12.mean,
+            gain_0.lit,
+            gain_0.count,
+            gain_6.lit,
+            gain_6.count,
+            gain_12.lit,
+            gain_12.count,
+        );
+    }
+    Ok(())
+}
+
+fn measure_keyboard_distribution(
+    duration_secs: f64,
+    analysis_fps: f64,
+) -> Result<KeyboardDistribution, String> {
+    if !duration_secs.is_finite() || duration_secs <= 2.0 {
+        return Err("対数スイープは 2 秒より長くしてください".to_owned());
+    }
+    if !analysis_fps.is_finite() || analysis_fps <= 0.0 {
+        return Err("解析 fps は 0 より大きい有限値にしてください".to_owned());
+    }
+    let pcm = synthetic_log_sweep_pcm(duration_secs);
+    let mut analyzer = SpectrumAnalyzer::new(musicvideo_core::DEFAULT_SPECTRUM_BANDS);
+    let mut states = DISTRIBUTION_GAINS_DB
+        .iter()
+        .map(|_| KeyboardAnimationState::default())
+        .collect::<Vec<_>>();
+    let mut frames = DISTRIBUTION_GAINS_DB
+        .iter()
+        .map(|_| KeyboardFrame::default())
+        .collect::<Vec<_>>();
+    let mut raw_peaks = vec![0.0_f32; KEYBOARD_NOTE_COUNT];
+    let mut keyboard_peaks = DISTRIBUTION_GAINS_DB
+        .iter()
+        .map(|_| vec![0.0_f32; KEYBOARD_NOTE_COUNT])
+        .collect::<Vec<_>>();
+    let frame_count = (duration_secs * analysis_fps).ceil() as usize;
+    for index in 0..=frame_count {
+        let time = (index as f64 / analysis_fps).min(duration_secs);
+        let analysis = analyzer.analyze(&pcm, BENCHMARK_SAMPLE_RATE, time);
+        for (peak, value) in raw_peaks.iter_mut().zip(&analysis.notes) {
+            *peak = peak.max(*value);
+        }
+        for (((gain_db, state), frame), peaks) in DISTRIBUTION_GAINS_DB
+            .iter()
+            .zip(&mut states)
+            .zip(&mut frames)
+            .zip(&mut keyboard_peaks)
+        {
+            prepare_keyboard_frame_into(
+                &analysis.notes,
+                analysis.note_min_midi,
+                *gain_db,
+                state,
+                frame,
+            );
+            for (peak, levels) in peaks.iter_mut().zip(&frame.levels) {
+                *peak = peak.max(levels.center);
+            }
+        }
+    }
+    Ok(KeyboardDistribution {
+        raw_peaks,
+        keyboard_peaks,
+    })
+}
+
+fn synthetic_log_sweep_pcm(duration_secs: f64) -> Vec<f32> {
+    let sample_frames = (duration_secs * BENCHMARK_SAMPLE_RATE as f64).ceil() as usize;
+    let mut pcm = Vec::with_capacity(sample_frames * 2);
+    let mut phase = 0.0_f64;
+    let lead_secs = 1.0;
+    let sweep_secs = (duration_secs - 2.0).max(0.001);
+    let min_frequency = 27.5_f64;
+    let max_frequency = 4_186.009_f64;
+    for sample in 0..sample_frames {
+        let time = sample as f64 / BENCHMARK_SAMPLE_RATE as f64;
+        let position = ((time - lead_secs) / sweep_secs).clamp(0.0, 1.0);
+        let frequency = min_frequency * (max_frequency / min_frequency).powf(position);
+        phase = (phase + std::f64::consts::TAU * frequency / BENCHMARK_SAMPLE_RATE as f64)
+            % std::f64::consts::TAU;
+        let value = (phase.sin() * DISTRIBUTION_SIGNAL_AMPLITUDE) as f32;
+        pcm.extend_from_slice(&[value, value]);
+    }
+    pcm
+}
+
+#[derive(Clone, Copy)]
+struct NoteRangeStats {
+    count: usize,
+    mean: f32,
+    min: f32,
+    max: f32,
+    lit: usize,
+}
+
+fn summarize_note_range(values: &[f32], first_midi: u8, last_midi: u8) -> NoteRangeStats {
+    let first = first_midi.saturating_sub(SPECTRUM_NOTE_MIN_MIDI) as usize;
+    let last = last_midi.saturating_sub(SPECTRUM_NOTE_MIN_MIDI) as usize;
+    let values = &values[first..=last.min(values.len().saturating_sub(1))];
+    let count = values.len();
+    let sum = values.iter().sum::<f32>();
+    NoteRangeStats {
+        count,
+        mean: sum / count.max(1) as f32,
+        min: values.iter().copied().fold(f32::INFINITY, f32::min),
+        max: values.iter().copied().fold(0.0, f32::max),
+        lit: values.iter().filter(|value| **value >= 0.20).count(),
+    }
+}
+
+fn keyboard_distribution_ranges() -> Vec<(&'static str, u8, u8)> {
+    let mut ranges = vec![
+        ("low_A0-B2", SPECTRUM_NOTE_MIN_MIDI, 47),
+        ("mid_C3-B5", 48, 83),
+        ("high_C6-C8", 84, SPECTRUM_NOTE_MAX_MIDI),
+        ("A0-B0", SPECTRUM_NOTE_MIN_MIDI, 23),
+    ];
+    for octave in 1..=7 {
+        let first = 12 * (octave + 1);
+        ranges.push((
+            match octave {
+                1 => "C1-B1",
+                2 => "C2-B2",
+                3 => "C3-B3",
+                4 => "C4-B4",
+                5 => "C5-B5",
+                6 => "C6-B6",
+                _ => "C7-B7",
+            },
+            first,
+            first + 11,
+        ));
+    }
+    ranges.push(("C8", SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MAX_MIDI));
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +642,16 @@ mod tests {
                 .iter()
                 .any(|layer| matches!(&layer.kind, LayerKind::PitchKeyboard(_)))
         );
+    }
+
+    #[test]
+    fn log_sweep_distribution_reaches_the_high_keyboard_range_and_gain_increases_it() {
+        let distribution = measure_keyboard_distribution(8.0, 30.0).unwrap();
+        let high_without_gain = summarize_note_range(&distribution.keyboard_peaks[0], 84, 108);
+        let high_with_gain = summarize_note_range(&distribution.keyboard_peaks[2], 84, 108);
+        assert_eq!(distribution.raw_peaks.len(), KEYBOARD_NOTE_COUNT);
+        assert!(high_without_gain.max > 0.05);
+        assert!(high_with_gain.mean > high_without_gain.mean);
+        assert!(high_with_gain.lit >= high_without_gain.lit);
     }
 }

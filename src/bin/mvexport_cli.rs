@@ -7,7 +7,8 @@ use mimageviewer::video::mvexport::{
     EncoderPreference, MusicVideoExportRequest, export_music_video, verify_exported_mp4,
 };
 use musicvideo_core::{
-    Assets, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId, default_project,
+    Assets, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId, LayerKind,
+    MusicColorMode, default_project,
 };
 
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
@@ -20,6 +21,8 @@ struct Args {
     encoder: EncoderPreference,
     video_bitrate_bps: u32,
     frame_hash: bool,
+    display_gain_db: f32,
+    miv_colors: bool,
 }
 
 fn main() {
@@ -38,7 +41,17 @@ fn run() -> Result<(), String> {
         return Err("書き出し秒数は 0 より大きい有限値にしてください".to_owned());
     }
     let assets = load_assets(&args.image)?;
-    let project = default_project(duration_secs);
+    let mut project = default_project(duration_secs);
+    project.display_gain_db = args.display_gain_db;
+    if args.miv_colors {
+        for layer in &mut project.layers {
+            match &mut layer.kind {
+                LayerKind::Spectrum(spectrum) => spectrum.color_mode = MusicColorMode::Miv,
+                LayerKind::PitchKeyboard(keyboard) => keyboard.color_mode = MusicColorMode::Miv,
+                _ => {}
+            }
+        }
+    }
     let output = project.output;
     let cancel = AtomicBool::new(false);
     let last_reported = AtomicU64::new(0);
@@ -129,6 +142,8 @@ fn parse_args() -> Result<Args, String> {
     let mut encoder = EncoderPreference::Auto;
     let mut video_bitrate_bps = DEFAULT_VIDEO_BITRATE_BPS;
     let mut frame_hash = false;
+    let mut display_gain_db = 0.0;
+    let mut miv_colors = false;
     let mut values = std::env::args().skip(1);
     while let Some(argument) = values.next() {
         match argument.as_str() {
@@ -154,6 +169,16 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("--video-bitrate の値が不正です: {value}"))?;
             }
             "--frame-hash" => frame_hash = true,
+            "--display-gain-db" => {
+                let value = next_value(&mut values, "--display-gain-db")?;
+                display_gain_db = value
+                    .parse::<f32>()
+                    .map_err(|_| format!("--display-gain-db の値が不正です: {value}"))?;
+                if !display_gain_db.is_finite() {
+                    return Err(format!("--display-gain-db は有限値にしてください: {value}"));
+                }
+            }
+            "--miv-colors" => miv_colors = true,
             "--help" | "-h" => return Err(usage().to_owned()),
             _ => return Err(format!("不明な引数です: {argument}\n{}", usage())),
         }
@@ -166,6 +191,8 @@ fn parse_args() -> Result<Args, String> {
         encoder,
         video_bitrate_bps,
         frame_hash,
+        display_gain_db,
+        miv_colors,
     })
 }
 
@@ -176,7 +203,7 @@ fn next_value(values: &mut impl Iterator<Item = String>, option: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "使用法: mvexport_cli --audio <音声> --image <画像> --out <出力.mp4> [--seconds N] [--encoder auto|nvenc|qsv|amf|mf|openh264] [--video-bitrate bps] [--frame-hash]"
+    "使用法: mvexport_cli --audio <音声> --image <画像> --out <出力.mp4> [--seconds N] [--encoder auto|nvenc|qsv|amf|mf|openh264] [--video-bitrate bps] [--display-gain-db dB] [--miv-colors] [--frame-hash]"
 }
 
 fn load_assets(image_path: &Path) -> Result<Assets, String> {

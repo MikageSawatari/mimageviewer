@@ -20,8 +20,8 @@ pub use assets::{
 };
 pub use model::{
     Animatable, AudioRef, Fill, Fit, Glow, GradientStop, GradientStops, GradientStopsError,
-    ImageId, ImageRef, Interp, Keyframe, Layer, LayerId, LayerKind, NormRect, Output,
-    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    ImageId, ImageRef, Interp, Keyframe, Layer, LayerId, LayerKind, MusicColorMode, NormRect,
+    Output, PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
     SpectrumShape, TextAlign, TimeFormat, TimeTextLayer, Track, TrackError,
 };
 pub use preset::{

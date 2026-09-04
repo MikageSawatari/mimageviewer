@@ -60,6 +60,13 @@ fn main() {
         }
         return;
     }
+    if command.as_deref() == Some("--keyboard-distribution") {
+        if let Err(error) = export::run_keyboard_distribution() {
+            eprintln!("鍵盤点灯分布の測定に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(error) = run_gui() {
         eprintln!("musicvideo_lab を起動できません: {error}");

@@ -255,8 +255,16 @@ Wav2Bar の見た目（線形 FFT ビン 0–750 / 200 点）を厳密に再現�
 
 ### D6. 鍵盤表示のロジックは core へ切り出して共有する
 
-現在は egui の描画関数の中にロジックが埋まっている。配置・輝度・低域整理の判断を純関数へ出し、
+配置・輝度・低域整理に加え、五度圏ベースの鍵盤色・スペクトラム色も `music-core` の純関数に置き、
 **mIV の音楽ビューと書き出しの両方が同じ関数を呼ぶ**。egui 描画をそのまま書き出しへ持ち込まない。
+書き出し側はレイヤごとにカスタム Fill / mIV 配色を選択できる。鍵盤の表示ゲインはプロジェクトに
+`display_gain_db`（既定 0 dB）として持ち、音声波形そのものを変えず `prepare_keyboard_frame` に渡す。
+
+2026-09-04 の既知信号診断（48 kHz、27.5–4186 Hz、振幅 0.0035 の一定振幅対数スイープ）では、
+各鍵の raw peak 平均は低域 A0–B2 = 0.1094、中域 C3–B5 = 0.1027、高域 C6–C8 = 0.1033。
+高域だけが系統的に落ちる結果ではない。鍵盤の peak 平均は表示ゲイン 0 / +6 / +12 dB で、低域
+0.3535 / 0.5938 / 0.8347、中域 0.3078 / 0.5497 / 0.7901、高域 0.3298 / 0.5705 / 0.8110。
+したがって静かな素材は表示ゲインで持ち上げ、既存の等ラウドネス重み・解析音域は変更しない。
 
 ### D7. エンコードは既存資産を再利用し、出口だけ新規に作る
 
@@ -304,6 +312,7 @@ Project {
     audio: AudioRef { path },
     output: Output { width, height, fps, video_bitrate, encoder_preference },
     duration_secs: f64,            // 既定 = 音声長
+    display_gain_db: f32,          // 鍵盤表示だけの追加ゲイン。既定 0 dB
     layers: Vec<Layer>,            // 描画順（先頭が奥）
 }
 
@@ -324,8 +333,9 @@ LayerKind =
   | Spectrum     { axis: Semitone{..},          // v1 はこれだけ。Linear{min_hz,max_hz} は将来 (D5)
                    shape: Bars{..} | Radial{ radius, .. },
                    point_count, thickness, smoothing: { kind, factor },
+                   color_mode: Custom | Miv,
                    fill: Animatable<Fill> }
-  | PitchKeyboard{ .. }
+  | PitchKeyboard{ color_mode: Custom | Miv, .. }
   | ProgressBar  { shape: Linear | Radial, border_thickness,
                    fill: Animatable<Fill> }
   | TimeText     { format, font, size, align, fill: Animatable<Fill> }

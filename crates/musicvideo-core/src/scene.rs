@@ -1,7 +1,8 @@
 use music_core::{KeyboardFrame, SPECTRUM_NOTE_MIN_MIDI};
 
 use crate::model::{
-    Fill, Fit, Glow, ImageId, LayerKind, NormRect, Project, SpectrumShape, TextAlign, TimeFormat,
+    Fill, Fit, Glow, ImageId, LayerKind, MusicColorMode, NormRect, Project, SpectrumShape,
+    TextAlign, TimeFormat,
 };
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -67,11 +68,13 @@ pub enum SceneItemKind {
         values: Vec<f32>,
         point_count: usize,
         shape: SpectrumShape,
+        color_mode: MusicColorMode,
         fill: Fill,
     },
     PitchKeyboard {
         keyboard: KeyboardFrame,
         background: Fill,
+        color_mode: MusicColorMode,
         fill: Fill,
     },
     ProgressBar {
@@ -137,12 +140,14 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                     values,
                     point_count: layer.point_count.max(1),
                     shape: sanitize_spectrum_shape(layer.shape),
+                    color_mode: layer.color_mode,
                     fill: layer.fill.evaluate(time),
                 }
             }
             LayerKind::PitchKeyboard(layer) => SceneItemKind::PitchKeyboard {
                 keyboard: spectrum.keyboard.clone(),
                 background: layer.background.evaluate(time),
+                color_mode: layer.color_mode,
                 fill: layer.fill.evaluate(time),
             },
             LayerKind::ProgressBar(layer) => SceneItemKind::ProgressBar {

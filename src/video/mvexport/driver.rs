@@ -131,7 +131,11 @@ pub(super) fn export(
             / plan.frame_rate.numerator as f64;
 
         let render_started = Instant::now();
-        let spectrum_frame = spectrum.full_frame_at(&decoded.stereo_samples, t_secs, 0.0);
+        let spectrum_frame = spectrum.full_frame_at(
+            &decoded.stereo_samples,
+            t_secs,
+            request.project.display_gain_db,
+        );
         let scene = evaluate(&request.project, t_secs, spectrum_frame);
         let report = render_frame(&scene, &request.assets, &mut rgba).map_err(|error| {
             ExportError::Render(format!(
@@ -246,6 +250,11 @@ fn validate_request(request: &MusicVideoExportRequest) -> Result<ExportPlan, Exp
     if !request.project.duration_secs.is_finite() || request.project.duration_secs <= 0.0 {
         return Err(ExportError::InvalidRequest(
             "書き出し時間は 0 より大きい有限値にしてください".to_owned(),
+        ));
+    }
+    if !request.project.display_gain_db.is_finite() {
+        return Err(ExportError::InvalidRequest(
+            "表示ゲインは有限値にしてください".to_owned(),
         ));
     }
     if request.video_bitrate_bps == 0 {

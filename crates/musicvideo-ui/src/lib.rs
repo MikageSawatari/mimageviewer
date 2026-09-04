@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use egui::TextureHandle;
 use musicvideo_core::{
-    Animatable, Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerKind, Project, Rgba8,
-    SpectrumDirection, SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
+    Animatable, Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerKind, MusicColorMode,
+    Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,17 @@ pub fn draw_editor(
     state: &mut EditorState,
 ) -> EditorResponse {
     state.reconcile(project);
+    let mut project_changed = ui
+        .add(
+            egui::DragValue::new(&mut project.display_gain_db)
+                .range(-48.0..=48.0)
+                .speed(0.1)
+                .prefix("表示ゲイン ")
+                .suffix(" dB"),
+        )
+        .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
+        .changed();
+    ui.separator();
     ui.heading("レイヤー");
     for (index, layer) in project.layers.iter().enumerate() {
         if ui
@@ -67,7 +78,6 @@ pub fn draw_editor(
         }
     }
 
-    let mut project_changed = false;
     if ui.button("＋ ピッチ鍵盤を追加").clicked() {
         project.layers.push(new_pitch_keyboard_layer(project));
         state.selected_layer = project.layers.len() - 1;
@@ -162,7 +172,10 @@ fn edit_layer_properties(ui: &mut egui::Ui, layer: &mut Layer) -> bool {
         LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
         LayerKind::PitchKeyboard(keyboard) => {
             let mut changed = edit_fill(ui, "鍵盤の背景", &mut keyboard.background);
-            changed |= edit_fill(ui, "点灯する鍵の塗り", &mut keyboard.fill);
+            changed |= edit_music_color_mode(ui, &mut keyboard.color_mode);
+            if keyboard.color_mode == MusicColorMode::Custom {
+                changed |= edit_fill(ui, "点灯する鍵の塗り", &mut keyboard.fill);
+            }
             changed
         }
         LayerKind::ProgressBar(progress) => {
@@ -320,8 +333,28 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
             });
         }
     }
-    changed |= edit_fill(ui, "スペクトラムの塗り", &mut spectrum.fill);
+    changed |= edit_music_color_mode(ui, &mut spectrum.color_mode);
+    if spectrum.color_mode == MusicColorMode::Custom {
+        changed |= edit_fill(ui, "スペクトラムの塗り", &mut spectrum.fill);
+    }
     changed
+}
+
+fn edit_music_color_mode(ui: &mut egui::Ui, mode: &mut MusicColorMode) -> bool {
+    let previous = *mode;
+    ui.horizontal(|ui| {
+        ui.label("配色");
+        egui::ComboBox::from_id_salt("music-color-mode")
+            .selected_text(match mode {
+                MusicColorMode::Custom => "カスタム",
+                MusicColorMode::Miv => "mIV 本体と同じ",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(mode, MusicColorMode::Custom, "カスタム");
+                ui.selectable_value(mode, MusicColorMode::Miv, "mIV 本体と同じ");
+            });
+    });
+    *mode != previous
 }
 
 fn drag_pixels(
