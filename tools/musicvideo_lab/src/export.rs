@@ -307,12 +307,7 @@ fn benchmark_once(
         ImageId::new(BACKGROUND_ID),
         synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
     );
-    let mut project = default_project(frames as f64 / 60.0);
-    if !glow_enabled {
-        for layer in &mut project.layers {
-            layer.glow = musicvideo_core::Animatable::Const(None);
-        }
-    }
+    let project = benchmark_project(frames as f64 / 60.0, glow_enabled);
     let pcm = synthetic_chirp_pcm(project.duration_secs + 1.0);
     let mut spectrum = SpectrumSource::new(
         BENCHMARK_SAMPLE_RATE,
@@ -364,7 +359,7 @@ fn benchmark_once(
     let cache_after_measurement = assets.scaled_image_cache_stats();
     validate_benchmark_cache(cache_after_warmup, cache_after_measurement, frames as u64)?;
     println!(
-        "musicvideo benchmark: glow={} frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
+        "musicvideo benchmark: glow={} keyboard=on frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
         if glow_enabled { "on" } else { "off" },
         stats.frames,
         stats.width,
@@ -395,6 +390,17 @@ fn benchmark_once(
             .saturating_sub(cache_after_warmup.hits)
     );
     Ok(stats)
+}
+
+fn benchmark_project(duration_secs: f64, glow_enabled: bool) -> Project {
+    let mut project = default_project(duration_secs);
+    project.layers.push(new_pitch_keyboard_layer(&project));
+    if !glow_enabled {
+        for layer in &mut project.layers {
+            layer.glow = musicvideo_core::Animatable::Const(None);
+        }
+    }
+    project
 }
 
 fn validate_benchmark_cache(
@@ -440,4 +446,21 @@ fn synthetic_chirp_pcm(duration_secs: f64) -> Vec<f32> {
         pcm.extend_from_slice(&[value, value]);
     }
     pcm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musicvideo_core::LayerKind;
+
+    #[test]
+    fn benchmark_scene_includes_the_pitch_keyboard_path() {
+        let project = benchmark_project(10.0, true);
+        assert!(
+            project
+                .layers
+                .iter()
+                .any(|layer| matches!(&layer.kind, LayerKind::PitchKeyboard(_)))
+        );
+    }
 }

@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use music_core::{KeyboardFrame, KeyboardLayoutCache, KeyboardRect, layout_keyboard_cached};
+use music_core::{
+    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, layout_keyboard_cached,
+};
 
 use crate::assets::{AssetError, Assets, ImageAsset};
 use crate::model::{
@@ -897,24 +899,199 @@ fn draw_pitch_keyboard(
             ),
             &mut cache,
         );
-        for &x in &layout.octave_guides_x {
-            draw_keyboard_guide(frame, rect, x, opacity, corner_radius_px, mask_mode);
-        }
-        for &key in &layout.keys {
-            draw_keyboard_key(
-                frame,
-                rect,
-                key,
-                &sampler,
-                opacity,
-                corner_radius_px,
-                mask_mode,
-            );
-        }
+        let clip_coverage = KeyboardClipCoverage::new(rect, corner_radius_px);
+        draw_keyboard_guides(
+            frame,
+            rect,
+            &layout.octave_guides_x,
+            opacity,
+            mask_mode,
+            &clip_coverage,
+        );
+        draw_keyboard_keys(
+            frame,
+            rect,
+            &layout.keys,
+            &sampler,
+            opacity,
+            mask_mode,
+            &clip_coverage,
+        );
     });
 }
 
-fn draw_keyboard_guide(
+struct KeyboardClipCoverage {
+    rect: PixelRect,
+    values: Option<Vec<f32>>,
+}
+
+impl KeyboardClipCoverage {
+    fn new(rect: PixelRect, corner_radius_px: f32) -> Self {
+        if corner_radius_px <= 0.0 || rect.is_empty() {
+            return Self { rect, values: None };
+        }
+        let width = rect.width();
+        let mut values = vec![0.0; width * rect.height()];
+        values
+            .par_chunks_exact_mut(width)
+            .enumerate()
+            .for_each(|(local_y, row)| {
+                let y = rect.y0 + local_y;
+                for (local_x, value) in row.iter_mut().enumerate() {
+                    let x = rect.x0 + local_x;
+                    *value = rounded_rect_coverage(
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        rect,
+                        corner_radius_px,
+                    );
+                }
+            });
+        Self {
+            rect,
+            values: Some(values),
+        }
+    }
+
+    fn at(&self, x: usize, y: usize) -> f32 {
+        self.values.as_ref().map_or(1.0, |values| {
+            values[(y - self.rect.y0) * self.rect.width() + (x - self.rect.x0)]
+        })
+    }
+}
+
+fn draw_keyboard_guides(
+    frame: &mut Frame,
+    clip: PixelRect,
+    guides: &[f32],
+    opacity: f32,
+    mask_mode: bool,
+    clip_coverage: &KeyboardClipCoverage,
+) {
+    let color = if mask_mode {
+        Rgba8::WHITE
+    } else {
+        Rgba8::new(120, 134, 148, 82)
+    };
+    let row_bytes = frame.width as usize * 4;
+    frame
+        .rgba
+        .par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
+        .for_each(|(y, row)| {
+            for &guide_x in guides {
+                let min_x = (guide_x - 1.0).floor().max(clip.x0 as f32) as usize;
+                let max_x = (guide_x + 1.0).ceil().min(clip.x1 as f32) as usize;
+                for pixel_x in min_x..max_x {
+                    let px = pixel_x as f32 + 0.5;
+                    let line_coverage = (0.5 - ((px - guide_x).abs() - 0.4)).clamp(0.0, 1.0);
+                    let clip_coverage = clip_coverage.at(pixel_x, y);
+                    if line_coverage <= 0.0 || clip_coverage <= 0.0 {
+                        continue;
+                    }
+                    let offset = pixel_x * 4;
+                    blend_pixel(
+                        &mut row[offset..offset + 4],
+                        color,
+                        opacity * line_coverage * clip_coverage,
+                    );
+                }
+            }
+        });
+}
+
+fn draw_keyboard_keys(
+    frame: &mut Frame,
+    clip: PixelRect,
+    keys: &[KeyPlacement],
+    sampler: &FillSampler<'_>,
+    opacity: f32,
+    mask_mode: bool,
+    clip_coverage: &KeyboardClipCoverage,
+) {
+    let row_bytes = frame.width as usize * 4;
+    frame
+        .rgba
+        .par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
+        .for_each(|(y, row)| {
+            let py = y as f32 + 0.5;
+            for &key in keys {
+                let min_y = key.rect.top.floor().max(clip.y0 as f32) as usize;
+                let max_y = key.rect.bottom.ceil().min(clip.y1 as f32) as usize;
+                if y < min_y || y >= max_y {
+                    continue;
+                }
+                let min_x = key.rect.left.floor().max(clip.x0 as f32) as usize;
+                let max_x = key.rect.right.ceil().min(clip.x1 as f32) as usize;
+                let key_corner = if key.black { 1.0 } else { 0.0 };
+                let stroke_width = if key.black { 0.75 } else { 0.8 };
+                let stroke_color = if key.black {
+                    Rgba8::new(255, 255, 255, 80)
+                } else {
+                    Rgba8::new(0, 0, 0, 155)
+                };
+                let base = unlit_keyboard_key(key.black, key.real_key);
+                let band_position = key.note_position;
+                for x in min_x..max_x {
+                    let px = x as f32 + 0.5;
+                    let outer = float_rounded_rect_coverage(px, py, key.rect, key_corner);
+                    let clip_coverage = clip_coverage.at(x, y);
+                    let coverage = outer * clip_coverage;
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let color = if mask_mode {
+                        Rgba8::WHITE
+                    } else if key.real_key {
+                        let level = keyboard_vertical_level(key, py);
+                        let active = sampler.sample(px, py, band_position, false);
+                        let amount = (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
+                        mix_rgba(base, active, amount)
+                    } else {
+                        base
+                    };
+                    let offset = x * 4;
+                    blend_pixel(&mut row[offset..offset + 4], color, opacity * coverage);
+
+                    if mask_mode {
+                        continue;
+                    }
+
+                    let inner = KeyboardRect::new(
+                        key.rect.left + stroke_width,
+                        key.rect.top + stroke_width,
+                        key.rect.right - stroke_width,
+                        key.rect.bottom - stroke_width,
+                    );
+                    let inner_coverage = if inner.right > inner.left && inner.bottom > inner.top {
+                        float_rounded_rect_coverage(
+                            px,
+                            py,
+                            inner,
+                            (key_corner - stroke_width).max(0.0),
+                        )
+                    } else {
+                        0.0
+                    };
+                    let stroke_coverage = (outer - inner_coverage).max(0.0) * clip_coverage;
+                    if stroke_coverage <= 0.0 {
+                        continue;
+                    }
+                    blend_pixel(
+                        &mut row[offset..offset + 4],
+                        stroke_color,
+                        opacity * stroke_coverage,
+                    );
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+fn draw_keyboard_guide_serial(
     frame: &mut Frame,
     clip: PixelRect,
     x: f32,
@@ -949,10 +1126,11 @@ fn draw_keyboard_guide(
     }
 }
 
-fn draw_keyboard_key(
+#[cfg(test)]
+fn draw_keyboard_key_serial(
     frame: &mut Frame,
     clip: PixelRect,
-    key: music_core::KeyPlacement,
+    key: KeyPlacement,
     sampler: &FillSampler<'_>,
     opacity: f32,
     corner_radius_px: f32,
@@ -2232,6 +2410,96 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first, other_opacity);
+    }
+
+    #[test]
+    fn parallel_keyboard_matches_the_serial_pixel_order_bit_for_bit() {
+        let mut notes = vec![0.0; music_core::KEYBOARD_NOTE_COUNT];
+        for (index, level) in notes.iter_mut().enumerate() {
+            *level = ((index * 37 % 101) as f32 / 100.0).powi(2);
+        }
+        let mut state = KeyboardAnimationState::default();
+        let keyboard = prepare_keyboard_frame(&notes, SPECTRUM_NOTE_MIN_MIDI, 0.0, &mut state);
+        let rect = PixelRect {
+            x0: 13,
+            y0: 17,
+            x1: 387,
+            y1: 143,
+        };
+        let keyboard_rect = KeyboardRect::new(
+            rect.x0 as f32,
+            rect.y0 as f32,
+            rect.x1 as f32,
+            rect.y1 as f32,
+        );
+        let layout = layout_keyboard(&keyboard, keyboard_rect);
+        let background = Fill::Solid(Rgba8::new(11, 19, 31, 96));
+        let fill = Fill::LinearGradient {
+            stops: GradientStops::new(vec![
+                GradientStop {
+                    position: 0.0,
+                    color: Rgba8::new(30, 220, 255, 255),
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: Rgba8::new(255, 60, 170, 210),
+                },
+            ])
+            .unwrap(),
+            angle_deg: 17.0,
+        };
+
+        for corner_radius_px in [0.0, 6.0] {
+            for mask_mode in [false, true] {
+                let mut parallel = Frame::new(400, 160).unwrap();
+                let mut serial = parallel.clone();
+                draw_pitch_keyboard(
+                    &mut parallel,
+                    rect,
+                    &keyboard,
+                    &background,
+                    &fill,
+                    0.73,
+                    corner_radius_px,
+                    mask_mode,
+                );
+
+                draw_filled_rect(
+                    &mut serial,
+                    rect,
+                    &background,
+                    0.73,
+                    corner_radius_px,
+                    mask_mode,
+                );
+                let sampler = FillSampler::new(&fill, rect);
+                for &x in &layout.octave_guides_x {
+                    draw_keyboard_guide_serial(
+                        &mut serial,
+                        rect,
+                        x,
+                        0.73,
+                        corner_radius_px,
+                        mask_mode,
+                    );
+                }
+                for &key in &layout.keys {
+                    draw_keyboard_key_serial(
+                        &mut serial,
+                        rect,
+                        key,
+                        &sampler,
+                        0.73,
+                        corner_radius_px,
+                        mask_mode,
+                    );
+                }
+                assert_eq!(
+                    parallel, serial,
+                    "corner_radius_px={corner_radius_px}, mask_mode={mask_mode}"
+                );
+            }
+        }
     }
 
     #[test]

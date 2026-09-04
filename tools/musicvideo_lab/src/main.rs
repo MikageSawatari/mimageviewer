@@ -49,10 +49,45 @@ fn main() {
         println!("サンプル画像を書き出しました: {}", output.display());
         return;
     }
+    if command.as_deref() == Some("--preview-benchmark") {
+        let frames = args
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(300);
+        if let Err(error) = run_preview_benchmark(frames) {
+            eprintln!("プレビューベンチマークに失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(error) = run_gui() {
         eprintln!("musicvideo_lab を起動できません: {error}");
     }
+}
+
+fn run_preview_benchmark(frames: usize) -> Result<(), String> {
+    let font = project::load_default_font();
+    let assets = project::create_assets(font.as_ref())?;
+    assets.insert_image(
+        musicvideo_core::ImageId::new(project::BACKGROUND_ID),
+        project::synthetic_background(3000, 1687),
+    );
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "mIV 音楽ビデオ ラボ — プレビュー計測",
+        options,
+        Box::new(move |creation| {
+            project::setup_egui(&creation.egui_ctx, font.as_ref());
+            app::MusicVideoLabApp::new_preview_benchmark(assets, frames)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(Into::into)
+        }),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn run_gui() -> eframe::Result {
