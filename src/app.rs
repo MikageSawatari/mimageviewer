@@ -5609,6 +5609,12 @@ struct UpdatePerfRecorder {
     last_mark_at: std::time::Instant,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
     next_stage: usize,
+    /// The fullscreen viewport stage split further, because it turned out to hold 57% of a
+    /// stall while the paint closure inside it explained only a quarter of that. The same
+    /// four spans are already computed for `slow_frame_breakdown`, but that event is emitted
+    /// on the grid path, which fullscreen returns before reaching - so it fired once in a
+    /// whole session. These carry the same numbers onto the event that does fire.
+    fullscreen_split_ms: [f64; 4],
 }
 
 impl UpdatePerfRecorder {
@@ -5617,6 +5623,7 @@ impl UpdatePerfRecorder {
             started_at,
             last_mark_at: started_at,
             stage_ms: [0.0; UPDATE_PERF_STAGE_COUNT],
+            fullscreen_split_ms: [0.0; 4],
             next_stage: 0,
         }
     }
@@ -5656,6 +5663,7 @@ impl UpdatePerfRecorder {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            fullscreen_split_ms: self.fullscreen_split_ms,
         }
     }
 }
@@ -5666,6 +5674,25 @@ fn update_perf_start_with(
     now: impl FnOnce() -> std::time::Instant,
 ) -> Option<UpdatePerfRecorder> {
     perf_on.then(now).map(UpdatePerfRecorder::new)
+}
+
+/// Records how the fullscreen viewport stage divides, in the order the spans occur.
+#[inline]
+fn note_update_perf_fullscreen_split(
+    recorder: &mut Option<UpdatePerfRecorder>,
+    keep_alive_ms: f64,
+    main_viewport_ms: f64,
+    detached_windows_ms: f64,
+    detached_backstop_ms: f64,
+) {
+    if let Some(recorder) = recorder {
+        recorder.fullscreen_split_ms = [
+            keep_alive_ms,
+            main_viewport_ms,
+            detached_windows_ms,
+            detached_backstop_ms,
+        ];
+    }
 }
 
 #[inline]
@@ -5690,6 +5717,7 @@ struct UpdatePerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    fullscreen_split_ms: [f64; 4],
 }
 
 impl UpdatePerfBreakdown {
@@ -5754,6 +5782,14 @@ impl UpdatePerfBreakdown {
             "unaccounted_ms",
             serde_json::Value::from(self.unaccounted_ms),
         ));
+        for (field, value) in [
+            ("fs_keep_alive_ms", self.fullscreen_split_ms[0]),
+            ("fs_main_viewport_ms", self.fullscreen_split_ms[1]),
+            ("fs_detached_windows_ms", self.fullscreen_split_ms[2]),
+            ("fs_detached_backstop_ms", self.fullscreen_split_ms[3]),
+        ] {
+            extras.push((field, serde_json::Value::from(value)));
+        }
         crate::perf::event("ui", "update_breakdown", None, 0, &extras);
     }
 }
@@ -68824,6 +68860,13 @@ impl App {
         self.render_active_detached_viewport_backstop(ctx);
         let t_detached_backstop = frame_t0.elapsed();
         let t_render_fullscreen_viewport = t_detached_backstop;
+        note_update_perf_fullscreen_split(
+            &mut update_perf,
+            (t_keep_fullscreen_viewport - t_root_input).as_secs_f64() * 1000.0,
+            (t_main_fs_viewport - t_keep_fullscreen_viewport).as_secs_f64() * 1000.0,
+            (t_detached_image_windows - t_main_fs_viewport).as_secs_f64() * 1000.0,
+            (t_detached_backstop - t_detached_image_windows).as_secs_f64() * 1000.0,
+        );
         mark_update_perf(&mut update_perf, UpdatePerfStage::FullscreenViewport);
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
