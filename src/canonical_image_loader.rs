@@ -42,7 +42,7 @@ pub enum CanonicalImageSource<'a> {
 pub struct CanonicalDecodeOptions<'a> {
     pub susie_priority: bool,
     pub susie_cancel: Option<&'a Arc<AtomicBool>>,
-    pub cancel: Option<&'a AtomicBool>,
+    pub cancel: Option<&'a Arc<AtomicBool>>,
     pub animation_policy: AnimationPolicy,
 }
 
@@ -65,7 +65,7 @@ impl CanonicalDecodeOptions<'_> {
             // Susie IPC cannot be interrupted safely. Once entered, it must keep
             // the scheduler permit until the reply arrives.
             susie_cancel: None,
-            cancel: Some(cancel.as_ref()),
+            cancel: Some(cancel),
             animation_policy,
         }
     }
@@ -162,6 +162,7 @@ pub enum CanonicalDecodeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalCancelStage {
+    SourceRead,
     SourceReadComplete,
     AnimationFrameBoundary,
 }
@@ -267,7 +268,10 @@ struct ResolvedSource<'a> {
 }
 
 impl<'a> ResolvedSource<'a> {
-    fn resolve(source: CanonicalImageSource<'a>) -> Result<Self, CanonicalDecodeError> {
+    fn resolve(
+        source: CanonicalImageSource<'a>,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<Self, CanonicalDecodeError> {
         match source {
             CanonicalImageSource::File {
                 path,
@@ -290,8 +294,23 @@ impl<'a> ResolvedSource<'a> {
                 archive_path,
                 entry_name,
             } => {
-                let bytes = crate::zip_loader::read_entry_bytes(archive_path, entry_name)
-                    .map_err(CanonicalDecodeError::SourceRead)?;
+                let result = match cancel {
+                    Some(cancel) => crate::zip_loader::read_entry_bytes_cancellable(
+                        archive_path,
+                        entry_name,
+                        cancel,
+                    ),
+                    None => crate::zip_loader::read_entry_bytes(archive_path, entry_name),
+                };
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(_) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => {
+                        return Err(CanonicalDecodeError::Cancelled(
+                            CanonicalCancelStage::SourceRead,
+                        ));
+                    }
+                    Err(error) => return Err(CanonicalDecodeError::SourceRead(error)),
+                };
                 let basename = crate::zip_loader::entry_basename(entry_name);
                 let extension = basename
                     .rsplit('.')
@@ -323,11 +342,9 @@ fn decode_canonical_image_with_fallbacks(
     options: CanonicalDecodeOptions<'_>,
     fallbacks: &impl FallbackDecoder,
 ) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
-    let source = ResolvedSource::resolve(source)?;
-    if options
-        .cancel
-        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-    {
+    let source = ResolvedSource::resolve(source, options.cancel)?;
+    let cancel = options.cancel.map(Arc::as_ref);
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         return Err(CanonicalDecodeError::Cancelled(
             CanonicalCancelStage::SourceReadComplete,
         ));
@@ -341,8 +358,8 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "gif" {
         let frames = match bytes {
-            Some(bytes) => decode_gif_frames_from_bytes_cancellable(bytes, options.cancel),
-            None => decode_gif_frames_cancellable(source.path, options.cancel),
+            Some(bytes) => decode_gif_frames_from_bytes_cancellable(bytes, cancel),
+            None => decode_gif_frames_cancellable(source.path, cancel),
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -362,8 +379,8 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "png" {
         let frames = match bytes {
-            Some(bytes) => decode_apng_frames_from_bytes_cancellable(bytes, options.cancel),
-            None => decode_apng_frames_cancellable(source.path, options.cancel),
+            Some(bytes) => decode_apng_frames_from_bytes_cancellable(bytes, cancel),
+            None => decode_apng_frames_cancellable(source.path, cancel),
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -383,8 +400,8 @@ fn decode_canonical_image_with_fallbacks(
 
     if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "webp" {
         let frames = match bytes {
-            Some(bytes) => decode_webp_frames_from_bytes_cancellable(bytes, options.cancel),
-            None => decode_webp_frames_cancellable(source.path, options.cancel),
+            Some(bytes) => decode_webp_frames_from_bytes_cancellable(bytes, cancel),
+            None => decode_webp_frames_cancellable(source.path, cancel),
         };
         match frames {
             AnimationDecodeResult::Frames(frames) => {
@@ -1153,12 +1170,12 @@ mod tests {
     }
 
     #[test]
-    fn archive_read_completion_is_a_decode_cancel_boundary() {
+    fn archive_reader_interrupt_is_a_canonical_cancel() {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("book.zip");
         let png = png_bytes(2, 2);
         write_zip(&zip_path, &[("page.png", &png)]);
-        let cancel = AtomicBool::new(true);
+        let cancel = Arc::new(AtomicBool::new(true));
 
         let result = decode_canonical_image(
             CanonicalImageSource::ArchiveEntry {
@@ -1176,8 +1193,35 @@ mod tests {
         assert!(matches!(
             result,
             Err(CanonicalDecodeError::Cancelled(
-                CanonicalCancelStage::SourceReadComplete
+                CanonicalCancelStage::SourceRead
             ))
+        ));
+    }
+
+    #[test]
+    fn corrupt_archive_without_cancel_remains_a_source_read_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("corrupt.zip");
+        std::fs::write(&zip_path, b"not a zip archive").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = decode_canonical_image(
+            CanonicalImageSource::ArchiveEntry {
+                archive_path: &zip_path,
+                entry_name: "page.png",
+            },
+            CanonicalDecodeOptions {
+                susie_priority: true,
+                susie_cancel: None,
+                cancel: Some(&cancel),
+                animation_policy: AnimationPolicy::FullFrames,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(CanonicalDecodeError::SourceRead(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
         ));
     }
 

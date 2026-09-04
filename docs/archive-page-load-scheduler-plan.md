@@ -170,6 +170,19 @@ UI スレッドでは待たない。
 
 ### 4.1 ZIP 目次の再利用 — 位置指定読みの clone 可能 reader
 
+**S2 実装済み (2026-09-04)。** `zip_loader::ArchiveDirectoryCache` が外側 ZIP の
+`ZipArchive<PositionedFileReader>` template を所有する。cache 全体の lock は
+`(path, mtime, size)` の照合と per-key slot 取得だけ、初回解析は lock 外で行う。同じ key の
+cold miss だけを `Condvar` で single-flight にし、ready 後は request 用 clone の一瞬だけ
+slot lock を握る。エントリ I/O は lock 外で並行する。上限は 8 書庫で、既存の
+`clear_nested_cache` (= フォルダ / 外側コンテナ切替境界) がこの cache も破棄する。
+
+同日の `bench_zip_seek` (10,000 entries / 30 pages) では、本番経路 [2] の合計 p50 が
+**60.06ms → 1.98ms**、比較対象 [3] は 1.97ms だった。後測定の mean 3.91ms / max 60.74ms は
+cold 初回の解析 1 回を含む。cold cache の並列 [5] でも解析回数は 1 / 4 / 6 / 8 / 16 / 32 /
+51 worker の全ケースで **1 回**。wall は 8 worker で 183.0ms → 99.6ms、51 worker で
+1,221.9ms → 176.5ms になり、目次解析時間の同時数比例を解消した。
+
 `zip` 2.4.2 の `ZipArchive<R>` は `Clone` で、解析結果を `shared: Arc<Shared>` として持つ。
 **reader を `Clone` にすれば、clone は目次を共有し、再解析なしで読み出し口を増やせる。**
 
@@ -198,6 +211,18 @@ clone ごとに独立に持つ。`ZipArchive` の clone は「`Arc` 2 本 + `u64
 > 意味では書庫の大小によらず効く**。
 
 ### 4.2 中断できる reader
+
+**S2 実装済み (2026-09-04)。** `PositionedFileReader` とメモリ上の入れ子 ZIP 用
+`CancellableReader` は `read` / `seek` の各入口で request 固有 `Arc<AtomicBool>` を確認する。
+cache template の reader は cancel を持たず、`ZipArchive::clone` で作る request 側 reader に
+だけ付ける。cold miss の最初の解析にも request reader を使い、成功後に cancel を外した clone を
+template として保存する。
+
+zip クレートの `ZipError` を `io::Error` へ変換する箇所では cancel flag を再確認し、立って
+いれば `Interrupted`、立っていなければ従来どおり `InvalidData` にする。canonical decoder は
+前者を `CanonicalDecodeError::Cancelled(CanonicalCancelStage::SourceRead)`、後者を
+`CanonicalDecodeError::SourceRead` として扱う。成功直後に cancel が立った従来の境界は
+`SourceReadComplete` のまま残す。
 
 同じ reader に **cancel フラグを持たせ、`read` / `seek` が立っていたら
 `io::ErrorKind::Interrupted` を返す**。`ZipArchive::new` はファイルを直接開かず
@@ -320,7 +345,7 @@ Remote 側 §1.0i で「近傍だけ + 非同期補完」を不採用とした�
 | 段階 | 内容 | 完了の条件 |
 | --- | --- | --- |
 | S1 | `FsPageLoadScheduler` 新設と `start_fs_load` の接続 (§3) | **実装・自動テスト済み**。実機 smoke / 再計測待ち |
-| S2 | 書庫読み出しの短縮と中断 (§4.1 / §4.2) | 1 ページの実測短縮に加え、**cancel から実終了までが短くなる**。名前解決・入れ子・RAR の回帰なし |
+| S2 | 書庫読み出しの短縮と中断 (§4.1 / §4.2) | **実装・自動テスト・単体 bench 済み**。実機セッションでの cancel → 実終了再計測待ち |
 | S2b | PDFium のプログレッシブ描画 (§4.3) | 描画結果が一発版と一致し、レンダ中に中断が効く |
 | S3 | アニメーション通知の分離 (§6) | 静止 PNG/WebP で通知が出ず、GIF/APNG/Animated WebP では出る |
 | S4 | 目盛りの単体テスト (§7.2) | 寸法判明で単位数が変わることが固定される |

@@ -96,27 +96,18 @@ fn main() {
         .take(pages.min(entry_names.len().saturating_sub(start)))
         .collect();
 
-    // --- 2. 現行経路: ページごとに open + 目次解析 + 名前解決 + 読み出し ---
+    // --- 2. 本番経路: 初回だけ解析し、以後は template clone + 読み出し ---
     let mut cur_total = Vec::new();
-    let mut cur_read = Vec::new();
     let mut bytes_len = Vec::new();
+    mimageviewer::zip_loader::clear_nested_cache();
     for name in &targets {
         let t = Instant::now();
-        let file = std::fs::File::open(path).unwrap();
-        let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
-        let pre = t.elapsed();
-        let idx = ar.index_for_name(name).unwrap();
-        let mut e = ar.by_index(idx).unwrap();
-        let mut buf = Vec::with_capacity(e.size() as usize);
-        e.read_to_end(&mut buf).unwrap();
-        let all = t.elapsed();
-        cur_total.push(ms(all));
-        cur_read.push(ms(all - pre));
+        let buf = mimageviewer::zip_loader::read_entry_bytes(path, name).unwrap();
+        cur_total.push(ms(t.elapsed()));
         bytes_len.push(buf.len() as f64);
     }
-    println!("\n[2] 現行経路 (ページごとに開き直す)");
-    stat("読み出しのみ", &cur_read);
-    stat("合計 (前処理込み)", &cur_total);
+    println!("\n[2] 本番経路 (解析済み目次を clone)");
+    stat("合計 (metadata 照合込み)", &cur_total);
     stat(
         "エントリのバイト数 (KiB 表示)",
         &bytes_len.iter().map(|b| b / 1024.0).collect::<Vec<_>>(),
@@ -159,12 +150,12 @@ fn main() {
     }
     stat("image::load_from_memory", &dec);
 
-    // --- 5. 並列競合: 現行経路 (開き直し + 目次解析 + 読み出し + デコード) を N 本同時に走らせる ---
+    // --- 5. 並列競合: cold cache から本番経路を N 本同時に走らせる ---
     println!(
         "
-[5] 並列競合 (現行経路をそのまま N 本同時)"
+[5] 並列競合 (cold cache の本番経路を N 本同時)"
     );
-    for workers in [1usize, 4, 8, 16, 32, 51] {
+    for workers in [1usize, 4, 6, 8, 16, 32, 51] {
         let names: Vec<String> = entry_names
             .iter()
             .skip(start + 100)
@@ -175,47 +166,39 @@ fn main() {
             break;
         }
         let path_buf = path.to_path_buf();
+        mimageviewer::zip_loader::clear_nested_cache();
+        let parse_count_before = mimageviewer::zip_loader::archive_directory_parse_count();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
         let t = Instant::now();
         let handles: Vec<_> = names
             .into_iter()
             .map(|name| {
                 let p = path_buf.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
+                    barrier.wait();
                     let t = Instant::now();
-                    let file = std::fs::File::open(&p).unwrap();
-                    let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
-                    let t_dir = t.elapsed();
-                    let idx = ar.index_for_name(&name).unwrap();
-                    let mut e = ar.by_index(idx).unwrap();
-                    let mut buf = Vec::with_capacity(e.size() as usize);
-                    e.read_to_end(&mut buf).unwrap();
+                    let buf = mimageviewer::zip_loader::read_entry_bytes(&p, &name).unwrap();
                     let t_read = t.elapsed();
                     let _ = image::load_from_memory(&buf).unwrap();
-                    (
-                        ms(t_dir),
-                        ms(t_read - t_dir),
-                        ms(t.elapsed() - t_read),
-                        ms(t.elapsed()),
-                    )
+                    (ms(t_read), ms(t.elapsed() - t_read), ms(t.elapsed()))
                 })
             })
             .collect();
-        let mut dirs = Vec::new();
         let mut reads = Vec::new();
         let mut decs = Vec::new();
         let mut alls = Vec::new();
         for h in handles {
-            let (d, r, c, a) = h.join().unwrap();
-            dirs.push(d);
+            let (r, c, a) = h.join().unwrap();
             reads.push(r);
             decs.push(c);
             alls.push(a);
         }
         let wall = ms(t.elapsed());
+        let parse_count =
+            mimageviewer::zip_loader::archive_directory_parse_count() - parse_count_before;
         println!(
-            "  workers={workers:<3} wall={wall:>8.1}ms   1本あたり: 目次 p50={:>7.1} max={:>7.1} / 読み p50={:>6.1} / デコード p50={:>6.1} / 合計 p50={:>7.1} max={:>7.1}",
-            pct(dirs.clone(), 0.5),
-            dirs.iter().cloned().fold(0.0, f64::max),
+            "  workers={workers:<3} wall={wall:>8.1}ms  目次解析={parse_count}回  1本あたり: 読み p50={:>6.1} / デコード p50={:>6.1} / 合計 p50={:>7.1} max={:>7.1}",
             pct(reads.clone(), 0.5),
             pct(decs.clone(), 0.5),
             pct(alls.clone(), 0.5),

@@ -18,14 +18,441 @@
 //! - **ナビゲーション時クリア**: 別フォルダ/ZIP を開いたら `clear_all()` で全破棄し、
 //!   外側 ZIP を切り替えても古いキャッシュが居残らないようにする。
 //!
-//! スレッドセーフのため、各呼び出しで ZIP を独立に開いている (共有ハンドルなし)。
+//! 外側 ZIP は位置指定 reader の `ZipArchive` template を共有し、request ごとの clone で読む。
+//! clone は独立した論理位置を持つため、同じ書庫の並列読みでも file position は競合しない。
 
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+// ── 外側 ZIP の中央目次キャッシュ ─────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveCacheKey {
+    path: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl ArchiveCacheKey {
+    fn from_path(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            mtime: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+}
+
+fn interrupted_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "ZIP source read was cancelled",
+    )
+}
+
+fn zip_error_to_io(error: impl ToString, cancel: Option<&AtomicBool>) -> std::io::Error {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        interrupted_error()
+    } else {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+    }
+}
+
+/// `ZipArchive::clone` の次の reader clone に付ける request 固有 cancel。
+/// template 自身には cancel を保持しない。
+#[derive(Debug)]
+enum ReaderCloneCancel {
+    Disabled,
+    Cancellable(Arc<AtomicBool>),
+}
+
+type ReaderCloneControl = Arc<Mutex<Option<ReaderCloneCancel>>>;
+
+/// 1 つの `File` を共有しつつ、clone ごとに論理位置を持つ位置指定 reader。
+#[derive(Debug)]
+pub struct PositionedFileReader {
+    file: Arc<File>,
+    position: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    clone_control: ReaderCloneControl,
+}
+
+impl PositionedFileReader {
+    fn new(file: Arc<File>, cancel: Option<Arc<AtomicBool>>) -> (Self, ReaderCloneControl) {
+        let clone_control = Arc::new(Mutex::new(None));
+        (
+            Self {
+                file,
+                position: 0,
+                cancel,
+                clone_control: Arc::clone(&clone_control),
+            },
+            clone_control,
+        )
+    }
+
+    fn check_cancel(&self) -> std::io::Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            Err(interrupted_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Clone for PositionedFileReader {
+    fn clone(&self) -> Self {
+        let next_cancel = lock_unpoisoned(&self.clone_control).take();
+        let cancel = match next_cancel {
+            Some(ReaderCloneCancel::Disabled) => None,
+            Some(ReaderCloneCancel::Cancellable(cancel)) => Some(cancel),
+            None => self.cancel.clone(),
+        };
+        Self {
+            file: Arc::clone(&self.file),
+            position: self.position,
+            cancel,
+            clone_control: Arc::clone(&self.clone_control),
+        }
+    }
+}
+
+impl Read for PositionedFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check_cancel()?;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        let read =
+            std::os::windows::fs::FileExt::seek_read(self.file.as_ref(), buffer, self.position)?;
+        #[cfg(not(windows))]
+        let read = std::os::unix::fs::FileExt::read_at(self.file.as_ref(), buffer, self.position)?;
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ZIP reader position overflow",
+            )
+        })?;
+        Ok(read)
+    }
+}
+
+impl Seek for PositionedFileReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check_cancel()?;
+        let next = match position {
+            SeekFrom::Start(position) => position as i128,
+            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+            SeekFrom::End(offset) => self.file.metadata()?.len() as i128 + offset as i128,
+        };
+        if !(0..=u64::MAX as i128).contains(&next) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid ZIP reader seek",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
+}
+
+/// メモリ上の入れ子 ZIP にも同じ I/O 境界で cancel を適用する。
+struct CancellableReader<R> {
+    inner: R,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl<R> CancellableReader<R> {
+    fn new(inner: R, cancel: Option<Arc<AtomicBool>>) -> Self {
+        Self { inner, cancel }
+    }
+
+    fn check_cancel(&self) -> std::io::Result<()> {
+        if is_cancelled(self.cancel.as_ref()) {
+            Err(interrupted_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check_cancel()?;
+        self.inner.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for CancellableReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.check_cancel()?;
+        self.inner.seek(position)
+    }
+}
+
+type DiskZipArchive = zip::ZipArchive<PositionedFileReader>;
+
+struct CachedArchiveTemplate {
+    archive: DiskZipArchive,
+    clone_control: ReaderCloneControl,
+}
+
+impl CachedArchiveTemplate {
+    fn clone_for_request(
+        &self,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> std::io::Result<DiskZipArchive> {
+        clone_archive_with_cancel(&self.archive, &self.clone_control, cancel.cloned())
+    }
+}
+
+#[derive(Clone)]
+struct CachedIoError {
+    kind: std::io::ErrorKind,
+    message: String,
+    cancelled: bool,
+}
+
+impl CachedIoError {
+    fn from_error(error: &std::io::Error, cancelled: bool) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+            cancelled,
+        }
+    }
+
+    fn to_error(&self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message.clone())
+    }
+}
+
+enum ArchiveTemplateState {
+    Loading,
+    Ready(CachedArchiveTemplate),
+    Failed(CachedIoError),
+}
+
+struct ArchiveTemplateSlot {
+    state: Mutex<ArchiveTemplateState>,
+    ready: Condvar,
+}
+
+struct ArchiveDirectoryCacheEntry {
+    key: ArchiveCacheKey,
+    slot: Arc<ArchiveTemplateSlot>,
+    last_used: Instant,
+}
+
+struct ArchiveDirectoryCacheInner {
+    entries: Vec<ArchiveDirectoryCacheEntry>,
+}
+
+/// 外側 ZIP の解析済み中央目次を、書庫数上限つきで所有する。
+///
+/// global lock は metadata key の照合と slot 取得だけに使う。初回解析は lock 外、同じ
+/// key の二重解析は per-key `Condvar` で single-flight にする。ready 後は template の
+/// clone の一瞬だけ slot lock を握り、エントリ I/O 中はどの cache lock も保持しない。
+struct ArchiveDirectoryCache {
+    inner: Mutex<ArchiveDirectoryCacheInner>,
+    max_archives: usize,
+    parse_count: AtomicUsize,
+}
+
+const ARCHIVE_DIRECTORY_CACHE_MAX_ARCHIVES: usize = 8;
+const ARCHIVE_DIRECTORY_WAIT_POLL: Duration = Duration::from_millis(5);
+
+impl ArchiveDirectoryCache {
+    fn new(max_archives: usize) -> Self {
+        Self {
+            inner: Mutex::new(ArchiveDirectoryCacheInner {
+                entries: Vec::new(),
+            }),
+            max_archives: max_archives.max(1),
+            parse_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn open_archive(
+        &self,
+        path: &Path,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> std::io::Result<DiskZipArchive> {
+        'lookup: loop {
+            if is_cancelled(cancel) {
+                return Err(interrupted_error());
+            }
+            // 取得のたびに metadata を取り、同じ path の古い identity を失効させる。
+            let key = ArchiveCacheKey::from_path(path)?;
+            let (slot, is_builder) = self.slot_for_key(key.clone());
+            if is_builder {
+                let built = self.build_archive(path, cancel);
+                match built {
+                    Ok((request_archive, template)) => {
+                        *lock_unpoisoned(&slot.state) = ArchiveTemplateState::Ready(template);
+                        slot.ready.notify_all();
+                        return Ok(request_archive);
+                    }
+                    Err(error) => {
+                        let failure = CachedIoError::from_error(&error, is_cancelled(cancel));
+                        *lock_unpoisoned(&slot.state) = ArchiveTemplateState::Failed(failure);
+                        slot.ready.notify_all();
+                        self.remove_slot(&key, &slot);
+                        return Err(error);
+                    }
+                }
+            }
+
+            let mut state = lock_unpoisoned(&slot.state);
+            loop {
+                match &*state {
+                    ArchiveTemplateState::Ready(template) => {
+                        return template.clone_for_request(cancel);
+                    }
+                    ArchiveTemplateState::Loading => {
+                        if is_cancelled(cancel) {
+                            return Err(interrupted_error());
+                        }
+                        state = match slot.ready.wait_timeout(state, ARCHIVE_DIRECTORY_WAIT_POLL) {
+                            Ok((state, _)) => state,
+                            Err(poisoned) => poisoned.into_inner().0,
+                        };
+                    }
+                    ArchiveTemplateState::Failed(failure) => {
+                        let retry = failure.cancelled && !is_cancelled(cancel);
+                        let error = failure.to_error();
+                        drop(state);
+                        self.remove_slot(&key, &slot);
+                        if retry {
+                            continue 'lookup;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    fn slot_for_key(&self, key: ArchiveCacheKey) -> (Arc<ArchiveTemplateSlot>, bool) {
+        let mut inner = lock_unpoisoned(&self.inner);
+        inner
+            .entries
+            .retain(|entry| entry.key.path != key.path || entry.key == key);
+        if let Some(entry) = inner.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.last_used = Instant::now();
+            return (Arc::clone(&entry.slot), false);
+        }
+        if inner.entries.len() >= self.max_archives {
+            let oldest = inner
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            inner.entries.swap_remove(oldest);
+        }
+        let slot = Arc::new(ArchiveTemplateSlot {
+            state: Mutex::new(ArchiveTemplateState::Loading),
+            ready: Condvar::new(),
+        });
+        inner.entries.push(ArchiveDirectoryCacheEntry {
+            key,
+            slot: Arc::clone(&slot),
+            last_used: Instant::now(),
+        });
+        (slot, true)
+    }
+
+    fn build_archive(
+        &self,
+        path: &Path,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> std::io::Result<(DiskZipArchive, CachedArchiveTemplate)> {
+        if is_cancelled(cancel) {
+            return Err(interrupted_error());
+        }
+        let file = Arc::new(File::open(path)?);
+        let (reader, clone_control) = PositionedFileReader::new(file, cancel.cloned());
+        self.parse_count.fetch_add(1, Ordering::Relaxed);
+        let archive = zip::ZipArchive::new(reader)
+            .map_err(|error| zip_error_to_io(error, cancel.map(Arc::as_ref)))?;
+        // 保存する clone だけ cancel を外す。現在要求は元 archive を使い続ける。
+        let template_archive = clone_archive_with_cancel(&archive, &clone_control, None)?;
+        let template = CachedArchiveTemplate {
+            archive: template_archive,
+            clone_control,
+        };
+        Ok((archive, template))
+    }
+
+    fn remove_slot(&self, key: &ArchiveCacheKey, slot: &Arc<ArchiveTemplateSlot>) {
+        lock_unpoisoned(&self.inner)
+            .entries
+            .retain(|entry| entry.key != *key || !Arc::ptr_eq(&entry.slot, slot));
+    }
+
+    fn clear(&self) {
+        lock_unpoisoned(&self.inner).entries.clear();
+    }
+
+    #[cfg(test)]
+    fn parse_count(&self) -> usize {
+        self.parse_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock_unpoisoned(&self.inner).entries.len()
+    }
+}
+
+fn clone_archive_with_cancel(
+    archive: &DiskZipArchive,
+    clone_control: &ReaderCloneControl,
+    cancel: Option<Arc<AtomicBool>>,
+) -> std::io::Result<DiskZipArchive> {
+    let mut control = lock_unpoisoned(clone_control);
+    if control.is_some() {
+        return Err(std::io::Error::other(
+            "ZIP archive clone control was already in use",
+        ));
+    }
+    *control = Some(match cancel {
+        Some(cancel) => ReaderCloneCancel::Cancellable(cancel),
+        None => ReaderCloneCancel::Disabled,
+    });
+    drop(control);
+    Ok(archive.clone())
+}
+
+static ARCHIVE_DIRECTORY_CACHE: LazyLock<ArchiveDirectoryCache> =
+    LazyLock::new(|| ArchiveDirectoryCache::new(ARCHIVE_DIRECTORY_CACHE_MAX_ARCHIVES));
+
+#[cfg(any(test, feature = "dev-tools"))]
+pub fn archive_directory_parse_count() -> usize {
+    ARCHIVE_DIRECTORY_CACHE.parse_count.load(Ordering::Relaxed)
+}
 
 // ── 内側 ZIP バイト列キャッシュ ──────────────────────────────────
 
@@ -134,35 +561,23 @@ static NESTED_CACHE: LazyLock<NestedZipCache> =
 // O(N²) になる (2,000 ページで ~4M 回の SHIFT_JIS デコード)。
 // 「正規化デコード名 → index」はアーカイブが変わらない限り不変なので、
 // (path, len, mtime) keyed で 1 回だけ構築し、以後は O(1) で引く。
-#[derive(Clone, PartialEq, Eq)]
-struct DecodedNameCacheKey {
-    path: PathBuf,
-    len: u64,
-    mtime: Option<std::time::SystemTime>,
-}
-
 const DECODED_NAME_CACHE_MAX_ARCHIVES: usize = 8;
 
 static DECODED_NAME_INDEX_CACHE: LazyLock<
     Mutex<
         Vec<(
-            DecodedNameCacheKey,
+            ArchiveCacheKey,
             Arc<std::collections::HashMap<String, usize>>,
         )>,
     >,
 > = LazyLock::new(|| Mutex::new(Vec::new()));
 
-fn decoded_name_cache_key(zip_path: &Path) -> Option<DecodedNameCacheKey> {
-    let meta = std::fs::metadata(zip_path).ok()?;
-    Some(DecodedNameCacheKey {
-        path: zip_path.to_path_buf(),
-        len: meta.len(),
-        mtime: meta.modified().ok(),
-    })
+fn decoded_name_cache_key(zip_path: &Path) -> Option<ArchiveCacheKey> {
+    ArchiveCacheKey::from_path(zip_path).ok()
 }
 
 fn decoded_name_cache_get(
-    key: &DecodedNameCacheKey,
+    key: &ArchiveCacheKey,
 ) -> Option<Arc<std::collections::HashMap<String, usize>>> {
     let cache = DECODED_NAME_INDEX_CACHE.lock().ok()?;
     cache
@@ -172,7 +587,7 @@ fn decoded_name_cache_get(
 }
 
 fn decoded_name_cache_put(
-    key: DecodedNameCacheKey,
+    key: ArchiveCacheKey,
     map: Arc<std::collections::HashMap<String, usize>>,
 ) {
     let Ok(mut cache) = DECODED_NAME_INDEX_CACHE.lock() else {
@@ -186,9 +601,11 @@ fn decoded_name_cache_put(
 }
 
 /// 外側のフォルダ/ZIP/PDF を切り替えたときに呼ぶ。
-/// 全エントリを破棄し、古い外側のキャッシュが居残らないようにする。
+/// 内側 ZIP bytes と外側 ZIP の解析済み目次を破棄し、古い書庫を居残らせない。
+/// 関数名は既存呼び出しとの互換のため維持する。
 pub fn clear_nested_cache() {
     NESTED_CACHE.clear();
+    ARCHIVE_DIRECTORY_CACHE.clear();
 }
 
 // ── 共通ヘルパー ────────────────────────────────────────────────
@@ -344,9 +761,7 @@ pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipE
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::enumerate_image_entries_detailed(zip_path);
     }
-    let file = File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(BufReader::new(file))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
 
     // ZIP 自身の mtime をフォールバックに使う
     let zip_mtime = std::fs::metadata(zip_path)
@@ -558,10 +973,12 @@ pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::read_first_image_bytes(zip_path);
     }
-    let file = File::open(zip_path).ok()?;
-    let file_size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(zip_path)
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
     let t0 = std::time::Instant::now();
-    let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None).ok()?;
     let result = read_first_image_recursive(&mut archive, zip_path, "");
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if total_ms > 50.0 {
@@ -650,12 +1067,32 @@ fn read_first_image_recursive<R: Read + Seek>(
 /// 保持されるため、同じ内側 ZIP 内のエントリを連続で読む場合は再展開コストが
 /// 発生しない。
 pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Vec<u8>> {
+    read_entry_bytes_impl(zip_path, entry_name, None)
+}
+
+/// [`read_entry_bytes`] の cancel 対応版。外側・入れ子 ZIP の reader I/O 境界で停止する。
+pub fn read_entry_bytes_cancellable(
+    zip_path: &Path,
+    entry_name: &str,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    read_entry_bytes_impl(zip_path, entry_name, Some(cancel))
+}
+
+fn read_entry_bytes_impl(
+    zip_path: &Path,
+    entry_name: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    if is_cancelled(cancel) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::read_entry_bytes(zip_path, entry_name);
     }
     let parts = split_nested_zip_path(entry_name);
     if parts.len() == 1 {
-        return read_entry_from_disk(zip_path, entry_name);
+        return read_entry_from_disk(zip_path, entry_name, cancel);
     }
 
     // 最深のキャッシュヒットを探す。キー = parts[0..level].join("/")
@@ -680,8 +1117,11 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     //   **両方**持つ場合、cold 読みは literal 側を返す (列挙も両方を別エントリとして
     //   挙げており identity は元々曖昧。どちらかを決定的に選ぶ仕様とする、Codex P3)。
     if current_bytes.is_none() {
-        if let Ok(bytes) = read_entry_from_disk(zip_path, entry_name) {
+        if let Ok(bytes) = read_entry_from_disk(zip_path, entry_name, cancel) {
             return Ok(bytes);
+        }
+        if is_cancelled(cancel) {
+            return Err(interrupted_error());
         }
     }
 
@@ -691,8 +1131,8 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     while level < parts.len() - 1 {
         // parts[level] は内側 ZIP のエントリ。中身は別の ZIP バイト列。
         let next_bytes: Vec<u8> = match &current_bytes {
-            Some(b) => read_entry_from_bytes(b, parts[level])?,
-            None => read_entry_from_disk(zip_path, parts[level])?,
+            Some(b) => read_entry_from_bytes(b, parts[level], cancel)?,
+            None => read_entry_from_disk(zip_path, parts[level], cancel)?,
         };
         let arc = Arc::new(next_bytes);
         let key_so_far = parts[0..=level].join("/");
@@ -704,25 +1144,36 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     // 葉の読み取り
     let leaf = parts[parts.len() - 1];
     match &current_bytes {
-        Some(b) => read_entry_from_bytes(b, leaf),
-        None => read_entry_from_disk(zip_path, leaf),
+        Some(b) => read_entry_from_bytes(b, leaf, cancel),
+        None => read_entry_from_disk(zip_path, leaf, cancel),
     }
 }
 
-fn read_entry_from_disk(zip_path: &Path, entry_name: &str) -> std::io::Result<Vec<u8>> {
-    let file = File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(BufReader::new(file))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    read_by_name(&mut archive, entry_name, decoded_name_cache_key(zip_path))
+fn read_entry_from_disk(
+    zip_path: &Path,
+    entry_name: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, cancel)?;
+    read_by_name(
+        &mut archive,
+        entry_name,
+        decoded_name_cache_key(zip_path),
+        cancel.map(Arc::as_ref),
+    )
 }
 
-fn read_entry_from_bytes(bytes: &Arc<Vec<u8>>, entry_name: &str) -> std::io::Result<Vec<u8>> {
-    let cursor = Cursor::new(bytes.as_slice());
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+fn read_entry_from_bytes(
+    bytes: &Arc<Vec<u8>>,
+    entry_name: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    let reader = CancellableReader::new(Cursor::new(bytes.as_slice()), cancel.cloned());
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|error| zip_error_to_io(error, cancel.map(Arc::as_ref)))?;
     // メモリ上の子 ZIP は安定したキャッシュキーを持たないので index キャッシュなし
     // (走査は raw メタのみで解凍を伴わない)。
-    read_by_name(&mut archive, entry_name, None)
+    read_by_name(&mut archive, entry_name, None, cancel.map(Arc::as_ref))
 }
 
 /// エントリ名から index を解く。**名前解決はここだけが持つ。**
@@ -734,7 +1185,8 @@ fn read_entry_from_bytes(bytes: &Arc<Vec<u8>>, entry_name: &str) -> std::io::Res
 fn resolve_entry_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
-    cache_key: Option<DecodedNameCacheKey>,
+    cache_key: Option<ArchiveCacheKey>,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<usize> {
     if let Some(index) = archive.index_for_name(entry_name) {
         return Ok(index);
@@ -745,29 +1197,31 @@ fn resolve_entry_index<R: Read + Seek>(
     {
         return Ok(index);
     }
-    decoded_name_index(archive, entry_name, cache_key)
+    decoded_name_index(archive, entry_name, cache_key, cancel)
 }
 
 fn read_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
-    cache_key: Option<DecodedNameCacheKey>,
+    cache_key: Option<ArchiveCacheKey>,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<Vec<u8>> {
-    let index = resolve_entry_index(archive, entry_name, cache_key)?;
-    read_by_index(archive, index)
+    let index = resolve_entry_index(archive, entry_name, cache_key, cancel)?;
+    read_by_index(archive, index, cancel)
 }
 
 /// エントリの先頭 `limit` バイトだけを読む。画像ヘッダから寸法を取るための限定 API。
 fn read_prefix_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
-    cache_key: Option<DecodedNameCacheKey>,
+    cache_key: Option<ArchiveCacheKey>,
     limit: u64,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<Vec<u8>> {
-    let index = resolve_entry_index(archive, entry_name, cache_key)?;
+    let index = resolve_entry_index(archive, entry_name, cache_key, cancel)?;
     let mut entry = archive
         .by_index(index)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(|error| zip_error_to_io(error, cancel))?;
     let mut bytes = Vec::with_capacity(limit.min(entry.size()) as usize);
     entry.by_ref().take(limit).read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -776,14 +1230,15 @@ fn read_prefix_by_name<R: Read + Seek>(
 fn decoded_name_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
-    cache_key: Option<DecodedNameCacheKey>,
+    cache_key: Option<ArchiveCacheKey>,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<usize> {
     let wanted = entry_name.replace('\\', "/");
     if let Some(key) = cache_key {
         let map = match decoded_name_cache_get(&key) {
             Some(map) => map,
             None => {
-                let map = Arc::new(build_decoded_name_index_map(archive)?);
+                let map = Arc::new(build_decoded_name_index_map(archive, cancel)?);
                 decoded_name_cache_put(key, Arc::clone(&map));
                 map
             }
@@ -795,9 +1250,12 @@ fn decoded_name_index<R: Read + Seek>(
     }
     // キャッシュキーなし (メモリ上の子 ZIP): raw メタの 1 パス走査で index を探す。
     for i in 0..archive.len() {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(interrupted_error());
+        }
         let entry = archive
             .by_index_raw(i)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|error| zip_error_to_io(error, cancel))?;
         if normalized_zip_entry_name(&entry) == wanted {
             return Ok(i);
         }
@@ -807,13 +1265,17 @@ fn decoded_name_index<R: Read + Seek>(
 
 fn build_decoded_name_index_map<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<std::collections::HashMap<String, usize>> {
     let mut map = std::collections::HashMap::with_capacity(archive.len());
     for i in 0..archive.len() {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(interrupted_error());
+        }
         // by_index_raw は伸長準備をしない (central directory メタ読みのみで安価)。
         let entry = archive
             .by_index_raw(i)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|error| zip_error_to_io(error, cancel))?;
         map.insert(normalized_zip_entry_name(&entry), i);
     }
     Ok(map)
@@ -822,10 +1284,11 @@ fn build_decoded_name_index_map<R: Read + Seek>(
 fn read_by_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
+    cancel: Option<&AtomicBool>,
 ) -> std::io::Result<Vec<u8>> {
     let mut entry = archive
         .by_index(index)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(|error| zip_error_to_io(error, cancel))?;
     let mut bytes = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -844,7 +1307,7 @@ fn entry_not_found(entry_name: &str) -> std::io::Error {
 /// このハンドルは**外側 ZIP のみ**を保持する。ネストパスを読む場合は
 /// `read_entry_bytes` を使い、関数側でネスト境界を解釈させること。
 pub enum ZipArchiveHandle {
-    Zip(zip::ZipArchive<BufReader<File>>),
+    Zip(DiskZipArchive),
     Rar(PathBuf),
 }
 
@@ -855,10 +1318,9 @@ pub fn open_archive(zip_path: &Path) -> std::io::Result<ZipArchiveHandle> {
     if crate::rar_loader::is_rar_path(zip_path) {
         return Ok(ZipArchiveHandle::Rar(zip_path.to_path_buf()));
     }
-    let file = File::open(zip_path)?;
-    zip::ZipArchive::new(BufReader::new(file))
+    ARCHIVE_DIRECTORY_CACHE
+        .open_archive(zip_path, None)
         .map(ZipArchiveHandle::Zip)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// すでに開いた `ZipArchiveHandle` から 1 エントリの生バイト列を読む。
@@ -870,7 +1332,7 @@ pub fn read_entry_from_archive(
     match archive {
         ZipArchiveHandle::Zip(archive) => {
             // ZIP バッチハンドルはパスを保持しないため index キャッシュなし。
-            read_by_name(archive, entry_name, None)
+            read_by_name(archive, entry_name, None, None)
         }
         ZipArchiveHandle::Rar(path) => crate::rar_loader::read_entry_bytes(path, entry_name),
     }
@@ -891,7 +1353,9 @@ pub fn read_entry_prefix_from_archive(
 ) -> std::io::Result<Vec<u8>> {
     match archive {
         // 名前解決は `read_entry_from_archive` と同じ段を通す。
-        ZipArchiveHandle::Zip(archive) => read_prefix_by_name(archive, entry_name, None, limit),
+        ZipArchiveHandle::Zip(archive) => {
+            read_prefix_by_name(archive, entry_name, None, limit, None)
+        }
         // RAR は部分読みの経路を持たない。全体を読んで先頭だけ使う。
         ZipArchiveHandle::Rar(path) => crate::rar_loader::read_entry_bytes(path, entry_name),
     }
@@ -1109,6 +1573,188 @@ mod tests {
         zw.finish().unwrap();
     }
 
+    fn read_with_directory_cache(
+        cache: &ArchiveDirectoryCache,
+        path: &Path,
+        entry_name: &str,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut archive = cache.open_archive(path, cancel)?;
+        read_by_name(&mut archive, entry_name, None, cancel.map(Arc::as_ref))
+    }
+
+    #[test]
+    fn positioned_reader_returns_interrupted_from_read_and_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let (mut reader, _) =
+            PositionedFileReader::new(Arc::new(File::open(path).unwrap()), Some(cancel));
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            reader.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn directory_cache_reuses_one_central_directory_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reuse.zip");
+        write_test_zip(&path, &[("page.jpg", b"PAGE")]);
+        let cache = ArchiveDirectoryCache::new(2);
+
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"PAGE"
+        );
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"PAGE"
+        );
+        assert_eq!(cache.parse_count(), 1);
+    }
+
+    #[test]
+    fn directory_cache_is_bounded_by_archive_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ArchiveDirectoryCache::new(2);
+        for index in 0..3 {
+            let path = dir.path().join(format!("book-{index}.zip"));
+            write_test_zip(&path, &[("page.jpg", b"PAGE")]);
+            assert_eq!(
+                read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+                b"PAGE"
+            );
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.parse_count(), 3);
+    }
+
+    #[test]
+    fn directory_cache_invalidates_when_size_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("size.zip");
+        let cache = ArchiveDirectoryCache::new(2);
+        write_test_zip(&path, &[("page.jpg", b"OLD")]);
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"OLD"
+        );
+
+        write_test_zip(&path, &[("page.jpg", b"NEW-LONGER")]);
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"NEW-LONGER"
+        );
+        assert_eq!(cache.parse_count(), 2);
+    }
+
+    #[test]
+    fn directory_cache_invalidates_when_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mtime.zip");
+        let cache = ArchiveDirectoryCache::new(2);
+        write_test_zip(&path, &[("page.jpg", b"OLD")]);
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"OLD"
+        );
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut changed = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            write_test_zip(&path, &[("page.jpg", b"NEW")]);
+            if std::fs::metadata(&path).unwrap().modified().unwrap() != original_mtime {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "test filesystem did not advance mtime");
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"NEW"
+        );
+        assert_eq!(cache.parse_count(), 2);
+    }
+
+    #[test]
+    fn request_cancel_does_not_poison_the_cached_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.zip");
+        write_test_zip(&path, &[("page.jpg", b"PAGE")]);
+        let cache = ArchiveDirectoryCache::new(2);
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"PAGE"
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cancelled_archive = cache.open_archive(&path, Some(&cancel)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let error = read_by_name(
+            &mut cancelled_archive,
+            "page.jpg",
+            None,
+            Some(cancel.as_ref()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+        assert_eq!(
+            read_with_directory_cache(&cache, &path, "page.jpg", None).unwrap(),
+            b"PAGE"
+        );
+        assert_eq!(cache.parse_count(), 1);
+    }
+
+    #[test]
+    fn parallel_reads_share_the_directory_and_keep_positions_independent() {
+        const WORKERS: usize = 8;
+        const ENTRIES: [(&str, &[u8]); WORKERS] = [
+            ("p0.bin", b"zero"),
+            ("p1.bin", b"one-one"),
+            ("p2.bin", b"two-two-two"),
+            ("p3.bin", b"three"),
+            ("p4.bin", b"four-four"),
+            ("p5.bin", b"five-five-five"),
+            ("p6.bin", b"six"),
+            ("p7.bin", b"seven-seven"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parallel.zip");
+        write_test_zip(&path, &ENTRIES);
+        let cache = Arc::new(ArchiveDirectoryCache::new(2));
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+
+        let workers: Vec<_> = ENTRIES
+            .iter()
+            .map(|(name, expected)| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                let name = (*name).to_owned();
+                let expected = expected.to_vec();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let actual = read_with_directory_cache(&cache, &path, &name, None).unwrap();
+                    assert_eq!(actual, expected);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(cache.parse_count(), 1);
+    }
+
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = 0xffff_ffff_u32;
         for &byte in data {
@@ -1217,6 +1863,17 @@ mod tests {
             read_entry_from_archive(&mut archive, display_name).unwrap(),
             b"IMAGE"
         );
+    }
+
+    #[test]
+    fn read_entry_bytes_keeps_the_direct_rar_dispatch() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/○×△□ Vol.2.rar");
+        let entries = crate::rar_loader::enumerate_image_entries_detailed(&path).unwrap();
+        let entry_name = &entries.entries[0].entry_name;
+        let expected = crate::rar_loader::read_entry_bytes(&path, entry_name).unwrap();
+        let actual = read_entry_bytes(&path, entry_name).unwrap();
+        assert_eq!(actual, expected);
     }
 
     /// 変換キャッシュ ZIP は "inner.zip/p.jpg" のような literal なフラットエントリを

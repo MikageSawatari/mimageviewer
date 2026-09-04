@@ -422,10 +422,10 @@ App-global な `FsPageLoadScheduler` の permit を取得してから以下へ�
 ```
 
 待機中の要求は cancel されると source を読まずに終了する。実行中の cancel は permit を
-即時返却せず、worker が実際に終了するまで `Cancelling` として数える。書庫読み出し直後・
-decode 前と animation frame 境界で cancel を確認し、PDFium / Susie IPC は開始後の応答まで
-permit 内で待つ。先読みから表示対象への遷移は同じ ticket の High 昇格であり、
-cancel + 再投入は行わない。
+即時返却せず、worker が実際に終了するまで `Cancelling` として数える。ZIP は位置指定 reader の
+`read` / `seek` 境界、書庫読み出し直後・decode 前、animation frame 境界で cancel を確認する。
+PDFium / Susie IPC は開始後の応答まで permit 内で待つ。先読みから表示対象への遷移は同じ
+ticket の High 昇格であり、cancel + 再投入は行わない。
 
 Animated (`FsCacheEntry::Animated`) は playback-only として扱う。表示時は常に
 `current_frame` の raw テクスチャを直接選び、`edit_result_cache` /
