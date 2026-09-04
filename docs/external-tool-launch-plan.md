@@ -947,7 +947,11 @@ P2b-2 で追加したうち、`OsDefault + Batch` は実際には 1 件ずつ起
 - 一時ディレクトリは mIV が作る。既存ディレクトリを再利用しない。展開先パスはエントリ名を sanitize して
   ディレクトリ外へ出さない (Zip Slip 対策)。製本の sanitized basename
   ([books.rs:1594](../src/books.rs:1594)) を流用する。
-- 起動したプロセスの標準入出力は継承しない。
+- 起動したプロセスの標準入出力は継承しない。**例外は「コンソール窓を表示する」を ON にした
+  ツールだけ**で、そこでは継承することが設定の意味そのものになる。`CREATE_NO_WINDOW` を
+  外すだけでは足りない — Rust の `Command` は `STARTF_USESTDHANDLES` を常に立てるので、
+  NUL へ向けた handle が新しいコンソールの handle を上書きし、**窓は出るのに中身が空**に
+  なる (2026-09-04 実測: 窓は `IsWindowVisible` = 真、子の `GetConsoleMode(stdout)` は失敗)。
 
 ---
 

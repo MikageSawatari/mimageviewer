@@ -1829,11 +1829,22 @@ fn launch_request(
                 arguments
             ));
             let mut command = Command::new(&executable);
-            command
-                .args(&arguments)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            command.args(&arguments).stdin(Stdio::null());
+            // 既定は標準出力を捨てる (mIV の stdio を子へ漏らさない)。
+            //
+            // **「コンソール窓を表示する」を ON にしたときだけ継承する。** `CREATE_NO_WINDOW`
+            // を外すだけでは足りない: Rust の `Command` は `STARTF_USESTDHANDLES` を常に
+            // 立てるので、NUL へ向けた handle が新しいコンソールの handle を上書きし、
+            // **窓は出るのに中身が空**になる (2026-09-04 実測: 窓は visible、`GetConsoleMode`
+            // は失敗)。継承にすると、コンソールを持たない mIV から起動した子は割り当てられた
+            // 新しいコンソールへ、コンソール付きで起動された mIV の子はその同じコンソールへ
+            // 出力する。どちらでも利用者は出力を読める。
+            //
+            // 継承するのは Windows でコンソールを見せるときだけ。非 Windows は従来どおり
+            // 常に捨てる。
+            if !(cfg!(windows) && show_console) {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
             if let Some(directory) = &working_directory {
                 command.current_dir(directory);
             }
