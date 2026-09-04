@@ -10,7 +10,8 @@ use musicvideo_core::{
 
 use crate::decode::AudioData;
 use crate::project::{
-    BACKGROUND_ID, FontData, SPECTRUM_BANDS, create_assets, default_project, synthetic_background,
+    BACKGROUND_ID, FontData, create_assets, default_project, spectrum_band_count,
+    synthetic_background,
 };
 
 const BENCHMARK_WARMUP_FRAMES: usize = 10;
@@ -76,7 +77,7 @@ pub fn export_png_sequence(
     let output_dir = create_output_dir(output_root)?;
     let mut spectrum = SpectrumSource::new(
         audio.sample_rate,
-        SPECTRUM_BANDS,
+        spectrum_band_count(&project),
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("スペクトラム解析を初期化できません: {error}"))?;
@@ -243,20 +244,78 @@ fn ensure_resolved(report: &RenderReport, context: &str) -> Result<(), String> {
     Err(format!("{context}で未解決の素材があります: {details}"))
 }
 
-pub fn run_benchmark(frames: usize, font: &FontData) -> Result<RenderStats, String> {
-    if frames == 0 {
-        return Err("ベンチマークのフレーム数は 1 以上を指定してください".to_owned());
-    }
+pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String> {
     let assets = create_assets(Some(font))?;
     assets.insert_image(
         ImageId::new(BACKGROUND_ID),
         synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
     );
-    let project = default_project(frames as f64 / 60.0);
+    let project = default_project(10.0);
+    let pcm = synthetic_chirp_pcm(11.0);
+    let mut spectrum = SpectrumSource::new(
+        BENCHMARK_SAMPLE_RATE,
+        spectrum_band_count(&project),
+        Smoothing::Average { factor: 0.7 },
+    )
+    .map_err(|error| format!("サンプル用の解析を初期化できません: {error}"))?;
+    let time = 5.0;
+    let bands = SpectrumFrame::new(spectrum.frame_at(&pcm, time).to_vec());
+    let scene = evaluate(&project, time, &bands);
+    let mut frame = Frame::new(project.output.width, project.output.height)
+        .map_err(|error| format!("サンプル画像を確保できません: {error}"))?;
+    let report = render_frame(&scene, &assets, &mut frame)
+        .map_err(|error| format!("サンプル画像を合成できません: {error}"))?;
+    ensure_resolved(&report, "サンプル画像")?;
+    image::save_buffer_with_format(
+        output,
+        &frame.rgba,
+        frame.width,
+        frame.height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| {
+        format!(
+            "サンプル画像を保存できません ({}): {error}",
+            output.display()
+        )
+    })
+}
+
+pub fn run_benchmark(frames: usize, font: &FontData) -> Result<(), String> {
+    if frames == 0 {
+        return Err("ベンチマークのフレーム数は 1 以上を指定してください".to_owned());
+    }
+    let without_glow = benchmark_once(frames, font, false)?;
+    let with_glow = benchmark_once(frames, font, true)?;
+    println!(
+        "musicvideo benchmark glow_delta: composition_mean_ms={:.3} composition_p95_ms={:.3}",
+        with_glow.composition.mean_ms - without_glow.composition.mean_ms,
+        with_glow.composition.p95_ms - without_glow.composition.p95_ms,
+    );
+    Ok(())
+}
+
+fn benchmark_once(
+    frames: usize,
+    font: &FontData,
+    glow_enabled: bool,
+) -> Result<RenderStats, String> {
+    let assets = create_assets(Some(font))?;
+    assets.insert_image(
+        ImageId::new(BACKGROUND_ID),
+        synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
+    );
+    let mut project = default_project(frames as f64 / 60.0);
+    if !glow_enabled {
+        for layer in &mut project.layers {
+            layer.glow = musicvideo_core::Animatable::Const(None);
+        }
+    }
     let pcm = synthetic_chirp_pcm(project.duration_secs + 1.0);
     let mut spectrum = SpectrumSource::new(
         BENCHMARK_SAMPLE_RATE,
-        SPECTRUM_BANDS,
+        spectrum_band_count(&project),
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("ベンチマーク解析を初期化できません: {error}"))?;
@@ -304,7 +363,8 @@ pub fn run_benchmark(frames: usize, font: &FontData) -> Result<RenderStats, Stri
     let cache_after_measurement = assets.scaled_image_cache_stats();
     validate_benchmark_cache(cache_after_warmup, cache_after_measurement, frames as u64)?;
     println!(
-        "musicvideo benchmark: frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
+        "musicvideo benchmark: glow={} frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
+        if glow_enabled { "on" } else { "off" },
         stats.frames,
         stats.width,
         stats.height,

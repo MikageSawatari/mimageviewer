@@ -1,4 +1,6 @@
-use crate::model::{Fit, ImageId, LayerKind, NormRect, Project, Rgba8, TextAlign, TimeFormat};
+use crate::model::{
+    Fill, Fit, Glow, ImageId, LayerKind, NormRect, Project, SpectrumShape, TextAlign, TimeFormat,
+};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SpectrumFrame {
@@ -22,13 +24,16 @@ pub struct Scene {
 pub struct SceneItem {
     pub rect: NormRect,
     pub opacity: f32,
+    pub rotation_deg: f32,
+    pub corner_radius_px: f32,
+    pub glow: Option<Glow>,
     pub kind: SceneItemKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneItemKind {
     Solid {
-        color: Rgba8,
+        fill: Fill,
     },
     Image {
         image: ImageId,
@@ -36,23 +41,22 @@ pub enum SceneItemKind {
     },
     Spectrum {
         values: Vec<f32>,
-        gap_ratio: f32,
-        min_height_px: f32,
-        thickness: f32,
-        color: Rgba8,
+        point_count: usize,
+        shape: SpectrumShape,
+        fill: Fill,
     },
     ProgressBar {
         progress: f32,
         border_thickness_px: f32,
-        color: Rgba8,
-        border_color: Rgba8,
+        fill: Fill,
+        border_fill: Fill,
     },
     TimeText {
         text: String,
         font_key: String,
         size_px: f32,
         align: TextAlign,
-        color: Rgba8,
+        fill: Fill,
     },
 }
 
@@ -85,7 +89,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
         }
         let kind = match &layer.kind {
             LayerKind::Solid { fill } => SceneItemKind::Solid {
-                color: fill.evaluate(time).color(),
+                fill: fill.evaluate(time),
             },
             LayerKind::Image { image, fit } => SceneItemKind::Image {
                 image: image.clone(),
@@ -102,29 +106,31 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 }
                 SceneItemKind::Spectrum {
                     values,
-                    gap_ratio: layer.gap_ratio.clamp(0.0, 1.0),
-                    min_height_px: layer.min_height_px.max(0.0),
-                    thickness: layer.thickness.max(0.0),
-                    color: layer.fill.evaluate(time).color(),
+                    point_count: layer.point_count.max(1),
+                    shape: sanitize_spectrum_shape(layer.shape),
+                    fill: layer.fill.evaluate(time),
                 }
             }
             LayerKind::ProgressBar(layer) => SceneItemKind::ProgressBar {
                 progress,
                 border_thickness_px: layer.border_thickness_px.max(0.0),
-                color: layer.fill.evaluate(time).color(),
-                border_color: layer.border_fill.evaluate(time).color(),
+                fill: layer.fill.evaluate(time),
+                border_fill: layer.border_fill.evaluate(time),
             },
             LayerKind::TimeText(layer) => SceneItemKind::TimeText {
                 text: format_time(layer.format, time, duration),
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
-                color: layer.fill.evaluate(time).color(),
+                fill: layer.fill.evaluate(time),
             },
         };
         items.push(SceneItem {
             rect: layer.rect.evaluate(time),
             opacity,
+            rotation_deg: finite_or(layer.rotation.evaluate(time), 0.0),
+            corner_radius_px: finite_or(layer.corner_radius.evaluate(time), 0.0).max(0.0),
+            glow: layer.glow.evaluate(time).map(sanitize_glow),
             kind,
         });
     }
@@ -134,6 +140,45 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
         height: project.output.height,
         items,
     }
+}
+
+fn sanitize_spectrum_shape(shape: SpectrumShape) -> SpectrumShape {
+    match shape {
+        SpectrumShape::Bars {
+            gap_ratio,
+            min_height_px,
+            thickness_px,
+        } => SpectrumShape::Bars {
+            gap_ratio: finite_or(gap_ratio, 0.0).clamp(0.0, 1.0),
+            min_height_px: finite_or(min_height_px, 0.0).max(0.0),
+            thickness_px: finite_or(thickness_px, 0.0).max(0.0),
+        },
+        SpectrumShape::Radial {
+            radius_px,
+            thickness_px,
+            start_angle_deg,
+            sweep_deg,
+            direction,
+        } => SpectrumShape::Radial {
+            radius_px: finite_or(radius_px, 0.0).max(0.0),
+            thickness_px: finite_or(thickness_px, 0.0).max(0.0),
+            start_angle_deg: finite_or(start_angle_deg, -90.0),
+            sweep_deg: finite_or(sweep_deg, 360.0),
+            direction,
+        },
+    }
+}
+
+fn sanitize_glow(glow: Glow) -> Glow {
+    Glow {
+        color: glow.color,
+        radius_px: finite_or(glow.radius_px, 0.0).max(0.0),
+        spread_px: finite_or(glow.spread_px, 0.0).max(0.0),
+    }
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
 }
 
 pub fn format_time(format: TimeFormat, t_secs: f64, total_secs: f64) -> String {

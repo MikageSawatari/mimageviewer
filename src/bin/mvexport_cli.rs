@@ -7,16 +7,9 @@ use mimageviewer::video::mvexport::{
     EncoderPreference, MusicVideoExportRequest, export_music_video, verify_exported_mp4,
 };
 use musicvideo_core::{
-    Animatable, Assets, Fill, Fit, ImageAsset, ImageId, Layer, LayerId, LayerKind, NormRect,
-    Output, ProgressBarLayer, Project, Rgba8, SpectrumLayer, TextAlign, TimeFormat, TimeTextLayer,
+    Assets, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId, default_project,
 };
 
-const BACKGROUND_ID: &str = "background";
-const FONT_KEY: &str = "default";
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
-const FPS: f64 = 60.0;
-const SPECTRUM_BANDS: usize = 96;
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
 
 struct Args {
@@ -46,6 +39,7 @@ fn run() -> Result<(), String> {
     }
     let assets = load_assets(&args.image)?;
     let project = default_project(duration_secs);
+    let output = project.output;
     let cancel = AtomicBool::new(false);
     let last_reported = AtomicU64::new(0);
     let progress = |completed: u64, total: u64| {
@@ -71,10 +65,11 @@ fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     println!(
-        "書き出し: frames={} resolution={}x{} fps={FPS:.3} encoder={} render_mean_ms={:.3} render_p95_ms={:.3} convert_mean_ms={:.3} encode_mean_ms={:.3} wall_secs={:.3} realtime_ratio={:.3} rgba_sha256={}",
+        "書き出し: frames={} resolution={}x{} fps={:.3} encoder={} render_mean_ms={:.3} render_p95_ms={:.3} convert_mean_ms={:.3} encode_mean_ms={:.3} wall_secs={:.3} realtime_ratio={:.3} rgba_sha256={}",
         summary.frames,
-        WIDTH,
-        HEIGHT,
+        output.width,
+        output.height,
+        output.fps,
         summary.encoder,
         summary.render_mean_ms,
         summary.render_p95_ms,
@@ -179,7 +174,7 @@ fn load_assets(image_path: &Path) -> Result<Assets, String> {
         load_default_font().ok_or_else(|| "Windows の日本語フォントを読み込めません".to_owned())?;
     let mut fonts = FontSet::new();
     fonts.insert(
-        LoadedFont::from_bytes(FONT_KEY, bytes)
+        LoadedFont::from_bytes(DEFAULT_FONT_KEY, bytes)
             .map_err(|error| format!("フォントを読み込めません: {error}"))?,
     );
     let assets = Assets::new(fonts);
@@ -189,7 +184,7 @@ fn load_assets(image_path: &Path) -> Result<Assets, String> {
     let (width, height) = decoded.dimensions();
     let image = ImageAsset::new(width, height, decoded.into_raw())
         .map_err(|error| format!("背景画像が不正です: {error}"))?;
-    assets.insert_image(ImageId::new(BACKGROUND_ID), image);
+    assets.insert_image(ImageId::new(DEFAULT_BACKGROUND_IMAGE_ID), image);
     Ok(assets)
 }
 
@@ -202,77 +197,4 @@ fn load_default_font() -> Option<Vec<u8>> {
     ]
     .into_iter()
     .find_map(|path| std::fs::read(path).ok())
-}
-
-fn default_project(duration_secs: f64) -> Project {
-    let rect = |x: f32, y: f32, width: f32, height: f32| {
-        Animatable::Const(NormRect::new(
-            x / WIDTH as f32,
-            y / HEIGHT as f32,
-            width / WIDTH as f32,
-            height / HEIGHT as f32,
-        ))
-    };
-    let layer = |id: u64, name: &str, rect: Animatable<NormRect>, kind: LayerKind| Layer {
-        id: LayerId(id),
-        name: name.to_owned(),
-        visible: Animatable::Const(true),
-        opacity: Animatable::Const(1.0),
-        rect,
-        kind,
-    };
-    Project {
-        version: 1,
-        output: Output {
-            width: WIDTH,
-            height: HEIGHT,
-            fps: FPS,
-        },
-        duration_secs,
-        layers: vec![
-            layer(
-                1,
-                "背景画像",
-                Animatable::Const(NormRect::FULL),
-                LayerKind::Image {
-                    image: ImageId::new(BACKGROUND_ID),
-                    fit: Fit::Cover,
-                },
-            ),
-            layer(
-                2,
-                "直線スペクトラム",
-                rect(160.0, 220.0, 1600.0, 600.0),
-                LayerKind::Spectrum(SpectrumLayer {
-                    band_count: SPECTRUM_BANDS,
-                    gap_ratio: 0.30,
-                    min_height_px: 3.0,
-                    thickness: 12.0,
-                    fill: Animatable::Const(Fill::Solid(Rgba8::new(120, 255, 35, 220))),
-                }),
-            ),
-            layer(
-                3,
-                "進捗バー",
-                rect(60.0, 1000.0, 1800.0, 50.0),
-                LayerKind::ProgressBar(ProgressBarLayer {
-                    border_thickness_px: 2.0,
-                    fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
-                    border_fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
-                }),
-            ),
-            layer(
-                4,
-                "時間表示",
-                rect(1520.0, 920.0, 400.0, 100.0),
-                LayerKind::TimeText(TimeTextLayer {
-                    format: TimeFormat::MmSsOfTotal,
-                    font_key: FONT_KEY.to_owned(),
-                    size_px: 50.0,
-                    align: TextAlign::Center,
-                    fill: Animatable::Const(Fill::Solid(Rgba8::BLACK)),
-                }),
-            ),
-        ],
-    }
 }

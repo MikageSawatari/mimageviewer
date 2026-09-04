@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use musicvideo_core::{
-    Assets, Frame, ImageAsset, ImageId, Project, RenderReport, Smoothing, SpectrumFrame,
-    SpectrumSource, UnresolvedAsset, evaluate, render_frame,
+    Animatable, Assets, Fill, Frame, Glow, GradientStop, GradientStops, ImageAsset, ImageId, Layer,
+    LayerKind, Project, RenderReport, Rgba8, Smoothing, SpectrumDirection, SpectrumFrame,
+    SpectrumLayer, SpectrumShape, SpectrumSource, UnresolvedAsset, evaluate, render_frame,
 };
 
 use crate::decode::{AudioData, decode_audio};
 use crate::export::{ExportOutcome, export_png_sequence, frame_count};
-use crate::project::{BACKGROUND_ID, DEFAULT_DURATION_SECS, SPECTRUM_BANDS, default_project};
+use crate::project::{BACKGROUND_ID, DEFAULT_DURATION_SECS, default_project, spectrum_band_count};
 
 type AudioLoadResult = Result<(PathBuf, Arc<AudioData>), String>;
 type ImageLoadResult = Result<(PathBuf, ImageAsset), String>;
@@ -63,6 +64,7 @@ pub struct MusicVideoLabApp {
     preview_report: RenderReport,
     export_pending: Option<ExportPending>,
     last_export: Option<ExportOutcome>,
+    selected_layer: usize,
 }
 
 impl MusicVideoLabApp {
@@ -90,6 +92,7 @@ impl MusicVideoLabApp {
             preview_report: RenderReport::default(),
             export_pending: None,
             last_export: None,
+            selected_layer: 1,
         }
     }
 
@@ -232,15 +235,16 @@ impl MusicVideoLabApp {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
+                let band_count = spectrum_band_count(&project);
                 let bands = match audio {
                     Some(audio) => SpectrumSource::new(
                         audio.sample_rate,
-                        SPECTRUM_BANDS,
+                        band_count,
                         Smoothing::Average { factor: 0.7 },
                     )
                     .map(|mut source| source.frame_at(&audio.stereo_pcm, position_secs).to_vec())
                     .map_err(|error| format!("スペクトラム解析に失敗しました: {error}")),
-                    None => Ok(vec![0.0; SPECTRUM_BANDS]),
+                    None => Ok(vec![0.0; band_count]),
                 };
                 let result = bands.and_then(|bands| {
                     if worker_cancel.load(Ordering::Relaxed) {
@@ -525,6 +529,28 @@ impl eframe::App for MusicVideoLabApp {
             });
         });
 
+        let mut project_changed = false;
+        egui::SidePanel::right("musicvideo-properties")
+            .default_width(330.0)
+            .show(ctx, |ui| {
+                ui.heading("レイヤー");
+                for (index, layer) in self.project.layers.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.selected_layer == index, &layer.name)
+                        .clicked()
+                    {
+                        self.selected_layer = index;
+                    }
+                }
+                ui.separator();
+                if let Some(layer) = self.project.layers.get_mut(self.selected_layer) {
+                    project_changed = edit_layer_properties(ui, layer);
+                }
+            });
+        if project_changed {
+            self.mark_preview_dirty();
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
@@ -555,6 +581,360 @@ impl eframe::App for MusicVideoLabApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
+}
+
+fn edit_layer_properties(ui: &mut egui::Ui, layer: &mut Layer) -> bool {
+    let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
+    if let Some(visible) = const_mut(&mut layer.visible) {
+        changed |= ui.checkbox(visible, "表示する").changed();
+    }
+    if let Some(opacity) = const_mut(&mut layer.opacity) {
+        changed |= ui
+            .add(egui::Slider::new(opacity, 0.0..=1.0).text("不透明度"))
+            .changed();
+    }
+    if let Some(rotation) = const_mut(&mut layer.rotation) {
+        changed |= ui
+            .add(
+                egui::DragValue::new(rotation)
+                    .range(-180.0..=180.0)
+                    .prefix("回転 ")
+                    .suffix("°"),
+            )
+            .changed();
+    }
+    if let Some(radius) = const_mut(&mut layer.corner_radius) {
+        changed |= ui
+            .add(
+                egui::DragValue::new(radius)
+                    .range(0.0..=1000.0)
+                    .suffix(" px 角丸"),
+            )
+            .changed();
+    }
+    changed |= edit_glow(ui, &mut layer.glow);
+    ui.separator();
+    changed |= match &mut layer.kind {
+        LayerKind::Solid { fill } => edit_fill(ui, "塗り", fill),
+        LayerKind::Image { .. } => false,
+        LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
+        LayerKind::ProgressBar(progress) => {
+            let mut changed = ui
+                .add(
+                    egui::DragValue::new(&mut progress.border_thickness_px)
+                        .range(0.0..=100.0)
+                        .suffix(" px 枠"),
+                )
+                .changed();
+            changed |= edit_fill(ui, "進捗の塗り", &mut progress.fill);
+            changed |= edit_fill(ui, "枠の塗り", &mut progress.border_fill);
+            changed
+        }
+        LayerKind::TimeText(text) => edit_fill(ui, "文字の塗り", &mut text.fill),
+    };
+    changed
+}
+
+fn const_mut<T>(value: &mut Animatable<T>) -> Option<&mut T> {
+    match value {
+        Animatable::Const(value) => Some(value),
+        Animatable::Track(_) => None,
+    }
+}
+
+fn edit_glow(ui: &mut egui::Ui, value: &mut Animatable<Option<Glow>>) -> bool {
+    let Some(glow) = const_mut(value) else {
+        ui.label("グローのキーフレーム編集は P3 で対応します");
+        return false;
+    };
+    let mut enabled = glow.is_some();
+    let mut changed = ui.checkbox(&mut enabled, "グロー").changed();
+    if enabled && glow.is_none() {
+        *glow = Some(Glow {
+            color: Rgba8::WHITE,
+            radius_px: 12.0,
+            spread_px: 0.0,
+        });
+        changed = true;
+    } else if !enabled && glow.is_some() {
+        *glow = None;
+        changed = true;
+    }
+    if let Some(glow) = glow {
+        changed |= edit_color(ui, "グロー色", &mut glow.color);
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut glow.radius_px)
+                    .range(0.0..=128.0)
+                    .suffix(" px 半径"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut glow.spread_px)
+                    .range(0.0..=128.0)
+                    .suffix(" px 広がり"),
+            )
+            .changed();
+    }
+    changed
+}
+
+fn edit_color(ui: &mut egui::Ui, label: &str, color: &mut Rgba8) -> bool {
+    let mut value = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed = ui.color_edit_button_srgba(&mut value).changed();
+    });
+    if changed {
+        *color = Rgba8::new(value.r(), value.g(), value.b(), value.a());
+    }
+    changed
+}
+
+fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(&mut spectrum.band_count)
+                .range(1..=128)
+                .prefix("解析バンド "),
+        )
+        .changed();
+    changed |= ui
+        .add(
+            egui::DragValue::new(&mut spectrum.point_count)
+                .range(1..=4096)
+                .prefix("描画点 "),
+        )
+        .changed();
+    let mut radial = matches!(spectrum.shape, SpectrumShape::Radial { .. });
+    let was_radial = radial;
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut radial, false, "直線");
+        ui.radio_value(&mut radial, true, "円形");
+    });
+    if radial != was_radial {
+        spectrum.shape = if radial {
+            SpectrumShape::Radial {
+                radius_px: 380.0,
+                thickness_px: 4.0,
+                start_angle_deg: -90.0,
+                sweep_deg: 360.0,
+                direction: SpectrumDirection::Clockwise,
+            }
+        } else {
+            SpectrumShape::Bars {
+                gap_ratio: 0.3,
+                min_height_px: 3.0,
+                thickness_px: 12.0,
+            }
+        };
+        changed = true;
+    }
+    match &mut spectrum.shape {
+        SpectrumShape::Bars {
+            gap_ratio,
+            min_height_px,
+            thickness_px,
+        } => {
+            changed |= ui
+                .add(egui::Slider::new(gap_ratio, 0.0..=1.0).text("隙間"))
+                .changed();
+            changed |= drag_pixels(ui, "最小高さ", min_height_px, 0.0..=1000.0);
+            changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
+        }
+        SpectrumShape::Radial {
+            radius_px,
+            thickness_px,
+            start_angle_deg,
+            sweep_deg,
+            direction,
+        } => {
+            changed |= drag_pixels(ui, "半径", radius_px, 0.0..=2000.0);
+            changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
+            changed |= ui
+                .add(egui::DragValue::new(start_angle_deg).suffix("° 開始"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(sweep_deg)
+                        .range(0.0..=360.0)
+                        .suffix("° 範囲"),
+                )
+                .changed();
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .radio_value(direction, SpectrumDirection::Clockwise, "時計回り")
+                    .changed();
+                changed |= ui
+                    .radio_value(direction, SpectrumDirection::CounterClockwise, "反時計回り")
+                    .changed();
+            });
+        }
+    }
+    changed |= edit_fill(ui, "スペクトラムの塗り", &mut spectrum.fill);
+    changed
+}
+
+fn drag_pixels(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.add(
+        egui::DragValue::new(value)
+            .range(range)
+            .prefix(format!("{label} "))
+            .suffix(" px"),
+    )
+    .changed()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillKind {
+    Solid,
+    Linear,
+    Radial,
+    Band,
+}
+
+fn edit_fill(ui: &mut egui::Ui, label: &str, value: &mut Animatable<Fill>) -> bool {
+    let Some(fill) = const_mut(value) else {
+        ui.label(format!("{label}: キーフレーム編集は P3 で対応します"));
+        return false;
+    };
+    ui.collapsing(label, |ui| {
+        let mut kind = match fill {
+            Fill::Solid(_) => FillKind::Solid,
+            Fill::LinearGradient { .. } => FillKind::Linear,
+            Fill::RadialGradient { .. } => FillKind::Radial,
+            Fill::BandGradient { .. } => FillKind::Band,
+        };
+        let previous = kind;
+        egui::ComboBox::from_id_salt(("fill-kind", label))
+            .selected_text(fill_kind_label(kind))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut kind, FillKind::Solid, "単色");
+                ui.selectable_value(&mut kind, FillKind::Linear, "線形グラデーション");
+                ui.selectable_value(&mut kind, FillKind::Radial, "放射グラデーション");
+                ui.selectable_value(&mut kind, FillKind::Band, "バンドグラデーション");
+            });
+        let mut changed = kind != previous;
+        if changed {
+            *fill = default_fill(kind);
+        }
+        match fill {
+            Fill::Solid(color) => changed |= edit_color(ui, "色", color),
+            Fill::LinearGradient { stops, angle_deg } => {
+                changed |= ui
+                    .add(egui::DragValue::new(angle_deg).suffix("° 角度"))
+                    .changed();
+                changed |= edit_gradient_stops(ui, stops);
+            }
+            Fill::RadialGradient {
+                stops,
+                center,
+                radius,
+            } => {
+                changed |= ui
+                    .add(egui::Slider::new(&mut center.0, 0.0..=1.0).text("中心 X "))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut center.1, 0.0..=1.0).text("中心 Y "))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(radius, 0.01..=2.0).text("半径"))
+                    .changed();
+                changed |= edit_gradient_stops(ui, stops);
+            }
+            Fill::BandGradient { stops } => changed |= edit_gradient_stops(ui, stops),
+        }
+        changed
+    })
+    .body_returned
+    .unwrap_or(false)
+}
+
+fn fill_kind_label(kind: FillKind) -> &'static str {
+    match kind {
+        FillKind::Solid => "単色",
+        FillKind::Linear => "線形",
+        FillKind::Radial => "放射",
+        FillKind::Band => "バンド",
+    }
+}
+
+fn default_fill(kind: FillKind) -> Fill {
+    match kind {
+        FillKind::Solid => Fill::Solid(Rgba8::WHITE),
+        FillKind::Linear => Fill::LinearGradient {
+            stops: default_gradient_stops(),
+            angle_deg: 0.0,
+        },
+        FillKind::Radial => Fill::RadialGradient {
+            stops: default_gradient_stops(),
+            center: (0.5, 0.5),
+            radius: 0.5,
+        },
+        FillKind::Band => Fill::BandGradient {
+            stops: default_gradient_stops(),
+        },
+    }
+}
+
+fn default_gradient_stops() -> GradientStops {
+    GradientStops::new(vec![
+        GradientStop {
+            position: 0.0,
+            color: Rgba8::new(120, 255, 35, 255),
+        },
+        GradientStop {
+            position: 1.0,
+            color: Rgba8::new(255, 136, 255, 255),
+        },
+    ])
+    .expect("fixed gradient stops are valid")
+}
+
+fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
+    let mut values = stops.to_vec();
+    let mut changed = false;
+    let mut remove = None;
+    let can_remove = values.len() > 1;
+    for (index, stop) in values.iter_mut().enumerate() {
+        ui.push_id(index, |ui| {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut stop.position)
+                            .range(0.0..=1.0)
+                            .speed(0.01),
+                    )
+                    .changed();
+                changed |= edit_color(ui, "色", &mut stop.color);
+                if can_remove && ui.small_button("削除").clicked() {
+                    remove = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        values.remove(index);
+        changed = true;
+    }
+    if ui.small_button("ストップを追加").clicked() {
+        values.push(GradientStop {
+            position: 1.0,
+            color: Rgba8::WHITE,
+        });
+        changed = true;
+    }
+    if changed {
+        *stops = GradientStops::new(values).expect("UI restricts gradient stop positions");
+    }
+    changed
 }
 
 fn format_clock(seconds: f64) -> String {

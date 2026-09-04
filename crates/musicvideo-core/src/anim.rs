@@ -1,4 +1,6 @@
-use crate::model::{Animatable, Fill, ImageId, Interp, NormRect, Rgba8, Track};
+use crate::model::{
+    Animatable, Fill, Glow, GradientStop, GradientStops, ImageId, Interp, NormRect, Rgba8, Track,
+};
 
 /// Values that can be sampled from an animation track.
 ///
@@ -118,14 +120,102 @@ impl Interpolate for Rgba8 {
     }
 }
 
+impl Interpolate for Glow {
+    fn interpolate(from: &Self, to: &Self, amount: f32) -> Self {
+        Self {
+            color: Rgba8::interpolate(&from.color, &to.color, amount),
+            radius_px: f32::interpolate(&from.radius_px, &to.radius_px, amount),
+            spread_px: f32::interpolate(&from.spread_px, &to.spread_px, amount),
+        }
+    }
+}
+
+impl<T: Interpolate> Interpolate for Option<T> {
+    fn interpolate(from: &Self, to: &Self, amount: f32) -> Self {
+        match (from, to) {
+            (Some(from), Some(to)) => Some(T::interpolate(from, to, amount)),
+            _ => from.clone(),
+        }
+    }
+}
+
 impl Interpolate for Fill {
     fn interpolate(from: &Self, to: &Self, amount: f32) -> Self {
         match (from, to) {
             (Fill::Solid(from), Fill::Solid(to)) => {
                 Fill::Solid(Rgba8::interpolate(from, to, amount))
             }
+            (
+                Fill::LinearGradient {
+                    stops: from_stops,
+                    angle_deg: from_angle,
+                },
+                Fill::LinearGradient {
+                    stops: to_stops,
+                    angle_deg: to_angle,
+                },
+            ) => interpolate_stops(from_stops, to_stops, amount)
+                .map(|stops| Fill::LinearGradient {
+                    stops,
+                    angle_deg: f32::interpolate(from_angle, to_angle, amount),
+                })
+                .unwrap_or_else(|| from.clone()),
+            (
+                Fill::RadialGradient {
+                    stops: from_stops,
+                    center: from_center,
+                    radius: from_radius,
+                },
+                Fill::RadialGradient {
+                    stops: to_stops,
+                    center: to_center,
+                    radius: to_radius,
+                },
+            ) => interpolate_stops(from_stops, to_stops, amount)
+                .map(|stops| Fill::RadialGradient {
+                    stops,
+                    center: (
+                        f32::interpolate(&from_center.0, &to_center.0, amount),
+                        f32::interpolate(&from_center.1, &to_center.1, amount),
+                    ),
+                    radius: f32::interpolate(from_radius, to_radius, amount),
+                })
+                .unwrap_or_else(|| from.clone()),
+            (Fill::BandGradient { stops: from_stops }, Fill::BandGradient { stops: to_stops }) => {
+                interpolate_stops(from_stops, to_stops, amount)
+                    .map(|stops| Fill::BandGradient { stops })
+                    .unwrap_or_else(|| from.clone())
+            }
+            _ => from.clone(),
         }
     }
+}
+
+fn interpolate_stops(
+    from: &GradientStops,
+    to: &GradientStops,
+    amount: f32,
+) -> Option<GradientStops> {
+    if from.as_slice().len() != to.as_slice().len()
+        || from
+            .as_slice()
+            .iter()
+            .zip(to.as_slice())
+            .any(|(from, to)| from.position != to.position)
+    {
+        return None;
+    }
+    GradientStops::new(
+        from.as_slice()
+            .iter()
+            .zip(to.as_slice())
+            .map(|(from, to)| GradientStop {
+                position: from.position,
+                color: Rgba8::interpolate(&from.color, &to.color, amount),
+            })
+            .collect(),
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -241,5 +331,62 @@ mod tests {
             assert_eq!(easing_amount(interp, 0.0), 0.0, "{interp:?} at zero");
             assert_eq!(easing_amount(interp, 1.0), 1.0, "{interp:?} at one");
         }
+    }
+
+    fn gradient_stops(position: f32, first: Rgba8, second: Rgba8) -> GradientStops {
+        GradientStops::new(vec![
+            GradientStop {
+                position: 0.0,
+                color: first,
+            },
+            GradientStop {
+                position,
+                color: second,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn fill_interpolates_colors_only_when_stop_layout_matches() {
+        let from = Fill::LinearGradient {
+            stops: gradient_stops(1.0, Rgba8::BLACK, Rgba8::new(100, 0, 0, 255)),
+            angle_deg: 0.0,
+        };
+        let to = Fill::LinearGradient {
+            stops: gradient_stops(1.0, Rgba8::WHITE, Rgba8::new(200, 0, 0, 255)),
+            angle_deg: 90.0,
+        };
+        let Fill::LinearGradient { stops, angle_deg } = Fill::interpolate(&from, &to, 0.5) else {
+            panic!("matching gradients must remain linear gradients");
+        };
+        assert_eq!(angle_deg, 45.0);
+        assert_eq!(stops.as_slice()[0].color, Rgba8::new(128, 128, 128, 255));
+        assert_eq!(stops.as_slice()[1].color, Rgba8::new(150, 0, 0, 255));
+
+        let mismatched = Fill::LinearGradient {
+            stops: gradient_stops(0.8, Rgba8::WHITE, Rgba8::WHITE),
+            angle_deg: 90.0,
+        };
+        assert_eq!(Fill::interpolate(&from, &mismatched, 0.5), from);
+    }
+
+    #[test]
+    fn optional_glow_interpolates_some_to_some_and_steps_across_none() {
+        let from = Some(Glow {
+            color: Rgba8::BLACK,
+            radius_px: 4.0,
+            spread_px: 0.0,
+        });
+        let to = Some(Glow {
+            color: Rgba8::WHITE,
+            radius_px: 12.0,
+            spread_px: 2.0,
+        });
+        let middle = Option::<Glow>::interpolate(&from, &to, 0.5).unwrap();
+        assert_eq!(middle.radius_px, 8.0);
+        assert_eq!(middle.spread_px, 1.0);
+        assert_eq!(middle.color, Rgba8::new(128, 128, 128, 255));
+        assert_eq!(Option::<Glow>::interpolate(&from, &None, 0.9), from);
     }
 }

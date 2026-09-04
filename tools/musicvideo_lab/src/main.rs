@@ -1,7 +1,9 @@
 //! `musicvideo_lab` — 音楽ビデオ書き出しのラボ GUI。
 //!
-//! 正本: `docs/music-video-export-plan.md`。P1a のブリーフ: `docs/brief-musicvideo-p1a.md`。
+//! 正本: `docs/music-video-export-plan.md`。P1a/P2a のブリーフは `docs/brief-musicvideo-p1a.md`
+//! と `docs/brief-musicvideo-p2a.md`。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -14,7 +16,8 @@ mod project;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--benchmark") {
+    let command = args.next();
+    if command.as_deref() == Some("--benchmark") {
         let frames = args
             .next()
             .and_then(|value| value.parse::<usize>().ok())
@@ -27,6 +30,22 @@ fn main() {
             eprintln!("ベンチマークに失敗しました: {error}");
             std::process::exit(1);
         }
+        return;
+    }
+    if command.as_deref() == Some("--sample-frame") {
+        let output = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/musicvideo-p2a-sample.png"));
+        let Some(font) = project::load_default_font() else {
+            eprintln!("サンプル描画に必要な Windows 日本語フォントが見つかりません");
+            std::process::exit(1);
+        };
+        if let Err(error) = export::render_sample_frame(&output, &font) {
+            eprintln!("サンプル描画に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        println!("サンプル画像を書き出しました: {}", output.display());
         return;
     }
 
