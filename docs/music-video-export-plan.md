@@ -90,7 +90,8 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
 | 音声の全尺デコード | [src/audio_decode.rs](../src/audio_decode.rs) `decode_audio_file_to_stereo_f32` | インターリーブ stereo f32 / 48kHz |
 | スペクトラム解析 | [crates/music-core/src/analysis.rs](../crates/music-core/src/analysis.rs) | `spectrum_analysis_from_stereo_window(pcm, rate, center_secs, bands)` は PCM と時刻だけの関数。オフラインレンダに直接使える |
 | 鍵盤表示のロジック | [src/ui_music_spectrum.rs](../src/ui_music_spectrum.rs) `draw_pitch_keyboard` | 黒鍵配置・輝度・低域整理の**ロジック部分**を core へ切り出して共有（D6） |
-| wgpu 直叩きの前例 | `src/video/gpu_renderer/`, [src/gpu_lanczos.rs](../src/gpu_lanczos.rs) | 独自シェーダ・オフスクリーン描画の実装パターン |
+| **テキスト（日本語）と CPU ラスタライズ** | [crates/comic-core/](../crates/comic-core/) `font.rs` / `layout.rs` / `raster.rs` | rustybuzz による OpenType シェーピング（縦書き・縦中横含む）＋ `ab_glyph_rasterizer` のカバレッジ＋ TTF/OTF/TTC ロード。RGBA8 へ焼く CPU ラスタライザに袋文字・影・**グロー**（`TextGlowStyle { color, radius_px, spread_px }` = CSS box-shadow と同じ意味論、`draw_layout_soft_mask`）まで揃っている。egui 非依存 |
+| wgpu 直叩きの前例 | `src/video/gpu_renderer/`, [src/gpu_lanczos.rs](../src/gpu_lanczos.rs) | GPU 化が必要になった場合の実装パターン（D4） |
 | ラボ→本体の統合運用 | comic-core/comic_lab、music-core/music_lab | 別 worktree は `-p` 指定でビルドすれば本体 build.rs が走らず vendor/ 不要 |
 
 ### 2.2 新規に作るもの
@@ -98,8 +99,8 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
 | 項目 | 理由 |
 | --- | --- |
 | シーングラフとキーフレーム評価 | 既存コードにアニメーションの概念が無い（`keyframe` の既存出現は全て動画の I フレームの意味） |
-| 任意バンド境界の解析 API | `music-core` の帯域積分（`power_for_range`）は private で、半音バンド固定・128 上限。線形軸 200 点（§1.4）を出すために、任意の `(low_hz, high_hz)` 列と重み付け有無を受ける公開 API を `music-core` に足す |
-| wgpu ラスタライザ（グラデーション・オブジェクト単位グロー・円形） | egui の painter ではグローが出せない |
+| ~~任意バンド境界の解析 API~~ | **P1/P2 では作らない**（D5）。`music-core` の帯域積分（`power_for_range`）は private・半音バンド固定・128 上限。線形軸などのオプションを足す段になったら、任意の `(low_hz, high_hz)` 列と重み付け有無を受ける公開 API を `music-core` に追加する |
+| バー / 円弧 / 進捗バーの描画とグラデーション | `comic-core` は吹き出し（楕円・角丸・尾）とテキストが対象なので、スペクトラムの幾何と `Fill` の勾配は新規 |
 | **MP4 ファイルへの muxer** | 既存の出口は HLS 用の in-memory fMP4 リング（[src/video/stream/segmenter.rs](../src/video/stream/segmenter.rs)）だけ。ファイル出力は `ffmpeg::format::output` で mp4 を新規に開く |
 | プロジェクトファイル（JSON） | 既存の永続化ストアに載せない（D9） |
 
@@ -126,18 +127,35 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
   同じ理由で「t 昇順の逐次適用」を前提にする。
 - 受け入れ基準: 同一プロジェクトを 2 回書き出したとき、全フレームがビット一致する。
 
-### D4. グローは「オブジェクト単位の外側グロー」を第一級にする
+### D4. ラスタライザは CPU から始める（`comic-core` を土台にする）
 
-`(blur radius, 色)` を各レイヤのプロパティとして持ち、CSS の `box-shadow` / `text-shadow` と
-同じ意味論で描く（レイヤのアルファをぼかして指定色で下に加算）。
-シーン全体のブルームは v1 では作らない（現行の絵の再現に不要）。
+当初は wgpu 自前を想定していたが、[crates/comic-core/](../crates/comic-core/) に
+**日本語シェーピング・グリフラスタライズ・袋文字・影・グロー・RGBA8 への焼き込み**が
+egui 非依存で既にある（§2.1）。テキストのためだけに GPU のグリフ atlas を新設する理由は無い。
 
-### D5. 周波数軸は 2 モード持ち、バンド生成器は 1 つにする
+- **P1 は CPU ラスタライザ 1 本**。`comic-core` の `RgbaOverlay` へ全レイヤを焼き、
+  グローは既存の soft-mask（膨張 + ぼかし）をテキスト以外のアルファへ一般化して使う。
+- プレビューは焼いた RGBA8 をテクスチャとして表示するだけ（**描き手は 1 つ**、D1）。
+  `comic_lab` が egui プレビューと CPU 焼き込みの 2 経路を持って突き合わせているのとは対照的に、
+  ここでは最初から 1 経路にする。
+- **GPU 化は性能で判断する**。P1 に「1080p60 を実時間の 2 倍速で書き出せるか」の実測を含め、
+  届かなければ合成だけ wgpu へ移す。`Scene` を挟んである（D2）ので差し替えは局所で済む。
+- 副次効果として書き出しがハードウェア非依存で**ビット再現**する（D3 の受け入れ基準が
+  同一機に限定されなくなる）。
 
-- `Linear { min_hz, max_hz }` … Wav2Bar 互換の見た目（現行プロジェクトの再現用）
-- `Semitone { min_midi, max_midi, loudness_weighted }` … mIV の音楽ビューと同じ音楽的な軸
+グロー自体は `(blur radius, spread, 色)` を各レイヤのプロパティとして持ち、CSS の
+`box-shadow` / `text-shadow` と同じ意味論で描く。シーン全体のブルームは v1 では作らない。
 
-どちらも「バンド境界の列 → 帯域パワー → 表示値」という同じ経路を通し、
+### D5. 周波数軸は mIV の音楽的な軸を既定にする
+
+Wav2Bar の見た目（線形 FFT ビン 0–750 / 200 点）を厳密に再現する必要は無い、という判断
+（2026-09-04 ユーザー確定）。**既定は `music-core` の半音バンド + 等ラウドネス重み付け**とし、
+`Linear { min_hz, max_hz }` など他方式は将来のオプションとして後から足す。
+
+したがって P1/P2 では `music-core` の既存 API（最大 128 バンド）をそのまま使い、
+任意バンド境界の公開 API 追加は**将来のオプション実装時まで先送り**する。
+
+いずれの方式でも「バンド境界の列 → 帯域パワー → 表示値」という同じ経路を通し、
 **直線表示と円形表示は同じバンド列に対する座標変換違い**にする（円形専用の解析を持たない）。
 
 ### D6. 鍵盤表示のロジックは core へ切り出して共有する
@@ -208,7 +226,7 @@ Layer {
 LayerKind =
   | Image        { source: ImageRef, fit: Fit, scale_percent }
   | Solid        { fill: Animatable<Fill> }
-  | Spectrum     { axis: Linear{min_hz,max_hz} | Semitone{..},
+  | Spectrum     { axis: Semitone{..},          // v1 はこれだけ。Linear{min_hz,max_hz} は将来 (D5)
                    shape: Bars{..} | Radial{ radius, .. },
                    point_count, thickness, smoothing: { kind, factor },
                    fill: Animatable<Fill> }
@@ -233,31 +251,37 @@ Fill          = Solid(Color) | LinearGradient{..} | RadialGradient{..} | BandGra
 ## 5. レンダリングパイプライン
 
 ```
-SceneGraph --evaluate(t)--> Scene --rasterize--> RGBA テクスチャ
+SceneGraph --evaluate(t)--> Scene --rasterize(CPU)--> RgbaOverlay(1920x1080)
                                      |
-                                     +-- レイヤごと: glow があればオフスクリーンへ描いて
-                                     |               アルファをぼかし、指定色で加算してから本体を描く
+                                     +-- レイヤごと: glow があればアルファを膨張+ぼかして
+                                     |               指定色で先に置き、その上に本体を描く
                                      +-- 無ければ直接本描画
 ```
 
-- プレビューは同じ `rasterize` を出力解像度で呼び、結果をウィンドウサイズへ縮小して表示する。
-- テキストのグリフラスタライズは未決（Q2）。日本語が要るので mIV の
-  [src/ui_fonts.rs](../src/ui_fonts.rs) が組む fallback スタックを使いたい。
-  候補: egui の `Fonts` でグリフ atlas を作り、自前パスでそのテクスチャを描く。
+- プレビューは同じ `rasterize` を出力解像度で呼び、焼いた RGBA8 をテクスチャとして表示する
+  （縮小以外の差を作らない）。
+- **テキストは `comic-core` に投げる**（D4）。`layout_text` / `layout_text_wrapped` でレイアウトし、
+  グリフのカバレッジを `RgbaOverlay` へ焼く。フォントは `FontSet` で TTF/OTF/TTC をロードする。
+  日本語のシェーピング・縦書き・袋文字・影・グローは既にこの経路にある。
+- 焼いたテキストは **(文字列, フォント, サイズ, 色, 縁取り, グロー) をキーにキャッシュ**する。
+  時間表示は `mm:ss` なら 1 秒に 1 回しか変わらないので、毎フレームのレイアウトは走らない。
 
 ---
 
 ## 6. 書き出しパイプライン
 
 ```
-frame n → t = n/fps → evaluate → rasterize(offscreen) → readback → RGBA→NV12/YUV420p → H.264 ┐
-音声:  全尺 stereo f32 ─────────────────────────────────────────────→ AAC ──────────────────┴→ mp4
+frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV420p → H.264 ┐
+音声:  全尺 stereo f32 ───────────────────────────────────→ AAC ───────────────────┴→ mp4
 ```
 
-- readback（GPU→CPU）が最も詰まりやすい。数フレーム分をパイプライン化し、マップ待ちで GPU を
-  遊ばせない。背圧の設計は `clockless_transcode.rs` の有界リングに倣う。
-- 色変換は swscale（まず動かす）→ 遅ければ compute shader（P2 以降の最適化）。
+- 合成とエンコードは別スレッドにし、間を有界リングで繋ぐ（背圧の設計は
+  `clockless_transcode.rs` に倣う）。エンコーダが NVENC なら合成が律速になる想定。
+- 色変換は swscale。
 - 性能目標: 1080p60 の 5 分（18,000 フレーム）を**実時間の 2 倍以上の速度**で書き出す。
+  **P1 でこれを実測し、届かなければ合成を wgpu へ移す**（D4）。
+  1 フレームあたりの予算は 8.3ms。内訳の目安は 背景ブリット 1–2ms / バー・図形 1ms /
+  グローぼかし 2–4ms / 色変換 2–3ms。静的な背景画像の拡縮は起動時に 1 回だけ行いキャッシュする。
 
 ---
 
@@ -266,8 +290,8 @@ frame n → t = n/fps → evaluate → rasterize(offscreen) → readback → RGB
 | # | 内容 | 受け入れ基準 |
 | --- | --- | --- |
 | **P0** | §1.4 の実測インベントリ確定（済）＋本書のユーザー承認 | 承認 |
-| **P1** | 書き出し完走: 静的シーン（背景画像 + 直線バー + 時間表示 + 進捗バー）を wgpu で描き MP4 まで出す。キーフレーム無し・グロー無し | 5 分の曲が 1920x1080 / 60fps の MP4 になり、音ズレ無く再生でき、投稿できる。2 回書き出してフレームがビット一致する |
-| **P2** | 見栄え: オブジェクト単位グロー / グラデーション / 円形スペアナ / 線形周波数軸 / 鍵盤表示 | **§1.4 のプロジェクトを mIV 上で再現できる**（並べて見比べて遜色が無い） |
+| **P1** | 書き出し完走: 静的シーン（背景画像 + 直線バー + 時間表示 + 進捗バー）を CPU ラスタライザで描き MP4 まで出す。キーフレーム無し・グロー無し | 5 分の曲が 1920x1080 / 60fps の MP4 になり、音ズレ無く再生でき、投稿できる。2 回書き出してフレームがビット一致する。**書き出し速度を実測して記録する**（実時間の 2 倍に届かなければ D4 に従い GPU 化を判断） |
+| **P2** | 見栄え: オブジェクト単位グロー / グラデーション / 円形スペアナ / 鍵盤表示 | **§1.4 のプロジェクトを mIV 上で再現できる**（並べて見比べて遜色が無い）。ただし**スペクトラムの周波数軸は一致対象から外す**（D5 — mIV の音楽的な軸で良い） |
 | **P3** | キーフレーム: 画像切替・フェード・色変化・ON/OFF | 既存の楽曲 1 本を Wav2Bar を使わずに最初から最後まで作り切れる |
 | **P4** | 本体統合: mIV の編集モードとして載せる。プロジェクト保存 / 読み込み、書き出しダイアログ、keymap | [docs/ui-responsiveness.md](ui-responsiveness.md) §4 を通過。閲覧側の退行が無い |
 
@@ -293,8 +317,10 @@ frame n → t = n/fps → evaluate → rasterize(offscreen) → readback → RGB
 | # | 内容 | 期限 |
 | --- | --- | --- |
 | Q1 | 画像切替の表現（レイヤ複数 + opacity か、専用の slides 機構か） | P3 着手前 |
-| Q2 | テキストのグリフラスタライズ方式（egui の Fonts で atlas 化して自前パスで描くか） | P1 着手前 |
-| Q3 | `music-core` に足す任意バンド境界 API の形（`power_for_range` の公開範囲） | P2 着手前 |
+| ~~Q2~~ | ~~テキストのグリフラスタライズ方式~~ → **解決**: `comic-core` を使う（D4、2026-09-04） | — |
+| ~~Q3~~ | ~~任意バンド境界 API~~ → **先送り**: 既定は半音軸（D5、2026-09-04） | 将来のオプション実装時 |
 | Q4 | プロジェクトファイルのパス保存（絶対 / 相対 / 埋め込み） | P3 |
 | Q5 | 鍵盤ロジックの切り出し先（`music-core` か `musicvideo-core` か） | P2 着手前 |
 | Q6 | Wav2Bar の `SVG Filters` 相当（任意フィルタ）を持つか | P3 以降・現行未使用なので後回し |
+| Q7 | フォント選択 UI を `comic-core` の `FontSet` にどう繋ぐか（mIV のテキスト注釈と同じフォント一覧を使うか） | P2 |
+| Q8 | 周波数軸オプション（線形 / 対数 / 重み無し）をいつ足すか | P3 以降 |
