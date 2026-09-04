@@ -2277,6 +2277,17 @@ CPU の submit は 0.9ms しかないので「GPU 実行が重い」と考えた
 
 **推測で直しにいかない。** この 1 件だけで既に 3 回外している。
 
+#### 追加した内訳計装 (2026-09-04)
+
+- `ui.poll_prefetch_breakdown` を追加。`total_ms > 8.0` の呼び出しだけを出し、`caller` で
+  `top_level` / `fullscreen_viewport` を区別する。内訳は `fs_pending_drain_ms`、
+  `fs_pending_postprocess_ms`、`upload_backlog_ms`、`build_static_fs_cache_entry_ms`、
+  `apply_sync_adjustment_ms`、`auto_apply_saved_mask_ms`、`update_prefetch_window_ms`、
+  `other_postprocessing_ms`、および `unaccounted_ms`。
+- `ui.update_breakdown` に、UI frame 内の `still_image_display_indices` / `get_nav_indices`
+  それぞれの呼び出し回数と累計時間を追加。worker thread や UI frame 外の呼び出しは数えない。
+- どちらも `--perf-log` 無効時は時計を読まず、表示・キャッシュ・先読みの挙動は変えない。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
