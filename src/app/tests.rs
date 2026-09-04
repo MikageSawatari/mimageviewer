@@ -870,21 +870,22 @@ fn fullscreen_fs_cache_does_not_cross_install_new_items_generation() {
     app.fs_early_dims.insert(0, [1200, 1800]);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_tx, rx) = std::sync::mpsc::channel();
-    app.fs_pending.insert(
-        0,
-        FsPendingValue::new(
-            std::sync::Arc::clone(&cancel),
-            rx,
-            9,
-            FsLoadPurpose::for_page(true),
-        ),
-    );
-    app.fs_upload_backlog.push(FsUploadResult::new(
-        0,
-        FsLoadResult::Failed,
+    let animation_started_at = std::time::Instant::now();
+    let mut pending = FsPendingValue::new(
+        std::sync::Arc::clone(&cancel),
+        rx,
         9,
         FsLoadPurpose::for_page(true),
-    ));
+    );
+    pending.animation_expansion_started_at = Some(animation_started_at);
+    app.fs_pending.insert(0, pending);
+    let mut upload = FsUploadResult::new(0, FsLoadResult::Failed, 9, FsLoadPurpose::for_page(true));
+    upload.animation_expansion_started_at = Some(animation_started_at);
+    app.fs_upload_backlog.push(upload);
+    assert_eq!(
+        app.current_animation_expansion_started_at(),
+        Some(animation_started_at)
+    );
 
     app.install_new_items(
         vec![GridItem::Image(PathBuf::from("C:/new/book/page.png"))],
@@ -911,6 +912,7 @@ fn stale_fullscreen_load_completion_is_not_enqueued_for_new_items() {
         FsLoadResult::Failed,
         17,
         FsLoadPurpose::for_page(true),
+        None,
     );
 
     assert!(!accepted);
@@ -34838,15 +34840,10 @@ mod pipeline_cache_refactor_tests {
                 .animation_policy(),
             crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly
         );
-        let started_at = app
-            .current_animation_expansion_started_at()
-            .expect("the current Display request must expose its in-flight animation expansion");
-        assert!(
-            animation_expansion_progress_visible(
-                Some(started_at),
-                started_at + std::time::Duration::from_millis(150),
-            ),
-            "Display expansion must reach the shared visible predicate"
+        assert_eq!(
+            app.current_animation_expansion_started_at(),
+            None,
+            "Display alone must not claim animation expansion before worker confirmation"
         );
     }
 
@@ -35006,12 +35003,143 @@ mod pipeline_cache_refactor_tests {
     #[test]
     fn static_display_request_does_not_claim_animation_expansion_progress() {
         let mut app = setup_app();
-        let idx = push_image(&mut app, r"C:\missing\still.jpg");
+        let idx = push_image(&mut app, r"C:\missing\still.png");
         app.fullscreen_idx = Some(idx);
 
         app.start_fs_load(idx);
 
         assert!(app.fs_pending.contains_key(&idx));
+        assert_eq!(app.current_animation_expansion_started_at(), None);
+    }
+
+    #[test]
+    fn animation_confirmation_message_enables_progress_without_completing_the_request() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\animated.png");
+        app.fullscreen_idx = Some(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            idx,
+            FsPendingValue::new(cancel, rx, input_seq, FsLoadPurpose::for_page(true)),
+        );
+        let started_at = std::time::Instant::now();
+        tx.send(FsLoadResult::AnimationExpansionStarted { started_at })
+            .unwrap();
+
+        app.poll_prefetch(&ctx);
+
+        assert!(
+            app.fs_pending.contains_key(&idx),
+            "animation confirmation is non-terminal"
+        );
+        assert_eq!(
+            app.current_animation_expansion_started_at(),
+            Some(started_at)
+        );
+        assert!(animation_expansion_progress_visible(
+            app.current_animation_expansion_started_at(),
+            started_at + std::time::Duration::from_millis(150),
+        ));
+    }
+
+    #[test]
+    fn leaving_display_discards_confirmation_but_keeps_prefetch_work() {
+        let mut app = setup_app();
+        let old_pending = push_image(&mut app, r"C:\missing\old.png");
+        let current = push_image(&mut app, r"C:\missing\current.jpg");
+        let old_backlog = push_image(&mut app, r"C:\missing\ready.webp");
+        let started_at = std::time::Instant::now();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut pending =
+            FsPendingValue::new(cancel, rx, app.input_seq, FsLoadPurpose::for_page(true));
+        pending.animation_expansion_started_at = Some(started_at);
+        app.fs_pending.insert(old_pending, pending);
+        let mut upload = FsUploadResult::new(
+            old_backlog,
+            FsLoadResult::Failed,
+            app.input_seq,
+            FsLoadPurpose::for_page(true),
+        );
+        upload.animation_expansion_started_at = Some(started_at);
+        app.fs_upload_backlog.push(upload);
+
+        app.discard_animation_expansion_confirmation_outside_display(current, None);
+
+        assert!(app.fs_pending.contains_key(&old_pending));
+        assert!(
+            app.fs_pending
+                .get(&old_pending)
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+        assert_eq!(app.fs_upload_backlog.len(), 1);
+        assert!(
+            app.fs_upload_backlog
+                .iter()
+                .next()
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn late_confirmation_after_leaving_page_is_discarded() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let old = push_image(&mut app, r"C:\missing\old.png");
+        let current = push_image(&mut app, r"C:\missing\current.jpg");
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.fullscreen_idx = Some(current);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            old,
+            FsPendingValue::new(cancel, rx, input_seq, FsLoadPurpose::for_page(true)),
+        );
+        tx.send(FsLoadResult::AnimationExpansionStarted {
+            started_at: std::time::Instant::now(),
+        })
+        .unwrap();
+
+        app.poll_prefetch(&ctx);
+
+        assert!(app.fs_pending.contains_key(&old));
+        assert!(
+            app.fs_pending
+                .get(&old)
+                .unwrap()
+                .animation_expansion_started_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelling_display_request_discards_animation_confirmation() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\animated.webp");
+        app.fullscreen_idx = Some(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut pending = FsPendingValue::new(
+            Arc::clone(&cancel),
+            rx,
+            app.input_seq,
+            FsLoadPurpose::for_page(true),
+        );
+        pending.animation_expansion_started_at = Some(std::time::Instant::now());
+        app.fs_pending.insert(idx, pending);
+
+        app.defer_page_turn_full_resolution_work();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.fs_pending.contains_key(&idx));
         assert_eq!(app.current_animation_expansion_started_at(), None);
     }
 

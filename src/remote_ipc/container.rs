@@ -6322,6 +6322,7 @@ fn decode_remote_ai_canonical(
             susie_cancel: Some(cancel),
             cancel: None,
             animation_policy: crate::canonical_image_loader::AnimationPolicy::FullFrames,
+            on_animation_confirmed: None,
         },
     )
     .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?;

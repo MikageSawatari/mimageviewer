@@ -390,6 +390,25 @@ impl<T> ItemsGenerationVec<T> {
         })
     }
 
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        let expected = self.items_generation;
+        let cache_name = self.cache_name;
+        let idx_of = self.idx_of;
+        self.entries.iter_mut().filter_map(move |entry| {
+            if entry.items_generation == expected {
+                Some(&mut entry.value)
+            } else {
+                log_stale(
+                    cache_name,
+                    idx_of(&entry.value),
+                    expected,
+                    entry.items_generation,
+                );
+                None
+            }
+        })
+    }
+
     pub(crate) fn remove_with_generation(&mut self, position: usize) -> (u64, T) {
         let entry = self.entries.remove(position);
         (entry.items_generation, entry.value)

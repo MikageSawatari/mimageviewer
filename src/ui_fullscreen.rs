@@ -27926,6 +27926,10 @@ impl App {
         // 連結読みも見開き構成なら相方が一緒に出ている。**昇格を止めるのは画面から
         // 外れたページだけ** (§1.157: この判定が 8 か所に散っていた)。
         let displayed_partner = self.displayed_spread_partner(current_idx);
+        self.discard_animation_expansion_confirmation_outside_display(
+            current_idx,
+            displayed_partner,
+        );
         let stale_promotions = self
             .fs_pending
             .iter()

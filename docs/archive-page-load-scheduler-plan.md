@@ -312,8 +312,16 @@ FPDF_RenderPage_Close(page)
 
 **直し方**: 「一般の画像読み込み」と「形式を確認した後のアニメーション展開」を分ける。
 拡張子は候補の絞り込みにしか使えないので、**worker が実際に複数フレームだと判定してから**
-通知する。既存の `fs_early_dims` と同じ形で、worker から早期に「これはアニメーションで
-N フレーム」を伝える経路を足す。判定材料が来るまでは通常の読み込み表示にする。
+通知する。既存の `FsLoadResult::DimsOnly` と同じチャネル / drain 経路へ非終端の
+`AnimationExpansionStarted` を流す。確認時刻は世代付き `fs_pending` が所有し、終端結果と
+一緒に世代付き `fs_upload_backlog` へ移す。ページを離れる、cancel、items 世代変更、終端 upload
+の各境界で捨てる。判定材料が来るまでは通常の読み込み表示にする。
+
+確認地点は APNG の `decoder.is_apng() == true` 直後、Animated WebP の
+`decoder.has_animation() == true` 直後、GIF の 2 枚目のフレーム追加直後。各 decoder は
+一度だけ消費できる callback wrapper を使い、1 decode あたり高々 1 通知にする。
+`AnimationPromotion` は既にアニメーションと判明した entry から始まるため、従来どおり request
+開始時刻を進捗表示に使う。
 
 §3 で詰まり自体が解消すると 150ms を超える頻度は下がるが、**誤りは残る**ので別に直す。
 

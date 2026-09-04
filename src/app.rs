@@ -5337,9 +5337,7 @@ const ANIMATION_EXPANSION_PROGRESS_DELAY: std::time::Duration =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsLoadPurpose {
-    Display {
-        started_at: std::time::Instant,
-    },
+    Display,
     Prefetch,
     AnimationPromotion {
         target_idx: usize,
@@ -5350,9 +5348,7 @@ pub(crate) enum FsLoadPurpose {
 impl FsLoadPurpose {
     pub(crate) fn for_page(is_current: bool) -> Self {
         if is_current {
-            Self::Display {
-                started_at: std::time::Instant::now(),
-            }
+            Self::Display
         } else {
             Self::Prefetch
         }
@@ -5361,7 +5357,7 @@ impl FsLoadPurpose {
     const fn animation_policy(self) -> AnimationPolicy {
         match self {
             Self::Prefetch => AnimationPolicy::FirstFrameOnly,
-            Self::Display { .. } | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
+            Self::Display | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
         }
     }
 
@@ -5370,12 +5366,11 @@ impl FsLoadPurpose {
         idx: usize,
     ) -> Option<std::time::Instant> {
         match self {
-            Self::Display { started_at } => Some(started_at),
             Self::AnimationPromotion {
                 target_idx,
                 started_at,
             } if target_idx == idx => Some(started_at),
-            Self::Prefetch | Self::AnimationPromotion { .. } => None,
+            Self::Display | Self::Prefetch | Self::AnimationPromotion { .. } => None,
         }
     }
 
@@ -5407,6 +5402,7 @@ pub(crate) struct FsPendingValue {
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
+    animation_expansion_started_at: Option<std::time::Instant>,
 }
 
 impl FsPendingValue {
@@ -5423,6 +5419,7 @@ impl FsPendingValue {
             rx,
             load_seq,
             purpose,
+            animation_expansion_started_at: None,
         }
     }
 
@@ -5511,6 +5508,7 @@ pub(crate) struct FsUploadResult {
     pub(crate) result: FsLoadResult,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
+    animation_expansion_started_at: Option<std::time::Instant>,
 }
 
 impl FsUploadResult {
@@ -5525,6 +5523,7 @@ impl FsUploadResult {
             result,
             load_seq,
             purpose,
+            animation_expansion_started_at: None,
         }
     }
 }
@@ -51579,10 +51578,18 @@ impl App {
                     verified_bytes: verified_source_bytes.as_deref(),
                 }
             };
-            let canonical_decode = decode_canonical_image(
-                canonical_source,
-                CanonicalDecodeOptions::fullscreen_cancellable(purpose.animation_policy(), &cancel),
-            );
+            let notify_animation_confirmed = || {
+                let _ = tx.send(FsLoadResult::AnimationExpansionStarted {
+                    started_at: std::time::Instant::now(),
+                });
+            };
+            let mut decode_options =
+                CanonicalDecodeOptions::fullscreen_cancellable(purpose.animation_policy(), &cancel);
+            if matches!(purpose, FsLoadPurpose::Display) {
+                decode_options =
+                    decode_options.with_animation_confirmation(&notify_animation_confirmed);
+            }
+            let canonical_decode = decode_canonical_image(canonical_source, decode_options);
             if cancel.load(Ordering::Relaxed) {
                 emit_exit("cancel_after_decode");
                 return;
@@ -52103,6 +52110,10 @@ impl App {
         // KEEP 範囲内かどうかとは独立に、ページを離れた時点で worker を止め、
         // decode 済み backlog も捨てる。
         let displayed_partner = self.displayed_spread_partner(current_idx);
+        self.discard_animation_expansion_confirmation_outside_display(
+            current_idx,
+            displayed_partner,
+        );
         let stale_promotions: Vec<usize> = self
             .fs_pending
             .iter()
@@ -58150,6 +58161,7 @@ impl App {
         result: FsLoadResult,
         load_seq: u64,
         purpose: FsLoadPurpose,
+        animation_expansion_started_at: Option<std::time::Instant>,
     ) -> bool {
         if !self
             .fs_upload_backlog
@@ -58161,7 +58173,8 @@ impl App {
             .fs_upload_backlog
             .iter()
             .position(|entry| entry.idx == idx);
-        let entry = FsUploadResult::new(idx, result, load_seq, purpose);
+        let mut entry = FsUploadResult::new(idx, result, load_seq, purpose);
+        entry.animation_expansion_started_at = animation_expansion_started_at;
         if let Some(pos) = backlog_pos {
             self.fs_upload_backlog
                 .replace_for_generation(pos, items_generation, entry)
@@ -58189,6 +58202,7 @@ impl App {
             result,
             load_seq,
             FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx)),
+            None,
         );
         self.fs_early_dims.remove(&idx);
         crate::logger::log(format!(
@@ -58236,6 +58250,25 @@ impl App {
         Self::page_is_displayed(idx, current, partner)
     }
 
+    /// 通常 Display の確認通知は、その表示単位を離れたら同じ in-flight decode に再利用しない。
+    /// worker 自体を先読みとして生かす場合も、戻ってきたときは古い進捗時刻を表示しない。
+    pub(crate) fn discard_animation_expansion_confirmation_outside_display(
+        &mut self,
+        current: usize,
+        partner: Option<usize>,
+    ) {
+        for (&idx, pending) in self.fs_pending.iter_mut() {
+            if !Self::page_is_displayed(idx, current, partner) {
+                pending.animation_expansion_started_at = None;
+            }
+        }
+        for entry in self.fs_upload_backlog.iter_mut() {
+            if !Self::page_is_displayed(entry.idx, current, partner) {
+                entry.animation_expansion_started_at = None;
+            }
+        }
+    }
+
     fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
         if !self.page_is_displayed_now(idx)
             || self
@@ -58281,12 +58314,20 @@ impl App {
         }
         self.fs_pending
             .get(&idx)
-            .and_then(|pending| pending.purpose.animation_expansion_started_at_for(idx))
+            .and_then(|pending| {
+                pending
+                    .purpose
+                    .animation_expansion_started_at_for(idx)
+                    .or(pending.animation_expansion_started_at)
+            })
             .or_else(|| {
                 self.fs_upload_backlog.iter().find_map(|entry| {
-                    (entry.idx == idx)
-                        .then(|| entry.purpose.animation_expansion_started_at_for(idx))
-                        .flatten()
+                    (entry.idx == idx).then_some(
+                        entry
+                            .purpose
+                            .animation_expansion_started_at_for(idx)
+                            .or(entry.animation_expansion_started_at),
+                    )?
                 })
             })
     }
@@ -65291,17 +65332,44 @@ impl App {
             }
         }
 
+        let displayed_page = self.fullscreen_idx.map(|current| {
+            let partner = self.displayed_spread_partner(current);
+            (current, partner)
+        });
+
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
         // drain を続ける。fs_early_dims への書き込みは fs_pending 借用中はできないので
         // ローカル vec に積んでから後段で apply する。
-        let mut completed: Vec<(usize, FsLoadResult, u64, u64, FsLoadPurpose)> = Vec::new();
+        let mut completed: Vec<(
+            usize,
+            FsLoadResult,
+            u64,
+            u64,
+            FsLoadPurpose,
+            Option<std::time::Instant>,
+        )> = Vec::new();
         let mut disconnected: Vec<(usize, FsLoadPurpose)> = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
+        let mut animation_expansion_updates: Vec<(usize, std::time::Instant, u64)> = Vec::new();
         for (&key, items_generation, pending) in self.fs_pending.iter_with_generation() {
+            let mut animation_expansion_started_at = pending.animation_expansion_started_at;
             loop {
                 match pending.rx.try_recv() {
                     Ok(FsLoadResult::DimsOnly { source_dims }) => {
                         early_dims_updates.push((key, source_dims, items_generation));
+                        continue;
+                    }
+                    Ok(FsLoadResult::AnimationExpansionStarted { started_at }) => {
+                        let still_displayed = displayed_page.is_some_and(|(current, partner)| {
+                            Self::page_is_displayed(key, current, partner)
+                        });
+                        if matches!(pending.purpose, FsLoadPurpose::Display)
+                            && still_displayed
+                            && animation_expansion_started_at.is_none()
+                        {
+                            animation_expansion_started_at = Some(started_at);
+                            animation_expansion_updates.push((key, started_at, items_generation));
+                        }
                         continue;
                     }
                     Ok(result) => {
@@ -65311,6 +65379,7 @@ impl App {
                             pending.load_seq,
                             items_generation,
                             pending.purpose,
+                            animation_expansion_started_at,
                         ));
                         break;
                     }
@@ -65326,6 +65395,16 @@ impl App {
         for (key, dims, items_generation) in early_dims_updates {
             self.fs_early_dims
                 .insert_for_generation(key, items_generation, dims);
+        }
+        let animation_expansion_repaint = !animation_expansion_updates.is_empty();
+        for (key, started_at, items_generation) in animation_expansion_updates {
+            if self.fs_pending.accepts_generation(key, items_generation) {
+                if let Some(pending) = self.fs_pending.get_mut(&key) {
+                    pending
+                        .animation_expansion_started_at
+                        .get_or_insert(started_at);
+                }
+            }
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
         for (key, purpose) in disconnected {
@@ -65345,7 +65424,7 @@ impl App {
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
-        for (key, _, _, _, _) in &completed {
+        for (key, _, _, _, _, _) in &completed {
             if let Some(mut pending) = self.fs_pending.remove(key) {
                 pending.disarm_ticket();
             }
@@ -65357,7 +65436,15 @@ impl App {
         // pano_high_res_source には入らないので、backlog に複数滞留させる必要なし。
         // mpsc 受信直後に drop して memory peak を最小化する。
         let current_fs = self.fullscreen_idx;
-        for (key, mut result, load_seq, items_generation, purpose) in completed {
+        for (
+            key,
+            mut result,
+            load_seq,
+            items_generation,
+            purpose,
+            animation_expansion_started_at,
+        ) in completed
+        {
             if Some(key) != current_fs {
                 if let FsLoadResult::StaticPanorama {
                     ci,
@@ -65379,6 +65466,7 @@ impl App {
                 result,
                 load_seq,
                 purpose,
+                animation_expansion_started_at,
             );
         }
 
@@ -65435,13 +65523,17 @@ impl App {
             .fs_upload_backlog
             .iter()
             .any(|entry| upload_is_admitted(entry.idx));
-        let repaint = !to_process.is_empty() || early_dims_repaint || has_more_admitted_backlog;
+        let repaint = !to_process.is_empty()
+            || early_dims_repaint
+            || animation_expansion_repaint
+            || has_more_admitted_backlog;
         for (items_generation, upload) in to_process {
             let FsUploadResult {
                 idx: key,
                 result,
                 load_seq,
                 purpose,
+                animation_expansion_started_at: _,
             } = upload;
             if !self.fs_cache.accepts_generation(key, items_generation) {
                 continue;
@@ -65616,8 +65708,8 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
-                FsLoadResult::DimsOnly { .. } => {
-                    unreachable!("DimsOnly should be drained before reaching completion match")
+                FsLoadResult::DimsOnly { .. } | FsLoadResult::AnimationExpansionStarted { .. } => {
+                    unreachable!("non-terminal fs load result reached completion match")
                 }
             };
             self.fs_cache
