@@ -592,6 +592,17 @@ fn draw_native_seek_strip(
                                         egui::Color32::from_gray(190),
                                     );
                                 }
+                                Some(NativeOverlaySeekStripCellContent::RetryPending {
+                                    reason,
+                                }) => {
+                                    painter.text(
+                                        cell_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        reason,
+                                        crate::ui_fonts::hud_text_font(13.0),
+                                        egui::Color32::from_gray(160),
+                                    );
+                                }
                                 Some(NativeOverlaySeekStripCellContent::Pending) | None => {}
                             }
                             painter.rect_stroke(
@@ -2226,6 +2237,7 @@ pub struct NativeOverlaySeekStripCell {
 pub enum NativeOverlaySeekStripCellContent {
     Pending,
     Ready(NativeOverlayTileThumbnail),
+    RetryPending { reason: &'static str },
     Failed { reason: &'static str },
 }
 

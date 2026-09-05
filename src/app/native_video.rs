@@ -3,6 +3,8 @@ use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
     VIDEO_SEEK_STRIP_ACTIONS,
 };
+#[cfg(windows)]
+use crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4584,7 +4586,10 @@ impl App {
                         session.drag_state = VideoSeekStripDragState::Dragging;
                     }
                     session.center = center;
-                    Self::request_video_seek_strip_window(session);
+                    Self::request_video_seek_strip_window(
+                        session,
+                        StripThumbnailRequestTrigger::UserInteraction,
+                    );
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
@@ -4606,6 +4611,12 @@ impl App {
                         }
                         session.drag_state = VideoSeekStripDragState::Idle;
                         session.last_follow_recenter_at = Some(std::time::Instant::now());
+                        // 全体表示は帯をドラッグできないため、クリック/ドラッグ確定そのものを
+                        // 同一窓の時間切れセルを再生成できる利用者操作として扱う。
+                        Self::request_video_seek_strip_window(
+                            session,
+                            StripThumbnailRequestTrigger::UserInteraction,
+                        );
                         target_secs
                     }
                     _ => None,
@@ -4641,7 +4652,10 @@ impl App {
                         session.rebuild_whole_axis_if_needed();
                         session.pin_whole_center();
                     }
-                    Self::request_video_seek_strip_window(session);
+                    Self::request_video_seek_strip_window(
+                        session,
+                        StripThumbnailRequestTrigger::WindowRecalculated,
+                    );
                 }
             }
             crate::video::NativeVideoOutputEvent::SetSeekStripView { view } => {
@@ -8262,7 +8276,10 @@ impl App {
         session.last_wave_request = None;
         session.pending_wave_span = None;
         session.wave_holdover = None;
-        Self::request_video_seek_strip_window(session);
+        Self::request_video_seek_strip_window(
+            session,
+            StripThumbnailRequestTrigger::StripRedisplayed,
+        );
         true
     }
 
@@ -8323,7 +8340,10 @@ impl App {
                 session.last_sent_thumbnail_request_id = None;
             }
         }
-        Self::request_video_seek_strip_window(session);
+        Self::request_video_seek_strip_window(
+            session,
+            StripThumbnailRequestTrigger::StripRedisplayed,
+        );
         true
     }
 
@@ -8362,7 +8382,10 @@ impl App {
         let rebuilt = session.rebuild_whole_axis_if_needed();
         let pinned = session.pin_whole_center();
         if rebuilt || pinned {
-            Self::request_video_seek_strip_window(session);
+            Self::request_video_seek_strip_window(
+                session,
+                StripThumbnailRequestTrigger::WindowRecalculated,
+            );
         }
         rebuilt || pinned
     }
@@ -8412,14 +8435,20 @@ impl App {
                 }
             }
         }
-        Self::request_video_seek_strip_window(session);
+        Self::request_video_seek_strip_window(
+            session,
+            StripThumbnailRequestTrigger::UserInteraction,
+        );
         session.drag_state = VideoSeekStripDragState::Idle;
         session.last_follow_recenter_at = Some(std::time::Instant::now());
         true
     }
 
     #[cfg(windows)]
-    fn request_video_seek_strip_window(session: &mut VideoSeekStripSession) {
+    fn request_video_seek_strip_window(
+        session: &mut VideoSeekStripSession,
+        request_trigger: crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger,
+    ) {
         match session.center {
             crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                 let VideoSeekStripAxisState::Ready(axis) = &session.axis else {
@@ -8463,7 +8492,17 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
-                let trigger_cells_missing = worker.any_cell_unsettled(&trigger_targets);
+                let request_spec = crate::video::seek_strip_thumbs::StripWindowSpec::new(
+                    center_index,
+                    visible,
+                    request_lookahead,
+                );
+                let trigger_cells_missing = worker.any_cell_unsettled(
+                    axis,
+                    request_spec,
+                    &trigger_targets,
+                    request_trigger,
+                );
                 if !crate::video::seek_strip::should_request_strip_window(
                     trigger_cells_missing,
                     session.last_sent_thumbnail_request_id,
@@ -8477,6 +8516,7 @@ impl App {
                     center_index,
                     visible,
                     request_lookahead,
+                    request_trigger,
                 ) {
                     session.last_sent_thumbnail_request_id = Some(request_id);
                 }
@@ -8592,7 +8632,10 @@ impl App {
             session.center,
             crate::video::seek_strip::SeekStripCenter::Thumbnails { .. }
         ) {
-            Self::request_video_seek_strip_window(session);
+            Self::request_video_seek_strip_window(
+                session,
+                StripThumbnailRequestTrigger::UserInteraction,
+            );
         }
     }
 
@@ -8635,7 +8678,10 @@ impl App {
             wave_cache,
         ));
         session.wave_holdover = previous_raster;
-        Self::request_video_seek_strip_window(session);
+        Self::request_video_seek_strip_window(
+            session,
+            StripThumbnailRequestTrigger::UserInteraction,
+        );
     }
 
     #[cfg(windows)]
@@ -8708,7 +8754,10 @@ impl App {
             }
         }
         session.last_follow_recenter_at = Some(now);
-        Self::request_video_seek_strip_window(session);
+        Self::request_video_seek_strip_window(
+            session,
+            StripThumbnailRequestTrigger::WindowRecalculated,
+        );
         true
     }
 
@@ -8828,7 +8877,10 @@ impl App {
         {
             // Poll the waveform transition even while paused. A visible-width first paint stays
             // published while a wider retained raster is scheduled when this range has one.
-            Self::request_video_seek_strip_window(session);
+            Self::request_video_seek_strip_window(
+                session,
+                StripThumbnailRequestTrigger::DeliveryRecovery,
+            );
         }
         let thumbnail_range_value_secs = self.settings.video_seek_strip_min_interval_secs;
         let waveform_range_value_secs = self.settings.video_seek_strip_waveform_span_secs;
@@ -8887,7 +8939,10 @@ impl App {
                                     wave_cache.clone(),
                                 ));
                             }
-                            Self::request_video_seek_strip_window(session);
+                            Self::request_video_seek_strip_window(
+                                session,
+                                StripThumbnailRequestTrigger::WindowRecalculated,
+                            );
                         }
                         crate::video::seek_strip_thumbs::StripAxisResolution::Unavailable(
                             reason,
@@ -8943,6 +8998,13 @@ impl App {
                                             .and_then(|snapshot| target_secs.and_then(|target| {
                                                 snapshot.outcome_for_secs(target)
                                             }));
+                                        let retry_state = thumbnail_snapshot
+                                            .as_ref()
+                                            .and_then(|snapshot| {
+                                                target_secs.and_then(|target| {
+                                                    snapshot.retry_state_for_secs(target)
+                                                })
+                                            });
                                         let latest_failure = thumbnail_snapshot
                                             .as_ref()
                                             .and_then(|snapshot| {
@@ -8950,6 +9012,7 @@ impl App {
                                             });
                                         let content = match crate::video::seek_strip_thumbs::decide_strip_thumbnail_cell_state(
                                             outcome,
+                                            retry_state,
                                             latest_failure,
                                         ) {
                                             crate::video::seek_strip_thumbs::StripThumbnailCellState::Pending => {
@@ -8966,6 +9029,14 @@ impl App {
                                                         rgba: std::sync::Arc::clone(&thumbnail.rgba),
                                                     },
                                                 )
+                                            }
+                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::RetryPending(retry_state) => {
+                                                if retry_state.keeps_repainting() {
+                                                    visible_cells_pending = true;
+                                                }
+                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::RetryPending {
+                                                    reason: retry_state.user_label(),
+                                                }
                                             }
                                             crate::video::seek_strip_thumbs::StripThumbnailCellState::Failed(failure) => {
                                                 crate::video::native_presenter::NativeOverlaySeekStripCellContent::Failed {

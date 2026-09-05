@@ -6,8 +6,8 @@
 //! メインプレイヤーの `GpuVideoDevice` / D3D ロックを共有せず、`LIVE_VIDEO_DECODE_THREADS`
 //! にも含めない。
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,8 +31,31 @@ pub(crate) const STRIP_THUMB_EXTRACT_WIDTH: u32 = 320;
 const STRIP_THUMB_EXTRACT_HEIGHT: u32 = 320;
 /// Absorbs only rounding when FFmpeg index and packet timestamps are converted to seconds.
 const FRAME_PTS_MATCH_EPSILON_SECS: f64 = 0.005;
-/// A requested window must settle to ready or a typed cell failure within this bound.
-pub(crate) const STRIP_THUMB_WINDOW_TIMEOUT_SECS: u64 = 30;
+/// One cell gets this full decode budget; decoder startup and sibling cells do not consume it.
+pub(crate) const STRIP_THUMB_CELL_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum forward-decode span relative to the axis' observed raw GOP.
+///
+/// A backward seek may land one raw GOP before its target, so continuing through one more GOP
+/// has the same two-GOP decode envelope while avoiding another demux seek. The lower bound uses
+/// the raw-GOP ceiling already accepted by the strip axis: dense-GOP material must not fragment
+/// the established 0.1--30 second zoomed runs merely because its measured GOP is shorter. The
+/// upper bound prevents a sparse or incomplete fallback index from licensing unbounded forward
+/// decode. With no usable index, the same accepted-GOP envelope gives a documented 30 second
+/// default rather than guessing from the requested window.
+const STRIP_DECODE_RUN_GOP_MULTIPLIER: f64 = 2.0;
+
+fn strip_decode_run_max_forward_gap_secs(maximum_keyframe_gap_secs: Option<f64>) -> f64 {
+    let accepted_gop_ceiling = super::seek_strip::SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS;
+    let observed_gop = maximum_keyframe_gap_secs
+        .filter(|gap| gap.is_finite() && *gap > 0.0)
+        .unwrap_or(accepted_gop_ceiling)
+        .clamp(
+            accepted_gop_ceiling,
+            accepted_gop_ceiling * STRIP_DECODE_RUN_GOP_MULTIPLIER,
+        );
+    observed_gop * STRIP_DECODE_RUN_GOP_MULTIPLIER
+}
 
 /// セルが要求した時刻から作る、窓変更をまたいで安定したプロセス内キー。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -84,7 +107,6 @@ pub(crate) enum StripThumbnailFailure {
     DecodeFailed(String),
     ConvertFailed(String),
     NoFrame(NoFrameReason),
-    WindowTimedOut { timeout_secs: u64 },
 }
 
 impl StripThumbnailFailure {
@@ -96,7 +118,7 @@ impl StripThumbnailFailure {
             | Self::DemuxFailed(detail)
             | Self::DecodeFailed(detail)
             | Self::ConvertFailed(detail) => detail.len(),
-            Self::InvalidCellTime | Self::NoFrame(_) | Self::WindowTimedOut { .. } => 0,
+            Self::InvalidCellTime | Self::NoFrame(_) => 0,
         }
     }
 }
@@ -159,7 +181,6 @@ impl StripThumbnailFailure {
             Self::DecodeFailed(_) => "復号に失敗",
             Self::ConvertFailed(_) => "画像変換に失敗",
             Self::NoFrame(_) => "フレームなし",
-            Self::WindowTimedOut { .. } => "生成が時間切れです",
         }
     }
 }
@@ -171,6 +192,93 @@ pub(crate) enum StripThumbnailOutcome {
     Failed(StripThumbnailFailure),
 }
 
+/// An event that is allowed to make a timed-out cell attempt work again.
+///
+/// `DeliveryRecovery` preserves the 2026-08-27 supersede fix for cells that never received any
+/// result, but deliberately does not unlock a timeout for the same window. The other variants
+/// are finite UI/lifecycle events rather than elapsed-time wakeups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripThumbnailRequestTrigger {
+    DeliveryRecovery,
+    WindowRecalculated,
+    StripRedisplayed,
+    UserInteraction,
+}
+
+impl StripThumbnailRequestTrigger {
+    fn permits_same_window_timeout_retry(self) -> bool {
+        matches!(self, Self::StripRedisplayed | Self::UserInteraction)
+    }
+}
+
+/// Why a non-terminal timed-out cell is active again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripThumbnailRetryTrigger {
+    WindowPassCompleted,
+    WindowRecalculated,
+    StripRedisplayed,
+    UserInteraction,
+}
+
+impl From<StripThumbnailRequestTrigger> for StripThumbnailRetryTrigger {
+    fn from(trigger: StripThumbnailRequestTrigger) -> Self {
+        match trigger {
+            StripThumbnailRequestTrigger::DeliveryRecovery
+            | StripThumbnailRequestTrigger::WindowRecalculated => Self::WindowRecalculated,
+            StripThumbnailRequestTrigger::StripRedisplayed => Self::StripRedisplayed,
+            StripThumbnailRequestTrigger::UserInteraction => Self::UserInteraction,
+        }
+    }
+}
+
+/// Timeout is a recoverable scheduling state, never a terminal media failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripThumbnailRetryState {
+    Scheduled {
+        trigger: StripThumbnailRetryTrigger,
+        timeout_secs: u64,
+    },
+    Running {
+        trigger: StripThumbnailRetryTrigger,
+        timeout_secs: u64,
+    },
+    AwaitingTrigger {
+        timeout_secs: u64,
+    },
+}
+
+impl StripThumbnailRetryState {
+    pub(crate) fn user_label(self) -> &'static str {
+        match self {
+            Self::Scheduled { .. } | Self::Running { .. } => "もう一度生成しています",
+            Self::AwaitingTrigger { .. } => "操作すると再生成します",
+        }
+    }
+
+    pub(crate) fn keeps_repainting(self) -> bool {
+        matches!(self, Self::Scheduled { .. } | Self::Running { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StripThumbnailRetryWindow {
+    requested_ids: BTreeSet<StripCellId>,
+}
+
+impl StripThumbnailRetryWindow {
+    fn from_requested_ids(requested_ids: &BTreeSet<StripCellId>) -> Self {
+        Self {
+            requested_ids: requested_ids.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StripThumbnailRetry {
+    state: StripThumbnailRetryState,
+    window: StripThumbnailRetryWindow,
+}
+
 /// UI へ渡す前に確定する、1 セルの表示状態。
 ///
 /// `None` はまだ worker が決着させていない pending であり、失敗と同一視しない。
@@ -178,19 +286,26 @@ pub(crate) enum StripThumbnailOutcome {
 pub(crate) enum StripThumbnailCellState<'a> {
     Pending,
     Ready(&'a StripThumbnail),
+    RetryPending(&'a StripThumbnailRetryState),
     Failed(&'a StripThumbnailFailure),
 }
 
 pub(crate) fn decide_strip_thumbnail_cell_state<'a>(
     outcome: Option<&'a StripThumbnailOutcome>,
+    retry_state: Option<&'a StripThumbnailRetryState>,
     latest_request_failure: Option<&'a StripThumbnailFailure>,
 ) -> StripThumbnailCellState<'a> {
     match outcome {
         Some(StripThumbnailOutcome::Ready(thumbnail)) => StripThumbnailCellState::Ready(thumbnail),
         Some(StripThumbnailOutcome::Failed(failure)) => StripThumbnailCellState::Failed(failure),
-        None => latest_request_failure.map_or(
-            StripThumbnailCellState::Pending,
-            StripThumbnailCellState::Failed,
+        None => retry_state.map_or_else(
+            || {
+                latest_request_failure.map_or(
+                    StripThumbnailCellState::Pending,
+                    StripThumbnailCellState::Failed,
+                )
+            },
+            StripThumbnailCellState::RetryPending,
         ),
     }
 }
@@ -296,6 +411,7 @@ pub(crate) struct StripThumbnailSnapshot {
     pub(crate) axis: StripAxisResolution,
     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
     pub(crate) cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
+    retry_cells: BTreeMap<StripCellId, StripThumbnailRetry>,
     pub(crate) status: StripThumbnailWorkerStatus,
     pub(crate) latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
     #[cfg(any(test, feature = "dev-tools"))]
@@ -306,6 +422,14 @@ impl StripThumbnailSnapshot {
     pub(crate) fn outcome_for_secs(&self, target_secs: f64) -> Option<&StripThumbnailOutcome> {
         let id = StripCellId::from_secs(target_secs)?;
         self.cells.get(&id)
+    }
+
+    pub(crate) fn retry_state_for_secs(
+        &self,
+        target_secs: f64,
+    ) -> Option<&StripThumbnailRetryState> {
+        let id = StripCellId::from_secs(target_secs)?;
+        self.retry_cells.get(&id).map(|retry| &retry.state)
     }
 
     pub(crate) fn latest_failure_for_index(&self, index: usize) -> Option<&StripThumbnailFailure> {
@@ -786,6 +910,58 @@ pub(crate) struct StripDecodeRun {
     pub(crate) cells: Vec<PlannedStripCell>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TimedOutRunPlan {
+    remaining: Option<StripDecodeRun>,
+    retry: Option<StripDecodeRun>,
+    retry_state: StripThumbnailRetryState,
+}
+
+/// Split only the cell whose own budget expired out of a run.
+///
+/// The untouched suffix runs next so one slow cell cannot consume or fail its siblings. The first
+/// timeout is queued once behind the rest of the window; a second timeout in the same request is
+/// quiescent until an explicit request trigger changes the situation.
+fn plan_timed_out_run(
+    run: &StripDecodeRun,
+    timed_out_cell: &PlannedStripCell,
+    attempt_number: usize,
+) -> TimedOutRunPlan {
+    let timed_out_pos = run
+        .cells
+        .iter()
+        .position(|cell| cell.id == timed_out_cell.id)
+        .unwrap_or(run.cells.len());
+    let remaining_cells = run
+        .cells
+        .get(timed_out_pos.saturating_add(1)..)
+        .unwrap_or_default()
+        .to_vec();
+    let remaining = (!remaining_cells.is_empty()).then_some(StripDecodeRun {
+        cells: remaining_cells,
+    });
+    if attempt_number == 1 {
+        TimedOutRunPlan {
+            remaining,
+            retry: Some(StripDecodeRun {
+                cells: vec![timed_out_cell.clone()],
+            }),
+            retry_state: StripThumbnailRetryState::Scheduled {
+                trigger: StripThumbnailRetryTrigger::WindowPassCompleted,
+                timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+            },
+        }
+    } else {
+        TimedOutRunPlan {
+            remaining,
+            retry: None,
+            retry_state: StripThumbnailRetryState::AwaitingTrigger {
+                timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+            },
+        }
+    }
+}
+
 /// セルを可視優先・中心優先の連続 run にまとめる純関数。
 ///
 /// 最も中心に近い可視 miss は単独 run にして最初に出す。残りは最大連続範囲へまとめ、
@@ -794,6 +970,7 @@ pub(crate) struct StripDecodeRun {
 pub(crate) fn group_strip_decode_runs(
     cells: &[PlannedStripCell],
     center_index: f64,
+    max_forward_gap_secs: f64,
 ) -> Vec<StripDecodeRun> {
     let mut visible: Vec<_> = cells.iter().filter(|cell| cell.visible).cloned().collect();
     let lookahead: Vec<_> = cells.iter().filter(|cell| !cell.visible).cloned().collect();
@@ -810,14 +987,23 @@ pub(crate) fn group_strip_decode_runs(
         runs.push(StripDecodeRun { cells: vec![pivot] });
     }
 
-    runs.extend(group_one_priority_band(visible, center_index));
-    runs.extend(group_one_priority_band(lookahead, center_index));
+    runs.extend(group_one_priority_band(
+        visible,
+        center_index,
+        max_forward_gap_secs,
+    ));
+    runs.extend(group_one_priority_band(
+        lookahead,
+        center_index,
+        max_forward_gap_secs,
+    ));
     runs
 }
 
 fn group_one_priority_band(
     mut cells: Vec<PlannedStripCell>,
     center_index: f64,
+    max_forward_gap_secs: f64,
 ) -> Vec<StripDecodeRun> {
     cells.sort_by_key(|cell| cell.index);
     let mut grouped: Vec<Vec<PlannedStripCell>> = Vec::new();
@@ -825,7 +1011,15 @@ fn group_one_priority_band(
         let extends_last = grouped
             .last()
             .and_then(|run| run.last())
-            .is_some_and(|previous| previous.index.checked_add(1) == Some(cell.index));
+            .is_some_and(|previous| {
+                let forward_gap_secs = cell.target_secs - previous.target_secs;
+                previous.index.checked_add(1) == Some(cell.index)
+                    && forward_gap_secs.is_finite()
+                    && forward_gap_secs >= 0.0
+                    && max_forward_gap_secs.is_finite()
+                    && max_forward_gap_secs >= 0.0
+                    && forward_gap_secs <= max_forward_gap_secs
+            });
         if extends_last {
             if let Some(run) = grouped.last_mut() {
                 run.push(cell);
@@ -890,19 +1084,41 @@ struct WindowRequest {
     id: u64,
     axis: Arc<StripAxis>,
     spec: StripWindowSpec,
+    trigger: StripThumbnailRequestTrigger,
     requested_at: Instant,
 }
 
-fn window_timeout_failure(elapsed: Duration) -> Option<StripThumbnailFailure> {
-    (elapsed >= Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS)).then_some(
-        StripThumbnailFailure::WindowTimedOut {
-            timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
-        },
-    )
+fn cell_decode_budget_exhausted(elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(STRIP_THUMB_CELL_TIMEOUT_SECS)
 }
 
-fn request_timeout_failure(request: &WindowRequest) -> Option<StripThumbnailFailure> {
-    window_timeout_failure(request.requested_at.elapsed())
+fn timed_out_active_cell(
+    run: &StripDecodeRun,
+    active_cell_index: usize,
+    elapsed: Duration,
+) -> Option<PlannedStripCell> {
+    cell_decode_budget_exhausted(elapsed)
+        .then(|| run.cells.get(active_cell_index).cloned())
+        .flatten()
+}
+
+fn retry_window_for(axis: &StripAxis, spec: StripWindowSpec) -> StripThumbnailRetryWindow {
+    let work = plan_strip_window_work(axis, spec, &BTreeSet::new());
+    StripThumbnailRetryWindow::from_requested_ids(&work.requested_ids)
+}
+
+fn cell_needs_request(
+    outcome: Option<&StripThumbnailOutcome>,
+    retry: Option<&StripThumbnailRetry>,
+    current_window: &StripThumbnailRetryWindow,
+    trigger: StripThumbnailRequestTrigger,
+) -> bool {
+    if outcome.is_some() {
+        return false;
+    }
+    retry.is_none_or(|retry| {
+        retry.window != *current_window || trigger.permits_same_window_timeout_retry()
+    })
 }
 
 #[derive(Default)]
@@ -930,6 +1146,7 @@ struct SharedState {
     axis: StripAxisResolution,
     axis_diagnostics: Option<StripAxisDiagnostics>,
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
+    retry_cells: BTreeMap<StripCellId, StripThumbnailRetry>,
     status: StripThumbnailWorkerStatus,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
     /// 最後に処理を終えた要求の id。**終えた = 全セルが揃った、ではない。**
@@ -947,6 +1164,7 @@ impl SharedState {
             axis: StripAxisResolution::Resolving,
             axis_diagnostics: None,
             cells: BTreeMap::new(),
+            retry_cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
             last_finished_request_id: None,
@@ -961,6 +1179,7 @@ impl SharedState {
             axis: self.axis.clone(),
             axis_diagnostics: self.axis_diagnostics.clone(),
             cells: self.cells.clone(),
+            retry_cells: self.retry_cells.clone(),
             status: self.status.clone(),
             latest_request_failures: self.latest_request_failures.clone(),
             #[cfg(any(test, feature = "dev-tools"))]
@@ -1062,13 +1281,14 @@ impl SeekStripThumbnailWorker {
         }
     }
 
-    /// `(axis, center_index, visible_count, lookahead)` の最新窓を要求する。
+    /// `(axis, center_index, visible_count, lookahead)` の最新窓と、再試行を許可した契機を要求する。
     pub(crate) fn request(
         &self,
         axis: Arc<StripAxis>,
         center_index: f64,
         visible_count: usize,
         lookahead: StripLookahead,
+        trigger: StripThumbnailRequestTrigger,
     ) -> Result<u64, StripThumbnailRequestError> {
         if self.cancel.load(Ordering::Acquire)
             || matches!(
@@ -1086,6 +1306,7 @@ impl SeekStripThumbnailWorker {
             id: request_id,
             axis,
             spec: StripWindowSpec::new(center_index, visible_count, lookahead),
+            trigger,
             requested_at: Instant::now(),
         };
         lock_recover(&self.requests).replace(request);
@@ -1093,14 +1314,29 @@ impl SeekStripThumbnailWorker {
         Ok(request_id)
     }
 
-    /// 表示範囲のうち、まだ 1 つも結果が無いセルがあるか。
+    /// 表示範囲のうち、今回の型付き契機で要求できる未解決セルがあるか。
     ///
     /// snapshot を作らずに済ませる軽い問い合わせ。要求のたびに cells を丸ごと clone すると、
-    /// 判定のためだけに毎回のコピーが乗る。
-    pub(crate) fn any_cell_unsettled(&self, target_secs: &[f64]) -> bool {
+    /// 判定のためだけに毎回のコピーが乗る。時間切れセルは未解決だが、同じ窓の
+    /// `DeliveryRecovery` では false にして毎フレームの再要求を防ぐ。
+    pub(crate) fn any_cell_unsettled(
+        &self,
+        axis: &StripAxis,
+        spec: StripWindowSpec,
+        target_secs: &[f64],
+        trigger: StripThumbnailRequestTrigger,
+    ) -> bool {
+        let current_window = retry_window_for(axis, spec);
         let shared = lock_recover(&self.state);
         target_secs.iter().any(|secs| {
-            StripCellId::from_secs(*secs).is_none_or(|id| !shared.cells.contains_key(&id))
+            StripCellId::from_secs(*secs).is_none_or(|id| {
+                cell_needs_request(
+                    shared.cells.get(&id),
+                    shared.retry_cells.get(&id),
+                    &current_window,
+                    trigger,
+                )
+            })
         })
     }
 
@@ -1465,7 +1701,30 @@ fn process_window_request(
         shared.fill_wait_emitted_request_id = None;
     }
 
-    let settled = lock_recover(state).settled_ids();
+    let retry_window = retry_window_for(&request.axis, request.spec);
+    let settled = {
+        let mut shared = lock_recover(state);
+        shared
+            .retry_cells
+            .retain(|id, _| retry_window.requested_ids.contains(id));
+        let mut settled = shared.settled_ids();
+        for (id, retry) in &mut shared.retry_cells {
+            let eligible =
+                retry.window != retry_window || request.trigger.permits_same_window_timeout_retry();
+            if eligible {
+                retry.window = retry_window.clone();
+                retry.state = StripThumbnailRetryState::Scheduled {
+                    trigger: request.trigger.into(),
+                    timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+                };
+            } else {
+                // A same-window delivery poll may recover a cell discarded by supersede, but a
+                // timed-out cell waits for one of the explicit triggers above.
+                settled.insert(*id);
+            }
+        }
+        settled
+    };
     let work = plan_strip_window_work(&request.axis, request.spec, &settled);
     // 窓が決まったこの時点で、窓の外の古いセルを予算まで落とす。落としたセルは
     // `settled_ids` から消えるので、また必要になれば次の要求が WebP cache から拾い直す。
@@ -1495,6 +1754,7 @@ fn process_window_request(
 
     if maybe_emit_fill_wait(path, &request, &work, requests, state) {
         emit_open_once(path, &request.axis, 0, "memory", 0.0, runtime);
+        quiesce_interrupted_retries(state, &retry_window);
         return;
     }
 
@@ -1520,6 +1780,7 @@ fn process_window_request(
             0.0,
             runtime,
         );
+        quiesce_interrupted_retries(state, &retry_window);
         return;
     }
 
@@ -1534,15 +1795,9 @@ fn process_window_request(
             0.0,
             runtime,
         );
+        quiesce_interrupted_retries(state, &retry_window);
         return;
     }
-    if let Some(failure) = request_timeout_failure(&request) {
-        for cell in &decode_cells {
-            publish_failure(state, cell, failure.clone());
-        }
-        return;
-    }
-
     let open_t0 = Instant::now();
     if runtime.decoder.is_none() && runtime.decoder_unavailable.is_none() {
         let use_hw = hw_decode && !runtime.hw_decode_failed;
@@ -1583,13 +1838,6 @@ fn process_window_request(
         }
         return;
     }
-    if let Some(failure) = request_timeout_failure(&request) {
-        for cell in &decode_cells {
-            publish_failure(state, cell, failure.clone());
-        }
-        return;
-    }
-
     let mut metrics = DecodeMetrics::default();
     let mut superseded = false;
     // どの出口で run ループを抜けたかを残す。抜け方によっては**セルが未着のまま**になり、
@@ -1600,11 +1848,22 @@ fn process_window_request(
         .map(|cell| (cell.index, cell.id))
         .collect();
     let mut retry_with_software = true;
+    let mut timeout_attempts = BTreeMap::<StripCellId, usize>::new();
+    let max_forward_gap_secs = strip_decode_run_max_forward_gap_secs(
+        lock_recover(state)
+            .axis_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.maximum_keyframe_gap_secs),
+    );
     while retry_with_software && !cancel.load(Ordering::Acquire) {
         retry_with_software = false;
         decode_cells.retain(|cell| !lock_recover(state).cells.contains_key(&cell.id));
-        let runs = group_strip_decode_runs(&decode_cells, request.spec.center_index);
-        for run in runs {
+        let mut runs = VecDeque::from(group_strip_decode_runs(
+            &decode_cells,
+            request.spec.center_index,
+            max_forward_gap_secs,
+        ));
+        while let Some(run) = runs.pop_front() {
             if cancelled_or_superseded(cancel, requests, request.id) {
                 let decision =
                     decide_strip_supersede(&lock_recover(state).settled_ids(), &run.cells);
@@ -1626,6 +1885,7 @@ fn process_window_request(
                 .decoder
                 .as_ref()
                 .is_some_and(SeekStripDecoder::keyframes_only);
+            mark_retry_running(state, &run.cells, &retry_window);
             let result = {
                 let Some(decoder) = runtime.decoder.as_mut() else {
                     exit_reason = "decoder_gone";
@@ -1637,14 +1897,7 @@ fn process_window_request(
                     queue_deferred_cache_write(pending_writes, &decoded);
                     let _ = maybe_emit_fill_wait(path, &request, &work, requests, state);
                 };
-                decoder.decode_run(
-                    &run,
-                    request.id,
-                    request.requested_at,
-                    requests,
-                    cancel,
-                    &mut publish,
-                )
+                decoder.decode_run(&run, request.id, requests, cancel, &mut publish)
             };
             let full_frame_retry = decoder_was_keyframes_only
                 .then(|| result.full_frame_retry_reason())
@@ -1702,6 +1955,22 @@ fn process_window_request(
                     superseded = true;
                     break;
                 }
+                RunStop::TimedOut(cell) => {
+                    let attempt_number = timeout_attempts
+                        .entry(cell.id)
+                        .and_modify(|attempts| *attempts += 1)
+                        .or_insert(1);
+                    let timeout_plan = plan_timed_out_run(&run, &cell, *attempt_number);
+                    publish_retry_state(state, &cell, &retry_window, timeout_plan.retry_state);
+                    if let Some(retry) = timeout_plan.retry {
+                        runs.push_back(retry);
+                    } else {
+                        exit_reason = "cell_timeout_awaiting_trigger";
+                    }
+                    if let Some(remaining) = timeout_plan.remaining {
+                        runs.push_front(remaining);
+                    }
+                }
                 RunStop::Failed(failure)
                     if decoder_was_hw && failure.should_retry_in_software() =>
                 {
@@ -1741,22 +2010,15 @@ fn process_window_request(
                     break;
                 }
                 RunStop::Failed(failure) => {
-                    let timed_out = matches!(failure, StripThumbnailFailure::WindowTimedOut { .. });
-                    let failed_cells = if timed_out {
-                        decode_cells.as_slice()
-                    } else {
-                        run.cells.as_slice()
-                    };
-                    for cell in failed_cells {
+                    for cell in &run.cells {
                         publish_failure(state, cell, failure.clone());
-                    }
-                    if timed_out {
-                        break;
                     }
                 }
             }
         }
     }
+
+    quiesce_interrupted_retries(state, &retry_window);
 
     // 未着のまま終わったセルだけを名指しする。app 側の 1 行と突き合わせれば、
     // どちらが落としたかが決まる。
@@ -1828,7 +2090,9 @@ fn load_cached_cells(
 }
 
 fn publish_ready(state: &Mutex<SharedState>, cell: &PlannedStripCell, thumbnail: StripThumbnail) {
-    lock_recover(state)
+    let mut shared = lock_recover(state);
+    shared.retry_cells.remove(&cell.id);
+    shared
         .cells
         .insert(cell.id, StripThumbnailOutcome::Ready(thumbnail));
 }
@@ -1842,9 +2106,75 @@ fn publish_failure(
     if shared.cells.contains_key(&cell.id) {
         return;
     }
+    shared.retry_cells.remove(&cell.id);
     shared
         .cells
         .insert(cell.id, StripThumbnailOutcome::Failed(failure));
+}
+
+fn publish_retry_state(
+    state: &Mutex<SharedState>,
+    cell: &PlannedStripCell,
+    retry_window: &StripThumbnailRetryWindow,
+    retry_state: StripThumbnailRetryState,
+) {
+    let mut shared = lock_recover(state);
+    if shared.cells.contains_key(&cell.id) {
+        return;
+    }
+    shared.retry_cells.insert(
+        cell.id,
+        StripThumbnailRetry {
+            state: retry_state,
+            window: retry_window.clone(),
+        },
+    );
+}
+
+fn mark_retry_running(
+    state: &Mutex<SharedState>,
+    cells: &[PlannedStripCell],
+    retry_window: &StripThumbnailRetryWindow,
+) {
+    let mut shared = lock_recover(state);
+    for cell in cells {
+        let Some(retry) = shared.retry_cells.get_mut(&cell.id) else {
+            continue;
+        };
+        if retry.window != *retry_window {
+            continue;
+        }
+        if let StripThumbnailRetryState::Scheduled {
+            trigger,
+            timeout_secs,
+        } = retry.state
+        {
+            retry.state = StripThumbnailRetryState::Running {
+                trigger,
+                timeout_secs,
+            };
+        }
+    }
+}
+
+fn quiesce_interrupted_retries(
+    state: &Mutex<SharedState>,
+    retry_window: &StripThumbnailRetryWindow,
+) {
+    let mut shared = lock_recover(state);
+    for retry in shared.retry_cells.values_mut() {
+        if retry.window == *retry_window
+            && matches!(
+                retry.state,
+                StripThumbnailRetryState::Scheduled { .. }
+                    | StripThumbnailRetryState::Running { .. }
+            )
+        {
+            retry.state = StripThumbnailRetryState::AwaitingTrigger {
+                timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+            };
+        }
+    }
 }
 
 fn all_visible_ready(work: &StripWindowWork, state: &Mutex<SharedState>) -> bool {
@@ -2189,7 +2519,6 @@ impl SeekStripDecoder {
         &mut self,
         run: &StripDecodeRun,
         request_id: u64,
-        requested_at: Instant,
         requests: &Mutex<LatestWindowRequest>,
         cancel: &AtomicBool,
         publish: &mut impl FnMut(DecodedCell),
@@ -2200,9 +2529,11 @@ impl SeekStripDecoder {
         let Some(first) = run.cells.first() else {
             return RunDecodeResult::complete();
         };
-        if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
-            return RunDecodeResult::failed(failure);
-        }
+        // The budget starts at this cell's seek, not when its containing window was requested.
+        // `active_cell_index` lets the packet loop observe cursor progress without borrowing the
+        // decode closure's mutable cursor.
+        let active_cell_index = Cell::new(0usize);
+        let cell_started_at = Cell::new(Instant::now());
         let seek_target_secs = if self.mode == StripDecodeMode::FullFrames {
             first.target_secs
                 - first.frame_match_tolerance.before_secs
@@ -2258,6 +2589,10 @@ impl SeekStripDecoder {
         let mut transform_elapsed = Duration::ZERO;
         let indexed_presentation_targets = RefCell::new(BTreeMap::new());
         let mut cell_failures = Vec::new();
+        let reset_cell_budget = |next_cursor: usize| {
+            active_cell_index.set(next_cursor);
+            cell_started_at.set(Instant::now());
+        };
 
         let mut publish_frame_for =
             |frame: &Video, cells: &[PlannedStripCell]| -> Result<(), StripThumbnailFailure> {
@@ -2296,6 +2631,7 @@ impl SeekStripDecoder {
                 ));
                 publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
                 cursor += 1;
+                reset_cell_budget(cursor);
                 last_frame = None;
                 return Ok(cursor >= run.cells.len());
             };
@@ -2319,6 +2655,7 @@ impl SeekStripDecoder {
                 ) {
                     publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
                     cursor += 1;
+                    reset_cell_budget(cursor);
                     last_frame = Some((frame, pts_secs));
                     return Ok(cursor >= run.cells.len());
                 }
@@ -2365,6 +2702,7 @@ impl SeekStripDecoder {
                     ));
                 }
             }
+            let cursor_before_matches = cursor;
             cursor = matches.next_cursor;
 
             let exact_start = cursor;
@@ -2377,6 +2715,9 @@ impl SeekStripDecoder {
                 cursor += 1;
             }
             publish_frame_for(&frame, &run.cells[exact_start..cursor])?;
+            if cursor > cursor_before_matches {
+                reset_cell_budget(cursor);
+            }
             last_frame = Some((frame, pts_secs));
             Ok(cursor >= run.cells.len())
         };
@@ -2384,8 +2725,12 @@ impl SeekStripDecoder {
         let mut stop = RunStop::Complete;
         let mut run_completed = false;
         'packets: for item in input.packets() {
-            if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
-                stop = RunStop::Failed(failure);
+            if let Some(cell) = timed_out_active_cell(
+                run,
+                active_cell_index.get(),
+                cell_started_at.get().elapsed(),
+            ) {
+                stop = RunStop::TimedOut(cell);
                 break;
             }
             if cancel.load(Ordering::Acquire) {
@@ -2437,8 +2782,12 @@ impl SeekStripDecoder {
                 continue;
             }
             loop {
-                if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
-                    stop = RunStop::Failed(failure);
+                if let Some(cell) = timed_out_active_cell(
+                    run,
+                    active_cell_index.get(),
+                    cell_started_at.get().elapsed(),
+                ) {
+                    stop = RunStop::TimedOut(cell);
                     break 'packets;
                 }
                 let mut frame = Video::empty();
@@ -2460,14 +2809,22 @@ impl SeekStripDecoder {
         }
 
         if matches!(stop, RunStop::Complete) && !run_completed {
-            if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
-                stop = RunStop::Failed(failure);
+            if let Some(cell) = timed_out_active_cell(
+                run,
+                active_cell_index.get(),
+                cell_started_at.get().elapsed(),
+            ) {
+                stop = RunStop::TimedOut(cell);
             } else if let Err(error) = decoder.decoder_mut().send_eof() {
                 first_decode_error.get_or_insert_with(|| error.to_string());
             } else {
                 loop {
-                    if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
-                        stop = RunStop::Failed(failure);
+                    if let Some(cell) = timed_out_active_cell(
+                        run,
+                        active_cell_index.get(),
+                        cell_started_at.get().elapsed(),
+                    ) {
+                        stop = RunStop::TimedOut(cell);
                         break;
                     }
                     let mut frame = Video::empty();
@@ -2628,6 +2985,7 @@ enum RunStop {
     Complete,
     Superseded,
     Cancelled,
+    TimedOut(PlannedStripCell),
     Failed(StripThumbnailFailure),
 }
 
@@ -2906,12 +3264,18 @@ mod tests {
         );
     }
 
-    fn axis(count: usize) -> StripAxis {
+    fn axis_with_interval(count: usize, interval_secs: f64) -> StripAxis {
         StripAxis::KeyframeIndex {
-            keyframes: (0..count).map(|index| index as f64).collect(),
+            keyframes: (0..count)
+                .map(|index| index as f64 * interval_secs)
+                .collect(),
             adopted: (0..count).collect(),
-            duration_secs: count.saturating_sub(1) as f64,
+            duration_secs: count.saturating_sub(1) as f64 * interval_secs,
         }
+    }
+
+    fn axis(count: usize) -> StripAxis {
+        axis_with_interval(count, 1.0)
     }
 
     fn plan(
@@ -2938,53 +3302,255 @@ mod tests {
     #[test]
     fn cell_display_state_distinguishes_pending_ready_and_failed() {
         assert!(matches!(
-            decide_strip_thumbnail_cell_state(None, None),
+            decide_strip_thumbnail_cell_state(None, None, None),
             StripThumbnailCellState::Pending
         ));
 
         let ready = StripThumbnailOutcome::Ready(thumbnail(3.0));
         assert!(matches!(
-            decide_strip_thumbnail_cell_state(Some(&ready), None),
+            decide_strip_thumbnail_cell_state(Some(&ready), None, None),
             StripThumbnailCellState::Ready(thumbnail) if thumbnail.target_secs == 3.0
         ));
 
         let failed =
             StripThumbnailOutcome::Failed(StripThumbnailFailure::NoFrame(NoFrameReason::unknown()));
         assert!(matches!(
-            decide_strip_thumbnail_cell_state(Some(&failed), None),
+            decide_strip_thumbnail_cell_state(Some(&failed), None, None),
             StripThumbnailCellState::Failed(StripThumbnailFailure::NoFrame(_))
         ));
         assert!(matches!(
-            decide_strip_thumbnail_cell_state(None, Some(&StripThumbnailFailure::InvalidCellTime)),
+            decide_strip_thumbnail_cell_state(
+                None,
+                None,
+                Some(&StripThumbnailFailure::InvalidCellTime)
+            ),
             StripThumbnailCellState::Failed(StripThumbnailFailure::InvalidCellTime)
         ));
     }
 
     #[test]
-    fn window_timeout_is_terminal_at_the_bound_and_has_a_user_reason() {
-        assert_eq!(
-            window_timeout_failure(
-                Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS) - Duration::from_nanos(1)
-            ),
-            None
-        );
-        let failure = window_timeout_failure(Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS))
-            .expect("the exact window bound must settle pending cells");
-        assert_eq!(
-            failure,
-            StripThumbnailFailure::WindowTimedOut {
-                timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
-            }
-        );
-        assert_eq!(failure.user_label(), "生成が時間切れです");
-
-        let outcome = StripThumbnailOutcome::Failed(failure);
-        assert!(matches!(
-            decide_strip_thumbnail_cell_state(Some(&outcome), None),
-            StripThumbnailCellState::Failed(StripThumbnailFailure::WindowTimedOut {
-                timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
-            })
+    fn cell_timeout_is_recoverable_at_the_bound_and_has_distinct_ui_states() {
+        assert!(!cell_decode_budget_exhausted(
+            Duration::from_secs(STRIP_THUMB_CELL_TIMEOUT_SECS) - Duration::from_nanos(1)
         ));
+        assert!(cell_decode_budget_exhausted(Duration::from_secs(
+            STRIP_THUMB_CELL_TIMEOUT_SECS
+        )));
+
+        let retrying = StripThumbnailRetryState::Running {
+            trigger: StripThumbnailRetryTrigger::WindowPassCompleted,
+            timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+        };
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(None, Some(&retrying), None),
+            StripThumbnailCellState::RetryPending(StripThumbnailRetryState::Running { .. })
+        ));
+        assert_eq!(retrying.user_label(), "もう一度生成しています");
+        assert!(retrying.keeps_repainting());
+
+        let waiting = StripThumbnailRetryState::AwaitingTrigger {
+            timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+        };
+        assert_eq!(waiting.user_label(), "操作すると再生成します");
+        assert!(!waiting.keeps_repainting());
+    }
+
+    #[test]
+    fn one_slow_cell_leaves_its_siblings_runnable_with_fresh_budgets() {
+        let axis = axis(6);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(2.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let mut cells = work.cache_lookup.clone();
+        cells.sort_by_key(|cell| cell.index);
+        let run = StripDecodeRun { cells };
+        let slow = run.cells.first().expect("the run has a first cell").clone();
+
+        let timeout = plan_timed_out_run(&run, &slow, 1);
+        assert_eq!(
+            timeout
+                .remaining
+                .as_ref()
+                .expect("siblings continue")
+                .cells
+                .iter()
+                .map(|cell| cell.index)
+                .collect::<Vec<_>>(),
+            run.cells[1..]
+                .iter()
+                .map(|cell| cell.index)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            timeout
+                .retry
+                .as_ref()
+                .expect("one recovery pass is queued")
+                .cells,
+            vec![slow]
+        );
+    }
+
+    #[test]
+    fn a_transient_timeout_can_fill_on_the_bounded_recovery_pass() {
+        let axis = axis(3);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work.cache_lookup[0].clone();
+        let retry_window = StripThumbnailRetryWindow::from_requested_ids(&work.requested_ids);
+        let state = Mutex::new(SharedState::new());
+        let first_timeout = plan_timed_out_run(
+            &StripDecodeRun {
+                cells: vec![cell.clone()],
+            },
+            &cell,
+            1,
+        );
+        publish_retry_state(&state, &cell, &retry_window, first_timeout.retry_state);
+        assert!(lock_recover(&state).cells.get(&cell.id).is_none());
+
+        publish_ready(&state, &cell, thumbnail(cell.target_secs));
+        let snapshot = lock_recover(&state).snapshot();
+        assert!(matches!(
+            snapshot.outcome_for_secs(cell.target_secs),
+            Some(StripThumbnailOutcome::Ready(_))
+        ));
+        assert_eq!(snapshot.retry_state_for_secs(cell.target_secs), None);
+    }
+
+    #[test]
+    fn persistent_timeout_stops_after_two_runs_for_the_same_window() {
+        let axis = axis(3);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work.cache_lookup[0].clone();
+        let run = StripDecodeRun {
+            cells: vec![cell.clone()],
+        };
+
+        let first = plan_timed_out_run(&run, &cell, 1);
+        assert!(first.retry.is_some());
+        let second = plan_timed_out_run(&run, &cell, 2);
+        assert!(second.retry.is_none());
+        assert!(matches!(
+            second.retry_state,
+            StripThumbnailRetryState::AwaitingTrigger { .. }
+        ));
+        // A third run is never queued by the stable-window state machine.
+        assert_eq!(
+            usize::from(first.retry.is_some()) + usize::from(second.retry.is_some()),
+            1
+        );
+    }
+
+    #[test]
+    fn timeout_retry_requires_a_typed_change_but_missing_delivery_still_recovers() {
+        let axis = axis(8);
+        let spec = StripWindowSpec::new(3.0, 3, StripLookahead::new(1, 1));
+        let retry_window = retry_window_for(&axis, spec);
+        let timed_out_id = *retry_window
+            .requested_ids
+            .iter()
+            .next()
+            .expect("window has cells");
+        let retry = StripThumbnailRetry {
+            state: StripThumbnailRetryState::AwaitingTrigger {
+                timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+            },
+            window: retry_window.clone(),
+        };
+
+        assert!(!cell_needs_request(
+            None,
+            Some(&retry),
+            &retry_window,
+            StripThumbnailRequestTrigger::DeliveryRecovery,
+        ));
+        assert!(!cell_needs_request(
+            None,
+            Some(&retry),
+            &retry_window,
+            StripThumbnailRequestTrigger::WindowRecalculated,
+        ));
+        assert!(cell_needs_request(
+            None,
+            Some(&retry),
+            &retry_window,
+            StripThumbnailRequestTrigger::UserInteraction,
+        ));
+        assert!(cell_needs_request(
+            None,
+            Some(&retry),
+            &retry_window,
+            StripThumbnailRequestTrigger::StripRedisplayed,
+        ));
+
+        let moved_window = retry_window_for(
+            &axis,
+            StripWindowSpec::new(6.0, 3, StripLookahead::new(1, 1)),
+        );
+        assert!(cell_needs_request(
+            None,
+            Some(&retry),
+            &moved_window,
+            StripThumbnailRequestTrigger::DeliveryRecovery,
+        ));
+        assert!(cell_needs_request(
+            None,
+            None,
+            &retry_window,
+            StripThumbnailRequestTrigger::DeliveryRecovery,
+        ));
+
+        let ready = StripThumbnailOutcome::Ready(thumbnail(timed_out_id.target_secs()));
+        assert!(!cell_needs_request(
+            Some(&ready),
+            Some(&retry),
+            &moved_window,
+            StripThumbnailRequestTrigger::UserInteraction,
+        ));
+    }
+
+    #[test]
+    fn interrupted_retry_becomes_quiescent_instead_of_repainting_forever() {
+        let axis = axis(3);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work.cache_lookup[0].clone();
+        let retry_window = StripThumbnailRetryWindow::from_requested_ids(&work.requested_ids);
+        let state = Mutex::new(SharedState::new());
+        publish_retry_state(
+            &state,
+            &cell,
+            &retry_window,
+            StripThumbnailRetryState::Scheduled {
+                trigger: StripThumbnailRetryTrigger::UserInteraction,
+                timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS,
+            },
+        );
+
+        quiesce_interrupted_retries(&state, &retry_window);
+
+        let snapshot = lock_recover(&state).snapshot();
+        let retry = snapshot
+            .retry_state_for_secs(cell.target_secs)
+            .expect("the interrupted timeout remains recoverable");
+        assert!(matches!(
+            retry,
+            StripThumbnailRetryState::AwaitingTrigger { .. }
+        ));
+        assert!(!retry.keeps_repainting());
     }
 
     #[test]
@@ -3026,6 +3592,7 @@ mod tests {
                 axis: StripAxisResolution::Ready(resolved_axis),
                 axis_diagnostics: None,
                 cells: BTreeMap::new(),
+                retry_cells: BTreeMap::new(),
                 status: StripThumbnailWorkerStatus::DecoderUnavailable("open failed".into()),
                 latest_request_failures: Vec::new(),
                 decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
@@ -3064,6 +3631,15 @@ mod tests {
             Some(StripThumbnailOutcome::Failed(
                 StripThumbnailFailure::NoFrame(_)
             ))
+        ));
+        assert_eq!(snapshot.retry_state_for_secs(cell.target_secs), None);
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(
+                snapshot.outcome_for_secs(cell.target_secs),
+                snapshot.retry_state_for_secs(cell.target_secs),
+                None,
+            ),
+            StripThumbnailCellState::Failed(StripThumbnailFailure::NoFrame(_))
         ));
         assert_eq!(snapshot.latest_failure_for_index(cell.index), None);
     }
@@ -3184,6 +3760,7 @@ mod tests {
                     warmup_center_index,
                     visible_count,
                     balanced_lookahead,
+                    StripThumbnailRequestTrigger::StripRedisplayed,
                 )
                 .expect("worker warmup request must be accepted");
             loop {
@@ -3231,7 +3808,13 @@ mod tests {
                 _ => balanced_lookahead,
             };
             worker
-                .request(Arc::clone(&axis), center_index, visible_count, lookahead)
+                .request(
+                    Arc::clone(&axis),
+                    center_index,
+                    visible_count,
+                    lookahead,
+                    StripThumbnailRequestTrigger::UserInteraction,
+                )
                 .expect("worker request must be accepted");
             previous_center_index = Some(center_index);
             if sequence_index + 1 < center_sequence_secs.len() && request_delay_ms > 0 {
@@ -3640,7 +4223,11 @@ mod tests {
             StripWindowSpec::new(6.0, 5, StripLookahead::new(2, 2)),
             &BTreeSet::new(),
         );
-        let runs = group_strip_decode_runs(&work.cache_lookup, 6.0);
+        let runs = group_strip_decode_runs(
+            &work.cache_lookup,
+            6.0,
+            strip_decode_run_max_forward_gap_secs(Some(4.0)),
+        );
         let shapes: Vec<Vec<usize>> = runs
             .iter()
             .map(|run| run.cells.iter().map(|cell| cell.index).collect())
@@ -3661,12 +4248,86 @@ mod tests {
         );
         let decode =
             plan_strip_decode_cells(&work.cache_lookup, &BTreeSet::from([id(4.0), id(8.0)]));
-        let runs = group_strip_decode_runs(&decode, 6.0);
+        let runs = group_strip_decode_runs(
+            &decode,
+            6.0,
+            strip_decode_run_max_forward_gap_secs(Some(4.0)),
+        );
         let shapes: Vec<Vec<usize>> = runs
             .iter()
             .map(|run| run.cells.iter().map(|cell| cell.index).collect())
             .collect();
         assert_eq!(shapes, vec![vec![6], vec![7], vec![5], vec![9], vec![2, 3]]);
+    }
+
+    /// The run optimization is intentional for zoomed strips. A dense source GOP must not turn
+    /// the existing 0.1--30 second bands into one seek per cell.
+    #[test]
+    fn zoomed_strip_intervals_keep_the_existing_decode_runs() {
+        let max_forward_gap_secs = strip_decode_run_max_forward_gap_secs(Some(0.5));
+        for interval_secs in [0.1, 1.0, 5.0, 30.0] {
+            let axis = axis_with_interval(14, interval_secs);
+            let work = plan(
+                &axis,
+                StripWindowSpec::new(6.0, 5, StripLookahead::new(2, 2)),
+                &BTreeSet::new(),
+            );
+            let runs = group_strip_decode_runs(&work.cache_lookup, 6.0, max_forward_gap_secs);
+            let shapes: Vec<Vec<usize>> = runs
+                .iter()
+                .map(|run| run.cells.iter().map(|cell| cell.index).collect())
+                .collect();
+            assert_eq!(
+                shapes,
+                vec![vec![6], vec![7, 8], vec![3, 4, 5], vec![9, 10], vec![1, 2]],
+                "zoomed interval {interval_secs} seconds must retain maximal runs"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_strip_intervals_split_contiguous_indices_into_individual_seeks() {
+        let axis = axis_with_interval(14, 500.0);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(6.0, 5, StripLookahead::new(2, 2)),
+            &BTreeSet::new(),
+        );
+        let runs = group_strip_decode_runs(
+            &work.cache_lookup,
+            6.0,
+            strip_decode_run_max_forward_gap_secs(Some(4.17)),
+        );
+        assert_eq!(runs.len(), work.cache_lookup.len());
+        assert!(runs.iter().all(|run| run.cells.len() == 1));
+    }
+
+    #[test]
+    fn missing_index_uses_the_same_bounded_run_policy() {
+        let max_forward_gap_secs = strip_decode_run_max_forward_gap_secs(None);
+        assert_eq!(
+            max_forward_gap_secs,
+            crate::video::seek_strip::SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS
+                * STRIP_DECODE_RUN_GOP_MULTIPLIER
+        );
+
+        let zoomed_axis = axis_with_interval(14, 30.0);
+        let zoomed = plan(
+            &zoomed_axis,
+            StripWindowSpec::new(6.0, 5, StripLookahead::new(2, 2)),
+            &BTreeSet::new(),
+        );
+        let zoomed_runs = group_strip_decode_runs(&zoomed.cache_lookup, 6.0, max_forward_gap_secs);
+        assert!(zoomed_runs.iter().any(|run| run.cells.len() > 1));
+
+        let whole_axis = axis_with_interval(14, 500.0);
+        let whole = plan(
+            &whole_axis,
+            StripWindowSpec::new(6.0, 5, StripLookahead::new(2, 2)),
+            &BTreeSet::new(),
+        );
+        let whole_runs = group_strip_decode_runs(&whole.cache_lookup, 6.0, max_forward_gap_secs);
+        assert!(whole_runs.iter().all(|run| run.cells.len() == 1));
     }
 
     #[test]
@@ -3754,6 +4415,7 @@ mod tests {
             id,
             axis: Arc::clone(&axis),
             spec: StripWindowSpec::new(id as f64, 3, StripLookahead::default()),
+            trigger: StripThumbnailRequestTrigger::WindowRecalculated,
             requested_at: Instant::now(),
         };
         assert!(pending.replace(make(1)).is_none());
