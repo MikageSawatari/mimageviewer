@@ -334,7 +334,7 @@ fn run() -> Result<()> {
 
 fn usage() -> String {
     format!(
-        "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE\n  \
+        "Usage:\n  bench_dupe scan --dir DIR [--recursive] --out FILE [--threads N] [--limit N] [--skip N]\n  \
          bench_dupe decode-selfcheck --dir DIR [--recursive] --out FILE [--limit N]\n  \
          bench_dupe pdf-selfcheck --dir DIR [--recursive] --out FILE \
          [--limit-books N] [--max-pages-per-book N]\n  \
@@ -417,20 +417,62 @@ fn run_scan(args: &[String]) -> Result<()> {
     let mut dir = None;
     let mut output = None;
     let mut recursive = false;
+    let mut threads = None;
+    let mut limit = None;
+    let mut skip = 0usize;
     let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
+        let flag = args[index].as_str();
+        match flag {
             "--dir" => dir = Some(PathBuf::from(take_value(args, &mut index, "--dir")?)),
             "--out" => output = Some(PathBuf::from(take_value(args, &mut index, "--out")?)),
             "--recursive" => recursive = true,
+            // Concurrency is a measurement axis, not a setting: the product's
+            // own indexer decides its own. Reading is what dominates a scan, so
+            // the useful question is how many reads to have outstanding.
+            "--threads" => threads = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            // --skip with --limit takes a disjoint slice, so a sweep can give
+            // each thread count files the file cache has not already seen.
+            "--limit" => limit = Some(parse_usize(&take_value(args, &mut index, flag)?, flag)?),
+            "--skip" => skip = parse_usize(&take_value(args, &mut index, flag)?, flag)?,
             flag => return Err(format!("unknown scan option {flag:?}")),
         }
         index += 1;
     }
     let dir = dir.ok_or_else(|| "scan requires --dir".to_owned())?;
     let output = output.ok_or_else(|| "scan requires --out".to_owned())?;
-    let paths = collect_image_paths(&dir, recursive)?;
-    let results: Vec<Result<ScanRecord>> = paths.par_iter().map(|path| scan_one(path)).collect();
+    let mut paths = collect_image_paths(&dir, recursive)?;
+    if skip > 0 {
+        paths = if skip >= paths.len() {
+            Vec::new()
+        } else {
+            paths.split_off(skip)
+        };
+    }
+    if let Some(limit) = limit {
+        paths.truncate(limit);
+    }
+    let started = Instant::now();
+    let scan_all =
+        || -> Vec<Result<ScanRecord>> { paths.par_iter().map(|path| scan_one(path)).collect() };
+    let results: Vec<Result<ScanRecord>> = match threads {
+        Some(threads) => rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| format!("thread pool: {error}"))?
+            .install(scan_all),
+        None => scan_all(),
+    };
+    let wall = started.elapsed().as_secs_f64();
+    eprintln!(
+        "scan: files={} threads={} wall={:.2}s rate={:.1} files/s",
+        results.len(),
+        threads
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "default".to_owned()),
+        wall,
+        results.len() as f64 / wall.max(1e-9),
+    );
     let mut records = Vec::with_capacity(results.len());
     for result in results {
         records.push(result?);
