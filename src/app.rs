@@ -73713,6 +73713,52 @@ mod favorite_view_state_tests {
     }
 
     #[test]
+    fn preferences_standard_update_does_not_feed_back_into_the_active_favorite() {
+        let mut app = setup_app_for_test();
+        let id = uuid::Uuid::new_v4();
+        let common = state(100, SortOrder::FileName);
+        let favorite = state(180, SortOrder::DateDesc);
+        let edited_standard = state(240, SortOrder::Numeric);
+
+        app.settings.remember_favorite_view_state = true;
+        common.apply_to_settings(&mut app.settings);
+        app.favorite_view_states.insert(id, favorite.clone());
+        app.settings.apply_favorite_view_overlay(id, &favorite);
+
+        let mut edited = app.settings.preferences_snapshot();
+        edited_standard.apply_to_settings(&mut edited);
+        crate::ui_dialogs::preferences::prepare_preferences_settings_for_commit(
+            &mut edited,
+            &mut app.settings,
+        );
+        app.settings = edited;
+
+        assert_eq!(FavoriteViewState::from_settings(&app.settings), favorite);
+        assert_eq!(
+            FavoriteViewState::from_settings(&app.settings.preferences_snapshot()),
+            edited_standard
+        );
+        assert_eq!(app.favorite_view_states[&id], favorite);
+
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id], favorite);
+        assert!(
+            app.favorite_view_writes
+                .next_due_in_at(std::time::Instant::now())
+                .is_none()
+        );
+
+        app.settings.thumb_px = 260;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 260);
+        assert!(
+            app.favorite_view_writes
+                .next_due_in_at(std::time::Instant::now())
+                .is_some()
+        );
+    }
+
+    #[test]
     fn disabled_mode_does_not_apply_or_update_but_keeps_records() {
         let mut app = setup_app_for_test();
         let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));

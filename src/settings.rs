@@ -7112,6 +7112,34 @@ impl Settings {
         overlay.common.apply_to_settings(self);
     }
 
+    /// 環境設定ダイアログへ渡す snapshot を作る。
+    ///
+    /// 有効値へお気に入り専用の表示状態が載っていても、環境設定が表示・編集するのは
+    /// 常に標準の値とする。対象項目は [`FavoriteViewState`] の変換だけから導く。
+    pub(crate) fn preferences_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.clear_favorite_view_overlay();
+        snapshot
+    }
+
+    /// 環境設定で編集した表示状態を標準値へ route する。
+    ///
+    /// お気に入り専用値が有効な間は、その有効値を `Settings` のフィールドへ残したまま、
+    /// ダイアログの値だけを標準値へ反映する。お気に入り外ではダイアログの値をそのまま
+    /// 有効値 (= 標準値) にする。
+    pub(crate) fn route_preferences_view_state(
+        &mut self,
+        standard: FavoriteViewState,
+        active: FavoriteViewState,
+    ) {
+        let Some(overlay) = self.favorite_view_overlay.as_mut() else {
+            standard.apply_to_settings(self);
+            return;
+        };
+        overlay.common = standard;
+        active.apply_to_settings(self);
+    }
+
     pub(crate) fn active_favorite_view_id(&self) -> Option<Uuid> {
         self.favorite_view_overlay
             .as_ref()

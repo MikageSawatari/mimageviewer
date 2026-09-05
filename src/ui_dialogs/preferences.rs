@@ -57,6 +57,7 @@ pub fn draw_favorite_view_state_settings_snapshot_fixture(ui: &mut egui::Ui) {
         0,
     );
     state.favorite_view_state_entry_count = 3;
+    state.favorite_view_state_active = true;
     pages::page_thumbnail(ui, &mut state);
 }
 
@@ -70,6 +71,11 @@ fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
 }
 
 fn settings_equal_for_close_prompt(a: &Settings, b: &Settings) -> bool {
+    // 実行中は対象フィールドにお気に入り専用値が載るため、永続化対象の標準値へ
+    // 戻した snapshot 同士で比較する。これにより、専用値が有効な場所で標準値だけを
+    // 編集した場合も未保存確認を出せる。
+    let a = a.preferences_snapshot();
+    let b = b.preferences_snapshot();
     match (serde_json::to_value(a), serde_json::to_value(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -788,6 +794,8 @@ pub(crate) struct PreferencesState {
 
     // ── サムネイルページ: お気に入り別表示状態 ──────────────────
     pub favorite_view_state_entry_count: usize,
+    /// 現在地でお気に入り専用の表示状態が有効か。環境設定内の標準値案内に使う。
+    pub favorite_view_state_active: bool,
     pub favorite_view_state_clear_confirm_open: bool,
     pub favorite_view_state_clear_requested: bool,
     pub favorite_view_state_clear_result: Option<String>,
@@ -1186,7 +1194,7 @@ impl PreferencesState {
             };
 
         Self {
-            settings: s.clone(),
+            settings: s.preferences_snapshot(),
             selected: PreferencesPage::General,
             right_panel_scroll_generation: 0,
             search_query: String::new(),
@@ -1279,6 +1287,7 @@ impl PreferencesState {
             reading_history_clear_requested: false,
             reading_history_clear_result: None,
             favorite_view_state_entry_count: 0,
+            favorite_view_state_active: s.active_favorite_view_id().is_some(),
             favorite_view_state_clear_confirm_open: false,
             favorite_view_state_clear_requested: false,
             favorite_view_state_clear_result: None,
@@ -1795,14 +1804,19 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 
 // ── メインダイアログ ────────────────────────────────────────────
 
-fn prepare_preferences_settings_for_commit(
+pub(crate) fn prepare_preferences_settings_for_commit(
     edited: &mut crate::settings::Settings,
     live: &mut crate::settings::Settings,
 ) {
+    // ダイアログが編集した標準値と、いま画面に適用中の値を、どちらも同じ型で退避する。
+    // overwrite_non_preferences_from は対象の一部を runtime 値で補うため、その前に取る。
+    let standard_view_state = crate::settings::FavoriteViewState::from_settings(edited);
+    let active_view_state = crate::settings::FavoriteViewState::from_settings(live);
     let old_details_selection_bar_mode = live.details_selection_bar_mode.normalized();
     let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
 
     edited.overwrite_non_preferences_from(live);
+    edited.route_preferences_view_state(standard_view_state, active_view_state);
 
     // セット C は上の移送対象なので、スナップショット上で先に複製すると live 値で
     // 上書きされて消える。旧 live → 新 snapshot が Dedicated へ入る遷移だけ、移送後に複製する。
@@ -1962,8 +1976,10 @@ impl App {
                 .expect("preferences state was initialized above")
                 .right_panel_scroll_generation = generation;
         }
+        let favorite_view_state_active = self.settings.active_favorite_view_id().is_some();
         if let Some(state) = self.pref_state.as_mut() {
             state.favorite_view_state_entry_count = self.favorite_view_states.len();
+            state.favorite_view_state_active = favorite_view_state_active;
         }
 
         if let Some(requested) = self.preferences_requested_page.take() {
@@ -3640,5 +3656,147 @@ mod tests {
             "re-entering Dedicated must overwrite stale C from the latest A"
         );
         assert_eq!(dedicated_again.details_selection_bar_name_width, 333.0);
+    }
+
+    fn preference_view_state_variant(variant: usize) -> crate::settings::FavoriteViewState {
+        use crate::settings::{
+            FavoriteViewState, GridDisplayOrder, GridItemDisplayKind, GridViewMode, ReadingFlow,
+            SortOrder, SpreadMode, ThumbAspect,
+        };
+
+        match variant {
+            0 => FavoriteViewState {
+                grid_view_mode: GridViewMode::Thumbnail,
+                thumb_px: 100,
+                thumb_aspect: ThumbAspect::Square,
+                thumb_aspect_auto: false,
+                grid_display_order: GridDisplayOrder::default(),
+                sort_order: SortOrder::FileName,
+                default_spread_mode: SpreadMode::Single,
+                default_reading_flow: ReadingFlow::Paged,
+            },
+            1 => FavoriteViewState {
+                grid_view_mode: GridViewMode::Details,
+                thumb_px: 180,
+                thumb_aspect: ThumbAspect::Landscape16x9,
+                thumb_aspect_auto: true,
+                grid_display_order: GridDisplayOrder::from_rows([
+                    vec![GridItemDisplayKind::VideoAudio],
+                    vec![GridItemDisplayKind::Image],
+                    vec![GridItemDisplayKind::Archive],
+                    vec![GridItemDisplayKind::Folder],
+                ]),
+                sort_order: SortOrder::DateDesc,
+                default_spread_mode: SpreadMode::RtlCover,
+                default_reading_flow: ReadingFlow::Horizontal,
+            },
+            _ => FavoriteViewState {
+                grid_view_mode: GridViewMode::Thumbnail,
+                thumb_px: 240,
+                thumb_aspect: ThumbAspect::Portrait2x3,
+                thumb_aspect_auto: false,
+                grid_display_order: GridDisplayOrder::from_rows([
+                    vec![GridItemDisplayKind::Image, GridItemDisplayKind::VideoAudio],
+                    vec![GridItemDisplayKind::Folder],
+                    vec![GridItemDisplayKind::Archive],
+                    vec![],
+                ]),
+                sort_order: SortOrder::Numeric,
+                default_spread_mode: SpreadMode::Ltr,
+                default_reading_flow: ReadingFlow::Vertical,
+            },
+        }
+    }
+
+    #[test]
+    fn preferences_commit_routes_all_favorite_view_fields_to_standard_values() {
+        use crate::settings::{DetailsColumnId, FavoriteViewState, Settings};
+
+        let common = preference_view_state_variant(0);
+        let favorite = preference_view_state_variant(1);
+        let edited_standard = preference_view_state_variant(2);
+        let favorite_id = uuid::Uuid::new_v4();
+
+        let mut live = Settings::default();
+        common.apply_to_settings(&mut live);
+        live.remember_favorite_view_state = true;
+        live.thumb_tooltip_show_filename = true;
+        live.details_column_order = vec![DetailsColumnId::Name];
+        live.apply_favorite_view_overlay(favorite_id, &favorite);
+
+        let mut edited = live.preferences_snapshot();
+        assert_eq!(FavoriteViewState::from_settings(&edited), common);
+        edited_standard.apply_to_settings(&mut edited);
+        edited.thumb_tooltip_show_filename = false;
+        edited.details_column_order = vec![DetailsColumnId::Size];
+
+        prepare_preferences_settings_for_commit(&mut edited, &mut live);
+
+        assert_eq!(FavoriteViewState::from_settings(&edited), favorite);
+        assert_eq!(
+            FavoriteViewState::from_settings(&edited.preferences_snapshot()),
+            edited_standard
+        );
+        assert_eq!(edited.active_favorite_view_id(), Some(favorite_id));
+        assert!(!edited.thumb_tooltip_show_filename);
+        assert_eq!(edited.details_column_order, vec![DetailsColumnId::Name]);
+    }
+
+    #[test]
+    fn preferences_commit_without_an_overlay_keeps_using_edited_values() {
+        use crate::settings::{DetailsColumnId, FavoriteViewState, Settings};
+
+        let edited_standard = preference_view_state_variant(2);
+        for remember in [false, true] {
+            let mut live = Settings::default();
+            preference_view_state_variant(0).apply_to_settings(&mut live);
+            live.remember_favorite_view_state = remember;
+            live.details_column_order = vec![DetailsColumnId::Name];
+
+            let mut edited = live.preferences_snapshot();
+            edited_standard.apply_to_settings(&mut edited);
+            edited.thumb_tooltip_show_filename = false;
+            edited.details_column_order = vec![DetailsColumnId::Size];
+            prepare_preferences_settings_for_commit(&mut edited, &mut live);
+
+            assert_eq!(FavoriteViewState::from_settings(&edited), edited_standard);
+            assert!(edited.active_favorite_view_id().is_none());
+            assert!(!edited.thumb_tooltip_show_filename);
+            assert_eq!(edited.details_column_order, vec![DetailsColumnId::Name]);
+        }
+    }
+
+    #[test]
+    fn preferences_snapshot_and_close_prompt_compare_standard_values() {
+        use crate::settings::{FavoriteViewState, Settings};
+
+        let common = preference_view_state_variant(0);
+        let favorite = preference_view_state_variant(1);
+        let mut live = Settings::default();
+        common.apply_to_settings(&mut live);
+        live.apply_favorite_view_overlay(uuid::Uuid::new_v4(), &favorite);
+
+        let state = PreferencesState::from_settings(
+            &live,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        assert!(state.favorite_view_state_active);
+        assert_eq!(FavoriteViewState::from_settings(&state.settings), common);
+
+        let mut unchanged = state.settings.clone();
+        let mut unchanged_live = live.clone();
+        prepare_preferences_settings_for_commit(&mut unchanged, &mut unchanged_live);
+        assert!(settings_equal_for_close_prompt(&unchanged, &live));
+
+        let mut changed = state.settings;
+        preference_view_state_variant(2).apply_to_settings(&mut changed);
+        let mut changed_live = live.clone();
+        prepare_preferences_settings_for_commit(&mut changed, &mut changed_live);
+        assert!(!settings_equal_for_close_prompt(&changed, &live));
     }
 }

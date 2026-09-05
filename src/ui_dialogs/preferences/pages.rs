@@ -1346,6 +1346,12 @@ fn refresh_send_to_status(state: &mut PreferencesState) {
     state.send_to_status = Some(crate::explorer_integration::send_to_shortcut_status());
 }
 
+fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState) {
+    if state.favorite_view_state_active {
+        ui.small("ここでは標準の設定を変えます。現在地は独自の表示状態を記憶中です。");
+    }
+}
+
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
         ui.checkbox(
@@ -1358,6 +1364,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.small(
             "ツールチップの表示項目と、詳細一覧の列設定・選択列はすべての場所で共通です。OFF にしても保存済みの状態は残ります。",
         );
+        favorite_standard_settings_notice(ui, state);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -8466,6 +8473,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.label(
         "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向、0 でズーム/フィットを切り替えできます。",
     );
+    favorite_standard_settings_notice(ui, state);
     ui.add_space(4.0);
     anchored(ui, state, "spread/page-layout", |ui, state| {
         let s = &mut state.settings;
