@@ -23095,6 +23095,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             None,
             None,
+            None,
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
@@ -23135,6 +23136,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -24374,6 +24376,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -69970,6 +69973,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
         assert_eq!(config_for(requested).bar_lock, requested);
     }
@@ -69982,6 +69987,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
             config_for(requested).bar_lock.fixed_bar_gap_px,

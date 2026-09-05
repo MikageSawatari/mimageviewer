@@ -251,6 +251,19 @@ fn set_seek_preview_target(
     *anchor_x = value.map(|(_, x)| x);
 }
 
+fn native_seek_preview_requests_allowed(
+    position_controls_available: bool,
+    audio_only: bool,
+    video_speed_popup_open: bool,
+    mode: crate::settings::VideoSeekHoverPreviewMode,
+    thumbnail_strip_visible: bool,
+) -> bool {
+    position_controls_available
+        && !audio_only
+        && !video_speed_popup_open
+        && mode.is_visible(thumbnail_strip_visible)
+}
+
 fn native_seek_strip_preview_hover(
     strip: &NativeOverlaySeekStrip,
     strip_rect: egui::Rect,
@@ -1804,6 +1817,8 @@ struct NativeEguiOverlay {
     /// シークストリップの高さプリセット。**帯の矩形・セル寸法・映像の予約・波形ラスタの
     /// 要求は、すべてここから解決した 1 つの [`SeekStripLayout`] を見る。**
     seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
+    seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -7335,6 +7350,8 @@ impl NativeEguiOverlay {
             bottom_lock: VideoBottomLock::None,
             fixed_bar_gap_px: 0,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Always,
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Show,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             info_panel_locked: false,
@@ -8282,6 +8299,8 @@ impl NativeEguiOverlay {
             && self.bottom_lock == lock.bottom_lock
             && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
             && self.seek_strip_height == lock.seek_strip_height
+            && self.seek_hover_preview_mode == lock.seek_hover_preview_mode
+            && self.seek_bar_with_strip == lock.seek_bar_with_strip
         {
             return;
         }
@@ -8291,6 +8310,8 @@ impl NativeEguiOverlay {
         self.bottom_lock = lock.bottom_lock;
         self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
         self.seek_strip_height = lock.seek_strip_height;
+        self.seek_hover_preview_mode = lock.seek_hover_preview_mode;
+        self.seek_bar_with_strip = lock.seek_bar_with_strip;
         self.dirty = true;
     }
 
@@ -10037,6 +10058,8 @@ impl NativeEguiOverlay {
         let side_panel_mode = self.side_panel_mode;
         let top_bar_locked = self.top_bar_locked;
         let bottom_lock = self.bottom_lock;
+        let seek_hover_preview_mode = self.seek_hover_preview_mode;
+        let seek_bar_with_strip = self.seek_bar_with_strip;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
@@ -10048,6 +10071,11 @@ impl NativeEguiOverlay {
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
         let seek_strip_visible = seek_strip.is_some() && !tile_overlay_visible;
+        // Waveform is intentionally not a thumbnail strip for either display policy.
+        let thumbnail_strip_visible = seek_strip.as_ref().is_some_and(|strip| {
+            strip.center.mode() == crate::settings::VideoSeekStripMode::Thumbnails
+        }) && !tile_overlay_visible;
+        let normal_seek_bar_visible = seek_bar_with_strip.is_visible(thumbnail_strip_visible);
         let navigation_preview_visible = navigation_preview.is_some();
         let raw_seek_status_visible = seek_status_active
             && !tile_overlay_visible
@@ -11364,67 +11392,78 @@ impl NativeEguiOverlay {
                             overlay_height_points,
                         );
 
-                        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
-                        if position_controls_available {
-                            let progress = (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
-                            let filled = egui::Rect::from_min_max(
-                                bar_rect.min,
-                                egui::pos2(
-                                    bar_rect.min.x + bar_rect.width() * progress,
-                                    bar_rect.max.y,
-                                ),
-                            );
-                            painter.rect_filled(
-                                filled,
-                                2.0,
-                                egui::Color32::from_rgb(228, 228, 228),
-                            );
-                        }
-                        for tick in crate::seek_ruler::duration_ruler_ticks(
-                            duration_secs,
-                            bar_rect.width(),
-                            crate::seek_ruler::SEEK_RULER_TIME_MIN_SPACING,
-                        ) {
-                            let x = bar_rect.min.x + bar_rect.width() * tick.fraction;
-                            let top = bar_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
-                            let (height, gray) = if tick.major {
-                                (
-                                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
-                                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
-                                )
-                            } else {
-                                (
-                                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
-                                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
-                                )
-                            };
-                            painter.line_segment(
-                                [egui::pos2(x, top), egui::pos2(x, top + height)],
-                                egui::Stroke::new(
-                                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
-                                    egui::Color32::from_gray(gray),
-                                ),
-                            );
-                        }
-                        if position_controls_available {
-                            for marker in &timeline_markers {
-                                draw_timeline_marker(painter, bar_rect, duration_secs, *marker);
+                        if normal_seek_bar_visible {
+                            painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
+                            if position_controls_available {
+                                let progress =
+                                    (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
+                                let filled = egui::Rect::from_min_max(
+                                    bar_rect.min,
+                                    egui::pos2(
+                                        bar_rect.min.x + bar_rect.width() * progress,
+                                        bar_rect.max.y,
+                                    ),
+                                );
+                                painter.rect_filled(
+                                    filled,
+                                    2.0,
+                                    egui::Color32::from_rgb(228, 228, 228),
+                                );
+                            }
+                            for tick in crate::seek_ruler::duration_ruler_ticks(
+                                duration_secs,
+                                bar_rect.width(),
+                                crate::seek_ruler::SEEK_RULER_TIME_MIN_SPACING,
+                            ) {
+                                let x = bar_rect.min.x + bar_rect.width() * tick.fraction;
+                                let top = bar_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+                                let (height, gray) = if tick.major {
+                                    (
+                                        crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                                        crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                                    )
+                                } else {
+                                    (
+                                        crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                                        crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                                    )
+                                };
+                                painter.line_segment(
+                                    [egui::pos2(x, top), egui::pos2(x, top + height)],
+                                    egui::Stroke::new(
+                                        crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                                        egui::Color32::from_gray(gray),
+                                    ),
+                                );
+                            }
+                            if position_controls_available {
+                                for marker in &timeline_markers {
+                                    draw_timeline_marker(
+                                        painter,
+                                        bar_rect,
+                                        duration_secs,
+                                        *marker,
+                                    );
+                                }
                             }
                         }
 
                         let seek_resp = ui.interact(
-                            hit_rect,
+                            if normal_seek_bar_visible { hit_rect } else { egui::Rect::NOTHING },
                             egui::Id::new("native_video_seek_hit"),
-                            if position_controls_available {
+                            if normal_seek_bar_visible && position_controls_available {
                                 egui::Sense::click_and_drag()
                             } else {
                                 egui::Sense::hover()
                             },
                         );
-                        if position_controls_available && seek_resp.hovered() {
+                        if normal_seek_bar_visible
+                            && position_controls_available
+                            && seek_resp.hovered()
+                        {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
-                        if position_controls_available {
+                        if normal_seek_bar_visible && position_controls_available {
                             let target_at = |pos: egui::Pos2| {
                                 let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
                                 let frac =
@@ -11499,8 +11538,13 @@ impl NativeEguiOverlay {
                         // 速度 popup が開いているときは、popup 内のアイテムを選びに行く
                         // カーソル動線が seek_row を横切るため preview を抑止する。ストリップは
                         // 別の抑止理由ではなく、seek row と同じ単一 target の producer になる。
-                        let seek_preview_allowed =
-                            position_controls_available && !audio_only && !video_speed_popup_open;
+                        let seek_preview_allowed = native_seek_preview_requests_allowed(
+                            position_controls_available,
+                            audio_only,
+                            video_speed_popup_open,
+                            seek_hover_preview_mode,
+                            thumbnail_strip_visible,
+                        );
                         let strip_preview_active = if seek_preview_allowed {
                             match seek_strip_preview_hover {
                                 NativeSeekStripPreviewHover::Target(target) => {
@@ -13158,6 +13202,24 @@ mod tests {
             SeekStripSpan::Window,
             None,
         )
+    }
+
+    #[test]
+    fn hover_preview_policy_suppresses_requests_only_for_thumbnail_strip() {
+        let mode = crate::settings::VideoSeekHoverPreviewMode::HideWithThumbnailStrip;
+        assert!(!super::native_seek_preview_requests_allowed(
+            true, false, false, mode, true,
+        ));
+        assert!(super::native_seek_preview_requests_allowed(
+            true, false, false, mode, false,
+        ));
+        assert!(!super::native_seek_preview_requests_allowed(
+            true,
+            false,
+            false,
+            crate::settings::VideoSeekHoverPreviewMode::Never,
+            false,
+        ));
     }
 
     use super::{

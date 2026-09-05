@@ -737,6 +737,8 @@ pub(in crate::app) struct ViewerContextBundle {
     idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages_shared: Arc<std::sync::RwLock<std::collections::HashSet<usize>>>,
     thumbnail_eviction_generation: Option<u64>,
     details_thumb_suppression_applied: bool,
     details_hover_thumb_idx: Option<usize>,
@@ -1330,6 +1332,10 @@ impl ViewerContextBundle {
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages_shared: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
@@ -1657,6 +1663,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -1891,6 +1899,8 @@ impl App {
         swap_field!(idle_upgrade_cache_bypass_ineligible);
         swap_field!(keep_range);
         swap_field!(keep_set);
+        swap_field!(still_seek_thumbnail_pages);
+        swap_field!(still_seek_thumbnail_pages_shared);
         swap_field!(thumbnail_eviction_generation);
         swap_field!(details_thumb_suppression_applied);
         swap_field!(details_hover_thumb_idx);
@@ -2179,6 +2189,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -2409,6 +2421,8 @@ impl App {
             pending_grid_scroll,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_order,
             details_order_revision,

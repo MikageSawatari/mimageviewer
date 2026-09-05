@@ -510,6 +510,7 @@ fn decode_remote_source(
         None,
         None,
         None,
+        None,
     );
     let load_request_ms = load_request_started.elapsed().as_secs_f64() * 1000.0;
     drop(tx);

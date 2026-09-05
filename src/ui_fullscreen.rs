@@ -3139,22 +3139,328 @@ use self::draw_icons::*;
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
 pub(crate) const TOP_BAR_HEIGHT: f32 = 44.0;
-/// 静止画フルスクリーン下端のページシークバーの高さ。下端まで伸びる左右パネル
-/// (補正パネル / メタデータパネル) はこの分だけ下端を空けてシークバーと重ならない
-/// ようにする (`draw_fullscreen_seek_overlay` の panel_rect と同じ高さ)。
+/// 静止画フルスクリーン下端の通常ページシークバーの高さ。
+/// 実際の下端 chrome 高は [`StillSeekGeometry`] で一度だけ解決する。
 pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
-const FS_SEEK_HOVER_HEIGHT: f32 = 78.0;
+const FS_SEEK_HOVER_MARGIN: f32 = 40.0;
+const STILL_SEEK_STRIP_CELL_GAP: f32 = 4.0;
+const STILL_SEEK_STRIP_OVERSCAN_CELLS: usize = 2;
+const STILL_SEEK_PREVIEW_MAX_WIDTH: f32 = 240.0;
+const STILL_SEEK_PREVIEW_MAX_HEIGHT: f32 = 180.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillSeekGeometry {
+    bar_height: f32,
+    strip_height: f32,
+    total_height: f32,
+}
+
+impl StillSeekGeometry {
+    fn resolve(
+        strip_visible: bool,
+        strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+        bar_with_strip: crate::settings::StillSeekBarWithStrip,
+    ) -> Self {
+        let strip_height = if strip_visible {
+            strip_height.points()
+        } else {
+            0.0
+        };
+        let bar_height = if bar_with_strip.is_visible(strip_visible) {
+            FS_SEEK_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        Self {
+            bar_height,
+            strip_height,
+            total_height: bar_height + strip_height,
+        }
+    }
+
+    fn bar_only() -> Self {
+        Self::resolve(
+            false,
+            crate::video::seek_strip_layout::SeekStripHeight::Large,
+            crate::settings::StillSeekBarWithStrip::Show,
+        )
+    }
+
+    fn panel_rect(self, full_rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), full_rect.bottom() - self.total_height),
+            full_rect.right_bottom(),
+        )
+        .intersect(full_rect)
+    }
+
+    fn bar_rect(self, full_rect: egui::Rect) -> Option<egui::Rect> {
+        (self.bar_height > 0.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(full_rect.left(), full_rect.bottom() - self.bar_height),
+                full_rect.right_bottom(),
+            )
+            .intersect(full_rect)
+        })
+    }
+
+    fn strip_rect(self, full_rect: egui::Rect) -> Option<egui::Rect> {
+        (self.strip_height > 0.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    full_rect.left(),
+                    full_rect.bottom() - self.bar_height - self.strip_height,
+                ),
+                egui::pos2(full_rect.right(), full_rect.bottom() - self.bar_height),
+            )
+            .intersect(full_rect)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekStripWindow {
+    visible_start: usize,
+    visible_end: usize,
+    request_start: usize,
+    request_end: usize,
+}
+
+fn still_seek_strip_window(
+    total: usize,
+    current_pos: usize,
+    width: f32,
+    cell_width: f32,
+) -> StillSeekStripWindow {
+    if total == 0 {
+        return StillSeekStripWindow {
+            visible_start: 0,
+            visible_end: 0,
+            request_start: 0,
+            request_end: 0,
+        };
+    }
+    let visible_count = ((width + STILL_SEEK_STRIP_CELL_GAP)
+        / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
+        .floor()
+        .max(1.0) as usize;
+    let visible_count = visible_count.min(total);
+    let desired_start = current_pos.min(total - 1).saturating_sub(visible_count / 2);
+    let visible_start = desired_start.min(total - visible_count);
+    let visible_end = visible_start + visible_count;
+    StillSeekStripWindow {
+        visible_start,
+        visible_end,
+        request_start: visible_start.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
+        request_end: visible_end
+            .saturating_add(STILL_SEEK_STRIP_OVERSCAN_CELLS)
+            .min(total),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekPosition {
+    TrackFraction(f32),
+    SourcePosition(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedStillSeekTarget {
+    preview_idx: usize,
+    landing_idx: usize,
+    display_pos: usize,
+}
+
+fn resolve_still_seek_target(
+    image_indices: &[usize],
+    spread_units: Option<&[SpreadDisplayUnit]>,
+    position: StillSeekPosition,
+) -> Option<ResolvedStillSeekTarget> {
+    if image_indices.is_empty() {
+        return None;
+    }
+    match position {
+        StillSeekPosition::TrackFraction(fraction) => {
+            if let Some(units) = spread_units.filter(|units| !units.is_empty()) {
+                let display_pos = spread_seek_unit_from_fraction(fraction, units.len());
+                let landing_idx = units[display_pos].anchor_idx();
+                Some(ResolvedStillSeekTarget {
+                    preview_idx: landing_idx,
+                    landing_idx,
+                    display_pos,
+                })
+            } else {
+                let display_pos = if image_indices.len() <= 1 {
+                    0
+                } else {
+                    (fraction.clamp(0.0, 1.0) * (image_indices.len() - 1) as f32).round() as usize
+                }
+                .min(image_indices.len() - 1);
+                let landing_idx = image_indices[display_pos];
+                Some(ResolvedStillSeekTarget {
+                    preview_idx: landing_idx,
+                    landing_idx,
+                    display_pos,
+                })
+            }
+        }
+        StillSeekPosition::SourcePosition(source_pos) => {
+            let source_pos = source_pos.min(image_indices.len() - 1);
+            let preview_idx = image_indices[source_pos];
+            let (landing_idx, display_pos) = spread_units
+                .and_then(|units| {
+                    units.iter().enumerate().find_map(|(unit_pos, unit)| {
+                        unit.pages
+                            .contains(&preview_idx)
+                            .then_some((unit.anchor_idx(), unit_pos))
+                    })
+                })
+                .unwrap_or((preview_idx, source_pos));
+            Some(ResolvedStillSeekTarget {
+                preview_idx,
+                landing_idx,
+                display_pos,
+            })
+        }
+    }
+}
+
+fn still_seek_cell_rect(
+    row_rect: egui::Rect,
+    visual_slot: usize,
+    cell_width: f32,
+    cell_height: f32,
+) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            row_rect.left() + visual_slot as f32 * (cell_width + STILL_SEEK_STRIP_CELL_GAP),
+            row_rect.center().y - cell_height * 0.5,
+        ),
+        egui::vec2(cell_width, cell_height),
+    )
+}
+
+fn still_seek_source_position_at_x(
+    row_rect: egui::Rect,
+    window: StillSeekStripWindow,
+    cell_width: f32,
+    pointer_x: f32,
+    rtl: bool,
+) -> Option<usize> {
+    if window.visible_start >= window.visible_end
+        || pointer_x < row_rect.left()
+        || pointer_x > row_rect.right()
+    {
+        return None;
+    }
+    let count = window.visible_end - window.visible_start;
+    let slot = ((pointer_x - row_rect.left()) / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
+        .floor()
+        .max(0.0) as usize;
+    let slot = slot.min(count - 1);
+    Some(if rtl {
+        window.visible_end - 1 - slot
+    } else {
+        window.visible_start + slot
+    })
+}
+
+fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let size = if texture_size.x > 0.0 && texture_size.y > 0.0 {
+        let scale = (bounds.width() / texture_size.x).min(bounds.height() / texture_size.y);
+        texture_size * scale
+    } else {
+        bounds.size()
+    };
+    egui::Rect::from_center_size(bounds.center(), size.min(bounds.size()))
+}
+
+fn paint_still_seek_preview(
+    painter: &egui::Painter,
+    full_rect: egui::Rect,
+    panel_top: f32,
+    pointer_x: f32,
+    texture: Option<&egui::TextureHandle>,
+    label: &str,
+) {
+    let desired_image_size = texture.map_or(egui::vec2(160.0, 100.0), |tex| {
+        let size = tex.size_vec2();
+        let scale = (STILL_SEEK_PREVIEW_MAX_WIDTH / size.x.max(1.0))
+            .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
+        size * scale
+    });
+    let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
+    let min_left = full_rect.left() + 8.0;
+    let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
+    let left = (pointer_x - bubble_size.x * 0.5).clamp(min_left, max_left);
+    let bubble_rect = egui::Rect::from_min_size(
+        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
+        bubble_size,
+    );
+    let background = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 244);
+    painter.rect_filled(bubble_rect, 6.0, background);
+    painter.rect_stroke(
+        bubble_rect,
+        6.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(104)),
+        egui::StrokeKind::Inside,
+    );
+    let arrow_x = pointer_x.clamp(bubble_rect.left() + 12.0, bubble_rect.right() - 12.0);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(arrow_x - 7.0, bubble_rect.bottom()),
+            egui::pos2(arrow_x + 7.0, bubble_rect.bottom()),
+            egui::pos2(arrow_x, bubble_rect.bottom() + 8.0),
+        ],
+        background,
+        egui::Stroke::NONE,
+    ));
+    let image_bounds = egui::Rect::from_min_max(
+        bubble_rect.min + egui::vec2(6.0, 6.0),
+        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
+    );
+    if let Some(tex) = texture {
+        painter.image(
+            tex.id(),
+            fit_texture_rect(tex.size_vec2(), image_bounds),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        painter.text(
+            image_bounds.center(),
+            egui::Align2::CENTER_CENTER,
+            "読み込み中…",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_gray(170),
+        );
+    }
+    painter.text(
+        egui::pos2(bubble_rect.center().x, bubble_rect.bottom() - 12.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::monospace(13.0),
+        FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+    );
+}
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
-pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+pub(crate) fn metadata_panel_rect_with_seek_height(
+    full_rect: egui::Rect,
+    seek_height: f32,
+) -> egui::Rect {
     let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width().max(0.0) * 0.5);
     let panel_top = full_rect.min.y + TOP_BAR_HEIGHT;
-    let panel_bottom = (full_rect.max.y - FS_SEEK_BAR_HEIGHT).max(panel_top);
+    let panel_bottom = (full_rect.max.y - seek_height).max(panel_top);
     egui::Rect::from_min_max(
         egui::pos2(full_rect.max.x - panel_w, panel_top),
         egui::pos2(full_rect.max.x, panel_bottom),
     )
+}
+
+pub(crate) fn metadata_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    metadata_panel_rect_with_seek_height(full_rect, StillSeekGeometry::bar_only().total_height)
 }
 
 fn fullscreen_top_bar_rect(full_rect: egui::Rect) -> egui::Rect {
@@ -3570,19 +3876,49 @@ fn still_touch_panel_handle_rect(
     full_rect: egui::Rect,
     edge: crate::ui_helpers::PanelEdge,
 ) -> egui::Rect {
+    still_touch_panel_handle_rect_with_seek_height(
+        full_rect,
+        edge,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn still_touch_panel_handle_rect_with_seek_height(
+    full_rect: egui::Rect,
+    edge: crate::ui_helpers::PanelEdge,
+    seek_height: f32,
+) -> egui::Rect {
     touch_panel_handle_rect(
         full_rect,
         edge,
         TOP_BAR_HEIGHT,
-        FS_SEEK_BAR_HEIGHT,
+        seek_height,
         TOUCH_PANEL_HANDLE_WIDTH_PT,
     )
 }
 
 fn still_touch_panel_handle_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    still_touch_panel_handle_rects_with_seek_height(
+        full_rect,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn still_touch_panel_handle_rects_with_seek_height(
+    full_rect: egui::Rect,
+    seek_height: f32,
+) -> [egui::Rect; 2] {
     [
-        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Left),
-        still_touch_panel_handle_rect(full_rect, crate::ui_helpers::PanelEdge::Right),
+        still_touch_panel_handle_rect_with_seek_height(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Left,
+            seek_height,
+        ),
+        still_touch_panel_handle_rect_with_seek_height(
+            full_rect,
+            crate::ui_helpers::PanelEdge::Right,
+            seek_height,
+        ),
     ]
 }
 
@@ -3592,8 +3928,24 @@ fn visible_still_touch_panel_handle_rects(
     left_panel_open: bool,
     right_panel_open: bool,
 ) -> [egui::Rect; 2] {
+    visible_still_touch_panel_handle_rects_with_seek_height(
+        full_rect,
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn visible_still_touch_panel_handle_rects_with_seek_height(
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    seek_height: f32,
+) -> [egui::Rect; 2] {
     visible_touch_panel_handle_rects(
-        still_touch_panel_handle_rects(full_rect),
+        still_touch_panel_handle_rects_with_seek_height(full_rect, seek_height),
         handles_enabled,
         left_panel_open,
         right_panel_open,
@@ -3630,12 +3982,31 @@ fn extend_touch_excluded_with_panel_handles(
     left_panel_open: bool,
     right_panel_open: bool,
 ) {
+    extend_touch_excluded_with_panel_handles_and_seek_height(
+        excluded,
+        full_rect,
+        handles_enabled,
+        left_panel_open,
+        right_panel_open,
+        StillSeekGeometry::bar_only().total_height,
+    );
+}
+
+fn extend_touch_excluded_with_panel_handles_and_seek_height(
+    excluded: &mut Vec<egui::Rect>,
+    full_rect: egui::Rect,
+    handles_enabled: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    seek_height: f32,
+) {
     excluded.extend(
-        visible_still_touch_panel_handle_rects(
+        visible_still_touch_panel_handle_rects_with_seek_height(
             full_rect,
             handles_enabled,
             left_panel_open,
             right_panel_open,
+            seek_height,
         )
         .into_iter()
         .filter(egui::Rect::is_positive),
@@ -4073,13 +4444,34 @@ fn fullscreen_side_panel_rects(
     right_panel_visible: bool,
     left_panel_visible: bool,
 ) -> FullscreenSidePanelRects {
+    fullscreen_side_panel_rects_with_seek_height(
+        full_rect,
+        chrome_enabled,
+        mode,
+        right_panel_visible,
+        left_panel_visible,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn fullscreen_side_panel_rects_with_seek_height(
+    full_rect: egui::Rect,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+    seek_height: f32,
+) -> FullscreenSidePanelRects {
     if !chrome_enabled {
         return FullscreenSidePanelRects::default();
     }
     let click_mode = mode.normalized() == crate::settings::FsSidePanelMode::ClickToShow;
     FullscreenSidePanelRects {
         left: if left_panel_visible {
-            Some(adjustment_panel_rect(full_rect))
+            Some(adjustment_panel_rect_with_seek_height(
+                full_rect,
+                seek_height,
+            ))
         } else if click_mode {
             Some(panel_callout_edge_rect(
                 full_rect,
@@ -4089,7 +4481,7 @@ fn fullscreen_side_panel_rects(
             None
         },
         right: Some(if right_panel_visible {
-            metadata_panel_rect(full_rect)
+            metadata_panel_rect_with_seek_height(full_rect, seek_height)
         } else if click_mode {
             panel_callout_edge_rect(full_rect, crate::ui_helpers::PanelEdge::Right)
         } else {
@@ -4107,15 +4499,38 @@ fn fullscreen_side_panel_contains_pointer(
     left_panel_visible: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    fullscreen_side_panel_contains_pointer_with_seek_height(
+        full_rect,
+        pos,
+        chrome_enabled,
+        mode,
+        right_panel_visible,
+        left_panel_visible,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn fullscreen_side_panel_contains_pointer_with_seek_height(
+    full_rect: egui::Rect,
+    pos: egui::Pos2,
+    chrome_enabled: bool,
+    mode: crate::settings::FsSidePanelMode,
+    right_panel_visible: bool,
+    left_panel_visible: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     if !fullscreen_edge_hover_allowed(pos, navigator_exclusion) {
         return false;
     }
-    fullscreen_side_panel_rects(
+    fullscreen_side_panel_rects_with_seek_height(
         full_rect,
         chrome_enabled,
         mode,
         right_panel_visible,
         left_panel_visible,
+        seek_height,
     )
     .iter()
     .any(|rect| rect.contains(pos))
@@ -4352,8 +4767,24 @@ pub(crate) fn metadata_panel_hover_active_at(
     was_active: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    metadata_panel_hover_active_at_with_seek_height(
+        full_rect,
+        pointer_pos,
+        was_active,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+pub(crate) fn metadata_panel_hover_active_at_with_seek_height(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     let activation_rect = metadata_panel_hover_activation_rect(full_rect);
-    let sustain_rect = metadata_panel_rect(full_rect)
+    let sustain_rect = metadata_panel_rect_with_seek_height(full_rect, seek_height)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|p| {
         fullscreen_edge_hover_allowed(p, navigator_exclusion)
@@ -4370,13 +4801,29 @@ fn adjustment_panel_hover_active_at(
     was_active: bool,
     navigator_exclusion: Option<egui::Rect>,
 ) -> bool {
+    adjustment_panel_hover_active_at_with_seek_height(
+        full_rect,
+        pointer_pos,
+        was_active,
+        navigator_exclusion,
+        StillSeekGeometry::bar_only().total_height,
+    )
+}
+
+fn adjustment_panel_hover_active_at_with_seek_height(
+    full_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    was_active: bool,
+    navigator_exclusion: Option<egui::Rect>,
+    seek_height: f32,
+) -> bool {
     let strip =
         crate::ui_helpers::panel_edge_trigger_px(full_rect.width()).min(full_rect.width().max(0.0));
     let activation_rect = egui::Rect::from_min_max(
         full_rect.left_top(),
         egui::pos2(full_rect.left() + strip, full_rect.bottom()),
     );
-    let sustain_rect = adjustment_panel_rect(full_rect)
+    let sustain_rect = adjustment_panel_rect_with_seek_height(full_rect, seek_height)
         .expand(crate::ui_helpers::panel_hover_sustain_px(full_rect.width()));
     pointer_pos.is_some_and(|pos| {
         fullscreen_edge_hover_allowed(pos, navigator_exclusion)
@@ -8569,7 +9016,8 @@ impl App {
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
         let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
-        let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+        let bottom_m = (self.still_seek_geometry_for_idx(fs_idx, false).total_height + 8.0)
+            .min(image_rect.height() * 0.25);
         let pan_band = egui::Rect::from_min_max(
             egui::pos2(image_rect.left(), image_rect.top() + top_m),
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
@@ -9356,25 +9804,24 @@ fn capture_region_outside_rects(bounds: egui::Rect, hole: egui::Rect) -> [egui::
 /// 描画 (`draw_adjustment_panel`) と当たり判定 (ホバー閉じ / ホイール /
 /// クリック抑制) は必ずこの関数の rect を使うこと。幅がずれると「見えているのに
 /// 枠外扱い」になり、パネルが閉じる・操作がページ送りに化ける。
-fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+fn adjustment_panel_rect_with_seek_height(full_rect: egui::Rect, seek_height: f32) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
         egui::pos2(
             full_rect.min.x + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH,
             // 下端のページシークバーと重ならないよう、元の下端マージンとシークバー高さの
             // 大きい方だけ下端を空ける。
-            full_rect.max.y
-                - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN.max(FS_SEEK_BAR_HEIGHT),
+            full_rect.max.y - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN.max(seek_height),
         ),
     )
 }
 
+fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    adjustment_panel_rect_with_seek_height(full_rect, StillSeekGeometry::bar_only().total_height)
+}
+
 fn fullscreen_seek_panel_rect(full_rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(
-        egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_BAR_HEIGHT),
-        full_rect.right_bottom(),
-    )
-    .intersect(full_rect)
+    StillSeekGeometry::bar_only().panel_rect(full_rect)
 }
 
 fn fullscreen_seek_separator_y(panel_rect: egui::Rect, locked: bool) -> f32 {
@@ -9484,10 +9931,11 @@ fn compare_shader_visible_region(
 ///
 /// `right_panel_width` は 0 でなければ右端を空ける。パネル自身の矩形と同じ値を渡すこと
 /// (別々に clamp すると幅が食い違う)。
-fn fullscreen_rect_excluding_fixed_bars(
+fn fullscreen_rect_excluding_fixed_bars_with_seek_height(
     full_rect: egui::Rect,
     top_locked: bool,
     seek_locked: bool,
+    seek_height: f32,
     fixed_bar_gap_px: u32,
     right_panel_width: f32,
 ) -> egui::Rect {
@@ -9498,7 +9946,7 @@ fn fullscreen_rect_excluding_fixed_bars(
         full_rect.top()
     };
     let bottom = if seek_locked {
-        (full_rect.bottom() - FS_SEEK_BAR_HEIGHT - gap).max(top + 1.0)
+        (full_rect.bottom() - seek_height - gap).max(top + 1.0)
     } else {
         full_rect.bottom()
     };
@@ -9509,6 +9957,23 @@ fn fullscreen_rect_excluding_fixed_bars(
         full_rect.right()
     };
     egui::Rect::from_min_max(egui::pos2(full_rect.left(), top), egui::pos2(right, bottom))
+}
+
+fn fullscreen_rect_excluding_fixed_bars(
+    full_rect: egui::Rect,
+    top_locked: bool,
+    seek_locked: bool,
+    fixed_bar_gap_px: u32,
+    right_panel_width: f32,
+) -> egui::Rect {
+    fullscreen_rect_excluding_fixed_bars_with_seek_height(
+        full_rect,
+        top_locked,
+        seek_locked,
+        StillSeekGeometry::bar_only().total_height,
+        fixed_bar_gap_px,
+        right_panel_width,
+    )
 }
 
 /// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
@@ -11778,6 +12243,94 @@ pub fn draw_still_panel_reach_snapshot_fixture(
     }
 }
 
+/// Visual-only fixture for the still page seek strip and hover preview.
+#[doc(hidden)]
+pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::from_rgb(18, 22, 30));
+    let geometry = StillSeekGeometry::resolve(
+        true,
+        crate::video::seek_strip_layout::SeekStripHeight::Medium,
+        crate::settings::StillSeekBarWithStrip::Show,
+    );
+    let panel = geometry.panel_rect(full_rect);
+    ui.painter().rect_filled(
+        panel,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(8, 10, 14, 244),
+    );
+    let strip = geometry.strip_rect(full_rect).unwrap();
+    let row = strip.shrink2(egui::vec2(18.0, 5.0));
+    let cell_width = 58.0;
+    let cell_height =
+        strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
+    let colors = [
+        egui::Color32::from_rgb(64, 87, 118),
+        egui::Color32::from_rgb(118, 80, 64),
+        egui::Color32::from_rgb(71, 110, 79),
+        egui::Color32::from_rgb(111, 72, 114),
+        egui::Color32::from_rgb(120, 112, 70),
+        egui::Color32::from_rgb(65, 105, 115),
+    ];
+    let row_width =
+        colors.len() as f32 * cell_width + (colors.len() - 1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
+    let row = egui::Rect::from_center_size(row.center(), egui::vec2(row_width, row.height()));
+    for (slot, color) in colors.into_iter().enumerate() {
+        let rect = still_seek_cell_rect(row, slot, cell_width, cell_height);
+        ui.painter().rect_filled(rect, 3.0, color);
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_top()],
+            egui::Stroke::new(2.0, egui::Color32::from_white_alpha(90)),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            (slot + 18).to_string(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+        );
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(
+                if slot == 2 || slot == 3 { 3.0 } else { 1.0 },
+                if slot == 2 || slot == 3 {
+                    egui::Color32::from_rgb(112, 174, 255)
+                } else {
+                    egui::Color32::from_gray(76)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let bar = geometry.bar_rect(full_rect).unwrap();
+    let track = egui::Rect::from_center_size(
+        egui::pos2(full_rect.center().x - 28.0, bar.center().y),
+        egui::vec2(full_rect.width() - 150.0, 8.0),
+    );
+    ui.painter()
+        .rect_filled(track, 4.0, egui::Color32::from_gray(88));
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(track.min, egui::pos2(track.center().x, track.bottom())),
+        4.0,
+        egui::Color32::from_rgb(112, 174, 255),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(track.center().x, track.center().y),
+        6.0,
+        egui::Color32::from_rgb(232, 240, 255),
+    );
+    paint_still_seek_preview(
+        ui.painter(),
+        full_rect,
+        panel.top(),
+        full_rect.center().x + 40.0,
+        None,
+        "20 / 128",
+    );
+}
+
 /// Visual-only fixture for the music touch-panel handles. Production margin,
 /// handle geometry, visibility, and painting are reused so the snapshot also
 /// guards the empty-margin boundary around the mock waveform.
@@ -12321,13 +12874,21 @@ impl App {
         let right_open = self.metadata_panel_click_shown()
             || self.fs_info_panel.hover_active
             || self.fullscreen_tag_picker_open;
+        let seek_height = self
+            .fullscreen_idx
+            .map(|idx| self.still_seek_geometry_for_idx(idx, false).total_height)
+            .unwrap_or_else(|| StillSeekGeometry::bar_only().total_height);
         for (edge, rect) in [
             crate::ui_helpers::PanelEdge::Left,
             crate::ui_helpers::PanelEdge::Right,
         ]
         .into_iter()
-        .zip(visible_still_touch_panel_handle_rects(
-            full_rect, true, left_open, right_open,
+        .zip(visible_still_touch_panel_handle_rects_with_seek_height(
+            full_rect,
+            true,
+            left_open,
+            right_open,
+            seek_height,
         )) {
             if !rect.is_positive() {
                 continue;
@@ -15123,6 +15684,16 @@ impl App {
             && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
     }
 
+    fn still_seek_geometry_for_idx(&self, fs_idx: usize, is_video: bool) -> StillSeekGeometry {
+        let strip_visible = self.settings.still_seek_strip_visible
+            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
+        StillSeekGeometry::resolve(
+            strip_visible,
+            self.settings.still_seek_strip_height,
+            self.settings.still_seek_bar_with_strip,
+        )
+    }
+
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
     /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
     /// leave an empty strip at the top of the fullscreen canvas.
@@ -15189,7 +15760,11 @@ impl App {
         if self.fs_music_view_active(fs_idx) {
             crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
         } else {
-            metadata_panel_rect(full_rect).width()
+            metadata_panel_rect_with_seek_height(
+                full_rect,
+                self.still_seek_geometry_for_idx(fs_idx, false).total_height,
+            )
+            .width()
         }
     }
 
@@ -15215,10 +15790,12 @@ impl App {
         fs_idx: usize,
         is_video: bool,
     ) -> egui::Rect {
-        fullscreen_rect_excluding_fixed_bars(
+        let seek_geometry = self.still_seek_geometry_for_idx(fs_idx, is_video);
+        fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full_rect,
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
             self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
+            seek_geometry.total_height,
             self.settings.fullscreen_fixed_bar_gap_px,
             self.locked_info_panel_reserved_width_effective(full_rect, fs_idx, is_video),
         )
@@ -15342,7 +15919,7 @@ impl App {
         let padding = egui::vec2(8.0, 4.0);
         let size = galley.size() + padding * 2.0;
         let bottom_avoid = if self.fs_seek_overlay_visible {
-            FS_SEEK_BAR_HEIGHT + 8.0
+            self.still_seek_geometry_for_idx(fs_idx, false).total_height + 8.0
         } else {
             0.0
         };
@@ -15463,6 +16040,7 @@ impl App {
         // 問題も併せて解消される)。
         if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
             self.fs_seek_drag_active = false;
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
@@ -15471,9 +16049,13 @@ impl App {
             self.fs_seek_drag_active = false;
         }
         let locked = self.settings.fullscreen_seek_bar_locked;
+        let geometry = self.still_seek_geometry_for_idx(fs_idx, false);
 
         let bottom_band = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_HOVER_HEIGHT),
+            egui::pos2(
+                full_rect.left(),
+                full_rect.bottom() - geometry.total_height - FS_SEEK_HOVER_MARGIN,
+            ),
             full_rect.right_bottom(),
         );
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
@@ -15484,7 +16066,7 @@ impl App {
         });
         // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
         // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
-        let panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let panel_rect = geometry.panel_rect(full_rect);
         let visibility = StillSeekBarVisibilityInputs {
             allowed: true,
             locked,
@@ -15498,11 +16080,13 @@ impl App {
             content_available: true,
         };
         if !still_seek_bar_visible_from_inputs(visibility) {
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
         let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
             self.fs_seek_drag_active = false;
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         };
 
@@ -15524,8 +16108,45 @@ impl App {
             ),
         );
 
-        let lock_x = panel_rect.right() - BAR_BUTTON_SIZE - 6.0;
-        let lock_y = panel_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+        let control_rect = geometry
+            .bar_rect(full_rect)
+            .or_else(|| geometry.strip_rect(full_rect))
+            .unwrap_or(panel_rect);
+        let lock_x = control_rect.right() - BAR_BUTTON_SIZE - 6.0;
+        let toggle_x = lock_x - BAR_BUTTON_SIZE - 4.0;
+        let lock_y = control_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+        let strip_visible = self.settings.still_seek_strip_visible;
+        let strip_resp = draw_bar_button(
+            ui,
+            toggle_x,
+            lock_y,
+            "fullscreen_still_seek_strip",
+            |hovered| bar_button_bg(hovered, strip_visible),
+            strip_visible,
+            |painter, center, r| {
+                for offset in [-0.68_f32, 0.0, 0.68] {
+                    painter.rect_stroke(
+                        egui::Rect::from_center_size(
+                            center + egui::vec2(offset * r, 0.0),
+                            egui::vec2(r * 0.55, r * 1.15),
+                        ),
+                        1.0,
+                        egui::Stroke::new(1.2, egui::Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            },
+        )
+        .hover_tip_dark(if strip_visible {
+            "サムネイル列を隠す"
+        } else {
+            "サムネイル列を表示"
+        });
+        if strip_resp.clicked() {
+            self.settings.still_seek_strip_visible = !strip_visible;
+            self.settings.save();
+            ctx.request_repaint();
+        }
         let lock_resp = draw_bar_button(
             ui,
             lock_x,
@@ -15546,9 +16167,9 @@ impl App {
             ctx.request_repaint();
         }
 
-        let content_right = (lock_x - 6.0).max(panel_rect.left());
+        let content_right = (toggle_x - 6.0).max(panel_rect.left());
         let content_rect = egui::Rect::from_min_max(
-            panel_rect.min,
+            geometry.bar_rect(full_rect).unwrap_or(panel_rect).min,
             egui::pos2(content_right, panel_rect.bottom()),
         );
         let painter = ui.painter();
@@ -15556,6 +16177,7 @@ impl App {
         let all_nav_items_are_images =
             info.media_count == info.image_indices.len() && !info.image_indices.is_empty();
         if !all_nav_items_are_images {
+            self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             let summary = Self::fullscreen_mixed_media_summary(&info);
             painter.text(
                 content_rect.center(),
@@ -15585,190 +16207,338 @@ impl App {
         } else {
             None
         };
-        let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
-        let font = egui::FontId::monospace(13.0);
-        let sample_positions =
-            if !continuous_label_mode && self.spread_mode.is_spread() && total >= 2 {
-                if self.spread_mode.is_rtl() {
-                    vec![total, total - 1]
-                } else {
-                    vec![total - 1, total]
-                }
-            } else {
-                vec![total]
-            };
-        let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
-            .unwrap_or_else(|| format!("{} / {}", total, total));
-        let sample_galley = painter.layout_no_wrap(
-            sample_label,
-            font.clone(),
-            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
-        );
-        let label_width = (sample_galley.size().x + 18.0)
-            .max(64.0)
-            .min((inner.width() * 0.32).max(64.0));
-        let gap = 12.0;
-        let (label_rect, track_rect) = if is_rtl {
-            let label_rect =
-                egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
-            let track_rect = egui::Rect::from_min_max(
-                egui::pos2(label_rect.right() + gap, inner.center().y - 4.0),
-                egui::pos2(inner.right(), inner.center().y + 4.0),
-            );
-            (label_rect, track_rect)
-        } else {
-            let label_rect = egui::Rect::from_min_max(
-                egui::pos2(inner.right() - label_width, inner.top()),
-                inner.right_bottom(),
-            );
-            let track_rect = egui::Rect::from_min_max(
-                egui::pos2(inner.left(), inner.center().y - 4.0),
-                egui::pos2(label_rect.left() - gap, inner.center().y + 4.0),
-            );
-            (label_rect, track_rect)
-        };
-        if track_rect.width() < 48.0 {
-            return None;
-        }
-
-        let mut display_pos = spread_seek
+        let spread_units = spread_seek.as_ref().map(|(units, _)| units.as_slice());
+        let highlighted_pages: HashSet<usize> = spread_seek
             .as_ref()
-            .map_or(info.current_pos.min(total - 1), |(_, unit_index)| {
-                *unit_index
-            });
+            .map(|(units, unit_index)| units[*unit_index].pages.iter().copied().collect())
+            .unwrap_or_else(|| HashSet::from([fs_idx]));
+        let mut requested_pages = Vec::new();
+        let mut preview: Option<ResolvedStillSeekTarget> = None;
+        let mut preview_pointer_x = None;
         let mut target = None;
-        let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
-        let response = ui.interact(
-            hit_rect,
-            ui.make_persistent_id("fullscreen_seek_track"),
-            egui::Sense::click_and_drag(),
-        );
-        if response.hovered() || response.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
+        let mut strip_display_pos = None;
 
-        let seek_pointer = if response.dragged() || response.clicked() {
-            response.interact_pointer_pos()
-        } else {
-            None
-        };
-        if response.dragged() {
-            self.fs_seek_drag_active = true;
-            // A drag sweeps the keep range the way scrolling does, so hold thumbnail
-            // prefetch back for the same reason. See note_fullscreen_seek_activity.
-            self.note_fullscreen_seek_activity();
-        }
-        if let Some(pointer_pos) = seek_pointer {
-            let fraction = fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
-            let pos = if let Some((units, _)) = spread_seek.as_ref() {
-                spread_seek_unit_from_fraction(fraction, units.len())
-            } else {
-                if total <= 1 {
-                    0
+        if let Some(strip_rect) = geometry.strip_rect(full_rect) {
+            let strip_content = egui::Rect::from_min_max(
+                strip_rect.min + egui::vec2(6.0, 5.0),
+                egui::pos2(content_right - 6.0, strip_rect.bottom() - 5.0),
+            );
+            let configured_cell_width = self
+                .settings
+                .still_seek_strip_height
+                .window_cell_width_points();
+            let cell_width = configured_cell_width.min(strip_content.width().max(1.0));
+            let cell_height = (strip_rect.height()
+                - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
+                .max(1.0);
+            let window = still_seek_strip_window(
+                total,
+                info.current_pos,
+                strip_content.width(),
+                configured_cell_width,
+            );
+            requested_pages.extend(
+                info.image_indices[window.request_start..window.request_end]
+                    .iter()
+                    .copied(),
+            );
+            let visible_count = window.visible_end - window.visible_start;
+            let row_width = visible_count as f32 * cell_width
+                + visible_count.saturating_sub(1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
+            let row_rect = egui::Rect::from_center_size(
+                strip_content.center(),
+                egui::vec2(row_width.min(strip_content.width()), strip_content.height()),
+            );
+            let strip_response = ui.interact(
+                row_rect,
+                ui.make_persistent_id("fullscreen_still_seek_strip_row"),
+                egui::Sense::click_and_drag(),
+            );
+            if strip_response.hovered() || strip_response.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let pointer = strip_response.interact_pointer_pos();
+            let pointed_source_pos = pointer.and_then(|pointer| {
+                still_seek_source_position_at_x(row_rect, window, cell_width, pointer.x, is_rtl)
+            });
+            if (strip_response.hovered() || strip_response.dragged())
+                && self.settings.still_seek_hover_preview_mode.is_visible(true)
+                && let Some(source_pos) = pointed_source_pos
+            {
+                preview = resolve_still_seek_target(
+                    &info.image_indices,
+                    spread_units,
+                    StillSeekPosition::SourcePosition(source_pos),
+                );
+                preview_pointer_x = pointer.map(|p| p.x);
+            }
+            if (strip_response.clicked() || strip_response.dragged())
+                && let Some(source_pos) = pointed_source_pos
+                && let Some(resolved) = resolve_still_seek_target(
+                    &info.image_indices,
+                    spread_units,
+                    StillSeekPosition::SourcePosition(source_pos),
+                )
+            {
+                if strip_response.dragged() {
+                    self.fs_seek_drag_active = true;
+                    self.note_fullscreen_seek_activity();
+                }
+                strip_display_pos = Some(resolved.display_pos);
+                if resolved.landing_idx != fs_idx || continuous_label_mode {
+                    target = Some(resolved.landing_idx);
+                }
+            }
+
+            for visual_slot in 0..visible_count {
+                let source_pos = if is_rtl {
+                    window.visible_end - 1 - visual_slot
                 } else {
-                    (fraction * (total - 1) as f32).round() as usize
+                    window.visible_start + visual_slot
+                };
+                let idx = info.image_indices[source_pos];
+                let cell_rect =
+                    still_seek_cell_rect(row_rect, visual_slot, cell_width, cell_height)
+                        .intersect(strip_content);
+                painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(30));
+                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(idx) {
+                    painter.image(
+                        tex.id(),
+                        fit_texture_rect(tex.size_vec2(), cell_rect.shrink(2.0)),
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    painter.text(
+                        cell_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "…",
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::from_gray(150),
+                    );
                 }
-                .min(total - 1)
-            };
-            display_pos = pos;
-            if let Some((units, current_unit_index)) = spread_seek.as_ref() {
-                if pos != *current_unit_index {
-                    target = Some(units[pos].anchor_idx());
-                }
-            } else {
-                let target_idx = info.image_indices[pos];
-                if target_idx != fs_idx || continuous_label_mode {
-                    if continuous_label_mode {
-                        self.seek_to_continuous_page_with_contract(
-                            ctx,
-                            target_idx,
-                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
-                        );
+                let selected = highlighted_pages.contains(&idx);
+                painter.rect_stroke(
+                    cell_rect,
+                    3.0,
+                    egui::Stroke::new(
+                        if selected { 3.0 } else { 1.0 },
+                        if selected {
+                            egui::Color32::from_rgb(112, 174, 255)
+                        } else {
+                            egui::Color32::from_gray(76)
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        if geometry.bar_height > 0.0 {
+            let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
+            let font = egui::FontId::monospace(13.0);
+            let sample_positions =
+                if !continuous_label_mode && self.spread_mode.is_spread() && total >= 2 {
+                    if self.spread_mode.is_rtl() {
+                        vec![total, total - 1]
                     } else {
-                        target = Some(target_idx);
+                        vec![total - 1, total]
+                    }
+                } else {
+                    vec![total]
+                };
+            let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
+                .unwrap_or_else(|| format!("{} / {}", total, total));
+            let sample_galley = painter.layout_no_wrap(
+                sample_label,
+                font.clone(),
+                FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+            );
+            let label_width = (sample_galley.size().x + 18.0)
+                .max(64.0)
+                .min((inner.width() * 0.32).max(64.0));
+            let gap = 12.0;
+            let (label_rect, track_rect) = if is_rtl {
+                let label_rect =
+                    egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
+                let track_rect = egui::Rect::from_min_max(
+                    egui::pos2(label_rect.right() + gap, inner.center().y - 4.0),
+                    egui::pos2(inner.right(), inner.center().y + 4.0),
+                );
+                (label_rect, track_rect)
+            } else {
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.right() - label_width, inner.top()),
+                    inner.right_bottom(),
+                );
+                let track_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.left(), inner.center().y - 4.0),
+                    egui::pos2(label_rect.left() - gap, inner.center().y + 4.0),
+                );
+                (label_rect, track_rect)
+            };
+            if track_rect.width() >= 48.0 {
+                let mut display_pos = spread_seek
+                    .as_ref()
+                    .map_or(info.current_pos.min(total - 1), |(_, unit_index)| {
+                        *unit_index
+                    });
+                if let Some(pos) = strip_display_pos {
+                    display_pos = pos;
+                }
+                let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
+                let response = ui.interact(
+                    hit_rect,
+                    ui.make_persistent_id("fullscreen_seek_track"),
+                    egui::Sense::click_and_drag(),
+                );
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+
+                if let Some(pointer_pos) = response.interact_pointer_pos()
+                    && (response.hovered() || response.dragged())
+                {
+                    let fraction =
+                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
+                    let resolved = resolve_still_seek_target(
+                        &info.image_indices,
+                        spread_units,
+                        StillSeekPosition::TrackFraction(fraction),
+                    );
+                    if self
+                        .settings
+                        .still_seek_hover_preview_mode
+                        .is_visible(strip_visible)
+                    {
+                        preview = resolved;
+                        preview_pointer_x = Some(pointer_pos.x);
+                    }
+                    if (response.clicked() || response.dragged())
+                        && let Some(resolved) = resolved
+                    {
+                        if response.dragged() {
+                            self.fs_seek_drag_active = true;
+                            self.note_fullscreen_seek_activity();
+                        }
+                        display_pos = resolved.display_pos;
+                        if resolved.landing_idx != fs_idx || continuous_label_mode {
+                            target = Some(resolved.landing_idx);
+                        }
                     }
                 }
+
+                painter.rect_filled(
+                    track_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
+                );
+                let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
+                let fraction = if spread_seek.is_some() {
+                    spread_seek_unit_fraction(display_pos, seek_unit_count)
+                } else if total <= 1 {
+                    0.0
+                } else {
+                    display_pos as f32 / (total - 1) as f32
+                };
+                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
+                let filled_rect = if is_rtl {
+                    egui::Rect::from_min_max(
+                        egui::pos2(knob_x, track_rect.top()),
+                        track_rect.right_bottom(),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        track_rect.min,
+                        egui::pos2(knob_x, track_rect.bottom()),
+                    )
+                };
+                painter.rect_filled(
+                    filled_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
+                );
+                for tick in crate::seek_ruler::page_ruler_ticks(
+                    seek_unit_count,
+                    track_rect.width(),
+                    crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+                ) {
+                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
+                    let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+                    let (height, gray) = if tick.major {
+                        (
+                            crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                            crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                        )
+                    } else {
+                        (
+                            crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                            crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                        )
+                    };
+                    painter.line_segment(
+                        [egui::pos2(x, top), egui::pos2(x, top + height)],
+                        egui::Stroke::new(
+                            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                            egui::Color32::from_gray(gray),
+                        ),
+                    );
+                }
+                painter.circle_filled(
+                    egui::pos2(knob_x, track_rect.center().y),
+                    6.0,
+                    egui::Color32::from_rgb(232, 240, 255),
+                );
+                painter.circle_stroke(
+                    egui::pos2(knob_x, track_rect.center().y),
+                    6.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
+                );
+
+                let label_idx = spread_seek.as_ref().map_or_else(
+                    || info.image_indices[display_pos],
+                    |(units, _)| units[display_pos].anchor_idx(),
+                );
+                let label = self
+                    .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
+                    .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
+                painter.text(
+                    label_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    font,
+                    FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
+                );
             }
         }
 
-        painter.rect_filled(
-            track_rect,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
-        );
-        let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
-        let fraction = if spread_seek.is_some() {
-            spread_seek_unit_fraction(display_pos, seek_unit_count)
-        } else if total <= 1 {
-            0.0
-        } else {
-            display_pos as f32 / (total - 1) as f32
-        };
-        let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
-        let filled_rect = if is_rtl {
-            egui::Rect::from_min_max(
-                egui::pos2(knob_x, track_rect.top()),
-                track_rect.right_bottom(),
-            )
-        } else {
-            egui::Rect::from_min_max(track_rect.min, egui::pos2(knob_x, track_rect.bottom()))
-        };
-        painter.rect_filled(
-            filled_rect,
-            4.0,
-            egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
-        );
-        for tick in crate::seek_ruler::page_ruler_ticks(
-            seek_unit_count,
-            track_rect.width(),
-            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
-        ) {
-            let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
-            let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
-            let (height, gray) = if tick.major {
-                (
-                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
-                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+        if let Some(preview) = preview {
+            requested_pages.push(preview.preview_idx);
+        }
+        self.ensure_still_seek_thumbnail_requests(ctx, &requested_pages);
+        if let Some(preview) = preview {
+            let texture = self.thumbnails.get(preview.preview_idx).and_then(|state| {
+                if let ThumbnailState::Loaded { tex, .. } = state {
+                    Some(tex.clone())
+                } else {
+                    None
+                }
+            });
+            let label = self
+                .fullscreen_page_number_label_for_info(
+                    preview.preview_idx,
+                    &info,
+                    continuous_label_mode,
                 )
-            } else {
-                (
-                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
-                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
-                )
-            };
-            painter.line_segment(
-                [egui::pos2(x, top), egui::pos2(x, top + height)],
-                egui::Stroke::new(
-                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
-                    egui::Color32::from_gray(gray),
-                ),
+                .unwrap_or_default();
+            paint_still_seek_preview(
+                painter,
+                full_rect,
+                panel_rect.top(),
+                preview_pointer_x.unwrap_or(full_rect.center().x),
+                texture.as_ref(),
+                &label,
             );
         }
-        painter.circle_filled(
-            egui::pos2(knob_x, track_rect.center().y),
-            6.0,
-            egui::Color32::from_rgb(232, 240, 255),
-        );
-        painter.circle_stroke(
-            egui::pos2(knob_x, track_rect.center().y),
-            6.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
-        );
-
-        let label_idx = spread_seek.as_ref().map_or_else(
-            || info.image_indices[display_pos],
-            |(units, _)| units[display_pos].anchor_idx(),
-        );
-        let label = self
-            .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
-            .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
-        painter.text(
-            label_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font,
-            FULLSCREEN_PAGE_NUMBER_TEXT_COLOR,
-        );
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
         }
@@ -17848,6 +18618,9 @@ impl App {
                         let panels_t0 = std::time::Instant::now();
                         let mut side_panel_visible = false;
                         let mut right_panel_visible = false;
+                        let still_seek_height = self
+                            .still_seek_geometry_for_idx(fs_idx, state.is_video)
+                            .total_height;
                         // 音声 (音楽ビュー) は画像フルスクリーンの左右パネル (補正 / メタデータ /
                         // 表示トリム / 分析 / パノラマ等) を一切描かない。draw_fs_music_view が
                         // 自前の UI (上情報バー + 下シークバー) を描くので、動画が native presenter に
@@ -17958,13 +18731,17 @@ impl App {
                         } else if adjustment_active {
                             // 左補正パネル。右情報パネルは独立した表示条件で描く。
                             side_panel_visible = true;
-                            let panel_rect = adjustment_panel_rect(full_rect);
+                            let panel_rect = adjustment_panel_rect_with_seek_height(
+                                full_rect,
+                                still_seek_height,
+                            );
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
                             right_panel_visible = self.draw_metadata_panel(
                                 ui,
                                 ctx,
                                 full_rect,
                                 info_panel_lock_effective,
+                                still_seek_height,
                             );
                             side_panel_visible |= right_panel_visible;
                         } else if panorama_mode_active_now {
@@ -17988,6 +18765,7 @@ impl App {
                                 ctx,
                                 full_rect,
                                 info_panel_lock_effective,
+                                still_seek_height,
                             );
                             side_panel_visible = right_panel_visible;
                         }
@@ -25347,7 +26125,11 @@ impl App {
                     });
             return (FsPageNav::None, false);
         }
-        let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let seek_geometry = self
+            .fullscreen_idx
+            .map(|idx| self.still_seek_geometry_for_idx(idx, state.is_video))
+            .unwrap_or_else(StillSeekGeometry::bar_only);
+        let seek_panel_rect = seek_geometry.panel_rect(full_rect);
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
@@ -25536,6 +26318,7 @@ impl App {
             full_rect,
             side_panel_chrome_enabled && passive_side_panel_hover_enabled,
             navigator_exclusion,
+            seek_geometry.total_height,
         );
 
         // ── ホイール ──
@@ -25592,7 +26375,7 @@ impl App {
                 i.pointer
                     .hover_pos()
                     .map(|p| {
-                        let in_side_panel = fullscreen_side_panel_contains_pointer(
+                        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
                             full_rect,
                             p,
                             side_panel_chrome_enabled,
@@ -25600,6 +26383,7 @@ impl App {
                             has_right_panel,
                             self.adjustment_mode.is_open(),
                             navigator_exclusion,
+                            seek_geometry.total_height,
                         );
                         let in_music_side_panel = music_side_panel_contains_pointer(
                             full_rect,
@@ -25729,11 +26513,12 @@ impl App {
                 )
                 && !self.analysis_mode
                 && self.fullscreen_idx.is_some()
-                && adjustment_panel_hover_active_at(
+                && adjustment_panel_hover_active_at_with_seek_height(
                     full_rect,
                     ctx.input(|input| input.pointer.hover_pos()),
                     self.adjustment_mode.is_open(),
                     navigator_exclusion,
+                    seek_geometry.total_height,
                 );
             if left_panel_hover_active || bookmark_title_focused {
                 self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
@@ -25868,12 +26653,13 @@ impl App {
                 touch_help_phase_before = None;
             }
         }
-        let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects(
+        let mut touch_excluded: Vec<egui::Rect> = fullscreen_side_panel_rects_with_seek_height(
             full_rect,
             side_panel_chrome_enabled,
             self.settings.fullscreen_side_panel_mode,
             has_right_panel,
             self.adjustment_mode.is_open(),
+            seek_geometry.total_height,
         )
         .iter()
         .collect();
@@ -25897,12 +26683,13 @@ impl App {
         if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
             touch_excluded.push(navigator_rect);
         }
-        extend_touch_excluded_with_panel_handles(
+        extend_touch_excluded_with_panel_handles_and_seek_height(
             &mut touch_excluded,
             full_rect,
             side_panel_chrome_enabled && touch_chrome_latched,
             self.adjustment_mode.is_open(),
             has_right_panel,
+            seek_geometry.total_height,
         );
         if touch_help_phase_before.is_some() {
             // The modal guide owns the whole surface, including chrome which
@@ -26527,15 +27314,17 @@ impl App {
                                 let has_right_panel = self.metadata_panel_click_shown()
                                     || self.fs_info_panel.hover_active
                                     || self.fullscreen_tag_picker_open;
-                                let in_side_panel = fullscreen_side_panel_contains_pointer(
-                                    full_rect,
-                                    pos,
-                                    side_panel_chrome_enabled,
-                                    self.settings.fullscreen_side_panel_mode,
-                                    has_right_panel,
-                                    self.adjustment_mode.is_open(),
-                                    navigator_exclusion,
-                                );
+                                let in_side_panel =
+                                    fullscreen_side_panel_contains_pointer_with_seek_height(
+                                        full_rect,
+                                        pos,
+                                        side_panel_chrome_enabled,
+                                        self.settings.fullscreen_side_panel_mode,
+                                        has_right_panel,
+                                        self.adjustment_mode.is_open(),
+                                        navigator_exclusion,
+                                        seek_geometry.total_height,
+                                    );
                                 let in_seek_panel =
                                     seek_panel_interactive && seek_panel_rect.contains(pos);
                                 // Mouse clicks stay suppressed in continuous reading. The wheel is
@@ -32746,7 +33535,11 @@ impl App {
             // and zoom needs to be resolved only once.
             let zip_input = if self.fs_zoom_mode_engaged() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
-                let bottom_m = (FS_SEEK_BAR_HEIGHT + 8.0).min(image_rect.height() * 0.25);
+                let bottom_m = (self
+                    .still_seek_geometry_for_idx(left_idx, false)
+                    .total_height
+                    + 8.0)
+                    .min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
                     egui::pos2(image_rect.left(), image_rect.top() + top_m),
                     egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
@@ -51621,6 +52414,92 @@ mod tests {
         assert_eq!(spread_seek_unit_from_fraction(0.0, 0), 0);
         assert_eq!(spread_seek_unit_fraction(0, 1), 0.0);
         assert_eq!(spread_seek_unit_from_fraction(0.0, 1), 0);
+    }
+
+    #[test]
+    fn still_seek_strip_requests_are_bounded_by_view_width_for_fifty_thousand_pages() {
+        let window = still_seek_strip_window(50_000, 25_000, 1_920.0, 45.0);
+        let visible = window.visible_end - window.visible_start;
+        let requested = window.request_end - window.request_start;
+        assert!(visible <= 40);
+        assert!(requested <= visible + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2);
+        assert!(window.visible_start <= 25_000);
+        assert!(window.visible_end > 25_000);
+    }
+
+    #[test]
+    fn still_seek_strip_visual_order_mirrors_source_positions_for_rtl() {
+        let window = StillSeekStripWindow {
+            visible_start: 10,
+            visible_end: 14,
+            request_start: 8,
+            request_end: 16,
+        };
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(196.0, 40.0));
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, 45.0, 1.0, false),
+            Some(10)
+        );
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, 45.0, 1.0, true),
+            Some(13)
+        );
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, 45.0, 195.0, false),
+            Some(13)
+        );
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, 45.0, 195.0, true),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn still_seek_track_and_source_cells_share_spread_landing_resolution() {
+        let images = [4, 5, 6, 7];
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6, 7],
+            },
+        ];
+        let track =
+            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::TrackFraction(1.0))
+                .unwrap();
+        let cell =
+            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::SourcePosition(3))
+                .unwrap();
+        assert_eq!(track.landing_idx, 6);
+        assert_eq!(cell.preview_idx, 7);
+        assert_eq!(cell.landing_idx, track.landing_idx);
+    }
+
+    #[test]
+    fn resolved_still_seek_height_drives_fixed_media_and_side_panel_bottoms() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let geometry = StillSeekGeometry::resolve(
+            true,
+            crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            crate::settings::StillSeekBarWithStrip::Show,
+        );
+        let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
+            full,
+            false,
+            true,
+            geometry.total_height,
+            0,
+            0.0,
+        );
+        let left = adjustment_panel_rect_with_seek_height(full, geometry.total_height);
+        let right = metadata_panel_rect_with_seek_height(full, geometry.total_height);
+        assert_eq!(geometry.total_height, 110.0);
+        assert_eq!(media.bottom(), geometry.panel_rect(full).top());
+        assert_eq!(left.bottom(), media.bottom());
+        assert_eq!(right.bottom(), media.bottom());
     }
 
     #[test]

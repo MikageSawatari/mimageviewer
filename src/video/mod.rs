@@ -448,6 +448,8 @@ pub struct NativeBarLockState {
     pub bottom_lock: crate::settings::VideoBottomLock,
     pub fixed_bar_gap_px: u32,
     pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    pub seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
+    pub seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
 }
 
 impl NativeBarLockState {

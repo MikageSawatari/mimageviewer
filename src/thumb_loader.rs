@@ -36,6 +36,18 @@ pub fn worker_priority_key(
     }
 }
 
+/// Grid prefetch is bounded by the worker bbox. Foreground requests use the exact
+/// App-owned keep set and must not force that bbox to span distant seek pages.
+pub fn thumbnail_request_in_keep(
+    priority: bool,
+    still_seek_exact: bool,
+    idx: usize,
+    keep_start: usize,
+    keep_end: usize,
+) -> bool {
+    (idx >= keep_start && idx < keep_end) || (priority && still_seek_exact)
+}
+
 // -----------------------------------------------------------------------
 // キャッシュキー定数 (app.rs / ベンチマーク bin から参照)
 // -----------------------------------------------------------------------
@@ -989,6 +1001,7 @@ pub fn process_load_request(
     cancel: Option<&Arc<AtomicBool>>,
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
+    still_seek_thumbnail_pages: Option<&Arc<std::sync::RwLock<std::collections::HashSet<usize>>>>,
     // pin-aware auto-pick 用の DB ハンドル。`resolve_folder_thumb_image` が
     // recursive auto-pick の各段でサブフォルダの pin を引いて leaf 画像へ
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
@@ -1383,7 +1396,11 @@ pub fn process_load_request(
     if needs_heavy_io {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        if req.idx < ks || req.idx >= ke {
+        let still_seek_exact = req.priority
+            && still_seek_thumbnail_pages
+                .and_then(|shared| shared.read().ok())
+                .is_some_and(|pages| pages.contains(&req.idx));
+        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (after I/O resolve)  {}",
                 req.idx,
@@ -1511,7 +1528,11 @@ pub fn process_load_request(
     if req.pdf_page.is_some() && req.source_policy.allows_cache() {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        if req.idx < ks || req.idx >= ke {
+        let still_seek_exact = req.priority
+            && still_seek_thumbnail_pages
+                .and_then(|shared| shared.read().ok())
+                .is_some_and(|pages| pages.contains(&req.idx));
+        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (pdf before render)  {}",
                 req.idx,
@@ -3208,6 +3229,14 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn foreground_thumbnail_requests_do_not_need_a_widened_worker_bbox() {
+        assert!(!thumbnail_request_in_keep(false, false, 5_000, 2, 8));
+        assert!(!thumbnail_request_in_keep(true, false, 5_000, 2, 8));
+        assert!(thumbnail_request_in_keep(true, true, 5_000, 2, 8));
+        assert!(thumbnail_request_in_keep(false, false, 4, 2, 8));
+    }
+
+    #[test]
     fn unmeasured_time_is_all_of_it_when_nothing_was_timed() {
         assert_eq!(ThumbLoadPhases::default().unaccounted_ms(12.5), 12.5);
     }
@@ -3692,6 +3721,8 @@ mod tests {
             let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
             let keep_start = Arc::new(AtomicUsize::new(0));
             let keep_end = Arc::new(AtomicUsize::new(1));
+            let still_seek_thumbnail_pages =
+                Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
             let req = LoadRequest {
                 idx: 0,
                 path: img_path.clone(),
@@ -3715,6 +3746,7 @@ mod tests {
                 None,
                 &keep_start,
                 &keep_end,
+                Some(&still_seek_thumbnail_pages),
                 None,
                 None,
                 Some(&adjustment_db),

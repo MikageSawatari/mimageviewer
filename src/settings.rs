@@ -4244,6 +4244,18 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
+    /// 静止画ページシークバーに source page 単位のサムネイル列を表示する。
+    #[serde(default = "default_still_seek_strip_visible")]
+    pub still_seek_strip_visible: bool,
+    /// 静止画ページシークストリップの高さ (大 / 中 / 小 / 最小)。
+    #[serde(default = "default_still_seek_strip_height")]
+    pub still_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 静止画ページシークのマウスオーバープレビュー表示方針。
+    #[serde(default = "default_still_seek_hover_preview_mode")]
+    pub still_seek_hover_preview_mode: StillSeekHoverPreviewMode,
+    /// 静止画サムネイル列表示中の通常ページシークバー表示方針。
+    #[serde(default = "default_still_seek_bar_with_strip")]
+    pub still_seek_bar_with_strip: StillSeekBarWithStrip,
     /// 静止画フルスクリーン上部 HUD を常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_top_bar_locked: bool,
@@ -4716,6 +4728,12 @@ pub struct Settings {
     /// 下部バー固定との到達可能な組み合わせは `VideoBottomLock` が所有する。
     #[serde(default)]
     pub video_seek_strip_locked: bool,
+    /// 動画シークのマウスオーバープレビュー表示方針。
+    #[serde(default = "default_video_seek_hover_preview_mode")]
+    pub video_seek_hover_preview_mode: VideoSeekHoverPreviewMode,
+    /// 動画サムネイルストリップ表示中の通常シークバー表示方針。
+    #[serde(default = "default_video_seek_bar_with_strip")]
+    pub video_seek_bar_with_strip: VideoSeekBarWithStrip,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -5536,6 +5554,138 @@ impl VideoSeekStripState {
     }
 }
 
+/// 静止画シーク位置へ追従するサムネイルプレビューの表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekHoverPreviewMode {
+    #[default]
+    Always,
+    HideWithThumbnailStrip,
+    Never,
+}
+
+impl StillSeekHoverPreviewMode {
+    pub const ALL: [Self; 3] = [Self::Always, Self::HideWithThumbnailStrip, Self::Never];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::HideWithThumbnailStrip => !thumbnail_strip_visible,
+            Self::Never => false,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Always => "常に表示する",
+            Self::HideWithThumbnailStrip => "サムネイルストリップ表示中は表示しない",
+            Self::Never => "常に表示しない",
+        }
+    }
+}
+
+/// 静止画サムネイル列表示中の通常ページシークバー表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekBarWithStrip {
+    #[default]
+    Show,
+    Hide,
+}
+
+impl StillSeekBarWithStrip {
+    pub const ALL: [Self; 2] = [Self::Show, Self::Hide];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        !thumbnail_strip_visible || matches!(self, Self::Show)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Show => "表示する",
+            Self::Hide => "表示しない",
+        }
+    }
+}
+
+/// 動画シーク位置へ追従するサムネイルプレビューの表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekHoverPreviewMode {
+    #[default]
+    Always,
+    HideWithThumbnailStrip,
+    Never,
+}
+
+impl VideoSeekHoverPreviewMode {
+    pub const ALL: [Self; 3] = [Self::Always, Self::HideWithThumbnailStrip, Self::Never];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::HideWithThumbnailStrip => !thumbnail_strip_visible,
+            Self::Never => false,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Always => "常に表示する",
+            Self::HideWithThumbnailStrip => "サムネイルストリップ表示中は表示しない",
+            Self::Never => "常に表示しない",
+        }
+    }
+}
+
+/// 動画サムネイルストリップ表示中の通常シークバー表示方針。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekBarWithStrip {
+    #[default]
+    Show,
+    Hide,
+}
+
+impl VideoSeekBarWithStrip {
+    pub const ALL: [Self; 2] = [Self::Show, Self::Hide];
+
+    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
+        !thumbnail_strip_visible || matches!(self, Self::Show)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Show => "表示する",
+            Self::Hide => "表示しない",
+        }
+    }
+}
+
+fn default_still_seek_strip_visible() -> bool {
+    false
+}
+
+fn default_still_seek_strip_height() -> crate::video::seek_strip_layout::SeekStripHeight {
+    crate::video::seek_strip_layout::SeekStripHeight::Large
+}
+
+fn default_still_seek_hover_preview_mode() -> StillSeekHoverPreviewMode {
+    StillSeekHoverPreviewMode::Always
+}
+
+fn default_still_seek_bar_with_strip() -> StillSeekBarWithStrip {
+    StillSeekBarWithStrip::Show
+}
+
+fn default_video_seek_hover_preview_mode() -> VideoSeekHoverPreviewMode {
+    VideoSeekHoverPreviewMode::Always
+}
+
+fn default_video_seek_bar_with_strip() -> VideoSeekBarWithStrip {
+    VideoSeekBarWithStrip::Show
+}
+
 fn default_video_seek_strip_min_interval_secs() -> f64 {
     VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
 }
@@ -6074,6 +6224,10 @@ impl Default for Settings {
             panorama_projection: crate::panorama::PanoProjection::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
+            still_seek_strip_visible: default_still_seek_strip_visible(),
+            still_seek_strip_height: default_still_seek_strip_height(),
+            still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
+            still_seek_bar_with_strip: default_still_seek_bar_with_strip(),
             fullscreen_top_bar_locked: false,
             touch_still_chrome_learned: false,
             touch_video_chrome_learned: false,
@@ -6226,6 +6380,8 @@ impl Default for Settings {
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_seek_strip_locked: false,
+            video_seek_hover_preview_mode: default_video_seek_hover_preview_mode(),
+            video_seek_bar_with_strip: default_video_seek_bar_with_strip(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -8642,6 +8798,62 @@ mod tests {
         assert!(!SpreadMode::SplitLtr.advances_right_to_left());
         // ペア並び順は分割を含まない。2 つの問いを取り違えない。
         assert!(!SpreadMode::SplitRtl.is_rtl());
+    }
+
+    #[test]
+    fn still_and_video_seek_display_settings_have_compatible_defaults_and_round_trip() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.still_seek_strip_visible);
+        assert_eq!(
+            loaded.still_seek_strip_height,
+            crate::video::seek_strip_layout::SeekStripHeight::Large
+        );
+        assert_eq!(
+            loaded.still_seek_hover_preview_mode,
+            StillSeekHoverPreviewMode::Always
+        );
+        assert_eq!(
+            loaded.still_seek_bar_with_strip,
+            StillSeekBarWithStrip::Show
+        );
+        assert_eq!(
+            loaded.video_seek_hover_preview_mode,
+            VideoSeekHoverPreviewMode::Always
+        );
+        assert_eq!(
+            loaded.video_seek_bar_with_strip,
+            VideoSeekBarWithStrip::Show
+        );
+
+        let mut settings = Settings::default();
+        settings.still_seek_strip_visible = true;
+        settings.still_seek_hover_preview_mode = StillSeekHoverPreviewMode::Never;
+        settings.video_seek_bar_with_strip = VideoSeekBarWithStrip::Hide;
+        let stored = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&stored).unwrap();
+        assert!(restored.still_seek_strip_visible);
+        assert_eq!(
+            restored.still_seek_hover_preview_mode,
+            StillSeekHoverPreviewMode::Never
+        );
+        assert_eq!(
+            restored.video_seek_bar_with_strip,
+            VideoSeekBarWithStrip::Hide
+        );
+    }
+
+    #[test]
+    fn seek_display_policies_treat_only_thumbnail_strips_as_suppression_input() {
+        assert!(StillSeekHoverPreviewMode::Always.is_visible(true));
+        assert!(!StillSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(true));
+        assert!(StillSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(false));
+        assert!(!StillSeekHoverPreviewMode::Never.is_visible(false));
+        assert!(!StillSeekBarWithStrip::Hide.is_visible(true));
+        assert!(StillSeekBarWithStrip::Hide.is_visible(false));
+        assert!(!VideoSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(true));
+        assert!(VideoSeekHoverPreviewMode::HideWithThumbnailStrip.is_visible(false));
+        assert!(!VideoSeekBarWithStrip::Hide.is_visible(true));
+        assert!(VideoSeekBarWithStrip::Hide.is_visible(false));
     }
 
     #[test]

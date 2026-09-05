@@ -328,6 +328,15 @@ fn still_touch_panel_handles_latched_dark() {
 }
 
 #[test]
+fn still_seek_strip_and_hover_preview_dark() {
+    snapshot_with_theme(
+        "still_seek_strip_and_hover_preview_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_still_seek_strip_snapshot_fixture,
+    );
+}
+
+#[test]
 fn music_touch_panel_handles_observed_dark() {
     snapshot_with_theme(
         "music_touch_panel_handles_observed_dark",

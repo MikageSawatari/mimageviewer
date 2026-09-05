@@ -551,6 +551,12 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 - 3 箇所とも `canceled=true` を送信して `requested` cleanup する。`continue` だけでは
   `requested` に残って「再エンキューされない idx=Pending」状態で固まる。
 
+静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
+要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
+を `keep_set` へ合流する。要求は priority とし、worker は同 set の read-only shared
+projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
+間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
+
 **なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
 DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
 cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、
@@ -627,8 +633,10 @@ mImageViewer は 2 つのリストを使い分ける:
 
 具体像:
 
-- **`App::keep_range: (usize, usize)`** — `keep_set` の bounding box。worker 側で
-  atomic に読める `keep_start_shared` / `keep_end_shared` の値を供給する。
+- **`App::keep_range: (usize, usize)`** — グリッド保持帯（または明示的なナビゲーション
+  対象）の bounding box。worker 側で atomic に読める
+  `keep_start_shared` / `keep_end_shared` の値を供給する。静止画シークの遠隔 exact set
+  はここへ合流せず、上記の shared projection で別に判定する。
   疎な keep_set に対しては「広め」の判定になるので、worker が稀に非可視 idx を
   掴んでしまうが、main thread 側で enqueue しなければほぼ発生しない。
 - **`App::keep_set: HashSet<usize>`** — 実際に prefetch / 保持したい idx 集合。

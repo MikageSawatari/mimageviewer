@@ -606,6 +606,33 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["ページバー", "下部バー", "固定"]
     ),
     entry!(
+        "spread/seek-strip",
+        SpreadMode,
+        "ページシークバーにサムネイル列を表示",
+        [
+            "静止画",
+            "漫画",
+            "サムネイル",
+            "高さ",
+            "大",
+            "中",
+            "小",
+            "最小"
+        ]
+    ),
+    entry!(
+        "spread/seek-preview",
+        SpreadMode,
+        "マウスオーバーのサムネイル",
+        ["静止画", "プレビュー", "サムネイル列", "常に表示"]
+    ),
+    entry!(
+        "spread/seek-bar-with-strip",
+        SpreadMode,
+        "サムネイル列表示中の通常シークバー",
+        ["静止画", "ページシークバー", "表示しない"]
+    ),
+    entry!(
         "spread/seek-direction",
         SpreadMode,
         "ページシークバーの方向",
@@ -809,7 +836,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "固定表示",
             "鍵",
             "領域を確保",
-            "余白"
+            "余白",
+            "マウスオーバーのサムネイル",
+            "サムネイルストリップ表示中の通常シークバー"
         ]
     ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
