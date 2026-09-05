@@ -4404,14 +4404,16 @@ fn fullscreen_pdf_interrupted_render_is_cancel_like() {
 }
 
 #[test]
-fn scan_directory_can_ignore_convertible_archives() {
+fn folder_scan_can_ignore_convertible_archives() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
     std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false).unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
@@ -4421,6 +4423,91 @@ fn scan_directory_can_ignore_convertible_archives() {
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
     );
+    assert_eq!(
+        scan.omitted.ignored_archive, 3,
+        "RAR / 7z / LZH は設定で無視した書庫として数える"
+    );
+    assert_eq!(
+        scan.omitted.unsupported, 0,
+        "設定で無視した書庫を対象外へ二重計上しない"
+    );
+    assert_eq!(
+        scan.omitted.primary_count(),
+        3,
+        "旧 unsupported 3 件だった主数字を維持する"
+    );
+}
+
+#[test]
+fn folder_scan_lists_convertible_archives_for_ask_and_convert() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
+    std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
+    std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
+
+    for handling in [
+        crate::settings::ArchiveFileHandling::Ask,
+        crate::settings::ArchiveFileHandling::Convert,
+    ] {
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(handling);
+        let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+        let archive_count = scan
+            .folders
+            .iter()
+            .filter(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. }))
+            .count();
+
+        assert_eq!(
+            archive_count, 3,
+            "{handling:?} では変換対象書庫を一覧へ出す"
+        );
+        assert_eq!(
+            scan.omitted,
+            crate::app::folder_scan::OmittedFolderEntryCounts::default(),
+            "{handling:?} では内訳を増やさない"
+        );
+    }
+}
+
+#[test]
+fn folder_scan_keeps_unsupported_files_out_of_ignored_archive_bucket() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), b"text").unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.unsupported, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.primary_count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn folder_scan_classifies_hidden_archive_before_ignore_setting() {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let tmp = TempDir::new().expect("tempdir");
+    let mut archive = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN)
+        .open(tmp.path().join("hidden.rar"))
+        .unwrap();
+    archive.write_all(b"rar").unwrap();
+    drop(archive);
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.hidden, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.unsupported, 0);
 }
 
 #[test]
@@ -5886,6 +5973,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
         same_name: 3,
         hidden: 2,
+        ignored_archive: 4,
         unsupported: 5,
         system: 1,
     };

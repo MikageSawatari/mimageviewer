@@ -1002,6 +1002,30 @@ mod tests {
             .collect()
     }
 
+    /// 変換対象形式の名前は、`ArchiveFormat` を単一の持ち主として 3 か所に出る:
+    /// 設定ページの見出し (`page_cache` のリテラル)、この検索索引の title、そして
+    /// `非表示 N 件` の内訳とその設定リンク (`ui_main::omitted_entries_breakdown_label`)。
+    ///
+    /// 前 2 つは `index_entries_are_unique_valid_and_placed_in_pages` が
+    /// 「索引の title が pages.rs のソースに出ること」で結び付けている。ここでは残る 1 本、
+    /// **索引の title が `ArchiveFormat` 由来の名前を使っていること**を固定する。
+    /// これで形式を足したときに、内訳側だけが新しくなって設定ページと索引が古いまま、
+    /// という分かれ方をしない。
+    #[test]
+    fn the_archive_handling_title_spells_the_formats_the_way_archive_format_does() {
+        let labels = crate::archive_converter::ArchiveFormat::convertible_labels();
+        let entry = PREF_SEARCH_INDEX
+            .iter()
+            .find(|entry| entry.anchor == "cache/archive-handling")
+            .expect("cache/archive-handling が索引にありません");
+        assert!(
+            entry.title.contains(&labels),
+            "索引の title `{}` が ArchiveFormat 由来の形式名 `{labels}` を含んでいません。
+             形式を追加したら、設定ページの見出しと索引の title も同時に直すこと。",
+            entry.title
+        );
+    }
+
     #[test]
     fn index_entries_are_unique_valid_and_placed_in_pages() {
         let mut anchors = HashSet::new();
