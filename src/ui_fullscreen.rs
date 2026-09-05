@@ -83,7 +83,7 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
-const FS_RENDER_PERF_STAGE_COUNT: usize = 35;
+const FS_RENDER_PERF_STAGE_COUNT: usize = 44;
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,16 @@ enum FsRenderPerfStage {
     FsNavigationPageOther,
     FsNavigationBeginSequence,
     FsNavigationLandSeekContinuous,
-    FsNavigationLandOpenOther,
+    FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+    FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+    FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+    FsNavigationLandOpenOtherVideoAudioVst,
+    FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+    FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+    FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+    FsNavigationLandOpenOtherFullscreenCursorState,
+    FsNavigationLandOpenOtherRemainder,
     FsNavigationLandOpenRecordReadingHistory,
     FsNavigationLandOpenRecordBookResume,
     FsNavigationLandOpenStartMetadataLoad,
@@ -144,7 +153,16 @@ impl FsRenderPerfStage {
         Self::FsNavigationPageOther,
         Self::FsNavigationBeginSequence,
         Self::FsNavigationLandSeekContinuous,
-        Self::FsNavigationLandOpenOther,
+        Self::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        Self::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+        Self::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        Self::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        Self::FsNavigationLandOpenOtherVideoAudioVst,
+        Self::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        Self::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        Self::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        Self::FsNavigationLandOpenOtherFullscreenCursorState,
+        Self::FsNavigationLandOpenOtherRemainder,
         Self::FsNavigationLandOpenRecordReadingHistory,
         Self::FsNavigationLandOpenRecordBookResume,
         Self::FsNavigationLandOpenStartMetadataLoad,
@@ -174,6 +192,15 @@ enum FsNavigationPerfSpan {
     LandTarget,
     LandSeekContinuous,
     LandOpen,
+    LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    LandOpenOtherFsPageTurnDecisionForFrame,
+    LandOpenOtherDeferPageTurnFullResolutionWork,
+    LandOpenOtherSyncMainSelectionFromViewerIdx,
+    LandOpenOtherVideoAudioVst,
+    LandOpenOtherTryStartVideoTileFastSwap,
+    LandOpenOtherTryStartNativeVideoFastSwap,
+    LandOpenOtherCancelStaleVideoTileReopen,
+    LandOpenOtherFullscreenCursorState,
     Slideshow,
     SlideshowAdvance,
 }
@@ -187,6 +214,16 @@ struct FsNavigationPerfRecorder {
     land_target: std::time::Duration,
     land_seek_continuous: std::time::Duration,
     land_open: std::time::Duration,
+    land_open_other_should_block_detached_independent_still_navigation_to_video:
+        std::time::Duration,
+    land_open_other_fs_page_turn_decision_for_frame: std::time::Duration,
+    land_open_other_defer_page_turn_full_resolution_work: std::time::Duration,
+    land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration,
+    land_open_other_video_audio_vst: std::time::Duration,
+    land_open_other_try_start_video_tile_fast_swap: std::time::Duration,
+    land_open_other_try_start_native_video_fast_swap: std::time::Duration,
+    land_open_other_cancel_stale_video_tile_reopen: std::time::Duration,
+    land_open_other_fullscreen_cursor_state: std::time::Duration,
     open_fullscreen: FsOpenPerfRecorder,
     slideshow: std::time::Duration,
     slideshow_advance: std::time::Duration,
@@ -202,10 +239,49 @@ impl FsNavigationPerfRecorder {
             FsNavigationPerfSpan::LandTarget => &mut self.land_target,
             FsNavigationPerfSpan::LandSeekContinuous => &mut self.land_seek_continuous,
             FsNavigationPerfSpan::LandOpen => &mut self.land_open,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo => {
+                &mut self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            }
+            FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame => {
+                &mut self.land_open_other_fs_page_turn_decision_for_frame
+            }
+            FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork => {
+                &mut self.land_open_other_defer_page_turn_full_resolution_work
+            }
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx => {
+                &mut self.land_open_other_sync_main_selection_from_viewer_idx
+            }
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst => {
+                &mut self.land_open_other_video_audio_vst
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap => {
+                &mut self.land_open_other_try_start_video_tile_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap => {
+                &mut self.land_open_other_try_start_native_video_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen => {
+                &mut self.land_open_other_cancel_stale_video_tile_reopen
+            }
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState => {
+                &mut self.land_open_other_fullscreen_cursor_state
+            }
             FsNavigationPerfSpan::Slideshow => &mut self.slideshow,
             FsNavigationPerfSpan::SlideshowAdvance => &mut self.slideshow_advance,
         };
         *target += elapsed;
+    }
+
+    fn land_open_other_categorized(&self) -> std::time::Duration {
+        self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            + self.land_open_other_fs_page_turn_decision_for_frame
+            + self.land_open_other_defer_page_turn_full_resolution_work
+            + self.land_open_other_sync_main_selection_from_viewer_idx
+            + self.land_open_other_video_audio_vst
+            + self.land_open_other_try_start_video_tile_fast_swap
+            + self.land_open_other_try_start_native_video_fast_swap
+            + self.land_open_other_cancel_stale_video_tile_reopen
+            + self.land_open_other_fullscreen_cursor_state
     }
 }
 
@@ -259,9 +335,12 @@ impl FsRenderPerfRecorder {
             .saturating_sub(navigation.begin_sequence + navigation.land_target);
         let open_total = navigation.open_fullscreen.elapsed(FsOpenPerfSpan::Total);
         let open_categorized = navigation.open_fullscreen.categorized();
+        let land_open_other_categorized = navigation.land_open_other_categorized();
         debug_assert!(open_categorized <= open_total);
-        debug_assert!(open_total <= navigation.land_open);
-        let land_open_other = navigation.land_open.saturating_sub(open_total);
+        debug_assert!(open_total + land_open_other_categorized <= navigation.land_open);
+        let land_open_other_remainder = navigation
+            .land_open
+            .saturating_sub(open_total + land_open_other_categorized);
         let open_remainder = open_total.saturating_sub(open_categorized);
         let land_remainder = navigation
             .land_target
@@ -292,8 +371,44 @@ impl FsRenderPerfRecorder {
                 navigation.land_seek_continuous,
             ),
             (
-                FsRenderPerfStage::FsNavigationLandOpenOther,
-                land_open_other,
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.land_open_other_should_block_detached_independent_still_navigation_to_video,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+                navigation.land_open_other_fs_page_turn_decision_for_frame,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.land_open_other_defer_page_turn_full_resolution_work,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.land_open_other_sync_main_selection_from_viewer_idx,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.land_open_other_video_audio_vst,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.land_open_other_try_start_video_tile_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.land_open_other_try_start_native_video_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.land_open_other_cancel_stale_video_tile_reopen,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.land_open_other_fullscreen_cursor_state,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder,
             ),
             (
                 FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
@@ -547,8 +662,44 @@ impl FsRenderPerfBreakdown {
             FsRenderPerfStage::FsNavigationLandSeekContinuous,
         ),
         (
-            "handle_fs_navigation_land_target_open_other_ms",
-            FsRenderPerfStage::FsNavigationLandOpenOther,
+            "handle_fs_navigation_land_target_open_other_should_block_detached_independent_still_navigation_to_video_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_defer_page_turn_full_resolution_work_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_sync_main_selection_from_viewer_idx_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_video_audio_vst_active_exit_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_video_tile_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_native_video_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_cancel_stale_video_tile_reopen_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fullscreen_cursor_state_restore_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
         ),
         (
             "handle_fs_navigation_land_target_open_record_reading_history_ms",
@@ -14604,15 +14755,12 @@ impl App {
             );
         } else {
             let open_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
-            let open_fullscreen_perf = fs_navigation_perf
-                .as_mut()
-                .map(|perf| &mut perf.open_fullscreen);
             self.open_fullscreen_from_fs_navigation_with_contract(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 load_contract,
-                open_fullscreen_perf,
+                fs_navigation_perf,
             );
             finish_fs_navigation_perf_span(
                 fs_navigation_perf,
@@ -26283,12 +26431,13 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        let mut fs_navigation_perf = None;
         self.open_fullscreen_from_fs_navigation_with_contract(
             ctx,
             idx,
             history_trigger,
             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
-            None,
+            &mut fs_navigation_perf,
         );
     }
 
@@ -26298,10 +26447,20 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
-        mut open_fullscreen_perf: Option<&mut FsOpenPerfRecorder>,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         #[cfg(windows)]
-        if self.should_block_detached_independent_still_navigation_to_video(idx) {
+        let should_block_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let should_block = self.should_block_detached_independent_still_navigation_to_video(idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+            should_block_perf_t0,
+        );
+        #[cfg(windows)]
+        if should_block {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
             self.log_detached_image_window_debug(format!(
                 "blocked_independent_still_video_navigation target_idx={idx} \
@@ -26314,26 +26473,52 @@ impl App {
 
         let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
         let materialization = if target_is_still_page && self.fullscreen_idx.is_some() {
-            self.fs_page_turn_decision_for_frame(ctx, idx)
-                .navigation_target_open_materialization()
+            let page_turn_decision_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+            let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, idx);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame,
+                page_turn_decision_perf_t0,
+            );
+            page_turn_decision.navigation_target_open_materialization()
         } else {
             FsOpenMaterialization::Eager
         };
         if !matches!(materialization, FsOpenMaterialization::Eager) {
+            let defer_full_resolution_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.defer_page_turn_full_resolution_work();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                defer_full_resolution_perf_t0,
+            );
         }
 
+        let sync_selection_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.sync_main_selection_from_viewer_idx(idx);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+            sync_selection_perf_t0,
+        );
 
         // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
         // (presenter re-hide) へ戻す。以降は下の音声モード keep 分岐が hidden presenter を
         // source-swap するので、通常の音声モード継続ナビになる (VST GUI は閉じる)。
+        #[cfg(windows)]
+        let video_audio_vst_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         #[cfg(windows)]
         if let Some(cur) = self.fullscreen_idx
             && self.video_audio_vst_active_for(cur)
         {
             self.exit_video_audio_vst(ctx, cur);
         }
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst,
+            video_audio_vst_perf_t0,
+        );
 
         // 動画→音声モード (Inc 7): 音声モードのまま隣の動画へ file-nav (前後ファイルボタン /
         // キーボード ↑↓) したときは、hidden presenter を音声モードのまま source-swap で再利用する
@@ -26348,37 +26533,79 @@ impl App {
             && matches!(self.items.get(idx), Some(GridItem::Video(_)))
         {
             self.source_swap_keep_audio_mode = true;
+            let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let started =
                 self.try_start_native_video_fast_swap(ctx, idx, Some(true), true, history_trigger);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                native_video_fast_swap_perf_t0,
+            );
             self.source_swap_keep_audio_mode = false;
             if started {
                 return;
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
+            let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let cursor_state = self.fullscreen_cursor_state();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                cursor_state_perf_t0,
+            );
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
                 );
             }
+            let open_fullscreen_perf = fs_navigation_perf
+                .as_mut()
+                .map(|perf| &mut perf.open_fullscreen);
             self.open_fullscreen_with_materialization_and_contract(
                 idx,
                 history_trigger,
                 FsOpenMaterialization::Eager,
                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
-                open_fullscreen_perf.as_deref_mut(),
+                open_fullscreen_perf,
             );
+            let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                restore_cursor_state_perf_t0,
+            );
             return;
         }
 
         #[cfg(windows)]
-        if self.try_start_video_tile_fast_swap(ctx, idx) {
+        let video_tile_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let video_tile_fast_swap_started = self.try_start_video_tile_fast_swap(ctx, idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+            video_tile_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if video_tile_fast_swap_started {
             return;
         }
         #[cfg(windows)]
-        if self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger) {
+        let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let native_video_fast_swap_started =
+            self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            native_video_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if native_video_fast_swap_started {
             return;
         }
 
@@ -26390,28 +26617,49 @@ impl App {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
         } else {
+            let cancel_stale_video_tile_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "fs-navigation");
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                cancel_stale_video_tile_perf_t0,
+            );
         }
 
+        let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         let cursor_state = self.fullscreen_cursor_state();
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            cursor_state_perf_t0,
+        );
         if self.adjustment_mode.is_open() {
             crate::ime_focus::record_side_panel_close(
                 ctx,
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
+        let open_fullscreen_perf = fs_navigation_perf
+            .as_mut()
+            .map(|perf| &mut perf.open_fullscreen);
         self.open_fullscreen_with_materialization_and_contract(
             idx,
             history_trigger,
             materialization,
             load_contract,
-            open_fullscreen_perf.as_deref_mut(),
+            open_fullscreen_perf,
         );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
         // has already marked the cursor active before reaching this helper.
+        let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            restore_cursor_state_perf_t0,
+        );
 
         #[cfg(windows)]
         {
@@ -39053,6 +39301,19 @@ mod tests {
                 std::time::Instant::now()
             },
         );
+        let open_other_span = start_fs_navigation_perf_span_with(&navigation, || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        });
+        finish_fs_navigation_perf_span_with(
+            &mut navigation,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            open_other_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+        );
         let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
         let open_span = crate::app::start_fs_open_perf_span_with(&open_perf, || {
             clock_called.set(true);
@@ -39129,16 +39390,30 @@ mod tests {
         let navigation = FsNavigationPerfRecorder {
             close: std::time::Duration::from_millis(2),
             ctrl_sibling_mouse: std::time::Duration::from_millis(3),
-            page: std::time::Duration::from_millis(50),
+            page: std::time::Duration::from_millis(65),
             begin_sequence: std::time::Duration::from_millis(4),
-            land_target: std::time::Duration::from_millis(30),
+            land_target: std::time::Duration::from_millis(45),
             land_seek_continuous: std::time::Duration::ZERO,
-            land_open: std::time::Duration::from_millis(29),
+            land_open: std::time::Duration::from_millis(44),
+            land_open_other_should_block_detached_independent_still_navigation_to_video:
+                std::time::Duration::from_millis(1),
+            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(2),
+            land_open_other_defer_page_turn_full_resolution_work: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_video_audio_vst: std::time::Duration::from_millis(1),
+            land_open_other_try_start_video_tile_fast_swap: std::time::Duration::from_millis(1),
+            land_open_other_try_start_native_video_fast_swap: std::time::Duration::from_millis(3),
+            land_open_other_cancel_stale_video_tile_reopen: std::time::Duration::from_millis(1),
+            land_open_other_fullscreen_cursor_state: std::time::Duration::from_millis(2),
             open_fullscreen,
             slideshow: std::time::Duration::from_millis(7),
             slideshow_advance: std::time::Duration::from_millis(6),
         };
-        marked_at += std::time::Duration::from_millis(70);
+        marked_at += std::time::Duration::from_millis(85);
         recorder.mark_navigation_at(navigation, marked_at);
 
         assert_eq!(
@@ -39154,8 +39429,18 @@ mod tests {
             8.0
         );
         assert_eq!(
-            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenOther as usize],
-            4.0
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap as usize],
+            3.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState as usize],
+            2.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize],
+            6.0
         );
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
@@ -39165,6 +39450,15 @@ mod tests {
             recorder.stage_ms[FsRenderPerfStage::FsNavigationLandRemainder as usize],
             1.0
         );
+        let open_other_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo
+            as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(open_other_ms, 19.0);
         let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
             as usize
             ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
@@ -39172,14 +39466,14 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(land_ms, 30.0);
+        assert_eq!(land_ms, 45.0);
         let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
             ..=FsRenderPerfStage::FsNavigationRemainder as usize]
             .iter()
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(navigation_ms, 70.0);
+        assert_eq!(navigation_ms, 85.0);
         assert_eq!(
             FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
             Some(FsRenderPerfStage::FsBoundaryHint)
