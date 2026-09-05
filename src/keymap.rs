@@ -1485,6 +1485,8 @@ pub enum KeyAction {
     ExternalToolForContainer,
     GridSelectAll,
     GridDeselect,
+    GridCutFiles,
+    GridCopyFiles,
     GridToggleCheck,
     GridDelete,
     GridRename,
@@ -1972,6 +1974,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ExternalToolForContainer,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
+    KeyAction::GridCutFiles,
+    KeyAction::GridCopyFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridRename,
@@ -3564,6 +3568,8 @@ impl KeyAction {
             ExternalToolForContainer => "ExternalToolForContainer",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
+            GridCutFiles => "GridCutFiles",
+            GridCopyFiles => "GridCopyFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridRename => "GridRename",
@@ -4158,6 +4164,8 @@ impl KeyAction {
             ExternalToolForContainer => "現在のフォルダー / 本を外部ツールで開く",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
+            GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
+            GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridRename => "選択中の実ファイル/実フォルダの名前を変更する",
@@ -4630,6 +4638,8 @@ impl KeyAction {
             | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
+            | GridCutFiles
+            | GridCopyFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -5046,6 +5056,8 @@ impl KeyAction {
             | ExternalToolForContainer
             | GridSelectAll
             | GridDeselect
+            | GridCutFiles
+            | GridCopyFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -5516,6 +5528,8 @@ impl KeyAction {
             | ExternalToolForContainer => ChordList::EMPTY,
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
+            GridCutFiles => ChordList::one(Chord::ctrl(X)),
+            GridCopyFiles => ChordList::one(Chord::ctrl(C)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridRename | GridReload => ChordList::EMPTY,
@@ -7387,9 +7401,7 @@ impl Keymap {
             "# - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、\n",
         );
         out.push_str("#   OS が予約しているショートカットは keymap.ini では上書きできません。\n");
-        out.push_str(
-            "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
-        );
+        out.push_str("# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui の貼り付け、\n");
         out.push_str("#   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーション、\n");
         out.push_str("#   サムネイル一覧の Shift+矢印範囲選択は固定です。\n");
         out.push_str("#\n");

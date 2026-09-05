@@ -37916,20 +37916,20 @@ impl App {
             .blocks_legacy_main_shortcuts()
     }
 
-    fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
+    pub(crate) fn collect_shell_clipboard_paths(
+        &self,
+    ) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
         if !self.checked.is_empty() {
-            let mut paths = Vec::with_capacity(self.checked.len());
-            for &idx in &self.checked {
-                let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
-                    return Err(ShellClipboardSelectionError::UncopyableItem(
-                        self.items
-                            .get(idx)
-                            .and_then(GridItem::file_operation_refusal),
-                    ));
-                };
-                paths.push(path.to_path_buf());
+            let indexed_paths = self.collect_checked_indexed_paths();
+            if indexed_paths.len() != self.checked.len() {
+                let refusal = self.checked.iter().find_map(|&idx| {
+                    self.items
+                        .get(idx)
+                        .and_then(GridItem::file_operation_refusal)
+                });
+                return Err(ShellClipboardSelectionError::UncopyableItem(refusal));
             }
-            return Ok(paths);
+            return Ok(indexed_paths.into_iter().map(|(_, path)| path).collect());
         }
 
         let Some(idx) = self.selected else {
@@ -37967,6 +37967,18 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        self.invoke_shell_clipboard_verb_for_paths(ctx, &paths, verb);
+    }
+
+    pub(crate) fn invoke_shell_clipboard_verb_for_paths(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
         let Some(hwnd) = self.main_hwnd else {
             crate::logger::log(format!(
                 "shell_clipboard: {verb:?} skipped; main HWND unavailable"
@@ -37983,7 +37995,7 @@ impl App {
             crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         }
 
-        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb);
+        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb);
         Self::resync_egui_modifiers_from_os(ctx);
         match result {
             Ok(()) => ctx.request_repaint(),
@@ -38082,7 +38094,7 @@ impl App {
             return;
         }
 
-        let (ctrl_c, ctrl_x) = ctx.input(|i| {
+        let (egui_copy, egui_cut) = ctx.input(|i| {
             let mut c = false;
             let mut x = false;
             for event in &i.events {
@@ -38111,8 +38123,21 @@ impl App {
             false
         };
 
-        if ctrl_c || ctrl_x {
-            let verb = if ctrl_x {
+        let copy_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCopyFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::C));
+        let cut_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCutFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::X));
+        let copy_requested = self.keymap.pressed_action(ctx, KeyAction::GridCopyFiles)
+            || (egui_copy && copy_accepts_semantic_event);
+        let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
+            || (egui_cut && cut_accepts_semantic_event);
+
+        if copy_requested || cut_requested {
+            let verb = if cut_requested {
                 crate::native_context_menu::ShellClipboardVerb::Cut
             } else {
                 crate::native_context_menu::ShellClipboardVerb::Copy

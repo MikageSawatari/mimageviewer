@@ -59764,11 +59764,11 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_keep_delete_targets_real_only() {
+    fn checked_file_operation_paths_include_real_files_and_folders_only() {
         let mut app = setup_app();
 
-        // collect_checked_paths は Shell メニュー用の従来 helper なのでフォルダを除外する。
-        // 削除ターゲット helper は Del キーと同じく実フォルダも受け付ける。
+        // Shell クリップボードと削除が共有する正本 helper は、実ファイルと
+        // Space でチェック可能な実フォルダを含み、仮想ページだけを除外する。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -59807,19 +59807,6 @@ mod file_operation_selection_tests {
             app.checked.insert(idx);
         }
 
-        let mut paths = app.collect_checked_paths();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(r"C:\books\a.7z"),
-                PathBuf::from(r"C:\books\a.jpg"),
-                PathBuf::from(r"C:\books\a.mp4"),
-                PathBuf::from(r"C:\books\a.pdf"),
-                PathBuf::from(r"C:\books\a.zip"),
-            ]
-        );
-
         let targets = app.collect_checked_indexed_paths();
         assert_eq!(
             targets,
@@ -59831,7 +59818,7 @@ mod file_operation_selection_tests {
                 (image, PathBuf::from(r"C:\books\a.jpg")),
                 (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and include real folders while excluding virtual pages",
+            "shared targets are sorted by descending index and include real folders while excluding virtual pages",
         );
     }
 
@@ -59947,6 +59934,42 @@ mod file_operation_selection_tests {
             ))),
             "a selected virtual item should produce the same visible rejection path",
         );
+    }
+
+    #[test]
+    fn shell_clipboard_semantic_copy_event_respects_keymap_unbinding() {
+        let mut app = setup_app();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        app.selected = Some(image);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCopyFiles = none\nGridCutFiles = none\n",
+        );
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
+        );
+
+        app.keymap = crate::keymap::Keymap::from_ini_str("");
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast
+                .0
+                .contains("OSクリップボード操作を開始できませんでした")
+        }));
     }
 
     #[test]
