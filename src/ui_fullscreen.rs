@@ -83,7 +83,7 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
-const FS_RENDER_PERF_STAGE_COUNT: usize = 44;
+const FS_RENDER_PERF_STAGE_COUNT: usize = 51;
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,14 @@ enum FsRenderPerfStage {
     FsNavigationBeginSequence,
     FsNavigationLandSeekContinuous,
     FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
-    FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+    FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+    FsNavigationLandOpenOtherPageDecisionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionRemainder,
     FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
     FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
     FsNavigationLandOpenOtherVideoAudioVst,
@@ -154,7 +161,14 @@ impl FsRenderPerfStage {
         Self::FsNavigationBeginSequence,
         Self::FsNavigationLandSeekContinuous,
         Self::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
-        Self::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+        Self::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        Self::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionRemainder,
         Self::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
         Self::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
         Self::FsNavigationLandOpenOtherVideoAudioVst,
@@ -205,6 +219,67 @@ enum FsNavigationPerfSpan {
     SlideshowAdvance,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FsPageTurnDecisionPerfSpan {
+    OriginalPreviewActiveForFrame,
+    ResolveNavigationSequenceTarget,
+    ResolveFsDisplayTex,
+    EnsurePassthroughRendition,
+    ResolveOriginalPreviewTex,
+    EnsureNavigationTargetThumbnailRequests,
+    CacheLookup,
+}
+
+#[derive(Debug, Default)]
+struct FsPageTurnDecisionPerfRecorder {
+    original_preview_active_for_frame: std::time::Duration,
+    resolve_navigation_sequence_target: std::time::Duration,
+    resolve_fs_display_tex: std::time::Duration,
+    ensure_passthrough_rendition: std::time::Duration,
+    resolve_original_preview_tex: std::time::Duration,
+    ensure_navigation_target_thumbnail_requests: std::time::Duration,
+    cache_lookup: std::time::Duration,
+    cache_hit: Option<bool>,
+}
+
+impl FsPageTurnDecisionPerfRecorder {
+    fn add(&mut self, span: FsPageTurnDecisionPerfSpan, elapsed: std::time::Duration) {
+        let target = match span {
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame => {
+                &mut self.original_preview_active_for_frame
+            }
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget => {
+                &mut self.resolve_navigation_sequence_target
+            }
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex => &mut self.resolve_fs_display_tex,
+            FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition => {
+                &mut self.ensure_passthrough_rendition
+            }
+            FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex => {
+                &mut self.resolve_original_preview_tex
+            }
+            FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests => {
+                &mut self.ensure_navigation_target_thumbnail_requests
+            }
+            FsPageTurnDecisionPerfSpan::CacheLookup => &mut self.cache_lookup,
+        };
+        *target += elapsed;
+    }
+
+    fn resolve_navigation_sequence_target_categorized(&self) -> std::time::Duration {
+        self.resolve_fs_display_tex
+            + self.ensure_passthrough_rendition
+            + self.resolve_original_preview_tex
+            + self.ensure_navigation_target_thumbnail_requests
+    }
+
+    fn categorized(&self) -> std::time::Duration {
+        self.original_preview_active_for_frame
+            + self.resolve_navigation_sequence_target
+            + self.cache_lookup
+    }
+}
+
 #[derive(Debug, Default)]
 struct FsNavigationPerfRecorder {
     close: std::time::Duration,
@@ -217,6 +292,7 @@ struct FsNavigationPerfRecorder {
     land_open_other_should_block_detached_independent_still_navigation_to_video:
         std::time::Duration,
     land_open_other_fs_page_turn_decision_for_frame: std::time::Duration,
+    land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder,
     land_open_other_defer_page_turn_full_resolution_work: std::time::Duration,
     land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration,
     land_open_other_video_audio_vst: std::time::Duration,
@@ -291,6 +367,7 @@ struct FsRenderPerfRecorder {
     last_mark_at: std::time::Instant,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     next_stage: usize,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
 }
 
 impl FsRenderPerfRecorder {
@@ -300,6 +377,7 @@ impl FsRenderPerfRecorder {
             last_mark_at: started_at,
             stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
             next_stage: 0,
+            navigation_page_turn_decision_cache_hit: None,
         }
     }
 
@@ -336,6 +414,22 @@ impl FsRenderPerfRecorder {
         let open_total = navigation.open_fullscreen.elapsed(FsOpenPerfSpan::Total);
         let open_categorized = navigation.open_fullscreen.categorized();
         let land_open_other_categorized = navigation.land_open_other_categorized();
+        let page_turn_decision = &navigation.land_open_other_page_turn_decision;
+        let resolve_sequence_categorized =
+            page_turn_decision.resolve_navigation_sequence_target_categorized();
+        debug_assert!(
+            resolve_sequence_categorized <= page_turn_decision.resolve_navigation_sequence_target
+        );
+        let resolve_sequence_remainder = page_turn_decision
+            .resolve_navigation_sequence_target
+            .saturating_sub(resolve_sequence_categorized);
+        debug_assert!(
+            page_turn_decision.categorized()
+                <= navigation.land_open_other_fs_page_turn_decision_for_frame
+        );
+        let page_turn_decision_remainder = navigation
+            .land_open_other_fs_page_turn_decision_for_frame
+            .saturating_sub(page_turn_decision.categorized());
         debug_assert!(open_categorized <= open_total);
         debug_assert!(open_total + land_open_other_categorized <= navigation.land_open);
         let land_open_other_remainder = navigation
@@ -355,6 +449,7 @@ impl FsRenderPerfRecorder {
         let navigation_total = now.duration_since(self.last_mark_at);
         debug_assert!(categorized <= navigation_total);
         let remainder = navigation_total.saturating_sub(categorized);
+        self.navigation_page_turn_decision_cache_hit = page_turn_decision.cache_hit;
         let stages = [
             (FsRenderPerfStage::FsNavigationClose, navigation.close),
             (
@@ -375,8 +470,36 @@ impl FsRenderPerfRecorder {
                 navigation.land_open_other_should_block_detached_independent_still_navigation_to_video,
             ),
             (
-                FsRenderPerfStage::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
-                navigation.land_open_other_fs_page_turn_decision_for_frame,
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.original_preview_active_for_frame,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.resolve_fs_display_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+                page_turn_decision.ensure_passthrough_rendition,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.resolve_original_preview_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.ensure_navigation_target_thumbnail_requests,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder,
             ),
             (
                 FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
@@ -510,6 +633,7 @@ impl FsRenderPerfRecorder {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            navigation_page_turn_decision_cache_hit: self.navigation_page_turn_decision_cache_hit,
         }
     }
 }
@@ -527,6 +651,47 @@ fn mark_fs_render_perf(recorder: &mut Option<FsRenderPerfRecorder>, stage: FsRen
     if let Some(recorder) = recorder {
         recorder.mark(stage);
     }
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span_with(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<std::time::Instant> {
+    recorder.as_ref().map(|_| now())
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+) -> Option<std::time::Instant> {
+    start_fs_page_turn_decision_perf_span_with(recorder, std::time::Instant::now)
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span_with(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<std::time::Instant>,
+    now: impl FnOnce() -> std::time::Instant,
+) {
+    if let (Some(recorder), Some(started_at)) = (recorder.as_mut(), started_at) {
+        recorder.add(span, now().duration_since(started_at));
+    }
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<std::time::Instant>,
+) {
+    finish_fs_page_turn_decision_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+    );
 }
 
 #[inline]
@@ -604,6 +769,7 @@ struct FsRenderPerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
 }
 
 impl FsRenderPerfBreakdown {
@@ -666,8 +832,36 @@ impl FsRenderPerfBreakdown {
             FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
         ),
         (
-            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_ms",
-            FsRenderPerfStage::FsNavigationLandOpenOtherFsPageTurnDecisionForFrame,
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_original_preview_active_for_frame_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_fs_display_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_original_preview_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_navigation_target_thumbnail_requests_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
         ),
         (
             "handle_fs_navigation_land_target_open_other_defer_page_turn_full_resolution_work_ms",
@@ -763,13 +957,18 @@ impl FsRenderPerfBreakdown {
     ];
 
     fn emit(&self, frame_number: u64, input_seq: u64, fs_idx: Option<usize>) {
-        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 4);
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 5);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push((
             "idx",
             fs_idx.map_or(serde_json::Value::Null, serde_json::Value::from),
         ));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_hit",
+            self.navigation_page_turn_decision_cache_hit
+                .map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
         for (field, stage) in Self::EVENT_FIELDS {
             extras.push((
                 field,
@@ -7182,6 +7381,22 @@ impl App {
         fs_idx: usize,
         original_preview_active: bool,
     ) {
+        let mut perf = None;
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            &mut perf,
+        );
+    }
+
+    fn resolve_fs_navigation_sequence_target_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        original_preview_active: bool,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) {
         let Some(target) = self
             .fs_holdover_tex
             .as_ref()
@@ -7205,7 +7420,13 @@ impl App {
         }
 
         if accept_rendition {
+            let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
             self.ensure_navigation_target_thumbnail_requests(ctx, &target.pages);
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                perf_t0,
+            );
         }
         let bypasses_final_pipeline =
             self.fs_display_bypasses_final_pipeline(original_preview_active);
@@ -7214,9 +7435,23 @@ impl App {
                 // この frame は描画側も raw source を明示的に選ぶ。通常表示では下の final
                 // pipeline gate を維持するため、白黒からカラーへの途中切替を見せない契約は
                 // 緩めず、利用者が元画像を要求した frame だけ readiness source を揃える。
-                self.resolve_original_preview_tex(*idx).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_original_preview_tex(*idx).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex,
+                    perf_t0,
+                );
+                ready
             } else {
-                self.resolve_fs_display_tex(*idx, true).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_fs_display_tex(*idx, true).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+                    perf_t0,
+                );
+                ready
                     || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
                         && matches!(
                             self.thumbnails.get(*idx),
@@ -7229,10 +7464,16 @@ impl App {
             .iter()
             .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
         let rendition_ready = accept_rendition
-            && target
-                .pages
-                .iter()
-                .all(|idx| self.ensure_passthrough_rendition(ctx, *idx).is_some());
+            && target.pages.iter().all(|idx| {
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.ensure_passthrough_rendition(ctx, *idx).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition,
+                    perf_t0,
+                );
+                ready
+            });
         let rendition_failed = accept_rendition
             && target
                 .pages
@@ -18659,8 +18900,35 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
+        let mut perf = None;
+        self.fs_page_turn_decision_for_frame_with_perf(ctx, fs_idx, &mut perf)
+    }
+
+    fn fs_page_turn_decision_for_frame_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) -> FsPageTurnDecision {
+        let original_preview_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
         let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
-        self.resolve_fs_navigation_sequence_target(ctx, fs_idx, original_preview_active);
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+            original_preview_perf_t0,
+        );
+        let resolve_sequence_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            perf,
+        );
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget,
+            resolve_sequence_perf_t0,
+        );
         let (rendition_sequence_active, passthrough_rendition_ready) =
             self.fs_navigation_sequence_rendition_state(fs_idx);
         #[cfg(not(windows))]
@@ -18680,15 +18948,27 @@ impl App {
                 self.fs_page_turn_input_held(ctx, fs_idx);
             let frame_nr = ctx.cumulative_frame_nr();
             let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
-            if let Some(cached) = ctx
+            let cache_lookup_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+            let cached = ctx
                 .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
                 .filter(|cached| {
                     cached.frame_nr == frame_nr
                         && cached.items_generation == self.items_generation
                         && cached.idx == fs_idx
-                })
-            {
+                });
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::CacheLookup,
+                cache_lookup_perf_t0,
+            );
+            if let Some(cached) = cached {
+                if let Some(perf) = perf {
+                    perf.cache_hit = Some(true);
+                }
                 return cached.decision;
+            }
+            if let Some(perf) = perf {
+                perf.cache_hit = Some(false);
             }
             let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let mut burst_state = ctx
@@ -26474,12 +26754,24 @@ impl App {
         let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
         let materialization = if target_is_still_page && self.fullscreen_idx.is_some() {
             let page_turn_decision_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
-            let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, idx);
+            let mut page_turn_decision_perf = fs_navigation_perf
+                .as_ref()
+                .map(|_| FsPageTurnDecisionPerfRecorder::default());
+            let page_turn_decision = self.fs_page_turn_decision_for_frame_with_perf(
+                ctx,
+                idx,
+                &mut page_turn_decision_perf,
+            );
             finish_fs_navigation_perf_span(
                 fs_navigation_perf,
                 FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame,
                 page_turn_decision_perf_t0,
             );
+            if let (Some(navigation_perf), Some(page_turn_decision_perf)) =
+                (fs_navigation_perf.as_mut(), page_turn_decision_perf)
+            {
+                navigation_perf.land_open_other_page_turn_decision = page_turn_decision_perf;
+            }
             page_turn_decision.navigation_target_open_materialization()
         } else {
             FsOpenMaterialization::Eager
@@ -39314,6 +39606,23 @@ mod tests {
                 std::time::Instant::now()
             },
         );
+        let mut page_turn_decision = recorder
+            .as_ref()
+            .map(|_| FsPageTurnDecisionPerfRecorder::default());
+        let page_turn_span =
+            start_fs_page_turn_decision_perf_span_with(&page_turn_decision, || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            });
+        finish_fs_page_turn_decision_perf_span_with(
+            &mut page_turn_decision,
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+            page_turn_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+        );
         let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
         let open_span = crate::app::start_fs_open_perf_span_with(&open_perf, || {
             clock_called.set(true);
@@ -39390,14 +39699,24 @@ mod tests {
         let navigation = FsNavigationPerfRecorder {
             close: std::time::Duration::from_millis(2),
             ctrl_sibling_mouse: std::time::Duration::from_millis(3),
-            page: std::time::Duration::from_millis(65),
+            page: std::time::Duration::from_millis(83),
             begin_sequence: std::time::Duration::from_millis(4),
-            land_target: std::time::Duration::from_millis(45),
+            land_target: std::time::Duration::from_millis(63),
             land_seek_continuous: std::time::Duration::ZERO,
-            land_open: std::time::Duration::from_millis(44),
+            land_open: std::time::Duration::from_millis(62),
             land_open_other_should_block_detached_independent_still_navigation_to_video:
                 std::time::Duration::from_millis(1),
-            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(2),
+            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(20),
+            land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder {
+                original_preview_active_for_frame: std::time::Duration::from_millis(1),
+                resolve_navigation_sequence_target: std::time::Duration::from_millis(12),
+                resolve_fs_display_tex: std::time::Duration::from_millis(2),
+                ensure_passthrough_rendition: std::time::Duration::from_millis(3),
+                resolve_original_preview_tex: std::time::Duration::from_millis(1),
+                ensure_navigation_target_thumbnail_requests: std::time::Duration::from_millis(2),
+                cache_lookup: std::time::Duration::from_millis(1),
+                cache_hit: Some(true),
+            },
             land_open_other_defer_page_turn_full_resolution_work: std::time::Duration::from_millis(
                 1,
             ),
@@ -39413,7 +39732,7 @@ mod tests {
             slideshow: std::time::Duration::from_millis(7),
             slideshow_advance: std::time::Duration::from_millis(6),
         };
-        marked_at += std::time::Duration::from_millis(85);
+        marked_at += std::time::Duration::from_millis(103);
         recorder.mark_navigation_at(navigation, marked_at);
 
         assert_eq!(
@@ -39443,6 +39762,36 @@ mod tests {
             6.0
         );
         assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize],
+            4.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize],
+            6.0
+        );
+        assert_eq!(recorder.navigation_page_turn_decision_cache_hit, Some(true));
+        let page_turn_decision_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(page_turn_decision_ms, 20.0);
+        let resolve_sequence_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(resolve_sequence_ms, 12.0);
+        assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
             5.0
         );
@@ -39458,7 +39807,7 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(open_other_ms, 19.0);
+        assert_eq!(open_other_ms, 37.0);
         let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
             as usize
             ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
@@ -39466,14 +39815,14 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(land_ms, 45.0);
+        assert_eq!(land_ms, 63.0);
         let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
             ..=FsRenderPerfStage::FsNavigationRemainder as usize]
             .iter()
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(navigation_ms, 85.0);
+        assert_eq!(navigation_ms, 103.0);
         assert_eq!(
             FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
             Some(FsRenderPerfStage::FsBoundaryHint)
