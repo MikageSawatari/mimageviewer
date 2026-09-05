@@ -4867,62 +4867,7 @@ pub(crate) struct ExportDialogTarget {
     original_format: crate::save_with_metadata::SrcFormat,
     source_dir: std::path::PathBuf,
     pub(crate) basename: String,
-    pub(crate) pixels: crate::export_dialog::ExportPixels,
-}
-
-fn scale_sns_split_frames_to_export_pixels(
-    frames: &[crate::export_crop::CropRect],
-    source_size: [usize; 2],
-    target_size: [usize; 2],
-) -> Result<Vec<crate::export_crop::CropRect>, String> {
-    if frames.is_empty() {
-        return Ok(Vec::new());
-    }
-    let source_width = source_size[0].max(1) as f64;
-    let source_height = source_size[1].max(1) as f64;
-    let target_width = target_size[0].max(1);
-    let target_height = target_size[1].max(1);
-    let scale_x = target_width as f64 / source_width;
-    let scale_y = target_height as f64 / source_height;
-
-    // source の共有境界を同じ最近傍丸めで target へ写す。先頭枠の幅を全枠へ
-    // 複製すると、割り切れない余り (832 / 3 など) が末尾から失われる。
-    let frame_count = frames.len();
-    if target_width < frame_count {
-        return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-    }
-
-    let scale_boundary = |value: f32, scale: f64, limit: usize| -> Option<usize> {
-        let scaled = f64::from(value) * scale;
-        scaled
-            .is_finite()
-            .then(|| scaled.round().clamp(0.0, limit as f64) as usize)
-    };
-    let mut scaled = Vec::with_capacity(frame_count);
-    for frame in frames {
-        let Some(min_x) = scale_boundary(frame.min_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_x) = scale_boundary(frame.max_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(min_y) = scale_boundary(frame.min_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_y) = scale_boundary(frame.max_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        if max_x <= min_x || max_y <= min_y {
-            return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-        }
-        scaled.push(crate::export_crop::CropRect {
-            min_x: min_x as f32,
-            min_y: min_y as f32,
-            max_x: max_x as f32,
-            max_y: max_y as f32,
-        });
-    }
-    Ok(scaled)
+    pub(crate) composite: crate::export_dialog::ExportComposite,
 }
 
 fn export_batch_selection_update(
@@ -37579,7 +37524,7 @@ impl App {
         job
     }
 
-    fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
+    pub(crate) fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         match item {
             GridItem::Image(path) => Some(crate::capture::basename_for_path(path)),
@@ -37631,7 +37576,7 @@ impl App {
             self.show_feedback_toast("エクスポート中です".to_string());
             return false;
         }
-        // SNS 自身は snapshot の準備が成功するまで active のままにする。編集モードは
+        // SNS 自身は合成要求の準備が成功するまで active のままにする。編集モードは
         // 相互排他なので、SNS 経路ではこの 1 モードだけを例外にできる。
         if (self.is_overlay_edit_mode_active() && !(sns_split_export && self.sns_split.is_some()))
             || self.adjustment_mode.is_open()
@@ -37646,7 +37591,7 @@ impl App {
             return false;
         }
         let target = match if sns_split_export {
-            // 分割枠を作った 1 ページだけを snapshot する。通常 Ctrl+E の
+            // 分割枠を作った 1 ページだけを worker 合成へ渡す。通常 Ctrl+E の
             // 見開き合成経路は変更しない。
             self.prepare_single_export_dialog_target(ctx, fs_idx)
         } else {
@@ -37658,25 +37603,23 @@ impl App {
                 return false;
             }
         };
-        let sns_split_frames = match (sns_split, &target.pixels) {
-            (Some((frames, source_size)), crate::export_dialog::ExportPixels::Single(page)) => {
-                match scale_sns_split_frames_to_export_pixels(
+        let (sns_split_frames, sns_split_source_size) = match (sns_split, &target.composite) {
+            (Some((frames, source_size)), crate::export_dialog::ExportComposite::Single(page)) => {
+                if let Err(err) = crate::books::scale_export_crop_overrides(
                     &frames,
                     source_size,
-                    page.base_pixels.size,
+                    page.predicted_size,
                 ) {
-                    Ok(frames) => frames,
-                    Err(err) => {
-                        self.show_feedback_toast(err);
-                        return false;
-                    }
+                    self.show_feedback_toast(err);
+                    return false;
                 }
+                (frames, Some(source_size))
             }
-            (Some(_), crate::export_dialog::ExportPixels::Spread { .. }) => {
+            (Some(_), crate::export_dialog::ExportComposite::Spread { .. }) => {
                 self.show_feedback_toast("SNS 分割の単ページを準備できませんでした".to_string());
                 return false;
             }
-            (None, _) => Vec::new(),
+            (None, _) => (Vec::new(), None),
         };
 
         let output_dir = self
@@ -37687,7 +37630,7 @@ impl App {
             .unwrap_or_else(|| target.source_dir.clone());
         let original_selection = self.settings.export_batch_selection;
         let mut selection = original_selection;
-        let has_conceal_mask = target.pixels.has_conceal_mask();
+        let has_conceal_mask = target.composite.has_conceal_mask();
         if !sns_split_export {
             for i in 1..selection.len() {
                 if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
@@ -37701,7 +37644,7 @@ impl App {
         let original_include_metadata = self.settings.export_embed_metadata;
 
         // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
-        // snapshot と枠変換が揃った時だけ SNS モードを確定終了する。
+        // source・編集 snapshot と枠の検証が揃った時だけ SNS モードを確定終了する。
         if sns_split_export {
             self.reset_sns_split_mode();
         }
@@ -37714,7 +37657,7 @@ impl App {
                 self.settings.export_fallback_format,
             ),
             scale: if sns_split_export {
-                // 分割の書き出しは投稿用なので、既定で長辺を抑える。表示 pixels には
+                // 分割の書き出しは投稿用なので、既定で長辺を抑える。合成結果には
                 // AI 拡大が焼き込まれることがあり、実測で 1 枚 5.6MB と X の PNG 上限
                 // (5MB) 際まで膨らんだ。長辺指定は**元が小さければ何もしない**ので、
                 // AI 拡大を使っていない画像は等倍のまま出る。
@@ -37732,7 +37675,8 @@ impl App {
             selection,
             has_conceal_mask,
             sns_split_frames,
-            pixels: target.pixels,
+            sns_split_source_size,
+            composite: target.composite,
             original_selection,
             original_include_metadata,
             initial_focus_done: false,
@@ -37764,14 +37708,14 @@ impl App {
         self.ensure_export_local_adjust_ready(ctx, &[idx])?;
         let (source, source_label, original_format, source_dir, basename) =
             self.export_source_info_for_idx(idx)?;
-        let pixels = self.export_page_pixels_for_idx(ctx, idx)?;
+        let composite = self.export_page_composite_for_idx(ctx, idx)?;
         Ok(ExportDialogTarget {
             source,
             source_label,
             original_format,
             source_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Single(pixels),
+            composite: crate::export_dialog::ExportComposite::Single(composite),
         })
     }
 
@@ -37786,8 +37730,8 @@ impl App {
         let (_, left_label, _, left_dir, left_basename) =
             self.export_source_info_for_idx(left_idx)?;
         let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
-        let left = self.export_page_pixels_for_idx(ctx, left_idx)?;
-        let right = self.export_page_pixels_for_idx(ctx, right_idx)?;
+        let left = self.export_page_composite_for_idx(ctx, left_idx)?;
+        let right = self.export_page_composite_for_idx(ctx, right_idx)?;
         let basename =
             crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
         Ok(ExportDialogTarget {
@@ -37796,7 +37740,7 @@ impl App {
             original_format: crate::save_with_metadata::SrcFormat::Other("spread".to_string()),
             source_dir: left_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Spread { left, right },
+            composite: crate::export_dialog::ExportComposite::Spread { left, right },
         })
     }
 
@@ -37805,18 +37749,16 @@ impl App {
         ctx: &egui::Context,
         indices: &[usize],
     ) -> Result<(), String> {
-        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
-        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
-        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
+        // §1.177 で準備処理そのものを worker 所有へ移すまでは、従来どおり commit 完了を
+        // 待ってから source + snapshot を確定する。進行中のマスク状態を取り込まないための gate。
         if self.erase_inpaint_pending.keys().any(|k| {
             indices.contains(&k.idx) && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
         }) {
             return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
         }
 
-        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
-        // pre-erase pixels を書き出してしまう。ensure_erase_result_texture をここで
-        // 呼んで commit を再投入し、結果が揃うまで Ctrl+E を保留する。
+        // 保存済みマスクの commit を再投入し、従来の準備契約どおり結果が揃うまで
+        // Ctrl+E を保留する。この同期準備の廃止は §1.177 の範囲。
         for &idx in indices {
             if self.mask_pages.contains(&idx) {
                 let _ = self.ensure_erase_result_texture(ctx, idx);
@@ -37860,126 +37802,90 @@ impl App {
         Ok(())
     }
 
-    fn export_page_pixels_for_idx(
+    fn export_page_composite_for_idx(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Result<crate::export_dialog::ExportPagePixels, String> {
-        // 注釈 (comic) があれば最終 composite に焼き込んでから export する (最前面 D1)。
-        // 注釈が無ければ素の final composite。ここで得るのは「現在の設定で隠蔽まで
-        // 焼き込み済み」の表示スナップショットで、`_0` はこれをそのまま書き出す。
-        let base_pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
-            Some(p) => p,
-            None => self
-                .ensure_final_composite_pixels(ctx, idx)
-                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?,
-        };
-        // プリセット出力 (_1〜_4) は隠蔽のパラメータだけが違う同じ絵なので、隠蔽の入力
-        // まで戻って再合成する材料を別に持つ。base_pixels へマスクを重ねるだけだと隠蔽が
-        // 二重に掛かる (v1.1.0 の退行はこれを避けようとして conceal_mask=None を固定し、
-        // プリセット出力ごと止めていた)。
-        let conceal_variant = self
-            .export_conceal_variant_for_idx(ctx, idx)
-            .map(std::sync::Arc::new);
-        // crop は表示には反映しないので、export の最終段で base_pixels (= final
-        // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
-        let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
-        let rotation = self.get_rotation(idx);
-        Ok(crate::export_dialog::ExportPagePixels {
-            base_pixels,
-            conceal_variant,
-            crop,
-            rotation,
-        })
-    }
-
-    /// プリセット出力用の「隠蔽適用前」スナップショット。隠蔽マスクを持たないページは
-    /// `None` = プリセット出力は選べない (本来の条件)。
-    fn export_conceal_variant_for_idx(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantSource> {
-        // 表示側で隠蔽合成の入力になっているものと同じ段 (raw → 消しゴム → 補正レイヤー)。
-        let (base, _) = self.current_conceal_source_pixels(idx)?;
-        let mask = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])?;
-        let params = self.effective_params(idx).clone();
-        let creative_lut = (!params.creative_lut.is_identity())
-            .then(|| {
-                self.creative_lut_library
-                    .get(params.creative_lut.id)
-                    .map(|lut| (lut, params.creative_lut.strength))
-            })
-            .flatten();
-        let ai = self.export_conceal_variant_ai(ctx, idx, &params);
-        let comic = self.export_conceal_variant_comic(idx);
-        Some(crate::export_dialog::ConcealVariantSource {
-            base,
-            mask: std::sync::Arc::new(mask),
-            params,
-            creative_lut,
-            ai,
-            comic,
-        })
-    }
-
-    /// 表示の final composite が実際に final AI を通っているときだけ、プリセット再合成へ
-    /// 同じ AI 段を持たせる。表示が AI 抜き (機能無効 / サイズ上限外 / 推論失敗) なら
-    /// `None` にして `_0` と絵を揃える。
-    fn export_conceal_variant_ai(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-        params: &crate::adjustment::AdjustParams,
-    ) -> Option<crate::export_dialog::ConcealVariantAi> {
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, params)?;
-        // 完成した final composite を掴んだ後にここへ来るので、failed でなければ
-        // 表示は AI 結果を使っている。
-        if self.final_ai_failed.contains(&ai_key) {
-            return None;
+    ) -> Result<crate::export_dialog::ExportPageComposite, String> {
+        // source と編集 snapshot だけを UI スレッドで固定する。decode と、選択された段までの
+        // 合成は worker が行う。注釈は共通 compositor が AI / 表示用補正の後に焼く。
+        let item = self
+            .items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // 再生中の表示フレームは source file の decode からは復元できない。worker に
+        // file だけを渡すと第 1 フレームを黙って保存するため、表示フレームを snapshot
+        // できるようになるまでは従来どおり入口で拒否する。
+        if self.fs_entry_is_animated(idx) {
+            return Err("アニメーション画像はエクスポートできません".to_string());
         }
-        self.ensure_ai_runtime();
-        let runtime = self.ai_runtime.clone()?;
-        Some(crate::export_dialog::ConcealVariantAi {
-            runtime,
-            manager: std::sync::Arc::clone(&self.ai_model_manager),
-            feature_mode: self.settings.ai_feature_mode,
-            upscale_limit: self.settings.ai_upscale_limit(),
-            denoise_limit: self.settings.ai_denoise_limit(),
-            // 表示側が分類済みならその答えを渡す。auto upscale のモデル選択が
-            // `_0` と `_1`〜`_4` で食い違わないようにする。
-            category: self.ai_classify_cache.get(&idx).copied(),
-            transparent_bg_mode: self.fs_transparent_bg_mode,
-        })
-    }
-
-    /// プリセット再合成の最後に焼く注釈。`comic_composited_pixels_for_export` と同じ
-    /// 材料を、製本の headless compositor と同じ形 (`BookComicSnapshot`) で渡す。
-    fn export_conceal_variant_comic(
-        &mut self,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantComic> {
-        if !self.comic_has_objects(idx) {
-            return None;
-        }
-        let key = self.page_path_key(idx)?;
-        self.ensure_comic_doc_loaded(&key);
-        let objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
-        if objects.is_empty() {
-            return None; // デモ有効でも永続注釈が無ければ export には焼かない
-        }
-        let fonts = self.ensure_comic_fonts_for(&objects)?;
-        let source_dims = self
-            .source_dims_for_idx(idx)
-            .map(|(width, height)| [width.round() as usize, height.round() as usize]);
-        Some(crate::export_dialog::ConcealVariantComic {
-            snapshot: crate::books::BookComicSnapshot {
-                objects,
-                fonts,
-                stamp_cache: self.comic_stamp_cache.clone(),
+        let source = match item {
+            GridItem::Image(path) => crate::books::CompositeSource::File { path },
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => crate::books::CompositeSource::ZipEntry {
+                zip_path,
+                entry_name,
             },
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => crate::books::CompositeSource::PdfPage {
+                pdf_path,
+                page_num,
+                password: self.pdf_current_password.clone(),
+            },
+            _ => return Err("このアイテムはエクスポートできません".to_string()),
+        };
+        // プリセット出力 (_1〜_4) も同じ snapshot を使い、隠蔽 preset だけを worker 側で
+        // 差し替える。`_0` は override を付けず、snapshot が持つ現在値を 1 回だけ適用する。
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // crop は表示には反映しないので、worker 合成の幾何最終段で切り出す。
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let stage = self.settings.bake_stage_export;
+        let mut source_dims = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| [width.round() as usize, height.round() as usize])
+            .ok_or_else(|| "画像の読み込み完了後にエクスポートしてください".to_string())?;
+        const PDF_RENDER_LONG_EDGE: u32 = 4096;
+        if matches!(source, crate::books::CompositeSource::PdfPage { .. }) {
+            source_dims =
+                crate::books::predicted_pdf_render_size(source_dims, PDF_RENDER_LONG_EDGE);
+        }
+        let ai_will_run = crate::books::stage_will_run_ai(
+            stage,
+            &params,
+            self.book_ai_materials().policy,
             source_dims,
+        );
+        let display_dims = if ai_will_run {
+            self.ensure_final_composite_pixels(ctx, idx)
+                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?
+                .size
+        } else {
+            source_dims
+        };
+        let predicted_size =
+            crate::books::predicted_composed_size(source_dims, display_dims, ai_will_run);
+        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation, stage)?;
+        // Shape が保存されていても、画像外や 0 面積なら 1 画素も塗られない。
+        // プリセット欄は実際の合成マスクが非空のときだけ有効にする。
+        let has_conceal_mask = edits
+            .conceal
+            .as_ref()
+            .map(|conceal| crate::books::book_mask_has_covered_pixel(&conceal.mask, source_dims))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(crate::export_dialog::ExportPageComposite {
+            source,
+            edits,
+            pdf_render_long_edge: PDF_RENDER_LONG_EDGE,
+            predicted_size,
+            has_conceal_mask,
         })
     }
 
@@ -38008,8 +37914,15 @@ impl App {
         let basename_ok = !crate::capture::basename_from_text(&state.basename)
             .trim()
             .is_empty();
-        let can_start =
-            selected_count > 0 && basename_ok && !state.output_dir_text.trim().is_empty();
+        let render_size = state.render_size();
+        if let Err(error) = &render_size {
+            state.error.get_or_insert_with(|| error.clone());
+        }
+        let base_size = render_size.unwrap_or([1, 1]);
+        let can_start = selected_count > 0
+            && basename_ok
+            && !state.output_dir_text.trim().is_empty()
+            && state.render_size().is_ok();
         let mut open = true;
         let mut canceled = false;
         let mut start = false;
@@ -38119,7 +38032,6 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
-                let base_size = state.render_size();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for scale in crate::export_dialog::ExportScale::FIXED {
@@ -38256,11 +38168,16 @@ impl App {
             start = true;
         }
         if start {
-            match self.start_export_from_dialog(ctx, state.clone()) {
+            let mut state_slot = Some(state);
+            match self.start_export_from_dialog(ctx, &mut state_slot) {
                 Ok(()) => return,
                 Err(err) => {
-                    state.error = Some(err);
-                    self.export_dialog = Some(state);
+                    if let Some(mut state) = state_slot {
+                        state.error = Some(err);
+                        self.export_dialog = Some(state);
+                    } else {
+                        self.show_feedback_toast(err);
+                    }
                     return;
                 }
             }
@@ -38445,8 +38362,11 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state: crate::export_dialog::ExportDialogState,
+        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
     ) -> Result<(), String> {
+        let state = state_slot
+            .as_ref()
+            .expect("export dialog state must exist while validating");
         if self.export_pending.is_some() {
             return Err("エクスポート中です".to_string());
         }
@@ -38461,16 +38381,13 @@ impl App {
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
-        // ダイアログを開いた瞬間に snapshot した pixels / conceal mask を使う。
-        // ここで再 resolve すると animated GIF の current_frame が進んで違うフレーム
-        // が export される (Codex review CONFIRMED)。
-        let pixels = state.pixels.clone();
-        let has_conceal_mask = pixels.has_conceal_mask();
-        // プリセット再合成が final AI を回すなら、worker 終端までローカル AI 利用中に見せる。
-        let needs_ai_lease = pixels.conceal_variant_uses_ai();
+        let has_conceal_mask = state.composite.has_conceal_mask();
+        // 段が AI へ届くなら、worker 終端までローカル AI 利用中に見せる。
+        let needs_ai_lease = state.composite.includes_ai_stage();
         let sns_split_export = !state.sns_split_frames.is_empty();
         let entries = crate::export_dialog::plan_export_entries(
             &state.sns_split_frames,
+            state.sns_split_source_size,
             &state.selection,
             has_conceal_mask,
             &self.settings.conceal_presets,
@@ -38515,7 +38432,7 @@ impl App {
         if let Some(next_selection) = selection_update {
             self.settings.export_batch_selection = next_selection;
         }
-        // SNS はモード固有の既定値として毎回 Full で開く。その強制初期値を通常
+        // SNS はモード固有の既定値として毎回 長辺 2048px で開く。その強制初期値を通常
         // エクスポートの既定倍率へ逆流させない。
         if !sns_split_export {
             self.settings.export_default_scale = state.scale;
@@ -38533,13 +38450,16 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
+        let state = state_slot
+            .take()
+            .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {
             source: state.source,
             original_format: state.original_format,
             output_format: state.output_format,
             output_dir,
             basename: resolved_basename,
-            pixels,
+            composite: state.composite,
             scale: state.scale,
             entries,
             include_metadata: effective_include_metadata,
@@ -38630,48 +38550,6 @@ impl App {
                 ))
             }
             _ => Err("このアイテムはエクスポートできません".to_string()),
-        }
-    }
-
-    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
-    fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
-        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
-            return Ok(pixels);
-        }
-        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
-            return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
-        }
-        if self.has_active_local_adjust_layers(idx) {
-            return Err("補正レイヤーの反映完了後にエクスポートしてください".to_string());
-        }
-
-        if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            return Ok(pixels);
-        }
-        if !self.post_filter_bypassed
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(idx)
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Ok(Arc::clone(pixels)),
-            Some(FsCacheEntry::Animated {
-                frame_pixels,
-                current_frame,
-                ..
-            }) => frame_pixels
-                .get(*current_frame)
-                .cloned()
-                .ok_or_else(|| "アニメーションフレームを取得できません".to_string()),
-            _ => Err("画像の読み込み完了後にエクスポートしてください".to_string()),
         }
     }
 
@@ -40612,7 +40490,7 @@ mod tests {
         };
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&[frame], [100, 50], [400, 100]).unwrap();
+            crate::books::scale_export_crop_overrides(&[frame], [100, 50], [400, 100]).unwrap();
 
         assert_eq!(
             scaled,
@@ -40635,7 +40513,7 @@ mod tests {
         .with_seam_permille(0, [832, 1216]);
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&layout.frames(), [832, 1216], [832, 1216])
+            crate::books::scale_export_crop_overrides(&layout.frames(), [832, 1216], [832, 1216])
                 .unwrap();
         let bounds = scaled
             .iter()
@@ -40679,7 +40557,7 @@ mod tests {
         ];
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&frames, [130, 60], [173, 77]).unwrap();
+            crate::books::scale_export_crop_overrides(&frames, [130, 60], [173, 77]).unwrap();
         let bounds = scaled
             .iter()
             .map(|frame| {
@@ -40727,7 +40605,7 @@ mod tests {
             },
         ];
 
-        let scaled = scale_sns_split_frames_to_export_pixels(&frames, [10, 5], [11, 6]).unwrap();
+        let scaled = crate::books::scale_export_crop_overrides(&frames, [10, 5], [11, 6]).unwrap();
         let first = scaled[0].pixel_bounds(11, 6);
         let second = scaled[1].pixel_bounds(11, 6);
 
@@ -40737,7 +40615,7 @@ mod tests {
     }
 
     #[test]
-    fn sns_split_frames_reject_a_snapshot_too_narrow_for_distinct_entries() {
+    fn sns_split_frames_reject_a_composite_too_narrow_for_distinct_entries() {
         let frames = [
             crate::export_crop::CropRect {
                 min_x: 0.0,
@@ -40753,7 +40631,7 @@ mod tests {
             },
         ];
 
-        let err = scale_sns_split_frames_to_export_pixels(&frames, [2, 1000], [1, 500])
+        let err = crate::books::scale_export_crop_overrides(&frames, [2, 1000], [1, 500])
             .expect_err("1px 幅へ 2 枠は配置できない");
 
         assert!(err.contains("解像度が小さすぎ"));

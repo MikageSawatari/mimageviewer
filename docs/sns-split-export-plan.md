@@ -168,15 +168,15 @@ restore・スマートフォルダ・リモート IPC・リネーム移行・編
 | 画面↔画像の座標変換 | [`DisplayedImageTransform`](../src/displayed_image_transform.rs) の `screen_to_source_normalized` / `source_normalized_to_screen` | [ui_crop.rs:22](../src/ui_crop.rs:22) がそのまま使っている |
 | 8 ハンドル + 本体ドラッグ、比率固定リサイズ | [`ui_crop.rs`](../src/ui_crop.rs) (`CropHandle`、737 行) | 自由比率では通常の 8 ハンドル操作、固定プリセット時だけ既存の比率固定経路を使う (§4.2) |
 | 見開きからの pivot | `plan_page_edit_pivot` / `enter_page_edit_single_view` / `leave_page_edit_single_view` | [ui_crop.rs:162](../src/ui_crop.rs:162) と同じ |
-| 1 スナップショットから N ファイル書き出し | `ExportRequest.entries: Vec<ExportEntry>` を回す `spawn_export_worker` ([export_dialog.rs:284](../src/export_dialog.rs:284)) | 隠蔽プリセット 5 種の一括書き出しがこの仕組み |
-| crop の最終段適用 | `render_export_page_pixels` が `ExportPagePixels.crop` を適用 ([export_dialog.rs:542](../src/export_dialog.rs:542)) | 回転より前、パイプライン最終段 |
-| 仮想ページの入力 | `ExportSource` = `File` / `ZipEntry` / `PdfPage` / `RenderedSpread` | ZIP / PDF は**追加作業なしで通る** |
+| 1 スナップショットから N ファイル書き出し | `ExportRequest.entries: Vec<ExportEntry>` を回す `spawn_export_worker` | 隠蔽プリセット 5 種の一括書き出しがこの仕組み |
+| crop の最終段適用 | `books::compose_export_entry` の `crop_override` | 枠を作った source 寸法から worker の合成後実寸へ換算し、回転より前に適用する |
+| 仮想ページの入力 | 合成用の `CompositeSource` とメタデータ用の `ExportSource` | ZIP / PDF も worker が source を再デコードする |
 | 連番の衝突回避 | `resolve_session_basename(dir, base, ext, &suffixes)` | 既存ファイルを上書きしない |
 | アイコン | [`draw_icons.rs`](../src/ui_fullscreen/draw_icons.rs) の `draw_crop_icon` 等、全部ベクター描画 | ボタンは 28x28 px |
 
 **外部ツール起動 ([external-tool-launch-plan.md](external-tool-launch-plan.md)) の一時実体化
-(P3) には依存しない。**この操作をする瞬間、画像は既にフルスクリーンでデコード・合成済みなので、
-temp へ書き出して別プロセスへ渡す必要が無い。
+(P3) には依存しない。** SNS 分割は単枚 Ctrl+E の export worker が source を再デコード・合成し、
+外部ツールは materializer worker が一時ファイルを作る。
 
 ---
 
@@ -310,8 +310,9 @@ Instagram の 0.75 下限を外れない。
 既存のエクスポートダイアログを経由する。出力先・形式・倍率・連番・メタデータの扱いを
 そのまま使うため。
 
-- `ExportEntry` に `crop: Option<CropRect>` を足し、**あるときは `ExportPagePixels.crop` より
-  優先**する。`render_export_page_pixels` の適用箇所 1 つの分岐で済む
+- `ExportEntry` は `crop_override: Option<(CropRect, [usize; 2])>` を持つ。**あるときは
+  `BakedEditSnapshot.export_crop` より優先**し、`compose_export_entry` が source 座標から
+  合成後実寸へ換算して適用する
 - entries は N 個。`suffix` = 1..N、`label` = `"1 / 4"` 形式
 - Instagram では `frames()[0]` の実際の整数ピクセル寸法を正として横/縦を調べ、
   **0.75 未満または 1.91 超**なら書き出しを止める (境界値は許可)。X には比率制限を
@@ -321,8 +322,8 @@ Instagram の 0.75 下限を外れない。
 - **SNS 分割中は隠蔽プリセットの一括書き出しを無効にする** (現在の設定 1 種に固定)。
   N x 5 = 最大 20 ファイルの出力は意図と合わない。ダイアログでは理由付きで無効表示にする
 - 倍率は既存の選択肢のままだが、**既定は `LongEdge(2048)`** (2026-09-01 の実投稿を受けて変更)。
-  当初は等倍にしていたが、表示 pixels には AI 拡大が焼き込まれることがあり、実測で 1 枚 5.6MB と
-  X の PNG 上限 (5MB) 際まで膨らんだ。`LongEdge` は**元が小さければ何もしない**ので、AI 拡大を
+  焼き込み段階によっては AI 拡大後の大きな画像になり、実測で 1 枚 5.6MB と
+  X の PNG 上限 (5MB) 際まで膨らむ。`LongEdge` は**元が小さければ何もしない**ので、AI 拡大を
   使っていない画像は等倍のまま出る。§2.1 のとおり X はタイムライン用に `name=small` へ変換し直す
   ため、縮小してもタイムラインの見え方は変わらない。**通常書き出しの既定
   (`Settings::export_default_scale`) は書き換えない**
