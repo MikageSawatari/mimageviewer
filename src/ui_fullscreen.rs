@@ -28,9 +28,11 @@ use crate::ai::ModelKind;
 use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
-    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, PollPrefetchOrigin,
-    ViewerPresentation, build_fs_prefetch_indicator,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOpenPerfRecorder, FsOpenPerfSpan,
+    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, PassthroughRenditionPerfCall, PassthroughRenditionPerfRecorder,
+    PassthroughRenditionPerfSpan, PollPrefetchOrigin, ViewerPresentation,
+    build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -83,7 +85,7 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
-const FS_RENDER_PERF_STAGE_COUNT: usize = 11;
+const FS_RENDER_PERF_STAGE_COUNT: usize = 56;
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,51 @@ enum FsRenderPerfStage {
     StatePrecompute,
     ViewportPreparation,
     ViewportRender,
+    FsViewportBreakdownEmit,
+    ViewportShownStateUpdate,
+    FsNavigationClose,
+    FsNavigationCtrlSiblingMouse,
+    FsNavigationPageOther,
+    FsNavigationBeginSequence,
+    FsNavigationLandSeekContinuous,
+    FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+    FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+    FsNavigationLandOpenOtherPageDecisionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionRemainder,
+    FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+    FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+    FsNavigationLandOpenOtherVideoAudioVst,
+    FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+    FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+    FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+    FsNavigationLandOpenOtherFullscreenCursorState,
+    FsNavigationLandOpenOtherRemainder,
+    FsNavigationLandOpenRecordReadingHistory,
+    FsNavigationLandOpenRecordBookResume,
+    FsNavigationLandOpenStartMetadataLoad,
+    FsNavigationLandOpenStartFsLoad,
+    FsNavigationLandOpenUpdatePrefetchWindow,
+    FsNavigationLandOpenRefreshVideoMarkerCache,
+    FsNavigationLandOpenRefreshPdfPromotion,
+    FsNavigationLandOpenResetFileRuntime,
+    FsNavigationLandOpenViewerPresentation,
+    FsNavigationLandOpenRemainder,
+    FsNavigationLandRemainder,
+    FsNavigationSlideshowAdvance,
+    FsNavigationSlideshowOther,
+    FsNavigationRemainder,
+    FsBoundaryHint,
+    HandleFsRepaint,
     Tail,
 }
 
@@ -113,63 +160,843 @@ impl FsRenderPerfStage {
         Self::StatePrecompute,
         Self::ViewportPreparation,
         Self::ViewportRender,
+        Self::FsViewportBreakdownEmit,
+        Self::ViewportShownStateUpdate,
+        Self::FsNavigationClose,
+        Self::FsNavigationCtrlSiblingMouse,
+        Self::FsNavigationPageOther,
+        Self::FsNavigationBeginSequence,
+        Self::FsNavigationLandSeekContinuous,
+        Self::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        Self::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        Self::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionRemainder,
+        Self::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        Self::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        Self::FsNavigationLandOpenOtherVideoAudioVst,
+        Self::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        Self::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        Self::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        Self::FsNavigationLandOpenOtherFullscreenCursorState,
+        Self::FsNavigationLandOpenOtherRemainder,
+        Self::FsNavigationLandOpenRecordReadingHistory,
+        Self::FsNavigationLandOpenRecordBookResume,
+        Self::FsNavigationLandOpenStartMetadataLoad,
+        Self::FsNavigationLandOpenStartFsLoad,
+        Self::FsNavigationLandOpenUpdatePrefetchWindow,
+        Self::FsNavigationLandOpenRefreshVideoMarkerCache,
+        Self::FsNavigationLandOpenRefreshPdfPromotion,
+        Self::FsNavigationLandOpenResetFileRuntime,
+        Self::FsNavigationLandOpenViewerPresentation,
+        Self::FsNavigationLandOpenRemainder,
+        Self::FsNavigationLandRemainder,
+        Self::FsNavigationSlideshowAdvance,
+        Self::FsNavigationSlideshowOther,
+        Self::FsNavigationRemainder,
+        Self::FsBoundaryHint,
+        Self::HandleFsRepaint,
         Self::Tail,
     ];
+}
+
+const FS_NAVIGATION_PERF_SPAN_COUNT: usize = 18;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum FsNavigationPerfSpan {
+    Close,
+    CtrlSiblingMouse,
+    Page,
+    BeginSequence,
+    LandTarget,
+    LandSeekContinuous,
+    LandOpen,
+    LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+    LandOpenOtherFsPageTurnDecisionForFrame,
+    LandOpenOtherDeferPageTurnFullResolutionWork,
+    LandOpenOtherSyncMainSelectionFromViewerIdx,
+    LandOpenOtherVideoAudioVst,
+    LandOpenOtherTryStartVideoTileFastSwap,
+    LandOpenOtherTryStartNativeVideoFastSwap,
+    LandOpenOtherCancelStaleVideoTileReopen,
+    LandOpenOtherFullscreenCursorState,
+    Slideshow,
+    SlideshowAdvance,
+}
+
+const FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT: usize = 7;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+enum FsPageTurnDecisionPerfSpan {
+    OriginalPreviewActiveForFrame,
+    ResolveNavigationSequenceTarget,
+    ResolveFsDisplayTex,
+    EnsurePassthroughRendition,
+    ResolveOriginalPreviewTex,
+    EnsureNavigationTargetThumbnailRequests,
+    CacheLookup,
+}
+
+#[derive(Debug, Default)]
+struct FsPageTurnDecisionPerfRecorder {
+    original_preview_active_for_frame: std::time::Duration,
+    resolve_navigation_sequence_target: std::time::Duration,
+    resolve_fs_display_tex: std::time::Duration,
+    ensure_passthrough_rendition: std::time::Duration,
+    passthrough_rendition: PassthroughRenditionPerfRecorder,
+    resolve_original_preview_tex: std::time::Duration,
+    ensure_navigation_target_thumbnail_requests: std::time::Duration,
+    cache_lookup: std::time::Duration,
+    cycles: [u64; FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT],
+    cache_hit: Option<bool>,
+}
+
+impl FsPageTurnDecisionPerfRecorder {
+    fn add(&mut self, span: FsPageTurnDecisionPerfSpan, elapsed: std::time::Duration, cycles: u64) {
+        let target = match span {
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame => {
+                &mut self.original_preview_active_for_frame
+            }
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget => {
+                &mut self.resolve_navigation_sequence_target
+            }
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex => &mut self.resolve_fs_display_tex,
+            FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition => {
+                &mut self.ensure_passthrough_rendition
+            }
+            FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex => {
+                &mut self.resolve_original_preview_tex
+            }
+            FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests => {
+                &mut self.ensure_navigation_target_thumbnail_requests
+            }
+            FsPageTurnDecisionPerfSpan::CacheLookup => &mut self.cache_lookup,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+
+    fn resolve_navigation_sequence_target_categorized(&self) -> std::time::Duration {
+        self.resolve_fs_display_tex
+            + self.ensure_passthrough_rendition
+            + self.resolve_original_preview_tex
+            + self.ensure_navigation_target_thumbnail_requests
+    }
+
+    fn categorized(&self) -> std::time::Duration {
+        self.original_preview_active_for_frame
+            + self.resolve_navigation_sequence_target
+            + self.cache_lookup
+    }
+
+    fn cycles(&self, span: FsPageTurnDecisionPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn resolve_navigation_sequence_target_categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests)
+    }
+
+    fn categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget)
+            + self.cycles(FsPageTurnDecisionPerfSpan::CacheLookup)
+    }
+}
+
+#[derive(Debug, Default)]
+struct FsNavigationPerfRecorder {
+    close: std::time::Duration,
+    ctrl_sibling_mouse: std::time::Duration,
+    page: std::time::Duration,
+    begin_sequence: std::time::Duration,
+    land_target: std::time::Duration,
+    land_seek_continuous: std::time::Duration,
+    land_open: std::time::Duration,
+    land_open_other_should_block_detached_independent_still_navigation_to_video:
+        std::time::Duration,
+    land_open_other_fs_page_turn_decision_for_frame: std::time::Duration,
+    land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder,
+    land_open_other_defer_page_turn_full_resolution_work: std::time::Duration,
+    land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration,
+    land_open_other_video_audio_vst: std::time::Duration,
+    land_open_other_try_start_video_tile_fast_swap: std::time::Duration,
+    land_open_other_try_start_native_video_fast_swap: std::time::Duration,
+    land_open_other_cancel_stale_video_tile_reopen: std::time::Duration,
+    land_open_other_fullscreen_cursor_state: std::time::Duration,
+    open_fullscreen: FsOpenPerfRecorder,
+    slideshow: std::time::Duration,
+    slideshow_advance: std::time::Duration,
+    cycles: [u64; FS_NAVIGATION_PERF_SPAN_COUNT],
+}
+
+impl FsNavigationPerfRecorder {
+    fn add(&mut self, span: FsNavigationPerfSpan, elapsed: std::time::Duration, cycles: u64) {
+        let target = match span {
+            FsNavigationPerfSpan::Close => &mut self.close,
+            FsNavigationPerfSpan::CtrlSiblingMouse => &mut self.ctrl_sibling_mouse,
+            FsNavigationPerfSpan::Page => &mut self.page,
+            FsNavigationPerfSpan::BeginSequence => &mut self.begin_sequence,
+            FsNavigationPerfSpan::LandTarget => &mut self.land_target,
+            FsNavigationPerfSpan::LandSeekContinuous => &mut self.land_seek_continuous,
+            FsNavigationPerfSpan::LandOpen => &mut self.land_open,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo => {
+                &mut self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            }
+            FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame => {
+                &mut self.land_open_other_fs_page_turn_decision_for_frame
+            }
+            FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork => {
+                &mut self.land_open_other_defer_page_turn_full_resolution_work
+            }
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx => {
+                &mut self.land_open_other_sync_main_selection_from_viewer_idx
+            }
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst => {
+                &mut self.land_open_other_video_audio_vst
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap => {
+                &mut self.land_open_other_try_start_video_tile_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap => {
+                &mut self.land_open_other_try_start_native_video_fast_swap
+            }
+            FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen => {
+                &mut self.land_open_other_cancel_stale_video_tile_reopen
+            }
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState => {
+                &mut self.land_open_other_fullscreen_cursor_state
+            }
+            FsNavigationPerfSpan::Slideshow => &mut self.slideshow,
+            FsNavigationPerfSpan::SlideshowAdvance => &mut self.slideshow_advance,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+
+    fn land_open_other_categorized(&self) -> std::time::Duration {
+        self.land_open_other_should_block_detached_independent_still_navigation_to_video
+            + self.land_open_other_fs_page_turn_decision_for_frame
+            + self.land_open_other_defer_page_turn_full_resolution_work
+            + self.land_open_other_sync_main_selection_from_viewer_idx
+            + self.land_open_other_video_audio_vst
+            + self.land_open_other_try_start_video_tile_fast_swap
+            + self.land_open_other_try_start_native_video_fast_swap
+            + self.land_open_other_cancel_stale_video_tile_reopen
+            + self.land_open_other_fullscreen_cursor_state
+    }
+
+    fn cycles(&self, span: FsNavigationPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn land_open_other_categorized_cycles(&self) -> u64 {
+        self.cycles(
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ) + self.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState)
+    }
 }
 
 #[derive(Debug)]
 struct FsRenderPerfRecorder {
     started_at: std::time::Instant,
     last_mark_at: std::time::Instant,
+    started_cycles: u64,
+    last_mark_cycles: u64,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
     next_stage: usize,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
 
 impl FsRenderPerfRecorder {
-    fn new(started_at: std::time::Instant) -> Self {
+    fn new(started_at: std::time::Instant, started_cycles: u64) -> Self {
         Self {
             started_at,
             last_mark_at: started_at,
+            started_cycles,
+            last_mark_cycles: started_cycles,
             stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
+            stage_cycles: [0; FS_RENDER_PERF_STAGE_COUNT],
             next_stage: 0,
+            navigation_page_turn_decision_cache_hit: None,
+            navigation_passthrough_rendition_calls: Vec::new(),
         }
     }
 
     fn mark(&mut self, stage: FsRenderPerfStage) {
-        self.mark_at(stage, std::time::Instant::now());
+        self.mark_at(stage, std::time::Instant::now(), App::thread_cycles_now());
     }
 
-    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant) {
+    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant, cycles: u64) {
         debug_assert_eq!(
             FsRenderPerfStage::ALL.get(self.next_stage).copied(),
             Some(stage)
         );
         self.stage_ms[stage as usize] =
             now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.stage_cycles[stage as usize] = cycles.saturating_sub(self.last_mark_cycles);
         self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
         self.next_stage += 1;
     }
 
-    fn finish(self) -> FsRenderPerfBreakdown {
-        self.finish_at(std::time::Instant::now())
+    fn mark_navigation_at(
+        &mut self,
+        navigation: FsNavigationPerfRecorder,
+        now: std::time::Instant,
+        cycles: u64,
+    ) {
+        // Parent totals contain their explicitly timed child calls. Publish only each parent's
+        // residual alongside leaf stages so the render total counts every interval exactly once.
+        debug_assert!(navigation.begin_sequence + navigation.land_target <= navigation.page);
+        debug_assert!(
+            navigation.land_seek_continuous + navigation.land_open <= navigation.land_target
+        );
+        debug_assert!(navigation.slideshow_advance <= navigation.slideshow);
+        let page_other = navigation
+            .page
+            .saturating_sub(navigation.begin_sequence + navigation.land_target);
+        let open_total = navigation.open_fullscreen.elapsed(FsOpenPerfSpan::Total);
+        let open_categorized = navigation.open_fullscreen.categorized();
+        let land_open_other_categorized = navigation.land_open_other_categorized();
+        let page_turn_decision = &navigation.land_open_other_page_turn_decision;
+        let passthrough_rendition = &page_turn_decision.passthrough_rendition;
+        debug_assert!(
+            passthrough_rendition.categorized() <= page_turn_decision.ensure_passthrough_rendition
+        );
+        let passthrough_rendition_remainder = page_turn_decision
+            .ensure_passthrough_rendition
+            .saturating_sub(passthrough_rendition.categorized());
+        let resolve_sequence_categorized =
+            page_turn_decision.resolve_navigation_sequence_target_categorized();
+        debug_assert!(
+            resolve_sequence_categorized <= page_turn_decision.resolve_navigation_sequence_target
+        );
+        let resolve_sequence_remainder = page_turn_decision
+            .resolve_navigation_sequence_target
+            .saturating_sub(resolve_sequence_categorized);
+        debug_assert!(
+            page_turn_decision.categorized()
+                <= navigation.land_open_other_fs_page_turn_decision_for_frame
+        );
+        let page_turn_decision_remainder = navigation
+            .land_open_other_fs_page_turn_decision_for_frame
+            .saturating_sub(page_turn_decision.categorized());
+        debug_assert!(open_categorized <= open_total);
+        debug_assert!(open_total + land_open_other_categorized <= navigation.land_open);
+        let land_open_other_remainder = navigation
+            .land_open
+            .saturating_sub(open_total + land_open_other_categorized);
+        let open_remainder = open_total.saturating_sub(open_categorized);
+        let land_remainder = navigation
+            .land_target
+            .saturating_sub(navigation.land_seek_continuous + navigation.land_open);
+        let slideshow_other = navigation
+            .slideshow
+            .saturating_sub(navigation.slideshow_advance);
+        let categorized = navigation.close
+            + navigation.ctrl_sibling_mouse
+            + navigation.page
+            + navigation.slideshow;
+        let navigation_total = now.duration_since(self.last_mark_at);
+        debug_assert!(categorized <= navigation_total);
+        let remainder = navigation_total.saturating_sub(categorized);
+
+        let page_cycles = navigation.cycles(FsNavigationPerfSpan::Page);
+        let begin_sequence_cycles = navigation.cycles(FsNavigationPerfSpan::BeginSequence);
+        let land_target_cycles = navigation.cycles(FsNavigationPerfSpan::LandTarget);
+        debug_assert!(begin_sequence_cycles + land_target_cycles <= page_cycles);
+        let page_other_cycles =
+            page_cycles.saturating_sub(begin_sequence_cycles + land_target_cycles);
+        let land_seek_continuous_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandSeekContinuous);
+        let land_open_cycles = navigation.cycles(FsNavigationPerfSpan::LandOpen);
+        debug_assert!(land_seek_continuous_cycles + land_open_cycles <= land_target_cycles);
+        let land_remainder_cycles =
+            land_target_cycles.saturating_sub(land_seek_continuous_cycles + land_open_cycles);
+        let passthrough_rendition_cycles = passthrough_rendition.categorized_cycles();
+        let ensure_passthrough_rendition_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition);
+        debug_assert!(passthrough_rendition_cycles <= ensure_passthrough_rendition_cycles);
+        let passthrough_rendition_remainder_cycles =
+            passthrough_rendition.remainder_cycles(ensure_passthrough_rendition_cycles);
+        let resolve_sequence_categorized_cycles =
+            page_turn_decision.resolve_navigation_sequence_target_categorized_cycles();
+        let resolve_sequence_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget);
+        debug_assert!(resolve_sequence_categorized_cycles <= resolve_sequence_cycles);
+        let resolve_sequence_remainder_cycles =
+            resolve_sequence_cycles.saturating_sub(resolve_sequence_categorized_cycles);
+        let page_turn_decision_categorized_cycles = page_turn_decision.categorized_cycles();
+        let page_turn_decision_total_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame);
+        debug_assert!(page_turn_decision_categorized_cycles <= page_turn_decision_total_cycles);
+        let page_turn_decision_remainder_cycles =
+            page_turn_decision_total_cycles.saturating_sub(page_turn_decision_categorized_cycles);
+        let open_total_cycles = navigation.open_fullscreen.cycles(FsOpenPerfSpan::Total);
+        let open_categorized_cycles = navigation.open_fullscreen.categorized_cycles();
+        debug_assert!(open_categorized_cycles <= open_total_cycles);
+        let land_open_other_categorized_cycles = navigation.land_open_other_categorized_cycles();
+        debug_assert!(open_total_cycles + land_open_other_categorized_cycles <= land_open_cycles);
+        let land_open_other_remainder_cycles =
+            land_open_cycles.saturating_sub(open_total_cycles + land_open_other_categorized_cycles);
+        let open_remainder_cycles = open_total_cycles.saturating_sub(open_categorized_cycles);
+        let slideshow_cycles = navigation.cycles(FsNavigationPerfSpan::Slideshow);
+        let slideshow_advance_cycles = navigation.cycles(FsNavigationPerfSpan::SlideshowAdvance);
+        debug_assert!(slideshow_advance_cycles <= slideshow_cycles);
+        let slideshow_other_cycles = slideshow_cycles.saturating_sub(slideshow_advance_cycles);
+        let categorized_cycles = navigation.cycles(FsNavigationPerfSpan::Close)
+            + navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse)
+            + page_cycles
+            + slideshow_cycles;
+        let navigation_total_cycles = cycles.saturating_sub(self.last_mark_cycles);
+        debug_assert!(categorized_cycles <= navigation_total_cycles);
+        let remainder_cycles = navigation_total_cycles.saturating_sub(categorized_cycles);
+
+        self.navigation_page_turn_decision_cache_hit = page_turn_decision.cache_hit;
+        self.navigation_passthrough_rendition_calls = passthrough_rendition.calls.clone();
+        let stages = [
+            (FsRenderPerfStage::FsNavigationClose, navigation.close),
+            (
+                FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+                navigation.ctrl_sibling_mouse,
+            ),
+            (FsRenderPerfStage::FsNavigationPageOther, page_other),
+            (
+                FsRenderPerfStage::FsNavigationBeginSequence,
+                navigation.begin_sequence,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                navigation.land_seek_continuous,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.land_open_other_should_block_detached_independent_still_navigation_to_video,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.original_preview_active_for_frame,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.resolve_fs_display_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.source_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.build_pixels,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.load_texture,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cache_insert,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.resolve_original_preview_tex,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.ensure_navigation_target_thumbnail_requests,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.land_open_other_defer_page_turn_full_resolution_work,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.land_open_other_sync_main_selection_from_viewer_idx,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.land_open_other_video_audio_vst,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.land_open_other_try_start_video_tile_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.land_open_other_try_start_native_video_fast_swap,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.land_open_other_cancel_stale_video_tile_reopen,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.land_open_other_fullscreen_cursor_state,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .elapsed(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder,
+            ),
+            (FsRenderPerfStage::FsNavigationLandRemainder, land_remainder),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowAdvance,
+                navigation.slideshow_advance,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowOther,
+                slideshow_other,
+            ),
+            (FsRenderPerfStage::FsNavigationRemainder, remainder),
+        ];
+        for (stage, elapsed) in stages {
+            debug_assert_eq!(
+                FsRenderPerfStage::ALL.get(self.next_stage).copied(),
+                Some(stage)
+            );
+            self.stage_ms[stage as usize] = elapsed.as_secs_f64() * 1000.0;
+            self.next_stage += 1;
+        }
+        let cycle_stages = [
+            (
+                FsRenderPerfStage::FsNavigationClose,
+                navigation.cycles(FsNavigationPerfSpan::Close),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+                navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse),
+            ),
+            (FsRenderPerfStage::FsNavigationPageOther, page_other_cycles),
+            (
+                FsRenderPerfStage::FsNavigationBeginSequence,
+                begin_sequence_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                land_seek_continuous_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::SourceLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::BuildPixels),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::LoadTexture),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheInsert),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandRemainder,
+                land_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowAdvance,
+                slideshow_advance_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowOther,
+                slideshow_other_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationRemainder,
+                remainder_cycles,
+            ),
+        ];
+        for (stage, stage_cycles) in cycle_stages {
+            self.stage_cycles[stage as usize] = stage_cycles;
+        }
+        self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
     }
 
-    fn finish_at(mut self, finished_at: std::time::Instant) -> FsRenderPerfBreakdown {
+    fn finish(self) -> FsRenderPerfBreakdown {
+        self.finish_at(std::time::Instant::now(), App::thread_cycles_now())
+    }
+
+    fn finish_at(
+        mut self,
+        finished_at: std::time::Instant,
+        finished_cycles: u64,
+    ) -> FsRenderPerfBreakdown {
         // `render_fullscreen_viewport` has intentional early returns. Attribute the interval up
         // to that return to the currently active stage and leave later stages at zero.
         if self.next_stage < FS_RENDER_PERF_STAGE_COUNT {
             self.stage_ms[self.next_stage] =
                 finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.stage_cycles[self.next_stage] =
+                finished_cycles.saturating_sub(self.last_mark_cycles);
             self.next_stage += 1;
         }
         debug_assert!(self.next_stage <= FS_RENDER_PERF_STAGE_COUNT);
 
         let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
         let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        let total_cycles = finished_cycles.saturating_sub(self.started_cycles);
+        let accounted_cycles = self.stage_cycles.iter().sum::<u64>();
         FsRenderPerfBreakdown {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            total_cycles,
+            stage_cycles: self.stage_cycles,
+            unaccounted_cycles: total_cycles.saturating_sub(accounted_cycles),
+            navigation_page_turn_decision_cache_hit: self.navigation_page_turn_decision_cache_hit,
+            navigation_passthrough_rendition_calls: self.navigation_passthrough_rendition_calls,
         }
     }
 }
@@ -178,8 +1005,9 @@ impl FsRenderPerfRecorder {
 fn fs_render_perf_start_with(
     perf_on: bool,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) -> Option<FsRenderPerfRecorder> {
-    perf_on.then(now).map(FsRenderPerfRecorder::new)
+    perf_on.then(|| FsRenderPerfRecorder::new(now(), cycles_now()))
 }
 
 #[inline]
@@ -187,6 +1015,131 @@ fn mark_fs_render_perf(recorder: &mut Option<FsRenderPerfRecorder>, stage: FsRen
     if let Some(recorder) = recorder {
         recorder.mark(stage);
     }
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span_with(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_fs_page_turn_decision_perf_span(
+    recorder: &Option<FsPageTurnDecisionPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_page_turn_decision_perf_span_with(
+        recorder,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    )
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span_with(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_fs_page_turn_decision_perf_span(
+    recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    span: FsPageTurnDecisionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_fs_page_turn_decision_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
+#[inline]
+fn start_fs_navigation_perf_span_with(
+    recorder: &Option<FsNavigationPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_fs_navigation_perf_span(
+    recorder: &Option<FsNavigationPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_navigation_perf_span_with(recorder, std::time::Instant::now, App::thread_cycles_now)
+}
+
+#[inline]
+fn finish_fs_navigation_perf_span_with(
+    recorder: &mut Option<FsNavigationPerfRecorder>,
+    span: FsNavigationPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_fs_navigation_perf_span(
+    recorder: &mut Option<FsNavigationPerfRecorder>,
+    span: FsNavigationPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_fs_navigation_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
+#[inline]
+fn finish_fs_navigation_perf_with(
+    navigation: &mut Option<FsNavigationPerfRecorder>,
+    render: &mut Option<FsRenderPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(navigation), Some(render)) = (navigation.take(), render.as_mut()) {
+        render.mark_navigation_at(navigation, now(), cycles_now());
+    }
+}
+
+#[inline]
+fn finish_fs_navigation_perf(
+    navigation: &mut Option<FsNavigationPerfRecorder>,
+    render: &mut Option<FsRenderPerfRecorder>,
+) {
+    finish_fs_navigation_perf_with(
+        navigation,
+        render,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
 }
 
 #[inline]
@@ -209,6 +1162,11 @@ struct FsRenderPerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    total_cycles: u64,
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
+    unaccounted_cycles: u64,
+    navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
 
 impl FsRenderPerfBreakdown {
@@ -238,26 +1196,277 @@ impl FsRenderPerfBreakdown {
             FsRenderPerfStage::ViewportPreparation,
         ),
         ("viewport_render_ms", FsRenderPerfStage::ViewportRender),
+        (
+            "fs_viewport_breakdown_emit_ms",
+            FsRenderPerfStage::FsViewportBreakdownEmit,
+        ),
+        (
+            "viewport_shown_state_update_ms",
+            FsRenderPerfStage::ViewportShownStateUpdate,
+        ),
+        (
+            "handle_fs_navigation_close_ms",
+            FsRenderPerfStage::FsNavigationClose,
+        ),
+        (
+            "handle_fs_navigation_ctrl_sibling_mouse_ms",
+            FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+        ),
+        (
+            "handle_fs_navigation_page_other_ms",
+            FsRenderPerfStage::FsNavigationPageOther,
+        ),
+        (
+            "handle_fs_navigation_begin_sequence_ms",
+            FsRenderPerfStage::FsNavigationBeginSequence,
+        ),
+        (
+            "handle_fs_navigation_land_target_seek_continuous_ms",
+            FsRenderPerfStage::FsNavigationLandSeekContinuous,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_should_block_detached_independent_still_navigation_to_video_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_original_preview_active_for_frame_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_fs_display_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_source_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_build_pixels_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_load_texture_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_insert_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_original_preview_tex_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_navigation_target_thumbnail_requests_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_defer_page_turn_full_resolution_work_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_sync_main_selection_from_viewer_idx_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_video_audio_vst_active_exit_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_video_tile_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_try_start_native_video_fast_swap_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_cancel_stale_video_tile_reopen_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fullscreen_cursor_state_restore_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_reading_history_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_record_book_resume_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_metadata_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_start_fs_load_ms",
+            FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_update_prefetch_window_ms",
+            FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_video_marker_cache_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_refresh_pdf_promotion_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_reset_file_runtime_ms",
+            FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_viewer_presentation_ms",
+            FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenRemainder,
+        ),
+        (
+            "handle_fs_navigation_land_target_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandRemainder,
+        ),
+        (
+            "handle_fs_navigation_slideshow_advance_ms",
+            FsRenderPerfStage::FsNavigationSlideshowAdvance,
+        ),
+        (
+            "handle_fs_navigation_slideshow_other_ms",
+            FsRenderPerfStage::FsNavigationSlideshowOther,
+        ),
+        (
+            "handle_fs_navigation_remainder_ms",
+            FsRenderPerfStage::FsNavigationRemainder,
+        ),
+        ("fs_boundary_hint_ms", FsRenderPerfStage::FsBoundaryHint),
+        ("handle_fs_repaint_ms", FsRenderPerfStage::HandleFsRepaint),
         ("tail_ms", FsRenderPerfStage::Tail),
     ];
 
     fn emit(&self, frame_number: u64, input_seq: u64, fs_idx: Option<usize>) {
-        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 4);
+        let passthrough_rendition_total_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_ms[stage as usize])
+            .sum::<f64>();
+        let passthrough_rendition_total_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_cycles[stage as usize])
+            .sum::<u64>();
+        let passthrough_rendition_cache_hits = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(true))
+            .count();
+        let passthrough_rendition_cache_misses = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(false))
+            .count();
+        let cycle_field_names = Self::EVENT_FIELDS.map(|(field, _)| {
+            format!(
+                "{}_cycles",
+                field
+                    .strip_suffix("_ms")
+                    .expect("fullscreen render perf stage field must end in _ms")
+            )
+        });
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT * 2 + 13);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push((
             "idx",
             fs_idx.map_or(serde_json::Value::Null, serde_json::Value::from),
         ));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
-        for (field, stage) in Self::EVENT_FIELDS {
+        extras.push(("total_cycles", serde_json::Value::from(self.total_cycles)));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_hit",
+            self.navigation_page_turn_decision_cache_hit
+                .map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
+            serde_json::Value::from(passthrough_rendition_total_ms),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cycles",
+            serde_json::Value::from(passthrough_rendition_total_cycles),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_call_count",
+            serde_json::Value::from(self.navigation_passthrough_rendition_calls.len()),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_hit_count",
+            serde_json::Value::from(passthrough_rendition_cache_hits),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_miss_count",
+            serde_json::Value::from(passthrough_rendition_cache_misses),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_calls",
+            serde_json::to_value(&self.navigation_passthrough_rendition_calls)
+                .unwrap_or(serde_json::Value::Null),
+        ));
+        for ((field, stage), cycle_field) in
+            Self::EVENT_FIELDS.into_iter().zip(cycle_field_names.iter())
+        {
             extras.push((
                 field,
                 serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+            extras.push((
+                cycle_field.as_str(),
+                serde_json::Value::from(self.stage_cycles[stage as usize]),
             ));
         }
         extras.push((
             "unaccounted_ms",
             serde_json::Value::from(self.unaccounted_ms),
+        ));
+        extras.push((
+            "unaccounted_cycles",
+            serde_json::Value::from(self.unaccounted_cycles),
         ));
         crate::perf::event("ui", "fs_render_breakdown", None, input_seq, &extras);
     }
@@ -3658,62 +4867,7 @@ pub(crate) struct ExportDialogTarget {
     original_format: crate::save_with_metadata::SrcFormat,
     source_dir: std::path::PathBuf,
     pub(crate) basename: String,
-    pub(crate) pixels: crate::export_dialog::ExportPixels,
-}
-
-fn scale_sns_split_frames_to_export_pixels(
-    frames: &[crate::export_crop::CropRect],
-    source_size: [usize; 2],
-    target_size: [usize; 2],
-) -> Result<Vec<crate::export_crop::CropRect>, String> {
-    if frames.is_empty() {
-        return Ok(Vec::new());
-    }
-    let source_width = source_size[0].max(1) as f64;
-    let source_height = source_size[1].max(1) as f64;
-    let target_width = target_size[0].max(1);
-    let target_height = target_size[1].max(1);
-    let scale_x = target_width as f64 / source_width;
-    let scale_y = target_height as f64 / source_height;
-
-    // source の共有境界を同じ最近傍丸めで target へ写す。先頭枠の幅を全枠へ
-    // 複製すると、割り切れない余り (832 / 3 など) が末尾から失われる。
-    let frame_count = frames.len();
-    if target_width < frame_count {
-        return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-    }
-
-    let scale_boundary = |value: f32, scale: f64, limit: usize| -> Option<usize> {
-        let scaled = f64::from(value) * scale;
-        scaled
-            .is_finite()
-            .then(|| scaled.round().clamp(0.0, limit as f64) as usize)
-    };
-    let mut scaled = Vec::with_capacity(frame_count);
-    for frame in frames {
-        let Some(min_x) = scale_boundary(frame.min_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_x) = scale_boundary(frame.max_x, scale_x, target_width) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(min_y) = scale_boundary(frame.min_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        let Some(max_y) = scale_boundary(frame.max_y, scale_y, target_height) else {
-            return Err("SNS 分割枠の座標が不正です".to_string());
-        };
-        if max_x <= min_x || max_y <= min_y {
-            return Err("最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string());
-        }
-        scaled.push(crate::export_crop::CropRect {
-            min_x: min_x as f32,
-            min_y: min_y as f32,
-            max_x: max_x as f32,
-            max_y: max_y as f32,
-        });
-    }
-    Ok(scaled)
+    pub(crate) composite: crate::export_dialog::ExportComposite,
 }
 
 fn export_batch_selection_update(
@@ -6661,6 +7815,22 @@ impl App {
         fs_idx: usize,
         original_preview_active: bool,
     ) {
+        let mut perf = None;
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            &mut perf,
+        );
+    }
+
+    fn resolve_fs_navigation_sequence_target_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        original_preview_active: bool,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) {
         let Some(target) = self
             .fs_holdover_tex
             .as_ref()
@@ -6684,7 +7854,13 @@ impl App {
         }
 
         if accept_rendition {
+            let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
             self.ensure_navigation_target_thumbnail_requests(ctx, &target.pages);
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                perf_t0,
+            );
         }
         let bypasses_final_pipeline =
             self.fs_display_bypasses_final_pipeline(original_preview_active);
@@ -6693,9 +7869,23 @@ impl App {
                 // この frame は描画側も raw source を明示的に選ぶ。通常表示では下の final
                 // pipeline gate を維持するため、白黒からカラーへの途中切替を見せない契約は
                 // 緩めず、利用者が元画像を要求した frame だけ readiness source を揃える。
-                self.resolve_original_preview_tex(*idx).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_original_preview_tex(*idx).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex,
+                    perf_t0,
+                );
+                ready
             } else {
-                self.resolve_fs_display_tex(*idx, true).is_some()
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let ready = self.resolve_fs_display_tex(*idx, true).is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+                    perf_t0,
+                );
+                ready
                     || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
                         && matches!(
                             self.thumbnails.get(*idx),
@@ -6708,10 +7898,19 @@ impl App {
             .iter()
             .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
         let rendition_ready = accept_rendition
-            && target
-                .pages
-                .iter()
-                .all(|idx| self.ensure_passthrough_rendition(ctx, *idx).is_some());
+            && target.pages.iter().all(|idx| {
+                let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+                let passthrough_perf = perf.as_mut().map(|perf| &mut perf.passthrough_rendition);
+                let ready = self
+                    .ensure_passthrough_rendition_with_perf(ctx, *idx, passthrough_perf)
+                    .is_some();
+                finish_fs_page_turn_decision_perf_span(
+                    perf,
+                    FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition,
+                    perf_t0,
+                );
+                ready
+            });
         let rendition_failed = accept_rendition
             && target
                 .pages
@@ -8326,6 +9525,8 @@ fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
 /// ナビゲーション可能アイテムのインデックスリストを作成する。
 /// `adjacent_navigable_idx` と同じフィルタ条件。
 fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+    #[cfg(test)]
+    NAV_INDICES_BUILD_COUNT.set(NAV_INDICES_BUILD_COUNT.get() + 1);
     visible_indices
         .iter()
         .copied()
@@ -8339,6 +9540,21 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NAV_INDICES_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_nav_indices_build_count_for_test() {
+    NAV_INDICES_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn nav_indices_build_count_for_test() -> usize {
+    NAV_INDICES_BUILD_COUNT.get()
 }
 
 fn is_spread_pairable_item(item: Option<&GridItem>) -> bool {
@@ -10193,11 +11409,79 @@ pub(crate) struct FsKeyAction {
 
 #[derive(Clone)]
 pub(crate) struct FsSeekInfo {
-    image_indices: Vec<usize>,
+    image_indices: Arc<Vec<usize>>,
     current_pos: usize,
     media_count: usize,
     video_count: usize,
     other_count: usize,
+}
+
+/// 表示順から導出する一覧と seek 情報をまとめて所有する viewer context 単位のキャッシュ。
+///
+/// 3 つを別 field に戻すと失効点が再び分裂するため、破棄は常に単一メソッドで
+/// 一括して行う。main / detached 間ではこの owner 自体を共有せず bundle と一緒に交換する。
+#[derive(Default)]
+pub(crate) struct ViewerNavigationCaches {
+    source: Option<(u64, ReadingFlow)>,
+    nav_indices: Option<Arc<Vec<usize>>>,
+    still_image_indices: Option<Arc<Vec<usize>>>,
+    fs_seek_info: Option<(usize, FsSeekInfo)>,
+}
+
+impl ViewerNavigationCaches {
+    pub(crate) fn invalidate(&mut self) {
+        self.source = None;
+        self.nav_indices = None;
+        self.still_image_indices = None;
+        self.fs_seek_info = None;
+    }
+
+    fn ensure_source(&mut self, items_generation: u64, reading_flow: ReadingFlow) {
+        let source = (items_generation, reading_flow);
+        if self.source == Some(source) {
+            return;
+        }
+        self.invalidate();
+        self.source = Some(source);
+    }
+
+    fn nav_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.nav_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_nav_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.nav_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn still_image_indices(&self) -> Option<Arc<Vec<usize>>> {
+        self.still_image_indices.as_ref().map(Arc::clone)
+    }
+
+    fn install_still_image_indices(&mut self, indices: Vec<usize>) -> Arc<Vec<usize>> {
+        let indices = Arc::new(indices);
+        self.still_image_indices = Some(Arc::clone(&indices));
+        indices
+    }
+
+    fn fs_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
+        self.fs_seek_info
+            .as_ref()
+            .filter(|(cached_idx, _)| *cached_idx == fs_idx)
+            .map(|(_, info)| info.clone())
+    }
+
+    fn install_fs_seek_info(&mut self, fs_idx: usize, info: FsSeekInfo) {
+        self.fs_seek_info = Some((fs_idx, info));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_entries_for_test(&self) -> bool {
+        self.nav_indices.is_some()
+            || self.still_image_indices.is_some()
+            || self.fs_seek_info.is_some()
+    }
 }
 
 // Page labels live on the fullscreen viewer's fixed dark surfaces. They must
@@ -13940,11 +15224,10 @@ impl App {
         )
     }
 
-    fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
-        let display_order = self.current_grid_order();
-        let image_indices = build_image_reading_indices(&self.items, display_order);
+    fn fullscreen_seek_info(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+        let image_indices = self.get_still_image_indices();
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let nav_indices = build_nav_indices(&self.items, display_order);
+        let nav_indices = self.get_nav_indices();
         let (video_count, other_count) =
             count_seek_overlay_non_image_items(&self.items, &nav_indices);
         let media_count = image_indices.len() + video_count + other_count;
@@ -13961,17 +15244,17 @@ impl App {
     ///
     /// シークバー (locked 時は常時表示) とページ番号 overlay (既定 ON) は毎フレーム
     /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
-    /// フレームごとに作り直すのは純粋な無駄なので、`cached_nav_indices` と同じ
-    /// 無効化点 (rebuild_visible_indices / rebuild_details_order) でクリアされる
-    /// キャッシュに乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
+    /// フレームごとに作り直すのは純粋な無駄なので、一覧キャッシュと同じ owner に
+    /// 乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
     fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
-        if let Some((cached_idx, info)) = self.cached_fs_seek_info.as_ref()
-            && *cached_idx == fs_idx
-        {
-            return Some(info.clone());
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(info) = self.viewer_navigation_caches.fs_seek_info(fs_idx) {
+            return Some(info);
         }
         let info = self.fullscreen_seek_info(fs_idx)?;
-        self.cached_fs_seek_info = Some((fs_idx, info.clone()));
+        self.viewer_navigation_caches
+            .install_fs_seek_info(fs_idx, info.clone());
         Some(info)
     }
 
@@ -14134,19 +15417,33 @@ impl App {
         current_idx: usize,
         target_idx: usize,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         if self.continuous_reading_active_for_idx(current_idx)
             && self.continuous_reading_supported_idx(target_idx)
         {
             // A discrete page-unit command inside one continuous stream changes
             // its anchor; it is not a fresh fullscreen file open.
+            let seek_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.seek_to_continuous_page_with_contract(ctx, target_idx, load_contract);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandSeekContinuous,
+                seek_perf_t0,
+            );
         } else {
+            let open_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.open_fullscreen_from_fs_navigation_with_contract(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 load_contract,
+                fs_navigation_perf,
+            );
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpen,
+                open_perf_t0,
             );
         }
     }
@@ -15060,7 +16357,7 @@ impl App {
     /// span burned CPU or waited: a busy span reports the machine's real clock rate, a
     /// blocked one reports a small fraction of it (backlog 1.129).
     #[cfg(windows)]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         let mut cycles = 0u64;
         unsafe {
             let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
@@ -15072,13 +16369,16 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         0
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
-        let mut fs_render_perf =
-            fs_render_perf_start_with(crate::perf::is_enabled(), std::time::Instant::now);
+        let mut fs_render_perf = fs_render_perf_start_with(
+            crate::perf::is_enabled(),
+            std::time::Instant::now,
+            Self::thread_cycles_now,
+        );
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -17522,6 +18822,10 @@ impl App {
                 ],
             );
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::FsViewportBreakdownEmit,
+        );
 
         if !embedded {
             // embedded のときは専用 viewport を作っていないので shown フラグは
@@ -17532,9 +18836,13 @@ impl App {
                 self.fs_viewport_presentation = Some(desired_viewport_presentation);
             }
         }
+        mark_fs_render_perf(
+            &mut fs_render_perf,
+            FsRenderPerfStage::ViewportShownStateUpdate,
+        );
 
         // ── ナビゲーション & スライドショー処理 ──
-        self.handle_fs_navigation(
+        self.handle_fs_navigation_with_render_perf(
             ctx,
             close_fs,
             close_to_page_list,
@@ -17544,6 +18852,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            &mut fs_render_perf,
         );
 
         // hint_start_before と一致 = このフレームで再設定されていない
@@ -17555,7 +18864,9 @@ impl App {
                 self.fs_boundary_hint = None;
             }
         }
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FsBoundaryHint);
         self.handle_fs_repaint(ctx, fs_idx, state.is_video);
+        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HandleFsRepaint);
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::Tail);
         finish_fs_render_perf(
             &mut fs_render_perf,
@@ -18029,8 +19340,35 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
+        let mut perf = None;
+        self.fs_page_turn_decision_for_frame_with_perf(ctx, fs_idx, &mut perf)
+    }
+
+    fn fs_page_turn_decision_for_frame_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        perf: &mut Option<FsPageTurnDecisionPerfRecorder>,
+    ) -> FsPageTurnDecision {
+        let original_preview_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
         let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
-        self.resolve_fs_navigation_sequence_target(ctx, fs_idx, original_preview_active);
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+            original_preview_perf_t0,
+        );
+        let resolve_sequence_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+        self.resolve_fs_navigation_sequence_target_with_perf(
+            ctx,
+            fs_idx,
+            original_preview_active,
+            perf,
+        );
+        finish_fs_page_turn_decision_perf_span(
+            perf,
+            FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget,
+            resolve_sequence_perf_t0,
+        );
         let (rendition_sequence_active, passthrough_rendition_ready) =
             self.fs_navigation_sequence_rendition_state(fs_idx);
         #[cfg(not(windows))]
@@ -18050,15 +19388,27 @@ impl App {
                 self.fs_page_turn_input_held(ctx, fs_idx);
             let frame_nr = ctx.cumulative_frame_nr();
             let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
-            if let Some(cached) = ctx
+            let cache_lookup_perf_t0 = start_fs_page_turn_decision_perf_span(perf);
+            let cached = ctx
                 .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
                 .filter(|cached| {
                     cached.frame_nr == frame_nr
                         && cached.items_generation == self.items_generation
                         && cached.idx == fs_idx
-                })
-            {
+                });
+            finish_fs_page_turn_decision_perf_span(
+                perf,
+                FsPageTurnDecisionPerfSpan::CacheLookup,
+                cache_lookup_perf_t0,
+            );
+            if let Some(cached) = cached {
+                if let Some(perf) = perf {
+                    perf.cache_hit = Some(true);
+                }
                 return cached.decision;
+            }
+            if let Some(perf) = perf {
+                perf.cache_hit = Some(false);
             }
             let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let mut burst_state = ctx
@@ -19459,25 +20809,39 @@ impl App {
     // ── 見開きペアリング ────────────────────────────────────────────────
 
     /// build_nav_indices の結果をキャッシュして返す。
-    fn get_nav_indices(&mut self) -> Vec<usize> {
+    fn get_nav_indices(&mut self) -> Arc<Vec<usize>> {
         crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
-            if let Some(ref cached) = self.cached_nav_indices {
-                return cached.clone();
+            self.viewer_navigation_caches
+                .ensure_source(self.items_generation, self.reading_flow);
+            if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
+                return cached;
             }
             let nav = build_nav_indices(&self.items, self.current_grid_order());
-            self.cached_nav_indices = Some(nav.clone());
-            nav
+            self.viewer_navigation_caches.install_nav_indices(nav)
         })
     }
 
+    /// 連結読み・先読み用の静止画一覧を viewer context 内で共有する。
+    pub(crate) fn get_still_image_indices(&mut self) -> Arc<Vec<usize>> {
+        self.viewer_navigation_caches
+            .ensure_source(self.items_generation, self.reading_flow);
+        if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
+            return cached;
+        }
+        let indices =
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order());
+        self.viewer_navigation_caches
+            .install_still_image_indices(indices)
+    }
+
     pub(crate) fn fullscreen_large_jump_target(
-        &self,
+        &mut self,
         fs_idx: usize,
         forward: bool,
     ) -> Option<usize> {
-        crate::ui_helpers::large_jump_page_idx(
-            &self.items,
-            self.current_grid_order(),
+        let nav = self.get_still_image_indices();
+        crate::ui_helpers::large_jump_page_idx_from_nav_indices(
+            &nav,
             fs_idx,
             self.settings.fullscreen_jump_mode,
             self.settings.fullscreen_jump_percent,
@@ -19499,7 +20863,7 @@ impl App {
         // (`spread_page_nav`)。相方判定だけ違う列を見ていると、表示中でないページを
         // 表示中と誤り、逆に本当の相方を昇格対象から外す (§1.157、Codex Sol の指摘 3)。
         let nav = if self.continuous_reading_active_for_idx(idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -19545,7 +20909,7 @@ impl App {
             None => return FsPageNav::Delta(base_delta),
         };
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -19591,7 +20955,7 @@ impl App {
         dir: i32,
     ) -> Option<(usize, usize)> {
         let nav = if self.continuous_reading_active_for_idx(fs_idx) {
-            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+            self.get_still_image_indices()
         } else {
             self.get_nav_indices()
         };
@@ -25530,12 +26894,11 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        let display_order = self.current_grid_order().to_vec();
+        let image_indices = self.get_still_image_indices();
         // **自動送りは、読み手が自分で送るのと同じ歩幅にする。**分割を無視すると、
         // スライドショーを始めた瞬間に分割が解除されて画面が大きく変わってしまう
         // (2026-08-26 の実機判断)。
         let slide_nav = if self.spread_mode.is_spread() || self.spread_mode.is_split() {
-            let image_indices = build_image_reading_indices(&self.items, &display_order);
             self.spread_page_nav_for_indices(&image_indices, cur, 1)
         } else {
             FsPageNav::Delta(1)
@@ -25554,7 +26917,7 @@ impl App {
             // 別ページの半分へ。着地してから左右を確定する。
             FsPageNav::Split(step) => Some(step.source_idx),
             FsPageNav::Delta(delta) => {
-                crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
+                crate::ui_helpers::adjacent_idx_in_order(&image_indices, cur, delta)
             }
             FsPageNav::None | FsPageNav::Boundary { .. } => None,
         };
@@ -25788,11 +27151,13 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        let mut fs_navigation_perf = None;
         self.open_fullscreen_from_fs_navigation_with_contract(
             ctx,
             idx,
             history_trigger,
             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            &mut fs_navigation_perf,
         );
     }
 
@@ -25802,9 +27167,20 @@ impl App {
         idx: usize,
         history_trigger: crate::app::HistoryTrigger,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
         #[cfg(windows)]
-        if self.should_block_detached_independent_still_navigation_to_video(idx) {
+        let should_block_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let should_block = self.should_block_detached_independent_still_navigation_to_video(idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+            should_block_perf_t0,
+        );
+        #[cfg(windows)]
+        if should_block {
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::DetachedVideoUnsupported, false);
             self.log_detached_image_window_debug(format!(
                 "blocked_independent_still_video_navigation target_idx={idx} \
@@ -25817,26 +27193,64 @@ impl App {
 
         let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
         let materialization = if target_is_still_page && self.fullscreen_idx.is_some() {
-            self.fs_page_turn_decision_for_frame(ctx, idx)
-                .navigation_target_open_materialization()
+            let page_turn_decision_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+            let mut page_turn_decision_perf = fs_navigation_perf
+                .as_ref()
+                .map(|_| FsPageTurnDecisionPerfRecorder::default());
+            let page_turn_decision = self.fs_page_turn_decision_for_frame_with_perf(
+                ctx,
+                idx,
+                &mut page_turn_decision_perf,
+            );
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame,
+                page_turn_decision_perf_t0,
+            );
+            if let (Some(navigation_perf), Some(page_turn_decision_perf)) =
+                (fs_navigation_perf.as_mut(), page_turn_decision_perf)
+            {
+                navigation_perf.land_open_other_page_turn_decision = page_turn_decision_perf;
+            }
+            page_turn_decision.navigation_target_open_materialization()
         } else {
             FsOpenMaterialization::Eager
         };
         if !matches!(materialization, FsOpenMaterialization::Eager) {
+            let defer_full_resolution_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.defer_page_turn_full_resolution_work();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                defer_full_resolution_perf_t0,
+            );
         }
 
+        let sync_selection_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.sync_main_selection_from_viewer_idx(idx);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+            sync_selection_perf_t0,
+        );
 
         // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
         // (presenter re-hide) へ戻す。以降は下の音声モード keep 分岐が hidden presenter を
         // source-swap するので、通常の音声モード継続ナビになる (VST GUI は閉じる)。
+        #[cfg(windows)]
+        let video_audio_vst_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         #[cfg(windows)]
         if let Some(cur) = self.fullscreen_idx
             && self.video_audio_vst_active_for(cur)
         {
             self.exit_video_audio_vst(ctx, cur);
         }
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherVideoAudioVst,
+            video_audio_vst_perf_t0,
+        );
 
         // 動画→音声モード (Inc 7): 音声モードのまま隣の動画へ file-nav (前後ファイルボタン /
         // キーボード ↑↓) したときは、hidden presenter を音声モードのまま source-swap で再利用する
@@ -25851,31 +27265,79 @@ impl App {
             && matches!(self.items.get(idx), Some(GridItem::Video(_)))
         {
             self.source_swap_keep_audio_mode = true;
+            let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let started =
                 self.try_start_native_video_fast_swap(ctx, idx, Some(true), true, history_trigger);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                native_video_fast_swap_perf_t0,
+            );
             self.source_swap_keep_audio_mode = false;
             if started {
                 return;
             }
             // source-swap を開始できない稀ケースのみ通常 open にフォールバック (音声モードは抜ける)。
+            let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             let cursor_state = self.fullscreen_cursor_state();
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                cursor_state_perf_t0,
+            );
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
                     "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
                 );
             }
-            self.open_fullscreen(idx, history_trigger);
+            let open_fullscreen_perf = fs_navigation_perf
+                .as_mut()
+                .map(|perf| &mut perf.open_fullscreen);
+            self.open_fullscreen_with_materialization_and_contract(
+                idx,
+                history_trigger,
+                FsOpenMaterialization::Eager,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                open_fullscreen_perf,
+            );
+            let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                restore_cursor_state_perf_t0,
+            );
             return;
         }
 
         #[cfg(windows)]
-        if self.try_start_video_tile_fast_swap(ctx, idx) {
+        let video_tile_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let video_tile_fast_swap_started = self.try_start_video_tile_fast_swap(ctx, idx);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+            video_tile_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if video_tile_fast_swap_started {
             return;
         }
         #[cfg(windows)]
-        if self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger) {
+        let native_video_fast_swap_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
+        #[cfg(windows)]
+        let native_video_fast_swap_started =
+            self.try_start_native_video_fast_swap(ctx, idx, None, false, history_trigger);
+        #[cfg(windows)]
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            native_video_fast_swap_perf_t0,
+        );
+        #[cfg(windows)]
+        if native_video_fast_swap_started {
             return;
         }
 
@@ -25887,27 +27349,49 @@ impl App {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
         } else {
+            let cancel_stale_video_tile_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "fs-navigation");
+            finish_fs_navigation_perf_span(
+                fs_navigation_perf,
+                FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                cancel_stale_video_tile_perf_t0,
+            );
         }
 
+        let cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         let cursor_state = self.fullscreen_cursor_state();
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            cursor_state_perf_t0,
+        );
         if self.adjustment_mode.is_open() {
             crate::ime_focus::record_side_panel_close(
                 ctx,
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
+        let open_fullscreen_perf = fs_navigation_perf
+            .as_mut()
+            .map(|perf| &mut perf.open_fullscreen);
         self.open_fullscreen_with_materialization_and_contract(
             idx,
             history_trigger,
             materialization,
             load_contract,
+            open_fullscreen_perf,
         );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
         // has already marked the cursor active before reaching this helper.
+        let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        finish_fs_navigation_perf_span(
+            fs_navigation_perf,
+            FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+            restore_cursor_state_perf_t0,
+        );
 
         #[cfg(windows)]
         {
@@ -25936,14 +27420,17 @@ impl App {
         fs_idx: usize,
         at_end: bool,
     ) -> Option<usize> {
-        let display_order = self.current_grid_order().to_vec();
         let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
-        let target = crate::ui_helpers::boundary_page_navigation_idx(
-            &self.items,
-            &display_order,
-            at_end,
-            continuous_reading,
-        )?;
+        let nav = if continuous_reading {
+            self.get_still_image_indices()
+        } else {
+            self.get_nav_indices()
+        };
+        let target = if at_end {
+            nav.last().copied()
+        } else {
+            nav.first().copied()
+        }?;
         if target != fs_idx {
             Some(target)
         } else {
@@ -26444,7 +27931,39 @@ impl App {
         jump_to: Option<usize>,
         fs_idx: usize,
     ) {
+        let mut fs_render_perf = None;
+        self.handle_fs_navigation_with_render_perf(
+            ctx,
+            close_fs,
+            close_to_page_list,
+            ctrl_nav,
+            sibling_nav,
+            mouse_nav,
+            page_nav,
+            jump_to,
+            fs_idx,
+            &mut fs_render_perf,
+        );
+    }
+
+    fn handle_fs_navigation_with_render_perf(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        close_to_page_list: bool,
+        ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
+        page_nav: FsPageNav,
+        jump_to: Option<usize>,
+        fs_idx: usize,
+        fs_render_perf: &mut Option<FsRenderPerfRecorder>,
+    ) {
+        let mut fs_navigation_perf = fs_render_perf
+            .as_ref()
+            .map(|_| FsNavigationPerfRecorder::default());
         if close_fs {
+            let close_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             #[cfg(windows)]
             let presentation_was_transitioning =
                 self.video_presentation_transition.is_transitioning();
@@ -26472,7 +27991,13 @@ impl App {
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Close,
+                close_perf_t0,
+            );
         } else if close_to_page_list {
+            let close_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
             // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
             if self.adjustment_mode.is_open() {
@@ -26498,6 +28023,11 @@ impl App {
                 );
             }
             ctx.request_repaint();
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Close,
+                close_perf_t0,
+            );
         }
         // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が
         // 表示遷移を完結させるので、handle_fs_navigation 経由の通常 nav 経路は
@@ -26508,6 +28038,7 @@ impl App {
             && (self.video_tile_swap_pending.is_some()
                 || self.native_video_fast_swap_pending.is_some())
         {
+            finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
             return;
         }
         // Ctrl+↑↓ はフルスクリーンを保ったまま現在コンテキストの前後へ飛び、
@@ -26519,25 +28050,51 @@ impl App {
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if let Some(delta) = sibling_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if let Some(nav) = mouse_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             self.mouse_ring_nav = Some(nav);
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
         } else if !close_fs && !close_to_page_list {
+            let page_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 if !self.fs_navigation_sequence_blocks_new_target() {
+                    let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                     self.land_still_page_navigation_target(
                         ctx,
                         fs_idx,
                         new_idx,
                         crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                        &mut fs_navigation_perf,
+                    );
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::LandTarget,
+                        land_perf_t0,
                     );
                 }
             } else if let FsPageNav::Split(step) = page_nav {
@@ -26553,17 +28110,31 @@ impl App {
                         fs_idx,
                         Some(step.source_idx),
                     );
-                    if self.begin_fs_page_navigation_sequence(
+                    let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                    let sequence_started = self.begin_fs_page_navigation_sequence(
                         ctx,
                         fs_idx,
                         step.source_idx,
                         accept_rendition,
-                    ) {
+                    );
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::BeginSequence,
+                        begin_perf_t0,
+                    );
+                    if sequence_started {
+                        let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.land_still_page_navigation_target(
                             ctx,
                             fs_idx,
                             step.source_idx,
                             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            &mut fs_navigation_perf,
+                        );
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::LandTarget,
+                            land_perf_t0,
                         );
                     }
                     // **着地できたときだけ**左右を確定する。遷移が断られた場合に
@@ -26599,19 +28170,33 @@ impl App {
                             fs_idx,
                             moved.then_some(new_idx),
                         );
-                        if !moved
-                            || self.begin_fs_page_navigation_sequence(
+                        if !moved || {
+                            let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                            let sequence_started = self.begin_fs_page_navigation_sequence(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 accept_rendition,
-                            )
-                        {
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::BeginSequence,
+                                begin_perf_t0,
+                            );
+                            sequence_started
+                        } {
+                            let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::LandTarget,
+                                land_perf_t0,
                             );
                         }
                     }
@@ -26644,13 +28229,18 @@ impl App {
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = crate::ui_helpers::adjacent_page_navigation_idx(
-                    &self.items,
-                    &display_order,
-                    fs_idx,
-                    nav_delta.signum(),
-                    self.continuous_reading_active_for_idx(fs_idx),
-                ) {
+                } else if let Some(new_idx) = if self.continuous_reading_active_for_idx(fs_idx) {
+                    let nav = self.get_still_image_indices();
+                    crate::ui_helpers::adjacent_idx_in_order(&nav, fs_idx, nav_delta.signum())
+                } else {
+                    crate::ui_helpers::adjacent_page_navigation_idx(
+                        &self.items,
+                        &display_order,
+                        fs_idx,
+                        nav_delta.signum(),
+                        false,
+                    )
+                } {
                     let moved = new_idx != fs_idx;
                     if !moved || !self.fs_navigation_sequence_blocks_new_target() {
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -26658,19 +28248,33 @@ impl App {
                             fs_idx,
                             moved.then_some(new_idx),
                         );
-                        if !moved
-                            || self.begin_fs_page_navigation_sequence(
+                        if !moved || {
+                            let begin_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                            let sequence_started = self.begin_fs_page_navigation_sequence(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 accept_rendition,
-                            )
-                        {
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::BeginSequence,
+                                begin_perf_t0,
+                            );
+                            sequence_started
+                        } {
+                            let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                                &mut fs_navigation_perf,
+                            );
+                            finish_fs_navigation_perf_span(
+                                &mut fs_navigation_perf,
+                                FsNavigationPerfSpan::LandTarget,
+                                land_perf_t0,
                             );
                         }
                     }
@@ -26688,6 +28292,11 @@ impl App {
                     ));
                 }
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::Page,
+                page_nav_perf_t0,
+            );
         }
 
         // ── スライドショー タイマー ──
@@ -26695,6 +28304,7 @@ impl App {
         // in-flight 中に旧フォルダで誤って advance するのを防ぐ (SlideshowNext は発火時に
         // slideshow_playing=false にしているのでそもそも入らない)。手動 Ctrl+↑↓ が
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
+        let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing && !close_fs && !self.fs_nav_is_locked() {
             let now = std::time::Instant::now();
             let anchored = self
@@ -26704,13 +28314,34 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             } else {
                 if let Some(cur) = self.fullscreen_idx
-                    && self.advance_continuous_slideshow_scroll(ctx, cur, now)
+                    && {
+                        let advance_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+                        let advanced = self.advance_continuous_slideshow_scroll(ctx, cur, now);
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::SlideshowAdvance,
+                            advance_perf_t0,
+                        );
+                        advanced
+                    }
                 {
+                    finish_fs_navigation_perf_span(
+                        &mut fs_navigation_perf,
+                        FsNavigationPerfSpan::Slideshow,
+                        slideshow_perf_t0,
+                    );
+                    finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
                     return;
                 }
                 if now >= self.slideshow_next_at {
                     if let Some(cur) = self.fullscreen_idx {
+                        let advance_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.advance_slideshow(ctx, cur);
+                        finish_fs_navigation_perf_span(
+                            &mut fs_navigation_perf,
+                            FsNavigationPerfSpan::SlideshowAdvance,
+                            advance_perf_t0,
+                        );
                     }
                     // 前進 / 折り返し / 次フォルダ発火 (async) いずれも次フレームで反映する。
                     ctx.request_repaint();
@@ -26721,6 +28352,12 @@ impl App {
                 }
             }
         }
+        finish_fs_navigation_perf_span(
+            &mut fs_navigation_perf,
+            FsNavigationPerfSpan::Slideshow,
+            slideshow_perf_t0,
+        );
+        finish_fs_navigation_perf(&mut fs_navigation_perf, fs_render_perf);
     }
 
     /// フルスクリーンの再描画リクエストを管理する。
@@ -27771,8 +29408,7 @@ impl App {
         &mut self,
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
-        let display_order = self.current_grid_order().to_vec();
-        let image_indices = build_image_reading_indices(&self.items, &display_order);
+        let image_indices = self.get_still_image_indices();
         let mut image_units = Vec::new();
 
         if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
@@ -35888,7 +37524,7 @@ impl App {
         job
     }
 
-    fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
+    pub(crate) fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         match item {
             GridItem::Image(path) => Some(crate::capture::basename_for_path(path)),
@@ -35940,7 +37576,7 @@ impl App {
             self.show_feedback_toast("エクスポート中です".to_string());
             return false;
         }
-        // SNS 自身は snapshot の準備が成功するまで active のままにする。編集モードは
+        // SNS 自身は合成要求の準備が成功するまで active のままにする。編集モードは
         // 相互排他なので、SNS 経路ではこの 1 モードだけを例外にできる。
         if (self.is_overlay_edit_mode_active() && !(sns_split_export && self.sns_split.is_some()))
             || self.adjustment_mode.is_open()
@@ -35955,7 +37591,7 @@ impl App {
             return false;
         }
         let target = match if sns_split_export {
-            // 分割枠を作った 1 ページだけを snapshot する。通常 Ctrl+E の
+            // 分割枠を作った 1 ページだけを worker 合成へ渡す。通常 Ctrl+E の
             // 見開き合成経路は変更しない。
             self.prepare_single_export_dialog_target(ctx, fs_idx)
         } else {
@@ -35967,25 +37603,23 @@ impl App {
                 return false;
             }
         };
-        let sns_split_frames = match (sns_split, &target.pixels) {
-            (Some((frames, source_size)), crate::export_dialog::ExportPixels::Single(page)) => {
-                match scale_sns_split_frames_to_export_pixels(
+        let (sns_split_frames, sns_split_source_size) = match (sns_split, &target.composite) {
+            (Some((frames, source_size)), crate::export_dialog::ExportComposite::Single(page)) => {
+                if let Err(err) = crate::books::scale_export_crop_overrides(
                     &frames,
                     source_size,
-                    page.base_pixels.size,
+                    page.predicted_size,
                 ) {
-                    Ok(frames) => frames,
-                    Err(err) => {
-                        self.show_feedback_toast(err);
-                        return false;
-                    }
+                    self.show_feedback_toast(err);
+                    return false;
                 }
+                (frames, Some(source_size))
             }
-            (Some(_), crate::export_dialog::ExportPixels::Spread { .. }) => {
+            (Some(_), crate::export_dialog::ExportComposite::Spread { .. }) => {
                 self.show_feedback_toast("SNS 分割の単ページを準備できませんでした".to_string());
                 return false;
             }
-            (None, _) => Vec::new(),
+            (None, _) => (Vec::new(), None),
         };
 
         let output_dir = self
@@ -35996,7 +37630,7 @@ impl App {
             .unwrap_or_else(|| target.source_dir.clone());
         let original_selection = self.settings.export_batch_selection;
         let mut selection = original_selection;
-        let has_conceal_mask = target.pixels.has_conceal_mask();
+        let has_conceal_mask = target.composite.has_conceal_mask();
         if !sns_split_export {
             for i in 1..selection.len() {
                 if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
@@ -36010,7 +37644,7 @@ impl App {
         let original_include_metadata = self.settings.export_embed_metadata;
 
         // ここより前の失敗では one-shot の layout / 見開き pivot を保持する。
-        // snapshot と枠変換が揃った時だけ SNS モードを確定終了する。
+        // source・編集 snapshot と枠の検証が揃った時だけ SNS モードを確定終了する。
         if sns_split_export {
             self.reset_sns_split_mode();
         }
@@ -36023,7 +37657,7 @@ impl App {
                 self.settings.export_fallback_format,
             ),
             scale: if sns_split_export {
-                // 分割の書き出しは投稿用なので、既定で長辺を抑える。表示 pixels には
+                // 分割の書き出しは投稿用なので、既定で長辺を抑える。合成結果には
                 // AI 拡大が焼き込まれることがあり、実測で 1 枚 5.6MB と X の PNG 上限
                 // (5MB) 際まで膨らんだ。長辺指定は**元が小さければ何もしない**ので、
                 // AI 拡大を使っていない画像は等倍のまま出る。
@@ -36041,7 +37675,8 @@ impl App {
             selection,
             has_conceal_mask,
             sns_split_frames,
-            pixels: target.pixels,
+            sns_split_source_size,
+            composite: target.composite,
             original_selection,
             original_include_metadata,
             initial_focus_done: false,
@@ -36073,14 +37708,14 @@ impl App {
         self.ensure_export_local_adjust_ready(ctx, &[idx])?;
         let (source, source_label, original_format, source_dir, basename) =
             self.export_source_info_for_idx(idx)?;
-        let pixels = self.export_page_pixels_for_idx(ctx, idx)?;
+        let composite = self.export_page_composite_for_idx(ctx, idx)?;
         Ok(ExportDialogTarget {
             source,
             source_label,
             original_format,
             source_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Single(pixels),
+            composite: crate::export_dialog::ExportComposite::Single(composite),
         })
     }
 
@@ -36095,8 +37730,8 @@ impl App {
         let (_, left_label, _, left_dir, left_basename) =
             self.export_source_info_for_idx(left_idx)?;
         let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
-        let left = self.export_page_pixels_for_idx(ctx, left_idx)?;
-        let right = self.export_page_pixels_for_idx(ctx, right_idx)?;
+        let left = self.export_page_composite_for_idx(ctx, left_idx)?;
+        let right = self.export_page_composite_for_idx(ctx, right_idx)?;
         let basename =
             crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
         Ok(ExportDialogTarget {
@@ -36105,7 +37740,7 @@ impl App {
             original_format: crate::save_with_metadata::SrcFormat::Other("spread".to_string()),
             source_dir: left_dir,
             basename,
-            pixels: crate::export_dialog::ExportPixels::Spread { left, right },
+            composite: crate::export_dialog::ExportComposite::Spread { left, right },
         })
     }
 
@@ -36114,18 +37749,16 @@ impl App {
         ctx: &egui::Context,
         indices: &[usize],
     ) -> Result<(), String> {
-        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
-        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
-        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
+        // §1.177 で準備処理そのものを worker 所有へ移すまでは、従来どおり commit 完了を
+        // 待ってから source + snapshot を確定する。進行中のマスク状態を取り込まないための gate。
         if self.erase_inpaint_pending.keys().any(|k| {
             indices.contains(&k.idx) && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
         }) {
             return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
         }
 
-        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
-        // pre-erase pixels を書き出してしまう。ensure_erase_result_texture をここで
-        // 呼んで commit を再投入し、結果が揃うまで Ctrl+E を保留する。
+        // 保存済みマスクの commit を再投入し、従来の準備契約どおり結果が揃うまで
+        // Ctrl+E を保留する。この同期準備の廃止は §1.177 の範囲。
         for &idx in indices {
             if self.mask_pages.contains(&idx) {
                 let _ = self.ensure_erase_result_texture(ctx, idx);
@@ -36169,126 +37802,90 @@ impl App {
         Ok(())
     }
 
-    fn export_page_pixels_for_idx(
+    fn export_page_composite_for_idx(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Result<crate::export_dialog::ExportPagePixels, String> {
-        // 注釈 (comic) があれば最終 composite に焼き込んでから export する (最前面 D1)。
-        // 注釈が無ければ素の final composite。ここで得るのは「現在の設定で隠蔽まで
-        // 焼き込み済み」の表示スナップショットで、`_0` はこれをそのまま書き出す。
-        let base_pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
-            Some(p) => p,
-            None => self
-                .ensure_final_composite_pixels(ctx, idx)
-                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?,
-        };
-        // プリセット出力 (_1〜_4) は隠蔽のパラメータだけが違う同じ絵なので、隠蔽の入力
-        // まで戻って再合成する材料を別に持つ。base_pixels へマスクを重ねるだけだと隠蔽が
-        // 二重に掛かる (v1.1.0 の退行はこれを避けようとして conceal_mask=None を固定し、
-        // プリセット出力ごと止めていた)。
-        let conceal_variant = self
-            .export_conceal_variant_for_idx(ctx, idx)
-            .map(std::sync::Arc::new);
-        // crop は表示には反映しないので、export の最終段で base_pixels (= final
-        // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
-        let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
-        let rotation = self.get_rotation(idx);
-        Ok(crate::export_dialog::ExportPagePixels {
-            base_pixels,
-            conceal_variant,
-            crop,
-            rotation,
-        })
-    }
-
-    /// プリセット出力用の「隠蔽適用前」スナップショット。隠蔽マスクを持たないページは
-    /// `None` = プリセット出力は選べない (本来の条件)。
-    fn export_conceal_variant_for_idx(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantSource> {
-        // 表示側で隠蔽合成の入力になっているものと同じ段 (raw → 消しゴム → 補正レイヤー)。
-        let (base, _) = self.current_conceal_source_pixels(idx)?;
-        let mask = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])?;
-        let params = self.effective_params(idx).clone();
-        let creative_lut = (!params.creative_lut.is_identity())
-            .then(|| {
-                self.creative_lut_library
-                    .get(params.creative_lut.id)
-                    .map(|lut| (lut, params.creative_lut.strength))
-            })
-            .flatten();
-        let ai = self.export_conceal_variant_ai(ctx, idx, &params);
-        let comic = self.export_conceal_variant_comic(idx);
-        Some(crate::export_dialog::ConcealVariantSource {
-            base,
-            mask: std::sync::Arc::new(mask),
-            params,
-            creative_lut,
-            ai,
-            comic,
-        })
-    }
-
-    /// 表示の final composite が実際に final AI を通っているときだけ、プリセット再合成へ
-    /// 同じ AI 段を持たせる。表示が AI 抜き (機能無効 / サイズ上限外 / 推論失敗) なら
-    /// `None` にして `_0` と絵を揃える。
-    fn export_conceal_variant_ai(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-        params: &crate::adjustment::AdjustParams,
-    ) -> Option<crate::export_dialog::ConcealVariantAi> {
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, params)?;
-        // 完成した final composite を掴んだ後にここへ来るので、failed でなければ
-        // 表示は AI 結果を使っている。
-        if self.final_ai_failed.contains(&ai_key) {
-            return None;
+    ) -> Result<crate::export_dialog::ExportPageComposite, String> {
+        // source と編集 snapshot だけを UI スレッドで固定する。decode と、選択された段までの
+        // 合成は worker が行う。注釈は共通 compositor が AI / 表示用補正の後に焼く。
+        let item = self
+            .items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // 再生中の表示フレームは source file の decode からは復元できない。worker に
+        // file だけを渡すと第 1 フレームを黙って保存するため、表示フレームを snapshot
+        // できるようになるまでは従来どおり入口で拒否する。
+        if self.fs_entry_is_animated(idx) {
+            return Err("アニメーション画像はエクスポートできません".to_string());
         }
-        self.ensure_ai_runtime();
-        let runtime = self.ai_runtime.clone()?;
-        Some(crate::export_dialog::ConcealVariantAi {
-            runtime,
-            manager: std::sync::Arc::clone(&self.ai_model_manager),
-            feature_mode: self.settings.ai_feature_mode,
-            upscale_limit: self.settings.ai_upscale_limit(),
-            denoise_limit: self.settings.ai_denoise_limit(),
-            // 表示側が分類済みならその答えを渡す。auto upscale のモデル選択が
-            // `_0` と `_1`〜`_4` で食い違わないようにする。
-            category: self.ai_classify_cache.get(&idx).copied(),
-            transparent_bg_mode: self.fs_transparent_bg_mode,
-        })
-    }
-
-    /// プリセット再合成の最後に焼く注釈。`comic_composited_pixels_for_export` と同じ
-    /// 材料を、製本の headless compositor と同じ形 (`BookComicSnapshot`) で渡す。
-    fn export_conceal_variant_comic(
-        &mut self,
-        idx: usize,
-    ) -> Option<crate::export_dialog::ConcealVariantComic> {
-        if !self.comic_has_objects(idx) {
-            return None;
-        }
-        let key = self.page_path_key(idx)?;
-        self.ensure_comic_doc_loaded(&key);
-        let objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
-        if objects.is_empty() {
-            return None; // デモ有効でも永続注釈が無ければ export には焼かない
-        }
-        let fonts = self.ensure_comic_fonts_for(&objects)?;
-        let source_dims = self
-            .source_dims_for_idx(idx)
-            .map(|(width, height)| [width.round() as usize, height.round() as usize]);
-        Some(crate::export_dialog::ConcealVariantComic {
-            snapshot: crate::books::BookComicSnapshot {
-                objects,
-                fonts,
-                stamp_cache: self.comic_stamp_cache.clone(),
+        let source = match item {
+            GridItem::Image(path) => crate::books::CompositeSource::File { path },
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => crate::books::CompositeSource::ZipEntry {
+                zip_path,
+                entry_name,
             },
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => crate::books::CompositeSource::PdfPage {
+                pdf_path,
+                page_num,
+                password: self.pdf_current_password.clone(),
+            },
+            _ => return Err("このアイテムはエクスポートできません".to_string()),
+        };
+        // プリセット出力 (_1〜_4) も同じ snapshot を使い、隠蔽 preset だけを worker 側で
+        // 差し替える。`_0` は override を付けず、snapshot が持つ現在値を 1 回だけ適用する。
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        // crop は表示には反映しないので、worker 合成の幾何最終段で切り出す。
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let stage = self.settings.bake_stage_export;
+        let mut source_dims = self
+            .source_dims_for_idx(idx)
+            .map(|(width, height)| [width.round() as usize, height.round() as usize])
+            .ok_or_else(|| "画像の読み込み完了後にエクスポートしてください".to_string())?;
+        const PDF_RENDER_LONG_EDGE: u32 = 4096;
+        if matches!(source, crate::books::CompositeSource::PdfPage { .. }) {
+            source_dims =
+                crate::books::predicted_pdf_render_size(source_dims, PDF_RENDER_LONG_EDGE);
+        }
+        let ai_will_run = crate::books::stage_will_run_ai(
+            stage,
+            &params,
+            self.book_ai_materials().policy,
             source_dims,
+        );
+        let display_dims = if ai_will_run {
+            self.ensure_final_composite_pixels(ctx, idx)
+                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?
+                .size
+        } else {
+            source_dims
+        };
+        let predicted_size =
+            crate::books::predicted_composed_size(source_dims, display_dims, ai_will_run);
+        let edits = self.book_baked_edit_snapshot(&key, Some(idx), params, rotation, stage)?;
+        // Shape が保存されていても、画像外や 0 面積なら 1 画素も塗られない。
+        // プリセット欄は実際の合成マスクが非空のときだけ有効にする。
+        let has_conceal_mask = edits
+            .conceal
+            .as_ref()
+            .map(|conceal| crate::books::book_mask_has_covered_pixel(&conceal.mask, source_dims))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(crate::export_dialog::ExportPageComposite {
+            source,
+            edits,
+            pdf_render_long_edge: PDF_RENDER_LONG_EDGE,
+            predicted_size,
+            has_conceal_mask,
         })
     }
 
@@ -36317,8 +37914,15 @@ impl App {
         let basename_ok = !crate::capture::basename_from_text(&state.basename)
             .trim()
             .is_empty();
-        let can_start =
-            selected_count > 0 && basename_ok && !state.output_dir_text.trim().is_empty();
+        let render_size = state.render_size();
+        if let Err(error) = &render_size {
+            state.error.get_or_insert_with(|| error.clone());
+        }
+        let base_size = render_size.unwrap_or([1, 1]);
+        let can_start = selected_count > 0
+            && basename_ok
+            && !state.output_dir_text.trim().is_empty()
+            && state.render_size().is_ok();
         let mut open = true;
         let mut canceled = false;
         let mut start = false;
@@ -36428,7 +38032,6 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
-                let base_size = state.render_size();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     for scale in crate::export_dialog::ExportScale::FIXED {
@@ -36565,11 +38168,16 @@ impl App {
             start = true;
         }
         if start {
-            match self.start_export_from_dialog(ctx, state.clone()) {
+            let mut state_slot = Some(state);
+            match self.start_export_from_dialog(ctx, &mut state_slot) {
                 Ok(()) => return,
                 Err(err) => {
-                    state.error = Some(err);
-                    self.export_dialog = Some(state);
+                    if let Some(mut state) = state_slot {
+                        state.error = Some(err);
+                        self.export_dialog = Some(state);
+                    } else {
+                        self.show_feedback_toast(err);
+                    }
                     return;
                 }
             }
@@ -36754,8 +38362,11 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state: crate::export_dialog::ExportDialogState,
+        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
     ) -> Result<(), String> {
+        let state = state_slot
+            .as_ref()
+            .expect("export dialog state must exist while validating");
         if self.export_pending.is_some() {
             return Err("エクスポート中です".to_string());
         }
@@ -36770,16 +38381,13 @@ impl App {
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
-        // ダイアログを開いた瞬間に snapshot した pixels / conceal mask を使う。
-        // ここで再 resolve すると animated GIF の current_frame が進んで違うフレーム
-        // が export される (Codex review CONFIRMED)。
-        let pixels = state.pixels.clone();
-        let has_conceal_mask = pixels.has_conceal_mask();
-        // プリセット再合成が final AI を回すなら、worker 終端までローカル AI 利用中に見せる。
-        let needs_ai_lease = pixels.conceal_variant_uses_ai();
+        let has_conceal_mask = state.composite.has_conceal_mask();
+        // 段が AI へ届くなら、worker 終端までローカル AI 利用中に見せる。
+        let needs_ai_lease = state.composite.includes_ai_stage();
         let sns_split_export = !state.sns_split_frames.is_empty();
         let entries = crate::export_dialog::plan_export_entries(
             &state.sns_split_frames,
+            state.sns_split_source_size,
             &state.selection,
             has_conceal_mask,
             &self.settings.conceal_presets,
@@ -36824,7 +38432,7 @@ impl App {
         if let Some(next_selection) = selection_update {
             self.settings.export_batch_selection = next_selection;
         }
-        // SNS はモード固有の既定値として毎回 Full で開く。その強制初期値を通常
+        // SNS はモード固有の既定値として毎回 長辺 2048px で開く。その強制初期値を通常
         // エクスポートの既定倍率へ逆流させない。
         if !sns_split_export {
             self.settings.export_default_scale = state.scale;
@@ -36842,13 +38450,16 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
+        let state = state_slot
+            .take()
+            .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {
             source: state.source,
             original_format: state.original_format,
             output_format: state.output_format,
             output_dir,
             basename: resolved_basename,
-            pixels,
+            composite: state.composite,
             scale: state.scale,
             entries,
             include_metadata: effective_include_metadata,
@@ -36939,48 +38550,6 @@ impl App {
                 ))
             }
             _ => Err("このアイテムはエクスポートできません".to_string()),
-        }
-    }
-
-    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
-    fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
-        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
-            return Ok(pixels);
-        }
-        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
-            return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
-        }
-        if self.has_active_local_adjust_layers(idx) {
-            return Err("補正レイヤーの反映完了後にエクスポートしてください".to_string());
-        }
-
-        if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            return Ok(pixels);
-        }
-        if !self.post_filter_bypassed
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(idx)
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-        {
-            return Ok(Arc::clone(pixels));
-        }
-
-        match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Ok(Arc::clone(pixels)),
-            Some(FsCacheEntry::Animated {
-                frame_pixels,
-                current_frame,
-                ..
-            }) => frame_pixels
-                .get(*current_frame)
-                .cloned()
-                .ok_or_else(|| "アニメーションフレームを取得できません".to_string()),
-            _ => Err("画像の読み込み完了後にエクスポートしてください".to_string()),
         }
     }
 
@@ -38318,12 +39887,192 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fs_render_perf_timer_does_not_read_clock_when_disabled() {
+    fn nav_indices_cache_reuses_the_same_allocation() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..6).map(|_| GridItem::Image(PathBuf::new())).collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.viewer_navigation_caches.invalidate();
+
+        reset_nav_indices_build_count_for_test();
+        let first = app.get_nav_indices();
+        let second = app.get_nav_indices();
+
+        assert_eq!(nav_indices_build_count_for_test(), 1);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    fn cached_and_uncached_navigation_lists_are_identical() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        app.visible_indices = vec![2, 1, 0];
+        let uncached_nav = build_nav_indices(&app.items, &app.visible_indices);
+        let uncached_still =
+            crate::ui_helpers::still_image_display_indices(&app.items, &app.visible_indices);
+
+        app.viewer_navigation_caches.invalidate();
+        assert_eq!(app.get_nav_indices().as_ref(), &uncached_nav);
+        assert_eq!(app.get_still_image_indices().as_ref(), &uncached_still);
+    }
+
+    #[test]
+    fn viewer_navigation_cache_invalidate_clears_all_three_entries() {
+        let mut caches = ViewerNavigationCaches::default();
+        caches.ensure_source(7, ReadingFlow::Paged);
+        caches.install_nav_indices(vec![0, 1]);
+        caches.install_still_image_indices(vec![0]);
+        caches.install_fs_seek_info(
+            0,
+            FsSeekInfo {
+                image_indices: Arc::new(vec![0]),
+                current_pos: 0,
+                media_count: 2,
+                video_count: 1,
+                other_count: 0,
+            },
+        );
+
+        caches.invalidate();
+
+        assert!(caches.nav_indices().is_none());
+        assert!(caches.still_image_indices().is_none());
+        assert!(caches.fs_seek_info(0).is_none());
+    }
+
+    #[test]
+    fn fs_render_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
         let clock_called = std::cell::Cell::new(false);
-        let mut recorder = fs_render_perf_start_with(false, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let cycles_called = std::cell::Cell::new(false);
+        let mut recorder = fs_render_perf_start_with(
+            false,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut navigation = recorder
+            .as_ref()
+            .map(|_| FsNavigationPerfRecorder::default());
+        let navigation_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_span_with(
+            &mut navigation,
+            FsNavigationPerfSpan::Page,
+            navigation_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let open_other_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_span_with(
+            &mut navigation,
+            FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+            open_other_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut page_turn_decision = recorder
+            .as_ref()
+            .map(|_| FsPageTurnDecisionPerfRecorder::default());
+        let page_turn_span = start_fs_page_turn_decision_perf_span_with(
+            &page_turn_decision,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_page_turn_decision_perf_span_with(
+            &mut page_turn_decision,
+            FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
+            page_turn_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
+        let open_span = crate::app::start_fs_open_perf_span_with(
+            &open_perf,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        crate::app::finish_fs_open_perf_span_with(
+            &mut open_perf,
+            FsOpenPerfSpan::RecordReadingHistory,
+            open_span,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_fs_navigation_perf_with(
+            &mut navigation,
+            &mut recorder,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         for stage in FsRenderPerfStage::ALL {
             mark_fs_render_perf(&mut recorder, stage);
         }
@@ -38331,24 +40080,307 @@ mod tests {
 
         assert!(recorder.is_none());
         assert!(!clock_called.get());
+        assert!(!cycles_called.get());
     }
 
     #[test]
     fn fs_render_perf_stages_plus_unaccounted_equal_total() {
         let started_at = std::time::Instant::now();
-        let mut recorder = FsRenderPerfRecorder::new(started_at);
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
         let mut elapsed = std::time::Duration::ZERO;
+        let mut cycles = started_cycles;
         for (index, stage) in FsRenderPerfStage::ALL.into_iter().enumerate() {
             elapsed += std::time::Duration::from_millis(index as u64 + 1);
-            recorder.mark_at(stage, started_at + elapsed);
+            cycles += (index as u64 + 1) * 100;
+            recorder.mark_at(stage, started_at + elapsed, cycles);
         }
         let expected_unaccounted = std::time::Duration::from_millis(7);
-        let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+        let expected_unaccounted_cycles = 700;
+        let breakdown = recorder.finish_at(
+            started_at + elapsed + expected_unaccounted,
+            cycles + expected_unaccounted_cycles,
+        );
         let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
 
         assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
         assert!(
             (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
+        );
+    }
+
+    #[test]
+    fn fs_navigation_perf_children_partition_the_navigation_interval() {
+        let started_at = std::time::Instant::now();
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
+        let mut marked_at = started_at;
+        let mut marked_cycles = started_cycles;
+        for stage in FsRenderPerfStage::ALL {
+            if stage == FsRenderPerfStage::FsNavigationClose {
+                break;
+            }
+            marked_at += std::time::Duration::from_millis(1);
+            marked_cycles += 100;
+            recorder.mark_at(stage, marked_at, marked_cycles);
+        }
+        let mut open_fullscreen = FsOpenPerfRecorder::default();
+        for (span, ms) in [
+            (FsOpenPerfSpan::Total, 25),
+            (FsOpenPerfSpan::RecordReadingHistory, 2),
+            (FsOpenPerfSpan::RecordBookResume, 3),
+            (FsOpenPerfSpan::StartMetadataLoad, 1),
+            (FsOpenPerfSpan::StartFsLoad, 2),
+            (FsOpenPerfSpan::UpdatePrefetchWindow, 4),
+            (FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache, 1),
+            (FsOpenPerfSpan::RefreshFullscreenPdfPromotion, 2),
+            (FsOpenPerfSpan::ResetFileRuntime, 2),
+            (FsOpenPerfSpan::ViewerPresentation, 3),
+        ] {
+            open_fullscreen.add(span, std::time::Duration::from_millis(ms), ms * 100);
+        }
+        let navigation = FsNavigationPerfRecorder {
+            close: std::time::Duration::from_millis(2),
+            ctrl_sibling_mouse: std::time::Duration::from_millis(3),
+            page: std::time::Duration::from_millis(83),
+            begin_sequence: std::time::Duration::from_millis(4),
+            land_target: std::time::Duration::from_millis(68),
+            land_seek_continuous: std::time::Duration::ZERO,
+            land_open: std::time::Duration::from_millis(67),
+            land_open_other_should_block_detached_independent_still_navigation_to_video:
+                std::time::Duration::from_millis(1),
+            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(25),
+            land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder {
+                original_preview_active_for_frame: std::time::Duration::from_millis(1),
+                resolve_navigation_sequence_target: std::time::Duration::from_millis(17),
+                resolve_fs_display_tex: std::time::Duration::from_millis(2),
+                ensure_passthrough_rendition: std::time::Duration::from_millis(8),
+                passthrough_rendition: PassthroughRenditionPerfRecorder {
+                    source_lookup: std::time::Duration::from_millis(1),
+                    cache_lookup: std::time::Duration::from_millis(1),
+                    build_pixels: std::time::Duration::from_millis(2),
+                    load_texture: std::time::Duration::from_millis(2),
+                    cache_insert: std::time::Duration::from_millis(1),
+                    cycles: [100, 100, 200, 200, 100],
+                    calls: Vec::new(),
+                },
+                resolve_original_preview_tex: std::time::Duration::from_millis(1),
+                ensure_navigation_target_thumbnail_requests: std::time::Duration::from_millis(2),
+                cache_lookup: std::time::Duration::from_millis(1),
+                cycles: [100, 1_700, 200, 800, 100, 200, 100],
+                cache_hit: Some(true),
+            },
+            land_open_other_defer_page_turn_full_resolution_work: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_sync_main_selection_from_viewer_idx: std::time::Duration::from_millis(
+                1,
+            ),
+            land_open_other_video_audio_vst: std::time::Duration::from_millis(1),
+            land_open_other_try_start_video_tile_fast_swap: std::time::Duration::from_millis(1),
+            land_open_other_try_start_native_video_fast_swap: std::time::Duration::from_millis(3),
+            land_open_other_cancel_stale_video_tile_reopen: std::time::Duration::from_millis(1),
+            land_open_other_fullscreen_cursor_state: std::time::Duration::from_millis(2),
+            open_fullscreen,
+            slideshow: std::time::Duration::from_millis(7),
+            slideshow_advance: std::time::Duration::from_millis(6),
+            cycles: [
+                200, 300, 8_300, 400, 6_800, 0, 6_700, 100, 2_500, 100, 100, 100, 100, 300, 100,
+                200, 700, 600,
+            ],
+        };
+        marked_at += std::time::Duration::from_millis(103);
+        marked_cycles += 10_300;
+        recorder.mark_navigation_at(navigation, marked_at, marked_cycles);
+
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationPageOther as usize],
+            11.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationSlideshowOther as usize],
+            1.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationRemainder as usize],
+            8.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap as usize],
+            3.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState as usize],
+            2.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize],
+            6.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize],
+            4.0
+        );
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize],
+            6.0
+        );
+        assert_eq!(recorder.navigation_page_turn_decision_cache_hit, Some(true));
+        let passthrough_rendition_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(passthrough_rendition_ms, 8.0);
+        let passthrough_rendition_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(passthrough_rendition_cycles, 800);
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            1.0
+        );
+        assert_eq!(
+            recorder.stage_cycles
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            100
+        );
+        let page_turn_decision_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(page_turn_decision_ms, 25.0);
+        let page_turn_decision_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(page_turn_decision_cycles, 2_500);
+        let resolve_sequence_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(resolve_sequence_ms, 17.0);
+        let resolve_sequence_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(resolve_sequence_cycles, 1_700);
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
+            5.0
+        );
+        assert_eq!(
+            recorder.stage_ms[FsRenderPerfStage::FsNavigationLandRemainder as usize],
+            1.0
+        );
+        let open_other_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo
+            as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(open_other_ms, 42.0);
+        let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
+            as usize
+            ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(land_ms, 68.0);
+        let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+            ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(navigation_ms, 103.0);
+        let navigation_cycles =
+            FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+                ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+                .iter()
+                .copied()
+                .map(|stage| recorder.stage_cycles[stage as usize])
+                .sum::<u64>();
+        assert_eq!(navigation_cycles, 10_300);
+        assert_eq!(
+            FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
+            Some(FsRenderPerfStage::FsBoundaryHint)
+        );
+        while recorder.next_stage < FS_RENDER_PERF_STAGE_COUNT {
+            marked_at += std::time::Duration::from_millis(1);
+            marked_cycles += 100;
+            let stage = FsRenderPerfStage::ALL[recorder.next_stage];
+            recorder.mark_at(stage, marked_at, marked_cycles);
+        }
+        let finished_at = marked_at + std::time::Duration::from_millis(7);
+        let breakdown = recorder.finish_at(finished_at, marked_cycles + 700);
+        let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
+        assert!(
+            (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, 700);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
+        );
+    }
+
+    #[test]
+    fn fs_render_perf_event_fields_follow_stage_order() {
+        let event_stages = FsRenderPerfBreakdown::EVENT_FIELDS.map(|(_, stage)| stage);
+        assert_eq!(event_stages, FsRenderPerfStage::ALL);
+        assert!(
+            FsRenderPerfBreakdown::EVENT_FIELDS
+                .iter()
+                .all(|(field, _)| {
+                    field
+                        .strip_suffix("_ms")
+                        .is_some_and(|prefix| !prefix.is_empty())
+                })
         );
     }
 
@@ -38458,7 +40490,7 @@ mod tests {
         };
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&[frame], [100, 50], [400, 100]).unwrap();
+            crate::books::scale_export_crop_overrides(&[frame], [100, 50], [400, 100]).unwrap();
 
         assert_eq!(
             scaled,
@@ -38481,7 +40513,7 @@ mod tests {
         .with_seam_permille(0, [832, 1216]);
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&layout.frames(), [832, 1216], [832, 1216])
+            crate::books::scale_export_crop_overrides(&layout.frames(), [832, 1216], [832, 1216])
                 .unwrap();
         let bounds = scaled
             .iter()
@@ -38525,7 +40557,7 @@ mod tests {
         ];
 
         let scaled =
-            scale_sns_split_frames_to_export_pixels(&frames, [130, 60], [173, 77]).unwrap();
+            crate::books::scale_export_crop_overrides(&frames, [130, 60], [173, 77]).unwrap();
         let bounds = scaled
             .iter()
             .map(|frame| {
@@ -38573,7 +40605,7 @@ mod tests {
             },
         ];
 
-        let scaled = scale_sns_split_frames_to_export_pixels(&frames, [10, 5], [11, 6]).unwrap();
+        let scaled = crate::books::scale_export_crop_overrides(&frames, [10, 5], [11, 6]).unwrap();
         let first = scaled[0].pixel_bounds(11, 6);
         let second = scaled[1].pixel_bounds(11, 6);
 
@@ -38583,7 +40615,7 @@ mod tests {
     }
 
     #[test]
-    fn sns_split_frames_reject_a_snapshot_too_narrow_for_distinct_entries() {
+    fn sns_split_frames_reject_a_composite_too_narrow_for_distinct_entries() {
         let frames = [
             crate::export_crop::CropRect {
                 min_x: 0.0,
@@ -38599,7 +40631,7 @@ mod tests {
             },
         ];
 
-        let err = scale_sns_split_frames_to_export_pixels(&frames, [2, 1000], [1, 500])
+        let err = crate::books::scale_export_crop_overrides(&frames, [2, 1000], [1, 500])
             .expect_err("1px 幅へ 2 枠は配置できない");
 
         assert!(err.contains("解像度が小さすぎ"));
@@ -42454,7 +44486,7 @@ mod tests {
                 app.items = (0..7).map(|_| GridItem::Image(PathBuf::new())).collect();
                 app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
                 app.visible_indices = (0..app.items.len()).collect();
-                app.cached_nav_indices = None;
+                app.viewer_navigation_caches.invalidate();
                 app.spread_mode = mode;
                 app.fullscreen_idx = Some(2);
                 for idx in 0..app.items.len() {
@@ -43605,7 +45637,7 @@ mod tests {
             egui::Color32::LIGHT_GREEN,
         );
         app.visible_indices = vec![left, right];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.fullscreen_idx = Some(left);
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;

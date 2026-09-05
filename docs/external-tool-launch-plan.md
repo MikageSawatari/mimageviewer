@@ -228,8 +228,8 @@ Codex Sol による read-only 調査。file:line は調査時点の master (6464
 
 - 製本 ([books.rs:201](../src/books.rs:201)) — 通常ファイル / ZIP エントリ / 合成画像 / **動画フレーム** / PDF ページを
   表現でき、ZIP エントリは**元バイト列のまま**書き出す ([books.rs:916](../src/books.rs:916))
-- エクスポート ([export_dialog.rs:129](../src/export_dialog.rs:129)) — `File` / `ZipEntry` / `PdfPage` /
-  **`RenderedSpread` (見開き合成)** を扱い、ワーカーでキャンセル可能
+- エクスポート ([export_dialog.rs](../src/export_dialog.rs)) — `File` / `ZipEntry` / `PdfPage` の
+  source と編集 snapshot を扱い、見開きも左右をワーカーで合成してキャンセル可能
 
 どちらも「利用者が保持する最終成果物」を作るもので、**外部プロセスへ手渡すための temp という概念は無い**。
 
@@ -533,7 +533,7 @@ Ctrl+B ([ui_fullscreen.rs:33496](../src/ui_fullscreen.rs:33496)) には呼び出
 | 加工ありのページ | 焼き込んで PNG (`CompositeSource` + `BakedEditSnapshot` を再利用) | 無し (製本と同じ経路) |
 | PDF ページ | PNG へレンダリング | 解像度は**ツールごとに選べる。既定は長辺 4096** (製本と同じ)。選択肢は **2048 / 4096 / 8192 のみ** |
 | 動画フレーム | PNG (`capture_frame()` → encode) | 既定 PNG。品質はキャプチャ設定を流用 |
-| 見開き合成 | `RenderedSpread` を PNG 化 (エクスポート [export_dialog.rs:129](../src/export_dialog.rs:129) を再利用) | 無し |
+| 見開き合成 | `MergedSpread` の左右を worker で個別合成して PNG 化 | 無し |
 
 **P3 実装済み (2026-09-01)。** 汎用の [`materializer.rs`](../src/materializer.rs) が上表の
 出力判断、ZIP 展開、PDF / 画像 decode、`BakedEditSnapshot` による焼き込み、PNG encode を担う。
@@ -552,14 +552,10 @@ launch-boundary 通知を返し、UI が items generation と起動元 viewer ta
 (viewport があるのはフルスクリーンだけ) ため、大半の入口で定義できない。
 正しく実装すると viewport 経路まで範囲が広がる。保存済みの `0` は **4096 として読む**。
 
-**AI アップスケール結果は焼き込まない** (利用者判断 2026-08-29)。表示中に AI 拡大が効いていても、
-外部ツールへ渡すのは等倍。AI アップスケールは**自分の表示用**という位置づけで、製本と同じ扱いに揃える。
-`page_requires_full_composite()` に AI が入っていないので、判定はそのまま使える。
-
-> 例外は <kbd>Ctrl+E</kbd> (`FsExport`「現在の表示結果を別ファイルへ書き出す」,
-> [keymap.rs:5441](../src/keymap.rs:5441))。これはダイアログを開いた瞬間の表示 pixels を
-> スナップショットするので、AI 拡大が完了していれば反映される
-> ([export_dialog.rs:226](../src/export_dialog.rs:226))。外部ツール起動はこれに揃えない。
+外部ツールの既定は「編集まで」なので、AI アップスケール結果は従来どおり焼き込まない。
+必要な場合は環境設定の「焼き込み段階」で「AI 処理まで」または「表示用補正まで」を選ぶ。
+単ページと `SpreadPolicy::Merged` は同じ `bake_stage_external_tool` を読み、どちらも
+materializer worker が source を再デコードして共通合成する。
 
 ### 4.4 プレースホルダと引数の組み立て
 
@@ -673,7 +669,7 @@ launch-boundary 通知を返し、UI が items generation と起動元 viewer ta
 
 | 値 | 動作 |
 | --- | --- |
-| `Merged` (既定) | 合成した 1 枚を渡す (`RenderedSpread` を実体化) |
+| `Merged` (既定) | 合成した 1 枚を渡す (`MergedSpread` を実体化) |
 | `BothPages` | 左右 2 件を読み順で渡す (`SelectionPolicy` に従って Each / Batch) |
 | `MainPageOnly` | 主ページ 1 件 |
 
@@ -695,15 +691,16 @@ launch-boundary 通知を返し、UI が items generation と起動元 viewer ta
 - 見えている組の解決は <kbd>Ctrl+S</kbd> / <kbd>Ctrl+E</kbd> と同じ `resolve_visible_spread_pair()`。
 - `BothPages` は**画面の左右ではなく読み順** (ページ番号の昇順) で渡す
   (`spread_reading_order`)。右綴じでも左綴じでも「先のページが先」になる。
-- `Merged` の合成は <kbd>Ctrl+E</kbd> と**同じ経路** (`prepare_spread_export_dialog_target` →
-  `render_export_pixels`)。見えているものと渡るものが食い違わないよう、判断を二重に持たない。
-  結果は `MaterializeSource::Rendered` として実体化ワーカーへ渡り、encode だけされる
-  (画素は既に補正・注釈込みなので、そこから焼き込むものが無い)。
-- **`Merged` にだけ「書き出しの焼き込み」の段が効かない** (表示画素をそのまま使うため)。
-  設定画面にその旨を出している。**レンダーと全画素 hash も UI スレッドで走る。**
-  どちらも、[焼き込み段階の統一](bake-stage-unification-plan.md) の段取り 6 で画像
-  <kbd>Ctrl+E</kbd> をワーカー経路へ移すときに一緒に解消する — 合成もその経路に乗る
-  (2026-09-02、Codex Sol 指摘 #4 / #8)。
+- `Merged` は `MaterializeSource::MergedSpread` に左右の source、
+  `MaterializePageEdits::Spread` に左右の編集 context を載せる。decode・選択段までの合成・
+  見開き結合・encode はすべて実体化 worker が行い、UI 入力ハンドラは画素を作らない。
+- **`Merged` にも「書き出しの焼き込み」の外部ツール行が効く。** 既定は「編集」で、
+  AI / 表示用補正が必要なら同じ行で深い段を選ぶ。単枚 Ctrl+E と適用順を共有するが、
+  出力ごとの段はそれぞれの設定を読む。
+- `TempOriginal + Merged` は設定 UI で選べず、保存済み定義に残っても `effective_spread` が
+  `MainPageOnly` へ正規化するため、出荷経路から `MergedSpread` には到達しない。materializer の
+  内部契約としてこの組み合わせを受けた場合も、左右の**編集前 source** を結合して
+  `TempOriginal` の意味を守る（旧 `Rendered` 相当の表示画素は使わない）。
 - `SelectionPolicy::Single` + `BothPages` は見開き中に 2 件になるので起動しない。設定画面で
   その旨を警告色で出す (**黙って片方だけ渡さない**)。
 
@@ -1073,10 +1070,9 @@ Codex Sol が挙げた「ACK が `handle_fs_navigation` より先に走る」は
 2. **ネイティブコンテキストメニューの mIV 差し込み領域へ、登録したツールをすべて足す** (§4.9)。
 3. **自己引き継ぎ (`{miv}`) は作らない。** mIV は単一インスタンスなので意味が無く、
    この機能はあくまで別アプリ向けとする。`resolve_openable_path_detailed` の修正も不要になった。
-4. **AI アップスケール結果は焼き込まない。** AI 拡大は自分の表示用という位置づけで、製本に揃える。
-   <kbd>Ctrl+E</kbd> のエクスポートだけが例外 (表示 pixels をそのまま書き出す) で、外部ツールはそこに揃えない。
-   要望が出たら、ツール登録時の設定として「AI アップスケールを反映する」を後から足せる
-   (`PayloadPolicy` に値を増やすのではなく、独立したフラグにする方が影響が小さい)。
+4. **AI アップスケール結果を焼き込まないことを外部ツールの既定にする。** 後に共通の
+   3 値の焼き込み段階へ統合し、必要な場合は「AI 処理まで」または「表示用補正まで」を
+   選べるようにした。単ページと見開き合成は同じ設定に従う。
 5. **PDF ページの解像度はツールごとに選べるようにし、既定は長辺 4096** (製本と同じ)。
 6. **ポータブル版の temp は `<exe_dir>\data\temp\`。** システム側を汚さないため。
 7. **元 ZIP への書き戻しは実装しない。** 代わりに、**編集用ツールに元ファイルでないものを渡そうとしたら
@@ -1171,12 +1167,12 @@ container でも stack でもない場合だけ source-only refresh。
 再読込が走る。追加 / 削除でも以前から起き得たが、中身の書き換えでも起きるようになった。
 未確定作業を失うかは未検証。
 
-## 7. 別作業: 焼き込み段階を製本 / Ctrl+E / 外部ツールで統一する
+## 7. 焼き込み段階の統一 (別計画で実装済み)
 
-**この計画の範囲外。** 出荷済みの 2 機能 (製本・<kbd>Ctrl+E</kbd>) の挙動を変えるので、
-独自の計画・移行・実機確認が要る。ここには経緯と、着手時に使える形だけ残す。
+実装と決定の正本は [bake-stage-unification-plan.md](bake-stage-unification-plan.md)。
+ここには外部ツール計画から見た経緯を残す。
 
-### いまの姿
+### 実装後の姿
 
 パイプラインには 4 段ある。
 
@@ -1188,23 +1184,21 @@ container でも stack でもない場合だけ source-only refresh。
 | 機能 | 出る段 | 実装 |
 | --- | --- | --- |
 | 製本 | 2 | `compose_book_page` (3・4 を意図的に落とす) |
-| <kbd>Ctrl+E</kbd> | 4 | `ensure_final_composite_pixels` (表示画素そのもの) |
-| 外部ツール | 2 | 製本と同じ経路 |
+| <kbd>Ctrl+E</kbd> | 設定で 2〜4 (既定 4) | source-based worker compositor |
+| 外部ツール | 設定で 2〜4 (既定 2) | materializer worker compositor |
 
-**段 3 だけを出す手段が無い。** 「AI 拡大は焼けた状態で手直ししたいが、カラー化は入れたくない」
-という需要 (利用者 2026-09-02) はここに落ちる。
+「AI 拡大は焼けた状態で手直ししたいが、カラー化は入れたくない」場合は段 3 を選べる。
 
-### 着手するときの形
+### 採用した形
 
 - **チェックボックスでは足りない。** 「表示専用効果を焼くか」の 2 値だと段 3 が表現できない。
-  **3 値の段選択** (`補正まで` / `AI まで` / `表示どおり`) にする。これは §6 の 4
-  (「AI アップスケール結果は焼き込まない。要望が出たら独立したフラグで足せる」) を、
-  フラグを増やさずに畳む形でもある。
-- **設定は機能ごとに持つ。** 既定が機能ごとに違う (製本 = 補正まで、Ctrl+E = 表示どおり、
-  外部ツール = 補正まで) 以上、1 つの設定では表せない。
+  **3 値の段選択** (`編集まで` / `AI 処理まで` / `表示用補正まで`) にする。外部ツールの
+  「AI アップスケール結果は焼き込まない」という従来仕様は、「編集まで」の既定として保つ。
+- **設定は機能ごとに持つ。** 既定が機能ごとに違う (製本 = 編集まで、Ctrl+E =
+  表示用補正まで、外部ツール = 編集まで) 以上、1 つの設定では表せない。
 - **既定は今の挙動をそのまま**にする。出荷済みの 2 機能の見た目を、移行で黙って変えない。
 - 実装は `BakedEditSnapshot` + `compose_book_page` を段の分だけ拡張して共有する。
   カラー化は AI 推論なので、ワーカー側の `ai_runtime` (`PageEditContext` が既に持っている) を使う。
   処理時間は利用者を待たせてよい (利用者判断 2026-09-02)。
-- これが入った時点で、外部ツールの `TempEdited` は「表示どおり」を選べるようになり、
-  値の名前もそこで見直す。
+- 外部ツールの `TempEdited` と `Merged` は同じ `bake_stage_external_tool` を読む。
+  名称は画面一致を約束する「表示どおり」ではなく、段の中身を示す「表示用補正」とした。

@@ -2077,7 +2077,9 @@ impl crate::app::App {
         tool: &ExternalTool,
         target: &LaunchTarget,
     ) -> Result<crate::materializer::MaterializeRequest, String> {
-        use crate::materializer::{MaterializeRequest, MaterializeSource, PageEditContext};
+        use crate::materializer::{
+            MaterializePageEdits, MaterializeRequest, MaterializeSource, PageEditContext,
+        };
 
         let index = self.launch_target_item_index(target);
         let (source, page_key, fallback_path) = match target {
@@ -2184,24 +2186,22 @@ impl crate::app::App {
         Ok(MaterializeRequest {
             source,
             policy: materialize_policy(tool.payload),
-            page_edits,
+            page_edits: page_edits.map(MaterializePageEdits::Single),
             pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
                 DEFAULT_PDF_RENDER_LONG_EDGE
             } else {
                 tool.pdf_render_long_edge
             },
-            rendered_pixels: None,
         })
     }
 
     /// フルスクリーンで見開きが見えているとき、ツールの `SpreadPolicy` に従って対象を
     /// 組み替える。**それ以外では `None` を返して従来どおりに扱う。**
     ///
-    /// ここでしかできない理由は 2 つある。見えている組は `resolve_visible_spread_pair` が
-    /// `&mut self` で解決するもので、`Merged` の合成には表示画素 (`ctx` が要る) が必要になる。
+    /// ここでしかできないのは、見えている組を `resolve_visible_spread_pair` が
+    /// `&mut self` で解決するため。`Merged` の画素合成自体は materializer worker が行う。
     fn external_tool_spread_expansion(
         &mut self,
-        ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
     ) -> Result<Option<Vec<crate::materializer::MaterializeRequest>>, String> {
@@ -2233,48 +2233,56 @@ impl crate::app::App {
                 }
                 Ok(Some(expanded))
             }
-            SpreadPolicy::Merged => Ok(Some(vec![
-                self.merged_spread_target(ctx, tool, left, right)?,
-            ])),
+            SpreadPolicy::Merged => Ok(Some(vec![self.merged_spread_target(tool, left, right)?])),
         }
     }
 
     /// 見開き 2 ページを 1 枚へ合成した対象を作る。
     ///
-    /// 合成そのものは <kbd>Ctrl+E</kbd> のエクスポートと**同じ経路**を通す
-    /// ([`prepare_spread_export_dialog_target`] → [`render_export_pixels`])。
-    /// 見えているものと書き出されるものが食い違わないよう、判断を二重に持たない。
+    /// 左右の source と編集スナップショットだけを UI スレッドで準備し、decode・各ページの
+    /// 選択段までの合成・見開き結合は materializer worker で行う。
     fn merged_spread_target(
-        &mut self,
-        ctx: &egui::Context,
+        &self,
         tool: &ExternalTool,
         left: usize,
         right: usize,
     ) -> Result<crate::materializer::MaterializeRequest, String> {
-        let export = self.prepare_spread_export_dialog_target(ctx, left, right)?;
-        // preset なしなので隠蔽の再合成は走らず、crop と回転と見開き結合だけ。UI スレッド
-        // から同期で呼ぶ短い処理で中断させる相手がいないため、cancel は立てない。
-        let never_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let image = crate::export_dialog::render_export_pixels(
-            &export.pixels,
-            None,
-            None,
-            &never_cancelled,
-        )
-        .map_err(|error| error.to_string())?;
+        let left_basename = self
+            .capture_basename_for_idx(left)
+            .unwrap_or_else(|| format!("page-{}", left + 1));
+        let right_basename = self
+            .capture_basename_for_idx(right)
+            .unwrap_or_else(|| format!("page-{}", right + 1));
+        let label =
+            crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
+        let left_target = LaunchTarget::from_grid_item(self.items.get(left));
+        let right_target = LaunchTarget::from_grid_item(self.items.get(right));
+        let left = self.materialize_target(tool, &left_target)?;
+        let right = self.materialize_target(tool, &right_target)?;
+        let left_edits = match left.page_edits {
+            Some(crate::materializer::MaterializePageEdits::Single(edits)) => edits,
+            _ => return Err("見開き左ページの編集情報を準備できません".to_string()),
+        };
+        let right_edits = match right.page_edits {
+            Some(crate::materializer::MaterializePageEdits::Single(edits)) => edits,
+            _ => return Err("見開き右ページの編集情報を準備できません".to_string()),
+        };
         Ok(crate::materializer::MaterializeRequest {
-            source: crate::materializer::MaterializeSource::Rendered {
-                label: export.basename.clone(),
+            source: crate::materializer::MaterializeSource::MergedSpread {
+                label,
+                left: Box::new(left.source),
+                right: Box::new(right.source),
             },
             policy: materialize_policy(tool.payload),
-            // 表示画素は補正も注釈も反映済み。ここから更に焼き込むものは無い。
-            page_edits: None,
+            page_edits: Some(crate::materializer::MaterializePageEdits::Spread {
+                left: left_edits,
+                right: right_edits,
+            }),
             pdf_render_long_edge: if tool.pdf_render_long_edge == 0 {
                 DEFAULT_PDF_RENDER_LONG_EDGE
             } else {
                 tool.pdf_render_long_edge
             },
-            rendered_pixels: Some(Arc::new(image.into_owned())),
         })
     }
 
@@ -2307,7 +2315,7 @@ impl crate::app::App {
 
     fn build_materialize_operation(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         tool: &ExternalTool,
         targets: &[LaunchTarget],
         origin: MaterializeOperationOrigin,
@@ -2317,7 +2325,7 @@ impl crate::app::App {
         validate_materializable_targets(&targets)?;
         // 見開き展開は stack 展開の隣。どちらも「利用者が 1 つ選んだものが、ツールから見ると
         // 何件になるか」を決める段で、件数の判定より前に済ませる必要がある。
-        let targets = match self.external_tool_spread_expansion(ctx, tool, &targets)? {
+        let targets = match self.external_tool_spread_expansion(tool, &targets)? {
             Some(expanded) => expanded,
             None => targets
                 .iter()
