@@ -108,34 +108,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 **これは仕組みからの推論であって実測ではない。** 頻度を根拠に優先度を決めるなら、
 実際に大量貼り付けをして再読込回数を数えるべき。
 
-### 1.0n フルスクリーンで JPEG を開くたび、ファイルを 2 回丸ごと読んでいる (2026-09-05 調査)
-
-**§1.0m の作業中に見つかった同型の defect。** 直す場所は違うが、原因は同じ
-「ヘッダの数バイトのために全体を読む」である。
-
-**経路**: `App::start_fs_load_with_purpose` (`src/app.rs`)
-→ `decode_canonical_image` → `canonical_image_loader.rs` の
-`apply_exif_orientation(image, source.path)` → `thumb_loader::read_exif_orientation_from_file`
-→ **`rexif::parse_file(path)`**。
-
-- デコーダが 1 回読み、**Orientation タグ 1 個のために `rexif` がもう 1 回丸ごと読む**。
-- `verified_bytes` が `Some` の経路 (relative bookmark provenance) だけは
-  `apply_exif_orientation_from_bytes` に入るので二重読みしない。**通常のフォルダから
-  開く JPEG は必ず `None`** なので、常に 2 回読んでいる。
-- 3 MB の JPEG なら 6 MB 読む。ページ送りのたびに起きる。
-
-**直し方は既にある**。§1.0m で `src/exif_reader.rs` に
-`read_rexif_from_path` (SOI から SOS までの prefix だけ読む) を作ったので、
-`thumb_loader::read_exif_orientation_from_file` をそれに載せ替えるだけでよい。
-`rexif::parse_file` の呼び出しは現在ここ 1 か所だけが残っている。
-
-**着手前に測ること**: 二重読みは OS のページキャッシュに当たるので、warm では
-安く見える。cold cache / HDD / ネットワークドライブでの効きを `--perf-log` の
-`fs.load` 区間で確認する。§1.0m で入れた `bytes_read` 計装と同じ考え方で、
-この経路の読み取り量も出せると比較しやすい。
-
-- 規模 / 優先度: 小 / P2。
-
 ### 1.0k テキスト注釈の編集が重いのは「毎フレーム全画面を焼き直す」ため (2026-08-30 調査)
 
 **発端**: 利用者から「テキスト注釈の編集が重い。1/2・1/4 解像度にする設定を入れて
@@ -2591,6 +2563,7 @@ emote-web-log.jsonl`):
 | 「非表示 N 件」の内訳で、設定で無視した RAR / 7z / LZH を分けて表示し、内訳ごとに対応する設定への導線を出すようにした | 新機能 | 次版 |
 | 静止画・漫画のページシークバーに、サムネイル列とマウスオーバープレビューを追加 (プレビューは既定 ON、列は既定 OFF)。動画側にもプレビューと通常バーの表示設定を追加 | 新機能 | 次版 |
 | Ctrl+F の AI プロンプト検索を高速化 (必要な範囲だけ読む + 8 並列) | 新機能 | 次版 |
+| フルスクリーンで JPEG を開くときに、ファイルを 2 回読んでいたのをやめた (初めて開くフォルダのページ送りが速くなる) | 新機能 | 次版 |
 
 v3.5.0 ぶんは記載済み (必読 3 件 = 右クリックの Windows 項目の移動 / 時刻順で種類をまとめない /
 `Shift+S` 巡回が 5 段階、新機能 4 件 = 外部ツール連携 / シークストリップ全体表示 /

@@ -3146,6 +3146,8 @@ const FS_SEEK_HOVER_MARGIN: f32 = 40.0;
 const STILL_SEEK_STRIP_CELL_GAP: f32 = 4.0;
 const STILL_SEEK_STRIP_OVERSCAN_CELLS: usize = 2;
 const STILL_SEEK_PREVIEW_MAX_WIDTH: f32 = 240.0;
+/// 見開きプレビューの 2 枚の間隔。本の綴じ目に相当するので詰めておく。
+const STILL_SEEK_PREVIEW_PANE_GAP: f32 = 3.0;
 const STILL_SEEK_PREVIEW_MAX_HEIGHT: f32 = 180.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3264,9 +3266,15 @@ enum StillSeekPosition {
     SourcePosition(usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedStillSeekTarget {
-    preview_idx: usize,
+    /// プレビューに出すページ。**見開きでは着地後に表示される 1〜2 ページ全部**を、
+    /// 元ページ順で入れる。
+    ///
+    /// カーソル下の 1 枚だけを出していた版は、見開きで「プレビューは 1 枚なのに
+    /// 開くと 2 ページ」になった (2026-09-05 利用者報告)。プレビューは
+    /// **押した結果の予告**なので、着地後に見えるものと同じ枚数にする。
+    preview_pages: Vec<usize>,
     landing_idx: usize,
     display_pos: usize,
 }
@@ -3285,7 +3293,7 @@ fn resolve_still_seek_target(
                 let display_pos = spread_seek_unit_from_fraction(fraction, units.len());
                 let landing_idx = units[display_pos].anchor_idx();
                 Some(ResolvedStillSeekTarget {
-                    preview_idx: landing_idx,
+                    preview_pages: units[display_pos].pages.clone(),
                     landing_idx,
                     display_pos,
                 })
@@ -3298,7 +3306,7 @@ fn resolve_still_seek_target(
                 .min(image_indices.len() - 1);
                 let landing_idx = image_indices[display_pos];
                 Some(ResolvedStillSeekTarget {
-                    preview_idx: landing_idx,
+                    preview_pages: vec![landing_idx],
                     landing_idx,
                     display_pos,
                 })
@@ -3306,18 +3314,20 @@ fn resolve_still_seek_target(
         }
         StillSeekPosition::SourcePosition(source_pos) => {
             let source_pos = source_pos.min(image_indices.len() - 1);
-            let preview_idx = image_indices[source_pos];
-            let (landing_idx, display_pos) = spread_units
-                .and_then(|units| {
-                    units.iter().enumerate().find_map(|(unit_pos, unit)| {
-                        unit.pages
-                            .contains(&preview_idx)
-                            .then_some((unit.anchor_idx(), unit_pos))
-                    })
+            let pointed_idx = image_indices[source_pos];
+            let unit = spread_units.and_then(|units| {
+                units.iter().enumerate().find_map(|(unit_pos, unit)| {
+                    unit.pages
+                        .contains(&pointed_idx)
+                        .then_some((unit_pos, unit))
                 })
-                .unwrap_or((preview_idx, source_pos));
+            });
+            let (preview_pages, landing_idx, display_pos) = match unit {
+                Some((unit_pos, unit)) => (unit.pages.clone(), unit.anchor_idx(), unit_pos),
+                None => (vec![pointed_idx], pointed_idx, source_pos),
+            };
             Some(ResolvedStillSeekTarget {
-                preview_idx,
+                preview_pages,
                 landing_idx,
                 display_pos,
             })
@@ -3375,20 +3385,48 @@ fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect 
     egui::Rect::from_center_size(bounds.center(), size.min(bounds.size()))
 }
 
+/// シーク位置のプレビューを描く。
+///
+/// `textures` は**着地後に表示されるページと同じ枚数・同じ並び**を受け取る
+/// (見開きなら 2 枚、右→左読みなら呼び出し側で反転済み)。未読み込みのページは
+/// `None` のまま枠だけ描き、読み込み後に差し替わる。
 fn paint_still_seek_preview(
     painter: &egui::Painter,
     full_rect: egui::Rect,
     panel_top: f32,
     pointer_x: f32,
-    texture: Option<&egui::TextureHandle>,
+    textures: &[Option<egui::TextureHandle>],
     label: &str,
 ) {
-    let desired_image_size = texture.map_or(egui::vec2(160.0, 100.0), |tex| {
-        let size = tex.size_vec2();
-        let scale = (STILL_SEEK_PREVIEW_MAX_WIDTH / size.x.max(1.0))
-            .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
-        size * scale
-    });
+    let pane_count = textures.len().max(1);
+    // 1 枚あたりの幅は、全体が最大幅に収まるように分け合う。見開きでも吹き出しが
+    // 横に伸びて画面からはみ出さないようにする。
+    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH
+        - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    let pane_size = textures
+        .iter()
+        .filter_map(|tex| tex.as_ref())
+        .map(|tex| {
+            let size = tex.size_vec2();
+            let scale = (per_pane_max_width / size.x.max(1.0))
+                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
+            size * scale
+        })
+        .fold(egui::Vec2::ZERO, |acc, size| {
+            egui::vec2(acc.x.max(size.x), acc.y.max(size.y))
+        });
+    let pane_size = if pane_size == egui::Vec2::ZERO {
+        // まだ 1 枚も読めていないときの見た目。読み込み後に伸縮しすぎないよう、
+        // 1 枚版の従来サイズを枚数ぶん並べた大きさにする。
+        egui::vec2(160.0_f32.min(per_pane_max_width), 100.0)
+    } else {
+        pane_size
+    };
+    let desired_image_size = egui::vec2(
+        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32,
+        pane_size.y,
+    );
     let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
     let min_left = full_rect.left() + 8.0;
     let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
@@ -3419,14 +3457,35 @@ fn paint_still_seek_preview(
         bubble_rect.min + egui::vec2(6.0, 6.0),
         egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
     );
-    if let Some(tex) = texture {
-        painter.image(
-            tex.id(),
-            fit_texture_rect(tex.size_vec2(), image_bounds),
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
+    let pane_width = (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    for (pane, texture) in textures.iter().enumerate() {
+        let left = image_bounds.left() + (pane_width + STILL_SEEK_PREVIEW_PANE_GAP) * pane as f32;
+        let pane_bounds = egui::Rect::from_min_size(
+            egui::pos2(left, image_bounds.top()),
+            egui::vec2(pane_width, image_bounds.height()),
         );
-    } else {
+        match texture {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    fit_texture_rect(tex.size_vec2(), pane_bounds),
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                painter.text(
+                    pane_bounds.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読み込み中…",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(170),
+                );
+            }
+        }
+    }
+    if textures.is_empty() {
         painter.text(
             image_bounds.center(),
             egui::Align2::CENTER_CENTER,
@@ -12321,13 +12380,15 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         6.0,
         egui::Color32::from_rgb(232, 240, 255),
     );
+    // 見開き 2 ページぶんの枠を出す fixture。実テクスチャは持たないので
+    // 「読み込み中…」が 2 面に並ぶ形になり、ペア表示のレイアウトを固定できる。
     paint_still_seek_preview(
         ui.painter(),
         full_rect,
         panel.top(),
         full_rect.center().x + 40.0,
-        None,
-        "20 / 128",
+        &[None, None],
+        "20-21 / 128",
     );
 }
 
@@ -16257,7 +16318,12 @@ impl App {
             if strip_response.hovered() || strip_response.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            let pointer = strip_response.interact_pointer_pos();
+            // `interact_pointer_pos` はボタンを押している間しか返らない。ホバーだけで
+            // プレビューを出すので `hover_pos` も見る (2026-09-05 利用者報告:
+            // 「ホバーでプレビューが出ない」)。
+            let pointer = strip_response
+                .interact_pointer_pos()
+                .or_else(|| strip_response.hover_pos());
             let pointed_source_pos = pointer.and_then(|pointer| {
                 still_seek_source_position_at_x(row_rect, window, cell_width, pointer.x, is_rtl)
             });
@@ -16395,7 +16461,10 @@ impl App {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
 
-                if let Some(pointer_pos) = response.interact_pointer_pos()
+                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
+                if let Some(pointer_pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| response.hover_pos())
                     && (response.hovered() || response.dragged())
                 {
                     let fraction =
@@ -16410,7 +16479,7 @@ impl App {
                         .still_seek_hover_preview_mode
                         .is_visible(strip_visible)
                     {
-                        preview = resolved;
+                        preview = resolved.clone();
                         preview_pointer_x = Some(pointer_pos.x);
                     }
                     if (response.clicked() || response.dragged())
@@ -16511,21 +16580,33 @@ impl App {
             }
         }
 
-        if let Some(preview) = preview {
-            requested_pages.push(preview.preview_idx);
+        if let Some(preview) = preview.as_ref() {
+            requested_pages.extend(preview.preview_pages.iter().copied());
         }
         self.ensure_still_seek_thumbnail_requests(ctx, &requested_pages);
-        if let Some(preview) = preview {
-            let texture = self.thumbnails.get(preview.preview_idx).and_then(|state| {
-                if let ThumbnailState::Loaded { tex, .. } = state {
-                    Some(tex.clone())
-                } else {
-                    None
-                }
-            });
+        if let Some(preview) = preview.as_ref() {
+            // 画面上の並びに合わせる。右→左読みでは元ページ順の逆から見える。
+            let mut pages = preview.preview_pages.clone();
+            if is_rtl {
+                pages.reverse();
+            }
+            let textures: Vec<Option<egui::TextureHandle>> = pages
+                .iter()
+                .map(|idx| {
+                    self.thumbnails.get(*idx).and_then(|state| {
+                        if let ThumbnailState::Loaded { tex, .. } = state {
+                            Some(tex.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            // ラベルは着地先から作る。見開きなら既存のページ番号表記がそのまま
+            // ペア表記 (`12-13 / 180` / `13,12 / 180`) になる。
             let label = self
                 .fullscreen_page_number_label_for_info(
-                    preview.preview_idx,
+                    preview.landing_idx,
                     &info,
                     continuous_label_mode,
                 )
@@ -16535,7 +16616,7 @@ impl App {
                 full_rect,
                 panel_rect.top(),
                 preview_pointer_x.unwrap_or(full_rect.center().x),
-                texture.as_ref(),
+                &textures,
                 &label,
             );
         }
@@ -52474,8 +52555,41 @@ mod tests {
             resolve_still_seek_target(&images, Some(&units), StillSeekPosition::SourcePosition(3))
                 .unwrap();
         assert_eq!(track.landing_idx, 6);
-        assert_eq!(cell.preview_idx, 7);
         assert_eq!(cell.landing_idx, track.landing_idx);
+        // **プレビューは着地後に見えるページと同じ枚数にする。** 7 を指しても、
+        // 開けば 6 と 7 の見開きになるので 2 枚を出す (2026-09-05 利用者報告)。
+        assert_eq!(cell.preview_pages, vec![6, 7]);
+        assert_eq!(track.preview_pages, cell.preview_pages);
+    }
+
+    #[test]
+    fn single_page_reading_previews_exactly_the_page_under_the_pointer() {
+        let images = [4, 5, 6, 7];
+        let resolved =
+            resolve_still_seek_target(&images, None, StillSeekPosition::SourcePosition(2)).unwrap();
+        assert_eq!(resolved.preview_pages, vec![6]);
+        assert_eq!(resolved.landing_idx, 6);
+    }
+
+    /// 見開きの片側だけが残る末尾ユニットでも、プレビュー枚数は着地後と一致する。
+    #[test]
+    fn a_trailing_single_page_spread_unit_previews_one_page() {
+        let images = [4, 5, 6];
+        let units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6],
+            },
+        ];
+        let resolved =
+            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::SourcePosition(2))
+                .unwrap();
+        assert_eq!(resolved.preview_pages, vec![6]);
+        assert_eq!(resolved.landing_idx, 6);
     }
 
     #[test]
