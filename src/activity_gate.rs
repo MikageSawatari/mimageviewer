@@ -14,6 +14,8 @@
 //! - `wait_until_idle(cancel)`: ワーカーが各 unit of work (ファイル 1 本 / フォルダ 1 つ)
 //!   の前に呼ぶ。最後の `bump()` から `quiet_threshold_ms` 経過するまでブロック。
 //! - `cancel` が立つと即 return する (キャンセル時にここで詰まらないため)。
+//! - 別バージョン索引は `is_idle()` / `is_paused()` を同じ状態源として使い、操作中の
+//!   新規開始数を 1 へ落とす。別の activity 判定は持たない。
 //!
 //! ## 実装
 //!

@@ -1,11 +1,12 @@
 //! お気に入り配下の「別バージョン」索引ジョブと遅延ロード線形検索。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{
-    Arc, Mutex, OnceLock, RwLock, Weak,
+    Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use image::GenericImageView;
 
@@ -27,6 +28,16 @@ pub const BOOK_COVERAGE: f32 = 0.5;
 pub const BOOK_MIN_MATCHED_PAGES: u32 = 3;
 pub const BOOK_MAX_BOOKS_PER_PAGE: u32 = 8;
 pub const BOOK_MIN_QUALITY: u8 = 1;
+
+// 2026-09-05 の HDD 実測では 16 並列が E: 102.7 MB/s / D: 150.8 MB/s でピーク、
+// 32 並列では 85.2 / 111.7 MB/s へ低下した。複数ドライブが同時に走っても各 16 が
+// 合計 32 にならないよう、ボリューム単位はピークの一段手前である 8 に制限する。
+const INDEX_GLOBAL_OUTSTANDING_LIMIT: usize = 16;
+const INDEX_PER_VOLUME_OUTSTANDING_LIMIT: usize = 8;
+// 操作中も差分照合を完全には止めず、既存 ActivityGate の状態で新規開始を 1 本へ絞る。
+const INDEX_ACTIVE_GLOBAL_OUTSTANDING_LIMIT: usize = 1;
+const INDEX_ACTIVE_PER_VOLUME_OUTSTANDING_LIMIT: usize = 1;
+const INDEX_LIMIT_RECHECK: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexStage {
@@ -990,6 +1001,331 @@ fn hamming256(left: &[u8; 32], right: &[u8; 32]) -> u32 {
         .sum()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum VolumeKey {
+    Drive(u8),
+    Unc(String, String),
+    Other(String),
+}
+
+fn volume_key(path: &Path) -> VolumeKey {
+    let Some(component) = path.components().next() else {
+        return VolumeKey::Other(String::new());
+    };
+    let Component::Prefix(prefix) = component else {
+        return VolumeKey::Other(String::new());
+    };
+    match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            VolumeKey::Drive(letter.to_ascii_uppercase())
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => VolumeKey::Unc(
+            server.to_string_lossy().to_lowercase(),
+            share.to_string_lossy().to_lowercase(),
+        ),
+        other => VolumeKey::Other(format!("{other:?}").to_lowercase()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConcurrencyLimits {
+    global: usize,
+    per_volume: usize,
+}
+
+fn current_concurrency_limits(
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+) -> ConcurrencyLimits {
+    match activity_gate {
+        Some(gate) if gate.is_paused() => ConcurrencyLimits {
+            global: 0,
+            per_volume: 0,
+        },
+        Some(gate) if !gate.is_idle() => ConcurrencyLimits {
+            global: INDEX_ACTIVE_GLOBAL_OUTSTANDING_LIMIT,
+            per_volume: INDEX_ACTIVE_PER_VOLUME_OUTSTANDING_LIMIT,
+        },
+        _ => ConcurrencyLimits {
+            global: INDEX_GLOBAL_OUTSTANDING_LIMIT,
+            per_volume: INDEX_PER_VOLUME_OUTSTANDING_LIMIT,
+        },
+    }
+}
+
+struct TaggedWork<T> {
+    volume: VolumeKey,
+    task: T,
+}
+
+impl<T> TaggedWork<T> {
+    fn new(volume: VolumeKey, task: T) -> Self {
+        Self { volume, task }
+    }
+}
+
+struct WorkQueueState<T> {
+    pending: VecDeque<TaggedWork<T>>,
+    in_flight: usize,
+    in_flight_by_volume: HashMap<VolumeKey, usize>,
+}
+
+struct BoundedWorkQueue<T> {
+    state: Mutex<WorkQueueState<T>>,
+    changed: Condvar,
+}
+
+impl<T> BoundedWorkQueue<T> {
+    fn new(initial: Vec<TaggedWork<T>>) -> Self {
+        Self {
+            state: Mutex::new(WorkQueueState {
+                pending: initial.into(),
+                in_flight: 0,
+                in_flight_by_volume: HashMap::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn take<'a>(
+        &'a self,
+        activity_gate: Option<&crate::activity_gate::ActivityGate>,
+        cancel: &AtomicBool,
+    ) -> Option<WorkLease<'a, T>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let discarded_pending = !state.pending.is_empty();
+                state.pending.clear();
+                if discarded_pending {
+                    self.changed.notify_all();
+                }
+                if state.in_flight == 0 {
+                    return None;
+                }
+            } else {
+                let limits = current_concurrency_limits(activity_gate);
+                if state.in_flight < limits.global
+                    && let Some(index) = state.pending.iter().position(|work| {
+                        state
+                            .in_flight_by_volume
+                            .get(&work.volume)
+                            .copied()
+                            .unwrap_or(0)
+                            < limits.per_volume
+                    })
+                {
+                    let work = state.pending.remove(index).expect("work index disappeared");
+                    state.in_flight += 1;
+                    *state
+                        .in_flight_by_volume
+                        .entry(work.volume.clone())
+                        .or_default() += 1;
+                    return Some(WorkLease {
+                        queue: self,
+                        volume: work.volume,
+                        task: Some(work.task),
+                        finished: false,
+                    });
+                }
+                if state.pending.is_empty() && state.in_flight == 0 {
+                    return None;
+                }
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, INDEX_LIMIT_RECHECK)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+    }
+
+    fn finish(&self, volume: &VolumeKey, children: Vec<TaggedWork<T>>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let remove_volume = if let Some(count) = state.in_flight_by_volume.get_mut(volume) {
+            debug_assert!(*count > 0);
+            *count = count.saturating_sub(1);
+            *count == 0
+        } else {
+            false
+        };
+        if remove_volume {
+            state.in_flight_by_volume.remove(volume);
+        }
+        state.pending.extend(children);
+        self.changed.notify_all();
+    }
+}
+
+struct WorkLease<'a, T> {
+    queue: &'a BoundedWorkQueue<T>,
+    volume: VolumeKey,
+    task: Option<T>,
+    finished: bool,
+}
+
+impl<T> WorkLease<'_, T> {
+    fn take_task(&mut self) -> T {
+        self.task.take().expect("work task already taken")
+    }
+
+    fn finish(mut self, children: Vec<TaggedWork<T>>) {
+        self.queue.finish(&self.volume, children);
+        self.finished = true;
+    }
+}
+
+impl<T> Drop for WorkLease<'_, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.queue.finish(&self.volume, Vec::new());
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScanAggregateState {
+    report: IndexReport,
+    seen_items: HashSet<String>,
+    seen_containers: HashSet<String>,
+    visited_dirs: HashSet<String>,
+    prune_safe: bool,
+}
+
+struct ScanAggregate<'a> {
+    state: Mutex<ScanAggregateState>,
+    progress: &'a Arc<Mutex<IndexProgress>>,
+}
+
+impl<'a> ScanAggregate<'a> {
+    fn new(progress: &'a Arc<Mutex<IndexProgress>>) -> Self {
+        Self {
+            state: Mutex::new(ScanAggregateState {
+                prune_safe: true,
+                ..ScanAggregateState::default()
+            }),
+            progress,
+        }
+    }
+
+    fn mark_directory_visited(&self, directory_key: String) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .visited_dirs
+            .insert(directory_key)
+    }
+
+    fn merge(
+        &self,
+        report: &mut IndexReport,
+        seen_items: &mut HashSet<String>,
+        seen_containers: &mut HashSet<String>,
+        prune_safe: bool,
+    ) {
+        let published = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.report.discovered = state.report.discovered.saturating_add(report.discovered);
+            let processed_room = state
+                .report
+                .discovered
+                .saturating_sub(state.report.processed);
+            debug_assert!(
+                report.processed <= processed_room,
+                "similar index processed count exceeded discovered count"
+            );
+            state.report.processed = state
+                .report
+                .processed
+                .saturating_add(report.processed.min(processed_room));
+            state.report.indexed = state.report.indexed.saturating_add(report.indexed);
+            state.report.unchanged = state.report.unchanged.saturating_add(report.unchanged);
+            state.report.removed = state.report.removed.saturating_add(report.removed);
+            state.report.containers_completed = state
+                .report
+                .containers_completed
+                .saturating_add(report.containers_completed);
+            state.report.password_required_pdfs = state
+                .report
+                .password_required_pdfs
+                .saturating_add(report.password_required_pdfs);
+            state.report.corrupt_containers = state
+                .report
+                .corrupt_containers
+                .saturating_add(report.corrupt_containers);
+            state.report.zero_page_containers = state
+                .report
+                .zero_page_containers
+                .saturating_add(report.zero_page_containers);
+            state.report.decode_failures = state
+                .report
+                .decode_failures
+                .saturating_add(report.decode_failures);
+            state.report.io_failures = state.report.io_failures.saturating_add(report.io_failures);
+            state.report.errors.append(&mut report.errors);
+            state.seen_items.extend(seen_items.drain());
+            state.seen_containers.extend(seen_containers.drain());
+            state.prune_safe &= prune_safe;
+            report.discovered = 0;
+            report.processed = 0;
+            report.indexed = 0;
+            report.unchanged = 0;
+            report.removed = 0;
+            report.containers_completed = 0;
+            report.password_required_pdfs = 0;
+            report.corrupt_containers = 0;
+            report.zero_page_containers = 0;
+            report.decode_failures = 0;
+            report.io_failures = 0;
+            state.report.clone()
+        };
+        publish_report(self.progress, &published);
+    }
+
+    fn snapshot(&self) -> ScanAggregateState {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        ScanAggregateState {
+            report: state.report.clone(),
+            seen_items: state.seen_items.clone(),
+            seen_containers: state.seen_containers.clone(),
+            visited_dirs: HashSet::new(),
+            prune_safe: state.prune_safe,
+        }
+    }
+}
+
+enum ScanWork {
+    Directory(PathBuf),
+    LooseImage {
+        candidate: FileCandidate,
+        page_index: Option<u32>,
+    },
+    ImageBook {
+        directory: PathBuf,
+        container_key: String,
+        images: Vec<FileCandidate>,
+    },
+    Zip(FileCandidate),
+    Pdf(FileCandidate),
+}
+
+impl ScanWork {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Directory(path) => path,
+            Self::LooseImage { candidate, .. } | Self::Zip(candidate) | Self::Pdf(candidate) => {
+                &candidate.path
+            }
+            Self::ImageBook { directory, .. } => directory,
+        }
+    }
+
+    fn tagged(self) -> TaggedWork<Self> {
+        TaggedWork::new(volume_key(self.path()), self)
+    }
+}
+
 fn run_index_job(
     db: &SimilarDb,
     roots: &[PathBuf],
@@ -1001,38 +1337,54 @@ fn run_index_job(
     db.cleanup_incomplete()
         .map_err(|error| format!("incomplete generation cleanup failed: {error}"))?;
     set_stage(progress, IndexStage::Scanning, None);
-    let mut context = ScanContext {
-        db,
-        pdf_passwords,
-        activity_gate,
-        cancel,
-        progress,
-        report: IndexReport::default(),
-        seen_items: HashSet::new(),
-        seen_containers: HashSet::new(),
-        visited_dirs: HashSet::new(),
-        prune_safe: true,
-    };
-    for root in roots {
-        if context.cancelled() {
-            break;
+    let aggregate = ScanAggregate::new(progress);
+    let initial = roots
+        .iter()
+        .cloned()
+        .map(ScanWork::Directory)
+        .map(ScanWork::tagged)
+        .collect();
+    let queue = BoundedWorkQueue::new(initial);
+    let worker_result = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(INDEX_GLOBAL_OUTSTANDING_LIMIT);
+        for _ in 0..INDEX_GLOBAL_OUTSTANDING_LIMIT {
+            workers.push(scope.spawn(|| {
+                scan_worker_loop(
+                    &queue,
+                    &aggregate,
+                    db,
+                    pdf_passwords,
+                    activity_gate,
+                    cancel,
+                    progress,
+                )
+            }));
         }
-        if let Err(error) = context.scan_directory(root) {
-            context.io_error(root, error);
+        for worker in workers {
+            if worker.join().is_err() {
+                return Err("similar index scan worker panicked".to_owned());
+            }
         }
+        Ok(())
+    });
+    if let Err(error) = worker_result {
+        db.cleanup_incomplete()
+            .map_err(|cleanup| format!("{error}; generation cleanup failed: {cleanup}"))?;
+        return Err(error);
     }
-    if context.cancelled() {
+    let mut aggregate = aggregate.snapshot();
+    if cancel.load(Ordering::Relaxed) {
         db.cleanup_incomplete()
             .map_err(|error| format!("cancel cleanup failed: {error}"))?;
-        return Ok(context.report);
+        return Ok(aggregate.report);
     }
     set_stage(progress, IndexStage::Pruning, None);
-    if context.prune_safe {
-        context.report.removed =
-            db.prune_except_seen(&context.seen_items, &context.seen_containers)
+    if aggregate.prune_safe {
+        aggregate.report.removed =
+            db.prune_except_seen(&aggregate.seen_items, &aggregate.seen_containers)
                 .map_err(|error| format!("stale row prune failed: {error}"))? as u64;
     }
-    publish_report(progress, &context.report);
+    publish_report(progress, &aggregate.report);
     let completed_at_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
@@ -1041,27 +1393,25 @@ fn run_index_job(
         current_hash_version(),
         completed_at_unix_secs,
         CompletedIndexStats {
-            password_required_pdfs: context.report.password_required_pdfs,
-            corrupt_containers: context.report.corrupt_containers,
-            zero_page_containers: context.report.zero_page_containers,
-            decode_failures: context.report.decode_failures,
-            io_failures: context.report.io_failures,
+            password_required_pdfs: aggregate.report.password_required_pdfs,
+            corrupt_containers: aggregate.report.corrupt_containers,
+            zero_page_containers: aggregate.report.zero_page_containers,
+            decode_failures: aggregate.report.decode_failures,
+            io_failures: aggregate.report.io_failures,
         },
     )
     .map_err(|error| format!("index summary publish failed: {error}"))?;
-    Ok(context.report)
+    Ok(aggregate.report)
 }
 
 struct ScanContext<'a> {
     db: &'a SimilarDb,
     pdf_passwords: &'a crate::pdf_passwords::PdfPasswordStore,
-    activity_gate: Option<&'a crate::activity_gate::ActivityGate>,
     cancel: &'a Arc<AtomicBool>,
-    progress: &'a Arc<Mutex<IndexProgress>>,
+    aggregate: &'a ScanAggregate<'a>,
     report: IndexReport,
     seen_items: HashSet<String>,
     seen_containers: HashSet<String>,
-    visited_dirs: HashSet<String>,
     /// 走査漏れと削除を区別できない I/O failure が 1 件でもあれば prune しない。
     prune_safe: bool,
 }
@@ -1073,27 +1423,85 @@ struct FileCandidate {
     file_size: i64,
 }
 
+fn scan_worker_loop(
+    queue: &BoundedWorkQueue<ScanWork>,
+    aggregate: &ScanAggregate<'_>,
+    db: &SimilarDb,
+    pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    cancel: &Arc<AtomicBool>,
+    progress: &Arc<Mutex<IndexProgress>>,
+) {
+    while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
+        let work = lease.take_task();
+        let path = work.path().to_path_buf();
+        set_stage(progress, IndexStage::Scanning, Some(path.clone()));
+        let mut context = ScanContext {
+            db,
+            pdf_passwords,
+            cancel,
+            aggregate,
+            report: IndexReport::default(),
+            seen_items: HashSet::new(),
+            seen_containers: HashSet::new(),
+            prune_safe: true,
+        };
+        let result = if context.cancelled() {
+            Ok(Vec::new())
+        } else {
+            match work {
+                ScanWork::Directory(directory) => context.discover_directory(&directory),
+                ScanWork::LooseImage {
+                    candidate,
+                    page_index,
+                } => context
+                    .process_loose_image(&candidate, page_index)
+                    .map(|()| Vec::new()),
+                ScanWork::ImageBook {
+                    directory,
+                    container_key,
+                    images,
+                } => context
+                    .process_image_book(&directory, &container_key, &images)
+                    .map(|()| Vec::new()),
+                ScanWork::Zip(candidate) => context.process_zip(&candidate).map(|()| Vec::new()),
+                ScanWork::Pdf(candidate) => context.process_pdf(&candidate).map(|()| Vec::new()),
+            }
+        };
+        let children = match result {
+            Ok(children) => children,
+            Err(error) => {
+                context.io_error(&path, error);
+                Vec::new()
+            }
+        };
+        context.publish();
+        lease.finish(children.into_iter().map(ScanWork::tagged).collect());
+    }
+}
+
 impl ScanContext<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    fn scan_directory(&mut self, directory: &Path) -> Result<(), String> {
+    fn publish(&mut self) {
+        self.aggregate.merge(
+            &mut self.report,
+            &mut self.seen_items,
+            &mut self.seen_containers,
+            self.prune_safe,
+        );
+    }
+
+    fn discover_directory(&mut self, directory: &Path) -> Result<Vec<ScanWork>, String> {
         if self.cancelled() {
-            return Ok(());
-        }
-        if crate::activity_gate::wait_and_check_cancel(self.activity_gate, self.cancel.as_ref()) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let directory_key = crate::search_index_db::normalize_path(directory);
-        if !self.visited_dirs.insert(directory_key.clone()) {
-            return Ok(());
+        if !self.aggregate.mark_directory_visited(directory_key.clone()) {
+            return Ok(Vec::new());
         }
-        set_stage(
-            self.progress,
-            IndexStage::Scanning,
-            Some(directory.to_path_buf()),
-        );
         let entries = std::fs::read_dir(directory)
             .map_err(|error| format!("read_dir {}: {error}", directory.display()))?;
         let mut subdirectories = Vec::new();
@@ -1105,7 +1513,7 @@ impl ScanContext<'_> {
 
         for entry in entries {
             if self.cancelled() {
-                return Ok(());
+                return Ok(Vec::new());
             }
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1211,26 +1619,28 @@ impl ScanContext<'_> {
         });
         let is_book =
             crate::app::folder_scan::is_image_only_book_contents(has_container, &all_media);
+        let mut work = Vec::new();
         if is_book {
-            self.process_image_book(directory, &directory_key, &images)?;
+            work.push(ScanWork::ImageBook {
+                directory: directory.to_path_buf(),
+                container_key: directory_key,
+                images,
+            });
         } else {
-            for (page_index, image) in images.iter().enumerate() {
-                self.process_loose_image(image, u32::try_from(page_index).ok())?;
+            for (page_index, candidate) in images.into_iter().enumerate() {
+                work.push(ScanWork::LooseImage {
+                    candidate,
+                    page_index: u32::try_from(page_index).ok(),
+                });
             }
         }
-        for zip in &zips {
-            self.process_zip(zip)?;
-        }
-        for pdf in &pdfs {
-            self.process_pdf(pdf)?;
-        }
+        work.extend(zips.into_iter().map(ScanWork::Zip));
+        work.extend(pdfs.into_iter().map(ScanWork::Pdf));
         for child in subdirectories {
-            if let Err(error) = self.scan_directory(&child) {
-                self.io_error(&child, error);
-            }
+            work.push(ScanWork::Directory(child));
         }
-        publish_report(self.progress, &self.report);
-        Ok(())
+        self.publish();
+        Ok(work)
     }
 
     fn process_loose_image(
@@ -1262,7 +1672,7 @@ impl ScanContext<'_> {
             Err(error) => self.decode_error(&candidate.path, error),
         }
         self.report.processed += 1;
-        publish_report(self.progress, &self.report);
+        self.publish();
         Ok(())
     }
 
@@ -1361,7 +1771,7 @@ impl ScanContext<'_> {
             };
             self.db.stage_item(generation, &item).map_err(db_error)?;
             self.report.processed += 1;
-            publish_report(self.progress, &self.report);
+            self.publish();
         }
         self.db
             .complete_container(container_key, generation)
@@ -1474,7 +1884,7 @@ impl ScanContext<'_> {
             };
             self.db.stage_item(generation, &item).map_err(db_error)?;
             self.report.processed += 1;
-            publish_report(self.progress, &self.report);
+            self.publish();
         }
         self.db
             .complete_container(&container_key, generation)
@@ -1595,7 +2005,7 @@ impl ScanContext<'_> {
             };
             self.db.stage_item(generation, &item).map_err(db_error)?;
             self.report.processed += 1;
-            publish_report(self.progress, &self.report);
+            self.publish();
         }
         self.db
             .complete_container(&container_key, generation)
@@ -1767,7 +2177,7 @@ impl ScanContext<'_> {
         self.report
             .errors
             .push(format!("I/O {}: {error}", path.display()));
-        publish_report(self.progress, &self.report);
+        self.publish();
     }
 }
 
@@ -2013,6 +2423,224 @@ fn raster_is_large_enough_for_canonical_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct StubConcurrency {
+        current_global: usize,
+        peak_global: usize,
+        current_by_volume: HashMap<VolumeKey, usize>,
+        peak_by_volume: HashMap<VolumeKey, usize>,
+    }
+
+    #[test]
+    fn bounded_stub_source_respects_global_and_per_volume_caps() {
+        let drive_e = VolumeKey::Drive(b'E');
+        let drive_d = VolumeKey::Drive(b'D');
+        let initial = (0..64)
+            .map(|index| {
+                let volume = if index % 2 == 0 {
+                    drive_e.clone()
+                } else {
+                    drive_d.clone()
+                };
+                TaggedWork::new(volume, index)
+            })
+            .collect();
+        let queue = BoundedWorkQueue::new(initial);
+        let cancel = AtomicBool::new(false);
+        let observed = Arc::new((Mutex::new(StubConcurrency::default()), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let violations = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            // 実運用の 16 worker より多い stub worker を競合させ、queue 自体の cap を検証する。
+            for _ in 0..32 {
+                let queue = &queue;
+                let cancel = &cancel;
+                let observed = Arc::clone(&observed);
+                let release = Arc::clone(&release);
+                let violations = &violations;
+                workers.push(scope.spawn(move || {
+                    while let Some(mut lease) = queue.take(None, cancel) {
+                        let _item = lease.take_task();
+                        {
+                            let (state, changed) = &*observed;
+                            let mut state = state.lock().unwrap();
+                            state.current_global += 1;
+                            state.peak_global = state.peak_global.max(state.current_global);
+                            let current = state
+                                .current_by_volume
+                                .entry(lease.volume.clone())
+                                .or_default();
+                            *current += 1;
+                            let current = *current;
+                            state
+                                .peak_by_volume
+                                .entry(lease.volume.clone())
+                                .and_modify(|peak| *peak = (*peak).max(current))
+                                .or_insert(current);
+                            if state.current_global > INDEX_GLOBAL_OUTSTANDING_LIMIT
+                                || current > INDEX_PER_VOLUME_OUTSTANDING_LIMIT
+                            {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                            }
+                            changed.notify_all();
+                        }
+                        let (released, changed) = &*release;
+                        let mut released = released.lock().unwrap();
+                        while !*released {
+                            released = changed.wait(released).unwrap();
+                        }
+                        drop(released);
+                        {
+                            let (state, _) = &*observed;
+                            let mut state = state.lock().unwrap();
+                            state.current_global -= 1;
+                            *state
+                                .current_by_volume
+                                .get_mut(&lease.volume)
+                                .expect("stub volume count missing") -= 1;
+                        }
+                        lease.finish(Vec::new());
+                    }
+                }));
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (state, changed) = &*observed;
+            let mut state = state.lock().unwrap();
+            while state.peak_global < INDEX_GLOBAL_OUTSTANDING_LIMIT {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "stub workers did not fill the global cap");
+                let (next, _) = changed.wait_timeout(state, deadline - now).unwrap();
+                state = next;
+            }
+            assert_eq!(state.peak_global, INDEX_GLOBAL_OUTSTANDING_LIMIT);
+            assert_eq!(state.peak_by_volume.get(&drive_e), Some(&8));
+            assert_eq!(state.peak_by_volume.get(&drive_d), Some(&8));
+            drop(state);
+            let (released, changed) = &*release;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert_eq!(violations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cancellation_waits_for_in_flight_stub_work_before_queue_completion() {
+        let queue = BoundedWorkQueue::new(vec![
+            TaggedWork::new(VolumeKey::Drive(b'E'), 1),
+            TaggedWork::new(VolumeKey::Drive(b'E'), 2),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let mut in_flight = queue.take(None, &cancel).expect("first stub work");
+        assert_eq!(in_flight.take_task(), 1);
+        cancel.store(true, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let queue = &queue;
+            let cancel = &cancel;
+            let waiter = scope.spawn(move || {
+                let next = queue.take(None, cancel);
+                tx.send(next.is_none()).unwrap();
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut state = queue.state.lock().unwrap();
+            while !state.pending.is_empty() {
+                let now = std::time::Instant::now();
+                assert!(
+                    now < deadline,
+                    "cancelled waiter did not discard pending work"
+                );
+                let (next, _) = queue.changed.wait_timeout(state, deadline - now).unwrap();
+                state = next;
+            }
+            assert_eq!(state.in_flight, 1);
+            drop(state);
+            assert!(
+                matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "cancelled queue must not finish while work is still in flight"
+            );
+            in_flight.finish(Vec::new());
+            assert!(
+                rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                "cancelled queue should finish after the last lease is released"
+            );
+            waiter.join().unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_key_uses_drive_or_unc_server_and_share() {
+        assert_eq!(
+            volume_key(Path::new(r"e:\library\page.jpg")),
+            VolumeKey::Drive(b'E')
+        );
+        assert_eq!(
+            volume_key(Path::new(r"\\Server\Share\book\page.jpg")),
+            VolumeKey::Unc("server".to_owned(), "share".to_owned())
+        );
+    }
+
+    #[test]
+    fn activity_gate_reduces_new_work_to_one_overall_and_per_volume() {
+        let gate = crate::activity_gate::ActivityGate::new(10_000);
+        gate.bump();
+        let active = current_concurrency_limits(Some(&gate));
+        assert_eq!(active.global, 1);
+        assert_eq!(active.per_volume, 1);
+        gate.set_paused(true);
+        let paused = current_concurrency_limits(Some(&gate));
+        assert_eq!(paused.global, 0);
+        assert_eq!(paused.per_volume, 0);
+    }
+
+    #[test]
+    fn concurrent_scan_keeps_container_publish_and_progress_counts_complete() {
+        let root = tempfile::tempdir().unwrap();
+        for book in ["book-a", "book-b"] {
+            let directory = root.path().join(book);
+            std::fs::create_dir(&directory).unwrap();
+            for page in 0..3 {
+                let image = image::DynamicImage::new_rgb8(16 + page, 16 + page);
+                image
+                    .save(directory.join(format!("{page:02}.png")))
+                    .unwrap();
+            }
+        }
+        let db = SimilarDb::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let report = run_index_job(
+            &db,
+            &[root.path().to_path_buf()],
+            &passwords,
+            None,
+            &cancel,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(report.discovered, 6);
+        assert_eq!(report.processed, 6);
+        assert_eq!(report.indexed, 6);
+        assert_eq!(report.containers_completed, 2);
+        assert!(report.processed <= report.discovered);
+        let containers = db.load_complete_containers().unwrap();
+        assert_eq!(containers.len(), 2);
+        assert!(
+            containers
+                .iter()
+                .all(|container| container.page_count == Some(3))
+        );
+    }
 
     fn row(id: u32, key: &str, signature: [u8; 32], quality: u8) -> SearchRow {
         SearchRow {
@@ -2131,17 +2759,16 @@ mod tests {
         db.upsert_loose_item(&existing).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(IndexProgress::Idle));
+        let aggregate = ScanAggregate::new(&progress);
         let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let context = ScanContext {
             db: &db,
             pdf_passwords: &passwords,
-            activity_gate: None,
             cancel: &cancel,
-            progress: &progress,
+            aggregate: &aggregate,
             report: IndexReport::default(),
             seen_items: HashSet::new(),
             seen_containers: HashSet::new(),
-            visited_dirs: HashSet::new(),
             prune_safe: true,
         };
         let unchanged = FileCandidate {
