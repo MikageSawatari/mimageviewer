@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+mod history;
 mod keyframes;
 mod modulators;
 mod timeline;
@@ -24,6 +25,7 @@ use musicvideo_core::{
     new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
 
+use history::{EditSurface, UndoHistory};
 use modulators::ModulatorEditorState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,17 +41,33 @@ struct LyricSelection {
     line_index: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+struct EditorSnapshot {
+    project: Project,
+    selected_layer: Option<LayerId>,
+    selected_key: Option<KeySelection>,
+    selected_lyric: Option<LyricSelection>,
+}
+
+/// Opaque pre-edit state used when a host-owned operation changes the project.
+///
+/// File dialogs and decoding remain outside this crate, but committing their
+/// project mutation through this token keeps Undo available when the shared UI
+/// is embedded in another application.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditCheckpoint(EditorSnapshot);
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditorState {
     selected_layer: usize,
     selected_key: Option<KeySelection>,
     dragging_key: Option<KeySelection>,
     selected_lyric: Option<LyricSelection>,
     dragging_lyric: Option<LyricSelection>,
-    last_lyric_stamp: Option<LyricSelection>,
     lyrics_notice: Option<(LayerId, String)>,
     pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
+    history: UndoHistory,
 }
 
 impl Default for EditorState {
@@ -60,10 +78,10 @@ impl Default for EditorState {
             dragging_key: None,
             selected_lyric: None,
             dragging_lyric: None,
-            last_lyric_stamp: None,
             lyrics_notice: None,
             pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
+            history: UndoHistory::default(),
         }
     }
 }
@@ -86,10 +104,10 @@ impl EditorState {
         self.dragging_key = None;
         self.selected_lyric = None;
         self.dragging_lyric = None;
-        self.last_lyric_stamp = None;
         self.lyrics_notice = None;
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
+        self.history.clear();
     }
 
     pub fn reconcile(&mut self, project: &Project) {
@@ -123,14 +141,6 @@ impl EditorState {
             self.selected_lyric = None;
             self.dragging_lyric = None;
         }
-        if self.last_lyric_stamp.is_some_and(|selection| {
-            !project.layers.iter().any(|layer| {
-                layer.id == selection.layer
-                    && matches!(&layer.kind, LayerKind::Lyrics(lyrics) if selection.line_index < lyrics.lines.len())
-            })
-        }) {
-            self.last_lyric_stamp = None;
-        }
         if self
             .pending_layer_delete
             .is_some_and(|id| !project.layers.iter().any(|layer| layer.id == id))
@@ -145,15 +155,132 @@ impl EditorState {
         }
     }
 
+    fn snapshot(&self, project: &Project) -> EditorSnapshot {
+        EditorSnapshot {
+            project: project.clone(),
+            selected_layer: project
+                .layers
+                .get(self.selected_layer)
+                .map(|layer| layer.id),
+            selected_key: self.selected_key,
+            selected_lyric: self.selected_lyric,
+        }
+    }
+
+    fn restore_snapshot(&mut self, project: &mut Project, snapshot: EditorSnapshot) {
+        *project = snapshot.project;
+        self.selected_layer = snapshot
+            .selected_layer
+            .and_then(|id| project.layers.iter().position(|layer| layer.id == id))
+            .unwrap_or(0)
+            .min(project.layers.len().saturating_sub(1));
+        self.selected_key = snapshot.selected_key;
+        self.selected_lyric = snapshot.selected_lyric;
+        self.dragging_key = None;
+        self.dragging_lyric = None;
+        self.pending_layer_delete = None;
+        self.modulator_editor = ModulatorEditorState::default();
+        self.reconcile(project);
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    pub fn history_depths(&self) -> (usize, usize) {
+        (self.history.undo_len(), self.history.redo_len())
+    }
+
+    pub fn undo(&mut self, project: &mut Project) -> bool {
+        let current = self.snapshot(project);
+        let Some(snapshot) = self.history.undo(current) else {
+            return false;
+        };
+        self.restore_snapshot(project, snapshot);
+        true
+    }
+
+    pub fn redo(&mut self, project: &mut Project) -> bool {
+        let current = self.snapshot(project);
+        let Some(snapshot) = self.history.redo(current) else {
+            return false;
+        };
+        self.restore_snapshot(project, snapshot);
+        true
+    }
+
+    pub fn begin_external_edit(&self, project: &Project) -> EditCheckpoint {
+        EditCheckpoint(self.snapshot(project))
+    }
+
+    pub fn finish_external_edit(&mut self, project: &Project, checkpoint: EditCheckpoint) -> bool {
+        let after = self.snapshot(project);
+        let changed = checkpoint.0 != after;
+        self.history.record_atomic(checkpoint.0, &after);
+        changed
+    }
+
+    pub fn apply_external_command(
+        &mut self,
+        project: &mut Project,
+        command: &EditorCommand,
+    ) -> bool {
+        self.try_apply_external_command(project, command)
+            .unwrap_or(false)
+    }
+
+    pub fn try_apply_external_command(
+        &mut self,
+        project: &mut Project,
+        command: &EditorCommand,
+    ) -> Result<bool, EditorCommandError> {
+        let checkpoint = self.begin_external_edit(project);
+        let changed = self.try_apply_command(project, command)?;
+        if changed {
+            self.finish_external_edit(project, checkpoint);
+        }
+        Ok(changed)
+    }
+
+    fn observe_ui_pass(
+        &mut self,
+        surface: EditSurface,
+        project: &Project,
+        checkpoint: EditCheckpoint,
+        changed: bool,
+        pointer_active: bool,
+        text_focus: Option<egui::Id>,
+    ) {
+        let after = self.snapshot(project);
+        self.history.observe_ui_pass(
+            surface,
+            checkpoint.0,
+            &after,
+            changed,
+            pointer_active,
+            text_focus,
+        );
+    }
+
     fn apply_command(&mut self, project: &mut Project, command: &EditorCommand) -> bool {
+        self.try_apply_command(project, command).unwrap_or(false)
+    }
+
+    fn try_apply_command(
+        &mut self,
+        project: &mut Project,
+        command: &EditorCommand,
+    ) -> Result<bool, EditorCommandError> {
         let selected_layer = project
             .layers
             .get(self.selected_layer)
             .map(|layer| layer.id);
         let animation_target = command.animation_target();
-        let Ok(result) = apply_editor_command(project, command) else {
-            return false;
-        };
+        let result = apply_editor_command(project, command)?;
         if let Some((layer, property)) = animation_target {
             self.selected_lyric = None;
             self.dragging_lyric = None;
@@ -189,9 +316,8 @@ impl EditorState {
         ) {
             self.selected_lyric = None;
             self.dragging_lyric = None;
-            self.last_lyric_stamp = None;
         }
-        result.changed
+        Ok(result.changed)
     }
 
     pub fn set_lyrics_notice(&mut self, layer: LayerId, notice: String) {
@@ -257,11 +383,30 @@ pub fn draw_editor(
     calibrations: &[ModulatorCalibration],
 ) -> EditorResponse {
     state.reconcile(project);
-    ui.heading("プロパティ");
+    let context = ui.ctx().clone();
+    let mut history_changed = apply_history_shortcut(&context, project, state);
+    ui.horizontal(|ui| {
+        ui.heading("プロパティ");
+        if ui
+            .add_enabled(state.can_undo(), egui::Button::new("元に戻す"))
+            .on_hover_text("Ctrl+Z")
+            .clicked()
+        {
+            history_changed |= state.undo(project);
+        }
+        if ui
+            .add_enabled(state.can_redo(), egui::Button::new("やり直す"))
+            .on_hover_text("Ctrl+Y / Ctrl+Shift+Z")
+            .clicked()
+        {
+            history_changed |= state.redo(project);
+        }
+    });
     ui.separator();
+    let checkpoint = state.begin_external_edit(project);
     let body_width = ui.available_width();
     let body_height = ui.available_height().max(0.0);
-    ui.allocate_ui_with_layout(
+    let allocation = ui.allocate_ui_with_layout(
         egui::vec2(body_width, body_height),
         egui::Layout::top_down(egui::Align::LEFT),
         |ui| {
@@ -269,7 +414,6 @@ pub fn draw_editor(
             ui.set_max_width(body_width);
             ui.set_min_height(body_height);
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-            let context = ui.ctx().clone();
             let mut response = egui::ScrollArea::vertical()
                 .max_height(body_height)
                 .min_scrolled_height(0.0)
@@ -448,8 +592,107 @@ pub fn draw_editor(
             }
             response
         },
-    )
-    .inner
+    );
+    let mut response = allocation.inner;
+    let pointer_active = context.input(|input| input.pointer.primary_down());
+    // Context::wants_keyboard_input is true while a TextEdit (including the
+    // editable part of DragValue) owns focus. This both defines the text-edit
+    // transaction boundary and keeps IME input owned by egui.
+    let text_focus = context.memory(|memory| memory.focused());
+    state.observe_ui_pass(
+        EditSurface::Properties,
+        project,
+        checkpoint,
+        response.project_changed,
+        pointer_active,
+        text_focus,
+    );
+    response.project_changed |= history_changed;
+    response
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryAction {
+    Undo,
+    Redo,
+}
+
+fn history_action_for_event(
+    event: &egui::Event,
+    text_input_focused: bool,
+) -> Option<HistoryAction> {
+    if text_input_focused {
+        // TextEdit and the platform IME own Ctrl+Z/Y while the field has focus.
+        return None;
+    }
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        repeat: false,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if *key == egui::Key::Z
+        && modifiers.matches_exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)
+    {
+        Some(HistoryAction::Redo)
+    } else if *key == egui::Key::Z && modifiers.matches_exact(egui::Modifiers::CTRL) {
+        Some(HistoryAction::Undo)
+    } else if *key == egui::Key::Y && modifiers.matches_exact(egui::Modifiers::CTRL) {
+        Some(HistoryAction::Redo)
+    } else {
+        None
+    }
+}
+
+fn apply_history_shortcut(
+    context: &egui::Context,
+    project: &mut Project,
+    state: &mut EditorState,
+) -> bool {
+    let text_input_focused = context.wants_keyboard_input();
+    let requested = context.input(|input| {
+        input
+            .events
+            .iter()
+            .find_map(|event| history_action_for_event(event, text_input_focused))
+    });
+    let Some(action) = requested else {
+        return false;
+    };
+    let (modifiers, key) = match action {
+        HistoryAction::Undo => (egui::Modifiers::CTRL, egui::Key::Z),
+        HistoryAction::Redo => {
+            let shift_z = context.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Z,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.matches_exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)
+                    )
+                })
+            });
+            if shift_z {
+                (egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+            } else {
+                (egui::Modifiers::CTRL, egui::Key::Y)
+            }
+        }
+    };
+    context.input_mut(|input| {
+        input.consume_key(modifiers, key);
+    });
+    match action {
+        HistoryAction::Undo => state.undo(project),
+        HistoryAction::Redo => state.redo(project),
+    }
 }
 
 fn draw_layer_delete_confirmation(
@@ -472,7 +715,7 @@ fn draw_layer_delete_confirmation(
             ui.heading("レイヤーの削除");
             ui.add_space(8.0);
             ui.label(format!("レイヤー「{layer_name}」を削除しますか？"));
-            ui.small("この操作はまだ元に戻せません。");
+            ui.small("削除後も「元に戻す」で復元できます。");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("削除する").clicked() {
@@ -805,25 +1048,9 @@ fn edit_lyrics(
             });
             state.selected_lyric = Some(selection);
             state.selected_key = None;
-            state.last_lyric_stamp = Some(selection);
-        }
-        let can_step_back = state
-            .last_lyric_stamp
-            .is_some_and(|selection| selection.layer == layer_id);
-        if ui
-            .add_enabled(can_step_back, egui::Button::new("1 つ前に戻す"))
-            .on_hover_text("直前に「次の行へ」で付けた時刻だけを取り消します")
-            .clicked()
-            && let Some(selection) = state.last_lyric_stamp.take()
-        {
-            commands.push(EditorCommand::SetLyricTime {
-                layer: selection.layer,
-                line_index: selection.line_index,
-                time_secs: None,
-            });
-            state.selected_lyric = Some(selection);
         }
     });
+    ui.small("時刻付けを戻すときは、上の「元に戻す」または Ctrl+Z を使います。");
     if let Some(index) = next_unset {
         let preview = lyrics.lines[index].text.replace('\n', " ");
         ui.small(format!("次: {} / {}", index + 1, preview));
@@ -881,7 +1108,6 @@ fn edit_lyrics(
                             line_index,
                             time_secs: Some(time),
                         });
-                        state.last_lyric_stamp = None;
                     }
                     if ui.small_button("未設定に戻す").clicked() {
                         commands.push(EditorCommand::SetLyricTime {
@@ -889,7 +1115,6 @@ fn edit_lyrics(
                             line_index,
                             time_secs: None,
                         });
-                        state.last_lyric_stamp = None;
                     }
                 } else {
                     ui.weak("未設定");
@@ -899,7 +1124,6 @@ fn edit_lyrics(
                             line_index,
                             time_secs: Some(current_time_secs),
                         });
-                        state.last_lyric_stamp = None;
                     }
                 }
                 let text = if line.text.is_empty() {
@@ -1309,7 +1533,33 @@ fn edit_gradient_stops(ui: &mut egui::Ui, stops: &mut GradientStops) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musicvideo_core::{Animatable, default_project};
+    use musicvideo_core::{
+        Animatable, ImageRef, Interp, Keyframe, LyricLine, ModulationBinding, ModulationCurve,
+        ModulationTarget, Track, default_project, new_band_energy_modulator, new_image_layer,
+        new_solid_layer,
+    };
+
+    fn assert_undo_redo_round_trip(
+        state: &mut EditorState,
+        project: &mut Project,
+        before: &Project,
+        after: &Project,
+    ) {
+        assert!(state.undo(project));
+        assert_eq!(project, before);
+        assert!(state.redo(project));
+        assert_eq!(project, after);
+    }
+
+    fn record_direct_edit(
+        state: &mut EditorState,
+        project: &mut Project,
+        edit: impl FnOnce(&mut Project),
+    ) {
+        let checkpoint = state.begin_external_edit(project);
+        edit(project);
+        assert!(state.finish_external_edit(project, checkpoint));
+    }
 
     #[test]
     fn new_keyboard_layer_uses_a_transparent_background_and_unique_id() {
@@ -1374,5 +1624,445 @@ mod tests {
         state.reset_for_project(&second);
 
         assert_eq!(state.pending_layer_delete, None);
+    }
+
+    #[test]
+    fn key_add_move_and_delete_each_round_trip_through_undo_and_redo() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        state.select_layer(0);
+        let layer = project.layers[0].id;
+
+        let before_add = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::AddKey {
+                layer,
+                property: AnimProperty::Opacity,
+                t: 1.0,
+            },
+        ));
+        let after_add = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_add, &after_add);
+        assert_eq!(state.selected_key.unwrap().key_index, 0);
+
+        let before_move = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::MoveKey {
+                layer,
+                property: AnimProperty::Opacity,
+                key_index: 0,
+                t: 3.0,
+            },
+        ));
+        let after_move = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_move, &after_move);
+
+        let before_delete = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteKey {
+                layer,
+                property: AnimProperty::Opacity,
+                key_index: 0,
+            },
+        ));
+        let after_delete = project.clone();
+        assert_eq!(project.layers[0].opacity, Animatable::Const(1.0));
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_delete, &after_delete);
+    }
+
+    #[test]
+    fn layer_add_reorder_and_delete_each_round_trip() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+
+        let before_add = project.clone();
+        let added = new_solid_layer(&project);
+        let added_id = added.id;
+        let checkpoint = state.begin_external_edit(&project);
+        project.layers.push(added);
+        state.select_layer(project.layers.len() - 1);
+        assert!(state.finish_external_edit(&project, checkpoint));
+        let after_add = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_add, &after_add);
+        assert_eq!(project.layers[state.selected_layer()].id, added_id);
+
+        let before_move = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: added_id,
+                direction: LayerMoveDirection::TowardBack,
+            },
+        ));
+        let after_move = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_move, &after_move);
+
+        let before_delete = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteLayer { layer: added_id },
+        ));
+        let after_delete = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_delete, &after_delete);
+    }
+
+    #[test]
+    fn deleting_an_image_layer_undoes_bindings_and_last_image_reference_together() {
+        let mut project = default_project(10.0);
+        let modulator = new_band_energy_modulator(&project);
+        let modulator_id = modulator.id;
+        project.modulators.push(modulator);
+        let image = ImageId::new("undo-image");
+        project.images.push(ImageRef {
+            id: image.clone(),
+            path: PathBuf::from("cover.png"),
+        });
+        let mut layer = new_image_layer(&project, image.clone());
+        layer.modulations.push(ModulationBinding {
+            target: ModulationTarget::ImageZoom,
+            modulator: modulator_id,
+            amount: 0.2,
+            curve: ModulationCurve::Squared,
+        });
+        let layer_id = layer.id;
+        project.layers.push(layer);
+        let mut state = EditorState::default();
+        state.select_layer(project.layers.len() - 1);
+        state.reset_for_project(&project);
+        state.select_layer(project.layers.len() - 1);
+        let before = project.clone();
+
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::DeleteLayer { layer: layer_id },
+        ));
+        let deleted = project.clone();
+        assert!(!project.images.iter().any(|reference| reference.id == image));
+        assert!(!project.layers.iter().any(|layer| layer.id == layer_id));
+
+        assert!(state.undo(&mut project));
+        assert_eq!(project, before);
+        let restored = project
+            .layers
+            .iter()
+            .find(|layer| layer.id == layer_id)
+            .unwrap();
+        assert_eq!(restored.modulations.len(), 1);
+        assert!(project.images.iter().any(|reference| reference.id == image));
+        assert_eq!(project.layers[state.selected_layer()].id, layer_id);
+        assert!(state.redo(&mut project));
+        assert_eq!(project, deleted);
+    }
+
+    #[test]
+    fn property_and_modulator_edits_round_trip() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+
+        let before_property = project.clone();
+        record_direct_edit(&mut state, &mut project, |project| {
+            project.layers[0].name = "変更したレイヤー".to_owned();
+        });
+        let after_property = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_property, &after_property);
+
+        let before_modulator = project.clone();
+        record_direct_edit(&mut state, &mut project, |project| {
+            project.modulators.push(new_band_energy_modulator(project));
+        });
+        let after_modulator = project.clone();
+        assert_undo_redo_round_trip(
+            &mut state,
+            &mut project,
+            &before_modulator,
+            &after_modulator,
+        );
+    }
+
+    #[test]
+    fn lyric_bulk_replacement_and_timestamp_round_trip() {
+        let mut project = default_project(10.0);
+        let lyrics = new_lyrics_layer(&project);
+        let layer = lyrics.id;
+        project.layers.push(lyrics);
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+
+        let before_replace = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::ReplaceLyrics {
+                layer,
+                lines: vec![
+                    LyricLine {
+                        text: "一行目".to_owned(),
+                        time_secs: None,
+                    },
+                    LyricLine {
+                        text: String::new(),
+                        time_secs: None,
+                    },
+                ],
+            },
+        ));
+        let after_replace = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_replace, &after_replace);
+
+        let before_stamp = project.clone();
+        assert!(state.apply_external_command(
+            &mut project,
+            &EditorCommand::SetLyricTime {
+                layer,
+                line_index: 0,
+                time_secs: Some(2.5),
+            },
+        ));
+        let after_stamp = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &before_stamp, &after_stamp);
+    }
+
+    #[test]
+    fn one_timeline_marker_drag_creates_exactly_one_history_step() {
+        let mut project = default_project(10.0);
+        project.layers[0].opacity = Animatable::Track(
+            Track::new(vec![Keyframe {
+                t: 1.0,
+                value: 0.5,
+                interp: Interp::Linear,
+            }])
+            .unwrap(),
+        );
+        let layer = project.layers[0].id;
+        let original = project.clone();
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+
+        for t in [1.5, 2.0, 3.0] {
+            let checkpoint = state.begin_external_edit(&project);
+            assert!(state.apply_command(
+                &mut project,
+                &EditorCommand::MoveKey {
+                    layer,
+                    property: AnimProperty::Opacity,
+                    key_index: 0,
+                    t,
+                },
+            ));
+            state.observe_ui_pass(
+                EditSurface::Timeline,
+                &project,
+                checkpoint,
+                true,
+                true,
+                None,
+            );
+        }
+        let release = state.begin_external_edit(&project);
+        state.observe_ui_pass(EditSurface::Timeline, &project, release, false, false, None);
+
+        assert_eq!(state.history_depths(), (1, 0));
+        let final_project = project.clone();
+        assert_undo_redo_round_trip(&mut state, &mut project, &original, &final_project);
+    }
+
+    #[test]
+    fn one_text_focus_session_creates_exactly_one_history_step() {
+        let mut project = default_project(10.0);
+        let original = project.clone();
+        let mut state = EditorState::default();
+
+        for name in ["編", "編集中", "編集中の名前"] {
+            let checkpoint = state.begin_external_edit(&project);
+            project.layers[0].name = name.to_owned();
+            state.observe_ui_pass(
+                EditSurface::Properties,
+                &project,
+                checkpoint,
+                true,
+                false,
+                Some(egui::Id::new("layer-name")),
+            );
+        }
+        let focus_lost = state.begin_external_edit(&project);
+        state.observe_ui_pass(
+            EditSurface::Properties,
+            &project,
+            focus_lost,
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(state.history_depths(), (1, 0));
+        assert!(state.undo(&mut project));
+        assert_eq!(project, original);
+    }
+
+    #[test]
+    fn moving_from_a_text_field_to_the_timeline_keeps_two_operations() {
+        let mut project = default_project(10.0);
+        let original = project.clone();
+        let mut state = EditorState::default();
+
+        let text_start = state.begin_external_edit(&project);
+        project.layers[0].name = "入力後".to_owned();
+        state.observe_ui_pass(
+            EditSurface::Properties,
+            &project,
+            text_start,
+            true,
+            false,
+            Some(egui::Id::new("layer-name")),
+        );
+        let after_text = project.clone();
+
+        let timeline_start = state.begin_external_edit(&project);
+        project.display_gain_db = 4.0;
+        state.observe_ui_pass(
+            EditSurface::Timeline,
+            &project,
+            timeline_start,
+            true,
+            true,
+            None,
+        );
+        let release = state.begin_external_edit(&project);
+        state.observe_ui_pass(EditSurface::Timeline, &project, release, false, false, None);
+
+        assert_eq!(state.history_depths(), (2, 0));
+        assert!(state.undo(&mut project));
+        assert_eq!(project, after_text);
+        assert!(state.undo(&mut project));
+        assert_eq!(project, original);
+    }
+
+    #[test]
+    fn loading_a_project_clears_both_history_stacks() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        record_direct_edit(&mut state, &mut project, |project| {
+            project.display_gain_db = 6.0;
+        });
+        assert!(state.undo(&mut project));
+        assert_eq!(state.history_depths(), (0, 1));
+
+        let loaded = default_project(20.0);
+        state.reset_for_project(&loaded);
+        project = loaded;
+        assert_eq!(state.history_depths(), (0, 0));
+        assert!(!state.undo(&mut project));
+        assert!(!state.redo(&mut project));
+    }
+
+    #[test]
+    fn new_edit_discards_redo_and_history_evicts_the_oldest_step() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        for value in 1..=140 {
+            record_direct_edit(&mut state, &mut project, |project| {
+                project.display_gain_db = value as f32;
+            });
+        }
+        assert_eq!(state.history_depths(), (history::HISTORY_LIMIT, 0));
+        for _ in 0..history::HISTORY_LIMIT {
+            assert!(state.undo(&mut project));
+        }
+        assert_eq!(project.display_gain_db, 12.0);
+        assert!(!state.undo(&mut project));
+        assert_eq!(state.history_depths(), (0, history::HISTORY_LIMIT));
+
+        record_direct_edit(&mut state, &mut project, |project| {
+            project.display_gain_db = -3.0;
+        });
+        assert_eq!(state.history_depths(), (1, 0));
+        assert!(!state.redo(&mut project));
+    }
+
+    #[test]
+    fn editor_shortcuts_are_not_taken_while_text_or_ime_input_owns_focus() {
+        let ctrl_z = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let ctrl_y = egui::Event::Key {
+            key: egui::Key::Y,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let ctrl_shift_z = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        };
+        assert_eq!(
+            history_action_for_event(&ctrl_z, false),
+            Some(HistoryAction::Undo)
+        );
+        assert_eq!(
+            history_action_for_event(&ctrl_y, false),
+            Some(HistoryAction::Redo)
+        );
+        assert_eq!(
+            history_action_for_event(&ctrl_shift_z, false),
+            Some(HistoryAction::Redo)
+        );
+        assert_eq!(history_action_for_event(&ctrl_z, true), None);
+        assert_eq!(history_action_for_event(&ctrl_y, true), None);
+        assert_eq!(history_action_for_event(&ctrl_shift_z, true), None);
+    }
+
+    #[test]
+    fn focused_egui_text_edit_keeps_ctrl_z_for_its_own_undo() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        record_direct_edit(&mut state, &mut project, |project| {
+            project.display_gain_db = 6.0;
+        });
+        let edited = project.clone();
+        let context = egui::Context::default();
+        let text_id = egui::Id::new("undo-owned-by-text-edit");
+        let mut text = "入力中".to_owned();
+        let _ = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+        assert!(context.wants_keyboard_input());
+
+        let modifiers = egui::Modifiers::CTRL;
+        let output = context.run(
+            egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |context| {
+                assert!(!apply_history_shortcut(context, &mut project, &mut state));
+                assert!(context.input(|input| !input.events.is_empty()));
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
+                });
+            },
+        );
+        drop(output);
+        assert_eq!(project, edited);
+        assert_eq!(state.history_depths(), (1, 0));
     }
 }

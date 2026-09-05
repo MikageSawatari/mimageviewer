@@ -13,8 +13,8 @@ use musicvideo_core::{
     modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
 };
 use musicvideo_ui::{
-    EditorCommand, EditorState, MissingImageNotice, TimelineWaveform, apply_editor_command,
-    draw_editor, draw_missing_images, draw_preview, draw_timeline,
+    EditorCommand, EditorState, MissingImageNotice, TimelineWaveform, draw_editor,
+    draw_missing_images, draw_preview, draw_timeline,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -1045,20 +1045,22 @@ impl MusicVideoLabApp {
                     report.inline_time_tags_removed,
                     report.offset_millis,
                 );
-                match apply_editor_command(
-                    &mut self.project,
-                    &EditorCommand::ReplaceLyrics {
-                        layer,
-                        lines: report.lines,
-                    },
-                ) {
-                    Ok(result) => {
+                let command = EditorCommand::ReplaceLyrics {
+                    layer,
+                    lines: report.lines,
+                };
+                match self
+                    .editor_state
+                    .try_apply_external_command(&mut self.project, &command)
+                {
+                    Ok(true) => {
                         self.editor_state.set_lyrics_notice(layer, notice.clone());
                         self.status =
                             format!("LRC を読み込みました ({}): {notice}", path.display());
-                        if result.changed {
-                            self.schedule_project_edit_preview();
-                        }
+                        self.schedule_project_edit_preview();
+                    }
+                    Ok(false) => {
+                        self.status = "LRC の内容は現在の歌詞と同じです".to_owned();
                     }
                     Err(error) => self.status = format!("LRC を反映できません: {error}"),
                 }
@@ -1546,11 +1548,18 @@ impl eframe::App for MusicVideoLabApp {
                 .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
                 .pick_file()
         {
+            let checkpoint = self.editor_state.begin_external_edit(&self.project);
             let image_id = next_image_id(&self.project);
             let layer = new_image_layer(&self.project, image_id.clone());
             let insertion_index = image_layer_insertion_index(&self.project);
+            self.project.images.push(ImageRef {
+                id: image_id.clone(),
+                path: path.clone(),
+            });
             self.project.layers.insert(insertion_index, layer);
             self.editor_state.select_layer(insertion_index);
+            self.editor_state
+                .finish_external_edit(&self.project, checkpoint);
             self.mark_preview_dirty();
             self.start_image_load(image_id, path, ctx);
         }

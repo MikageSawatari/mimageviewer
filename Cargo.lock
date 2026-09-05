@@ -4153,6 +4153,7 @@ name = "musicvideo-core"
 version = "0.1.0"
 dependencies = [
  "comic-core",
+ "encoding_rs",
  "music-core",
  "rayon",
  "serde",

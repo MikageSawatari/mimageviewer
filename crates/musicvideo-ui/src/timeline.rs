@@ -1,6 +1,7 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use musicvideo_core::{Interp, LayerId, Project};
 
+use crate::history::EditSurface;
 use crate::keyframes::{
     AnimProperty, EditorCommand, KeyMeta, animation_keys, animation_properties,
 };
@@ -56,6 +57,8 @@ pub fn draw_timeline(
     waveform: Option<&TimelineWaveform>,
 ) -> TimelineResponse {
     state.reconcile(project);
+    let checkpoint = state.begin_external_edit(project);
+    let context = ui.ctx().clone();
     let duration = project.duration_secs.max(0.001);
     let mut response = TimelineResponse::default();
     ui.horizontal(|ui| {
@@ -101,6 +104,16 @@ pub fn draw_timeline(
             }
         });
     draw_key_inspector(ui, project, state, duration, &mut response);
+    let pointer_active = context.input(|input| input.pointer.primary_down());
+    let text_focus = context.memory(|memory| memory.focused());
+    state.observe_ui_pass(
+        EditSurface::Timeline,
+        project,
+        checkpoint,
+        response.project_changed,
+        pointer_active,
+        text_focus,
+    );
     response
 }
 
@@ -438,7 +451,6 @@ fn draw_lyric_row(
             state.selected_lyric = Some(selection);
             state.selected_key = None;
             state.dragging_lyric = Some(selection);
-            state.last_lyric_stamp = None;
             state.select_layer_id(project, row.layer);
         } else {
             state.dragging_lyric = None;
@@ -622,7 +634,6 @@ fn draw_lyric_inspector(
                 time_secs: Some(time),
             });
             output.seek_to = Some(time);
-            state.last_lyric_stamp = None;
         }
         if ui.button("時刻を未設定に戻す").clicked() {
             command = Some(EditorCommand::SetLyricTime {
@@ -630,7 +641,6 @@ fn draw_lyric_inspector(
                 line_index: selection.line_index,
                 time_secs: None,
             });
-            state.last_lyric_stamp = None;
         }
     });
     if let Some(command) = command {
