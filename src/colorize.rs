@@ -331,10 +331,11 @@ fn mono_tone_axis_with(
     if total == 0 {
         return None;
     }
+    // Only read the clocks when the log will use them: this runs on every page turn.
     #[cfg(windows)]
     let timing_on = crate::perf::is_enabled();
     #[cfg(windows)]
-    let (t_sample, c_sample) = (std::time::Instant::now(), cycles_now());
+    let sample_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
     samples.clear();
     samples.reserve(MONO_SAMPLE_LIMIT);
@@ -347,15 +348,17 @@ fn mono_tone_axis_with(
             .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32]),
     );
     #[cfg(windows)]
-    let (sample_ms, sample_cycles) = (
-        t_sample.elapsed().as_secs_f64() * 1000.0,
-        cycles_now().saturating_sub(c_sample),
-    );
+    let (sample_ms, sample_cycles) = sample_started.map_or((0.0, 0), |(t, c)| {
+        (
+            t.elapsed().as_secs_f64() * 1000.0,
+            cycles_now().saturating_sub(c),
+        )
+    });
     if samples.len() < 8 {
         return None;
     }
     #[cfg(windows)]
-    let (t_compute, c_compute) = (std::time::Instant::now(), cycles_now());
+    let compute_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
 
     let inv_n = 1.0 / samples.len() as f32;
     let mut mean = [0.0_f32; 3];
@@ -398,12 +401,14 @@ fn mono_tone_axis_with(
     }
 
     #[cfg(windows)]
-    let (compute_ms, compute_cycles) = (
-        t_compute.elapsed().as_secs_f64() * 1000.0,
-        cycles_now().saturating_sub(c_compute),
-    );
+    let (compute_ms, compute_cycles) = compute_started.map_or((0.0, 0), |(t, c)| {
+        (
+            t.elapsed().as_secs_f64() * 1000.0,
+            cycles_now().saturating_sub(c),
+        )
+    });
     #[cfg(windows)]
-    let (t_res, c_res) = (std::time::Instant::now(), cycles_now());
+    let residual_started = timing_on.then(|| (std::time::Instant::now(), cycles_now()));
     residuals.clear();
     residuals.reserve(samples.len());
     residuals.extend(samples.iter().map(|sample| {
@@ -426,8 +431,10 @@ fn mono_tone_axis_with(
         acc.sample_cycles += sample_cycles;
         acc.compute_ms += compute_ms;
         acc.compute_cycles += compute_cycles;
-        acc.residual_ms += t_res.elapsed().as_secs_f64() * 1000.0;
-        acc.residual_cycles += cycles_now().saturating_sub(c_res);
+        if let Some((t, c)) = residual_started {
+            acc.residual_ms += t.elapsed().as_secs_f64() * 1000.0;
+            acc.residual_cycles += cycles_now().saturating_sub(c);
+        }
     }
     Some(MonoToneAxis {
         mean,
