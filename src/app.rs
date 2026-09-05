@@ -10662,8 +10662,9 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
-    /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
-    pub(crate) export_folder_refresh_pending: Option<PathBuf>,
+    /// 現在表示中の実フォルダを、メイン viewer が閉じた後に再読み込みする対象。
+    /// Ctrl+E 完了と、viewer 中に届いた監視由来の再走査が同じ先送りを使う。
+    pub(crate) folder_refresh_pending: Option<PathBuf>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、右下 indicator texture
     /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
@@ -14082,7 +14083,7 @@ impl App {
             export_dialog: None,
             export_batch_dialog: None,
             export_pending: None,
-            export_folder_refresh_pending: None,
+            folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
@@ -18203,6 +18204,20 @@ impl App {
         let new_sig = signature_from_scan(&scan);
         if self.current_folder_signature == Some(new_sig) {
             self.current_folder_last_mtime = Some(new_mtime);
+            return;
+        }
+        if self.viewer_session_blocks_main_window() {
+            // 一覧へ適用すると load_folder_with_scan -> close_fullscreen まで進むため、
+            // App::update の一覧側 consumer と同じ述語で、既存の再読み込みへ先送りする。
+            // 走査結果は保持しない。一覧へ戻った時点の内容を改めて 1 回読む方が正しい。
+            // その間は削除済みファイル等が背後の一覧へ残るが、閲覧を閉じないための
+            // 意図した取引である。mtime / signature も「適用済み」に進めず、Resumed の
+            // 安いふるいが pending より先にこの変更を見失わないようにする。
+            crate::logger::log(format!(
+                "auto-refresh: folder content changed while main viewer is open; deferring reload ({})",
+                folder.display()
+            ));
+            self.folder_refresh_pending = Some(folder);
             return;
         }
         self.clear_retained_final_ai_cache(&format!(
@@ -26719,19 +26734,19 @@ impl App {
             return;
         };
         if crate::folder_tree::path_eq(parent, &cur) {
-            self.export_folder_refresh_pending = Some(cur);
+            self.folder_refresh_pending = Some(cur);
         }
     }
 
-    /// Ctrl+E で現在フォルダへ保存されたファイルをグリッドへ反映する。
+    /// 先送りされた現在フォルダの変更をグリッドへ反映する。
     ///
-    /// フルスクリーン中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
-    /// `fullscreen_idx.is_none()` のときだけ実行する。
-    pub(crate) fn consume_export_folder_refresh_pending(&mut self) {
+    /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
+    /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
+    pub(crate) fn consume_folder_refresh_pending(&mut self) {
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
         // ここを通っても pending を消費せず、後で復帰したときに再読込できるよう
         // 残しておく (Codex review CONFIRMED)。
-        if self.export_folder_refresh_pending.is_none() {
+        if self.folder_refresh_pending.is_none() {
             return;
         }
         if self.items_are_global_search_view
@@ -26745,12 +26760,12 @@ impl App {
         let Some(cur) = self.current_favorite_target() else {
             return;
         };
-        let Some(target) = self.export_folder_refresh_pending.take() else {
+        let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };
         if crate::folder_tree::path_eq(&cur, &target) {
             crate::logger::log(format!(
-                "export: reloading current folder after Ctrl+E save ({})",
+                "folder-refresh: reloading current folder after deferred change ({})",
                 cur.display()
             ));
             self.folder_history.remove(&cur);
@@ -52742,10 +52757,10 @@ impl App {
         // 閉じても継続できる。進捗とキャンセル操作も一覧側のダイアログへ引き継がれるため、
         // `export_pending` と cancel フラグには触れない。
         self.export_dialog = None;
-        // **`export_folder_refresh_pending` は触らない**: これは「一覧に戻ったら
-        // サムネ更新」の dirty フラグ (commit 1cdf9c53 で導入) で、`consume_*` が
+        // **`folder_refresh_pending` は触らない**: これは「一覧に戻ったら
+        // 現在フォルダを更新」の dirty フラグで、`consume_*` が
         // 同フレ末で取り出す前提。close_fullscreen 内で None に戻すと取り出す前に
-        // 消えて、エクスポート後にサムネが更新されない (Codex review P1 再指摘)。
+        // 消えて、先送りしたフォルダ変更が一覧へ反映されない。
         self.fullscreen_video_marker_cache = None;
         self.cancel_fullscreen_video_marker_thumb_decode();
         // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。
@@ -68978,16 +68993,18 @@ impl App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
-        // Ctrl+E が現在フォルダへ保存したファイル、および 📌 ボタン /
-        // グリッドコンテキストメニューで書き換えた代表サムネを、同フレーム内で
-        // グリッドに反映する。
+        // 現在フォルダへ保存されたファイルや、監視再走査から先送りした変更、および
+        // 📌 ボタン / グリッドコンテキストメニューで書き換えた代表サムネを、
+        // 同フレーム内でグリッドに反映する。
         //
-        // **fullscreen 中は consume しない**: load_folder は close_fullscreen を呼ぶため、
-        // export 完了 / 右クリックメニュー操作 → ここで即時 reload → fs が予期せず
-        // 閉じてしまう。fullscreen のときは一覧へ戻った次フレーム、または
-        // close_fullscreen 側の dirty 消費経路に委ねる。
+        // **メイン viewer が塞がれている間は consume しない**: load_folder は
+        // close_fullscreen を呼ぶため、
+        // export 完了 / 監視変更 / 右クリックメニュー操作 → ここで即時 reload → fs が
+        // 予期せず閉じてしまう。fullscreen のときは一覧へ戻った次フレームに委ねる。
+        // 一覧表示中の監視変更は従来どおり即時に適用し、進行中の Ctrl+E 出力が背後の
+        // 一覧へ順次増える挙動も維持する (利用者判断 2026-09-05)。
         if !main_viewer_blocked {
-            self.consume_export_folder_refresh_pending();
+            self.consume_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
             // メディア別ウィンドウ (フル機能モード) の P ピンをメイン窓のグリッドへ
             // 即時反映する。従来は close_fullscreen でしか consume されず、メイン窓の

@@ -25822,9 +25822,9 @@ mod favorite_adjustment_defaults_tests {
 
         app.poll_export_pending(&ctx);
 
-        assert_eq!(app.export_folder_refresh_pending.as_ref(), Some(&folder));
-        app.consume_export_folder_refresh_pending();
-        assert!(app.export_folder_refresh_pending.is_none());
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        app.consume_folder_refresh_pending();
+        assert!(app.folder_refresh_pending.is_none());
         assert!(app.items.iter().any(|item| {
             matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
         }));
@@ -36292,10 +36292,83 @@ mod pipeline_cache_refactor_tests {
         phase_c_support::wait_for_external_rescan(&mut app);
 
         assert!(
+            app.folder_refresh_pending.is_none(),
+            "grid-visible rescans must still apply immediately"
+        );
+        assert!(
             app.items
                 .iter()
                 .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
             "worker の結果で差し替わる"
+        );
+    }
+
+    /// 監視由来の再走査も、Ctrl+E 完了と同じ folder refresh pending を使う。
+    /// viewer を閉じる load は走らせず、一覧へ戻って consumer が動くまで mtime / signature
+    /// と一覧を古いまま保つ。consumer はその時点のディスクを 1 回だけ読み直す。
+    #[test]
+    fn a_watch_rescan_during_main_viewer_is_deferred_and_consumed_once_after_close() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("viewer_deferred_rescan");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&first_image)
+            .unwrap();
+        let initial_mtime = std::time::SystemTime::UNIX_EPOCH;
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(initial_mtime);
+        app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.items = vec![GridItem::Image(first_image)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(app.viewer_session_blocks_main_window());
+
+        let added_image = folder.join("b.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([40, 50, 60, 255]))
+            .save(&added_image)
+            .unwrap();
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "rescan must not close the viewer"
+        );
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        assert_eq!(
+            app.current_folder_last_mtime,
+            Some(initial_mtime),
+            "deferred scan must not acknowledge the mtime before reload"
+        );
+        assert!(
+            !app.items.iter().any(
+                |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+            ),
+            "the grid intentionally remains stale while the viewer is open"
+        );
+
+        app.close_fullscreen();
+        assert!(!app.viewer_session_blocks_main_window());
+        app.consume_folder_refresh_pending();
+
+        assert!(app.folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+        ));
+        assert_ne!(app.current_folder_last_mtime, Some(initial_mtime));
+        let generation_after_reload = app.items_generation;
+
+        app.consume_folder_refresh_pending();
+        assert_eq!(
+            app.items_generation, generation_after_reload,
+            "an empty pending slot must not reload the folder a second time"
         );
     }
 
