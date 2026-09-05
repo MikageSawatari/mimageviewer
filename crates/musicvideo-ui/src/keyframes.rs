@@ -75,6 +75,13 @@ pub struct KeyMeta {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorCommand {
+    DeleteLayer {
+        layer: LayerId,
+    },
+    MoveLayer {
+        layer: LayerId,
+        direction: LayerMoveDirection,
+    },
     AddKey {
         layer: LayerId,
         property: AnimProperty,
@@ -111,8 +118,27 @@ pub enum EditorCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerMoveDirection {
+    TowardBack,
+    TowardFront,
+}
+
 impl EditorCommand {
-    pub fn target(&self) -> (LayerId, AnimProperty) {
+    pub fn layer(&self) -> LayerId {
+        match *self {
+            Self::DeleteLayer { layer }
+            | Self::MoveLayer { layer, .. }
+            | Self::AddKey { layer, .. }
+            | Self::SetValue { layer, .. }
+            | Self::MoveKey { layer, .. }
+            | Self::DeleteKey { layer, .. }
+            | Self::SetInterpolation { layer, .. }
+            | Self::CollapseToConst { layer, .. } => layer,
+        }
+    }
+
+    pub fn animation_target(&self) -> Option<(LayerId, AnimProperty)> {
         match *self {
             Self::AddKey {
                 layer, property, ..
@@ -131,7 +157,8 @@ impl EditorCommand {
             }
             | Self::CollapseToConst {
                 layer, property, ..
-            } => (layer, property),
+            } => Some((layer, property)),
+            Self::DeleteLayer { .. } | Self::MoveLayer { .. } => None,
         }
     }
 }
@@ -336,7 +363,17 @@ pub fn apply_editor_command(
     project: &mut Project,
     command: &EditorCommand,
 ) -> Result<CommandResult, EditorCommandError> {
-    let (layer_id, property) = command.target();
+    match *command {
+        EditorCommand::DeleteLayer { layer } => return delete_layer(project, layer),
+        EditorCommand::MoveLayer { layer, direction } => {
+            return move_layer(project, layer, direction);
+        }
+        _ => {}
+    }
+
+    let Some((layer_id, property)) = command.animation_target() else {
+        unreachable!();
+    };
     let duration_secs = project.duration_secs.max(0.0);
     let layer = project
         .layers
@@ -392,6 +429,63 @@ pub fn apply_editor_command(
             _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
         },
     }
+}
+
+fn delete_layer(
+    project: &mut Project,
+    layer_id: LayerId,
+) -> Result<CommandResult, EditorCommandError> {
+    let index = project
+        .layers
+        .iter()
+        .position(|layer| layer.id == layer_id)
+        .ok_or(EditorCommandError::MissingLayer)?;
+    let removed_image = match &project.layers[index].kind {
+        LayerKind::Image { image, .. } => Some(image.clone()),
+        _ => None,
+    };
+    project.layers.remove(index);
+
+    if let Some(image) = removed_image {
+        let still_referenced = project.layers.iter().any(
+            |layer| matches!(&layer.kind, LayerKind::Image { image: candidate, .. } if candidate == &image),
+        );
+        if !still_referenced {
+            project.images.retain(|reference| reference.id != image);
+        }
+    }
+
+    Ok(CommandResult {
+        changed: true,
+        selected_key: None,
+        clear_selection: true,
+    })
+}
+
+fn move_layer(
+    project: &mut Project,
+    layer_id: LayerId,
+    direction: LayerMoveDirection,
+) -> Result<CommandResult, EditorCommandError> {
+    let index = project
+        .layers
+        .iter()
+        .position(|layer| layer.id == layer_id)
+        .ok_or(EditorCommandError::MissingLayer)?;
+    let destination = match direction {
+        LayerMoveDirection::TowardBack if index > 0 => Some(index - 1),
+        LayerMoveDirection::TowardFront if index + 1 < project.layers.len() => Some(index + 1),
+        LayerMoveDirection::TowardBack | LayerMoveDirection::TowardFront => None,
+    };
+    let Some(destination) = destination else {
+        return Ok(CommandResult::default());
+    };
+    project.layers.swap(index, destination);
+    Ok(CommandResult {
+        changed: true,
+        selected_key: None,
+        clear_selection: false,
+    })
 }
 
 fn key_meta<T>(animation: &Animatable<T>) -> Vec<KeyMeta> {
@@ -575,6 +669,7 @@ fn apply_typed<T: AnimationValueType>(
                 clear_selection: true,
             })
         }
+        EditorCommand::DeleteLayer { .. } | EditorCommand::MoveLayer { .. } => unreachable!(),
     }
 }
 
@@ -588,7 +683,13 @@ fn checked_time(t: f64, duration_secs: f64) -> Result<f64, EditorCommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musicvideo_core::{ImageId, Rgba8, default_project, new_image_layer};
+    use std::path::PathBuf;
+
+    use musicvideo_core::{
+        Assets, Frame, ImageId, ImageRef, ModulationBinding, ModulationCurve, ModulationTarget,
+        ModulatorId, Rgba8, SpectrumFrame, default_project, evaluate, new_image_layer,
+        new_solid_layer, render_frame,
+    };
 
     fn opacity_keys(project: &Project) -> Vec<Keyframe<f32>> {
         let Animatable::Track(track) = &project.layers[0].opacity else {
@@ -689,6 +790,175 @@ mod tests {
         .unwrap();
         assert_eq!(project.layers[0].opacity, Animatable::Const(0.35));
         assert!(result.clear_selection);
+    }
+
+    #[test]
+    fn deleting_one_of_two_layers_keeps_the_shared_image_reference() {
+        let mut project = default_project(10.0);
+        project.layers.clear();
+        let image = ImageId::new("shared-image");
+        project.images.push(ImageRef {
+            id: image.clone(),
+            path: PathBuf::from("media/shared.png"),
+        });
+        let mut first = new_image_layer(&project, image.clone());
+        first.modulations.push(ModulationBinding {
+            target: ModulationTarget::ImageZoom,
+            modulator: ModulatorId(42),
+            amount: 0.15,
+            curve: ModulationCurve::Squared,
+        });
+        project.layers.push(first);
+        project
+            .layers
+            .push(new_image_layer(&project, image.clone()));
+
+        let deleted = project.layers[0].id;
+        apply_editor_command(&mut project, &EditorCommand::DeleteLayer { layer: deleted }).unwrap();
+
+        assert_eq!(project.layers.len(), 1);
+        assert!(project.layers[0].modulations.is_empty());
+        assert_eq!(project.images.len(), 1);
+        assert_eq!(project.images[0].id, image);
+    }
+
+    #[test]
+    fn deleting_the_last_image_layer_removes_its_image_reference() {
+        let mut project = default_project(10.0);
+        project.layers.clear();
+        let image = ImageId::new("last-image");
+        project.images.push(ImageRef {
+            id: image.clone(),
+            path: PathBuf::from("media/last.png"),
+        });
+        project.layers.push(new_image_layer(&project, image));
+
+        let deleted = project.layers[0].id;
+        apply_editor_command(&mut project, &EditorCommand::DeleteLayer { layer: deleted }).unwrap();
+
+        assert!(project.layers.is_empty());
+        assert!(project.images.is_empty());
+    }
+
+    #[test]
+    fn moving_layers_matches_back_to_front_project_order() {
+        let mut project = default_project(10.0);
+        let original = project
+            .layers
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<Vec<_>>();
+        let moved = original[1];
+
+        let toward_front = apply_editor_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: moved,
+                direction: LayerMoveDirection::TowardFront,
+            },
+        )
+        .unwrap();
+        assert!(toward_front.changed);
+        assert_eq!(
+            project
+                .layers
+                .iter()
+                .map(|layer| layer.id)
+                .collect::<Vec<_>>(),
+            [original[0], original[2], original[1], original[3]]
+        );
+
+        apply_editor_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: moved,
+                direction: LayerMoveDirection::TowardBack,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            project
+                .layers
+                .iter()
+                .map(|layer| layer.id)
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+
+    #[test]
+    fn moving_a_layer_past_either_edge_is_a_noop() {
+        let mut project = default_project(10.0);
+        let before = project.clone();
+        let backmost = project.layers.first().unwrap().id;
+        let frontmost = project.layers.last().unwrap().id;
+
+        let back_result = apply_editor_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: backmost,
+                direction: LayerMoveDirection::TowardBack,
+            },
+        )
+        .unwrap();
+        let front_result = apply_editor_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: frontmost,
+                direction: LayerMoveDirection::TowardFront,
+            },
+        )
+        .unwrap();
+
+        assert!(!back_result.changed);
+        assert!(!front_result.changed);
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn toward_front_changes_the_actual_overlap_in_the_same_direction_as_the_list() {
+        let mut project = default_project(10.0);
+        project.output.width = 1;
+        project.output.height = 1;
+        project.layers.clear();
+
+        let mut red = new_solid_layer(&project);
+        red.rect = Animatable::Const(NormRect::FULL);
+        red.corner_radius = Animatable::Const(0.0);
+        red.kind = LayerKind::Solid {
+            fill: Animatable::Const(Fill::Solid(Rgba8::new(255, 0, 0, 255))),
+        };
+        let red_id = red.id;
+        project.layers.push(red);
+
+        let mut blue = new_solid_layer(&project);
+        blue.rect = Animatable::Const(NormRect::FULL);
+        blue.corner_radius = Animatable::Const(0.0);
+        blue.kind = LayerKind::Solid {
+            fill: Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 255, 255))),
+        };
+        project.layers.push(blue);
+
+        let assets = Assets::default();
+        let spectrum = SpectrumFrame::default();
+        let mut frame = Frame::new(1, 1).unwrap();
+        let report =
+            render_frame(&evaluate(&project, 0.0, &spectrum), &assets, &mut frame).unwrap();
+        assert!(report.unresolved_assets.is_empty());
+        assert_eq!(frame.rgba, [0, 0, 255, 255]);
+
+        apply_editor_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: red_id,
+                direction: LayerMoveDirection::TowardFront,
+            },
+        )
+        .unwrap();
+        let report =
+            render_frame(&evaluate(&project, 0.0, &spectrum), &assets, &mut frame).unwrap();
+        assert!(report.unresolved_assets.is_empty());
+        assert_eq!(frame.rgba, [255, 0, 0, 255]);
     }
 
     #[test]

@@ -883,7 +883,7 @@ impl MusicVideoLabApp {
                             format!("プロジェクトは開きましたが音声を再生できません: {error}");
                         None
                     });
-                self.editor_state.reconcile(&self.project);
+                self.editor_state.reset_for_project(&self.project);
                 self.preview_report = RenderReport::default();
                 self.invalidate_modulator_calibration();
                 let issue_count =

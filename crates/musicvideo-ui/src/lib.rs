@@ -10,7 +10,7 @@ mod timeline;
 
 pub use keyframes::{
     AnimProperty, AnimationValue, CommandResult, EditorCommand, EditorCommandError,
-    apply_editor_command,
+    LayerMoveDirection, apply_editor_command,
 };
 pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
@@ -38,6 +38,7 @@ pub struct EditorState {
     selected_layer: usize,
     selected_key: Option<KeySelection>,
     dragging_key: Option<KeySelection>,
+    pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
 }
 
@@ -47,6 +48,7 @@ impl Default for EditorState {
             selected_layer: 1,
             selected_key: None,
             dragging_key: None,
+            pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
         }
     }
@@ -59,6 +61,17 @@ impl EditorState {
 
     pub fn select_layer(&mut self, index: usize) {
         self.selected_layer = index;
+    }
+
+    /// Clears selections and pending confirmations that belong to the previous project.
+    pub fn reset_for_project(&mut self, project: &Project) {
+        self.selected_layer = self
+            .selected_layer
+            .min(project.layers.len().saturating_sub(1));
+        self.selected_key = None;
+        self.dragging_key = None;
+        self.pending_layer_delete = None;
+        self.modulator_editor = ModulatorEditorState::default();
     }
 
     pub fn reconcile(&mut self, project: &Project) {
@@ -77,6 +90,12 @@ impl EditorState {
             self.selected_key = None;
             self.dragging_key = None;
         }
+        if self
+            .pending_layer_delete
+            .is_some_and(|id| !project.layers.iter().any(|layer| layer.id == id))
+        {
+            self.pending_layer_delete = None;
+        }
     }
 
     fn select_layer_id(&mut self, project: &Project, id: LayerId) {
@@ -86,30 +105,40 @@ impl EditorState {
     }
 
     fn apply_command(&mut self, project: &mut Project, command: &EditorCommand) -> bool {
-        let (layer, property) = command.target();
+        let selected_layer = project
+            .layers
+            .get(self.selected_layer)
+            .map(|layer| layer.id);
+        let animation_target = command.animation_target();
         let Ok(result) = apply_editor_command(project, command) else {
             return false;
         };
-        if result.clear_selection
-            && self
-                .selected_key
-                .is_some_and(|selected| selected.layer == layer && selected.property == property)
-        {
-            self.selected_key = None;
-            self.dragging_key = None;
-        } else if let Some(key_index) = result.selected_key {
-            let selection = KeySelection {
-                layer,
-                property,
-                key_index,
-            };
-            self.selected_key = Some(selection);
-            if self
-                .dragging_key
-                .is_some_and(|dragging| dragging.layer == layer && dragging.property == property)
+        if let Some((layer, property)) = animation_target {
+            if result.clear_selection
+                && self.selected_key.is_some_and(|selected| {
+                    selected.layer == layer && selected.property == property
+                })
             {
-                self.dragging_key = Some(selection);
+                self.selected_key = None;
+                self.dragging_key = None;
+            } else if let Some(key_index) = result.selected_key {
+                let selection = KeySelection {
+                    layer,
+                    property,
+                    key_index,
+                };
+                self.selected_key = Some(selection);
+                if self.dragging_key.is_some_and(|dragging| {
+                    dragging.layer == layer && dragging.property == property
+                }) {
+                    self.dragging_key = Some(selection);
+                }
             }
+        } else {
+            if let Some(selected_layer) = selected_layer {
+                self.select_layer_id(project, selected_layer);
+            }
+            self.reconcile(project);
         }
         result.changed
     }
@@ -181,7 +210,8 @@ pub fn draw_editor(
             ui.set_max_width(body_width);
             ui.set_min_height(body_height);
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-            egui::ScrollArea::vertical()
+            let context = ui.ctx().clone();
+            let mut response = egui::ScrollArea::vertical()
                 .max_height(body_height)
                 .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
@@ -205,6 +235,7 @@ pub fn draw_editor(
                     );
                     ui.separator();
                     ui.heading("レイヤー");
+                    ui.small("一覧の上が奥、下が手前です");
                     for (index, layer) in project.layers.iter().enumerate() {
                         if ui
                             .selectable_label(state.selected_layer == index, &layer.name)
@@ -219,6 +250,58 @@ pub fn draw_editor(
                                 state.dragging_key = None;
                             }
                         }
+                    }
+
+                    let selected_layer = project
+                        .layers
+                        .get(state.selected_layer)
+                        .map(|layer| layer.id);
+                    let mut order_command = None;
+                    ui.horizontal(|ui| {
+                        let can_move_toward_back =
+                            selected_layer.is_some() && state.selected_layer > 0;
+                        if ui
+                            .add_enabled(
+                                can_move_toward_back,
+                                egui::Button::new("一覧の上へ（奥）"),
+                            )
+                            .on_hover_text("描画順を1つ奥へ移動します")
+                            .clicked()
+                            && let Some(layer) = selected_layer
+                        {
+                            order_command = Some(EditorCommand::MoveLayer {
+                                layer,
+                                direction: LayerMoveDirection::TowardBack,
+                            });
+                        }
+                        let can_move_toward_front = selected_layer.is_some()
+                            && state.selected_layer + 1 < project.layers.len();
+                        if ui
+                            .add_enabled(
+                                can_move_toward_front,
+                                egui::Button::new("一覧の下へ（手前）"),
+                            )
+                            .on_hover_text("描画順を1つ手前へ移動します")
+                            .clicked()
+                            && let Some(layer) = selected_layer
+                        {
+                            order_command = Some(EditorCommand::MoveLayer {
+                                layer,
+                                direction: LayerMoveDirection::TowardFront,
+                            });
+                        }
+                    });
+                    if let Some(command) = order_command {
+                        project_changed |= state.apply_command(project, &command);
+                    }
+                    if ui
+                        .add_enabled(
+                            selected_layer.is_some(),
+                            egui::Button::new("選択中のレイヤーを削除…"),
+                        )
+                        .clicked()
+                    {
+                        state.pending_layer_delete = selected_layer;
                     }
 
                     let mut new_layer = None;
@@ -246,14 +329,18 @@ pub fn draw_editor(
                             NewLayerPreset::LinearSpectrum => {
                                 vec![new_linear_spectrum_layer(project)]
                             }
-                            NewLayerPreset::MivSpectrum => vec![new_miv_spectrum_layer(project)],
+                            NewLayerPreset::MivSpectrum => {
+                                vec![new_miv_spectrum_layer(project)]
+                            }
                             NewLayerPreset::MivSpectrumKeyboard => {
                                 new_miv_spectrum_keyboard_layers(project).into()
                             }
                             NewLayerPreset::PitchKeyboard => {
                                 vec![new_pitch_keyboard_layer(project)]
                             }
-                            NewLayerPreset::ProgressBar => vec![new_progress_bar_layer(project)],
+                            NewLayerPreset::ProgressBar => {
+                                vec![new_progress_bar_layer(project)]
+                            }
                             NewLayerPreset::TimeText => vec![new_time_text_layer(project)],
                             NewLayerPreset::Text => vec![new_text_layer(project)],
                             NewLayerPreset::Solid => vec![new_solid_layer(project)],
@@ -289,10 +376,57 @@ pub fn draw_editor(
                         add_image_layer_requested,
                     }
                 })
-                .inner
+                .inner;
+            if let Some(command) = draw_layer_delete_confirmation(&context, project, state) {
+                response.project_changed |= state.apply_command(project, &command);
+            }
+            response
         },
     )
     .inner
+}
+
+fn draw_layer_delete_confirmation(
+    context: &egui::Context,
+    project: &Project,
+    state: &mut EditorState,
+) -> Option<EditorCommand> {
+    let layer_id = state.pending_layer_delete?;
+    let Some(layer) = project.layers.iter().find(|layer| layer.id == layer_id) else {
+        state.pending_layer_delete = None;
+        return None;
+    };
+    let layer_name = layer.name.clone();
+    let mut confirmed = false;
+    let mut cancelled = false;
+    let response = egui::Modal::new(egui::Id::new("musicvideo-delete-layer-confirmation")).show(
+        context,
+        |ui| {
+            ui.set_min_width(320.0);
+            ui.heading("レイヤーの削除");
+            ui.add_space(8.0);
+            ui.label(format!("レイヤー「{layer_name}」を削除しますか？"));
+            ui.small("この操作はまだ元に戻せません。");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("削除する").clicked() {
+                    confirmed = true;
+                }
+                if ui.button("キャンセル").clicked() {
+                    cancelled = true;
+                }
+            });
+        },
+    );
+    if confirmed {
+        state.pending_layer_delete = None;
+        Some(EditorCommand::DeleteLayer { layer: layer_id })
+    } else {
+        if cancelled || response.should_close() {
+            state.pending_layer_delete = None;
+        }
+        None
+    }
 }
 
 /// Draws the already-composited frame. Texture creation and updates stay with the caller.
@@ -928,5 +1062,36 @@ mod tests {
                 "単色",
             ]
         );
+    }
+
+    #[test]
+    fn layer_order_command_keeps_the_same_layer_selected() {
+        let mut project = default_project(10.0);
+        let mut state = EditorState::default();
+        state.select_layer(1);
+        let selected = project.layers[1].id;
+
+        assert!(state.apply_command(
+            &mut project,
+            &EditorCommand::MoveLayer {
+                layer: selected,
+                direction: LayerMoveDirection::TowardFront,
+            },
+        ));
+
+        assert_eq!(state.selected_layer(), 2);
+        assert_eq!(project.layers[state.selected_layer()].id, selected);
+    }
+
+    #[test]
+    fn project_replacement_clears_a_pending_delete_even_when_layer_ids_repeat() {
+        let first = default_project(10.0);
+        let second = default_project(20.0);
+        let mut state = EditorState::default();
+        state.pending_layer_delete = Some(first.layers[1].id);
+
+        state.reset_for_project(&second);
+
+        assert_eq!(state.pending_layer_delete, None);
     }
 }
