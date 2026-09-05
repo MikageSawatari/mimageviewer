@@ -252,11 +252,57 @@ pub struct MonoToneAxis {
 /// 残差を返す。平均・共分散・主成分軸は許容値に依存しないため、この値は
 /// `mono_tolerance` が変わっても再利用できる。判定不能な極小サンプル、
 /// ほぼ単色な画像、主成分軸が縮退した画像では `None` を返す。
+/// Wall and executed cycles for the three parts of `mono_tone_axis`.
+///
+/// Its caller measured 7.5% busy - it waits rather than computes - and the only
+/// operations here that can wait are the two allocations and touching the source
+/// pixels. This says which, without guessing a tenth time.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MonoToneAxisTiming {
+    pub sample_ms: f64,
+    pub sample_cycles: u64,
+    pub compute_ms: f64,
+    pub compute_cycles: u64,
+    pub residual_ms: f64,
+    pub residual_cycles: u64,
+}
+
+#[cfg(windows)]
+static MONO_TIMING: std::sync::Mutex<Option<MonoToneAxisTiming>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn cycles_now() -> u64 {
+    let mut c = 0u64;
+    unsafe {
+        let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
+            windows::Win32::System::Threading::GetCurrentThread(),
+            &mut c,
+        );
+    }
+    c
+}
+
+/// Take and clear the accumulated split. Returns `None` when nothing ran.
+#[cfg(windows)]
+pub fn take_mono_tone_axis_timing() -> Option<MonoToneAxisTiming> {
+    MONO_TIMING.lock().ok().and_then(|mut slot| slot.take())
+}
+
+#[cfg(not(windows))]
+pub fn take_mono_tone_axis_timing() -> Option<()> {
+    None
+}
+
 pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
     let total = src.pixels.len();
     if total == 0 {
         return None;
     }
+    #[cfg(windows)]
+    let timing_on = crate::perf::is_enabled();
+    #[cfg(windows)]
+    let (t_sample, c_sample) = (std::time::Instant::now(), cycles_now());
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
     let samples: Vec<[f32; 3]> = src
         .pixels
@@ -266,9 +312,16 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
         .take(MONO_SAMPLE_LIMIT)
         .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
         .collect();
+    #[cfg(windows)]
+    let (sample_ms, sample_cycles) = (
+        t_sample.elapsed().as_secs_f64() * 1000.0,
+        cycles_now().saturating_sub(c_sample),
+    );
     if samples.len() < 8 {
         return None;
     }
+    #[cfg(windows)]
+    let (t_compute, c_compute) = (std::time::Instant::now(), cycles_now());
 
     let inv_n = 1.0 / samples.len() as f32;
     let mut mean = [0.0_f32; 3];
@@ -310,6 +363,13 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
         axis = [next[0] / length, next[1] / length, next[2] / length];
     }
 
+    #[cfg(windows)]
+    let (compute_ms, compute_cycles) = (
+        t_compute.elapsed().as_secs_f64() * 1000.0,
+        cycles_now().saturating_sub(c_compute),
+    );
+    #[cfg(windows)]
+    let (t_res, c_res) = (std::time::Instant::now(), cycles_now());
     let mut residuals = samples
         .iter()
         .map(|sample| {
@@ -326,6 +386,16 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
         .collect::<Vec<_>>();
     let percentile_index = required_mono_inliers(residuals.len()) - 1;
     let (_, p95, _) = residuals.select_nth_unstable_by(percentile_index, |a, b| a.total_cmp(b));
+    #[cfg(windows)]
+    if timing_on && let Ok(mut slot) = MONO_TIMING.lock() {
+        let acc = slot.get_or_insert_with(MonoToneAxisTiming::default);
+        acc.sample_ms += sample_ms;
+        acc.sample_cycles += sample_cycles;
+        acc.compute_ms += compute_ms;
+        acc.compute_cycles += compute_cycles;
+        acc.residual_ms += t_res.elapsed().as_secs_f64() * 1000.0;
+        acc.residual_cycles += cycles_now().saturating_sub(c_res);
+    }
     Some(MonoToneAxis {
         mean,
         axis,

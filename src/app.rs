@@ -66350,6 +66350,8 @@ impl App {
             perf_call.creative_lut_applied = Some(creative_lut.is_some());
         }
         let build_pixels_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
+        #[cfg(windows)]
+        let _ = crate::colorize::take_mono_tone_axis_timing();
         let rendition = build_passthrough_rendition_pixels(
             &source_pixels,
             &params,
@@ -66361,6 +66363,35 @@ impl App {
             PassthroughRenditionPerfSpan::BuildPixels,
             build_pixels_t0,
         );
+        // The span above measures 7% busy: it waits rather than computes, and the only
+        // things here that can wait are the two allocations and the first touch of the
+        // source pixels. Split those three so the next log names which.
+        #[cfg(windows)]
+        if crate::perf::is_enabled()
+            && let Some(t) = crate::colorize::take_mono_tone_axis_timing()
+        {
+            crate::perf::event(
+                "fs",
+                "mono_tone_axis_split",
+                None,
+                self.input_seq,
+                &[
+                    ("sample_ms", serde_json::Value::from(t.sample_ms)),
+                    ("sample_cycles", serde_json::Value::from(t.sample_cycles)),
+                    ("compute_ms", serde_json::Value::from(t.compute_ms)),
+                    ("compute_cycles", serde_json::Value::from(t.compute_cycles)),
+                    ("residual_ms", serde_json::Value::from(t.residual_ms)),
+                    (
+                        "residual_cycles",
+                        serde_json::Value::from(t.residual_cycles),
+                    ),
+                    (
+                        "source_pixels",
+                        serde_json::Value::from(source_pixels.pixels.len()),
+                    ),
+                ],
+            );
+        }
         let colorize_applied = rendition.colorize_applied;
         let pixel_buffer_generated = rendition.pixels.is_some();
         let catalog_texture_reused = !pixel_buffer_generated && !from_edit_preview;
