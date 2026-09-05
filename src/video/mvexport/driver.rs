@@ -112,6 +112,11 @@ pub(super) fn export(
     .map_err(|error| {
         ExportError::InvalidRequest(format!("スペクトラム解析を初期化できません: {error}"))
     })?;
+    spectrum
+        .configure_modulators(&request.project.modulators)
+        .map_err(|error| {
+            ExportError::InvalidRequest(format!("モジュレータを初期化できません: {error}"))
+        })?;
     let mut rgba = Frame::new(request.project.output.width, request.project.output.height)
         .map_err(|error| ExportError::Render(format!("RGBA フレームを確保できません: {error}")))?;
     let mut converter = RgbaConverter::new(

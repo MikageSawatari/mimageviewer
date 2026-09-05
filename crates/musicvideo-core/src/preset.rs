@@ -1,8 +1,10 @@
 use crate::model::{
-    Animatable, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind, MusicColorMode, NormRect,
-    Output, PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
-    SpectrumShape, TextAlign, TimeFormat, TimeTextLayer,
+    Animatable, BandRange, BandWeighting, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind,
+    Modulator, ModulatorId, ModulatorSource, MusicColorMode, NormRect, Output, PitchKeyboardLayer,
+    ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign,
+    TimeFormat, TimeTextLayer,
 };
+use crate::spectrum::Smoothing;
 
 pub const DEFAULT_BACKGROUND_IMAGE_ID: &str = "background";
 pub const DEFAULT_FONT_KEY: &str = "default";
@@ -38,6 +40,7 @@ pub fn default_project(duration_secs: f64) -> Project {
         rotation: Animatable::Const(0.0),
         corner_radius: Animatable::Const(corner_radius),
         glow: Animatable::Const(glow),
+        modulations: Vec::new(),
         kind,
     };
     let duration_secs = if duration_secs.is_finite() {
@@ -52,6 +55,7 @@ pub fn default_project(duration_secs: f64) -> Project {
         output: DEFAULT_OUTPUT,
         duration_secs,
         display_gain_db: 0.0,
+        modulators: Vec::new(),
         layers: vec![
             layer(
                 1,
@@ -137,6 +141,7 @@ pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
         rotation: Animatable::Const(0.0),
         corner_radius: Animatable::Const(4.0),
         glow: Animatable::Const(None),
+        modulations: Vec::new(),
         kind: LayerKind::PitchKeyboard(PitchKeyboardLayer {
             background: Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0))),
             color_mode: MusicColorMode::Custom,
@@ -155,9 +160,35 @@ pub fn new_image_layer(project: &Project, image: ImageId) -> Layer {
         rotation: Animatable::Const(0.0),
         corner_radius: Animatable::Const(0.0),
         glow: Animatable::Const(None),
+        modulations: Vec::new(),
         kind: LayerKind::Image {
             image,
             fit: Fit::Cover,
+        },
+    }
+}
+
+pub fn new_band_energy_modulator(project: &Project) -> Modulator {
+    let next_id = project
+        .modulators
+        .iter()
+        .map(|modulator| modulator.id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    Modulator {
+        id: ModulatorId(next_id),
+        name: format!("帯域エネルギー {next_id}"),
+        source: ModulatorSource::BandEnergy {
+            range: BandRange::Hz {
+                low_hz: 60.0,
+                high_hz: 120.0,
+            },
+            smoothing: Smoothing::Average { factor: 0.7 },
+            weighting: BandWeighting::Raw,
+            gain_db: 0.0,
+            floor: 0.0,
+            ceiling: 1.0,
         },
     }
 }

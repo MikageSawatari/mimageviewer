@@ -8,8 +8,9 @@ use music_core::{
     SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalyzer, prepare_keyboard_frame_into,
 };
 use musicvideo_core::{
-    Assets, Frame, ImageId, Project, RenderReport, ScaledImageCacheStats, Smoothing,
-    SpectrumSource, UnresolvedAsset, evaluate, render_frame,
+    Assets, Frame, ImageId, ModulationBinding, ModulationCurve, ModulationTarget, Project,
+    RenderReport, ScaledImageCacheStats, Smoothing, SpectrumSource, UnresolvedAsset, evaluate,
+    new_band_energy_modulator, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -94,6 +95,9 @@ pub fn export_png_sequence(
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("スペクトラム解析を初期化できません: {error}"))?;
+    spectrum
+        .configure_modulators(&project.modulators)
+        .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("出力フレームを確保できません: {error}"))?;
     let mut analysis_ms = Vec::with_capacity(total_frames);
@@ -301,12 +305,19 @@ pub fn run_benchmark(frames: usize, font: &FontData) -> Result<(), String> {
     if frames == 0 {
         return Err("ベンチマークのフレーム数は 1 以上を指定してください".to_owned());
     }
-    let without_glow = benchmark_once(frames, font, false)?;
-    let with_glow = benchmark_once(frames, font, true)?;
+    let without_glow = benchmark_once(frames, font, false, false)?;
+    let with_glow = benchmark_once(frames, font, true, false)?;
+    let with_modulation = benchmark_once(frames, font, true, true)?;
     println!(
         "musicvideo benchmark glow_delta: composition_mean_ms={:.3} composition_p95_ms={:.3}",
         with_glow.composition.mean_ms - without_glow.composition.mean_ms,
         with_glow.composition.p95_ms - without_glow.composition.p95_ms,
+    );
+    println!(
+        "musicvideo benchmark modulation_delta: analysis_mean_ms={:.3} composition_mean_ms={:.3} total_mean_ms={:.3}",
+        with_modulation.analysis.mean_ms - with_glow.analysis.mean_ms,
+        with_modulation.composition.mean_ms - with_glow.composition.mean_ms,
+        with_modulation.total.mean_ms - with_glow.total.mean_ms,
     );
     Ok(())
 }
@@ -315,13 +326,14 @@ fn benchmark_once(
     frames: usize,
     font: &FontData,
     glow_enabled: bool,
+    modulation_enabled: bool,
 ) -> Result<RenderStats, String> {
     let assets = create_assets(Some(font))?;
     assets.insert_image(
         ImageId::new(BACKGROUND_ID),
         synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
     );
-    let project = benchmark_project(frames as f64 / 60.0, glow_enabled);
+    let project = benchmark_project(frames as f64 / 60.0, glow_enabled, modulation_enabled);
     let pcm = synthetic_chirp_pcm(project.duration_secs + 1.0);
     let mut spectrum = SpectrumSource::new(
         BENCHMARK_SAMPLE_RATE,
@@ -329,6 +341,9 @@ fn benchmark_once(
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("ベンチマーク解析を初期化できません: {error}"))?;
+    spectrum
+        .configure_modulators(&project.modulators)
+        .map_err(|error| format!("ベンチマークのモジュレータを初期化できません: {error}"))?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("ベンチマーク用フレームを確保できません: {error}"))?;
 
@@ -373,8 +388,9 @@ fn benchmark_once(
     let cache_after_measurement = assets.scaled_image_cache_stats();
     validate_benchmark_cache(cache_after_warmup, cache_after_measurement, frames as u64)?;
     println!(
-        "musicvideo benchmark: glow={} keyboard=on frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
+        "musicvideo benchmark: glow={} modulation={} keyboard=on frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
         if glow_enabled { "on" } else { "off" },
+        if modulation_enabled { "on" } else { "off" },
         stats.frames,
         stats.width,
         stats.height,
@@ -406,13 +422,23 @@ fn benchmark_once(
     Ok(stats)
 }
 
-fn benchmark_project(duration_secs: f64, glow_enabled: bool) -> Project {
+fn benchmark_project(duration_secs: f64, glow_enabled: bool, modulation_enabled: bool) -> Project {
     let mut project = default_project(duration_secs);
     project.layers.push(new_pitch_keyboard_layer(&project));
     if !glow_enabled {
         for layer in &mut project.layers {
             layer.glow = musicvideo_core::Animatable::Const(None);
         }
+    }
+    if modulation_enabled {
+        let modulator = new_band_energy_modulator(&project);
+        project.layers[1].modulations.push(ModulationBinding {
+            target: ModulationTarget::SpectrumRadius,
+            modulator: modulator.id,
+            amount: 80.0,
+            curve: ModulationCurve::Squared,
+        });
+        project.modulators.push(modulator);
     }
     project
 }
@@ -732,13 +758,15 @@ mod tests {
 
     #[test]
     fn benchmark_scene_includes_the_pitch_keyboard_path() {
-        let project = benchmark_project(10.0, true);
+        let project = benchmark_project(10.0, true, true);
         assert!(
             project
                 .layers
                 .iter()
                 .any(|layer| matches!(&layer.kind, LayerKind::PitchKeyboard(_)))
         );
+        assert_eq!(project.modulators.len(), 1);
+        assert_eq!(project.layers[1].modulations.len(), 1);
     }
 
     #[test]

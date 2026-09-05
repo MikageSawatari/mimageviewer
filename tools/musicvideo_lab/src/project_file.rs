@@ -194,8 +194,9 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use musicvideo_core::{
-        Animatable, AudioRef, ImageId, ImageRef, Interp, Keyframe, Track, default_project,
-        new_image_layer,
+        Animatable, AudioRef, BandRange, BandWeighting, ImageId, ImageRef, Interp, Keyframe,
+        ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, Smoothing, Track,
+        default_project, new_band_energy_modulator, new_image_layer,
     };
 
     #[test]
@@ -298,6 +299,51 @@ mod tests {
                 (6.0, Interp::Step, 0.75),
                 (8.0, Interp::EaseInOut, 0.0),
             ]
+        );
+    }
+
+    #[test]
+    fn modulator_and_binding_round_trip_without_reordering() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("modulators.mivmv.json");
+        let mut project = default_project(12.0);
+        let mut bass = new_band_energy_modulator(&project);
+        bass.name = "C1–B1".to_owned();
+        bass.source = ModulatorSource::BandEnergy {
+            range: BandRange::Semitone {
+                low_midi: 24,
+                high_midi: 35,
+            },
+            smoothing: Smoothing::Average { factor: 0.65 },
+            weighting: BandWeighting::MivDisplay,
+            gain_db: 4.5,
+            floor: 0.15,
+            ceiling: 0.8,
+        };
+        let id = bass.id;
+        project.modulators.push(bass);
+        project.layers[1].modulations = vec![
+            ModulationBinding {
+                target: ModulationTarget::SpectrumRadius,
+                modulator: id,
+                amount: 80.0,
+                curve: ModulationCurve::Squared,
+            },
+            ModulationBinding {
+                target: ModulationTarget::GlowAlpha,
+                modulator: id,
+                amount: -0.4,
+                curve: ModulationCurve::Sqrt,
+            },
+        ];
+
+        save_project(&project_path, &project).unwrap();
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored, project);
+        assert_eq!(restored.modulators[0].id, id);
+        assert_eq!(
+            restored.layers[1].modulations,
+            project.layers[1].modulations
         );
     }
 

@@ -69,6 +69,35 @@ pub struct SpectrumAnalysis {
     pub note_min_midi: u8,
 }
 
+/// An arbitrary frequency interval evaluated from the same multi-resolution FFT
+/// windows as [`SpectrumAnalysis`]. MIDI endpoints include the complete notes.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SpectrumRange {
+    Hz { low_hz: f32, high_hz: f32 },
+    Midi { low_midi: u8, high_midi: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpectrumWeighting {
+    #[default]
+    None,
+    /// Apply the same equal-loudness display curve used by the music spectrum.
+    Display,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpectrumRangeRequest {
+    pub range: SpectrumRange,
+    pub weighting: SpectrumWeighting,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpectrumAnalysisWithRanges {
+    pub spectrum: SpectrumAnalysis,
+    /// One normalized 0..=1 value for each request, in request order.
+    pub range_values: Vec<f32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MultiResolutionWindowSpec {
     size: usize,
@@ -514,13 +543,29 @@ impl SpectrumAnalyzer {
         sample_rate: u32,
         center_secs: f64,
     ) -> SpectrumAnalysis {
+        self.analyze_with_ranges(stereo_samples, sample_rate, center_secs, &[])
+            .spectrum
+    }
+
+    /// Produces the ordinary spectrum plus arbitrary range values after one FFT
+    /// window update. Range integration never performs another analysis pass.
+    pub fn analyze_with_ranges(
+        &mut self,
+        stereo_samples: &[f32],
+        sample_rate: u32,
+        center_secs: f64,
+        range_requests: &[SpectrumRangeRequest],
+    ) -> SpectrumAnalysisWithRanges {
         let bands = self.bands;
         let frame_count = stereo_samples.len() / 2;
         if sample_rate == 0 || frame_count == 0 {
-            return SpectrumAnalysis {
-                bands: vec![0.0; bands],
-                notes: vec![0.0; SPECTRUM_NOTE_BANDS],
-                note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            return SpectrumAnalysisWithRanges {
+                spectrum: SpectrumAnalysis {
+                    bands: vec![0.0; bands],
+                    notes: vec![0.0; SPECTRUM_NOTE_BANDS],
+                    note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+                },
+                range_values: vec![0.0; range_requests.len()],
             };
         }
 
@@ -565,10 +610,18 @@ impl SpectrumAnalyzer {
             }
         }
 
-        SpectrumAnalysis {
-            bands: values,
-            notes,
-            note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+        let range_values = range_requests
+            .iter()
+            .map(|request| self.value_for_range(*request, max_hz))
+            .collect();
+
+        SpectrumAnalysisWithRanges {
+            spectrum: SpectrumAnalysis {
+                bands: values,
+                notes,
+                note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            },
+            range_values,
         }
     }
 
@@ -688,6 +741,24 @@ impl SpectrumAnalyzer {
             .map(|window| range_power_from_fft(&window.powers, window.bin_hz, low_hz, high_hz))
             .unwrap_or(base);
         (base * (1.0 - secondary_mix) + secondary * secondary_mix).max(0.0)
+    }
+
+    fn value_for_range(&self, request: SpectrumRangeRequest, max_hz: f32) -> f32 {
+        let Some((low_hz, high_hz)) = spectrum_range_hz(request.range) else {
+            return 0.0;
+        };
+        let low_hz = low_hz.max(10.0);
+        let high_hz = high_hz.min(max_hz);
+        if high_hz <= low_hz {
+            return 0.0;
+        }
+        let center_hz = (low_hz * high_hz).sqrt();
+        let power = self.power_for_range(center_hz, low_hz, high_hz, false);
+        let display_gain_db = match request.weighting {
+            SpectrumWeighting::None => 0.0,
+            SpectrumWeighting::Display => spectrum_display_weight_db(center_hz),
+        };
+        power_to_display_value(power, display_gain_db)
     }
 
     fn window_weights(&self, hz: f32) -> Vec<(usize, f32)> {
@@ -849,6 +920,23 @@ fn spectrum_band_midi(index: usize, total: usize) -> Option<u8> {
 
 fn midi_to_hz(midi: u8) -> f32 {
     440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+fn spectrum_range_hz(range: SpectrumRange) -> Option<(f32, f32)> {
+    let (low_hz, high_hz) = match range {
+        SpectrumRange::Hz { low_hz, high_hz } => (low_hz, high_hz),
+        SpectrumRange::Midi {
+            low_midi,
+            high_midi,
+        } if low_midi <= high_midi => {
+            let (low_hz, _) = midi_note_hz_range(low_midi);
+            let (_, high_hz) = midi_note_hz_range(high_midi);
+            (low_hz, high_hz)
+        }
+        SpectrumRange::Midi { .. } => return None,
+    };
+    (low_hz.is_finite() && high_hz.is_finite() && low_hz > 0.0 && high_hz > low_hz)
+        .then_some((low_hz, high_hz))
 }
 
 fn midi_note_hz_range(midi: u8) -> (f32, f32) {
@@ -1628,6 +1716,90 @@ mod tests {
         assert_eq!(spectrum.notes.len(), SPECTRUM_NOTE_BANDS);
         let a4 = (69 - spectrum.note_min_midi) as usize;
         assert!(spectrum.notes[a4] > 0.5);
+    }
+
+    #[test]
+    fn arbitrary_hz_and_midi_ranges_share_the_ordinary_analysis_pass() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let phase = std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0;
+            let x = phase.sin() * 0.5;
+            samples.extend([x, x]);
+        }
+        let requests = [
+            SpectrumRangeRequest {
+                range: SpectrumRange::Midi {
+                    low_midi: 69,
+                    high_midi: 69,
+                },
+                weighting: SpectrumWeighting::None,
+            },
+            SpectrumRangeRequest {
+                range: SpectrumRange::Hz {
+                    low_hz: 430.0,
+                    high_hz: 450.0,
+                },
+                weighting: SpectrumWeighting::None,
+            },
+            SpectrumRangeRequest {
+                range: SpectrumRange::Hz {
+                    low_hz: 100.0,
+                    high_hz: 200.0,
+                },
+                weighting: SpectrumWeighting::None,
+            },
+        ];
+        let mut ranged = SpectrumAnalyzer::new(SPECTRUM_BAND_COUNT);
+        let result = ranged.analyze_with_ranges(&samples, 48_000, 1.0, &requests);
+        let mut ordinary = SpectrumAnalyzer::new(SPECTRUM_BAND_COUNT);
+        let expected = ordinary.analyze(&samples, 48_000, 1.0);
+
+        assert_eq!(result.spectrum, expected);
+        assert_eq!(result.range_values.len(), requests.len());
+        assert!(result.range_values[0] > 0.5);
+        assert!(result.range_values[1] > 0.5);
+        assert!(result.range_values[2] < result.range_values[0] * 0.25);
+    }
+
+    #[test]
+    fn range_weighting_is_optional_and_invalid_ranges_are_silent() {
+        let mut samples = Vec::new();
+        for i in 0..96_000 {
+            let phase = std::f32::consts::TAU * 40.0 * i as f32 / 48_000.0;
+            let x = phase.sin() * 0.2;
+            samples.extend([x, x]);
+        }
+        let mut analyzer = SpectrumAnalyzer::new(64);
+        let result = analyzer.analyze_with_ranges(
+            &samples,
+            48_000,
+            1.0,
+            &[
+                SpectrumRangeRequest {
+                    range: SpectrumRange::Hz {
+                        low_hz: 35.0,
+                        high_hz: 45.0,
+                    },
+                    weighting: SpectrumWeighting::None,
+                },
+                SpectrumRangeRequest {
+                    range: SpectrumRange::Hz {
+                        low_hz: 35.0,
+                        high_hz: 45.0,
+                    },
+                    weighting: SpectrumWeighting::Display,
+                },
+                SpectrumRangeRequest {
+                    range: SpectrumRange::Midi {
+                        low_midi: 60,
+                        high_midi: 48,
+                    },
+                    weighting: SpectrumWeighting::None,
+                },
+            ],
+        );
+        assert!(result.range_values[0] > result.range_values[1]);
+        assert_eq!(result.range_values[2], 0.0);
     }
 
     #[test]

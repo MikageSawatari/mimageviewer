@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+use crate::spectrum::Smoothing;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
 
@@ -15,6 +17,9 @@ impl ImageId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModulatorId(pub u64);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
@@ -25,8 +30,95 @@ pub struct Project {
     /// 鍵盤表示へ適用する追加の表示ゲイン。音声そのものの音量は変えない。
     #[serde(default)]
     pub display_gain_db: f32,
+    /// Audio-driven sources evaluated once per frame before layer bindings.
+    #[serde(default)]
+    pub modulators: Vec<Modulator>,
     /// Drawing order. The first layer is the backmost layer.
     pub layers: Vec<Layer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Modulator {
+    pub id: ModulatorId,
+    pub name: String,
+    pub source: ModulatorSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ModulatorSource {
+    BandEnergy {
+        range: BandRange,
+        smoothing: Smoothing,
+        #[serde(default)]
+        weighting: BandWeighting,
+        gain_db: f32,
+        floor: f32,
+        ceiling: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BandRange {
+    Hz { low_hz: f32, high_hz: f32 },
+    Semitone { low_midi: u8, high_midi: u8 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BandWeighting {
+    #[default]
+    Raw,
+    MivDisplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModulationTarget {
+    Opacity,
+    Scale,
+    Rotation,
+    CornerRadius,
+    GlowRadius,
+    GlowAlpha,
+    FillBrightness,
+    SpectrumThickness,
+    SpectrumRadius,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModulationCurve {
+    #[default]
+    Linear,
+    Squared,
+    Sqrt,
+}
+
+impl ModulationCurve {
+    pub fn apply(self, value: f32) -> f32 {
+        let value = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        match self {
+            Self::Linear => value,
+            Self::Squared => value * value,
+            Self::Sqrt => value.sqrt(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModulationBinding {
+    pub target: ModulationTarget,
+    pub modulator: ModulatorId,
+    pub amount: f32,
+    #[serde(default)]
+    pub curve: ModulationCurve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModulatorValue {
+    pub id: ModulatorId,
+    pub value: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +152,8 @@ pub struct Layer {
     pub corner_radius: Animatable<f32>,
     #[serde(default = "default_glow")]
     pub glow: Animatable<Option<Glow>>,
+    #[serde(default)]
+    pub modulations: Vec<ModulationBinding>,
     pub kind: LayerKind,
 }
 
@@ -411,7 +505,9 @@ mod tests {
             .push(crate::preset::new_pitch_keyboard_layer(&project));
         let mut value = serde_json::to_value(project).unwrap();
         value.as_object_mut().unwrap().remove("display_gain_db");
+        value.as_object_mut().unwrap().remove("modulators");
         for layer in value["layers"].as_array_mut().unwrap() {
+            layer.as_object_mut().unwrap().remove("modulations");
             let kind = &mut layer["kind"];
             if let Some(spectrum) = kind.get_mut("Spectrum") {
                 spectrum.as_object_mut().unwrap().remove("color_mode");
@@ -422,6 +518,13 @@ mod tests {
         }
         let restored: Project = serde_json::from_value(value).unwrap();
         assert_eq!(restored.display_gain_db, 0.0);
+        assert!(restored.modulators.is_empty());
+        assert!(
+            restored
+                .layers
+                .iter()
+                .all(|layer| layer.modulations.is_empty())
+        );
         let LayerKind::Spectrum(spectrum) = &restored.layers[1].kind else {
             panic!("既定シーンの 2 番目はスペクトラムです");
         };

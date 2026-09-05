@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, Project, RenderReport,
-    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate, new_image_layer,
-    render_frame,
+    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, ModulatorValue, Project,
+    RenderReport, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate,
+    new_image_layer, render_frame,
 };
 use musicvideo_ui::{
     EditorState, MissingImageNotice, TimelineWaveform, draw_editor, draw_missing_images,
@@ -41,6 +41,7 @@ struct PreviewResult {
     render_ms: f64,
     report: RenderReport,
     spectrum: Option<SpectrumSource>,
+    modulator_values: Vec<ModulatorValue>,
     timings: PreviewWorkerTimings,
 }
 
@@ -193,6 +194,7 @@ pub struct MusicVideoLabApp {
     preview_render_ms: f64,
     preview_report: RenderReport,
     preview_spectrum: Option<SpectrumSource>,
+    preview_modulator_values: Vec<ModulatorValue>,
     preview_perf: PreviewPerfTracker,
     export_pending: Option<ExportPending>,
     last_export: Option<ExportOutcome>,
@@ -229,6 +231,7 @@ impl MusicVideoLabApp {
             preview_render_ms: 0.0,
             preview_report: RenderReport::default(),
             preview_spectrum: None,
+            preview_modulator_values: Vec::new(),
             preview_perf: PreviewPerfTracker::default(),
             export_pending: None,
             last_export: None,
@@ -459,6 +462,9 @@ impl MusicVideoLabApp {
                             )
                             .map_err(|error| format!("スペクトラム解析に失敗しました: {error}"))?,
                         };
+                        source
+                            .configure_modulators(&project.modulators)
+                            .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
                         let frame = source
                             .full_frame_at(
                                 &audio.stereo_pcm,
@@ -476,6 +482,7 @@ impl MusicVideoLabApp {
                         return Err("プレビューをキャンセルしました".to_owned());
                     }
                     let scene_composition_started = Instant::now();
+                    let modulator_values = spectrum_frame.modulators.clone();
                     let scene = evaluate(&project, position_secs, &spectrum_frame);
                     let mut frame = Frame::new(project.output.width, project.output.height)
                         .map_err(|error| format!("プレビューを確保できません: {error}"))?;
@@ -498,6 +505,7 @@ impl MusicVideoLabApp {
                         render_ms,
                         report,
                         spectrum,
+                        modulator_values,
                         timings: PreviewWorkerTimings {
                             analysis_ms,
                             scene_composition_ms,
@@ -531,6 +539,7 @@ impl MusicVideoLabApp {
                 self.preview_pending = None;
                 if result.revision == self.preview_revision {
                     self.preview_spectrum = result.spectrum;
+                    self.preview_modulator_values = result.modulator_values;
                     self.preview_render_ms = result.render_ms;
                     self.preview_report = result.report;
                     let texture_started = Instant::now();
@@ -1196,6 +1205,7 @@ impl eframe::App for MusicVideoLabApp {
                             &mut self.project,
                             &mut self.editor_state,
                             self.position_secs,
+                            &self.preview_modulator_values,
                         )
                     })
                     .inner;

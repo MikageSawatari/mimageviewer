@@ -7,8 +7,9 @@ use mimageviewer::video::mvexport::{
     EncoderPreference, MusicVideoExportRequest, export_music_video, verify_exported_mp4,
 };
 use musicvideo_core::{
-    Assets, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId, LayerKind,
-    MusicColorMode, default_project,
+    Assets, BandRange, DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, ImageAsset, ImageId,
+    LayerKind, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource,
+    MusicColorMode, default_project, new_band_energy_modulator,
 };
 
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
@@ -23,6 +24,7 @@ struct Args {
     frame_hash: bool,
     display_gain_db: f32,
     miv_colors: bool,
+    band_modulation: bool,
 }
 
 fn main() {
@@ -50,6 +52,28 @@ fn run() -> Result<(), String> {
                 LayerKind::PitchKeyboard(keyboard) => keyboard.color_mode = MusicColorMode::Miv,
                 _ => {}
             }
+        }
+    }
+    if args.band_modulation {
+        let mut modulator = new_band_energy_modulator(&project);
+        let ModulatorSource::BandEnergy { range, .. } = &mut modulator.source;
+        *range = BandRange::Semitone {
+            low_midi: 69,
+            high_midi: 69,
+        };
+        let modulator_id = modulator.id;
+        project.modulators.push(modulator);
+        if let Some(layer) = project
+            .layers
+            .iter_mut()
+            .find(|layer| matches!(&layer.kind, LayerKind::Spectrum(_)))
+        {
+            layer.modulations.push(ModulationBinding {
+                target: ModulationTarget::SpectrumRadius,
+                modulator: modulator_id,
+                amount: 80.0,
+                curve: ModulationCurve::Squared,
+            });
         }
     }
     let output = project.output;
@@ -144,6 +168,7 @@ fn parse_args() -> Result<Args, String> {
     let mut frame_hash = false;
     let mut display_gain_db = 0.0;
     let mut miv_colors = false;
+    let mut band_modulation = false;
     let mut values = std::env::args().skip(1);
     while let Some(argument) = values.next() {
         match argument.as_str() {
@@ -179,6 +204,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--miv-colors" => miv_colors = true,
+            "--band-modulation" => band_modulation = true,
             "--help" | "-h" => return Err(usage().to_owned()),
             _ => return Err(format!("不明な引数です: {argument}\n{}", usage())),
         }
@@ -193,6 +219,7 @@ fn parse_args() -> Result<Args, String> {
         frame_hash,
         display_gain_db,
         miv_colors,
+        band_modulation,
     })
 }
 
@@ -203,7 +230,7 @@ fn next_value(values: &mut impl Iterator<Item = String>, option: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "使用法: mvexport_cli --audio <音声> --image <画像> --out <出力.mp4> [--seconds N] [--encoder auto|nvenc|qsv|amf|mf|openh264] [--video-bitrate bps] [--display-gain-db dB] [--miv-colors] [--frame-hash]"
+    "使用法: mvexport_cli --audio <音声> --image <画像> --out <出力.mp4> [--seconds N] [--encoder auto|nvenc|qsv|amf|mf|openh264] [--video-bitrate bps] [--display-gain-db dB] [--miv-colors] [--band-modulation] [--frame-hash]"
 }
 
 fn load_assets(image_path: &Path) -> Result<Assets, String> {

@@ -126,6 +126,8 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
   analyzer を作り直す（不連続 = リセット）。時間方向の平滑化（§1.4 の smoothing factor 0.7）も
   同じ理由で「t 昇順の逐次適用」を前提にする。
 - 受け入れ基準: 同一プロジェクトを 2 回書き出したとき、全フレームがビット一致する。
+- 帯域エネルギーのモジュレータも同じ前進専用規約で評価する。値は PCM と t のみに依存し、
+  シーク時は解析器と EMA を一緒にリセットする。
 
 ### D4. ラスタライザは CPU から始める（`comic-core` を土台にする）
 
@@ -247,8 +249,11 @@ Wav2Bar の見た目（線形 FFT ビン 0–750 / 200 点）を厳密に再現�
 （2026-09-04 ユーザー確定）。**既定は `music-core` の半音バンド + 等ラウドネス重み付け**とし、
 `Linear { min_hz, max_hz }` など他方式は将来のオプションとして後から足す。
 
-したがって P1/P2 では `music-core` の既存 API（最大 128 バンド）をそのまま使い、
-任意バンド境界の公開 API 追加は**将来のオプション実装時まで先送り**する。
+P1/P2 では `music-core` の既存 API（最大 128 バンド）をそのまま使った。P3b 後の
+帯域エネルギーモジュレータで、Hz 範囲または MIDI 半音範囲と表示重み付けの有無を指定する
+追加 API を公開した。通常の bands / notes と任意範囲を同じ 1 回の多重解像度 FFT 更新から
+取り出し、変調のために解析を重複させない。表示用スペクトラムの周波数軸自体は従来どおり
+半音軸を既定とする。
 
 いずれの方式でも「バンド境界の列 → 帯域パワー → 表示値」という同じ経路を通し、
 **直線表示と円形表示は同じバンド列に対する座標変換違い**にする（円形専用の解析を持たない）。
@@ -321,7 +326,17 @@ Project {
     output: Output { width, height, fps, video_bitrate, encoder_preference },
     duration_secs: f64,            // 既定 = 音声長
     display_gain_db: f32,          // 鍵盤表示だけの追加ゲイン。既定 0 dB
+    modulators: Vec<Modulator>,    // 音声から得る 0..1 の変調源
     layers: Vec<Layer>,            // 描画順（先頭が奥）
+}
+
+Modulator {
+    id, name,
+    source: BandEnergy {
+        range: Hz{ low, high } | Semitone{ low_midi, high_midi },
+        smoothing, weighting: Raw | MivDisplay,
+        gain_db, floor, ceiling,
+    },
 }
 
 Layer {
@@ -332,7 +347,16 @@ Layer {
     rotation: Animatable<f32>,
     corner_radius: Animatable<f32>,
     glow:     Animatable<Option<Glow>>,   // { blur_px, color }  ← §1.4 の box-shadow 相当
+    modulations: Vec<ModulationBinding>,
     kind: LayerKind,
+}
+
+ModulationBinding {
+    target: Opacity | Scale | Rotation | CornerRadius | GlowRadius | GlowAlpha |
+            FillBrightness | SpectrumThickness | SpectrumRadius,
+    modulator: ModulatorId,
+    amount: f32,                  // 対象の単位で加算。負値も可
+    curve: Linear | Squared | Sqrt,
 }
 
 LayerKind =
@@ -358,6 +382,8 @@ Fill          = Solid(Color) | LinearGradient{..} | RadialGradient{..} | BandGra
   打つ」で表現する（専用のスライド機構を先に作らない）。煩雑なら P3 で「slides」ショートカットを
   検討する（未決 Q1）。
 - `BandGradient` は「バンド位置に応じて色を変える」用（高域ほど明るい等）。
+- 変調はスカラー対象だけに限定し、`Animatable<T>` 自体は汎用変調しない。最終値は
+  Const / Track の評価値へ binding を宣言順に加算する。Scale は矩形中心を固定して適用する。
 
 ---
 
@@ -416,6 +442,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P2c** ✅ | 性能: RGBA→NV12 変換とグローのぼかしを並列化する | **完了**（2026-09-04）。実時間比 3.277x / 3.187x、色変換平均 1.036ms、最適化前後で RGBA フレーム列のハッシュ一致 |
 | **P3a** ✅ | 編集 UI を `crates/musicvideo-ui`（egui 依存・eframe 非依存）へ移す + プロジェクトの保存/読み込み + 音付き再生プレビュー + 鍵盤背景の透過 | **完了**（2026-09-05、`5302f1155`）。ラボで保存・読み込みと音声時刻を正本にした再生プレビューを確認。`musicvideo-ui` は eframe / cpal / ffmpeg に依存しない |
 | **P3b** ✅ | キーフレーム: 画像切替・フェード・色変化・ON/OFF のタイムライン編集 | **完了**（2026-09-05）。共有波形解析を背景にしたタイムラインで追加・削除・移動・補間変更を行える。全 Animatable プロパティの Const↔Track、同一時刻キー、最後のキー削除時の Const 化、保存・読み込みをテスト済み |
+| **P3c** | 音声モジュレータの配管: 任意の Hz / 半音範囲のエネルギーをプロジェクト単位で定義し、レイヤのスカラーチャンネルへ加算 | 同じ 1 回の解析から bands / notes / 変調値を得る。無変調プロジェクトのフレームハッシュ不変、変調ありの 2 回一致、保存往復、編集 UI の現在値表示 |
 | **P4** | 本体統合: mIV の編集モードとして載せる。プロジェクト保存 / 読み込み、書き出しダイアログ、keymap | [docs/ui-responsiveness.md](ui-responsiveness.md) §4 を通過。閲覧側の退行が無い |
 
 各インクリメントの終わりで実機確認 → レビュー → コミット。
@@ -441,7 +468,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | --- | --- | --- |
 | Q1 | 画像切替の表現（レイヤ複数 + opacity か、専用の slides 機構か） | P3 着手前 |
 | ~~Q2~~ | ~~テキストのグリフラスタライズ方式~~ → **解決**: `comic-core` を使う（D4、2026-09-04） | — |
-| ~~Q3~~ | ~~任意バンド境界 API~~ → **先送り**: 既定は半音軸（D5、2026-09-04） | 将来のオプション実装時 |
+| ~~Q3~~ | ~~任意バンド境界 API~~ → **解決**: P3c の帯域エネルギーモジュレータ用に、Hz / MIDI 範囲と重み付け有無を受ける追加 API を公開（D5、2026-09-05）。表示軸のオプション化とは分離した | — |
 | ~~Q4~~ | ~~プロジェクトのパス保存~~ → **決着**: プロジェクトファイルからの相対パスで保存し、相対にできない場合だけ絶対。見つからない素材は黙って無視せず、どのレイヤのどのパスが無いかを出す（2026-09-04） | — |
 | ~~Q5~~ | ~~鍵盤ロジックの切り出し先~~ → **決着**: `music-core` に置く（2026-09-04）。鍵盤は「音楽の可視化」であって書き出し固有ではなく、本体の音楽ビューと `musicvideo-core` の両方が既に `music-core` に依存している。逆向き（本体が `musicvideo-core` に依存）にしない | — |
 | Q6 | Wav2Bar の `SVG Filters` 相当（任意フィルタ）を持つか | P3 以降・現行未使用なので後回し |

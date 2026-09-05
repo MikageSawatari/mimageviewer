@@ -16,7 +16,7 @@ use crate::model::{
     Fill, Fit, Glow, ImageId, MusicColorMode, NormRect, Rgba8, SpectrumDirection, SpectrumShape,
     TextAlign,
 };
-use crate::scene::{Scene, SceneItem, SceneItemKind};
+use crate::scene::{Scene, SceneItem, SceneItemKind, brighten_color};
 
 thread_local! {
     static KEYBOARD_LAYOUT_CACHE: RefCell<KeyboardLayoutCache> =
@@ -337,6 +337,7 @@ fn draw_item(
             point_count,
             shape,
             color_mode,
+            miv_brightness,
             fill,
         } => draw_spectrum(
             frame,
@@ -345,6 +346,7 @@ fn draw_item(
             *point_count,
             *shape,
             *color_mode,
+            *miv_brightness,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -354,6 +356,7 @@ fn draw_item(
             keyboard,
             background,
             color_mode,
+            miv_brightness,
             fill,
         } => draw_pitch_keyboard(
             frame,
@@ -361,6 +364,7 @@ fn draw_item(
             keyboard,
             background,
             *color_mode,
+            *miv_brightness,
             fill,
             item.opacity,
             item.corner_radius_px,
@@ -784,6 +788,7 @@ fn draw_spectrum(
     point_count: usize,
     shape: SpectrumShape,
     color_mode: MusicColorMode,
+    miv_brightness: f32,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
@@ -798,6 +803,7 @@ fn draw_spectrum(
             bar,
             &sampler,
             color_mode,
+            miv_brightness,
             opacity,
             corner_radius_px,
             mask_mode,
@@ -811,12 +817,17 @@ fn draw_spectrum_bar(
     bar: SpectrumBar,
     sampler: &FillSampler,
     color_mode: MusicColorMode,
+    miv_brightness: f32,
     opacity: f32,
     corner_radius_px: f32,
     mask_mode: bool,
 ) {
-    let miv_color = (color_mode == MusicColorMode::Miv)
-        .then(|| rgba8(miv_spectrum_color(bar.index, bar.total, bar.value)));
+    let miv_color = (color_mode == MusicColorMode::Miv).then(|| {
+        brighten_color(
+            rgba8(miv_spectrum_color(bar.index, bar.total, bar.value)),
+            miv_brightness,
+        )
+    });
     let pad = bar.thickness * 0.5 + 1.0;
     let min_x = (bar.start.0.min(bar.end.0) - pad)
         .floor()
@@ -899,6 +910,7 @@ fn draw_pitch_keyboard(
     keyboard: &KeyboardFrame,
     background: &Fill,
     color_mode: MusicColorMode,
+    miv_brightness: f32,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
@@ -941,6 +953,7 @@ fn draw_pitch_keyboard(
             &layout.keys,
             &sampler,
             color_mode,
+            miv_brightness,
             opacity,
             mask_mode,
             &clip_coverage,
@@ -1035,6 +1048,7 @@ fn draw_keyboard_keys(
     keys: &[KeyPlacement],
     sampler: &FillSampler<'_>,
     color_mode: MusicColorMode,
+    miv_brightness: f32,
     opacity: f32,
     mask_mode: bool,
     clip_coverage: &KeyboardClipCoverage,
@@ -1092,12 +1106,15 @@ fn draw_keyboard_keys(
                                     (level * if key.black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
                                 mix_rgba(base, active, amount)
                             }
-                            MusicColorMode::Miv => miv_keyboard_vertical_color(
-                                miv_gradients
-                                    .as_ref()
-                                    .expect("mIV 配色では鍵ごとの色が計算済みです")[key_index],
-                                key,
-                                py,
+                            MusicColorMode::Miv => brighten_color(
+                                miv_keyboard_vertical_color(
+                                    miv_gradients
+                                        .as_ref()
+                                        .expect("mIV 配色では鍵ごとの色が計算済みです")[key_index],
+                                    key,
+                                    py,
+                                ),
+                                miv_brightness,
                             ),
                         }
                     } else {
@@ -1463,6 +1480,7 @@ fn render_item_mask(
             shape,
             color_mode,
             fill,
+            ..
         } => draw_spectrum_mask(
             &mut alpha,
             rect.width(),
@@ -2423,6 +2441,7 @@ mod tests {
                 keyboard: keyboard.clone(),
                 background: Fill::Solid(Rgba8::BLACK),
                 color_mode: MusicColorMode::Custom,
+                miv_brightness: 0.0,
                 fill: Fill::Solid(fill),
             },
         };
@@ -2498,7 +2517,7 @@ mod tests {
         notes[(67 - SPECTRUM_NOTE_MIN_MIDI) as usize] = 0.7;
         let mut state = KeyboardAnimationState::default();
         let keyboard = prepare_keyboard_frame(&notes, SPECTRUM_NOTE_MIN_MIDI, 6.0, &mut state);
-        let make_scene = |fill| Scene {
+        let make_scene = |fill, miv_brightness| Scene {
             width: 320,
             height: 160,
             items: vec![
@@ -2511,6 +2530,7 @@ mod tests {
                         thickness_px: 8.0,
                     },
                     color_mode: MusicColorMode::Miv,
+                    miv_brightness,
                     fill: Fill::Solid(fill),
                 }),
                 SceneItem {
@@ -2523,21 +2543,26 @@ mod tests {
                         keyboard: keyboard.clone(),
                         background: Fill::Solid(Rgba8::new(0, 0, 0, 0)),
                         color_mode: MusicColorMode::Miv,
+                        miv_brightness,
                         fill: Fill::Solid(fill),
                     },
                 },
             ],
         };
-        let first_scene = make_scene(Rgba8::new(255, 0, 0, 255));
-        let second_scene = make_scene(Rgba8::new(0, 255, 0, 255));
+        let first_scene = make_scene(Rgba8::new(255, 0, 0, 255), 0.0);
+        let second_scene = make_scene(Rgba8::new(0, 255, 0, 255), 0.0);
+        let brighter_scene = make_scene(Rgba8::new(255, 0, 0, 255), 0.2);
         let mut first = Frame::new(1, 1).unwrap();
         let mut repeated = Frame::new(1, 1).unwrap();
         let mut other_fill = Frame::new(1, 1).unwrap();
+        let mut brighter = Frame::new(1, 1).unwrap();
         let _ = render_frame(&first_scene, &Assets::default(), &mut first).unwrap();
         let _ = render_frame(&first_scene, &Assets::default(), &mut repeated).unwrap();
         let _ = render_frame(&second_scene, &Assets::default(), &mut other_fill).unwrap();
+        let _ = render_frame(&brighter_scene, &Assets::default(), &mut brighter).unwrap();
         assert_eq!(first, repeated);
         assert_eq!(first, other_fill);
+        assert_ne!(first, brighter);
         assert!(
             first
                 .rgba
@@ -2593,6 +2618,7 @@ mod tests {
                     &keyboard,
                     &background,
                     MusicColorMode::Custom,
+                    0.0,
                     &fill,
                     0.73,
                     corner_radius_px,
@@ -2677,6 +2703,7 @@ mod tests {
                             keyboard: KeyboardFrame::default(),
                             background: Fill::Solid(background),
                             color_mode: MusicColorMode::Custom,
+                            miv_brightness: 0.0,
                             fill: Fill::Solid(Rgba8::WHITE),
                         },
                     },
@@ -2759,6 +2786,7 @@ mod tests {
                 direction: SpectrumDirection::Clockwise,
             },
             color_mode: MusicColorMode::Custom,
+            miv_brightness: 0.0,
             fill: Fill::BandGradient { stops },
         });
         layer.rotation_deg = 7.0;
@@ -2801,6 +2829,7 @@ mod tests {
                 direction: SpectrumDirection::Clockwise,
             },
             color_mode: MusicColorMode::Custom,
+            miv_brightness: 0.0,
             fill: Fill::Solid(Rgba8::WHITE),
         });
         let mut frame = Frame::new(1, 1).unwrap();
@@ -2849,6 +2878,7 @@ mod tests {
                 direction: SpectrumDirection::Clockwise,
             },
             color_mode: MusicColorMode::Custom,
+            miv_brightness: 0.0,
             fill: Fill::Solid(Rgba8::WHITE),
         });
         let mut radial_frame = Frame::new(1, 1).unwrap();

@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 mod keyframes;
+mod modulators;
 mod timeline;
 
 pub use keyframes::{
@@ -15,9 +16,12 @@ pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use egui::TextureHandle;
 use musicvideo_core::{
-    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, MusicColorMode,
-    Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
+    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, ModulatorValue,
+    MusicColorMode, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape,
+    new_pitch_keyboard_layer,
 };
+
+use modulators::ModulatorEditorState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeySelection {
@@ -31,6 +35,7 @@ pub struct EditorState {
     selected_layer: usize,
     selected_key: Option<KeySelection>,
     dragging_key: Option<KeySelection>,
+    modulator_editor: ModulatorEditorState,
 }
 
 impl Default for EditorState {
@@ -39,6 +44,7 @@ impl Default for EditorState {
             selected_layer: 1,
             selected_key: None,
             dragging_key: None,
+            modulator_editor: ModulatorEditorState::default(),
         }
     }
 }
@@ -126,6 +132,7 @@ pub fn draw_editor(
     project: &mut Project,
     state: &mut EditorState,
     current_time_secs: f64,
+    modulator_values: &[ModulatorValue],
 ) -> EditorResponse {
     state.reconcile(project);
     let mut project_changed = ui
@@ -138,6 +145,8 @@ pub fn draw_editor(
         )
         .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
         .changed();
+    project_changed |=
+        modulators::draw_modulators(ui, project, &mut state.modulator_editor, modulator_values);
     ui.separator();
     ui.heading("レイヤー");
     for (index, layer) in project.layers.iter().enumerate() {
@@ -166,6 +175,7 @@ pub fn draw_editor(
     ui.separator();
     let mut commands = Vec::new();
     let output = project.output;
+    let modulators = project.modulators.clone();
     if let Some(layer) = project.layers.get_mut(state.selected_layer) {
         let result = edit_layer_properties(
             ui,
@@ -174,6 +184,8 @@ pub fn draw_editor(
             current_time_secs,
             output.width,
             output.height,
+            &modulators,
+            modulator_values,
         );
         project_changed |= result.changed;
         commands = result.commands;
@@ -244,6 +256,8 @@ fn edit_layer_properties(
     current_time_secs: f64,
     output_width: u32,
     output_height: u32,
+    modulators: &[musicvideo_core::Modulator],
+    modulator_values: &[ModulatorValue],
 ) -> LayerEditResult {
     let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
     let mut commands = Vec::new();
@@ -272,6 +286,7 @@ fn edit_layer_properties(
             )
             .changed(),
     };
+    changed |= modulators::draw_bindings(ui, layer, modulators, modulator_values);
     LayerEditResult { changed, commands }
 }
 
