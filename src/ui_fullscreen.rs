@@ -31,7 +31,8 @@ use crate::app::{
     FsNavigationTargetPhase, FsOpenMaterialization, FsOpenPerfRecorder, FsOpenPerfSpan,
     FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
     FsPrefetchSideDisplay, PassthroughRenditionPerfCall, PassthroughRenditionPerfRecorder,
-    PollPrefetchOrigin, ViewerPresentation, build_fs_prefetch_indicator,
+    PassthroughRenditionPerfSpan, PollPrefetchOrigin, ViewerPresentation,
+    build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -208,6 +209,9 @@ impl FsRenderPerfStage {
     ];
 }
 
+const FS_NAVIGATION_PERF_SPAN_COUNT: usize = 18;
+
+#[repr(usize)]
 #[derive(Debug, Clone, Copy)]
 enum FsNavigationPerfSpan {
     Close,
@@ -230,6 +234,9 @@ enum FsNavigationPerfSpan {
     SlideshowAdvance,
 }
 
+const FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT: usize = 7;
+
+#[repr(usize)]
 #[derive(Debug, Clone, Copy)]
 enum FsPageTurnDecisionPerfSpan {
     OriginalPreviewActiveForFrame,
@@ -251,11 +258,12 @@ struct FsPageTurnDecisionPerfRecorder {
     resolve_original_preview_tex: std::time::Duration,
     ensure_navigation_target_thumbnail_requests: std::time::Duration,
     cache_lookup: std::time::Duration,
+    cycles: [u64; FS_PAGE_TURN_DECISION_PERF_SPAN_COUNT],
     cache_hit: Option<bool>,
 }
 
 impl FsPageTurnDecisionPerfRecorder {
-    fn add(&mut self, span: FsPageTurnDecisionPerfSpan, elapsed: std::time::Duration) {
+    fn add(&mut self, span: FsPageTurnDecisionPerfSpan, elapsed: std::time::Duration, cycles: u64) {
         let target = match span {
             FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame => {
                 &mut self.original_preview_active_for_frame
@@ -276,6 +284,7 @@ impl FsPageTurnDecisionPerfRecorder {
             FsPageTurnDecisionPerfSpan::CacheLookup => &mut self.cache_lookup,
         };
         *target += elapsed;
+        self.cycles[span as usize] += cycles;
     }
 
     fn resolve_navigation_sequence_target_categorized(&self) -> std::time::Duration {
@@ -289,6 +298,23 @@ impl FsPageTurnDecisionPerfRecorder {
         self.original_preview_active_for_frame
             + self.resolve_navigation_sequence_target
             + self.cache_lookup
+    }
+
+    fn cycles(&self, span: FsPageTurnDecisionPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn resolve_navigation_sequence_target_categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex)
+            + self.cycles(FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests)
+    }
+
+    fn categorized_cycles(&self) -> u64 {
+        self.cycles(FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame)
+            + self.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget)
+            + self.cycles(FsPageTurnDecisionPerfSpan::CacheLookup)
     }
 }
 
@@ -315,10 +341,11 @@ struct FsNavigationPerfRecorder {
     open_fullscreen: FsOpenPerfRecorder,
     slideshow: std::time::Duration,
     slideshow_advance: std::time::Duration,
+    cycles: [u64; FS_NAVIGATION_PERF_SPAN_COUNT],
 }
 
 impl FsNavigationPerfRecorder {
-    fn add(&mut self, span: FsNavigationPerfSpan, elapsed: std::time::Duration) {
+    fn add(&mut self, span: FsNavigationPerfSpan, elapsed: std::time::Duration, cycles: u64) {
         let target = match span {
             FsNavigationPerfSpan::Close => &mut self.close,
             FsNavigationPerfSpan::CtrlSiblingMouse => &mut self.ctrl_sibling_mouse,
@@ -358,6 +385,7 @@ impl FsNavigationPerfRecorder {
             FsNavigationPerfSpan::SlideshowAdvance => &mut self.slideshow_advance,
         };
         *target += elapsed;
+        self.cycles[span as usize] += cycles;
     }
 
     fn land_open_other_categorized(&self) -> std::time::Duration {
@@ -371,24 +399,47 @@ impl FsNavigationPerfRecorder {
             + self.land_open_other_cancel_stale_video_tile_reopen
             + self.land_open_other_fullscreen_cursor_state
     }
+
+    fn cycles(&self, span: FsNavigationPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn land_open_other_categorized_cycles(&self) -> u64 {
+        self.cycles(
+            FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+        ) + self.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen)
+            + self.cycles(FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState)
+    }
 }
 
 #[derive(Debug)]
 struct FsRenderPerfRecorder {
     started_at: std::time::Instant,
     last_mark_at: std::time::Instant,
+    started_cycles: u64,
+    last_mark_cycles: u64,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
     next_stage: usize,
     navigation_page_turn_decision_cache_hit: Option<bool>,
     navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
 
 impl FsRenderPerfRecorder {
-    fn new(started_at: std::time::Instant) -> Self {
+    fn new(started_at: std::time::Instant, started_cycles: u64) -> Self {
         Self {
             started_at,
             last_mark_at: started_at,
+            started_cycles,
+            last_mark_cycles: started_cycles,
             stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
+            stage_cycles: [0; FS_RENDER_PERF_STAGE_COUNT],
             next_stage: 0,
             navigation_page_turn_decision_cache_hit: None,
             navigation_passthrough_rendition_calls: Vec::new(),
@@ -396,17 +447,19 @@ impl FsRenderPerfRecorder {
     }
 
     fn mark(&mut self, stage: FsRenderPerfStage) {
-        self.mark_at(stage, std::time::Instant::now());
+        self.mark_at(stage, std::time::Instant::now(), App::thread_cycles_now());
     }
 
-    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant) {
+    fn mark_at(&mut self, stage: FsRenderPerfStage, now: std::time::Instant, cycles: u64) {
         debug_assert_eq!(
             FsRenderPerfStage::ALL.get(self.next_stage).copied(),
             Some(stage)
         );
         self.stage_ms[stage as usize] =
             now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.stage_cycles[stage as usize] = cycles.saturating_sub(self.last_mark_cycles);
         self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
         self.next_stage += 1;
     }
 
@@ -414,6 +467,7 @@ impl FsRenderPerfRecorder {
         &mut self,
         navigation: FsNavigationPerfRecorder,
         now: std::time::Instant,
+        cycles: u64,
     ) {
         // Parent totals contain their explicitly timed child calls. Publish only each parent's
         // residual alongside leaf stages so the render total counts every interval exactly once.
@@ -470,6 +524,58 @@ impl FsRenderPerfRecorder {
         let navigation_total = now.duration_since(self.last_mark_at);
         debug_assert!(categorized <= navigation_total);
         let remainder = navigation_total.saturating_sub(categorized);
+
+        let page_cycles = navigation.cycles(FsNavigationPerfSpan::Page);
+        let begin_sequence_cycles = navigation.cycles(FsNavigationPerfSpan::BeginSequence);
+        let land_target_cycles = navigation.cycles(FsNavigationPerfSpan::LandTarget);
+        debug_assert!(begin_sequence_cycles + land_target_cycles <= page_cycles);
+        let page_other_cycles =
+            page_cycles.saturating_sub(begin_sequence_cycles + land_target_cycles);
+        let land_seek_continuous_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandSeekContinuous);
+        let land_open_cycles = navigation.cycles(FsNavigationPerfSpan::LandOpen);
+        debug_assert!(land_seek_continuous_cycles + land_open_cycles <= land_target_cycles);
+        let land_remainder_cycles =
+            land_target_cycles.saturating_sub(land_seek_continuous_cycles + land_open_cycles);
+        let passthrough_rendition_cycles = passthrough_rendition.categorized_cycles();
+        let ensure_passthrough_rendition_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition);
+        debug_assert!(passthrough_rendition_cycles <= ensure_passthrough_rendition_cycles);
+        let passthrough_rendition_remainder_cycles =
+            passthrough_rendition.remainder_cycles(ensure_passthrough_rendition_cycles);
+        let resolve_sequence_categorized_cycles =
+            page_turn_decision.resolve_navigation_sequence_target_categorized_cycles();
+        let resolve_sequence_cycles =
+            page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveNavigationSequenceTarget);
+        debug_assert!(resolve_sequence_categorized_cycles <= resolve_sequence_cycles);
+        let resolve_sequence_remainder_cycles =
+            resolve_sequence_cycles.saturating_sub(resolve_sequence_categorized_cycles);
+        let page_turn_decision_categorized_cycles = page_turn_decision.categorized_cycles();
+        let page_turn_decision_total_cycles =
+            navigation.cycles(FsNavigationPerfSpan::LandOpenOtherFsPageTurnDecisionForFrame);
+        debug_assert!(page_turn_decision_categorized_cycles <= page_turn_decision_total_cycles);
+        let page_turn_decision_remainder_cycles =
+            page_turn_decision_total_cycles.saturating_sub(page_turn_decision_categorized_cycles);
+        let open_total_cycles = navigation.open_fullscreen.cycles(FsOpenPerfSpan::Total);
+        let open_categorized_cycles = navigation.open_fullscreen.categorized_cycles();
+        debug_assert!(open_categorized_cycles <= open_total_cycles);
+        let land_open_other_categorized_cycles = navigation.land_open_other_categorized_cycles();
+        debug_assert!(open_total_cycles + land_open_other_categorized_cycles <= land_open_cycles);
+        let land_open_other_remainder_cycles =
+            land_open_cycles.saturating_sub(open_total_cycles + land_open_other_categorized_cycles);
+        let open_remainder_cycles = open_total_cycles.saturating_sub(open_categorized_cycles);
+        let slideshow_cycles = navigation.cycles(FsNavigationPerfSpan::Slideshow);
+        let slideshow_advance_cycles = navigation.cycles(FsNavigationPerfSpan::SlideshowAdvance);
+        debug_assert!(slideshow_advance_cycles <= slideshow_cycles);
+        let slideshow_other_cycles = slideshow_cycles.saturating_sub(slideshow_advance_cycles);
+        let categorized_cycles = navigation.cycles(FsNavigationPerfSpan::Close)
+            + navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse)
+            + page_cycles
+            + slideshow_cycles;
+        let navigation_total_cycles = cycles.saturating_sub(self.last_mark_cycles);
+        debug_assert!(categorized_cycles <= navigation_total_cycles);
+        let remainder_cycles = navigation_total_cycles.saturating_sub(categorized_cycles);
+
         self.navigation_page_turn_decision_cache_hit = page_turn_decision.cache_hit;
         self.navigation_passthrough_rendition_calls = passthrough_rendition.calls.clone();
         let stages = [
@@ -652,29 +758,243 @@ impl FsRenderPerfRecorder {
             self.stage_ms[stage as usize] = elapsed.as_secs_f64() * 1000.0;
             self.next_stage += 1;
         }
+        let cycle_stages = [
+            (
+                FsRenderPerfStage::FsNavigationClose,
+                navigation.cycles(FsNavigationPerfSpan::Close),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationCtrlSiblingMouse,
+                navigation.cycles(FsNavigationPerfSpan::CtrlSiblingMouse),
+            ),
+            (FsRenderPerfStage::FsNavigationPageOther, page_other_cycles),
+            (
+                FsRenderPerfStage::FsNavigationBeginSequence,
+                begin_sequence_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandSeekContinuous,
+                land_seek_continuous_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::OriginalPreviewActiveForFrame,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::SourceLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::BuildPixels),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::LoadTexture),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cycles(PassthroughRenditionPerfSpan::CacheInsert),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::ResolveOriginalPreviewTex),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
+                page_turn_decision.cycles(
+                    FsPageTurnDecisionPerfSpan::EnsureNavigationTargetThumbnailRequests,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
+                resolve_sequence_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionCacheLookup,
+                page_turn_decision.cycles(FsPageTurnDecisionPerfSpan::CacheLookup),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder,
+                page_turn_decision_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherDeferPageTurnFullResolutionWork,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherDeferPageTurnFullResolutionWork,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherSyncMainSelectionFromViewerIdx,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherSyncMainSelectionFromViewerIdx,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherVideoAudioVst,
+                navigation.cycles(FsNavigationPerfSpan::LandOpenOtherVideoAudioVst),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartVideoTileFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartVideoTileFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherTryStartNativeVideoFastSwap,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherCancelStaleVideoTileReopen,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherCancelStaleVideoTileReopen,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherFullscreenCursorState,
+                navigation.cycles(
+                    FsNavigationPerfSpan::LandOpenOtherFullscreenCursorState,
+                ),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherRemainder,
+                land_open_other_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordReadingHistory,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordReadingHistory),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRecordBookResume,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RecordBookResume),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartMetadataLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartMetadataLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenStartFsLoad,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::StartFsLoad),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenUpdatePrefetchWindow,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::UpdatePrefetchWindow),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshVideoMarkerCache,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRefreshPdfPromotion,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::RefreshFullscreenPdfPromotion),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenResetFileRuntime,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ResetFileRuntime),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenViewerPresentation,
+                navigation
+                    .open_fullscreen
+                    .cycles(FsOpenPerfSpan::ViewerPresentation),
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenRemainder,
+                open_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandRemainder,
+                land_remainder_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowAdvance,
+                slideshow_advance_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationSlideshowOther,
+                slideshow_other_cycles,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationRemainder,
+                remainder_cycles,
+            ),
+        ];
+        for (stage, stage_cycles) in cycle_stages {
+            self.stage_cycles[stage as usize] = stage_cycles;
+        }
         self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
     }
 
     fn finish(self) -> FsRenderPerfBreakdown {
-        self.finish_at(std::time::Instant::now())
+        self.finish_at(std::time::Instant::now(), App::thread_cycles_now())
     }
 
-    fn finish_at(mut self, finished_at: std::time::Instant) -> FsRenderPerfBreakdown {
+    fn finish_at(
+        mut self,
+        finished_at: std::time::Instant,
+        finished_cycles: u64,
+    ) -> FsRenderPerfBreakdown {
         // `render_fullscreen_viewport` has intentional early returns. Attribute the interval up
         // to that return to the currently active stage and leave later stages at zero.
         if self.next_stage < FS_RENDER_PERF_STAGE_COUNT {
             self.stage_ms[self.next_stage] =
                 finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.stage_cycles[self.next_stage] =
+                finished_cycles.saturating_sub(self.last_mark_cycles);
             self.next_stage += 1;
         }
         debug_assert!(self.next_stage <= FS_RENDER_PERF_STAGE_COUNT);
 
         let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
         let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        let total_cycles = finished_cycles.saturating_sub(self.started_cycles);
+        let accounted_cycles = self.stage_cycles.iter().sum::<u64>();
         FsRenderPerfBreakdown {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            total_cycles,
+            stage_cycles: self.stage_cycles,
+            unaccounted_cycles: total_cycles.saturating_sub(accounted_cycles),
             navigation_page_turn_decision_cache_hit: self.navigation_page_turn_decision_cache_hit,
             navigation_passthrough_rendition_calls: self.navigation_passthrough_rendition_calls,
         }
@@ -685,8 +1005,9 @@ impl FsRenderPerfRecorder {
 fn fs_render_perf_start_with(
     perf_on: bool,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) -> Option<FsRenderPerfRecorder> {
-    perf_on.then(now).map(FsRenderPerfRecorder::new)
+    perf_on.then(|| FsRenderPerfRecorder::new(now(), cycles_now()))
 }
 
 #[inline]
@@ -700,26 +1021,36 @@ fn mark_fs_render_perf(recorder: &mut Option<FsRenderPerfRecorder>, stage: FsRen
 fn start_fs_page_turn_decision_perf_span_with(
     recorder: &Option<FsPageTurnDecisionPerfRecorder>,
     now: impl FnOnce() -> std::time::Instant,
-) -> Option<std::time::Instant> {
-    recorder.as_ref().map(|_| now())
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
 }
 
 #[inline]
 fn start_fs_page_turn_decision_perf_span(
     recorder: &Option<FsPageTurnDecisionPerfRecorder>,
-) -> Option<std::time::Instant> {
-    start_fs_page_turn_decision_perf_span_with(recorder, std::time::Instant::now)
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_page_turn_decision_perf_span_with(
+        recorder,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    )
 }
 
 #[inline]
 fn finish_fs_page_turn_decision_perf_span_with(
     recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
     span: FsPageTurnDecisionPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) {
-    if let (Some(recorder), Some(started_at)) = (recorder.as_mut(), started_at) {
-        recorder.add(span, now().duration_since(started_at));
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
     }
 }
 
@@ -727,13 +1058,14 @@ fn finish_fs_page_turn_decision_perf_span_with(
 fn finish_fs_page_turn_decision_perf_span(
     recorder: &mut Option<FsPageTurnDecisionPerfRecorder>,
     span: FsPageTurnDecisionPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
 ) {
     finish_fs_page_turn_decision_perf_span_with(
         recorder,
         span,
         started_at,
         std::time::Instant::now,
+        App::thread_cycles_now,
     );
 }
 
@@ -741,26 +1073,32 @@ fn finish_fs_page_turn_decision_perf_span(
 fn start_fs_navigation_perf_span_with(
     recorder: &Option<FsNavigationPerfRecorder>,
     now: impl FnOnce() -> std::time::Instant,
-) -> Option<std::time::Instant> {
-    recorder.as_ref().map(|_| now())
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
 }
 
 #[inline]
 fn start_fs_navigation_perf_span(
     recorder: &Option<FsNavigationPerfRecorder>,
-) -> Option<std::time::Instant> {
-    start_fs_navigation_perf_span_with(recorder, std::time::Instant::now)
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_navigation_perf_span_with(recorder, std::time::Instant::now, App::thread_cycles_now)
 }
 
 #[inline]
 fn finish_fs_navigation_perf_span_with(
     recorder: &mut Option<FsNavigationPerfRecorder>,
     span: FsNavigationPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) {
-    if let (Some(recorder), Some(started_at)) = (recorder.as_mut(), started_at) {
-        recorder.add(span, now().duration_since(started_at));
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder.as_mut(), started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
     }
 }
 
@@ -768,9 +1106,15 @@ fn finish_fs_navigation_perf_span_with(
 fn finish_fs_navigation_perf_span(
     recorder: &mut Option<FsNavigationPerfRecorder>,
     span: FsNavigationPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
 ) {
-    finish_fs_navigation_perf_span_with(recorder, span, started_at, std::time::Instant::now);
+    finish_fs_navigation_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
 }
 
 #[inline]
@@ -778,9 +1122,10 @@ fn finish_fs_navigation_perf_with(
     navigation: &mut Option<FsNavigationPerfRecorder>,
     render: &mut Option<FsRenderPerfRecorder>,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) {
     if let (Some(navigation), Some(render)) = (navigation.take(), render.as_mut()) {
-        render.mark_navigation_at(navigation, now());
+        render.mark_navigation_at(navigation, now(), cycles_now());
     }
 }
 
@@ -789,7 +1134,12 @@ fn finish_fs_navigation_perf(
     navigation: &mut Option<FsNavigationPerfRecorder>,
     render: &mut Option<FsRenderPerfRecorder>,
 ) {
-    finish_fs_navigation_perf_with(navigation, render, std::time::Instant::now);
+    finish_fs_navigation_perf_with(
+        navigation,
+        render,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
 }
 
 #[inline]
@@ -812,6 +1162,9 @@ struct FsRenderPerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    total_cycles: u64,
+    stage_cycles: [u64; FS_RENDER_PERF_STAGE_COUNT],
+    unaccounted_cycles: u64,
     navigation_page_turn_decision_cache_hit: Option<bool>,
     navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
@@ -1030,6 +1383,15 @@ impl FsRenderPerfBreakdown {
             .copied()
             .map(|stage| self.stage_ms[stage as usize])
             .sum::<f64>();
+        let passthrough_rendition_total_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_cycles[stage as usize])
+            .sum::<u64>();
         let passthrough_rendition_cache_hits = self
             .navigation_passthrough_rendition_calls
             .iter()
@@ -1040,13 +1402,22 @@ impl FsRenderPerfBreakdown {
             .iter()
             .filter(|call| call.cache_hit == Some(false))
             .count();
-        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 10);
+        let cycle_field_names = Self::EVENT_FIELDS.map(|(field, _)| {
+            format!(
+                "{}_cycles",
+                field
+                    .strip_suffix("_ms")
+                    .expect("fullscreen render perf stage field must end in _ms")
+            )
+        });
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT * 2 + 13);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push((
             "idx",
             fs_idx.map_or(serde_json::Value::Null, serde_json::Value::from),
         ));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        extras.push(("total_cycles", serde_json::Value::from(self.total_cycles)));
         extras.push((
             "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_hit",
             self.navigation_page_turn_decision_cache_hit
@@ -1055,6 +1426,10 @@ impl FsRenderPerfBreakdown {
         extras.push((
             "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
             serde_json::Value::from(passthrough_rendition_total_ms),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cycles",
+            serde_json::Value::from(passthrough_rendition_total_cycles),
         ));
         extras.push((
             "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_call_count",
@@ -1073,15 +1448,25 @@ impl FsRenderPerfBreakdown {
             serde_json::to_value(&self.navigation_passthrough_rendition_calls)
                 .unwrap_or(serde_json::Value::Null),
         ));
-        for (field, stage) in Self::EVENT_FIELDS {
+        for ((field, stage), cycle_field) in
+            Self::EVENT_FIELDS.into_iter().zip(cycle_field_names.iter())
+        {
             extras.push((
                 field,
                 serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+            extras.push((
+                cycle_field.as_str(),
+                serde_json::Value::from(self.stage_cycles[stage as usize]),
             ));
         }
         extras.push((
             "unaccounted_ms",
             serde_json::Value::from(self.unaccounted_ms),
+        ));
+        extras.push((
+            "unaccounted_cycles",
+            serde_json::Value::from(self.unaccounted_cycles),
         ));
         crate::perf::event("ui", "fs_render_breakdown", None, input_seq, &extras);
     }
@@ -16044,8 +16429,11 @@ impl App {
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
-        let mut fs_render_perf =
-            fs_render_perf_start_with(crate::perf::is_enabled(), std::time::Instant::now);
+        let mut fs_render_perf = fs_render_perf_start_with(
+            crate::perf::is_enabled(),
+            std::time::Instant::now,
+            Self::thread_cycles_now,
+        );
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -39678,19 +40066,34 @@ mod tests {
     }
 
     #[test]
-    fn fs_render_perf_timer_does_not_read_clock_when_disabled() {
+    fn fs_render_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
         let clock_called = std::cell::Cell::new(false);
-        let mut recorder = fs_render_perf_start_with(false, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let cycles_called = std::cell::Cell::new(false);
+        let mut recorder = fs_render_perf_start_with(
+            false,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         let mut navigation = recorder
             .as_ref()
             .map(|_| FsNavigationPerfRecorder::default());
-        let navigation_span = start_fs_navigation_perf_span_with(&navigation, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let navigation_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         finish_fs_navigation_perf_span_with(
             &mut navigation,
             FsNavigationPerfSpan::Page,
@@ -39699,11 +40102,22 @@ mod tests {
                 clock_called.set(true);
                 std::time::Instant::now()
             },
+            || {
+                cycles_called.set(true);
+                1
+            },
         );
-        let open_other_span = start_fs_navigation_perf_span_with(&navigation, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let open_other_span = start_fs_navigation_perf_span_with(
+            &navigation,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         finish_fs_navigation_perf_span_with(
             &mut navigation,
             FsNavigationPerfSpan::LandOpenOtherTryStartNativeVideoFastSwap,
@@ -39712,15 +40126,25 @@ mod tests {
                 clock_called.set(true);
                 std::time::Instant::now()
             },
+            || {
+                cycles_called.set(true);
+                1
+            },
         );
         let mut page_turn_decision = recorder
             .as_ref()
             .map(|_| FsPageTurnDecisionPerfRecorder::default());
-        let page_turn_span =
-            start_fs_page_turn_decision_perf_span_with(&page_turn_decision, || {
+        let page_turn_span = start_fs_page_turn_decision_perf_span_with(
+            &page_turn_decision,
+            || {
                 clock_called.set(true);
                 std::time::Instant::now()
-            });
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         finish_fs_page_turn_decision_perf_span_with(
             &mut page_turn_decision,
             FsPageTurnDecisionPerfSpan::ResolveFsDisplayTex,
@@ -39729,12 +40153,23 @@ mod tests {
                 clock_called.set(true);
                 std::time::Instant::now()
             },
+            || {
+                cycles_called.set(true);
+                1
+            },
         );
         let mut open_perf: Option<&mut FsOpenPerfRecorder> = None;
-        let open_span = crate::app::start_fs_open_perf_span_with(&open_perf, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let open_span = crate::app::start_fs_open_perf_span_with(
+            &open_perf,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         crate::app::finish_fs_open_perf_span_with(
             &mut open_perf,
             FsOpenPerfSpan::RecordReadingHistory,
@@ -39743,11 +40178,23 @@ mod tests {
                 clock_called.set(true);
                 std::time::Instant::now()
             },
+            || {
+                cycles_called.set(true);
+                1
+            },
         );
-        finish_fs_navigation_perf_with(&mut navigation, &mut recorder, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        finish_fs_navigation_perf_with(
+            &mut navigation,
+            &mut recorder,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
         for stage in FsRenderPerfStage::ALL {
             mark_fs_render_perf(&mut recorder, stage);
         }
@@ -39755,38 +40202,55 @@ mod tests {
 
         assert!(recorder.is_none());
         assert!(!clock_called.get());
+        assert!(!cycles_called.get());
     }
 
     #[test]
     fn fs_render_perf_stages_plus_unaccounted_equal_total() {
         let started_at = std::time::Instant::now();
-        let mut recorder = FsRenderPerfRecorder::new(started_at);
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
         let mut elapsed = std::time::Duration::ZERO;
+        let mut cycles = started_cycles;
         for (index, stage) in FsRenderPerfStage::ALL.into_iter().enumerate() {
             elapsed += std::time::Duration::from_millis(index as u64 + 1);
-            recorder.mark_at(stage, started_at + elapsed);
+            cycles += (index as u64 + 1) * 100;
+            recorder.mark_at(stage, started_at + elapsed, cycles);
         }
         let expected_unaccounted = std::time::Duration::from_millis(7);
-        let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+        let expected_unaccounted_cycles = 700;
+        let breakdown = recorder.finish_at(
+            started_at + elapsed + expected_unaccounted,
+            cycles + expected_unaccounted_cycles,
+        );
         let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
 
         assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
         assert!(
             (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
         );
     }
 
     #[test]
     fn fs_navigation_perf_children_partition_the_navigation_interval() {
         let started_at = std::time::Instant::now();
-        let mut recorder = FsRenderPerfRecorder::new(started_at);
+        let started_cycles = 1_000;
+        let mut recorder = FsRenderPerfRecorder::new(started_at, started_cycles);
         let mut marked_at = started_at;
+        let mut marked_cycles = started_cycles;
         for stage in FsRenderPerfStage::ALL {
             if stage == FsRenderPerfStage::FsNavigationClose {
                 break;
             }
             marked_at += std::time::Duration::from_millis(1);
-            recorder.mark_at(stage, marked_at);
+            marked_cycles += 100;
+            recorder.mark_at(stage, marked_at, marked_cycles);
         }
         let mut open_fullscreen = FsOpenPerfRecorder::default();
         for (span, ms) in [
@@ -39801,7 +40265,7 @@ mod tests {
             (FsOpenPerfSpan::ResetFileRuntime, 2),
             (FsOpenPerfSpan::ViewerPresentation, 3),
         ] {
-            open_fullscreen.add(span, std::time::Duration::from_millis(ms));
+            open_fullscreen.add(span, std::time::Duration::from_millis(ms), ms * 100);
         }
         let navigation = FsNavigationPerfRecorder {
             close: std::time::Duration::from_millis(2),
@@ -39825,11 +40289,13 @@ mod tests {
                     build_pixels: std::time::Duration::from_millis(2),
                     load_texture: std::time::Duration::from_millis(2),
                     cache_insert: std::time::Duration::from_millis(1),
+                    cycles: [100, 100, 200, 200, 100],
                     calls: Vec::new(),
                 },
                 resolve_original_preview_tex: std::time::Duration::from_millis(1),
                 ensure_navigation_target_thumbnail_requests: std::time::Duration::from_millis(2),
                 cache_lookup: std::time::Duration::from_millis(1),
+                cycles: [100, 1_700, 200, 800, 100, 200, 100],
                 cache_hit: Some(true),
             },
             land_open_other_defer_page_turn_full_resolution_work: std::time::Duration::from_millis(
@@ -39846,9 +40312,14 @@ mod tests {
             open_fullscreen,
             slideshow: std::time::Duration::from_millis(7),
             slideshow_advance: std::time::Duration::from_millis(6),
+            cycles: [
+                200, 300, 8_300, 400, 6_800, 0, 6_700, 100, 2_500, 100, 100, 100, 100, 300, 100,
+                200, 700, 600,
+            ],
         };
         marked_at += std::time::Duration::from_millis(103);
-        recorder.mark_navigation_at(navigation, marked_at);
+        marked_cycles += 10_300;
+        recorder.mark_navigation_at(navigation, marked_at, marked_cycles);
 
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationPageOther as usize],
@@ -39898,11 +40369,27 @@ mod tests {
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
         assert_eq!(passthrough_rendition_ms, 8.0);
+        let passthrough_rendition_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(passthrough_rendition_cycles, 800);
         assert_eq!(
             recorder.stage_ms
                 [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
                     as usize],
             1.0
+        );
+        assert_eq!(
+            recorder.stage_cycles
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            100
         );
         let page_turn_decision_ms = FsRenderPerfStage::ALL
             [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
@@ -39912,6 +40399,14 @@ mod tests {
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
         assert_eq!(page_turn_decision_ms, 25.0);
+        let page_turn_decision_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(page_turn_decision_cycles, 2_500);
         let resolve_sequence_ms = FsRenderPerfStage::ALL
             [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
                 as usize
@@ -39922,6 +40417,16 @@ mod tests {
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
         assert_eq!(resolve_sequence_ms, 17.0);
+        let resolve_sequence_cycles = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_cycles[stage as usize])
+            .sum::<u64>();
+        assert_eq!(resolve_sequence_cycles, 1_700);
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
             5.0
@@ -39954,20 +40459,35 @@ mod tests {
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
         assert_eq!(navigation_ms, 103.0);
+        let navigation_cycles =
+            FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
+                ..=FsRenderPerfStage::FsNavigationRemainder as usize]
+                .iter()
+                .copied()
+                .map(|stage| recorder.stage_cycles[stage as usize])
+                .sum::<u64>();
+        assert_eq!(navigation_cycles, 10_300);
         assert_eq!(
             FsRenderPerfStage::ALL.get(recorder.next_stage).copied(),
             Some(FsRenderPerfStage::FsBoundaryHint)
         );
         while recorder.next_stage < FS_RENDER_PERF_STAGE_COUNT {
             marked_at += std::time::Duration::from_millis(1);
+            marked_cycles += 100;
             let stage = FsRenderPerfStage::ALL[recorder.next_stage];
-            recorder.mark_at(stage, marked_at);
+            recorder.mark_at(stage, marked_at, marked_cycles);
         }
         let finished_at = marked_at + std::time::Duration::from_millis(7);
-        let breakdown = recorder.finish_at(finished_at);
+        let breakdown = recorder.finish_at(finished_at, marked_cycles + 700);
         let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+        let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
         assert!(
             (accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON
+        );
+        assert_eq!(breakdown.unaccounted_cycles, 700);
+        assert_eq!(
+            accounted_cycles + breakdown.unaccounted_cycles,
+            breakdown.total_cycles
         );
     }
 
@@ -39975,6 +40495,15 @@ mod tests {
     fn fs_render_perf_event_fields_follow_stage_order() {
         let event_stages = FsRenderPerfBreakdown::EVENT_FIELDS.map(|(_, stage)| stage);
         assert_eq!(event_stages, FsRenderPerfStage::ALL);
+        assert!(
+            FsRenderPerfBreakdown::EVENT_FIELDS
+                .iter()
+                .all(|(field, _)| {
+                    field
+                        .strip_suffix("_ms")
+                        .is_some_and(|prefix| !prefix.is_empty())
+                })
+        );
     }
 
     /// 全画面まわりで「いま居る場所」を聞く側が、復元先の矩形を読んでいないこと。

@@ -5685,7 +5685,10 @@ impl UpdatePerfStage {
 struct UpdatePerfRecorder {
     started_at: std::time::Instant,
     last_mark_at: std::time::Instant,
+    started_cycles: u64,
+    last_mark_cycles: u64,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
+    stage_cycles: [u64; UPDATE_PERF_STAGE_COUNT],
     next_stage: usize,
     /// The fullscreen viewport stage split further, because it turned out to hold 57% of a
     /// stall while the paint closure inside it explained only a quarter of that. The same
@@ -5697,11 +5700,14 @@ struct UpdatePerfRecorder {
 }
 
 impl UpdatePerfRecorder {
-    fn new(started_at: std::time::Instant) -> Self {
+    fn new(started_at: std::time::Instant, started_cycles: u64) -> Self {
         Self {
             started_at,
             last_mark_at: started_at,
+            started_cycles,
+            last_mark_cycles: started_cycles,
             stage_ms: [0.0; UPDATE_PERF_STAGE_COUNT],
+            stage_cycles: [0; UPDATE_PERF_STAGE_COUNT],
             fullscreen_split_ms: [0.0; 4],
             nav_helper_metrics: NavHelperPerfMetrics::default(),
             next_stage: 0,
@@ -5709,40 +5715,53 @@ impl UpdatePerfRecorder {
     }
 
     fn mark(&mut self, stage: UpdatePerfStage) {
-        self.mark_at(stage, std::time::Instant::now());
+        self.mark_at(stage, std::time::Instant::now(), App::thread_cycles_now());
     }
 
-    fn mark_at(&mut self, stage: UpdatePerfStage, now: std::time::Instant) {
+    fn mark_at(&mut self, stage: UpdatePerfStage, now: std::time::Instant, cycles: u64) {
         debug_assert_eq!(
             UpdatePerfStage::ALL.get(self.next_stage).copied(),
             Some(stage)
         );
         self.stage_ms[stage as usize] =
             now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.stage_cycles[stage as usize] = cycles.saturating_sub(self.last_mark_cycles);
         self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
         self.next_stage += 1;
     }
 
     fn finish(self) -> UpdatePerfBreakdown {
-        self.finish_at(std::time::Instant::now())
+        self.finish_at(std::time::Instant::now(), App::thread_cycles_now())
     }
 
-    fn finish_at(mut self, finished_at: std::time::Instant) -> UpdatePerfBreakdown {
+    fn finish_at(
+        mut self,
+        finished_at: std::time::Instant,
+        finished_cycles: u64,
+    ) -> UpdatePerfBreakdown {
         // `update_frame` has several intentional early returns. Attribute the interval up to
         // that return to the currently active stage and leave later, unvisited stages at zero.
         if self.next_stage < UPDATE_PERF_STAGE_COUNT {
             self.stage_ms[self.next_stage] =
                 finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.stage_cycles[self.next_stage] =
+                finished_cycles.saturating_sub(self.last_mark_cycles);
             self.next_stage += 1;
         }
         debug_assert!(self.next_stage <= UPDATE_PERF_STAGE_COUNT);
 
         let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
         let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        let total_cycles = finished_cycles.saturating_sub(self.started_cycles);
+        let accounted_cycles = self.stage_cycles.iter().sum::<u64>();
         UpdatePerfBreakdown {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            total_cycles,
+            stage_cycles: self.stage_cycles,
+            unaccounted_cycles: total_cycles.saturating_sub(accounted_cycles),
             fullscreen_split_ms: self.fullscreen_split_ms,
             nav_helper_metrics: self.nav_helper_metrics,
         }
@@ -5753,8 +5772,9 @@ impl UpdatePerfRecorder {
 fn update_perf_start_with(
     perf_on: bool,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) -> Option<UpdatePerfRecorder> {
-    perf_on.then(now).map(UpdatePerfRecorder::new)
+    perf_on.then(|| UpdatePerfRecorder::new(now(), cycles_now()))
 }
 
 /// Records how the fullscreen viewport stage divides, in the order the spans occur.
@@ -5800,6 +5820,9 @@ struct UpdatePerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    total_cycles: u64,
+    stage_cycles: [u64; UPDATE_PERF_STAGE_COUNT],
+    unaccounted_cycles: u64,
     fullscreen_split_ms: [f64; 4],
     nav_helper_metrics: NavHelperPerfMetrics,
 }
@@ -5853,18 +5876,37 @@ impl UpdatePerfBreakdown {
     ];
 
     fn emit(&self, frame_number: u64) {
-        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT + 11);
+        let cycle_field_names = Self::EVENT_FIELDS.map(|(field, _)| {
+            format!(
+                "{}_cycles",
+                field
+                    .strip_suffix("_ms")
+                    .expect("update perf stage field must end in _ms")
+            )
+        });
+        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT * 2 + 13);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
-        for (field, stage) in Self::EVENT_FIELDS {
+        extras.push(("total_cycles", serde_json::Value::from(self.total_cycles)));
+        for ((field, stage), cycle_field) in
+            Self::EVENT_FIELDS.into_iter().zip(cycle_field_names.iter())
+        {
             extras.push((
                 field,
                 serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+            extras.push((
+                cycle_field.as_str(),
+                serde_json::Value::from(self.stage_cycles[stage as usize]),
             ));
         }
         extras.push((
             "unaccounted_ms",
             serde_json::Value::from(self.unaccounted_ms),
+        ));
+        extras.push((
+            "unaccounted_cycles",
+            serde_json::Value::from(self.unaccounted_cycles),
         ));
         for (field, value) in [
             ("fs_keep_alive_ms", self.fullscreen_split_ms[0]),
@@ -6893,6 +6935,9 @@ impl FsOpenMaterialization {
     }
 }
 
+const FS_OPEN_PERF_SPAN_COUNT: usize = 10;
+
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsOpenPerfSpan {
     Total,
@@ -6919,10 +6964,11 @@ pub(crate) struct FsOpenPerfRecorder {
     refresh_fullscreen_pdf_promotion: std::time::Duration,
     reset_file_runtime: std::time::Duration,
     viewer_presentation: std::time::Duration,
+    cycles: [u64; FS_OPEN_PERF_SPAN_COUNT],
 }
 
 impl FsOpenPerfRecorder {
-    pub(crate) fn add(&mut self, span: FsOpenPerfSpan, elapsed: std::time::Duration) {
+    pub(crate) fn add(&mut self, span: FsOpenPerfSpan, elapsed: std::time::Duration, cycles: u64) {
         let target = match span {
             FsOpenPerfSpan::Total => &mut self.total,
             FsOpenPerfSpan::RecordReadingHistory => &mut self.record_reading_history,
@@ -6940,6 +6986,7 @@ impl FsOpenPerfRecorder {
             FsOpenPerfSpan::ViewerPresentation => &mut self.viewer_presentation,
         };
         *target += elapsed;
+        self.cycles[span as usize] += cycles;
     }
 
     pub(crate) fn elapsed(&self, span: FsOpenPerfSpan) -> std::time::Duration {
@@ -6970,32 +7017,56 @@ impl FsOpenPerfRecorder {
             + self.reset_file_runtime
             + self.viewer_presentation
     }
+
+    pub(crate) fn cycles(&self, span: FsOpenPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    pub(crate) fn categorized_cycles(&self) -> u64 {
+        self.cycles(FsOpenPerfSpan::RecordReadingHistory)
+            + self.cycles(FsOpenPerfSpan::RecordBookResume)
+            + self.cycles(FsOpenPerfSpan::StartMetadataLoad)
+            + self.cycles(FsOpenPerfSpan::StartFsLoad)
+            + self.cycles(FsOpenPerfSpan::UpdatePrefetchWindow)
+            + self.cycles(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache)
+            + self.cycles(FsOpenPerfSpan::RefreshFullscreenPdfPromotion)
+            + self.cycles(FsOpenPerfSpan::ResetFileRuntime)
+            + self.cycles(FsOpenPerfSpan::ViewerPresentation)
+    }
 }
 
 #[inline]
 pub(crate) fn start_fs_open_perf_span_with(
     recorder: &Option<&mut FsOpenPerfRecorder>,
     now: impl FnOnce() -> std::time::Instant,
-) -> Option<std::time::Instant> {
-    recorder.as_ref().map(|_| now())
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
 }
 
 #[inline]
 fn start_fs_open_perf_span(
     recorder: &Option<&mut FsOpenPerfRecorder>,
-) -> Option<std::time::Instant> {
-    start_fs_open_perf_span_with(recorder, std::time::Instant::now)
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_open_perf_span_with(recorder, std::time::Instant::now, App::thread_cycles_now)
 }
 
 #[inline]
 pub(crate) fn finish_fs_open_perf_span_with(
     recorder: &mut Option<&mut FsOpenPerfRecorder>,
     span: FsOpenPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) {
-    if let (Some(recorder), Some(started_at)) = (recorder.as_deref_mut(), started_at) {
-        recorder.add(span, now().duration_since(started_at));
+    if let (Some(recorder), Some((started_at, started_cycles))) =
+        (recorder.as_deref_mut(), started_at)
+    {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
     }
 }
 
@@ -7003,9 +7074,15 @@ pub(crate) fn finish_fs_open_perf_span_with(
 fn finish_fs_open_perf_span(
     recorder: &mut Option<&mut FsOpenPerfRecorder>,
     span: FsOpenPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
 ) {
-    finish_fs_open_perf_span_with(recorder, span, started_at, std::time::Instant::now);
+    finish_fs_open_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
 }
 
 impl FsPageLoadState {
@@ -7432,6 +7509,7 @@ pub(crate) struct PassthroughRenditionPerfRecorder {
     pub(crate) build_pixels: std::time::Duration,
     pub(crate) load_texture: std::time::Duration,
     pub(crate) cache_insert: std::time::Duration,
+    pub(crate) cycles: [u64; PASSTHROUGH_RENDITION_PERF_SPAN_COUNT],
     pub(crate) calls: Vec<PassthroughRenditionPerfCall>,
 }
 
@@ -7444,7 +7522,24 @@ impl PassthroughRenditionPerfRecorder {
             + self.cache_insert
     }
 
-    fn add(&mut self, span: PassthroughRenditionPerfSpan, elapsed: std::time::Duration) {
+    pub(crate) fn categorized_cycles(&self) -> u64 {
+        self.cycles.iter().sum()
+    }
+
+    pub(crate) fn remainder_cycles(&self, total_cycles: u64) -> u64 {
+        total_cycles.saturating_sub(self.categorized_cycles())
+    }
+
+    pub(crate) fn cycles(&self, span: PassthroughRenditionPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn add(
+        &mut self,
+        span: PassthroughRenditionPerfSpan,
+        elapsed: std::time::Duration,
+        cycles: u64,
+    ) {
         let target = match span {
             PassthroughRenditionPerfSpan::SourceLookup => &mut self.source_lookup,
             PassthroughRenditionPerfSpan::CacheLookup => &mut self.cache_lookup,
@@ -7453,11 +7548,15 @@ impl PassthroughRenditionPerfRecorder {
             PassthroughRenditionPerfSpan::CacheInsert => &mut self.cache_insert,
         };
         *target += elapsed;
+        self.cycles[span as usize] += cycles;
     }
 }
 
+const PASSTHROUGH_RENDITION_PERF_SPAN_COUNT: usize = 5;
+
+#[repr(usize)]
 #[derive(Debug, Clone, Copy)]
-enum PassthroughRenditionPerfSpan {
+pub(crate) enum PassthroughRenditionPerfSpan {
     SourceLookup,
     CacheLookup,
     BuildPixels,
@@ -7469,26 +7568,36 @@ enum PassthroughRenditionPerfSpan {
 fn start_passthrough_rendition_perf_span_with(
     recorder: Option<&PassthroughRenditionPerfRecorder>,
     now: impl FnOnce() -> std::time::Instant,
-) -> Option<std::time::Instant> {
-    recorder.map(|_| now())
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.map(|_| (now(), cycles_now()))
 }
 
 #[inline]
 fn start_passthrough_rendition_perf_span(
     recorder: Option<&PassthroughRenditionPerfRecorder>,
-) -> Option<std::time::Instant> {
-    start_passthrough_rendition_perf_span_with(recorder, std::time::Instant::now)
+) -> Option<(std::time::Instant, u64)> {
+    start_passthrough_rendition_perf_span_with(
+        recorder,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    )
 }
 
 #[inline]
 fn finish_passthrough_rendition_perf_span_with(
     recorder: Option<&mut PassthroughRenditionPerfRecorder>,
     span: PassthroughRenditionPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) {
-    if let (Some(recorder), Some(started_at)) = (recorder, started_at) {
-        recorder.add(span, now().duration_since(started_at));
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder, started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
     }
 }
 
@@ -7496,13 +7605,14 @@ fn finish_passthrough_rendition_perf_span_with(
 fn finish_passthrough_rendition_perf_span(
     recorder: Option<&mut PassthroughRenditionPerfRecorder>,
     span: PassthroughRenditionPerfSpan,
-    started_at: Option<std::time::Instant>,
+    started_at: Option<(std::time::Instant, u64)>,
 ) {
     finish_passthrough_rendition_perf_span_with(
         recorder,
         span,
         started_at,
         std::time::Instant::now,
+        App::thread_cycles_now,
     );
 }
 
@@ -68606,7 +68716,11 @@ impl App {
     /// 呼び出し側 (`update`) へ置く。
     fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_perf_on = crate::perf::is_enabled();
-        let mut update_perf = update_perf_start_with(update_perf_on, std::time::Instant::now);
+        let mut update_perf = update_perf_start_with(
+            update_perf_on,
+            std::time::Instant::now,
+            Self::thread_cycles_now,
+        );
         begin_nav_helper_perf_frame(update_perf_on);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();

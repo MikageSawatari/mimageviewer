@@ -2803,35 +2803,73 @@ fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
 }
 
 #[test]
-fn update_perf_timer_does_not_read_clock_when_disabled() {
+fn update_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
     let clock_called = Cell::new(false);
-    let mut recorder = update_perf_start_with(false, || {
-        clock_called.set(true);
-        std::time::Instant::now()
-    });
+    let cycles_called = Cell::new(false);
+    let mut recorder = update_perf_start_with(
+        false,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || {
+            cycles_called.set(true);
+            1
+        },
+    );
     for stage in UpdatePerfStage::ALL {
         mark_update_perf(&mut recorder, stage);
     }
+    finish_update_perf(&mut recorder, 0);
 
     assert!(recorder.is_none());
     assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
+    let cycle_fields = UpdatePerfBreakdown::EVENT_FIELDS.map(|(field, _)| {
+        format!(
+            "{}_cycles",
+            field
+                .strip_suffix("_ms")
+                .expect("wall-clock field must end in _ms")
+        )
+    });
+
+    assert_eq!(cycle_fields.len(), UPDATE_PERF_STAGE_COUNT);
+    assert!(cycle_fields.iter().all(|field| field.ends_with("_cycles")));
 }
 
 #[test]
 fn update_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
-    let mut recorder = UpdatePerfRecorder::new(started_at);
+    let started_cycles = 1_000;
+    let mut recorder = UpdatePerfRecorder::new(started_at, started_cycles);
     let mut elapsed = std::time::Duration::ZERO;
+    let mut cycles = started_cycles;
     for (index, stage) in UpdatePerfStage::ALL.into_iter().enumerate() {
         elapsed += std::time::Duration::from_millis(index as u64 + 1);
-        recorder.mark_at(stage, started_at + elapsed);
+        cycles += (index as u64 + 1) * 100;
+        recorder.mark_at(stage, started_at + elapsed, cycles);
     }
     let expected_unaccounted = std::time::Duration::from_millis(7);
-    let breakdown = recorder.finish_at(started_at + elapsed + expected_unaccounted);
+    let expected_unaccounted_cycles = 700;
+    let breakdown = recorder.finish_at(
+        started_at + elapsed + expected_unaccounted,
+        cycles + expected_unaccounted_cycles,
+    );
     let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+    let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
 
     assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
     assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+    assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+    assert_eq!(
+        accounted_cycles + breakdown.unaccounted_cycles,
+        breakdown.total_cycles
+    );
 }
 
 #[test]
@@ -2851,8 +2889,9 @@ fn poll_prefetch_perf_timer_does_not_read_clock_when_disabled() {
 }
 
 #[test]
-fn passthrough_rendition_perf_timer_does_not_read_clock_when_disabled() {
+fn passthrough_rendition_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
     let clock_called = Cell::new(false);
+    let cycles_called = Cell::new(false);
     let mut recorder: Option<PassthroughRenditionPerfRecorder> = None;
     for span in [
         PassthroughRenditionPerfSpan::SourceLookup,
@@ -2861,18 +2900,57 @@ fn passthrough_rendition_perf_timer_does_not_read_clock_when_disabled() {
         PassthroughRenditionPerfSpan::LoadTexture,
         PassthroughRenditionPerfSpan::CacheInsert,
     ] {
-        let started_at = start_passthrough_rendition_perf_span_with(recorder.as_ref(), || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
-        finish_passthrough_rendition_perf_span_with(recorder.as_mut(), span, started_at, || {
-            clock_called.set(true);
-            std::time::Instant::now()
-        });
+        let started_at = start_passthrough_rendition_perf_span_with(
+            recorder.as_ref(),
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_passthrough_rendition_perf_span_with(
+            recorder.as_mut(),
+            span,
+            started_at,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
     }
 
     assert!(recorder.is_none());
     assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn passthrough_rendition_perf_spans_plus_remainder_equal_total_cycles() {
+    let mut recorder = PassthroughRenditionPerfRecorder::default();
+    for (span, cycles) in [
+        (PassthroughRenditionPerfSpan::SourceLookup, 11),
+        (PassthroughRenditionPerfSpan::CacheLookup, 13),
+        (PassthroughRenditionPerfSpan::BuildPixels, 17),
+        (PassthroughRenditionPerfSpan::LoadTexture, 19),
+        (PassthroughRenditionPerfSpan::CacheInsert, 23),
+    ] {
+        recorder.add(span, std::time::Duration::ZERO, cycles);
+    }
+    let total_cycles = 100;
+    let remainder_cycles = recorder.remainder_cycles(total_cycles);
+
+    assert_eq!(recorder.categorized_cycles(), 83);
+    assert_eq!(
+        recorder.categorized_cycles() + remainder_cycles,
+        total_cycles
+    );
 }
 
 #[test]
