@@ -1,8 +1,8 @@
 use crate::model::{
-    Animatable, BandRange, BandWeighting, Fill, Fit, Glow, ImageId, Layer, LayerId, LayerKind,
-    Modulator, ModulatorId, ModulatorSource, MusicColorMode, NormRect, Output, PitchKeyboardLayer,
-    ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign,
-    TimeFormat, TimeTextLayer,
+    Animatable, BandCalibration, BandRange, BandWeighting, Fill, Fit, Glow, ImageId, Layer,
+    LayerId, LayerKind, Modulator, ModulatorId, ModulatorSource, MusicColorMode, NormRect, Output,
+    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    SpectrumShape, TextAlign, TimeFormat, TimeTextLayer,
 };
 use crate::spectrum::Smoothing;
 
@@ -18,6 +18,10 @@ pub const PROJECT_VERSION: u32 = 1;
 pub const KICK_ATTACK_SECS: f32 = 0.015;
 pub const KICK_RELEASE_SECS: f32 = 0.18;
 pub const KICK_THRESHOLD: f32 = 0.08;
+pub const KICK_CALIBRATION_LOW_PERCENTILE: f32 = 50.0;
+pub const KICK_CALIBRATION_HIGH_PERCENTILE: f32 = 99.0;
+pub const BAND_ENERGY_CALIBRATION_LOW_PERCENTILE: f32 = 5.0;
+pub const BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE: f32 = 95.0;
 
 /// Builds the shared §1.4 reference scene used by preview and MP4 export.
 pub fn default_project(duration_secs: f64) -> Project {
@@ -186,7 +190,7 @@ pub fn new_band_energy_modulator(project: &Project) -> Modulator {
         } else {
             format!("キックに合わせる動き {next_id}")
         },
-        source: ModulatorSource::BandEnergy {
+        source: ModulatorSource::BandOnset {
             range: BandRange::Hz {
                 low_hz: 40.0,
                 high_hz: 120.0,
@@ -199,6 +203,10 @@ pub fn new_band_energy_modulator(project: &Project) -> Modulator {
             gain_db: 3.0,
             floor: 0.03,
             ceiling: 0.8,
+            calibration: BandCalibration::Auto {
+                low_percentile: KICK_CALIBRATION_LOW_PERCENTILE,
+                high_percentile: KICK_CALIBRATION_HIGH_PERCENTILE,
+            },
             threshold: KICK_THRESHOLD,
         },
     }
@@ -275,7 +283,7 @@ mod tests {
         assert_eq!(modulator.name, "キックに合わせる動き");
         assert_eq!(
             modulator.source,
-            ModulatorSource::BandEnergy {
+            ModulatorSource::BandOnset {
                 range: BandRange::Hz {
                     low_hz: 40.0,
                     high_hz: 120.0,
@@ -288,6 +296,10 @@ mod tests {
                 gain_db: 3.0,
                 floor: 0.03,
                 ceiling: 0.8,
+                calibration: BandCalibration::Auto {
+                    low_percentile: KICK_CALIBRATION_LOW_PERCENTILE,
+                    high_percentile: KICK_CALIBRATION_HIGH_PERCENTILE,
+                },
                 threshold: KICK_THRESHOLD,
             }
         );

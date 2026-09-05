@@ -54,10 +54,42 @@ pub enum ModulatorSource {
         gain_db: f32,
         floor: f32,
         ceiling: f32,
+        /// Whether the input range is taken from the saved manual values or
+        /// calibrated from the complete decoded track.
+        #[serde(default)]
+        calibration: BandCalibration,
         /// Values below this normalized 0..=1 level are treated as silence
         /// before temporal smoothing.
         #[serde(default)]
         threshold: f32,
+    },
+    /// Positive change in a band's gained display energy. Unlike
+    /// `BandEnergy`, a sustained bass note settles back to zero.
+    BandOnset {
+        range: BandRange,
+        smoothing: Smoothing,
+        #[serde(default)]
+        weighting: BandWeighting,
+        gain_db: f32,
+        floor: f32,
+        ceiling: f32,
+        #[serde(default)]
+        calibration: BandCalibration,
+        #[serde(default)]
+        threshold: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum BandCalibration {
+    /// Preserve the P3c/P3d floor and ceiling exactly. This is also the default
+    /// for version-1 JSON written before automatic calibration existed.
+    #[default]
+    Manual,
+    /// Map these percentiles of the complete decoded track to 0 and 1.
+    Auto {
+        low_percentile: f32,
+        high_percentile: f32,
     },
 }
 

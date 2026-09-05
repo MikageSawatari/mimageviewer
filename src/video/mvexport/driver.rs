@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_the_third as ffmpeg;
 use musicvideo_core::{
-    Frame, LayerKind, RenderReport, Smoothing, SpectrumSource, UnresolvedAsset, evaluate,
-    render_frame,
+    Frame, LayerKind, RenderReport, Smoothing, SpectrumSource, UnresolvedAsset,
+    calibrate_modulators, evaluate, render_frame,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -104,6 +104,21 @@ pub(super) fn export(
         cancel,
     )?);
     let aac_encode_secs = aac_encode_started.elapsed().as_secs_f64();
+    let calibrations = calibrate_modulators(
+        &decoded.stereo_samples,
+        decoded.info.sample_rate,
+        &request.project.modulators,
+        &|| cancel.load(Ordering::Relaxed),
+    )
+    .map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            ExportError::Cancelled
+        } else {
+            ExportError::InvalidRequest(format!(
+                "モジュレータの反応範囲を自動調整できません: {error}"
+            ))
+        }
+    })?;
     let mut spectrum = SpectrumSource::new(
         decoded.info.sample_rate,
         plan.spectrum_bands,
@@ -113,7 +128,7 @@ pub(super) fn export(
         ExportError::InvalidRequest(format!("スペクトラム解析を初期化できません: {error}"))
     })?;
     spectrum
-        .configure_modulators(&request.project.modulators)
+        .configure_modulators_with_calibrations(&request.project.modulators, &calibrations)
         .map_err(|error| {
             ExportError::InvalidRequest(format!("モジュレータを初期化できません: {error}"))
         })?;

@@ -16,9 +16,9 @@ pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use egui::TextureHandle;
 use musicvideo_core::{
-    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, ModulatorValue,
-    MusicColorMode, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape,
-    new_pitch_keyboard_layer,
+    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind,
+    ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8, SpectrumDirection,
+    SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
 };
 
 use modulators::ModulatorEditorState;
@@ -133,70 +133,98 @@ pub fn draw_editor(
     state: &mut EditorState,
     current_time_secs: f64,
     modulator_values: &[ModulatorValue],
+    calibrations: &[ModulatorCalibration],
 ) -> EditorResponse {
     state.reconcile(project);
-    let mut project_changed = ui
-        .add(
-            egui::DragValue::new(&mut project.display_gain_db)
-                .range(-48.0..=48.0)
-                .speed(0.1)
-                .prefix("表示ゲイン ")
-                .suffix(" dB"),
-        )
-        .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
-        .changed();
-    project_changed |=
-        modulators::draw_modulators(ui, project, &mut state.modulator_editor, modulator_values);
+    ui.heading("プロパティ");
     ui.separator();
-    ui.heading("レイヤー");
-    for (index, layer) in project.layers.iter().enumerate() {
-        if ui
-            .selectable_label(state.selected_layer == index, &layer.name)
-            .clicked()
-        {
-            state.selected_layer = index;
-            if state
-                .selected_key
-                .is_some_and(|selected| selected.layer != layer.id)
-            {
-                state.selected_key = None;
-                state.dragging_key = None;
-            }
-        }
-    }
+    let body_width = ui.available_width();
+    let body_height = ui.available_height().max(0.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(body_width, body_height),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_width(body_width);
+            ui.set_max_width(body_width);
+            ui.set_min_height(body_height);
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut project_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut project.display_gain_db)
+                                .range(-48.0..=48.0)
+                                .speed(0.1)
+                                .prefix("表示ゲイン ")
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
+                        .changed();
+                    project_changed |= modulators::draw_modulators(
+                        ui,
+                        project,
+                        &mut state.modulator_editor,
+                        modulator_values,
+                        calibrations,
+                    );
+                    ui.separator();
+                    ui.heading("レイヤー");
+                    for (index, layer) in project.layers.iter().enumerate() {
+                        if ui
+                            .selectable_label(state.selected_layer == index, &layer.name)
+                            .clicked()
+                        {
+                            state.selected_layer = index;
+                            if state
+                                .selected_key
+                                .is_some_and(|selected| selected.layer != layer.id)
+                            {
+                                state.selected_key = None;
+                                state.dragging_key = None;
+                            }
+                        }
+                    }
 
-    if ui.button("＋ ピッチ鍵盤を追加").clicked() {
-        project.layers.push(new_pitch_keyboard_layer(project));
-        state.selected_layer = project.layers.len() - 1;
-        state.selected_key = None;
-        project_changed = true;
-    }
-    let add_image_layer_requested = ui.button("＋ 画像レイヤーを追加").clicked();
-    ui.separator();
-    let mut commands = Vec::new();
-    let output = project.output;
-    let modulators = project.modulators.clone();
-    if let Some(layer) = project.layers.get_mut(state.selected_layer) {
-        let result = edit_layer_properties(
-            ui,
-            layer,
-            state.selected_key,
-            current_time_secs,
-            output.width,
-            output.height,
-            &modulators,
-            modulator_values,
-        );
-        project_changed |= result.changed;
-        commands = result.commands;
-    }
-    for command in commands {
-        project_changed |= state.apply_command(project, &command);
-    }
-    EditorResponse {
-        project_changed,
-        add_image_layer_requested,
-    }
+                    if ui.button("＋ ピッチ鍵盤を追加").clicked() {
+                        project.layers.push(new_pitch_keyboard_layer(project));
+                        state.selected_layer = project.layers.len() - 1;
+                        state.selected_key = None;
+                        project_changed = true;
+                    }
+                    let add_image_layer_requested = ui.button("＋ 画像レイヤーを追加").clicked();
+                    ui.separator();
+                    let mut commands = Vec::new();
+                    let output = project.output;
+                    let modulators = project.modulators.clone();
+                    if let Some(layer) = project.layers.get_mut(state.selected_layer) {
+                        let result = edit_layer_properties(
+                            ui,
+                            layer,
+                            state.selected_key,
+                            current_time_secs,
+                            output.width,
+                            output.height,
+                            &modulators,
+                            modulator_values,
+                        );
+                        project_changed |= result.changed;
+                        commands = result.commands;
+                    }
+                    for command in commands {
+                        project_changed |= state.apply_command(project, &command);
+                    }
+                    EditorResponse {
+                        project_changed,
+                        add_image_layer_requested,
+                    }
+                })
+                .inner
+        },
+    )
+    .inner
 }
 
 /// Draws the already-composited frame. Texture creation and updates stay with the caller.

@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, ModulatorValue, Project,
-    RenderReport, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, evaluate,
-    new_image_layer, render_frame,
+    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, ModulatorCalibration,
+    ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport, Smoothing, SpectrumFrame,
+    SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
+    modulator_calibration_requests, new_image_layer, render_frame,
 };
 use musicvideo_ui::{
     EditorState, MissingImageNotice, TimelineWaveform, draw_editor, draw_missing_images,
@@ -167,6 +168,12 @@ struct PreviewPending {
     rx: mpsc::Receiver<Result<PreviewResult, String>>,
 }
 
+struct CalibrationPending {
+    cancel: Arc<AtomicBool>,
+    request: Vec<ModulatorCalibrationRequest>,
+    rx: mpsc::Receiver<Result<Vec<ModulatorCalibration>, String>>,
+}
+
 struct ExportPending {
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicUsize>,
@@ -195,6 +202,9 @@ pub struct MusicVideoLabApp {
     preview_report: RenderReport,
     preview_spectrum: Option<SpectrumSource>,
     preview_modulator_values: Vec<ModulatorValue>,
+    modulator_calibrations: Vec<ModulatorCalibration>,
+    calibration_request: Vec<ModulatorCalibrationRequest>,
+    calibration_pending: Option<CalibrationPending>,
     preview_perf: PreviewPerfTracker,
     export_pending: Option<ExportPending>,
     last_export: Option<ExportOutcome>,
@@ -232,6 +242,9 @@ impl MusicVideoLabApp {
             preview_report: RenderReport::default(),
             preview_spectrum: None,
             preview_modulator_values: Vec::new(),
+            modulator_calibrations: Vec::new(),
+            calibration_request: Vec::new(),
+            calibration_pending: None,
             preview_perf: PreviewPerfTracker::default(),
             export_pending: None,
             last_export: None,
@@ -277,10 +290,113 @@ impl MusicVideoLabApp {
         }
     }
 
+    fn schedule_project_edit_preview(&mut self) {
+        // A slider can change faster than a full-resolution frame finishes.
+        // Let the current complete frame reach the texture, then render the
+        // newest project snapshot. Seek and asset replacement still use
+        // mark_preview_dirty because their in-flight result is invalid.
+        self.preview_dirty = true;
+    }
+
+    fn invalidate_modulator_calibration(&mut self) {
+        if let Some(pending) = self.calibration_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.calibration_request.clear();
+        self.modulator_calibrations.clear();
+        self.preview_spectrum = None;
+    }
+
+    fn start_calibration_if_needed(&mut self, ctx: &egui::Context) {
+        let request = modulator_calibration_requests(&self.project.modulators);
+        if request == self.calibration_request {
+            return;
+        }
+        if let Some(pending) = self.calibration_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.calibration_request = request.clone();
+        self.modulator_calibrations.clear();
+        self.preview_spectrum = None;
+        if request.is_empty() {
+            return;
+        }
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+        let modulators = self.project.modulators.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("musicvideo-modulator-calibration".to_owned())
+            .spawn(move || {
+                let result = calibrate_modulators(
+                    &audio.stereo_pcm,
+                    audio.sample_rate,
+                    &modulators,
+                    &|| worker_cancel.load(Ordering::Relaxed),
+                )
+                .map_err(|error| format!("曲全体の反応範囲を計算できません: {error}"));
+                if !worker_cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                    worker_ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.status = "曲全体からモジュレータの反応範囲を計算しています".to_owned();
+                self.calibration_pending = Some(CalibrationPending {
+                    cancel,
+                    request,
+                    rx,
+                });
+            }
+            Err(error) => {
+                self.status = format!("自動調整ワーカーを開始できません: {error}");
+            }
+        }
+    }
+
+    fn poll_calibration(&mut self) {
+        let result = self
+            .calibration_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv());
+        match result {
+            Some(Ok(Ok(calibrations))) => {
+                let Some(pending) = self.calibration_pending.take() else {
+                    return;
+                };
+                if pending.request == modulator_calibration_requests(&self.project.modulators) {
+                    self.modulator_calibrations = calibrations;
+                    self.preview_spectrum = None;
+                    self.status = "曲全体に合わせて反応範囲を自動調整しました".to_owned();
+                    self.mark_preview_dirty();
+                }
+            }
+            Some(Ok(Err(error))) => {
+                self.calibration_pending = None;
+                self.status = error;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.calibration_pending = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn calibration_ready(&self) -> bool {
+        self.audio.is_none()
+            || self.calibration_request.is_empty()
+            || self.modulator_calibrations.len() == self.calibration_request.len()
+    }
+
     fn schedule_playback_preview(&mut self) {
         // Playback time advances while the current worker is rendering. Keep that completed
         // frame, then render the newest audio position next. Revisions are reserved for project
-        // edits and seeks that really invalidate an in-flight frame.
+        // state changes and seeks that really invalidate an in-flight frame.
         self.preview_dirty = true;
     }
 
@@ -378,6 +494,7 @@ impl MusicVideoLabApp {
                 };
                 self.audio = Some(audio);
                 self.waveform = Some(waveform);
+                self.invalidate_modulator_calibration();
                 if self.audio_player.is_some() {
                     self.status = "音声を読み込みました".to_owned();
                 }
@@ -426,7 +543,7 @@ impl MusicVideoLabApp {
     }
 
     fn start_preview_if_needed(&mut self, ctx: &egui::Context) {
-        if !self.preview_dirty || self.preview_pending.is_some() {
+        if !self.preview_dirty || self.preview_pending.is_some() || !self.calibration_ready() {
             return;
         }
         self.preview_dirty = false;
@@ -435,6 +552,7 @@ impl MusicVideoLabApp {
         let position_secs = self.position_secs;
         let audio = self.audio.clone();
         let previous_spectrum = self.preview_spectrum.take();
+        let calibrations = self.modulator_calibrations.clone();
         let assets = Arc::clone(&self.assets);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -463,7 +581,10 @@ impl MusicVideoLabApp {
                             .map_err(|error| format!("スペクトラム解析に失敗しました: {error}"))?,
                         };
                         source
-                            .configure_modulators(&project.modulators)
+                            .configure_modulators_with_calibrations(
+                                &project.modulators,
+                                &calibrations,
+                            )
                             .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
                         let frame = source
                             .full_frame_at(
@@ -764,6 +885,7 @@ impl MusicVideoLabApp {
                     });
                 self.editor_state.reconcile(&self.project);
                 self.preview_report = RenderReport::default();
+                self.invalidate_modulator_calibration();
                 let issue_count =
                     self.image_errors.len() + usize::from(loaded.audio_error.is_some());
                 if let Some(error) = loaded.audio_error {
@@ -929,6 +1051,7 @@ impl eframe::App for MusicVideoLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let update_started = Instant::now();
         self.poll_loads();
+        self.poll_calibration();
         let mut displayed_perf = self.poll_preview(ctx);
         self.poll_export();
         self.poll_projects();
@@ -1206,12 +1329,13 @@ impl eframe::App for MusicVideoLabApp {
                             &mut self.editor_state,
                             self.position_secs,
                             &self.preview_modulator_values,
+                            &self.modulator_calibrations,
                         )
                     })
                     .inner;
                 add_image_layer_requested = response.add_image_layer_requested;
                 if response.project_changed {
-                    self.mark_preview_dirty();
+                    self.schedule_project_edit_preview();
                 }
             });
 
@@ -1249,7 +1373,7 @@ impl eframe::App for MusicVideoLabApp {
         if let Some(position_secs) = timeline_response.seek_to {
             self.seek_to(position_secs);
         } else if timeline_response.project_changed {
-            self.mark_preview_dirty();
+            self.schedule_project_edit_preview();
         }
 
         egui::CentralPanel::default()
@@ -1259,6 +1383,7 @@ impl eframe::App for MusicVideoLabApp {
             });
         let egui_layout_ms = egui_layout_started.elapsed().as_secs_f64() * 1000.0;
 
+        self.start_calibration_if_needed(ctx);
         self.start_preview_if_needed(ctx);
         if self.audio_pending.is_some()
             || self.image_pending.is_some()
@@ -1266,6 +1391,7 @@ impl eframe::App for MusicVideoLabApp {
             || self.export_pending.is_some()
             || self.project_load_pending.is_some()
             || self.project_save_pending.is_some()
+            || self.calibration_pending.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -1332,6 +1458,9 @@ impl Drop for MusicVideoLabApp {
         if let Some(pending) = &self.preview_pending {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(pending) = &self.calibration_pending {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(pending) = &self.export_pending {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -1346,17 +1475,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playback_ticks_do_not_invalidate_an_in_flight_preview() {
+    fn playback_and_project_edits_do_not_cancel_a_complete_in_flight_frame() {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let revision = app.preview_revision;
         app.preview_dirty = false;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel();
+        app.preview_pending = Some(PreviewPending {
+            cancel: Arc::clone(&cancel),
+            rx,
+        });
 
         app.schedule_playback_preview();
         assert!(app.preview_dirty);
         assert_eq!(app.preview_revision, revision);
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        app.preview_dirty = false;
+        app.schedule_project_edit_preview();
+        assert!(app.preview_dirty);
+        assert_eq!(app.preview_revision, revision);
+        assert!(!cancel.load(Ordering::Relaxed));
 
         app.mark_preview_dirty();
         assert_eq!(app.preview_revision, revision.wrapping_add(1));
+        assert!(cancel.load(Ordering::Relaxed));
     }
 
     #[test]

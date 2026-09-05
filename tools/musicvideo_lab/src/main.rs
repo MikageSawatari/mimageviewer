@@ -81,7 +81,28 @@ fn main() {
         }
         return;
     }
-
+    if command.as_deref() == Some("--project-modulator-response") {
+        let Some(path) = args.next().map(PathBuf::from) else {
+            eprintln!("--project-modulator-response には project.mivmv.json のパスが必要です");
+            std::process::exit(2);
+        };
+        if let Err(error) = export::run_project_modulator_response(&path) {
+            eprintln!("実素材のモジュレータ測定に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if command.as_deref() == Some("--project-text-drag-diagnostic") {
+        let Some(path) = args.next().map(PathBuf::from) else {
+            eprintln!("--project-text-drag-diagnostic には project.mivmv.json のパスが必要です");
+            std::process::exit(2);
+        };
+        if let Err(error) = export::run_project_text_drag_diagnostic(&path) {
+            eprintln!("実素材のテキスト診断に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = run_gui() {
         eprintln!("musicvideo_lab を起動できません: {error}");
     }

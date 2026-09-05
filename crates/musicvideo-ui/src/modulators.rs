@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
 use musicvideo_core::{
-    BandRange, BandWeighting, Layer, LayerKind, ModulationBinding, ModulationCurve,
-    ModulationTarget, Modulator, ModulatorId, ModulatorSource, ModulatorValue, Project, Smoothing,
-    SpectrumShape, new_band_energy_modulator,
+    BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
+    BandCalibration, BandRange, BandWeighting, KICK_CALIBRATION_HIGH_PERCENTILE,
+    KICK_CALIBRATION_LOW_PERCENTILE, Layer, LayerKind, ModulationBinding, ModulationCurve,
+    ModulationTarget, Modulator, ModulatorCalibration, ModulatorId, ModulatorSource,
+    ModulatorValue, Project, Smoothing, SpectrumShape, modulator_calibration_requests,
+    new_band_energy_modulator,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,7 @@ pub(crate) fn draw_modulators(
     project: &mut Project,
     state: &mut ModulatorEditorState,
     live_values: &[ModulatorValue],
+    calibrations: &[ModulatorCalibration],
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -51,7 +55,7 @@ pub(crate) fn draw_modulators(
                     .default_open(index == 0)
                     .show(ui, |ui| {
                         changed |= ui.text_edit_singleline(&mut modulator.name).changed();
-                        changed |= edit_source(ui, modulator, state);
+                        changed |= edit_source(ui, modulator, state, calibrations);
                         ui.add(
                             egui::ProgressBar::new(live)
                                 .show_percentage()
@@ -83,17 +87,66 @@ fn edit_source(
     ui: &mut egui::Ui,
     modulator: &mut Modulator,
     state: &mut ModulatorEditorState,
+    calibrations: &[ModulatorCalibration],
 ) -> bool {
-    let ModulatorSource::BandEnergy {
-        range,
-        smoothing,
-        weighting,
-        gain_db,
-        floor,
-        ceiling,
-        threshold,
-    } = &mut modulator.source;
     let mut changed = false;
+    let mut source_kind = match modulator.source {
+        ModulatorSource::BandEnergy { .. } => BandSourceKind::Energy,
+        ModulatorSource::BandOnset { .. } => BandSourceKind::Onset,
+    };
+    let previous_source_kind = source_kind;
+    egui::ComboBox::from_label("反応するもの")
+        .selected_text(source_kind.label())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut source_kind,
+                BandSourceKind::Onset,
+                BandSourceKind::Onset.label(),
+            );
+            ui.selectable_value(
+                &mut source_kind,
+                BandSourceKind::Energy,
+                BandSourceKind::Energy.label(),
+            );
+        });
+    if source_kind != previous_source_kind {
+        set_source_kind(&mut modulator.source, source_kind);
+        changed = true;
+    }
+    let current_calibration = matching_calibration(modulator, calibrations).copied();
+
+    let (range, smoothing, weighting, gain_db, floor, ceiling, calibration, threshold) =
+        match &mut modulator.source {
+            ModulatorSource::BandEnergy {
+                range,
+                smoothing,
+                weighting,
+                gain_db,
+                floor,
+                ceiling,
+                calibration,
+                threshold,
+            }
+            | ModulatorSource::BandOnset {
+                range,
+                smoothing,
+                weighting,
+                gain_db,
+                floor,
+                ceiling,
+                calibration,
+                threshold,
+            } => (
+                range,
+                smoothing,
+                weighting,
+                gain_db,
+                floor,
+                ceiling,
+                calibration,
+                threshold,
+            ),
+        };
     let mut semitone = matches!(range, BandRange::Semitone { .. });
     let was_semitone = semitone;
     ui.horizontal(|ui| {
@@ -211,14 +264,74 @@ fn edit_source(
                 .suffix(" dB"),
         )
         .changed();
-    ui.horizontal(|ui| {
-        changed |= ui
-            .add(egui::Slider::new(floor, 0.0..=0.999).text("床"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(ceiling, 0.001..=1.0).text("天井"))
-            .changed();
-    });
+    let mut automatic = matches!(calibration, BandCalibration::Auto { .. });
+    if ui
+        .checkbox(&mut automatic, "曲全体から反応範囲を自動調整")
+        .on_hover_text("全尺の分布を一度調べ、静かな値と強い値を 0〜1 に割り当てます")
+        .changed()
+    {
+        if automatic {
+            let (low_percentile, high_percentile) = source_kind.default_percentiles();
+            *calibration = BandCalibration::Auto {
+                low_percentile,
+                high_percentile,
+            };
+        } else {
+            if let Some(value) = current_calibration {
+                *floor = value.floor;
+                *ceiling = value.ceiling;
+            }
+            *calibration = BandCalibration::Manual;
+        }
+        changed = true;
+    }
+    match calibration {
+        BandCalibration::Manual => {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::Slider::new(floor, 0.0..=0.999).text("弱い側"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(ceiling, 0.001..=1.0).text("強い側"))
+                    .changed();
+            });
+            ui.weak("手動調整中");
+        }
+        BandCalibration::Auto {
+            low_percentile,
+            high_percentile,
+        } => {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(low_percentile)
+                            .range(0.0..=99.0)
+                            .speed(0.1)
+                            .suffix("% 下限"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(high_percentile)
+                            .range(1.0..=100.0)
+                            .speed(0.1)
+                            .suffix("% 上限"),
+                    )
+                    .changed();
+            });
+            if *high_percentile <= *low_percentile {
+                *high_percentile = (*low_percentile + 0.1).min(100.0);
+            }
+            if let Some(value) = current_calibration {
+                ui.label(format!(
+                    "この曲では {:.3}〜{:.3} を 0〜1 に割り当てました",
+                    value.floor, value.ceiling
+                ));
+            } else {
+                ui.weak("この曲の反応範囲を計算しています…");
+            }
+        }
+    }
     changed |= ui
         .add(
             egui::Slider::new(threshold, 0.0..=1.0)
@@ -233,6 +346,104 @@ fn edit_source(
         *threshold = threshold.clamp(0.0, 1.0);
     }
     changed
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BandSourceKind {
+    Energy,
+    Onset,
+}
+
+impl BandSourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Energy => "帯域の音量",
+            Self::Onset => "音の立ち上がり（キック向け）",
+        }
+    }
+
+    fn default_percentiles(self) -> (f32, f32) {
+        match self {
+            Self::Energy => (
+                BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
+                BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
+            ),
+            Self::Onset => (
+                KICK_CALIBRATION_LOW_PERCENTILE,
+                KICK_CALIBRATION_HIGH_PERCENTILE,
+            ),
+        }
+    }
+}
+
+fn set_source_kind(source: &mut ModulatorSource, kind: BandSourceKind) {
+    let mut replacement = match source.clone() {
+        ModulatorSource::BandEnergy {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            calibration,
+            threshold,
+        }
+        | ModulatorSource::BandOnset {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            calibration,
+            threshold,
+        } => match kind {
+            BandSourceKind::Energy => ModulatorSource::BandEnergy {
+                range,
+                smoothing,
+                weighting,
+                gain_db,
+                floor,
+                ceiling,
+                calibration,
+                threshold,
+            },
+            BandSourceKind::Onset => ModulatorSource::BandOnset {
+                range,
+                smoothing,
+                weighting,
+                gain_db,
+                floor,
+                ceiling,
+                calibration,
+                threshold,
+            },
+        },
+    };
+    let calibration = match &mut replacement {
+        ModulatorSource::BandEnergy { calibration, .. }
+        | ModulatorSource::BandOnset { calibration, .. } => calibration,
+    };
+    if matches!(calibration, BandCalibration::Auto { .. }) {
+        let (low_percentile, high_percentile) = kind.default_percentiles();
+        *calibration = BandCalibration::Auto {
+            low_percentile,
+            high_percentile,
+        };
+    }
+    *source = replacement;
+}
+
+fn matching_calibration<'a>(
+    modulator: &Modulator,
+    calibrations: &'a [ModulatorCalibration],
+) -> Option<&'a ModulatorCalibration> {
+    let request = modulator_calibration_requests(std::slice::from_ref(modulator))
+        .into_iter()
+        .next()?;
+    calibrations
+        .iter()
+        .find(|calibration| calibration.request == request)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -612,5 +823,44 @@ mod tests {
         assert_eq!(project.modulators, vec![second.clone()]);
         assert_eq!(project.layers[0].modulations.len(), 1);
         assert_eq!(project.layers[0].modulations[0].modulator, second.id);
+    }
+
+    #[test]
+    fn changing_feature_keeps_settings_but_uses_feature_specific_percentiles() {
+        let project = musicvideo_core::default_project(10.0);
+        let mut source = new_band_energy_modulator(&project).source;
+        set_source_kind(&mut source, BandSourceKind::Energy);
+        let ModulatorSource::BandEnergy {
+            range,
+            smoothing,
+            gain_db,
+            calibration,
+            ..
+        } = source
+        else {
+            panic!("source kind did not change");
+        };
+        assert_eq!(
+            range,
+            BandRange::Hz {
+                low_hz: 40.0,
+                high_hz: 120.0
+            }
+        );
+        assert_eq!(
+            smoothing,
+            Smoothing::Envelope {
+                attack_secs: musicvideo_core::KICK_ATTACK_SECS,
+                release_secs: musicvideo_core::KICK_RELEASE_SECS,
+            }
+        );
+        assert_eq!(gain_db, 3.0);
+        assert_eq!(
+            calibration,
+            BandCalibration::Auto {
+                low_percentile: BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
+                high_percentile: BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
+            }
+        );
     }
 }

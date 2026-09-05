@@ -4,20 +4,25 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use music_core::{
-    KEYBOARD_NOTE_COUNT, KeyboardAnimationState, KeyboardFrame, SPECTRUM_NOTE_MAX_MIDI,
-    SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalyzer, prepare_keyboard_frame_into,
+    AnalysisConfig, KEYBOARD_NOTE_COUNT, KeyboardAnimationState, KeyboardFrame,
+    SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalyzer,
+    analyze_stereo_timeline_cancellable, prepare_keyboard_frame_into,
 };
 use musicvideo_core::{
-    Assets, Frame, ImageId, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
-    ModulatorSource, Project, RenderReport, ScaledImageCacheStats, Smoothing, SpectrumSource,
-    UnresolvedAsset, evaluate, new_band_energy_modulator, render_frame,
+    Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
+    BandCalibration, Frame, ImageId, MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve,
+    ModulationTarget, ModulatorId, ModulatorSource, Project, RenderReport, ScaledImageCacheStats,
+    Scene, SceneItemKind, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset,
+    calibrate_modulators, evaluate, new_band_energy_modulator, render_frame,
 };
 
 use crate::decode::AudioData;
+use crate::decode::decode_audio;
 use crate::project::{
     BACKGROUND_ID, FontData, create_assets, default_project, new_pitch_keyboard_layer,
     spectrum_band_count, synthetic_background,
 };
+use crate::project_file::load_project;
 
 const BENCHMARK_WARMUP_FRAMES: usize = 10;
 const BENCHMARK_BACKGROUND_WIDTH: u32 = 3000;
@@ -32,6 +37,271 @@ const STATIONARY_TONE_CENTER_SECS: f64 = 1.0;
 const KICK_RESPONSE_FPS: f64 = 60.0;
 const KICK_RESPONSE_DURATION_SECS: f64 = 2.0;
 const KICK_ONSET_SECS: f64 = 0.8;
+
+pub fn run_project_modulator_response(project_path: &Path) -> Result<(), String> {
+    let project = load_project(project_path)?;
+    let audio_path = project
+        .audio
+        .as_ref()
+        .ok_or_else(|| "プロジェクトに音声素材がありません".to_owned())?
+        .path
+        .clone();
+    let cancel = AtomicBool::new(false);
+    let audio = decode_audio(&audio_path, &cancel)?;
+
+    let onset = new_band_energy_modulator(&project);
+    let mut level = onset.clone();
+    level.id = ModulatorId(onset.id.0.saturating_add(1));
+    level.name = "低域の音量".to_owned();
+    level.source = match onset.source.clone() {
+        ModulatorSource::BandOnset {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            threshold,
+            ..
+        } => ModulatorSource::BandEnergy {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            calibration: BandCalibration::Auto {
+                low_percentile: BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
+                high_percentile: BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
+            },
+            threshold,
+        },
+        ModulatorSource::BandEnergy { .. } => {
+            return Err("キック既定が立ち上がり検出になっていません".to_owned());
+        }
+    };
+    let modulators = [level, onset];
+    let calibrations =
+        calibrate_modulators(&audio.stereo_pcm, audio.sample_rate, &modulators, &|| false)
+            .map_err(|error| format!("実素材の自動調整に失敗しました: {error}"))?;
+    for calibration in &calibrations {
+        println!(
+            "calibration id={} feature={:?} percentiles={:.1}-{:.1} range={:.6}-{:.6} samples={}",
+            calibration.request.id.0,
+            calibration.request.feature,
+            calibration.request.low_percentile,
+            calibration.request.high_percentile,
+            calibration.floor,
+            calibration.ceiling,
+            calibration.sample_count,
+        );
+    }
+
+    let mut source = SpectrumSource::new(
+        audio.sample_rate,
+        spectrum_band_count(&project),
+        Smoothing::Average { factor: 0.7 },
+    )
+    .map_err(|error| format!("実素材のスペクトラム解析を初期化できません: {error}"))?;
+    source
+        .configure_modulators_with_calibrations(&modulators, &calibrations)
+        .map_err(|error| format!("実素材のモジュレータを初期化できません: {error}"))?;
+    let sample_count = (audio.duration_secs * MODULATOR_CALIBRATION_HZ).ceil() as usize;
+    let mut values = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let time = index as f64 / MODULATOR_CALIBRATION_HZ;
+        let frame = source.full_frame_at(&audio.stereo_pcm, time, project.display_gain_db);
+        let level_value = frame
+            .modulators
+            .iter()
+            .find(|value| value.id == modulators[0].id)
+            .map_or(0.0, |value| value.value);
+        let onset_value = frame
+            .modulators
+            .iter()
+            .find(|value| value.id == modulators[1].id)
+            .map_or(0.0, |value| value.value);
+        values.push((level_value, onset_value));
+    }
+    let level_saturated = values.iter().filter(|value| value.0 >= 0.95).count();
+    let onset_saturated = values.iter().filter(|value| value.1 >= 0.95).count();
+    let onset_quiet = values.iter().filter(|value| value.1 <= 0.1).count();
+    println!(
+        "distribution frames={} level_ge_0.95={:.3}% onset_ge_0.95={:.3}% onset_le_0.10={:.3}%",
+        values.len(),
+        level_saturated as f64 * 100.0 / values.len().max(1) as f64,
+        onset_saturated as f64 * 100.0 / values.len().max(1) as f64,
+        onset_quiet as f64 * 100.0 / values.len().max(1) as f64,
+    );
+
+    let timeline = analyze_stereo_timeline_cancellable(
+        &audio.stereo_pcm,
+        audio.sample_rate,
+        AnalysisConfig::default(),
+        &|| false,
+    )
+    .ok_or_else(|| "実素材のビート位置を解析できません".to_owned())?;
+    println!(
+        "independent beat grid: status={:?} bpm={:?} confidence={:.3}",
+        timeline.beat_grid.status, timeline.beat_grid.bpm, timeline.beat_grid.confidence
+    );
+    println!("time_secs level_on_beat onset_on_beat level_between onset_between");
+    let rows = timeline
+        .beat_grid
+        .beats
+        .windows(2)
+        .filter(|beats| beats[0].time_secs >= 20.0)
+        .take(16)
+        .map(|beats| {
+            let beat = beats[0].time_secs;
+            let between = (beats[0].time_secs + beats[1].time_secs) * 0.5;
+            let on = response_at(&values, beat);
+            let off = response_at(&values, between);
+            println!(
+                "{beat:.3} {:.6} {:.6} {:.6} {:.6}",
+                on.0, on.1, off.0, off.1
+            );
+            (on, off)
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() {
+        let mean = |select: fn(&((f32, f32), (f32, f32))) -> f32| {
+            rows.iter().map(select).sum::<f32>() / rows.len() as f32
+        };
+        println!(
+            "beat means: level_on={:.6} onset_on={:.6} level_between={:.6} onset_between={:.6}",
+            mean(|row| row.0.0),
+            mean(|row| row.0.1),
+            mean(|row| row.1.0),
+            mean(|row| row.1.1),
+        );
+    }
+    println!("dense time series: time_secs level onset");
+    for step in 0..=40 {
+        let time = 25.0 + step as f64 * 0.05;
+        let value = response_at(&values, time);
+        println!("{time:.3} {:.6} {:.6}", value.0, value.1);
+    }
+    Ok(())
+}
+
+fn response_at(values: &[(f32, f32)], time_secs: f64) -> (f32, f32) {
+    let index = (time_secs * MODULATOR_CALIBRATION_HZ).round().max(0.0) as usize;
+    values
+        .get(index.min(values.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Replays a continuous property drag against the real project and observes
+/// the completed CPU frames directly. This separates missing glyph output
+/// from preview scheduling: text rasterization is synchronous, so a completed
+/// frame must either contain pixels or report its font as unresolved.
+pub fn run_project_text_drag_diagnostic(project_path: &Path) -> Result<(), String> {
+    const FRAMES: usize = 360;
+    const POSITION_SECS: f64 = 26.0;
+
+    let mut project = load_project(project_path)?;
+    let font = crate::project::load_default_font()
+        .ok_or_else(|| "テキスト診断に必要な Windows 日本語フォントが見つかりません".to_owned())?;
+    let assets = crate::project::create_assets(Some(&font))?;
+    for reference in &project.images {
+        let image = image::open(&reference.path)
+            .map_err(|error| {
+                format!(
+                    "実素材の画像を読み込めません ({}): {error}",
+                    reference.path.display()
+                )
+            })?
+            .to_rgba8();
+        let image =
+            musicvideo_core::ImageAsset::new(image.width(), image.height(), image.into_raw())
+                .map_err(|error| format!("実素材の画像を保持できません: {error}"))?;
+        assets.insert_image(reference.id.clone(), image);
+    }
+    let text_layer = project
+        .layers
+        .iter()
+        .position(|layer| matches!(layer.kind, musicvideo_core::LayerKind::TimeText(_)))
+        .ok_or_else(|| "プロジェクトに時間表示レイヤーがありません".to_owned())?;
+    let spectrum = SpectrumFrame::new(vec![0.0; spectrum_band_count(&project)]);
+    let mut isolated_frame = Frame::new(project.output.width, project.output.height)
+        .map_err(|error| format!("テキスト診断フレームを確保できません: {error}"))?;
+    let mut full_frame = Frame::new(project.output.width, project.output.height)
+        .map_err(|error| format!("実素材診断フレームを確保できません: {error}"))?;
+    let mut missing_pixels = Vec::new();
+    let mut unresolved_fonts = Vec::new();
+    let mut render_ms = Vec::with_capacity(FRAMES);
+
+    for frame_index in 0..FRAMES {
+        // A mouse drag supplies many distinct f32 values and therefore
+        // deliberately exercises the text-cache miss path as well as hits.
+        let phase = frame_index % 120;
+        let size_px = if phase < 60 {
+            35.0 + phase as f32 * 0.75
+        } else {
+            35.0 + (119 - phase) as f32 * 0.75
+        };
+        let musicvideo_core::LayerKind::TimeText(text) = &mut project.layers[text_layer].kind
+        else {
+            unreachable!("time-text layer index changed")
+        };
+        text.size_px = size_px;
+
+        let scene = evaluate(&project, POSITION_SECS, &spectrum);
+        let text_items = scene
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, SceneItemKind::TimeText { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let isolated = Scene {
+            width: scene.width,
+            height: scene.height,
+            items: text_items,
+        };
+        let started = Instant::now();
+        let report = render_frame(&isolated, &assets, &mut isolated_frame)
+            .map_err(|error| format!("テキスト診断の合成に失敗しました: {error}"))?;
+        render_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        if isolated_frame
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| pixel[..3] == [0, 0, 0])
+        {
+            missing_pixels.push(frame_index);
+        }
+        if report
+            .unresolved_assets
+            .iter()
+            .any(|asset| matches!(asset, UnresolvedAsset::Font(_)))
+        {
+            unresolved_fonts.push(frame_index);
+        }
+
+        // Also exercise the supplied project's full layer stack and assets.
+        let report = render_frame(&scene, &assets, &mut full_frame)
+            .map_err(|error| format!("実素材の全レイヤー合成に失敗しました: {error}"))?;
+        ensure_resolved(&report, "実素材の全レイヤー合成")?;
+    }
+
+    render_ms.sort_by(f64::total_cmp);
+    let mean = render_ms.iter().sum::<f64>() / render_ms.len() as f64;
+    let p95 = render_ms[((render_ms.len() - 1) as f64 * 0.95).round() as usize];
+    println!(
+        "text drag diagnostic: completed={} text_missing={} unresolved_font={} mean_ms={mean:.3} p95_ms={p95:.3}",
+        FRAMES,
+        missing_pixels.len(),
+        unresolved_fonts.len(),
+    );
+    if !missing_pixels.is_empty() {
+        println!("text-missing frame indices: {missing_pixels:?}");
+    }
+    if !unresolved_fonts.is_empty() {
+        println!("unresolved-font frame indices: {unresolved_fonts:?}");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimingStats {
@@ -98,8 +368,15 @@ pub fn export_png_sequence(
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("スペクトラム解析を初期化できません: {error}"))?;
+    let calibrations = calibrate_modulators(
+        &audio.stereo_pcm,
+        audio.sample_rate,
+        &project.modulators,
+        &|| cancel.load(Ordering::Relaxed),
+    )
+    .map_err(|error| format!("モジュレータの反応範囲を自動調整できません: {error}"))?;
     spectrum
-        .configure_modulators(&project.modulators)
+        .configure_modulators_with_calibrations(&project.modulators, &calibrations)
         .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("出力フレームを確保できません: {error}"))?;
@@ -344,8 +621,11 @@ fn benchmark_once(
         Smoothing::Average { factor: 0.7 },
     )
     .map_err(|error| format!("ベンチマーク解析を初期化できません: {error}"))?;
+    let calibrations =
+        calibrate_modulators(&pcm, BENCHMARK_SAMPLE_RATE, &project.modulators, &|| false)
+            .map_err(|error| format!("ベンチマークの自動調整に失敗しました: {error}"))?;
     spectrum
-        .configure_modulators(&project.modulators)
+        .configure_modulators_with_calibrations(&project.modulators, &calibrations)
         .map_err(|error| format!("ベンチマークのモジュレータを初期化できません: {error}"))?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("ベンチマーク用フレームを確保できません: {error}"))?;
@@ -606,19 +886,53 @@ fn measure_kick_envelope_response() -> Result<Vec<KickResponseSample>, String> {
     let mut raw = new_band_energy_modulator(&project);
     raw.id = ModulatorId(1);
     raw.name = "raw".to_owned();
-    let ModulatorSource::BandEnergy { smoothing, .. } = &mut raw.source;
+    // This older diagnostic isolates temporal smoothing itself. Keep its
+    // source level-based even though the user-facing kick preset now uses the
+    // separate onset feature.
+    raw.source = match raw.source {
+        ModulatorSource::BandOnset {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            calibration,
+            threshold,
+        } => ModulatorSource::BandEnergy {
+            range,
+            smoothing,
+            weighting,
+            gain_db,
+            floor,
+            ceiling,
+            calibration,
+            threshold,
+        },
+        source @ ModulatorSource::BandEnergy { .. } => source,
+    };
+    let smoothing = match &mut raw.source {
+        ModulatorSource::BandEnergy { smoothing, .. }
+        | ModulatorSource::BandOnset { smoothing, .. } => smoothing,
+    };
     *smoothing = Smoothing::None;
 
     let mut average = raw.clone();
     average.id = ModulatorId(2);
     average.name = "average".to_owned();
-    let ModulatorSource::BandEnergy { smoothing, .. } = &mut average.source;
+    let smoothing = match &mut average.source {
+        ModulatorSource::BandEnergy { smoothing, .. }
+        | ModulatorSource::BandOnset { smoothing, .. } => smoothing,
+    };
     *smoothing = Smoothing::Average { factor: 0.7 };
 
     let mut envelope = raw.clone();
     envelope.id = ModulatorId(3);
     envelope.name = "envelope".to_owned();
-    let ModulatorSource::BandEnergy { smoothing, .. } = &mut envelope.source;
+    let smoothing = match &mut envelope.source {
+        ModulatorSource::BandEnergy { smoothing, .. }
+        | ModulatorSource::BandOnset { smoothing, .. } => smoothing,
+    };
     *smoothing = Smoothing::Envelope {
         attack_secs: musicvideo_core::KICK_ATTACK_SECS,
         release_secs: musicvideo_core::KICK_RELEASE_SECS,

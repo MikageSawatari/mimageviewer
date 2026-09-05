@@ -56,7 +56,10 @@ fn run() -> Result<(), String> {
     }
     if args.band_modulation {
         let mut modulator = new_band_energy_modulator(&project);
-        let ModulatorSource::BandEnergy { range, .. } = &mut modulator.source;
+        let range = match &mut modulator.source {
+            ModulatorSource::BandEnergy { range, .. }
+            | ModulatorSource::BandOnset { range, .. } => range,
+        };
         *range = BandRange::Semitone {
             low_midi: 69,
             high_midi: 69,

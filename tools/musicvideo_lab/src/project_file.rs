@@ -194,9 +194,9 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use musicvideo_core::{
-        Animatable, AudioRef, BandRange, BandWeighting, ImageId, ImageRef, Interp, Keyframe,
-        ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, Smoothing, Track,
-        default_project, new_band_energy_modulator, new_image_layer,
+        Animatable, AudioRef, BandCalibration, BandRange, BandWeighting, ImageId, ImageRef, Interp,
+        Keyframe, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, Smoothing,
+        Track, default_project, new_band_energy_modulator, new_image_layer,
     };
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
         let mut project = default_project(12.0);
         let mut bass = new_band_energy_modulator(&project);
         bass.name = "C1–B1".to_owned();
-        bass.source = ModulatorSource::BandEnergy {
+        bass.source = ModulatorSource::BandOnset {
             range: BandRange::Semitone {
                 low_midi: 24,
                 high_midi: 35,
@@ -322,6 +322,10 @@ mod tests {
             gain_db: 4.5,
             floor: 0.15,
             ceiling: 0.8,
+            calibration: BandCalibration::Auto {
+                low_percentile: 40.0,
+                high_percentile: 98.0,
+            },
             threshold: 0.12,
         };
         let id = bass.id;
@@ -352,33 +356,48 @@ mod tests {
     }
 
     #[test]
-    fn legacy_average_modulator_json_defaults_the_new_threshold() {
+    fn legacy_average_modulator_json_defaults_the_new_fields() {
         let temp = tempfile::tempdir().unwrap();
         let project_path = temp.path().join("legacy-modulator.mivmv.json");
         let mut project = default_project(12.0);
         let mut modulator = new_band_energy_modulator(&project);
-        let ModulatorSource::BandEnergy {
-            smoothing,
-            threshold,
-            ..
-        } = &mut modulator.source;
-        *smoothing = Smoothing::Average { factor: 0.65 };
-        *threshold = 0.5;
+        modulator.source = ModulatorSource::BandEnergy {
+            range: BandRange::Hz {
+                low_hz: 40.0,
+                high_hz: 120.0,
+            },
+            smoothing: Smoothing::Average { factor: 0.65 },
+            weighting: BandWeighting::Raw,
+            gain_db: 3.0,
+            floor: 0.03,
+            ceiling: 0.8,
+            calibration: BandCalibration::Manual,
+            threshold: 0.5,
+        };
         project.modulators.push(modulator);
         let mut value = serde_json::to_value(&project).unwrap();
         value["modulators"][0]["source"]["BandEnergy"]
             .as_object_mut()
             .unwrap()
             .remove("threshold");
+        value["modulators"][0]["source"]["BandEnergy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("calibration");
         std::fs::write(&project_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
         let restored = load_project(&project_path).unwrap();
         let ModulatorSource::BandEnergy {
             smoothing,
+            calibration,
             threshold,
             ..
-        } = restored.modulators[0].source;
+        } = restored.modulators[0].source
+        else {
+            panic!("legacy source changed variant");
+        };
         assert_eq!(smoothing, Smoothing::Average { factor: 0.65 });
+        assert_eq!(calibration, BandCalibration::Manual);
         assert_eq!(threshold, 0.0);
     }
 
