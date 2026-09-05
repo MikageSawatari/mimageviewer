@@ -3160,6 +3160,12 @@ enum NativeVideoPointerDown {
         viewport_height_points: f32,
         pixels_per_point: f32,
     },
+    ZoomPan {
+        fs_idx: usize,
+        last_position_points: egui::Pos2,
+        region_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    },
 }
 
 #[cfg(windows)]
@@ -5571,6 +5577,84 @@ use crate::thumb_loader::{
 
 const UPDATE_PERF_STAGE_COUNT: usize = 23;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct NavHelperPerfMetrics {
+    still_image_display_indices_calls: u64,
+    still_image_display_indices_ms: f64,
+    get_nav_indices_calls: u64,
+    get_nav_indices_ms: f64,
+}
+
+impl NavHelperPerfMetrics {
+    fn record(&mut self, kind: NavHelperPerfKind, elapsed_ms: f64) {
+        match kind {
+            NavHelperPerfKind::StillImageDisplayIndices => {
+                self.still_image_display_indices_calls += 1;
+                self.still_image_display_indices_ms += elapsed_ms;
+            }
+            NavHelperPerfKind::GetNavIndices => {
+                self.get_nav_indices_calls += 1;
+                self.get_nav_indices_ms += elapsed_ms;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavHelperPerfKind {
+    StillImageDisplayIndices,
+    GetNavIndices,
+}
+
+#[derive(Debug, Default)]
+struct NavHelperPerfFrame {
+    active: bool,
+    metrics: NavHelperPerfMetrics,
+}
+
+thread_local! {
+    /// Armed only by `App::update_frame` on the UI thread. Calls made by workers or outside an
+    /// update frame see their own inactive TLS slot and are deliberately not counted.
+    static NAV_HELPER_PERF_FRAME: std::cell::RefCell<NavHelperPerfFrame> =
+        std::cell::RefCell::new(NavHelperPerfFrame::default());
+}
+
+fn begin_nav_helper_perf_frame(active: bool) {
+    NAV_HELPER_PERF_FRAME.with(|frame| {
+        *frame.borrow_mut() = NavHelperPerfFrame {
+            active,
+            metrics: NavHelperPerfMetrics::default(),
+        };
+    });
+}
+
+fn finish_nav_helper_perf_frame() -> NavHelperPerfMetrics {
+    NAV_HELPER_PERF_FRAME.with(|frame| {
+        let mut frame = frame.borrow_mut();
+        frame.active = false;
+        std::mem::take(&mut frame.metrics)
+    })
+}
+
+fn measure_nav_helper_with<T>(
+    kind: NavHelperPerfKind,
+    mut now: impl FnMut() -> std::time::Instant,
+    measure: impl FnOnce() -> T,
+) -> T {
+    let started_at = NAV_HELPER_PERF_FRAME.with(|frame| frame.borrow().active.then(&mut now));
+    let result = measure();
+    if let Some(started_at) = started_at {
+        let elapsed_ms = now().saturating_duration_since(started_at).as_secs_f64() * 1000.0;
+        NAV_HELPER_PERF_FRAME.with(|frame| frame.borrow_mut().metrics.record(kind, elapsed_ms));
+    }
+    result
+}
+
+#[inline]
+pub(crate) fn measure_nav_helper<T>(kind: NavHelperPerfKind, measure: impl FnOnce() -> T) -> T {
+    measure_nav_helper_with(kind, std::time::Instant::now, measure)
+}
+
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdatePerfStage {
@@ -5631,7 +5715,10 @@ impl UpdatePerfStage {
 struct UpdatePerfRecorder {
     started_at: std::time::Instant,
     last_mark_at: std::time::Instant,
+    started_cycles: u64,
+    last_mark_cycles: u64,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
+    stage_cycles: [u64; UPDATE_PERF_STAGE_COUNT],
     next_stage: usize,
     /// The fullscreen viewport stage split further, because it turned out to hold 57% of a
     /// stall while the paint closure inside it explained only a quarter of that. The same
@@ -5639,55 +5726,74 @@ struct UpdatePerfRecorder {
     /// on the grid path, which fullscreen returns before reaching - so it fired once in a
     /// whole session. These carry the same numbers onto the event that does fire.
     fullscreen_split_ms: [f64; 4],
+    nav_helper_metrics: NavHelperPerfMetrics,
 }
 
 impl UpdatePerfRecorder {
-    fn new(started_at: std::time::Instant) -> Self {
+    fn new(started_at: std::time::Instant, started_cycles: u64) -> Self {
         Self {
             started_at,
             last_mark_at: started_at,
+            started_cycles,
+            last_mark_cycles: started_cycles,
             stage_ms: [0.0; UPDATE_PERF_STAGE_COUNT],
+            stage_cycles: [0; UPDATE_PERF_STAGE_COUNT],
             fullscreen_split_ms: [0.0; 4],
+            nav_helper_metrics: NavHelperPerfMetrics::default(),
             next_stage: 0,
         }
     }
 
     fn mark(&mut self, stage: UpdatePerfStage) {
-        self.mark_at(stage, std::time::Instant::now());
+        self.mark_at(stage, std::time::Instant::now(), App::thread_cycles_now());
     }
 
-    fn mark_at(&mut self, stage: UpdatePerfStage, now: std::time::Instant) {
+    fn mark_at(&mut self, stage: UpdatePerfStage, now: std::time::Instant, cycles: u64) {
         debug_assert_eq!(
             UpdatePerfStage::ALL.get(self.next_stage).copied(),
             Some(stage)
         );
         self.stage_ms[stage as usize] =
             now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.stage_cycles[stage as usize] = cycles.saturating_sub(self.last_mark_cycles);
         self.last_mark_at = now;
+        self.last_mark_cycles = cycles;
         self.next_stage += 1;
     }
 
     fn finish(self) -> UpdatePerfBreakdown {
-        self.finish_at(std::time::Instant::now())
+        self.finish_at(std::time::Instant::now(), App::thread_cycles_now())
     }
 
-    fn finish_at(mut self, finished_at: std::time::Instant) -> UpdatePerfBreakdown {
+    fn finish_at(
+        mut self,
+        finished_at: std::time::Instant,
+        finished_cycles: u64,
+    ) -> UpdatePerfBreakdown {
         // `update_frame` has several intentional early returns. Attribute the interval up to
         // that return to the currently active stage and leave later, unvisited stages at zero.
         if self.next_stage < UPDATE_PERF_STAGE_COUNT {
             self.stage_ms[self.next_stage] =
                 finished_at.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+            self.stage_cycles[self.next_stage] =
+                finished_cycles.saturating_sub(self.last_mark_cycles);
             self.next_stage += 1;
         }
         debug_assert!(self.next_stage <= UPDATE_PERF_STAGE_COUNT);
 
         let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
         let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        let total_cycles = finished_cycles.saturating_sub(self.started_cycles);
+        let accounted_cycles = self.stage_cycles.iter().sum::<u64>();
         UpdatePerfBreakdown {
             total_ms,
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
+            total_cycles,
+            stage_cycles: self.stage_cycles,
+            unaccounted_cycles: total_cycles.saturating_sub(accounted_cycles),
             fullscreen_split_ms: self.fullscreen_split_ms,
+            nav_helper_metrics: self.nav_helper_metrics,
         }
     }
 }
@@ -5696,8 +5802,9 @@ impl UpdatePerfRecorder {
 fn update_perf_start_with(
     perf_on: bool,
     now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
 ) -> Option<UpdatePerfRecorder> {
-    perf_on.then(now).map(UpdatePerfRecorder::new)
+    perf_on.then(|| UpdatePerfRecorder::new(now(), cycles_now()))
 }
 
 /// Records how the fullscreen viewport stage divides, in the order the spans occur.
@@ -5728,7 +5835,9 @@ fn mark_update_perf(recorder: &mut Option<UpdatePerfRecorder>, stage: UpdatePerf
 
 #[inline]
 fn finish_update_perf(recorder: &mut Option<UpdatePerfRecorder>, frame_number: u64) {
-    if let Some(recorder) = recorder.take() {
+    let nav_helper_metrics = finish_nav_helper_perf_frame();
+    if let Some(mut recorder) = recorder.take() {
+        recorder.nav_helper_metrics = nav_helper_metrics;
         let breakdown = recorder.finish();
         if breakdown.total_ms > 8.0 {
             breakdown.emit(frame_number);
@@ -5741,7 +5850,11 @@ struct UpdatePerfBreakdown {
     total_ms: f64,
     stage_ms: [f64; UPDATE_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
+    total_cycles: u64,
+    stage_cycles: [u64; UPDATE_PERF_STAGE_COUNT],
+    unaccounted_cycles: u64,
     fullscreen_split_ms: [f64; 4],
+    nav_helper_metrics: NavHelperPerfMetrics,
 }
 
 impl UpdatePerfBreakdown {
@@ -5793,8 +5906,233 @@ impl UpdatePerfBreakdown {
     ];
 
     fn emit(&self, frame_number: u64) {
-        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT + 3);
+        let cycle_field_names = Self::EVENT_FIELDS.map(|(field, _)| {
+            format!(
+                "{}_cycles",
+                field
+                    .strip_suffix("_ms")
+                    .expect("update perf stage field must end in _ms")
+            )
+        });
+        let mut extras = Vec::with_capacity(UPDATE_PERF_STAGE_COUNT * 2 + 13);
         extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
+        extras.push(("total_cycles", serde_json::Value::from(self.total_cycles)));
+        for ((field, stage), cycle_field) in
+            Self::EVENT_FIELDS.into_iter().zip(cycle_field_names.iter())
+        {
+            extras.push((
+                field,
+                serde_json::Value::from(self.stage_ms[stage as usize]),
+            ));
+            extras.push((
+                cycle_field.as_str(),
+                serde_json::Value::from(self.stage_cycles[stage as usize]),
+            ));
+        }
+        extras.push((
+            "unaccounted_ms",
+            serde_json::Value::from(self.unaccounted_ms),
+        ));
+        extras.push((
+            "unaccounted_cycles",
+            serde_json::Value::from(self.unaccounted_cycles),
+        ));
+        for (field, value) in [
+            ("fs_keep_alive_ms", self.fullscreen_split_ms[0]),
+            ("fs_main_viewport_ms", self.fullscreen_split_ms[1]),
+            ("fs_detached_windows_ms", self.fullscreen_split_ms[2]),
+            ("fs_detached_backstop_ms", self.fullscreen_split_ms[3]),
+        ] {
+            extras.push((field, serde_json::Value::from(value)));
+        }
+        extras.extend([
+            (
+                "still_image_display_indices_calls",
+                serde_json::Value::from(self.nav_helper_metrics.still_image_display_indices_calls),
+            ),
+            (
+                "still_image_display_indices_ms",
+                serde_json::Value::from(self.nav_helper_metrics.still_image_display_indices_ms),
+            ),
+            (
+                "get_nav_indices_calls",
+                serde_json::Value::from(self.nav_helper_metrics.get_nav_indices_calls),
+            ),
+            (
+                "get_nav_indices_ms",
+                serde_json::Value::from(self.nav_helper_metrics.get_nav_indices_ms),
+            ),
+        ]);
+        crate::perf::event("ui", "update_breakdown", None, 0, &extras);
+    }
+}
+
+const POLL_PREFETCH_PERF_STAGE_COUNT: usize = 8;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollPrefetchPerfStage {
+    FsPendingDrain,
+    FsPendingPostprocess,
+    UploadBacklog,
+    BuildStaticFsCacheEntry,
+    ApplySyncAdjustment,
+    AutoApplySavedMask,
+    UpdatePrefetchWindow,
+    OtherPostprocessing,
+}
+
+impl PollPrefetchPerfStage {
+    #[cfg(test)]
+    const ALL: [Self; POLL_PREFETCH_PERF_STAGE_COUNT] = [
+        Self::FsPendingDrain,
+        Self::FsPendingPostprocess,
+        Self::UploadBacklog,
+        Self::BuildStaticFsCacheEntry,
+        Self::ApplySyncAdjustment,
+        Self::AutoApplySavedMask,
+        Self::UpdatePrefetchWindow,
+        Self::OtherPostprocessing,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollPrefetchOrigin {
+    TopLevel,
+    FullscreenViewport,
+}
+
+impl PollPrefetchOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLevel => "top_level",
+            Self::FullscreenViewport => "fullscreen_viewport",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PollPrefetchPerfRecorder {
+    origin: PollPrefetchOrigin,
+    started_at: std::time::Instant,
+    last_mark_at: std::time::Instant,
+    stage_ms: [f64; POLL_PREFETCH_PERF_STAGE_COUNT],
+}
+
+impl PollPrefetchPerfRecorder {
+    fn new(origin: PollPrefetchOrigin, started_at: std::time::Instant) -> Self {
+        Self {
+            origin,
+            started_at,
+            last_mark_at: started_at,
+            stage_ms: [0.0; POLL_PREFETCH_PERF_STAGE_COUNT],
+        }
+    }
+
+    fn mark(&mut self, stage: PollPrefetchPerfStage) {
+        self.mark_at(stage, std::time::Instant::now());
+    }
+
+    fn mark_at(&mut self, stage: PollPrefetchPerfStage, now: std::time::Instant) {
+        self.stage_ms[stage as usize] +=
+            now.duration_since(self.last_mark_at).as_secs_f64() * 1000.0;
+        self.last_mark_at = now;
+    }
+
+    fn finish(self) -> PollPrefetchPerfBreakdown {
+        self.finish_at(std::time::Instant::now())
+    }
+
+    fn finish_at(self, finished_at: std::time::Instant) -> PollPrefetchPerfBreakdown {
+        let total_ms = finished_at.duration_since(self.started_at).as_secs_f64() * 1000.0;
+        let accounted_ms = self.stage_ms.iter().sum::<f64>();
+        PollPrefetchPerfBreakdown {
+            origin: self.origin,
+            total_ms,
+            stage_ms: self.stage_ms,
+            unaccounted_ms: total_ms - accounted_ms,
+        }
+    }
+}
+
+#[inline]
+fn poll_prefetch_perf_start_with(
+    perf_on: bool,
+    origin: PollPrefetchOrigin,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<PollPrefetchPerfRecorder> {
+    perf_on
+        .then(now)
+        .map(|started_at| PollPrefetchPerfRecorder::new(origin, started_at))
+}
+
+#[inline]
+fn mark_poll_prefetch_perf(
+    recorder: &mut Option<PollPrefetchPerfRecorder>,
+    stage: PollPrefetchPerfStage,
+) {
+    if let Some(recorder) = recorder {
+        recorder.mark(stage);
+    }
+}
+
+#[inline]
+fn finish_poll_prefetch_perf(
+    recorder: &mut Option<PollPrefetchPerfRecorder>,
+    frame_number: u64,
+    input_seq: u64,
+) {
+    if let Some(recorder) = recorder.take() {
+        let breakdown = recorder.finish();
+        if breakdown.total_ms > 8.0 {
+            breakdown.emit(frame_number, input_seq);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PollPrefetchPerfBreakdown {
+    origin: PollPrefetchOrigin,
+    total_ms: f64,
+    stage_ms: [f64; POLL_PREFETCH_PERF_STAGE_COUNT],
+    unaccounted_ms: f64,
+}
+
+impl PollPrefetchPerfBreakdown {
+    const EVENT_FIELDS: [(&'static str, PollPrefetchPerfStage); POLL_PREFETCH_PERF_STAGE_COUNT] = [
+        ("fs_pending_drain_ms", PollPrefetchPerfStage::FsPendingDrain),
+        (
+            "fs_pending_postprocess_ms",
+            PollPrefetchPerfStage::FsPendingPostprocess,
+        ),
+        ("upload_backlog_ms", PollPrefetchPerfStage::UploadBacklog),
+        (
+            "build_static_fs_cache_entry_ms",
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        ),
+        (
+            "apply_sync_adjustment_ms",
+            PollPrefetchPerfStage::ApplySyncAdjustment,
+        ),
+        (
+            "auto_apply_saved_mask_ms",
+            PollPrefetchPerfStage::AutoApplySavedMask,
+        ),
+        (
+            "update_prefetch_window_ms",
+            PollPrefetchPerfStage::UpdatePrefetchWindow,
+        ),
+        (
+            "other_postprocessing_ms",
+            PollPrefetchPerfStage::OtherPostprocessing,
+        ),
+    ];
+
+    fn emit(&self, frame_number: u64, input_seq: u64) {
+        let mut extras = Vec::with_capacity(POLL_PREFETCH_PERF_STAGE_COUNT + 4);
+        extras.push(("n", serde_json::Value::from(frame_number)));
+        extras.push(("caller", serde_json::Value::from(self.origin.as_str())));
         extras.push(("total_ms", serde_json::Value::from(self.total_ms)));
         for (field, stage) in Self::EVENT_FIELDS {
             extras.push((
@@ -5806,15 +6144,7 @@ impl UpdatePerfBreakdown {
             "unaccounted_ms",
             serde_json::Value::from(self.unaccounted_ms),
         ));
-        for (field, value) in [
-            ("fs_keep_alive_ms", self.fullscreen_split_ms[0]),
-            ("fs_main_viewport_ms", self.fullscreen_split_ms[1]),
-            ("fs_detached_windows_ms", self.fullscreen_split_ms[2]),
-            ("fs_detached_backstop_ms", self.fullscreen_split_ms[3]),
-        ] {
-            extras.push((field, serde_json::Value::from(value)));
-        }
-        crate::perf::event("ui", "update_breakdown", None, 0, &extras);
+        crate::perf::event("ui", "poll_prefetch_breakdown", None, input_seq, &extras);
     }
 }
 
@@ -6635,6 +6965,156 @@ impl FsOpenMaterialization {
     }
 }
 
+const FS_OPEN_PERF_SPAN_COUNT: usize = 10;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsOpenPerfSpan {
+    Total,
+    RecordReadingHistory,
+    RecordBookResume,
+    StartMetadataLoad,
+    StartFsLoad,
+    UpdatePrefetchWindow,
+    RefreshFullscreenVideoMarkerCache,
+    RefreshFullscreenPdfPromotion,
+    ResetFileRuntime,
+    ViewerPresentation,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FsOpenPerfRecorder {
+    total: std::time::Duration,
+    record_reading_history: std::time::Duration,
+    record_book_resume: std::time::Duration,
+    start_metadata_load: std::time::Duration,
+    start_fs_load: std::time::Duration,
+    update_prefetch_window: std::time::Duration,
+    refresh_fullscreen_video_marker_cache: std::time::Duration,
+    refresh_fullscreen_pdf_promotion: std::time::Duration,
+    reset_file_runtime: std::time::Duration,
+    viewer_presentation: std::time::Duration,
+    cycles: [u64; FS_OPEN_PERF_SPAN_COUNT],
+}
+
+impl FsOpenPerfRecorder {
+    pub(crate) fn add(&mut self, span: FsOpenPerfSpan, elapsed: std::time::Duration, cycles: u64) {
+        let target = match span {
+            FsOpenPerfSpan::Total => &mut self.total,
+            FsOpenPerfSpan::RecordReadingHistory => &mut self.record_reading_history,
+            FsOpenPerfSpan::RecordBookResume => &mut self.record_book_resume,
+            FsOpenPerfSpan::StartMetadataLoad => &mut self.start_metadata_load,
+            FsOpenPerfSpan::StartFsLoad => &mut self.start_fs_load,
+            FsOpenPerfSpan::UpdatePrefetchWindow => &mut self.update_prefetch_window,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache => {
+                &mut self.refresh_fullscreen_video_marker_cache
+            }
+            FsOpenPerfSpan::RefreshFullscreenPdfPromotion => {
+                &mut self.refresh_fullscreen_pdf_promotion
+            }
+            FsOpenPerfSpan::ResetFileRuntime => &mut self.reset_file_runtime,
+            FsOpenPerfSpan::ViewerPresentation => &mut self.viewer_presentation,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+
+    pub(crate) fn elapsed(&self, span: FsOpenPerfSpan) -> std::time::Duration {
+        match span {
+            FsOpenPerfSpan::Total => self.total,
+            FsOpenPerfSpan::RecordReadingHistory => self.record_reading_history,
+            FsOpenPerfSpan::RecordBookResume => self.record_book_resume,
+            FsOpenPerfSpan::StartMetadataLoad => self.start_metadata_load,
+            FsOpenPerfSpan::StartFsLoad => self.start_fs_load,
+            FsOpenPerfSpan::UpdatePrefetchWindow => self.update_prefetch_window,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache => {
+                self.refresh_fullscreen_video_marker_cache
+            }
+            FsOpenPerfSpan::RefreshFullscreenPdfPromotion => self.refresh_fullscreen_pdf_promotion,
+            FsOpenPerfSpan::ResetFileRuntime => self.reset_file_runtime,
+            FsOpenPerfSpan::ViewerPresentation => self.viewer_presentation,
+        }
+    }
+
+    pub(crate) fn categorized(&self) -> std::time::Duration {
+        self.record_reading_history
+            + self.record_book_resume
+            + self.start_metadata_load
+            + self.start_fs_load
+            + self.update_prefetch_window
+            + self.refresh_fullscreen_video_marker_cache
+            + self.refresh_fullscreen_pdf_promotion
+            + self.reset_file_runtime
+            + self.viewer_presentation
+    }
+
+    pub(crate) fn cycles(&self, span: FsOpenPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    pub(crate) fn categorized_cycles(&self) -> u64 {
+        self.cycles(FsOpenPerfSpan::RecordReadingHistory)
+            + self.cycles(FsOpenPerfSpan::RecordBookResume)
+            + self.cycles(FsOpenPerfSpan::StartMetadataLoad)
+            + self.cycles(FsOpenPerfSpan::StartFsLoad)
+            + self.cycles(FsOpenPerfSpan::UpdatePrefetchWindow)
+            + self.cycles(FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache)
+            + self.cycles(FsOpenPerfSpan::RefreshFullscreenPdfPromotion)
+            + self.cycles(FsOpenPerfSpan::ResetFileRuntime)
+            + self.cycles(FsOpenPerfSpan::ViewerPresentation)
+    }
+}
+
+#[inline]
+pub(crate) fn start_fs_open_perf_span_with(
+    recorder: &Option<&mut FsOpenPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.as_ref().map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_fs_open_perf_span(
+    recorder: &Option<&mut FsOpenPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_fs_open_perf_span_with(recorder, std::time::Instant::now, App::thread_cycles_now)
+}
+
+#[inline]
+pub(crate) fn finish_fs_open_perf_span_with(
+    recorder: &mut Option<&mut FsOpenPerfRecorder>,
+    span: FsOpenPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) =
+        (recorder.as_deref_mut(), started_at)
+    {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_fs_open_perf_span(
+    recorder: &mut Option<&mut FsOpenPerfRecorder>,
+    span: FsOpenPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_fs_open_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
+}
+
 impl FsPageLoadState {
     fn needs_load_request(self) -> bool {
         matches!(self, Self::NeedsLoad)
@@ -7011,6 +7491,159 @@ impl PassthroughUnavailable {
             Self::IdentityMismatch => "identity_mismatch",
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PassthroughRenditionPerfCall {
+    idx: usize,
+    source_width: Option<usize>,
+    source_height: Option<usize>,
+    from_edit_preview: Option<bool>,
+    pub(crate) cache_hit: Option<bool>,
+    color_adjustment_applied: Option<bool>,
+    colorize_mode: Option<crate::colorize::ColorizeMode>,
+    colorize_applicable_override: Option<bool>,
+    colorize_applied: Option<bool>,
+    creative_lut_applied: Option<bool>,
+    pixel_buffer_generated_this_call: Option<bool>,
+    catalog_texture_reused: Option<bool>,
+    texture_uploaded_this_call: Option<bool>,
+    outcome: &'static str,
+}
+
+impl PassthroughRenditionPerfCall {
+    fn new(idx: usize) -> Self {
+        Self {
+            idx,
+            source_width: None,
+            source_height: None,
+            from_edit_preview: None,
+            cache_hit: None,
+            color_adjustment_applied: None,
+            colorize_mode: None,
+            colorize_applicable_override: None,
+            colorize_applied: None,
+            creative_lut_applied: None,
+            pixel_buffer_generated_this_call: None,
+            catalog_texture_reused: None,
+            texture_uploaded_this_call: None,
+            outcome: "in_progress",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PassthroughRenditionPerfRecorder {
+    pub(crate) source_lookup: std::time::Duration,
+    pub(crate) cache_lookup: std::time::Duration,
+    pub(crate) build_pixels: std::time::Duration,
+    pub(crate) load_texture: std::time::Duration,
+    pub(crate) cache_insert: std::time::Duration,
+    pub(crate) cycles: [u64; PASSTHROUGH_RENDITION_PERF_SPAN_COUNT],
+    pub(crate) calls: Vec<PassthroughRenditionPerfCall>,
+}
+
+impl PassthroughRenditionPerfRecorder {
+    pub(crate) fn categorized(&self) -> std::time::Duration {
+        self.source_lookup
+            + self.cache_lookup
+            + self.build_pixels
+            + self.load_texture
+            + self.cache_insert
+    }
+
+    pub(crate) fn categorized_cycles(&self) -> u64 {
+        self.cycles.iter().sum()
+    }
+
+    pub(crate) fn remainder_cycles(&self, total_cycles: u64) -> u64 {
+        total_cycles.saturating_sub(self.categorized_cycles())
+    }
+
+    pub(crate) fn cycles(&self, span: PassthroughRenditionPerfSpan) -> u64 {
+        self.cycles[span as usize]
+    }
+
+    fn add(
+        &mut self,
+        span: PassthroughRenditionPerfSpan,
+        elapsed: std::time::Duration,
+        cycles: u64,
+    ) {
+        let target = match span {
+            PassthroughRenditionPerfSpan::SourceLookup => &mut self.source_lookup,
+            PassthroughRenditionPerfSpan::CacheLookup => &mut self.cache_lookup,
+            PassthroughRenditionPerfSpan::BuildPixels => &mut self.build_pixels,
+            PassthroughRenditionPerfSpan::LoadTexture => &mut self.load_texture,
+            PassthroughRenditionPerfSpan::CacheInsert => &mut self.cache_insert,
+        };
+        *target += elapsed;
+        self.cycles[span as usize] += cycles;
+    }
+}
+
+const PASSTHROUGH_RENDITION_PERF_SPAN_COUNT: usize = 5;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PassthroughRenditionPerfSpan {
+    SourceLookup,
+    CacheLookup,
+    BuildPixels,
+    LoadTexture,
+    CacheInsert,
+}
+
+#[inline]
+fn start_passthrough_rendition_perf_span_with(
+    recorder: Option<&PassthroughRenditionPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) -> Option<(std::time::Instant, u64)> {
+    recorder.map(|_| (now(), cycles_now()))
+}
+
+#[inline]
+fn start_passthrough_rendition_perf_span(
+    recorder: Option<&PassthroughRenditionPerfRecorder>,
+) -> Option<(std::time::Instant, u64)> {
+    start_passthrough_rendition_perf_span_with(
+        recorder,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    )
+}
+
+#[inline]
+fn finish_passthrough_rendition_perf_span_with(
+    recorder: Option<&mut PassthroughRenditionPerfRecorder>,
+    span: PassthroughRenditionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+    now: impl FnOnce() -> std::time::Instant,
+    cycles_now: impl FnOnce() -> u64,
+) {
+    if let (Some(recorder), Some((started_at, started_cycles))) = (recorder, started_at) {
+        recorder.add(
+            span,
+            now().duration_since(started_at),
+            cycles_now().saturating_sub(started_cycles),
+        );
+    }
+}
+
+#[inline]
+fn finish_passthrough_rendition_perf_span(
+    recorder: Option<&mut PassthroughRenditionPerfRecorder>,
+    span: PassthroughRenditionPerfSpan,
+    started_at: Option<(std::time::Instant, u64)>,
+) {
+    finish_passthrough_rendition_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+        App::thread_cycles_now,
+    );
 }
 
 #[derive(Clone)]
@@ -10941,8 +11574,9 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
-    /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
-    pub(crate) export_folder_refresh_pending: Option<PathBuf>,
+    /// 現在表示中の実フォルダを、メイン viewer が閉じた後に再読み込みする対象。
+    /// Ctrl+E 完了と、viewer 中に届いた監視由来の再走査が同じ先送りを使う。
+    pub(crate) folder_refresh_pending: Option<PathBuf>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、右下 indicator texture
     /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
@@ -11083,6 +11717,9 @@ pub struct App {
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
     pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 通常動画の拡大・パン。360 と違いセッション意図は持たず、項目や表示コンテキストが
+    /// 変わるたびに `None` へ戻す。
+    pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、
     /// 「360 で見ていた」という事実はこちらが覚える。次に開いたものが 360 素材なら
@@ -12201,12 +12838,9 @@ pub struct App {
     /// キー操作で開いた外部ツール選択モーダル。対象は open 時点の snapshot を保持する。
     pub(crate) external_tool_picker: Option<crate::external_tool::ExternalToolPickerRequest>,
 
-    // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
-    /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
-    pub(crate) cached_nav_indices: Option<Vec<usize>>,
-    /// フルスクリーンのシークバー/ページ番号 overlay 用 reading-index キャッシュ
-    /// (fs_idx keyed)。`cached_nav_indices` と同じ箇所で無効化する。
-    pub(crate) cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    // ── viewer navigation の導出一覧キャッシュ ──────────────────
+    /// nav / 静止画 / seek 情報を一括失効する context-local owner。
+    pub(crate) viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches,
 
     // ── AI アップスケール ──────────────────────────────────────────
     /// AI ランタイム (ONNX Runtime)
@@ -13326,6 +13960,13 @@ pub struct App {
     /// `frame.begin`, which is the first moment both halves are known.
     perf_prev_update_ms: Option<f64>,
     perf_last_update_end: Option<std::time::Instant>,
+    /// Cycles the UI thread actually executed during the previous update.
+    ///
+    /// Wall time alone cannot tell a frame that computed for 15ms from one that was
+    /// descheduled for 12 of them. Dividing by the wall time gives the clock rate the
+    /// thread really got: near the machine's rate means it was busy, a fraction of it
+    /// means it was waiting or preempted. Same technique as backlog 1.129.
+    perf_prev_update_cycles: Option<u64>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
     /// 全 GPU テクスチャ会計を約 1 秒に 1 回へ間引く perf-log 専用時刻。
@@ -14365,7 +15006,7 @@ impl App {
             export_dialog: None,
             export_batch_dialog: None,
             export_pending: None,
-            export_folder_refresh_pending: None,
+            folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
@@ -14432,6 +15073,7 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             panorama_state: None,
+            video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
@@ -14803,8 +15445,7 @@ impl App {
             external_tool_modal_owner_drawn_frame: None,
             external_tool_launch_confirmation: None,
             external_tool_picker: None,
-            cached_nav_indices: None,
-            cached_fs_seek_info: None,
+            viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
 
             // AI (settings から復元)
             ai_runtime: None,
@@ -15178,6 +15819,7 @@ impl App {
             perf_last_frame_begin: None,
             perf_prev_update_ms: None,
             perf_last_update_end: None,
+            perf_prev_update_cycles: None,
             last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
@@ -15955,6 +16597,7 @@ impl App {
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
+        self.viewer_navigation_caches.invalidate();
         self.invalidate_facet_name_cache();
         idx
     }
@@ -18489,6 +19132,20 @@ impl App {
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
+        if self.viewer_session_blocks_main_window() {
+            // 一覧へ適用すると load_folder_with_scan -> close_fullscreen まで進むため、
+            // App::update の一覧側 consumer と同じ述語で、既存の再読み込みへ先送りする。
+            // 走査結果は保持しない。一覧へ戻った時点の内容を改めて 1 回読む方が正しい。
+            // その間は削除済みファイル等が背後の一覧へ残るが、閲覧を閉じないための
+            // 意図した取引である。mtime / signature も「適用済み」に進めず、Resumed の
+            // 安いふるいが pending より先にこの変更を見失わないようにする。
+            crate::logger::log(format!(
+                "auto-refresh: folder content changed while main viewer is open; deferring reload ({})",
+                folder.display()
+            ));
+            self.folder_refresh_pending = Some(folder);
+            return;
+        }
         self.clear_retained_final_ai_cache(&format!(
             "external_folder_change folder={}",
             folder.display()
@@ -18527,6 +19184,16 @@ impl App {
                 GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
                 _ => None,
             });
+        if self
+            .export_pending
+            .as_ref()
+            .is_some_and(|pending| !pending.finished)
+        {
+            crate::logger::log(format!(
+                "external_rescan: reloading current folder while Ctrl+E export continues ({})",
+                folder.display()
+            ));
+        }
         crate::logger::log(format!(
             "auto-refresh: folder content changed ({}), reloading",
             folder.display()
@@ -19678,10 +20345,12 @@ impl App {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
             crate::logger::log(format!(
-                "omitted entries: same_name={} hidden={} unsupported={} system={} chip={} \
+                "omitted entries: same_name={} hidden={} ignored_archive={} unsupported={} \
+                 system={} chip={} \
                  published={} surface={:?}",
                 omitted_entries.same_name,
                 omitted_entries.hidden,
+                omitted_entries.ignored_archive,
                 omitted_entries.unsupported,
                 omitted_entries.system,
                 omitted_entries.primary_count(),
@@ -22323,6 +22992,7 @@ impl App {
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
+        self.viewer_navigation_caches.invalidate();
         self.invalidate_facet_name_cache();
         self.visible_indices.clear();
         self.details_order.clear();
@@ -27045,19 +27715,19 @@ impl App {
             return;
         };
         if crate::folder_tree::path_eq(parent, &cur) {
-            self.export_folder_refresh_pending = Some(cur);
+            self.folder_refresh_pending = Some(cur);
         }
     }
 
-    /// Ctrl+E で現在フォルダへ保存されたファイルをグリッドへ反映する。
+    /// 先送りされた現在フォルダの変更をグリッドへ反映する。
     ///
-    /// フルスクリーン中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
-    /// `fullscreen_idx.is_none()` のときだけ実行する。
-    pub(crate) fn consume_export_folder_refresh_pending(&mut self) {
+    /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
+    /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
+    pub(crate) fn consume_folder_refresh_pending(&mut self) {
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
         // ここを通っても pending を消費せず、後で復帰したときに再読込できるよう
         // 残しておく (Codex review CONFIRMED)。
-        if self.export_folder_refresh_pending.is_none() {
+        if self.folder_refresh_pending.is_none() {
             return;
         }
         if self.items_are_global_search_view
@@ -27071,12 +27741,12 @@ impl App {
         let Some(cur) = self.current_favorite_target() else {
             return;
         };
-        let Some(target) = self.export_folder_refresh_pending.take() else {
+        let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };
         if crate::folder_tree::path_eq(&cur, &target) {
             crate::logger::log(format!(
-                "export: reloading current folder after Ctrl+E save ({})",
+                "folder-refresh: reloading current folder after deferred change ({})",
                 cur.display()
             ));
             self.folder_history.remove(&cur);
@@ -37335,20 +38005,20 @@ impl App {
             .blocks_legacy_main_shortcuts()
     }
 
-    fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
+    pub(crate) fn collect_shell_clipboard_paths(
+        &self,
+    ) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
         if !self.checked.is_empty() {
-            let mut paths = Vec::with_capacity(self.checked.len());
-            for &idx in &self.checked {
-                let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
-                    return Err(ShellClipboardSelectionError::UncopyableItem(
-                        self.items
-                            .get(idx)
-                            .and_then(GridItem::file_operation_refusal),
-                    ));
-                };
-                paths.push(path.to_path_buf());
+            let indexed_paths = self.collect_checked_indexed_paths();
+            if indexed_paths.len() != self.checked.len() {
+                let refusal = self.checked.iter().find_map(|&idx| {
+                    self.items
+                        .get(idx)
+                        .and_then(GridItem::file_operation_refusal)
+                });
+                return Err(ShellClipboardSelectionError::UncopyableItem(refusal));
             }
-            return Ok(paths);
+            return Ok(indexed_paths.into_iter().map(|(_, path)| path).collect());
         }
 
         let Some(idx) = self.selected else {
@@ -37386,6 +38056,18 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        self.invoke_shell_clipboard_verb_for_paths(ctx, &paths, verb);
+    }
+
+    pub(crate) fn invoke_shell_clipboard_verb_for_paths(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
         let Some(hwnd) = self.main_hwnd else {
             crate::logger::log(format!(
                 "shell_clipboard: {verb:?} skipped; main HWND unavailable"
@@ -37402,7 +38084,7 @@ impl App {
             crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         }
 
-        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb);
+        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb);
         Self::resync_egui_modifiers_from_os(ctx);
         match result {
             Ok(()) => ctx.request_repaint(),
@@ -37501,7 +38183,7 @@ impl App {
             return;
         }
 
-        let (ctrl_c, ctrl_x) = ctx.input(|i| {
+        let (egui_copy, egui_cut) = ctx.input(|i| {
             let mut c = false;
             let mut x = false;
             for event in &i.events {
@@ -37530,8 +38212,21 @@ impl App {
             false
         };
 
-        if ctrl_c || ctrl_x {
-            let verb = if ctrl_x {
+        let copy_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCopyFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::C));
+        let cut_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCutFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::X));
+        let copy_requested = self.keymap.pressed_action(ctx, KeyAction::GridCopyFiles)
+            || (egui_copy && copy_accepts_semantic_event);
+        let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
+            || (egui_cut && cut_accepts_semantic_event);
+
+        if copy_requested || cut_requested {
+            let verb = if cut_requested {
                 crate::native_context_menu::ShellClipboardVerb::Cut
             } else {
                 crate::native_context_menu::ShellClipboardVerb::Copy
@@ -38705,6 +39400,9 @@ impl App {
             // park は利用者が 360 をやめた操作ではないので、**意図は残す**。
             // 残さないと parked 側が resume したときに 360 が戻らない (backlog §1.145)。
             self.apply_panorama_mode_toggle(fs_idx);
+        }
+        if self.video_zoom_state.take().is_some() {
+            self.sync_native_video_zoom_state(fs_idx);
         }
         self.pano_toast_shown_for_current_fs = false;
         if self.analysis_mode {
@@ -41713,7 +42411,7 @@ impl App {
                 let _ = app.poll_detached_physical_folder_open(ctx);
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
-                app.poll_prefetch(ctx);
+                app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
                 // Thumbnail results belong to the context whose worker generation and rx
                 // produced them. Consume them while that detached owner is mounted so image
                 // pixels can become pass-through renditions without leaking state into the main
@@ -44585,6 +45283,7 @@ impl App {
             history_trigger,
             requested_materialization,
             FsPageLoadContract::Sequential,
+            None,
         );
     }
 
@@ -44594,10 +45293,29 @@ impl App {
         history_trigger: HistoryTrigger,
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
+        mut perf: Option<&mut FsOpenPerfRecorder>,
     ) {
+        let total_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
-        if self.route_materialized_physical_still_open_to_active_context(idx) {
+        let route_materialized_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
+        let routed_materialized_physical_still =
+            self.route_materialized_physical_still_open_to_active_context(idx);
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            route_materialized_perf_t0,
+        );
+        #[cfg(windows)]
+        if routed_materialized_physical_still {
+            finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
             return;
+        }
+
+        #[cfg(windows)]
+        if self.fullscreen_idx != Some(idx) {
+            self.video_zoom_state = None;
         }
 
         let sequence_is_awaiting_folder_target = self
@@ -44629,7 +45347,13 @@ impl App {
         }
         // 明示 open の左右パネルはファイル単位の一時状態。新規入場と viewer 内の
         // ファイル移動が集約されるこの境界で、前ファイルの owner を引き継がない。
+        let reset_side_panel_perf_t0 = start_fs_open_perf_span(&perf);
         self.reset_fs_side_panel_runtime_for_file_change();
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ResetFileRuntime,
+            reset_side_panel_perf_t0,
+        );
         crate::logger::log(format!("=== open_fullscreen: idx={idx} ==="));
         // 別アイテムへナビ / 新規オープンする時点で、前アイテムの「動画→音声モード」(Inc 7) は
         // 終わる。stale index (同 idx が別 item を指す) 事故を避けるため必ずクリアする
@@ -44654,6 +45378,8 @@ impl App {
         // を立てている場合はそれを尊重する (is_none 判定)。この判定は `fullscreen_idx` を idx へ
         // 更新する前・`prepare_viewer_presentation_open` が presentation を書き換える前に行う。
         #[cfg(windows)]
+        let detached_presentation_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
         if self.fs_media_open_forced_presentation.is_none()
             && !self.fs_open_intent_from_grid
             && self.fullscreen_idx.is_some()
@@ -44668,6 +45394,12 @@ impl App {
         if !reuse_detached_window_for_folder_nav {
             self.prepare_detached_image_windows_for_open(idx);
         }
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            detached_presentation_perf_t0,
+        );
         #[cfg(windows)]
         if self.vst3_deferred_media_open.is_some() && self.vst3_deferred_media_open != Some(idx) {
             self.vst3_deferred_media_open = None;
@@ -44696,14 +45428,34 @@ impl App {
         }
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
+        let record_book_resume_perf_t0 = start_fs_open_perf_span(&perf);
         self.record_book_resume(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RecordBookResume,
+            record_book_resume_perf_t0,
+        );
+        let record_reading_history_perf_t0 = start_fs_open_perf_span(&perf);
         self.record_reading_history(idx, history_trigger);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RecordReadingHistory,
+            record_reading_history_perf_t0,
+        );
         self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
         #[cfg(windows)]
+        let prepare_presentation_perf_t0 = start_fs_open_perf_span(&perf);
+        #[cfg(windows)]
         self.prepare_viewer_presentation_open(idx, entering_native_video_fullscreen);
+        #[cfg(windows)]
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ViewerPresentation,
+            prepare_presentation_perf_t0,
+        );
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
@@ -44713,7 +45465,13 @@ impl App {
         // `open_fullscreen_from_fs_navigation` のようなラッパーを通すこと。
         self.cursor_last_activity = Some(std::time::Instant::now());
         self.cursor_hide_reason = None;
+        let refresh_video_markers_perf_t0 = start_fs_open_perf_span(&perf);
         self.refresh_fullscreen_video_marker_cache(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache,
+            refresh_video_markers_perf_t0,
+        );
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
@@ -44729,7 +45487,13 @@ impl App {
         self.fs_last_native_focus_claim_at = None;
         self.fs_last_main_focus_restore_at = None;
         self.fs_primary_suppression = Default::default();
+        let reset_erase_perf_t0 = start_fs_open_perf_span(&perf);
         self.reset_erase_mode();
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::ResetFileRuntime,
+            reset_erase_perf_t0,
+        );
 
         // 360 度パノラマビュー: 別画像へナビ時は GPU リソースを解放する
         // (Arc + LRU 1 設計、§4.1)。state は保持して同セッションで equirect に
@@ -44839,12 +45603,24 @@ impl App {
                     if materialization.admits_non_target_full_resolution_work()
                         && self.reading_flow.is_paged()
                     {
+                        let update_prefetch_perf_t0 = start_fs_open_perf_span(&perf);
                         self.update_prefetch_window(idx);
+                        finish_fs_open_perf_span(
+                            &mut perf,
+                            FsOpenPerfSpan::UpdatePrefetchWindow,
+                            update_prefetch_perf_t0,
+                        );
                     }
                 }
                 // `ensure_fs_page_load` 後に見開き partner の prefetch が追加された場合も、
                 // 同じ page-change frame で pending set の増加を拾って pool へ昇格を依頼する。
+                let refresh_pdf_promotion_perf_t0 = start_fs_open_perf_span(&perf);
                 self.refresh_fullscreen_pdf_promotion();
+                finish_fs_open_perf_span(
+                    &mut perf,
+                    FsOpenPerfSpan::RefreshFullscreenPdfPromotion,
+                    refresh_pdf_promotion_perf_t0,
+                );
             }
             Some(GridItem::Video(_)) => {
                 // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
@@ -44897,11 +45673,18 @@ impl App {
                         ));
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
+                        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
                         return;
                     }
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
                     self.fs_open_intent_from_grid = grid_open_intent;
+                    let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
                     self.start_fs_load(idx);
+                    finish_fs_open_perf_span(
+                        &mut perf,
+                        FsOpenPerfSpan::StartFsLoad,
+                        start_fs_load_perf_t0,
+                    );
                 }
             }
             Some(GridItem::Audio(_)) => {
@@ -44931,6 +45714,7 @@ impl App {
                         ));
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
+                        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
                         return;
                     }
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));
@@ -44938,7 +45722,13 @@ impl App {
                     // 音声分岐が再度 take するので、動画分岐 (25987) と同じく戻してから呼ぶ。
                     // これで「音声 × 一覧から開く」設定 (music_open_resume) が効く (Codex P2)。
                     self.fs_open_intent_from_grid = grid_open_intent;
+                    let start_fs_load_perf_t0 = start_fs_open_perf_span(&perf);
                     self.start_fs_load(idx);
+                    finish_fs_open_perf_span(
+                        &mut perf,
+                        FsOpenPerfSpan::StartFsLoad,
+                        start_fs_load_perf_t0,
+                    );
                 }
             }
             _ => {}
@@ -44947,7 +45737,14 @@ impl App {
         // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
         // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
         // 100ms 級にブロックする。メタデータパネルは値到着まで空表示。
+        let start_metadata_load_perf_t0 = start_fs_open_perf_span(&perf);
         self.start_metadata_load(idx);
+        finish_fs_open_perf_span(
+            &mut perf,
+            FsOpenPerfSpan::StartMetadataLoad,
+            start_metadata_load_perf_t0,
+        );
+        finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
     }
 
     /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。
@@ -46701,8 +47498,7 @@ impl App {
                 .unwrap_or_default();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
-            self.cached_nav_indices = None;
-            self.cached_fs_seek_info = None;
+            self.viewer_navigation_caches.invalidate();
             if !self.checked.is_empty() {
                 let vi = &self.visible_indices;
                 self.checked.retain(|idx| vi.binary_search(idx).is_ok());
@@ -46835,8 +47631,7 @@ impl App {
         } else {
             self.details_order.clear();
         }
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
         // 「F1 で非表示にした後、矢印キーで一覧先頭に飛ぶ」挙動も解消される。
@@ -47737,6 +48532,7 @@ impl App {
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
+                self.viewer_navigation_caches.invalidate();
             }
         }
         self.scroll_to_selected = true;
@@ -47887,8 +48683,7 @@ impl App {
 
     pub(crate) fn rebuild_details_order(&mut self) {
         self.details_order_revision = self.details_order_revision.wrapping_add(1);
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         if !self.details_sort_key_visible(self.settings.details_sort_key) {
             self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
             self.settings.details_sort_ascending = true;
@@ -52563,10 +53358,11 @@ impl App {
     /// フルスクリーンの前後移動 / スライドショーはフィルタ後かつ詳細表示では
     /// `details_order` 適用後の display list を使うため、先読みも同じ順序に揃える。
     /// ★フィルタや Ctrl+F で疎な一覧になっても、非表示の raw idx を先読みしない。
-    fn collect_image_indices(&self) -> Vec<usize> {
-        Self::collect_image_indices_from(&self.items, self.current_grid_order())
+    fn collect_image_indices(&mut self) -> Arc<Vec<usize>> {
+        self.get_still_image_indices()
     }
 
+    #[cfg(test)]
     fn collect_image_indices_from(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
         crate::ui_helpers::still_image_display_indices(items, visible_indices)
     }
@@ -53065,27 +53861,22 @@ impl App {
         if cf_was_open && self.items_are_bookmark_view {
             self.refresh_bookmark_browser();
         }
-        // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
-        // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
-        // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
-        // 完了まで残るが、後続エントリは drop される)。
+        // 開始前の Ctrl+E ダイアログは表示中ページの文脈に属するので閉じる。
+        // 開始済みの worker は source と編集 snapshot を完全に所有しており、viewer を
+        // 閉じても継続できる。進捗とキャンセル操作も一覧側のダイアログへ引き継がれるため、
+        // `export_pending` と cancel フラグには触れない。
         self.export_dialog = None;
-        if let Some(pending) = self.export_pending.as_ref() {
-            pending
-                .cancel
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.export_pending = None;
-        // **`export_folder_refresh_pending` は触らない**: これは「一覧に戻ったら
-        // サムネ更新」の dirty フラグ (commit 1cdf9c53 で導入) で、`consume_*` が
+        // **`folder_refresh_pending` は触らない**: これは「一覧に戻ったら
+        // 現在フォルダを更新」の dirty フラグで、`consume_*` が
         // 同フレ末で取り出す前提。close_fullscreen 内で None に戻すと取り出す前に
-        // 消えて、エクスポート後にサムネが更新されない (Codex review P1 再指摘)。
+        // 消えて、先送りしたフォルダ変更が一覧へ反映されない。
         self.fullscreen_video_marker_cache = None;
         self.cancel_fullscreen_video_marker_thumb_decode();
         // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。
         // docs/panorama-360-view-plan.md §5.1 / §6.3。CallbackResources からも
         // UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
         self.panorama_state = None;
+        self.video_zoom_state = None;
         self.clear_pano_upload();
         self.pano_toast_shown_for_current_fs = false;
         // Phase 2a (§4.6.3 step 8): フル RGBA (最大 2.15 GB) を drop + 進行中 worker を cancel。
@@ -54354,7 +55145,7 @@ impl App {
     }
 
     /// 先読み範囲内の item_idx 集合を計算する。
-    fn compute_keep_set(&self, current_idx: usize) -> std::collections::HashSet<usize> {
+    fn compute_keep_set(&mut self, current_idx: usize) -> std::collections::HashSet<usize> {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             // フルスクリーン表示中に★/Ctrl+Fフィルタが変わり、現在ページが
@@ -54396,7 +55187,7 @@ impl App {
     }
 
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
-    pub(crate) fn ai_prefetch_targets(&self, current_idx: usize) -> Vec<usize> {
+    pub(crate) fn ai_prefetch_targets(&mut self, current_idx: usize) -> Vec<usize> {
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return Vec::new();
@@ -54456,7 +55247,10 @@ impl App {
     /// AI 先読み対象を前後に分けた表示モデルを返す。総 target が 0 なら非表示
     /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は表示を
     /// 隠して「AI 処理中」ラベルだけ見せる。
-    pub(crate) fn final_ai_prefetch_indicator(&self, fs_idx: usize) -> Option<FsPrefetchIndicator> {
+    pub(crate) fn final_ai_prefetch_indicator(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<FsPrefetchIndicator> {
         let image_indices = self.collect_image_indices();
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
         let target_positions = interleaved_prefetch_positions(
@@ -65360,7 +66154,8 @@ impl App {
         source_dims: [usize; 2],
         load_seq: u64,
         perf_key_str: Option<String>,
-        upload_t0: std::time::Instant,
+        upload_t0: Option<std::time::Instant>,
+        prefetch_perf: &mut Option<PollPrefetchPerfRecorder>,
         result_kind: &'static str,
         store_retained_pdf_page_raster: bool,
         animation: StaticAnimationState,
@@ -65370,15 +66165,20 @@ impl App {
         }
         let upload = clamp_for_gpu(&pixels);
         let [w, h] = pixels.size;
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
         let handle = ctx.load_texture(
             format!("fs_{key}"),
             upload.into_owned(),
             DISPLAY_IMAGE_TEXTURE_OPTIONS,
         );
-        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+        let upload_ms = upload_t0.map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0);
+        mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
         // `load_seq` を使うのは、decode 中に別操作が入っても
         // ready が load_begin と同じシーケンスに紐づくようにするため。
-        if crate::perf::is_enabled() {
+        if let Some(upload_ms) = upload_ms {
             crate::perf::event(
                 "fs",
                 "ready",
@@ -65393,19 +66193,29 @@ impl App {
                 ],
             );
         }
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
         // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
         // 先読み分は表示に入った時点で final pipeline
         // (ensure_final_composite_texture) が処理する。
         if self.fullscreen_idx == Some(key) && animation == StaticAnimationState::Still {
             self.apply_sync_adjustment(ctx, key, &pixels);
+            mark_poll_prefetch_perf(prefetch_perf, PollPrefetchPerfStage::ApplySyncAdjustment);
         }
-        FsCacheEntry::Static {
+        let entry = FsCacheEntry::Static {
             tex: handle,
             pixels,
             source_dims: Some(source_dims),
             load_seq,
             animation,
-        }
+        };
+        mark_poll_prefetch_perf(
+            prefetch_perf,
+            PollPrefetchPerfStage::BuildStaticFsCacheEntry,
+        );
+        entry
     }
 
     /// cache 済み edit result 画素から、許容値に依存しない近モノクロ要約を少しずつ作る。
@@ -65510,7 +66320,24 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        let outcome = match self.ensure_passthrough_rendition_inner(ctx, idx) {
+        self.ensure_passthrough_rendition_with_perf(ctx, idx, None)
+    }
+
+    pub(crate) fn ensure_passthrough_rendition_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+    ) -> Option<egui::TextureHandle> {
+        let mut perf_call = perf
+            .as_ref()
+            .map(|_| PassthroughRenditionPerfCall::new(idx));
+        let outcome = match self.ensure_passthrough_rendition_inner(
+            ctx,
+            idx,
+            perf.as_deref_mut(),
+            perf_call.as_mut(),
+        ) {
             Ok(texture) if self.display_texture_matches_page(&texture, idx) => {
                 self.passthrough_unavailable = None;
                 Ok(texture)
@@ -65520,6 +66347,13 @@ impl App {
         };
         self.passthrough_last_call
             .insert(idx, (self.frame_counter, outcome.as_ref().err().copied()));
+        if let (Some(perf), Some(mut perf_call)) = (perf, perf_call) {
+            perf_call.outcome = match &outcome {
+                Ok(_) => "ready",
+                Err(reason) => reason.as_str(),
+            };
+            perf.calls.push(perf_call);
+        }
         match outcome {
             Ok(texture) => Some(texture),
             Err(reason) => {
@@ -65570,29 +66404,83 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
+        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+        mut perf_call: Option<&mut PassthroughRenditionPerfCall>,
     ) -> Result<egui::TextureHandle, PassthroughUnavailable> {
+        let source_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
             Some(crate::grid_item::ThumbnailState::Loaded {
                 tex,
                 from_edit_preview,
                 ..
             }) => (tex.clone(), *from_edit_preview),
-            _ => return Err(PassthroughUnavailable::ThumbnailNotLoaded),
+            _ => {
+                finish_passthrough_rendition_perf_span(
+                    perf.as_deref_mut(),
+                    PassthroughRenditionPerfSpan::SourceLookup,
+                    source_lookup_t0,
+                );
+                return Err(PassthroughUnavailable::ThumbnailNotLoaded);
+            }
         };
-        let source_pixels = self
-            .thumb_pixels
-            .get(&idx)
-            .ok_or(PassthroughUnavailable::ThumbnailPixelsNotResident)?
-            .clone();
+        let source_pixels = match self.thumb_pixels.get(&idx) {
+            Some(source_pixels) => source_pixels.clone(),
+            None => {
+                if let Some(perf_call) = perf_call.as_deref_mut() {
+                    perf_call.from_edit_preview = Some(from_edit_preview);
+                }
+                finish_passthrough_rendition_perf_span(
+                    perf.as_deref_mut(),
+                    PassthroughRenditionPerfSpan::SourceLookup,
+                    source_lookup_t0,
+                );
+                return Err(PassthroughUnavailable::ThumbnailPixelsNotResident);
+            }
+        };
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            let [source_width, source_height] = source_pixels.size;
+            perf_call.source_width = Some(source_width);
+            perf_call.source_height = Some(source_height);
+            perf_call.from_edit_preview = Some(from_edit_preview);
+        }
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::SourceLookup,
+            source_lookup_t0,
+        );
         let params = self.effective_params(idx).clone();
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.color_adjustment_applied = Some(!params.is_color_identity());
+            perf_call.colorize_mode = Some(params.colorize.mode);
+        }
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),
             source_pixels.size,
             &params,
         );
+        let cache_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
+            if let Some(perf_call) = perf_call.as_deref_mut() {
+                perf_call.cache_hit = Some(true);
+                perf_call.colorize_applied = Some(entry.colorize_applied);
+                perf_call.pixel_buffer_generated_this_call = Some(false);
+                perf_call.texture_uploaded_this_call = Some(false);
+            }
+            finish_passthrough_rendition_perf_span(
+                perf.as_deref_mut(),
+                PassthroughRenditionPerfSpan::CacheLookup,
+                cache_lookup_t0,
+            );
             return Ok(entry.texture);
         }
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.cache_hit = Some(false);
+        }
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::CacheLookup,
+            cache_lookup_t0,
+        );
 
         let creative_lut = if !params.creative_lut.is_identity() {
             self.creative_lut_library
@@ -65611,13 +66499,62 @@ impl App {
                 .or_else(|| self.known_monochrome_only_applicability(idx, &params))
         })
         .flatten();
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.colorize_applicable_override = colorize_applicable_override;
+            perf_call.creative_lut_applied = Some(creative_lut.is_some());
+        }
+        let build_pixels_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
+        #[cfg(windows)]
+        let _ = crate::colorize::take_mono_tone_axis_timing();
         let rendition = build_passthrough_rendition_pixels(
             &source_pixels,
             &params,
             creative_lut,
             colorize_applicable_override,
         );
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::BuildPixels,
+            build_pixels_t0,
+        );
+        // The span above measures 7% busy: it waits rather than computes, and the only
+        // things here that can wait are the two allocations and the first touch of the
+        // source pixels. Split those three so the next log names which.
+        #[cfg(windows)]
+        if crate::perf::is_enabled()
+            && let Some(t) = crate::colorize::take_mono_tone_axis_timing()
+        {
+            crate::perf::event(
+                "fs",
+                "mono_tone_axis_split",
+                None,
+                self.input_seq,
+                &[
+                    ("sample_ms", serde_json::Value::from(t.sample_ms)),
+                    ("sample_cycles", serde_json::Value::from(t.sample_cycles)),
+                    ("compute_ms", serde_json::Value::from(t.compute_ms)),
+                    ("compute_cycles", serde_json::Value::from(t.compute_cycles)),
+                    ("residual_ms", serde_json::Value::from(t.residual_ms)),
+                    (
+                        "residual_cycles",
+                        serde_json::Value::from(t.residual_cycles),
+                    ),
+                    (
+                        "source_pixels",
+                        serde_json::Value::from(source_pixels.pixels.len()),
+                    ),
+                ],
+            );
+        }
         let colorize_applied = rendition.colorize_applied;
+        let pixel_buffer_generated = rendition.pixels.is_some();
+        let catalog_texture_reused = !pixel_buffer_generated && !from_edit_preview;
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.colorize_applied = Some(colorize_applied);
+            perf_call.pixel_buffer_generated_this_call = Some(pixel_buffer_generated);
+            perf_call.catalog_texture_reused = Some(catalog_texture_reused);
+            perf_call.texture_uploaded_this_call = Some(!catalog_texture_reused);
+        }
         let (pixels, texture) = if rendition.pixels.is_none() && !from_edit_preview {
             (Arc::clone(&source_pixels), catalog_texture)
         } else {
@@ -65626,16 +66563,22 @@ impl App {
                     .pixels
                     .unwrap_or_else(|| source_pixels.as_ref().clone()),
             );
-            let texture = ctx.load_texture(
-                format!(
-                    "passthrough_rendition_{}_{}_{}_{}",
-                    key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
-                ),
-                (*pixels).clone(),
-                egui::TextureOptions::LINEAR,
+            let texture_name = format!(
+                "passthrough_rendition_{}_{}_{}_{}",
+                key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+            );
+            let upload_pixels = (*pixels).clone();
+            let load_texture_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
+            let texture =
+                ctx.load_texture(texture_name, upload_pixels, egui::TextureOptions::LINEAR);
+            finish_passthrough_rendition_perf_span(
+                perf.as_deref_mut(),
+                PassthroughRenditionPerfSpan::LoadTexture,
+                load_texture_t0,
             );
             (pixels, texture)
         };
+        let cache_insert_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         self.passthrough_rendition_cache.insert(
             key,
             PassthroughRenditionEntry {
@@ -65644,6 +66587,11 @@ impl App {
                 colorize_applied,
                 texture: texture.clone(),
             },
+        );
+        finish_passthrough_rendition_perf_span(
+            perf,
+            PassthroughRenditionPerfSpan::CacheInsert,
+            cache_insert_t0,
         );
         Ok(texture)
     }
@@ -65687,7 +66635,12 @@ impl App {
     /// 現在の typed navigation target に属する完成済み result は page-turn suppression 中も
     /// upload し、それ以外の先読みは sequence settle 後まで backlog に保持する。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
-    pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context, origin: PollPrefetchOrigin) {
+        let mut prefetch_perf = poll_prefetch_perf_start_with(
+            crate::perf::is_enabled(),
+            origin,
+            std::time::Instant::now,
+        );
         // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
         // native 解像度判明後の AI 用 native 再レンダは、AI 設定変更も合わせて拾うため
         // `App::update` の `maybe_native_rerender_pdf_for_ai` (sync_upscale_from_preset 直後)
@@ -65718,6 +66671,10 @@ impl App {
         let mut disconnected: Vec<(usize, FsLoadPurpose)> = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
         let mut animation_expansion_updates: Vec<(usize, std::time::Instant, u64)> = Vec::new();
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::OtherPostprocessing,
+        );
         for (&key, items_generation, pending) in self.fs_pending.iter_with_generation() {
             let mut animation_expansion_started_at = pending.animation_expansion_started_at;
             loop {
@@ -65758,6 +66715,7 @@ impl App {
                 }
             }
         }
+        mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::FsPendingDrain);
         let early_dims_repaint = !early_dims_updates.is_empty();
         for (key, dims, items_generation) in early_dims_updates {
             self.fs_early_dims
@@ -65838,6 +66796,10 @@ impl App {
                 animation_expansion_started_at,
             );
         }
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::FsPendingPostprocess,
+        );
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
@@ -65896,6 +66858,7 @@ impl App {
             || early_dims_repaint
             || animation_expansion_repaint
             || has_more_admitted_backlog;
+        mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
         for (items_generation, upload) in to_process {
             let FsUploadResult {
                 idx: key,
@@ -65925,7 +66888,7 @@ impl App {
             // 実害はないが HashMap が膨張しないようクリーンアップする)
             self.fs_early_dims.remove(&key);
             let perf_key_str = self.perf_item_key(key);
-            let upload_t0 = std::time::Instant::now();
+            let upload_t0 = prefetch_perf.as_ref().map(|_| std::time::Instant::now());
             // static source の差し替えでは、この後の `apply_sync_adjustment` が旧世代の
             // final composite を破棄し得る。PDF Z ズーム再描画の完成表示を失わないよう、
             // raw upload / 同期補正より前に display-only holdover を確保する。
@@ -65937,6 +66900,7 @@ impl App {
             ) {
                 self.capture_final_effect_source_reload_holdover(key);
             }
+            mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
             let entry = match result {
                 FsLoadResult::Static {
                     ci,
@@ -65952,6 +66916,7 @@ impl App {
                         load_seq,
                         perf_key_str.clone(),
                         upload_t0,
+                        &mut prefetch_perf,
                         "static",
                         true,
                         animation,
@@ -65968,6 +66933,7 @@ impl App {
                     load_seq,
                     perf_key_str.clone(),
                     upload_t0,
+                    &mut prefetch_perf,
                     "static_cached",
                     false,
                     StaticAnimationState::Still,
@@ -66025,10 +66991,15 @@ impl App {
                         upload.into_owned(),
                         DISPLAY_IMAGE_TEXTURE_OPTIONS,
                     );
-                    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    let upload_ms =
+                        upload_t0.map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0);
+                    mark_poll_prefetch_perf(
+                        &mut prefetch_perf,
+                        PollPrefetchPerfStage::UploadBacklog,
+                    );
                     let (full_w, full_h) = high_res.dims();
                     let source_pixels = (full_w as u64) * (full_h as u64);
-                    if crate::perf::is_enabled() {
+                    if let Some(upload_ms) = upload_ms {
                         crate::perf::event(
                             "fs",
                             "ready",
@@ -66067,8 +67038,16 @@ impl App {
                         };
                         self.pano_quality_state.insert(source_key, state);
                     }
+                    mark_poll_prefetch_perf(
+                        &mut prefetch_perf,
+                        PollPrefetchPerfStage::UploadBacklog,
+                    );
                     if self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels);
+                        mark_poll_prefetch_perf(
+                            &mut prefetch_perf,
+                            PollPrefetchPerfStage::ApplySyncAdjustment,
+                        );
                     }
                     FsCacheEntry::Static {
                         tex: handle,
@@ -66083,6 +67062,7 @@ impl App {
                     unreachable!("non-terminal fs load result reached completion match")
                 }
             };
+            mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
             self.fs_cache
                 .insert_for_generation(key, items_generation, entry);
             self.record_fs_cache_page_dims_for_spread(key);
@@ -66094,8 +67074,16 @@ impl App {
             // NeedsUserConfirmation を立てる。SettleReady の小さい候補は worker tee
             // 経路 (StaticPanorama) で処理されるので、ここに到達するのは tee 不採用ケース。
             self.maybe_update_pano_quality_state_from_static(key);
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::OtherPostprocessing,
+            );
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::AutoApplySavedMask,
+            );
             if self.fullscreen_idx == Some(key) {
                 // 連結表示の keep/prefetch 範囲は viewport 上の可視ページから
                 // ui_fullscreen 側で毎フレーム計算する。ここで通常の前後ページ window を
@@ -66103,12 +67091,20 @@ impl App {
                 if self.reading_flow.is_paged() {
                     self.update_prefetch_window(key);
                 }
+                mark_poll_prefetch_perf(
+                    &mut prefetch_perf,
+                    PollPrefetchPerfStage::UpdatePrefetchWindow,
+                );
                 // 360 候補のトースト補完 (Codex P3 第 19 ラウンド):
                 // ChatGPT 生成画像のような XMP なし 2:1 画像は、`fs_cache.source_dims`
                 // が確定して初めて aspect 判定可能になる。`open_fullscreen` 時点で
                 // 未確定だったケースを fs_cache 完了時にここで救う。
                 self.maybe_show_panorama_hint_toast(key);
             }
+            mark_poll_prefetch_perf(
+                &mut prefetch_perf,
+                PollPrefetchPerfStage::OtherPostprocessing,
+            );
         }
         if repaint {
             ctx.request_repaint();
@@ -66116,6 +67112,11 @@ impl App {
         if self.reconcile_colorize_mono_summaries() == COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME {
             ctx.request_repaint();
         }
+        mark_poll_prefetch_perf(
+            &mut prefetch_perf,
+            PollPrefetchPerfStage::OtherPostprocessing,
+        );
+        finish_poll_prefetch_perf(&mut prefetch_perf, self.frame_counter, self.input_seq);
     }
 
     fn update_reading_history_media_progress(
@@ -67429,6 +68430,7 @@ impl App {
         }
         self.sync_main_selection_from_viewer_idx(next_idx);
         self.fullscreen_idx = Some(next_idx);
+        self.video_zoom_state = None;
         self.video_audio_mode = None;
         self.video_audio_vst = None;
         self.video_audio_mode_entry_target = None;
@@ -67900,7 +68902,12 @@ impl App {
     /// 呼び出し側 (`update`) へ置く。
     fn update_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_perf_on = crate::perf::is_enabled();
-        let mut update_perf = update_perf_start_with(update_perf_on, std::time::Instant::now);
+        let mut update_perf = update_perf_start_with(
+            update_perf_on,
+            std::time::Instant::now,
+            Self::thread_cycles_now,
+        );
+        begin_nav_helper_perf_frame(update_perf_on);
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
@@ -68268,6 +69275,20 @@ impl App {
                     // spent rendering and presenting after it returned.
                     ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
                     ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
+                    (
+                        "prev_update_cycles",
+                        serde_json::Value::from(self.perf_prev_update_cycles.unwrap_or(0)),
+                    ),
+                    // Near the machine's clock rate means the frame computed; a fraction of
+                    // it means the thread spent that wall time waiting or preempted.
+                    (
+                        "prev_update_cycles_per_ms",
+                        serde_json::Value::from(if prev_update_ms > 0.0 {
+                            self.perf_prev_update_cycles.unwrap_or(0) as f64 / prev_update_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
                 ],
             );
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
@@ -68522,7 +69543,7 @@ impl App {
         // スクロールすると新しく入ってきた idx 分が少しずつキューに積まれる。
         self.enqueue_visible_tag_prewarms();
 
-        self.poll_prefetch(ctx);
+        self.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
         mark_update_perf(&mut update_perf, UpdatePerfStage::PrefetchPoll);
         self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);
@@ -69350,16 +70371,18 @@ impl App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
-        // Ctrl+E が現在フォルダへ保存したファイル、および 📌 ボタン /
-        // グリッドコンテキストメニューで書き換えた代表サムネを、同フレーム内で
-        // グリッドに反映する。
+        // 現在フォルダへ保存されたファイルや、監視再走査から先送りした変更、および
+        // 📌 ボタン / グリッドコンテキストメニューで書き換えた代表サムネを、
+        // 同フレーム内でグリッドに反映する。
         //
-        // **fullscreen 中は consume しない**: load_folder は close_fullscreen を呼ぶため、
-        // export 完了 / 右クリックメニュー操作 → ここで即時 reload → fs が予期せず
-        // 閉じてしまう。fullscreen のときは一覧へ戻った次フレーム、または
-        // close_fullscreen 側の dirty 消費経路に委ねる。
+        // **メイン viewer が塞がれている間は consume しない**: load_folder は
+        // close_fullscreen を呼ぶため、
+        // export 完了 / 監視変更 / 右クリックメニュー操作 → ここで即時 reload → fs が
+        // 予期せず閉じてしまう。fullscreen のときは一覧へ戻った次フレームに委ねる。
+        // 一覧表示中の監視変更は従来どおり即時に適用し、進行中の Ctrl+E 出力が背後の
+        // 一覧へ順次増える挙動も維持する (利用者判断 2026-09-05)。
         if !main_viewer_blocked {
-            self.consume_export_folder_refresh_pending();
+            self.consume_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
             // メディア別ウィンドウ (フル機能モード) の P ピンをメイン窓のグリッドへ
             // 即時反映する。従来は close_fullscreen でしか consume されず、メイン窓の
@@ -70467,6 +71490,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
@@ -70484,6 +71508,8 @@ impl eframe::App for App {
             self.perf_prev_update_ms =
                 Some(end.saturating_duration_since(t0).as_secs_f64() * 1000.0);
             self.perf_last_update_end = Some(end);
+            self.perf_prev_update_cycles =
+                update_cycles_t0.map(|start| Self::thread_cycles_now().saturating_sub(start));
         }
     }
 

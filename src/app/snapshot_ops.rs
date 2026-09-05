@@ -149,8 +149,7 @@ impl App {
 
     fn clear_snapshot_index_space_derived_state(&mut self) {
         self.slideshow_scroll_range_cache = None;
-        self.cached_nav_indices = None;
-        self.cached_fs_seek_info = None;
+        self.viewer_navigation_caches.invalidate();
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.continuous_reading_scroll_transition = None;

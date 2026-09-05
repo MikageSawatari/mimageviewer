@@ -311,12 +311,13 @@ impl GridItem {
         }
     }
 
-    /// ファイル整理系の操作のうち、チェック選択で扱う実ファイルのパス。
+    /// `is_checkable` の基礎となる、フォルダを除く実ファイルのパス。
     ///
     /// 画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため対象。
-    /// **フォルダはチェック対象外** — 単一選択の削除や Shell コピー/カット、D&D では
-    /// [`Self::drag_source_path`] を使って扱う。ZIP/PDF 内ページなど仮想フォルダ内アイテムは
-    /// 独立した実パスを持たないため対象外。
+    /// `is_checkable` 自体はフォルダを含めないが、サブフォルダ展開可能な一覧では
+    /// `App::grid_item_can_be_checked` がフォルダを追加で認める。単一・チェック選択を問わず、
+    /// Shell コピー/カット、D&D、削除の実パス解決には [`Self::drag_source_path`] を使う。
+    /// ZIP/PDF 内ページなど仮想フォルダ内アイテムは独立した実パスを持たないため対象外。
     pub fn file_operation_path(&self) -> Option<&Path> {
         match self {
             Self::Image(p)

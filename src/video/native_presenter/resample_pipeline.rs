@@ -34,6 +34,7 @@ use crate::settings::VideoScaleFilter;
 use crate::video::anime4k_policy::VideoAnime4kMeasurementPoint;
 use crate::video::anime4k_policy::VideoAnime4kVariant;
 use crate::video::display_metadata::VideoOrientation;
+use crate::video::zoom_view::VideoZoomSourceRect;
 
 /// ビルド時に FXC で DXBC 化した resample シェーダ
 /// ([shaders/video_resample.hlsl](shaders/video_resample.hlsl))。NIS は WGSL から naga で
@@ -56,6 +57,7 @@ const NIS_FS_NIS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_nis_fs
 struct ResampleConstants {
     source_target: [f32; 4],
     axis_filter: [f32; 4],
+    source_region: [f32; 4],
     inverse_axes: [f32; 4],
     inverse_offset: [f32; 4],
 }
@@ -99,8 +101,8 @@ pub(super) enum VideoResampleMode {
 
 pub(super) fn select_video_resample_mode(
     filter: VideoScaleFilter,
-    source_axis_width: u32,
-    source_axis_height: u32,
+    source_axis_width: f32,
+    source_axis_height: f32,
     target_width: u32,
     target_height: u32,
     smoothing_percent: u32,
@@ -109,7 +111,8 @@ pub(super) fn select_video_resample_mode(
     if filter == VideoScaleFilter::OsDefault {
         return None;
     }
-    let downscaling = target_width < source_axis_width || target_height < source_axis_height;
+    let downscaling =
+        (target_width as f32) < source_axis_width || (target_height as f32) < source_axis_height;
     Some(match (filter, downscaling) {
         (VideoScaleFilter::Sharp, false) => VideoResampleMode::Nis,
         (VideoScaleFilter::Nearest, false) => VideoResampleMode::Nearest,
@@ -491,6 +494,7 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        source_rect: VideoZoomSourceRect,
         mode: VideoResampleMode,
     ) -> Result<(), String> {
         match mode {
@@ -504,6 +508,7 @@ impl VideoResamplePipeline {
                 target_width,
                 target_height,
                 orientation,
+                source_rect,
                 smoothing_percent,
             ),
             VideoResampleMode::Nis | VideoResampleMode::Nearest => self.draw_single_pass(
@@ -516,6 +521,7 @@ impl VideoResamplePipeline {
                 target_width,
                 target_height,
                 orientation,
+                source_rect,
                 mode,
             ),
             VideoResampleMode::Anime4k { variant } => self.draw_anime4k(
@@ -528,6 +534,7 @@ impl VideoResamplePipeline {
                 target_width,
                 target_height,
                 orientation,
+                source_rect,
                 variant,
             ),
         }
@@ -545,6 +552,7 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        source_rect: VideoZoomSourceRect,
         smoothing_percent: u32,
     ) -> Result<(), String> {
         let (intermediate_width, intermediate_height) =
@@ -559,8 +567,8 @@ impl VideoResamplePipeline {
         let source_view = create_shader_view(device, source)?;
         let target_view = create_render_target(device, target)?;
         let mapping = inverse_orientation_mapping(source_width, source_height, orientation);
-        let source_axis_x = mapping.source_axis_x as f32;
-        let source_axis_y = mapping.source_axis_y as f32;
+        let source_axis_x = source_rect.extent[0];
+        let source_axis_y = source_rect.extent[1];
         let blur_factor = crate::settings::downscale_smoothing_blur_factor(smoothing_percent);
         let stretch = |source_axis: f32, target_axis: u32| {
             let ratio = source_axis / target_axis.max(1) as f32;
@@ -578,10 +586,16 @@ impl VideoResamplePipeline {
                 target_height.max(1) as f32,
             ],
             axis_filter: [
-                source_axis_x,
-                source_axis_y,
+                mapping.source_axis_x as f32,
+                mapping.source_axis_y as f32,
                 stretch(source_axis_x, target_width),
                 stretch(source_axis_y, target_height),
+            ],
+            source_region: [
+                source_rect.origin[0],
+                source_rect.origin[1],
+                source_rect.extent[0],
+                source_rect.extent[1],
             ],
             inverse_axes: [
                 mapping.inverse_x[0],
@@ -641,6 +655,7 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        source_rect: VideoZoomSourceRect,
         mode: VideoResampleMode,
     ) -> Result<(), String> {
         let source_view = create_shader_view(device, source)?;
@@ -659,6 +674,12 @@ impl VideoResamplePipeline {
                 1.0,
                 1.0,
             ],
+            source_region: [
+                source_rect.origin[0],
+                source_rect.origin[1],
+                source_rect.extent[0],
+                source_rect.extent[1],
+            ],
             inverse_axes: [
                 mapping.inverse_x[0],
                 mapping.inverse_x[1],
@@ -670,8 +691,8 @@ impl VideoResamplePipeline {
         let nis_constants = NisConstants {
             target_size: [target_width.max(1), target_height.max(1)],
             source_size: [source_width.max(1), source_height.max(1)],
-            source_origin: [0.0, 0.0],
-            source_extent: [mapping.source_axis_x as f32, mapping.source_axis_y as f32],
+            source_origin: source_rect.origin,
+            source_extent: source_rect.extent,
             inverse_x: mapping.inverse_x,
             inverse_y: mapping.inverse_y,
             inverse_offset: mapping.offset,
@@ -745,6 +766,7 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        source_rect: VideoZoomSourceRect,
         variant: VideoAnime4kVariant,
     ) -> Result<(), String> {
         let gpu_variant = gpu_anime4k_variant(variant);
@@ -786,12 +808,17 @@ impl VideoResamplePipeline {
 
         let source_view = create_shader_view(device, source)?;
         let target_view = create_render_target(device, target)?;
+        let mapping = inverse_orientation_mapping(source_width, source_height, orientation);
         let common = anime4k_video_constants(
             source_width,
             source_height,
             source_width,
             source_height,
             orientation,
+            VideoZoomSourceRect {
+                origin: [0.0, 0.0],
+                extent: [mapping.source_axis_x as f32, mapping.source_axis_y as f32],
+            },
         );
         let resolve = anime4k_video_constants(
             source_width,
@@ -799,6 +826,7 @@ impl VideoResamplePipeline {
             target_width,
             target_height,
             orientation,
+            source_rect,
         );
         let pass_inputs = gpu_variant.pass_inputs();
         let input_binding_count = gpu_variant.input_binding_count();
@@ -944,6 +972,7 @@ fn anime4k_video_constants(
     output_width: u32,
     output_height: u32,
     orientation: VideoOrientation,
+    source_rect: VideoZoomSourceRect,
 ) -> Anime4kConstants {
     let source_width = source_width.max(1);
     let source_height = source_height.max(1);
@@ -956,10 +985,10 @@ fn anime4k_video_constants(
         source_size: [source_width, source_height],
         process_size: [source_width, source_height],
         source_region: [
-            0.0,
-            0.0,
-            mapping.source_axis_x as f32,
-            mapping.source_axis_y as f32,
+            source_rect.origin[0],
+            source_rect.origin[1],
+            source_rect.extent[0],
+            source_rect.extent[1],
         ],
         inverse_x: mapping.inverse_x,
         inverse_y: mapping.inverse_y,
@@ -1318,6 +1347,10 @@ fn measure_video_anime4k_case(
             output_width,
             output_height,
             VideoOrientation::IDENTITY,
+            VideoZoomSourceRect {
+                origin: [0.0, 0.0],
+                extent: [source_width as f32, source_height as f32],
+            },
             mode,
         )?;
     }
@@ -1345,6 +1378,10 @@ fn measure_video_anime4k_case(
             output_width,
             output_height,
             VideoOrientation::IDENTITY,
+            VideoZoomSourceRect {
+                origin: [0.0, 0.0],
+                extent: [source_width as f32, source_height as f32],
+            },
             mode,
         )?;
         unsafe {
@@ -1604,6 +1641,10 @@ mod tests {
                 TARGET_WIDTH,
                 TARGET_HEIGHT,
                 VideoOrientation::IDENTITY,
+                VideoZoomSourceRect {
+                    origin: [0.0, 0.0],
+                    extent: [SOURCE_WIDTH as f32, SOURCE_HEIGHT as f32],
+                },
                 mode,
             )
             .unwrap_or_else(|error| panic!("draw {label}: {error}"));
@@ -1668,18 +1709,34 @@ mod tests {
     #[test]
     fn shader_filter_modes_use_their_upscaler_and_lanczos_for_every_downscale() {
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::Sharp, 1280, 720, 1920, 1080, 40, None),
+            select_video_resample_mode(
+                VideoScaleFilter::Sharp,
+                1280.0,
+                720.0,
+                1920,
+                1080,
+                40,
+                None,
+            ),
             Some(VideoResampleMode::Nis)
         );
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::Nearest, 1280, 720, 1920, 1080, 40, None),
+            select_video_resample_mode(
+                VideoScaleFilter::Nearest,
+                1280.0,
+                720.0,
+                1920,
+                1080,
+                40,
+                None,
+            ),
             Some(VideoResampleMode::Nearest)
         );
         assert_eq!(
             select_video_resample_mode(
                 VideoScaleFilter::Anime,
-                1280,
-                720,
+                1280.0,
+                720.0,
                 1920,
                 1080,
                 40,
@@ -1698,8 +1755,8 @@ mod tests {
             assert_eq!(
                 select_video_resample_mode(
                     filter,
-                    3840,
-                    2160,
+                    3840.0,
+                    2160.0,
                     1920,
                     1080,
                     40,
@@ -1713,14 +1770,36 @@ mod tests {
         assert_eq!(
             select_video_resample_mode(
                 VideoScaleFilter::OsDefault,
-                1280,
-                720,
+                1280.0,
+                720.0,
                 1920,
                 1080,
                 40,
                 None
             ),
             None
+        );
+    }
+
+    #[test]
+    fn zoomed_effective_source_extent_selects_an_upscaler() {
+        assert_eq!(
+            select_video_resample_mode(VideoScaleFilter::Sharp, 960.0, 540.0, 1920, 1080, 40, None,),
+            Some(VideoResampleMode::Nis)
+        );
+        assert_eq!(
+            select_video_resample_mode(
+                VideoScaleFilter::Sharp,
+                3840.0,
+                2160.0,
+                1920,
+                1080,
+                40,
+                None,
+            ),
+            Some(VideoResampleMode::Lanczos3 {
+                smoothing_percent: 40,
+            })
         );
     }
 
@@ -1855,8 +1934,17 @@ mod tests {
 
     #[test]
     fn anime4k_resolve_maps_the_oriented_whole_frame_back_to_raw_texels() {
-        let constants =
-            anime4k_video_constants(1920, 1080, 2160, 3840, VideoOrientation::new(90, false));
+        let constants = anime4k_video_constants(
+            1920,
+            1080,
+            2160,
+            3840,
+            VideoOrientation::new(90, false),
+            VideoZoomSourceRect {
+                origin: [0.0, 0.0],
+                extent: [1080.0, 1920.0],
+            },
+        );
         assert_eq!(constants.output_size, [2160, 3840]);
         assert_eq!(constants.source_size, [1920, 1080]);
         assert_eq!(constants.process_origin, [0, 0]);

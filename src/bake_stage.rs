@@ -45,8 +45,9 @@ pub enum BakeStage {
     Ai,
     /// 表示用補正まで。上に加えてスマートシャープ / カラー化 / Creative LUT / ポストフィルタ。
     ///
-    /// <kbd>Ctrl+E</kbd> の既定。**「画面と同一」ではない** — 段を全部適用したもので、
-    /// GPU テクスチャ上限の影響を受けない分だけ画面より良いことがある。
+    /// <kbd>Ctrl+E</kbd> の既定で、単枚書き出しもこの選択値を読む。
+    /// **「画面と同一」ではない** — 段を全部適用したもので、GPU テクスチャ上限の
+    /// 影響を受けない分だけ画面より良いことがある。
     DisplayAdjust,
 }
 
@@ -98,6 +99,14 @@ mod tests {
     #[test]
     fn the_default_is_the_shallow_stage_that_shipped() {
         assert_eq!(BakeStage::default(), BakeStage::Edits);
+    }
+
+    #[test]
+    fn single_export_default_remains_display_adjust() {
+        assert_eq!(
+            crate::settings::Settings::default().bake_stage_export,
+            BakeStage::DisplayAdjust
+        );
     }
 
     /// 設定へ保存する値なので、綴りが変わると読めなくなる。意図として固定する。

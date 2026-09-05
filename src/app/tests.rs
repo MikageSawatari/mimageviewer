@@ -7,6 +7,147 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[test]
+fn collect_image_indices_builds_the_still_list_once_for_repeated_calls() {
+    let mut app = setup_app_for_test();
+    app.items = vec![
+        GridItem::Image(PathBuf::new()),
+        GridItem::Video(PathBuf::new()),
+        GridItem::Image(PathBuf::new()),
+    ];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.viewer_navigation_caches.invalidate();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        1
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    let added = app.push_grid_item_pending(GridItem::Image(PathBuf::new()));
+    app.visible_indices.push(added);
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 1]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_items_generation_change() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    let next_generation = app.items_generation.wrapping_add(1);
+    app.set_items_generation(next_generation);
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_filter_change() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3).map(|_| GridItem::Image(PathBuf::new())).collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.search_filter = Some(std::collections::HashSet::from([0, 2]));
+    app.rebuild_visible_indices();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_details_order_change() {
+    let mut app = setup_app_for_test();
+    app.items = ['b', 'a', 'c']
+        .into_iter()
+        .map(|name| GridItem::Image(PathBuf::from(name.to_string())))
+        .collect();
+    app.visible_indices = (0..app.items.len()).collect();
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+    app.settings.details_sort_ascending = true;
+    app.rebuild_details_order();
+    assert_eq!(app.collect_image_indices().as_ref(), &[1, 0, 2]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+fn navigation_cache_rebuilds_after_continuous_reading_toggle() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    let _ = app.collect_image_indices();
+    app.reading_flow = crate::settings::ReadingFlow::Vertical;
+    let _ = app.collect_image_indices();
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn navigation_cache_is_owned_by_each_viewer_context() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::new())];
+    app.visible_indices = vec![0];
+
+    crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        detached.visible_indices = (0..detached.items.len()).collect();
+        detached.bump_items_generation();
+        assert_eq!(detached.collect_image_indices().as_ref(), &[0, 2]);
+    });
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+    assert_eq!(app.collect_image_indices().as_ref(), &[0]);
+    assert_eq!(
+        crate::ui_helpers::still_image_display_indices_build_count_for_test(),
+        2
+    );
+}
+
 #[cfg(windows)]
 fn test_detached_host_lease(
     window_id: u64,
@@ -1075,7 +1216,7 @@ fn spread_display_units_are_built_once_for_repeated_pair_resolution() {
         .collect();
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
-    app.cached_nav_indices = None;
+    app.viewer_navigation_caches.invalidate();
     app.spread_mode = crate::settings::SpreadMode::Ltr;
 
     crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -1266,7 +1407,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
         .collect();
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
-    app.cached_nav_indices = None;
+    app.viewer_navigation_caches.invalidate();
     app.spread_mode = crate::settings::SpreadMode::Ltr;
     let main_nav = (0..app.items.len()).collect::<Vec<_>>();
 
@@ -1282,7 +1423,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
             .collect();
         detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
         detached.visible_indices = (0..detached.items.len()).collect();
-        detached.cached_nav_indices = None;
+        detached.viewer_navigation_caches.invalidate();
         detached.spread_mode = crate::settings::SpreadMode::LtrCover;
         assert_eq!(
             detached.spread_display_unit_pages_for_test(&[0, 1, 2]),
@@ -2662,26 +2803,162 @@ fn pre_grid_perf_timer_does_not_read_clock_when_disabled() {
 }
 
 #[test]
-fn update_perf_timer_does_not_read_clock_when_disabled() {
+fn update_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
     let clock_called = Cell::new(false);
-    let mut recorder = update_perf_start_with(false, || {
-        clock_called.set(true);
-        std::time::Instant::now()
-    });
+    let cycles_called = Cell::new(false);
+    let mut recorder = update_perf_start_with(
+        false,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || {
+            cycles_called.set(true);
+            1
+        },
+    );
     for stage in UpdatePerfStage::ALL {
         mark_update_perf(&mut recorder, stage);
     }
+    finish_update_perf(&mut recorder, 0);
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn update_perf_cycle_event_fields_pair_with_wall_clock_fields() {
+    let cycle_fields = UpdatePerfBreakdown::EVENT_FIELDS.map(|(field, _)| {
+        format!(
+            "{}_cycles",
+            field
+                .strip_suffix("_ms")
+                .expect("wall-clock field must end in _ms")
+        )
+    });
+
+    assert_eq!(cycle_fields.len(), UPDATE_PERF_STAGE_COUNT);
+    assert!(cycle_fields.iter().all(|field| field.ends_with("_cycles")));
+}
+
+#[test]
+fn update_perf_stages_plus_unaccounted_equal_total() {
+    let started_at = std::time::Instant::now();
+    let started_cycles = 1_000;
+    let mut recorder = UpdatePerfRecorder::new(started_at, started_cycles);
+    let mut elapsed = std::time::Duration::ZERO;
+    let mut cycles = started_cycles;
+    for (index, stage) in UpdatePerfStage::ALL.into_iter().enumerate() {
+        elapsed += std::time::Duration::from_millis(index as u64 + 1);
+        cycles += (index as u64 + 1) * 100;
+        recorder.mark_at(stage, started_at + elapsed, cycles);
+    }
+    let expected_unaccounted = std::time::Duration::from_millis(7);
+    let expected_unaccounted_cycles = 700;
+    let breakdown = recorder.finish_at(
+        started_at + elapsed + expected_unaccounted,
+        cycles + expected_unaccounted_cycles,
+    );
+    let accounted_ms = breakdown.stage_ms.iter().sum::<f64>();
+    let accounted_cycles = breakdown.stage_cycles.iter().sum::<u64>();
+
+    assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
+    assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+    assert_eq!(breakdown.unaccounted_cycles, expected_unaccounted_cycles);
+    assert_eq!(
+        accounted_cycles + breakdown.unaccounted_cycles,
+        breakdown.total_cycles
+    );
+}
+
+#[test]
+fn poll_prefetch_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder = poll_prefetch_perf_start_with(false, PollPrefetchOrigin::TopLevel, || {
+        clock_called.set(true);
+        std::time::Instant::now()
+    });
+    for stage in PollPrefetchPerfStage::ALL {
+        mark_poll_prefetch_perf(&mut recorder, stage);
+    }
+    finish_poll_prefetch_perf(&mut recorder, 0, 0);
 
     assert!(recorder.is_none());
     assert!(!clock_called.get());
 }
 
 #[test]
-fn update_perf_stages_plus_unaccounted_equal_total() {
+fn passthrough_rendition_perf_timer_does_not_read_clock_or_cycles_when_disabled() {
+    let clock_called = Cell::new(false);
+    let cycles_called = Cell::new(false);
+    let mut recorder: Option<PassthroughRenditionPerfRecorder> = None;
+    for span in [
+        PassthroughRenditionPerfSpan::SourceLookup,
+        PassthroughRenditionPerfSpan::CacheLookup,
+        PassthroughRenditionPerfSpan::BuildPixels,
+        PassthroughRenditionPerfSpan::LoadTexture,
+        PassthroughRenditionPerfSpan::CacheInsert,
+    ] {
+        let started_at = start_passthrough_rendition_perf_span_with(
+            recorder.as_ref(),
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+        finish_passthrough_rendition_perf_span_with(
+            recorder.as_mut(),
+            span,
+            started_at,
+            || {
+                clock_called.set(true);
+                std::time::Instant::now()
+            },
+            || {
+                cycles_called.set(true);
+                1
+            },
+        );
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+    assert!(!cycles_called.get());
+}
+
+#[test]
+fn passthrough_rendition_perf_spans_plus_remainder_equal_total_cycles() {
+    let mut recorder = PassthroughRenditionPerfRecorder::default();
+    for (span, cycles) in [
+        (PassthroughRenditionPerfSpan::SourceLookup, 11),
+        (PassthroughRenditionPerfSpan::CacheLookup, 13),
+        (PassthroughRenditionPerfSpan::BuildPixels, 17),
+        (PassthroughRenditionPerfSpan::LoadTexture, 19),
+        (PassthroughRenditionPerfSpan::CacheInsert, 23),
+    ] {
+        recorder.add(span, std::time::Duration::ZERO, cycles);
+    }
+    let total_cycles = 100;
+    let remainder_cycles = recorder.remainder_cycles(total_cycles);
+
+    assert_eq!(recorder.categorized_cycles(), 83);
+    assert_eq!(
+        recorder.categorized_cycles() + remainder_cycles,
+        total_cycles
+    );
+}
+
+#[test]
+fn poll_prefetch_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
-    let mut recorder = UpdatePerfRecorder::new(started_at);
+    let mut recorder = PollPrefetchPerfRecorder::new(PollPrefetchOrigin::TopLevel, started_at);
     let mut elapsed = std::time::Duration::ZERO;
-    for (index, stage) in UpdatePerfStage::ALL.into_iter().enumerate() {
+    for (index, stage) in PollPrefetchPerfStage::ALL.into_iter().enumerate() {
         elapsed += std::time::Duration::from_millis(index as u64 + 1);
         recorder.mark_at(stage, started_at + elapsed);
     }
@@ -2691,6 +2968,58 @@ fn update_perf_stages_plus_unaccounted_equal_total() {
 
     assert!((breakdown.unaccounted_ms - 7.0).abs() < f64::EPSILON);
     assert!((accounted_ms + breakdown.unaccounted_ms - breakdown.total_ms).abs() < f64::EPSILON);
+}
+
+#[test]
+fn nav_helper_perf_does_not_read_clock_outside_an_enabled_ui_frame() {
+    begin_nav_helper_perf_frame(false);
+    let clock_called = Cell::new(false);
+    let result = measure_nav_helper_with(
+        NavHelperPerfKind::StillImageDisplayIndices,
+        || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        },
+        || 42,
+    );
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(result, 42);
+    assert!(!clock_called.get());
+    assert_eq!(metrics, NavHelperPerfMetrics::default());
+}
+
+#[test]
+fn nav_helper_perf_accumulates_calls_and_time_then_resets_at_frame_boundary() {
+    let started_at = std::time::Instant::now();
+    let clock_values = [
+        started_at,
+        started_at + std::time::Duration::from_millis(2),
+        started_at + std::time::Duration::from_millis(3),
+        started_at + std::time::Duration::from_millis(8),
+    ];
+    let clock_index = Cell::new(0usize);
+    let now = || {
+        let index = clock_index.get();
+        clock_index.set(index + 1);
+        clock_values[index]
+    };
+
+    begin_nav_helper_perf_frame(true);
+    measure_nav_helper_with(NavHelperPerfKind::StillImageDisplayIndices, now, || ());
+    measure_nav_helper_with(NavHelperPerfKind::GetNavIndices, now, || ());
+    let metrics = finish_nav_helper_perf_frame();
+
+    assert_eq!(metrics.still_image_display_indices_calls, 1);
+    assert!((metrics.still_image_display_indices_ms - 2.0).abs() < f64::EPSILON);
+    assert_eq!(metrics.get_nav_indices_calls, 1);
+    assert!((metrics.get_nav_indices_ms - 5.0).abs() < f64::EPSILON);
+
+    begin_nav_helper_perf_frame(true);
+    assert_eq!(
+        finish_nav_helper_perf_frame(),
+        NavHelperPerfMetrics::default()
+    );
 }
 
 #[test]
@@ -4075,14 +4404,16 @@ fn fullscreen_pdf_interrupted_render_is_cancel_like() {
 }
 
 #[test]
-fn scan_directory_can_ignore_convertible_archives() {
+fn folder_scan_can_ignore_convertible_archives() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
     std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false).unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
@@ -4092,6 +4423,91 @@ fn scan_directory_can_ignore_convertible_archives() {
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
     );
+    assert_eq!(
+        scan.omitted.ignored_archive, 3,
+        "RAR / 7z / LZH は設定で無視した書庫として数える"
+    );
+    assert_eq!(
+        scan.omitted.unsupported, 0,
+        "設定で無視した書庫を対象外へ二重計上しない"
+    );
+    assert_eq!(
+        scan.omitted.primary_count(),
+        3,
+        "旧 unsupported 3 件だった主数字を維持する"
+    );
+}
+
+#[test]
+fn folder_scan_lists_convertible_archives_for_ask_and_convert() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
+    std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
+    std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
+
+    for handling in [
+        crate::settings::ArchiveFileHandling::Ask,
+        crate::settings::ArchiveFileHandling::Convert,
+    ] {
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(handling);
+        let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+        let archive_count = scan
+            .folders
+            .iter()
+            .filter(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. }))
+            .count();
+
+        assert_eq!(
+            archive_count, 3,
+            "{handling:?} では変換対象書庫を一覧へ出す"
+        );
+        assert_eq!(
+            scan.omitted,
+            crate::app::folder_scan::OmittedFolderEntryCounts::default(),
+            "{handling:?} では内訳を増やさない"
+        );
+    }
+}
+
+#[test]
+fn folder_scan_keeps_unsupported_files_out_of_ignored_archive_bucket() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), b"text").unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.unsupported, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.primary_count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn folder_scan_classifies_hidden_archive_before_ignore_setting() {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let tmp = TempDir::new().expect("tempdir");
+    let mut archive = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN)
+        .open(tmp.path().join("hidden.rar"))
+        .unwrap();
+    archive.write_all(b"rar").unwrap();
+    drop(archive);
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.hidden, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.unsupported, 0);
 }
 
 #[test]
@@ -5557,6 +5973,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
         same_name: 3,
         hidden: 2,
+        ignored_archive: 4,
         unsupported: 5,
         system: 1,
     };
@@ -7803,6 +8220,53 @@ mod animated_playback_only_pipeline_tests {
             !app.final_composite_cache
                 .iter()
                 .any(|(key, _)| key.edit_key.idx == 0)
+        );
+    }
+
+    #[test]
+    fn ctrl_e_rejects_animated_images_instead_of_exporting_the_first_frame() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.items
+            .push(crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "c:/p/animated.gif",
+            )));
+        app.visible_indices = vec![0];
+        app.thumbnails
+            .push(crate::grid_item::ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+
+        let frame0 = egui::ColorImage::filled([2, 1], egui::Color32::RED);
+        let frame1 = egui::ColorImage::filled([2, 1], egui::Color32::GREEN);
+        let tex0 = ctx.load_texture(
+            "export_animation_frame_0",
+            frame0.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let tex1 = ctx.load_texture(
+            "export_animation_frame_1",
+            frame1.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Animated {
+                frames: vec![(tex0, 0.1), (tex1, 0.1)],
+                frame_pixels: vec![Arc::new(frame0), Arc::new(frame1)],
+                current_frame: 1,
+                playback: crate::fs_animation::AnimationPlayback::Paused,
+                load_seq: 0,
+            },
+        );
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        assert!(app.export_dialog.is_none());
+        assert_eq!(
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(message, _, _)| message.as_str()),
+            Some("アニメーション画像はエクスポートできません")
         );
     }
 }
@@ -15364,6 +15828,26 @@ mod favorite_adjustment_defaults_tests {
         app.items.len() - 1
     }
 
+    fn insert_export_static_source(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        size: [usize; 2],
+        label: &str,
+    ) {
+        let pixels = egui::ColorImage::filled(size, egui::Color32::WHITE);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some(size),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+
     fn mask_2x2() -> Vec<bool> {
         vec![true, false, false, true]
     }
@@ -18932,7 +19416,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
@@ -18959,7 +19443,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.reading_flow = ReadingFlow::Vertical;
         app.fullscreen_idx = Some(0);
 
@@ -19190,7 +19674,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
@@ -19210,7 +19694,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 3];
         app.visible_indices = vec![0, 1, 2];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         for idx in 0..3 {
@@ -19230,7 +19714,7 @@ mod favorite_adjustment_defaults_tests {
         ]);
         app.thumbnails = vec![ThumbnailState::Pending; 2];
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
 
         let expected = SpreadPair::Double { left: 0, right: 1 };
@@ -19275,7 +19759,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-resync-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
         crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -19338,7 +19822,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("spread-nav-{k}"), dims));
         }
         app.visible_indices = (0..7).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
 
         app.fullscreen_idx = Some(4);
@@ -19459,7 +19943,7 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         app.visible_indices = (0..4).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19563,7 +20047,7 @@ mod favorite_adjustment_defaults_tests {
                 .push(loaded_thumb(&ctx, &format!("split-nav-{k}"), dims));
         }
         app.visible_indices = (0..3).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
 
         crate::ui_fullscreen::reset_spread_display_units_build_count_for_test();
@@ -19661,7 +20145,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitRtl;
 
         app.fullscreen_idx = Some(0);
@@ -19714,7 +20198,7 @@ mod favorite_adjustment_defaults_tests {
             });
         }
         app.visible_indices = (0..2).collect();
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::SplitLtr;
         app.fullscreen_idx = Some(0);
         app.fullscreen_page_slice = PageSlice::Left;
@@ -19750,7 +20234,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..4).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
 
             app.fullscreen_idx = Some(2);
@@ -19806,7 +20290,7 @@ mod favorite_adjustment_defaults_tests {
                 app.thumbnails.push(ThumbnailState::Pending);
             }
             app.visible_indices = (0..5).collect();
-            app.cached_nav_indices = None;
+            app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
             app.spread_shift_anchor_idx = anchor;
             app.fullscreen_idx = Some(final_unit_start);
@@ -19855,7 +20339,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -19907,7 +20391,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3, 4, 5];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover;
         app.fullscreen_idx = Some(3);
 
@@ -19973,7 +20457,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::LtrCover; // pair_start=1 で [1,2] を表示中
         app.fullscreen_idx = Some(1);
         assert_eq!(
@@ -20007,7 +20491,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1, 2, 3];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Rtl;
         app.fullscreen_idx = Some(0);
         assert_eq!(
@@ -20042,7 +20526,7 @@ mod favorite_adjustment_defaults_tests {
             app.thumbnails.push(ThumbnailState::Pending);
         }
         app.visible_indices = vec![0, 1];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
 
@@ -25402,9 +25886,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.export_crop_mode);
     }
 
-    /// 見開き表示中の Ctrl+E は左右ページを 1 つの export snapshot として開く。
+    /// 見開き表示中の Ctrl+E は左右ページを 1 つの worker 合成要求として開く。
     #[test]
-    fn open_export_dialog_uses_spread_pixels_when_spread_is_visible() {
+    fn open_export_dialog_uses_spread_sources_when_spread_is_visible() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
         let ctx = egui::Context::default();
@@ -25462,15 +25946,23 @@ mod favorite_adjustment_defaults_tests {
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other("spread".to_string())
         );
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.size, [1, 2]);
-                assert_eq!(right.base_pixels.size, [1, 2]);
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert_eq!(left.predicted_size, [1, 2]);
+                assert_eq!(right.predicted_size, [1, 2]);
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("spread export should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("spread export should prepare both page sources")
             }
         }
 
@@ -25484,15 +25976,307 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("right-page entry should still snapshot the visible spread")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("right-page entry should still prepare the visible spread")
             }
         }
+    }
+
+    #[test]
+    fn export_dialog_plans_current_and_all_four_conceal_presets_from_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("conceal-presets.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        insert_export_static_source(&mut app, &ctx, idx, [4, 4], "export_conceal_presets");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let mut bitmap = vec![false; 16];
+        bitmap[5] = true;
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &bitmap, &[], 4, 4)
+            .expect("save conceal mask");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+        app.settings.conceal_presets = std::array::from_fn(|slot| {
+            Some(crate::conceal::ConcealPreset {
+                name: format!("preset {}", slot + 1),
+                ..Default::default()
+            })
+        });
+        app.settings.export_batch_selection = [true; 5];
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(state.has_conceal_mask);
+        match &state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+        assert_eq!(state.selection, [true; 5]);
+        let entries = crate::export_dialog::plan_export_entries(
+            &state.sns_split_frames,
+            state.sns_split_source_size,
+            &state.selection,
+            state.has_conceal_mask,
+            &app.settings.conceal_presets,
+        )
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn export_dialog_ignores_shapes_that_cover_no_pixel_after_mask_resize() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("outside-conceal-shape.png");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        // 保存時 4x4 の図形を 8x8 の source へ拡大しても、画像外のままで 1 px も塗られない。
+        insert_export_static_source(&mut app, &ctx, idx, [8, 8], "export_empty_conceal_shape");
+
+        let key = app.page_path_key(idx).expect("page path key");
+        let shape = crate::mask_db::Shape::Rect {
+            op: crate::mask_db::ShapeOp::Add,
+            center: (100.0, 100.0),
+            half_w: 1.0,
+            half_h: 1.0,
+            rotation_rad: 0.0,
+        };
+        app.conceal_db
+            .as_ref()
+            .expect("conceal db")
+            .set(&key, &[false; 16], &[shape], 4, 4)
+            .expect("save conceal shape");
+        app.conceal_page_keys.insert(key);
+        app.conceal_pages.insert(idx);
+
+        app.open_export_dialog_for_current(&ctx, idx);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(!state.has_conceal_mask);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Single(page) => {
+                assert!(!page.has_conceal_mask);
+            }
+            crate::export_dialog::ExportComposite::Spread { .. } => {
+                panic!("single page export should not prepare a spread")
+            }
+        }
+    }
+
+    #[test]
+    fn close_fullscreen_keeps_running_export_and_closes_prestart_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let source = app.tmp.path().join("export-source.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([40, 80, 120, 255]))
+            .save(&source)
+            .expect("write export source");
+        let idx = push_image(&mut app, source.to_str().unwrap());
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        insert_export_static_source(&mut app, &ctx, idx, [2, 1], "running_export_source");
+        app.open_export_dialog_for_current(&ctx, idx);
+        assert!(
+            app.export_dialog.is_some(),
+            "pre-start dialog should be open"
+        );
+
+        // 2 件目の合成を止め、worker が _0 を保存した後に fullscreen teardown が
+        // 割り込む状況を決定的に作る。worker が所有する source / snapshot だけで
+        // 残り 4 件まで継続できることを App の close 経路と一緒に固定する。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = std::sync::Arc::clone(&calls);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut edits = crate::books::BakedEditSnapshot {
+            params: crate::adjustment::AdjustParams::default(),
+            rotation: crate::rotation_db::Rotation::None,
+            conceal: None,
+            erase: None,
+            local_adjust: None,
+            comic: None,
+            comic_source_dims: None,
+            export_crop: None,
+            crop_legacy_writeback: None,
+            format: crate::capture::CaptureFormat::Png,
+            jpeg_matte: crate::capture::JpegMatte::Black,
+            stage: crate::bake_stage::BakeStage::Ai,
+            creative_lut: None,
+            ai: None,
+        };
+        edits.params.upscale_model = Some("test-upscale".to_string());
+        edits.ai = Some(crate::books::BookAiSnapshot {
+            run: Box::new(move |image, _| {
+                if worker_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    entered_tx.send(()).expect("signal second entry");
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .expect("release second entry");
+                }
+                Ok(crate::books::BookAiResult {
+                    image: image.clone(),
+                    used_upscale: false,
+                })
+            }),
+        });
+        let entries = (0..5)
+            .map(|suffix| crate::export_dialog::ExportEntry {
+                label: format!("preset {suffix}"),
+                suffix,
+                conceal_preset: None,
+                crop_override: None,
+            })
+            .collect();
+        let pending =
+            crate::export_dialog::spawn_export_worker(crate::export_dialog::ExportRequest {
+                source: crate::export_dialog::ExportSource::File {
+                    path: source.clone(),
+                },
+                original_format: crate::save_with_metadata::SrcFormat::Png,
+                output_format: crate::export_dialog::ExportFormat::Png,
+                output_dir: app.tmp.path().to_path_buf(),
+                basename: "continued-export".to_string(),
+                composite: crate::export_dialog::ExportComposite::Single(
+                    crate::export_dialog::ExportPageComposite {
+                        source: crate::books::CompositeSource::File {
+                            path: source.clone(),
+                        },
+                        edits,
+                        pdf_render_long_edge: 4096,
+                        predicted_size: [2, 1],
+                        has_conceal_mask: false,
+                    },
+                ),
+                scale: crate::export_dialog::ExportScale::Full,
+                entries,
+                include_metadata: false,
+                local_ai_activity: None,
+            })
+            .expect("start export worker");
+        let cancel = std::sync::Arc::clone(&pending.cancel);
+        app.export_pending = Some(pending);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("worker should reach second entry after saving _0");
+        assert!(app.tmp.path().join("continued-export_0.png").exists());
+
+        app.close_fullscreen();
+
+        assert!(app.export_dialog.is_none(), "pre-start dialog must close");
+        assert!(
+            app.export_pending.is_some(),
+            "running export must remain owned"
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            app.main_window_should_draw_export_dialogs(),
+            "the main window must take over progress and cancel controls"
+        );
+        release_tx.send(()).expect("resume export worker");
+
+        let mut completed = 0;
+        loop {
+            let event = app
+                .export_pending
+                .as_ref()
+                .expect("running export should remain")
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("worker event");
+            match event {
+                crate::export_dialog::ExportEvent::Completed(_) => completed += 1,
+                crate::export_dialog::ExportEvent::Cancelled => {
+                    panic!("fullscreen teardown must not cancel the export")
+                }
+                crate::export_dialog::ExportEvent::AllDone => break,
+                crate::export_dialog::ExportEvent::Started { .. }
+                | crate::export_dialog::ExportEvent::Failed(_) => {}
+            }
+        }
+        assert_eq!(completed, 5);
+        for suffix in 0..5 {
+            assert!(
+                app.tmp
+                    .path()
+                    .join(format!("continued-export_{suffix}.png"))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_export_refresh_is_consumed_after_returning_to_grid() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("images");
+        std::fs::create_dir_all(&folder).expect("create image folder");
+        app.settings.book_root = Some(app.tmp.path().join("books"));
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        let output = folder.join("finished_0.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&output)
+            .expect("write completed export");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.export_pending = Some(crate::export_dialog::ExportPending {
+            cancel,
+            rx,
+            total: 1,
+            done: 0,
+            last_message: "準備中".to_string(),
+            successes: Vec::new(),
+            errors: Vec::new(),
+            finished: false,
+            cancel_requested: false,
+        });
+        tx.send(crate::export_dialog::ExportEvent::Completed(
+            crate::export_dialog::ExportSuccess {
+                label: "current".to_string(),
+                path: output.clone(),
+            },
+        ))
+        .unwrap();
+        tx.send(crate::export_dialog::ExportEvent::AllDone).unwrap();
+
+        app.poll_export_pending(&ctx);
+
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        app.consume_folder_refresh_pending();
+        assert!(app.folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(|item| {
+            matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
+        }));
     }
 
     /// GitHub issue #1 (app 配線): native は AI 範囲内なのに 4096px レンダで現行が native
@@ -25776,7 +26560,7 @@ mod favorite_adjustment_defaults_tests {
             layout_dims: None,
         };
         app.visible_indices = vec![first, second];
-        app.cached_nav_indices = None;
+        app.viewer_navigation_caches.invalidate();
 
         for (mode, expected_indices, expected_textures) in [
             (
@@ -25983,13 +26767,21 @@ mod favorite_adjustment_defaults_tests {
             state.source,
             crate::export_dialog::ExportSource::RenderedSpread
         ));
-        match state.pixels {
-            crate::export_dialog::ExportPixels::Spread { left, right } => {
-                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
-                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+        match state.composite {
+            crate::export_dialog::ExportComposite::Spread { left, right } => {
+                assert!(matches!(
+                    left.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/a.jpg")
+                ));
+                assert!(matches!(
+                    right.source,
+                    crate::books::CompositeSource::File { ref path }
+                        if path == std::path::Path::new("c:/p/b.jpg")
+                ));
             }
-            crate::export_dialog::ExportPixels::Single(_) => {
-                panic!("visible spread layout should snapshot both pages")
+            crate::export_dialog::ExportComposite::Single(_) => {
+                panic!("visible spread layout should prepare both page sources")
             }
         }
     }
@@ -30740,7 +31532,7 @@ mod pipeline_cache_refactor_tests {
             FsLoadPurpose::for_page(true),
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_holdover_tex
@@ -34428,7 +35220,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [2, 2],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert_eq!(
             app.fs_page_load_state(idx),
@@ -35061,7 +35853,7 @@ mod pipeline_cache_refactor_tests {
         let source =
             std::fs::read_to_string(manifest_dir.join("src/app.rs")).expect("read app.rs as UTF-8");
         let body = source
-            .split_once("pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {")
+            .split_once("pub(crate) fn poll_prefetch(")
             .expect("poll_prefetch start")
             .1
             .split_once("    fn update_reading_history_media_progress(")
@@ -35249,7 +36041,7 @@ mod pipeline_cache_refactor_tests {
                 started_at,
             },
         ));
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(app.fs_upload_backlog.is_empty());
         assert!(matches!(
@@ -35285,7 +36077,7 @@ mod pipeline_cache_refactor_tests {
             },
         ));
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(matches!(
             app.fs_cache.get(&idx),
@@ -35347,7 +36139,7 @@ mod pipeline_cache_refactor_tests {
         tx.send(FsLoadResult::AnimationExpansionStarted { started_at })
             .unwrap();
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(
             app.fs_pending.contains_key(&idx),
@@ -35426,7 +36218,7 @@ mod pipeline_cache_refactor_tests {
         })
         .unwrap();
 
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(app.fs_pending.contains_key(&old));
         assert!(
@@ -35516,7 +36308,7 @@ mod pipeline_cache_refactor_tests {
             source_dims: [4, 4],
         })
         .unwrap();
-        app.poll_prefetch(&ctx);
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
 
         assert!(
             app.ensure_final_composite_texture(&ctx, left).is_some(),
@@ -35949,10 +36741,83 @@ mod pipeline_cache_refactor_tests {
         phase_c_support::wait_for_external_rescan(&mut app);
 
         assert!(
+            app.folder_refresh_pending.is_none(),
+            "grid-visible rescans must still apply immediately"
+        );
+        assert!(
             app.items
                 .iter()
                 .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("b.png"))),
             "worker の結果で差し替わる"
+        );
+    }
+
+    /// 監視由来の再走査も、Ctrl+E 完了と同じ folder refresh pending を使う。
+    /// viewer を閉じる load は走らせず、一覧へ戻って consumer が動くまで mtime / signature
+    /// と一覧を古いまま保つ。consumer はその時点のディスクを 1 回だけ読み直す。
+    #[test]
+    fn a_watch_rescan_during_main_viewer_is_deferred_and_consumed_once_after_close() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("viewer_deferred_rescan");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .save(&first_image)
+            .unwrap();
+        let initial_mtime = std::time::SystemTime::UNIX_EPOCH;
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(initial_mtime);
+        app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.items = vec![GridItem::Image(first_image)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(app.viewer_session_blocks_main_window());
+
+        let added_image = folder.join("b.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([40, 50, 60, 255]))
+            .save(&added_image)
+            .unwrap();
+        app.check_external_folder_changes(&ctx, crate::app::ExternalChangeCheck::Notified);
+        phase_c_support::wait_for_external_rescan(&mut app);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "rescan must not close the viewer"
+        );
+        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        assert_eq!(
+            app.current_folder_last_mtime,
+            Some(initial_mtime),
+            "deferred scan must not acknowledge the mtime before reload"
+        );
+        assert!(
+            !app.items.iter().any(
+                |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+            ),
+            "the grid intentionally remains stale while the viewer is open"
+        );
+
+        app.close_fullscreen();
+        assert!(!app.viewer_session_blocks_main_window());
+        app.consume_folder_refresh_pending();
+
+        assert!(app.folder_refresh_pending.is_none());
+        assert!(app.items.iter().any(
+            |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
+        ));
+        assert_ne!(app.current_folder_last_mtime, Some(initial_mtime));
+        let generation_after_reload = app.items_generation;
+
+        app.consume_folder_refresh_pending();
+        assert_eq!(
+            app.items_generation, generation_after_reload,
+            "an empty pending slot must not reload the folder a second time"
         );
     }
 
@@ -55635,7 +56500,7 @@ mod still_window_mode_key_tests {
         app.spread_shift_anchor_idx = Some(excluded);
         app.fs_zoom_pdf_rerender_idx = Some(video);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
-        app.cached_nav_indices = Some(vec![before, video, last]);
+        let _ = app.collect_image_indices();
         app.fs_vertical_cache_keep_set.insert(video);
         app.fs_context_menu_idx = Some(video);
         app.adjust_scope_selection_idx = Some(video);
@@ -55655,7 +56520,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.spread_shift_anchor_idx, None);
         assert_eq!(app.fs_zoom_pdf_rerender_idx, Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
-        assert!(app.cached_nav_indices.is_none());
+        assert!(!app.viewer_navigation_caches.has_entries_for_test());
         assert!(app.fs_vertical_cache_keep_set.is_empty());
         assert!(app.fs_context_menu_idx.is_none());
         assert!(app.adjust_scope_selection_idx.is_none());
@@ -58899,11 +59764,11 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_keep_delete_targets_real_only() {
+    fn checked_file_operation_paths_include_real_files_and_folders_only() {
         let mut app = setup_app();
 
-        // collect_checked_paths は Shell メニュー用の従来 helper なのでフォルダを除外する。
-        // 削除ターゲット helper は Del キーと同じく実フォルダも受け付ける。
+        // Shell クリップボードと削除が共有する正本 helper は、実ファイルと
+        // Space でチェック可能な実フォルダを含み、仮想ページだけを除外する。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -58942,19 +59807,6 @@ mod file_operation_selection_tests {
             app.checked.insert(idx);
         }
 
-        let mut paths = app.collect_checked_paths();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(r"C:\books\a.7z"),
-                PathBuf::from(r"C:\books\a.jpg"),
-                PathBuf::from(r"C:\books\a.mp4"),
-                PathBuf::from(r"C:\books\a.pdf"),
-                PathBuf::from(r"C:\books\a.zip"),
-            ]
-        );
-
         let targets = app.collect_checked_indexed_paths();
         assert_eq!(
             targets,
@@ -58966,7 +59818,7 @@ mod file_operation_selection_tests {
                 (image, PathBuf::from(r"C:\books\a.jpg")),
                 (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and include real folders while excluding virtual pages",
+            "shared targets are sorted by descending index and include real folders while excluding virtual pages",
         );
     }
 
@@ -59082,6 +59934,42 @@ mod file_operation_selection_tests {
             ))),
             "a selected virtual item should produce the same visible rejection path",
         );
+    }
+
+    #[test]
+    fn shell_clipboard_semantic_copy_event_respects_keymap_unbinding() {
+        let mut app = setup_app();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        app.selected = Some(image);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCopyFiles = none\nGridCutFiles = none\n",
+        );
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
+        );
+
+        app.keymap = crate::keymap::Keymap::from_ini_str("");
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast
+                .0
+                .contains("OSクリップボード操作を開始できませんでした")
+        }));
     }
 
     #[test]

@@ -1498,6 +1498,12 @@ token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`land
 **nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
 ページ読みと連結読みの列切替を混同しない。
 
+nav index 列自体は `ViewerNavigationCaches` が `Arc<Vec<usize>>` で保持する。動画を含む
+ページ単位列、動画を除く連結読み・先読み列、seek 情報の 3 つを 1 owner にまとめ、
+表示集合 / 詳細 sort / snapshot の index 空間変更では `invalidate` 1 回で同時に破棄する。
+items 世代と連結方式は owner の source key でも照合する。owner は
+`ViewerContextBundle` と一緒に交換し、main / detached 間で共有しない。
+
 未知寸法は従来どおり縦長と同じ `false` に分類する。`fs_cache`、thumbnail の source / layout 寸法、
 `page_dims_cache` への記録で cached nav 上の実効的な横長性が反転した場合だけ
 `landscape_epoch` を進める。したがって未知→縦長では再構築せず、未知 / 縦長→横長では
@@ -2267,21 +2273,18 @@ upload だけを速くすることではない。
 通常表示では範囲外を暗転するだけで、capture / export の最終段で初めて切り出す。
 そのためアップスケール ON/OFF や補正スライダー変更で編集マスクの解像度は変わらない。
 
-製本追加は表示 cache を読まず、UI thread で固定した `BakedEditSnapshot` を book worker の
-headless compositor が復元する。順序は raw → erase → local_adjust → conceal → adjustment →
-comic → rotation → export crop。表示専用の global AI upscale / denoise / smart sharpen /
-colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fullscreen / stack の
-どこから追加しても原寸の edit composite になる。編集が 1 つも無い File / ZIP entry は
+製本、単枚 / 一括 Ctrl+E、外部ツールは表示 cache を完成画素の入力にせず、
+`CompositeSource` と `BakedEditSnapshot` から worker の headless compositor が復元する。
+順序は raw → erase → local_adjust → conceal → adjustment → AI → smart sharpen → colorize →
+Creative LUT → post-filter → comic → rotation → export crop。各機能の `BakeStage` はこの順序を
+変えず、どこまで進むかだけを決める。製本で編集が 1 つも無い File / ZIP entry は従来どおり
 この経路へ入れず byte copy を維持する。
 
-Ctrl+E の隠蔽プリセット出力 (`_1`〜`_4`) は逆に、表示専用段を **落とさない**。`_0` は
-表示スナップショット (= 上の 12 段を通った final composite + 注釈) をそのまま書き出し、
-`_1`〜`_4` は 4 (隠蔽) の入力まで戻って隠蔽のパラメータだけを差し替え、そこから先を同じ順で
-流し直す (`export_dialog::compose_conceal_variant`)。final AI も掛け直すので、プリセット
-1 枚につき推論が 1 回走る。段を落とすと `_0` と `_1`〜`_4` が別物 (AI 拡大の有無で寸法まで
-違う) になるため、製本の「表示専用段を飛ばす」規則をここへ持ち込まない。逆に、隠蔽が
-焼き込み済みの final composite へマスクを重ねると隠蔽が二重に掛かる。v1.1.0 はこれを
-避けるために `conceal_mask: None` を固定し、結果としてプリセット出力ごと無効化していた。
+Ctrl+E の隠蔽プリセット出力 (`_1`〜`_4`) も、`_0` と同じ source・編集 snapshot・選択段を
+`books::compose_export_entry` へ渡す。`_0` は override を付けず snapshot の現在の隠蔽 preset を
+1 回だけ適用し、`_1`〜`_4` はその preset だけを差し替える。隠蔽以外の入力と段は同一なので、
+AI を含む段では各エントリの合成中に AI も実行する。焼き込み済み画素へマスクを重ねないため、
+隠蔽が二重に掛からない。
 
 ### 3.1 詳細
 

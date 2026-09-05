@@ -5,6 +5,22 @@
 //! integration tests share one compiled crate instead of compiling the same
 //! modules independently from both `main.rs` and `lib.rs`.
 
+/// Windows' process heap serialises large allocations behind one lock, and this app
+/// allocates from many threads at once: decode workers hand back megabyte buffers while
+/// the UI thread wants a few hundred kilobytes to draw the next page.
+///
+/// Measured on 2026-09-05, that lock was the page-turn hitch. Spans that allocated ran at
+/// 12% busy - time passing without cycles accruing - while the arithmetic between them,
+/// microseconds away on the same thread, ran at 98%. Removing one allocation from the
+/// hot path took its span from 12% to 96% busy, and the same signature then showed up in
+/// other spans that allocate, because the contention is the heap rather than any one
+/// caller.
+///
+/// mimalloc gives each thread its own arena, so the contention has nowhere to happen
+/// rather than being moved from one caller to the next.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;

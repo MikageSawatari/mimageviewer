@@ -233,6 +233,7 @@ pub enum BookPageSource {
     },
 }
 
+#[derive(Clone, Debug)]
 pub enum CompositeSource {
     File {
         path: PathBuf,
@@ -253,6 +254,20 @@ pub struct BookMaskSnapshot {
     pub bitmap: Vec<bool>,
     pub shapes: Vec<crate::mask_db::Shape>,
     pub size: [usize; 2],
+}
+
+/// bitmap と Shape を実際の保存寸法へ合成し、1 画素でも対象があるかを返す。
+///
+/// Shape の有無だけでは画像外や 0 面積の図形を「マスクあり」と誤判定する。Ctrl+E の
+/// 隠蔽プリセット可否は worker が実際に使うラスターマスクと同じ結果で決める。
+pub(crate) fn book_mask_has_covered_pixel(
+    snapshot: &BookMaskSnapshot,
+    target: [usize; 2],
+) -> Result<bool, String> {
+    let mut mask = resize_book_mask(snapshot, target)?;
+    let [width, height] = target;
+    crate::mask_db::rasterize_shapes_into(&mut mask.bitmap, &mask.shapes, width, height);
+    Ok(mask.bitmap.into_iter().any(|covered| covered))
 }
 
 pub struct BookEraseResult {
@@ -335,6 +350,60 @@ pub fn stage_requests_ai(
     stage.includes_ai()
         && (crate::ai::final_pipeline::effective_upscale_request(feature_mode, params).is_some()
             || crate::ai::final_pipeline::effective_denoise_request(feature_mode, params).is_some())
+}
+
+/// この source 寸法で AI 段が実際に選択対象になるか。
+///
+/// モデル選択そのものは画素内容にも依存するため worker に残すが、寸法予測では表示側と
+/// 同じ request / size-limit の述語を使う。アップスケールとデノイズはそれぞれ固有の
+/// 上限を持つので、どちらか一方でも対象なら表示合成寸法を採用する。
+pub fn stage_will_run_ai(
+    stage: crate::bake_stage::BakeStage,
+    params: &crate::adjustment::AdjustParams,
+    policy: BookAiPolicy,
+    source_dims: [usize; 2],
+) -> bool {
+    if !stage_requests_ai(stage, params, policy.feature_mode) {
+        return false;
+    }
+    let width = u32::try_from(source_dims[0]).unwrap_or(u32::MAX);
+    let height = u32::try_from(source_dims[1]).unwrap_or(u32::MAX);
+    let upscale = crate::ai::final_pipeline::effective_upscale_request(policy.feature_mode, params)
+        .is_some_and(|_| {
+            crate::ai::upscale::should_process_rect(width, height, policy.upscale_limit)
+        });
+    let denoise = crate::ai::final_pipeline::effective_denoise_request(policy.feature_mode, params)
+        .is_some_and(|_| {
+            crate::ai::upscale::should_process_rect(width, height, policy.denoise_limit)
+        });
+    upscale || denoise
+}
+
+/// headless compositor の幾何処理前に得られる寸法を予測する。
+/// AI が走らない経路は GPU 上限で縮めず、デコード元の寸法を保つ。
+pub fn predicted_composed_size(
+    source_dims: [usize; 2],
+    display_composite_dims: [usize; 2],
+    ai_will_run: bool,
+) -> [usize; 2] {
+    let size = if ai_will_run {
+        display_composite_dims
+    } else {
+        source_dims
+    };
+    [size[0].max(1), size[1].max(1)]
+}
+
+/// PDF の表示ラスタから、固定長辺で再レンダーされる寸法を予測する。
+pub fn predicted_pdf_render_size(source_dims: [usize; 2], long_edge: u32) -> [usize; 2] {
+    let width = source_dims[0].max(1);
+    let height = source_dims[1].max(1);
+    let current_long = width.max(height) as f64;
+    let scale = long_edge.max(1) as f64 / current_long;
+    [
+        (width as f64 * scale).round().max(1.0) as usize,
+        (height as f64 * scale).round().max(1.0) as usize,
+    ]
 }
 
 /// AI を通す気があるのに runtime を用意できなかったときの文面。
@@ -1265,13 +1334,12 @@ struct BookCompositeResult {
     used_diffusion_fallback: bool,
 }
 
-/// 表示の source 解像度 edit chain を headless に再構成する。
-/// global AI upscale / denoise だけを除外し、それ以外は Ctrl+E と同じ順で適用する。
+/// 表示の source 解像度 edit chain を、選択された段まで headless に再構成する。
 fn compose_book_page(
     image: egui::ColorImage,
     edits: &BakedEditSnapshot,
 ) -> Result<BookCompositeResult, String> {
-    compose_book_page_with_cancel(image, edits, Arc::new(AtomicBool::new(false)))
+    compose_book_page_with_cancel(image, edits, None, None, Arc::new(AtomicBool::new(false)))
 }
 
 /// Worker 側の外部ツール実体化用 headless 合成。
@@ -1280,7 +1348,44 @@ pub(crate) fn compose_book_page_for_materialization(
     edits: &BakedEditSnapshot,
     cancel: Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, String> {
-    Ok(compose_book_page_with_cancel(image, edits, cancel)?.image)
+    Ok(compose_book_page_with_cancel(image, edits, None, None, cancel)?.image)
+}
+
+/// Ctrl+E の 1 エントリぶんを、製本・一括書き出しと同じ順序で合成する。
+///
+/// `conceal_preset` はプリセット出力だけが指定する。`None` は snapshot の現在値を使う。
+/// `crop_override` は SNS 分割枠と作成時のラスタ寸法で、合成後・回転前の寸法へ換算する。
+pub(crate) fn compose_export_entry(
+    image: egui::ColorImage,
+    edits: &BakedEditSnapshot,
+    conceal_preset: Option<&crate::conceal::ConcealPreset>,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
+    cancel: Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
+    if !export_entry_requires_composite(edits, conceal_preset, crop_override) {
+        return Ok(image);
+    }
+    Ok(compose_book_page_with_cancel(image, edits, conceal_preset, crop_override, cancel)?.image)
+}
+
+fn export_entry_requires_composite(
+    edits: &BakedEditSnapshot,
+    conceal_preset: Option<&crate::conceal::ConcealPreset>,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
+) -> bool {
+    conceal_preset.is_some()
+        || crop_override.is_some()
+        || page_requires_full_composite(
+            &edits.params,
+            edits.rotation,
+            edits.conceal.is_some(),
+            edits.erase.is_some(),
+            edits.local_adjust.is_some(),
+            edits.comic.is_some(),
+            edits.export_crop.is_some(),
+            edits.stage,
+        )
 }
 
 /// 表示用補正の段。
@@ -1319,6 +1424,8 @@ fn apply_display_adjust(
 fn compose_book_page_with_cancel(
     mut image: egui::ColorImage,
     edits: &BakedEditSnapshot,
+    conceal_preset: Option<&crate::conceal::ConcealPreset>,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
     cancel: Arc<AtomicBool>,
 ) -> Result<BookCompositeResult, String> {
     ensure_materialization_not_cancelled(cancel.as_ref())?;
@@ -1372,7 +1479,7 @@ fn compose_book_page_with_cancel(
         image = crate::conceal_compose::compose_with_preset_cancel(
             &image,
             &mask.bitmap,
-            &conceal.preset,
+            conceal_preset.unwrap_or(&conceal.preset),
             cancel.as_ref(),
         )
         .ok_or_else(materialization_cancelled_error)?;
@@ -1426,7 +1533,14 @@ fn compose_book_page_with_cancel(
     }
 
     ensure_materialization_not_cancelled(cancel.as_ref())?;
-    let crop = edits.export_crop.map(|crop| {
+    let crop = if let Some((crop, source_size)) = crop_override {
+        Some(crop_after_rotation(
+            scale_export_crop_override(crop, source_size, image.size)?,
+            image.size,
+            edits.rotation,
+        ))
+    } else {
+        edits.export_crop.map(|crop| {
         let was_legacy = crop.valid_source_size().is_none();
         let resolved = crop.with_legacy_source_size(image.size);
         if was_legacy
@@ -1447,7 +1561,8 @@ fn compose_book_page_with_cancel(
         }
         let crop = resolved.scaled_to(image.size).rect;
         crop_after_rotation(crop, image.size, edits.rotation)
-    });
+        })
+    };
     if !edits.rotation.is_none() {
         image = crate::capture::rotate_color_image(&image, edits.rotation);
         ensure_materialization_not_cancelled(cancel.as_ref())?;
@@ -1563,6 +1678,95 @@ fn crop_after_rotation(
             max_x: crop.max_y,
             max_y: width - crop.min_x,
         },
+    }
+}
+
+pub fn scale_export_crop_override(
+    crop: crate::export_crop::CropRect,
+    source: [usize; 2],
+    target: [usize; 2],
+) -> Result<crate::export_crop::CropRect, String> {
+    let source = [source[0].max(1), source[1].max(1)];
+    let target = [target[0].max(1), target[1].max(1)];
+    let sx = target[0] as f64 / source[0] as f64;
+    let sy = target[1] as f64 / source[1] as f64;
+    let values = [
+        scaled_export_boundary(crop.min_x, sx, target[0]),
+        scaled_export_boundary(crop.min_y, sy, target[1]),
+        scaled_export_boundary(crop.max_x, sx, target[0]),
+        scaled_export_boundary(crop.max_y, sy, target[1]),
+    ];
+    let [Some(x0), Some(y0), Some(x1), Some(y1)] = values else {
+        return Err(export_crop_invalid_error());
+    };
+    if x1 <= x0 || y1 <= y0 {
+        return Err(export_crop_too_small_error());
+    }
+    Ok(crate::export_crop::CropRect {
+        min_x: x0 as f32,
+        min_y: y0 as f32,
+        max_x: x1 as f32,
+        max_y: y1 as f32,
+    })
+}
+
+fn scaled_export_boundary(value: f32, scale: f64, limit: usize) -> Option<usize> {
+    let value = f64::from(value) * scale;
+    value
+        .is_finite()
+        .then(|| value.round().clamp(0.0, limit as f64) as usize)
+}
+
+fn export_crop_invalid_error() -> String {
+    "SNS 分割枠の座標が不正です".to_string()
+}
+
+fn export_crop_too_small_error() -> String {
+    "最終合成の解像度が小さすぎて SNS 分割枠を配置できません".to_string()
+}
+
+pub fn scale_export_crop_overrides(
+    frames: &[crate::export_crop::CropRect],
+    source_size: [usize; 2],
+    target_size: [usize; 2],
+) -> Result<Vec<crate::export_crop::CropRect>, String> {
+    if target_size[0].max(1) < frames.len() {
+        return Err(export_crop_too_small_error());
+    }
+    frames
+        .iter()
+        .copied()
+        .map(|crop| scale_export_crop_override(crop, source_size, target_size))
+        .collect()
+}
+
+/// 合成予測寸法へ、実処理と同じ回転・切り取り規則を適用する。
+pub fn predicted_export_entry_size(
+    composed_size: [usize; 2],
+    edits: &BakedEditSnapshot,
+    crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
+) -> Result<[usize; 2], String> {
+    let composed_size = [composed_size[0].max(1), composed_size[1].max(1)];
+    let crop = if let Some((crop, source_size)) = crop_override {
+        Some(scale_export_crop_override(
+            crop,
+            source_size,
+            composed_size,
+        )?)
+    } else {
+        edits.export_crop.map(|crop| {
+            crop.with_legacy_source_size(composed_size)
+                .scaled_to(composed_size)
+                .rect
+        })
+    };
+    let rotated_size = crate::capture::rotated_size(composed_size, edits.rotation);
+    if let Some(crop) = crop {
+        let crop = crop_after_rotation(crop, composed_size, edits.rotation);
+        let (_, _, width, height) = crop.pixel_bounds(rotated_size[0], rotated_size[1]);
+        Ok([width, height])
+    } else {
+        Ok(rotated_size)
     }
 }
 
@@ -2157,6 +2361,280 @@ mod tests {
             creative_lut: None,
             ai: None,
         }
+    }
+
+    #[test]
+    fn predicted_export_size_matches_plain_rotation_crop_and_sns_composition() {
+        let source = egui::ColorImage::filled([6, 4], egui::Color32::WHITE);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let plain = empty_baked_edits();
+        let actual =
+            compose_export_entry(source.clone(), &plain, None, None, Arc::clone(&cancel)).unwrap();
+        assert_eq!(
+            predicted_export_entry_size([6, 4], &plain, None).unwrap(),
+            actual.size
+        );
+
+        let mut rotated = empty_baked_edits();
+        rotated.rotation = crate::rotation_db::Rotation::Cw90;
+        let actual =
+            compose_export_entry(source.clone(), &rotated, None, None, Arc::clone(&cancel))
+                .unwrap();
+        assert_eq!(
+            predicted_export_entry_size([6, 4], &rotated, None).unwrap(),
+            actual.size
+        );
+
+        let mut cropped = empty_baked_edits();
+        cropped.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 1.0,
+                max_x: 5.0,
+                max_y: 3.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [6, 4],
+        ));
+        let actual =
+            compose_export_entry(source.clone(), &cropped, None, None, Arc::clone(&cancel))
+                .unwrap();
+        assert_eq!(
+            predicted_export_entry_size([6, 4], &cropped, None).unwrap(),
+            actual.size
+        );
+
+        let sns_crop = crate::export_crop::CropRect {
+            min_x: 1.0,
+            min_y: 0.0,
+            max_x: 3.0,
+            max_y: 2.0,
+        };
+        let actual =
+            compose_export_entry(source, &plain, None, Some((sns_crop, [3, 2])), cancel).unwrap();
+        assert_eq!(
+            predicted_export_entry_size([6, 4], &plain, Some((sns_crop, [3, 2]))).unwrap(),
+            actual.size
+        );
+        assert_eq!(actual.size, [4, 4]);
+    }
+
+    #[test]
+    fn compose_export_entry_applies_crop_at_the_final_geometry_stage() {
+        let source = egui::ColorImage::new(
+            [3, 1],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+            ],
+        );
+        let mut edits = empty_baked_edits();
+        edits.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 1.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [3, 1],
+        ));
+
+        let actual =
+            compose_export_entry(source, &edits, None, None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+
+        assert_eq!(actual.size, [2, 1]);
+        assert_eq!(
+            actual.pixels,
+            vec![egui::Color32::GREEN, egui::Color32::BLUE]
+        );
+    }
+
+    #[test]
+    fn compose_export_entry_transforms_crop_after_rotation() {
+        let px = |value| egui::Color32::from_rgb(value, 0, 0);
+        let source = egui::ColorImage::new([3, 2], vec![px(1), px(2), px(3), px(4), px(5), px(6)]);
+        let mut edits = empty_baked_edits();
+        edits.rotation = crate::rotation_db::Rotation::Cw90;
+        edits.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 2.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [3, 2],
+        ));
+
+        let actual =
+            compose_export_entry(source, &edits, None, None, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+
+        assert_eq!(actual.size, [2, 2]);
+        assert_eq!(actual.pixels, vec![px(5), px(2), px(6), px(3)]);
+    }
+
+    #[test]
+    fn compose_export_entry_prefers_entry_crop_over_page_crop() {
+        let source = egui::ColorImage::new(
+            [4, 1],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+                egui::Color32::WHITE,
+            ],
+        );
+        let mut edits = empty_baked_edits();
+        edits.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 1.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [4, 1],
+        ));
+        let entry_crop = crate::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+        };
+
+        let actual = compose_export_entry(
+            source,
+            &edits,
+            None,
+            Some((entry_crop, [4, 1])),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(actual.size, [1, 1]);
+        assert_eq!(actual.pixels, vec![egui::Color32::RED]);
+        assert_eq!(
+            predicted_export_entry_size([4, 1], &edits, Some((entry_crop, [4, 1]))).unwrap(),
+            [1, 1]
+        );
+    }
+
+    #[test]
+    fn identity_export_bypass_matches_forced_composition() {
+        let source = egui::ColorImage::new(
+            [3, 2],
+            vec![
+                egui::Color32::from_rgb(1, 2, 3),
+                egui::Color32::from_rgb(40, 50, 60),
+                egui::Color32::from_rgb(70, 80, 90),
+                egui::Color32::from_rgb(100, 110, 120),
+                egui::Color32::from_rgb(130, 140, 150),
+                egui::Color32::from_rgb(250, 240, 230),
+            ],
+        );
+        let mut edits = empty_baked_edits();
+        edits.stage = crate::bake_stage::BakeStage::DisplayAdjust;
+        assert!(!export_entry_requires_composite(&edits, None, None));
+
+        let bypass_source = source.clone();
+        let source_pixels = bypass_source.pixels.as_ptr();
+        let bypassed = compose_export_entry(
+            bypass_source,
+            &edits,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            bypassed.pixels.as_ptr(),
+            source_pixels,
+            "identity entry must move the decoded pixels without allocating a replacement"
+        );
+
+        let preset = crate::conceal::ConcealPreset::default();
+        assert!(export_entry_requires_composite(&edits, Some(&preset), None));
+        let composed = compose_export_entry(
+            source,
+            &edits,
+            Some(&preset),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(bypassed, composed);
+    }
+
+    #[test]
+    fn conceal_mask_presence_uses_the_rasterized_result() {
+        let outside = BookMaskSnapshot {
+            bitmap: vec![false; 16],
+            shapes: vec![crate::mask_db::Shape::Rect {
+                op: crate::mask_db::ShapeOp::Add,
+                center: (100.0, 100.0),
+                half_w: 1.0,
+                half_h: 1.0,
+                rotation_rad: 0.0,
+            }],
+            size: [4, 4],
+        };
+        assert!(!book_mask_has_covered_pixel(&outside, [4, 4]).unwrap());
+
+        let inside = BookMaskSnapshot {
+            bitmap: vec![false; 16],
+            shapes: vec![crate::mask_db::Shape::Rect {
+                op: crate::mask_db::ShapeOp::Add,
+                center: (2.0, 2.0),
+                half_w: 1.0,
+                half_h: 1.0,
+                rotation_rad: 0.0,
+            }],
+            size: [4, 4],
+        };
+        assert!(book_mask_has_covered_pixel(&inside, [4, 4]).unwrap());
+    }
+
+    #[test]
+    fn predicted_size_uses_display_dimensions_only_when_ai_runs() {
+        assert_eq!(
+            predicted_composed_size([9000, 4500], [8192, 4096], false),
+            [9000, 4500]
+        );
+        assert_eq!(
+            predicted_composed_size([1200, 800], [2400, 1600], true),
+            [2400, 1600]
+        );
+
+        let frames = [
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 277.0,
+                max_y: 400.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 277.0,
+                min_y: 0.0,
+                max_x: 555.0,
+                max_y: 400.0,
+            },
+            crate::export_crop::CropRect {
+                min_x: 555.0,
+                min_y: 0.0,
+                max_x: 832.0,
+                max_y: 400.0,
+            },
+        ];
+        let scaled = scale_export_crop_overrides(&frames, [832, 400], [1664, 800]).unwrap();
+        assert_eq!(scaled[0].max_x, scaled[1].min_x);
+        assert_eq!(scaled[1].max_x, scaled[2].min_x);
+        assert_eq!(scaled[2].max_x, 1664.0);
     }
 
     #[test]

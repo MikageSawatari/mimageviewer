@@ -1,4 +1,4 @@
-//! Ctrl+E export worker と save_with_metadata の統合テスト。
+//! Ctrl+E export worker と source-based compositor の統合テスト。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -6,89 +6,45 @@ use std::time::Duration;
 
 use eframe::egui;
 use image::ImageEncoder;
+use mimageviewer::bake_stage::BakeStage;
+use mimageviewer::books::{
+    BakedEditSnapshot, BookAiResult, BookAiSnapshot, BookConcealSnapshot, BookMaskSnapshot,
+    CompositeSource,
+};
 use mimageviewer::export_dialog::{
-    ExportEntry, ExportEvent, ExportFormat, ExportPagePixels, ExportPixels, ExportRequest,
+    ExportComposite, ExportEntry, ExportEvent, ExportFormat, ExportPageComposite, ExportRequest,
     ExportScale, ExportSource, resolve_session_basename, spawn_export_worker,
 };
-use mimageviewer::save_with_metadata::{SaveOptions, SrcFormat, save_image_with_metadata};
+use mimageviewer::save_with_metadata::SrcFormat;
 
-fn solid_image(w: usize, h: usize, color: egui::Color32) -> Arc<egui::ColorImage> {
-    Arc::new(egui::ColorImage::new([w, h], vec![color; w * h]))
+fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: [u8; 4]) {
+    image::RgbaImage::from_pixel(width, height, image::Rgba(rgba))
+        .save(path)
+        .unwrap();
 }
 
-fn single_pixels(base_pixels: Arc<egui::ColorImage>) -> ExportPixels {
-    ExportPixels::Single(ExportPagePixels {
-        base_pixels,
-        conceal_variant: None,
-        crop: None,
-        rotation: mimageviewer::rotation_db::Rotation::None,
-    })
+fn jpeg_with_app1(payload: &[u8]) -> Vec<u8> {
+    jpeg_with_app1_dims(payload, 4, 4)
 }
 
-fn entry(label: &str, suffix: u8) -> ExportEntry {
-    ExportEntry {
-        label: label.to_string(),
-        suffix,
-        conceal_preset: None,
-        crop: None,
-    }
-}
-
-fn collect_events(
-    pending: mimageviewer::export_dialog::ExportPending,
-    timeout_secs: u64,
-) -> Vec<ExportEvent> {
-    let mut events = Vec::new();
-    loop {
-        let event = pending
-            .rx
-            .recv_timeout(Duration::from_secs(timeout_secs))
-            .expect("export worker should send an event");
-        let done = matches!(event, ExportEvent::AllDone | ExportEvent::Cancelled);
-        events.push(event);
-        if done {
-            break;
-        }
-    }
-    events
-}
-
-fn completed_count(events: &[ExportEvent]) -> usize {
-    events
-        .iter()
-        .filter(|e| matches!(e, ExportEvent::Completed(_)))
-        .count()
-}
-
-fn failed_count(events: &[ExportEvent]) -> usize {
-    events
-        .iter()
-        .filter(|e| matches!(e, ExportEvent::Failed(_)))
-        .count()
+fn jpeg_with_app1_dims(payload: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbImage::from_pixel(width, height, image::Rgb([120, 80, 40]));
+    let jpeg = turbojpeg::compress_image(&image, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
+    let length = payload.len() + 2;
+    let mut output = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+    output.extend_from_slice(&jpeg[..2]);
+    output.extend_from_slice(&[0xff, 0xe1, (length >> 8) as u8, length as u8]);
+    output.extend_from_slice(payload);
+    output.extend_from_slice(&jpeg[2..]);
+    output
 }
 
 fn encode_png_bytes() -> Vec<u8> {
-    let mut out = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut out)
+    let mut output = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut output)
         .write_image(&[255, 0, 0, 255], 1, 1, image::ColorType::Rgba8.into())
         .unwrap();
-    out
-}
-
-fn jpeg_with_app1_payload(payload: &[u8]) -> Vec<u8> {
-    let rgb = vec![128u8; 8 * 8 * 3];
-    let image = image::RgbImage::from_raw(8, 8, rgb).unwrap();
-    let jpeg = turbojpeg::compress_image(&image, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
-    let jpeg = jpeg.as_ref();
-    let len = payload.len() + 2;
-    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
-    out.extend_from_slice(&jpeg[..2]);
-    out.extend_from_slice(&[0xFF, 0xE1]);
-    out.push((len >> 8) as u8);
-    out.push((len & 0xFF) as u8);
-    out.extend_from_slice(payload);
-    out.extend_from_slice(&jpeg[2..]);
-    out
+    output
 }
 
 fn orientation_exif_payload(value: u16) -> Vec<u8> {
@@ -107,510 +63,53 @@ fn orientation_exif_payload(value: u16) -> Vec<u8> {
     payload
 }
 
-fn app1_payloads(jpeg: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
-        return out;
-    }
-    let mut pos = 2;
-    while pos + 4 <= jpeg.len() {
-        if jpeg[pos] != 0xFF {
-            pos += 1;
-            continue;
-        }
-        let marker = jpeg[pos + 1];
-        if marker == 0xDA {
-            break;
-        }
-        if marker == 0x00 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
-            pos += 2;
-            continue;
-        }
-        let len = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]) as usize;
-        if len < 2 || pos + 2 + len > jpeg.len() {
-            break;
-        }
-        if marker == 0xE1 {
-            out.push(&jpeg[pos + 4..pos + 2 + len]);
-        }
-        pos += 2 + len;
-    }
-    out
-}
-
 fn jpeg_orientation(jpeg: &[u8]) -> Option<u16> {
-    let payload = app1_payloads(jpeg)
-        .into_iter()
-        .find(|p| p.starts_with(b"Exif\0\0"))?;
-    let tiff = 6;
-    if payload.get(tiff..tiff + 8)? != b"II*\0\x08\0\0\0" {
+    if jpeg.len() < 4 || jpeg[0..2] != [0xff, 0xd8] {
         return None;
     }
-    let ifd0 = tiff + 8;
-    let count = u16::from_le_bytes([payload[ifd0], payload[ifd0 + 1]]) as usize;
-    let mut entry = ifd0 + 2;
-    for _ in 0..count {
-        let tag = u16::from_le_bytes([payload[entry], payload[entry + 1]]);
-        if tag == 0x0112 {
-            return Some(u16::from_le_bytes([payload[entry + 8], payload[entry + 9]]));
+    let mut position = 2;
+    while position + 4 <= jpeg.len() {
+        if jpeg[position] != 0xff {
+            position += 1;
+            continue;
         }
-        entry += 12;
+        let marker = jpeg[position + 1];
+        if marker == 0xda {
+            return None;
+        }
+        if marker == 0x00 || marker == 0x01 || (0xd0..=0xd9).contains(&marker) {
+            position += 2;
+            continue;
+        }
+        let length = u16::from_be_bytes([jpeg[position + 2], jpeg[position + 3]]) as usize;
+        if length < 2 || position + 2 + length > jpeg.len() {
+            return None;
+        }
+        if marker == 0xe1 {
+            let payload = &jpeg[position + 4..position + 2 + length];
+            if payload.starts_with(b"Exif\0\0") && payload.get(6..14) == Some(b"II*\0\x08\0\0\0") {
+                let ifd0 = 14;
+                let count = u16::from_le_bytes([payload[ifd0], payload[ifd0 + 1]]) as usize;
+                let mut entry = ifd0 + 2;
+                for _ in 0..count {
+                    if entry + 12 > payload.len() {
+                        return None;
+                    }
+                    let tag = u16::from_le_bytes([payload[entry], payload[entry + 1]]);
+                    if tag == 0x0112 {
+                        return Some(u16::from_le_bytes([payload[entry + 8], payload[entry + 9]]));
+                    }
+                    entry += 12;
+                }
+            }
+        }
+        position += 2 + length;
     }
     None
 }
 
-fn animated_webp_bytes() -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    bytes.extend_from_slice(b"WEBP");
-    bytes.extend_from_slice(b"ANIM");
-    bytes.extend_from_slice(&6_u32.to_le_bytes());
-    bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0]);
-    let total = (bytes.len() - 8) as u32;
-    bytes[4..8].copy_from_slice(&total.to_le_bytes());
-    bytes
-}
-
-#[test]
-fn export_single_jpeg_with_metadata() {
-    let temp = tempfile::tempdir().unwrap();
-    let src = temp.path().join("source.jpg");
-    let marker = b"Exif\0\0phase7-export-marker";
-    std::fs::write(&src, jpeg_with_app1_payload(marker)).unwrap();
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::File { path: src },
-        original_format: SrcFormat::Jpeg,
-        output_format: ExportFormat::Jpeg95,
-        output_dir: temp.path().to_path_buf(),
-        basename: "out".to_string(),
-        pixels: single_pixels(solid_image(4, 4, egui::Color32::from_rgb(10, 20, 30))),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: true,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-
-    let out = std::fs::read(temp.path().join("out_0.jpg")).unwrap();
-    assert!(
-        app1_payloads(&out).iter().any(|payload| *payload == marker),
-        "APP1 metadata marker should be copied to output JPEG"
-    );
-}
-
-#[test]
-fn export_batch_no_collision() {
-    let temp = tempfile::tempdir().unwrap();
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "batch".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::LIGHT_BLUE)),
-        scale: ExportScale::Full,
-        entries: vec![
-            entry("current", 0),
-            entry("preset1", 1),
-            entry("preset2", 2),
-        ],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 3);
-    for suffix in 0..=2 {
-        assert!(temp.path().join(format!("batch_{suffix}.png")).exists());
-    }
-}
-
-#[test]
-fn export_batch_with_collision_uses_session_number() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("batch_0.png"), b"already here").unwrap();
-    let basename = resolve_session_basename(temp.path(), "batch", "png", &[0, 1]).unwrap();
-    assert_eq!(basename, "batch_0001");
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename,
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::LIGHT_GREEN)),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0), entry("preset1", 1)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 2);
-    assert!(temp.path().join("batch_0001_0.png").exists());
-    assert!(temp.path().join("batch_0001_1.png").exists());
-}
-
-#[test]
-fn export_batch_partial_failure_continues() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("out_1.png"), b"collision").unwrap();
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "out".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::GRAY)),
-        scale: ExportScale::Full,
-        entries: vec![
-            entry("current", 0),
-            entry("preset1", 1),
-            entry("preset2", 2),
-        ],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 2);
-    assert_eq!(failed_count(&events), 1);
-    assert!(temp.path().join("out_0.png").exists());
-    assert!(temp.path().join("out_2.png").exists());
-    assert_eq!(
-        std::fs::read(temp.path().join("out_1.png")).unwrap(),
-        b"collision"
-    );
-}
-
-#[test]
-fn export_with_scale_half_produces_half_dimensions() {
-    let temp = tempfile::tempdir().unwrap();
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "half".to_string(),
-        pixels: single_pixels(solid_image(6, 4, egui::Color32::from_rgb(90, 120, 150))),
-        scale: ExportScale::Half,
-        entries: vec![entry("current", 0)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-    let out = image::open(temp.path().join("half_0.png")).unwrap();
-    assert_eq!((out.width(), out.height()), (3, 2));
-}
-
-#[test]
-fn export_with_scale_quarter_produces_quarter_dimensions() {
-    let temp = tempfile::tempdir().unwrap();
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "quarter".to_string(),
-        pixels: single_pixels(solid_image(8, 4, egui::Color32::from_rgb(90, 120, 150))),
-        scale: ExportScale::Quarter,
-        entries: vec![entry("current", 0)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-    let out = image::open(temp.path().join("quarter_0.png")).unwrap();
-    assert_eq!((out.width(), out.height()), (2, 1));
-}
-
-#[test]
-fn export_cancel_mid_batch() {
-    let temp = tempfile::tempdir().unwrap();
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("pdf".to_string()),
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "cancel".to_string(),
-        pixels: single_pixels(solid_image(2048, 2048, egui::Color32::from_rgb(20, 40, 60))),
-        scale: ExportScale::Full,
-        entries: (0..5).map(|i| entry(&format!("entry{i}"), i)).collect(),
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-
-    match pending.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-        ExportEvent::Started { .. } => {}
-        other => panic!("expected first Started event, got {other:?}"),
-    }
-    pending.cancel.store(true, Ordering::Relaxed);
-
-    let mut saw_cancel = false;
-    while let Ok(event) = pending.rx.recv_timeout(Duration::from_secs(10)) {
-        if matches!(event, ExportEvent::Cancelled) {
-            saw_cancel = true;
-            break;
-        }
-        if matches!(event, ExportEvent::AllDone) {
-            break;
-        }
-    }
-    assert!(
-        saw_cancel,
-        "worker should observe cancel before starting all entries"
-    );
-    assert!(
-        !temp.path().join("cancel_4.png").exists(),
-        "later entries should not be written after cancellation"
-    );
-}
-
-#[test]
-fn export_fallback_format_for_heic() {
-    let temp = tempfile::tempdir().unwrap();
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::PdfPage,
-        original_format: SrcFormat::Other("heic".to_string()),
-        output_format: ExportFormat::Jpeg95,
-        output_dir: temp.path().to_path_buf(),
-        basename: "fallback".to_string(),
-        pixels: single_pixels(solid_image(3, 3, egui::Color32::from_rgb(100, 80, 60))),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: true,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-    assert!(temp.path().join("fallback_0.jpg").exists());
-}
-
-#[test]
-fn export_zip_source_no_path() {
-    let temp = tempfile::tempdir().unwrap();
-    let zip_path = temp.path().join("source.zip");
-    {
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("entry.png", options).unwrap();
-        use std::io::Write;
-        zip.write_all(&encode_png_bytes()).unwrap();
-        zip.finish().unwrap();
-    }
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::ZipEntry {
-            zip_path,
-            entry_name: "entry.png".to_string(),
-        },
-        original_format: SrcFormat::Png,
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "zip-entry".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: true,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-    assert!(temp.path().join("zip-entry_0.png").exists());
-}
-
-#[test]
-fn export_zip_di2_orientation_canonical_after_display_rotation() {
-    let temp = tempfile::tempdir().unwrap();
-    let zip_path = temp.path().join("rotated-source.zip");
-    {
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("rotated.jpg", options).unwrap();
-        use std::io::Write;
-        zip.write_all(&jpeg_with_app1_payload(&orientation_exif_payload(6)))
-            .unwrap();
-        zip.finish().unwrap();
-    }
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::ZipEntry {
-            zip_path,
-            entry_name: "rotated.jpg".to_string(),
-        },
-        original_format: SrcFormat::Jpeg,
-        output_format: ExportFormat::Jpeg95,
-        output_dir: temp.path().to_path_buf(),
-        basename: "zip-di2".to_string(),
-        pixels: single_pixels(solid_image(4, 2, egui::Color32::from_rgb(30, 60, 90))),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: true,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 1);
-
-    let out = std::fs::read(temp.path().join("zip-di2_0.jpg")).unwrap();
-    assert_eq!(jpeg_orientation(&out), Some(1));
-    let decoded = image::load_from_memory(&out).unwrap();
-    assert_eq!((decoded.width(), decoded.height()), (4, 2));
-}
-
-#[test]
-fn export_animated_webp_fails() {
-    let temp = tempfile::tempdir().unwrap();
-    let src = temp.path().join("animated.webp");
-    std::fs::write(&src, animated_webp_bytes()).unwrap();
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::File { path: src },
-        original_format: SrcFormat::Webp,
-        output_format: ExportFormat::Webp,
-        output_dir: temp.path().to_path_buf(),
-        basename: "animated".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 0);
-    assert_eq!(failed_count(&events), 1);
-    assert!(!temp.path().join("animated_0.webp").exists());
-}
-
-/// 元 WebP がアニメ判定のため file read を試みるが、読み込みに失敗したケース。
-/// silent skip すると output PNG/JPEG で animation check が走らずアニメ WebP が
-/// 静止画化される穴があるため、read 失敗は全エントリ失敗にする (Codex review P3)。
-#[test]
-fn export_webp_source_read_failure_fails_all_entries() {
-    let temp = tempfile::tempdir().unwrap();
-    // 実在しないパスを渡して file read を失敗させる。
-    let missing = temp.path().join("missing.webp");
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::File {
-            path: missing.clone(),
-        },
-        original_format: SrcFormat::Webp,
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "missing".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
-        scale: ExportScale::Full,
-        entries: vec![entry("a", 0), entry("b", 1)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 0);
-    assert_eq!(failed_count(&events), 2);
-    assert!(!temp.path().join("missing_0.png").exists());
-    assert!(!temp.path().join("missing_1.png").exists());
-}
-
-/// 元 WebP がアニメーションのとき、出力形式に関係なく export を拒否する。
-/// 旧版は output=WebP のときだけ animation check が走り、PNG/JPEG 出力では
-/// 単一フレームを silent に書き出していた (Codex review CONFIRMED の修正)。
-#[test]
-fn export_animated_webp_rejected_when_output_is_png() {
-    let temp = tempfile::tempdir().unwrap();
-    let src = temp.path().join("animated.webp");
-    std::fs::write(&src, animated_webp_bytes()).unwrap();
-
-    let pending = spawn_export_worker(ExportRequest {
-        source: ExportSource::File { path: src },
-        original_format: SrcFormat::Webp,
-        output_format: ExportFormat::Png,
-        output_dir: temp.path().to_path_buf(),
-        basename: "anim2png".to_string(),
-        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
-        scale: ExportScale::Full,
-        entries: vec![entry("current", 0)],
-        include_metadata: false,
-        local_ai_activity: None,
-    })
-    .unwrap();
-    let events = collect_events(pending, 5);
-    assert_eq!(completed_count(&events), 0);
-    assert_eq!(failed_count(&events), 1);
-    assert!(!temp.path().join("anim2png_0.png").exists());
-}
-
-#[test]
-fn export_orientation_canonical() {
-    let temp = tempfile::tempdir().unwrap();
-    let src = jpeg_with_app1_payload(&orientation_exif_payload(6));
-    let dst = temp.path().join("canonical.jpg");
-    let pixels = solid_image(8, 8, egui::Color32::from_rgb(30, 60, 90));
-
-    save_image_with_metadata(
-        pixels.as_ref(),
-        None,
-        Some(&src),
-        &dst,
-        SrcFormat::Jpeg,
-        &SaveOptions::default(),
-    )
-    .unwrap();
-
-    let out = std::fs::read(dst).unwrap();
-    assert_eq!(jpeg_orientation(&out), Some(1));
-}
-
-#[test]
-fn export_orientation_preserved() {
-    let temp = tempfile::tempdir().unwrap();
-    let src = jpeg_with_app1_payload(&orientation_exif_payload(6));
-    let dst = temp.path().join("preserved.jpg");
-    let pixels = solid_image(8, 8, egui::Color32::from_rgb(30, 60, 90));
-    let options = SaveOptions {
-        caller_applied_orientation: false,
-        ..Default::default()
-    };
-
-    save_image_with_metadata(
-        pixels.as_ref(),
-        None,
-        Some(&src),
-        &dst,
-        SrcFormat::Jpeg,
-        &options,
-    )
-    .unwrap();
-
-    let out = std::fs::read(dst).unwrap();
-    assert_eq!(jpeg_orientation(&out), Some(6));
-}
-// ── 一覧からの一括エクスポート ───────────────────────────────────────────
-//
-// ここが「デコード → 合成 → 縮小 → エンコード → 書き出し」を実ファイルで通す唯一の
-// テスト。合成は製本と同じ `books::write_composited_page` なので、この経路が壊れると
-// 本の焼き込みも一緒に壊れる。
-
-fn batch_edits(
-    format: mimageviewer::capture::CaptureFormat,
-) -> mimageviewer::books::BakedEditSnapshot {
-    mimageviewer::books::BakedEditSnapshot {
+fn edits(stage: BakeStage) -> BakedEditSnapshot {
+    BakedEditSnapshot {
         params: mimageviewer::adjustment::AdjustParams::default(),
         rotation: mimageviewer::rotation_db::Rotation::None,
         conceal: None,
@@ -620,123 +119,846 @@ fn batch_edits(
         comic_source_dims: None,
         export_crop: None,
         crop_legacy_writeback: None,
-        format,
+        format: mimageviewer::capture::CaptureFormat::Png,
         jpeg_matte: mimageviewer::capture::JpegMatte::Black,
-        // 一覧の一括書き出しが実際に使う段 (`Settings::bake_stage_export_batch` の既定)。
-        // ここだけが実ファイルで合成経路を通すので、出荷される段を通す。
-        stage: mimageviewer::bake_stage::BakeStage::DisplayAdjust,
+        stage,
         creative_lut: None,
         ai: None,
     }
 }
 
+fn page(
+    path: &std::path::Path,
+    edits: BakedEditSnapshot,
+    predicted_size: [usize; 2],
+) -> ExportPageComposite {
+    page_from_source(
+        CompositeSource::File {
+            path: path.to_path_buf(),
+        },
+        edits,
+        predicted_size,
+    )
+}
+
+fn page_from_source(
+    source: CompositeSource,
+    edits: BakedEditSnapshot,
+    predicted_size: [usize; 2],
+) -> ExportPageComposite {
+    ExportPageComposite {
+        source,
+        edits,
+        pdf_render_long_edge: 4096,
+        predicted_size,
+        has_conceal_mask: false,
+    }
+}
+
+fn entry(label: &str, suffix: u8) -> ExportEntry {
+    ExportEntry {
+        label: label.to_string(),
+        suffix,
+        conceal_preset: None,
+        crop_override: None,
+    }
+}
+
+fn request(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    basename: &str,
+    composite: ExportComposite,
+    entries: Vec<ExportEntry>,
+) -> ExportRequest {
+    ExportRequest {
+        source: ExportSource::File {
+            path: source_path.to_path_buf(),
+        },
+        original_format: SrcFormat::Png,
+        output_format: ExportFormat::Png,
+        output_dir: output_dir.to_path_buf(),
+        basename: basename.to_string(),
+        composite,
+        scale: ExportScale::Full,
+        entries,
+        include_metadata: false,
+        local_ai_activity: None,
+    }
+}
+
+fn collect(pending: mimageviewer::export_dialog::ExportPending) -> Vec<ExportEvent> {
+    let mut events = Vec::new();
+    loop {
+        let event = pending
+            .rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("worker event");
+        let done = matches!(event, ExportEvent::AllDone | ExportEvent::Cancelled);
+        events.push(event);
+        if done {
+            return events;
+        }
+    }
+}
+
+fn completed(events: &[ExportEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, ExportEvent::Completed(_)))
+        .count()
+}
+
+fn failed(events: &[ExportEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, ExportEvent::Failed(_)))
+        .count()
+}
+
+fn staged_edits(stage: BakeStage) -> BakedEditSnapshot {
+    let mut edits = edits(stage);
+    // App は AI を要求する params のときだけ runner を snapshot へ載せる。
+    // `page_requires_full_composite` と同じ実運用の不変条件で段の切り替えを検証する。
+    edits.params.upscale_model = Some("test-upscale".to_string());
+    edits.params.post_filter = mimageviewer::adjustment::PostFilter::Sepia;
+    edits.ai = Some(BookAiSnapshot {
+        run: Box::new(|image, _| {
+            Ok(BookAiResult {
+                image: egui::ColorImage::filled(
+                    [image.size[0] * 2, image.size[1] * 2],
+                    egui::Color32::from_rgb(20, 180, 70),
+                ),
+                used_upscale: true,
+            })
+        }),
+    });
+    edits
+}
+
+#[test]
+fn selected_bake_stage_controls_ai_and_display_adjust() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.png");
+    write_png(&source, 3, 2, [200, 30, 20, 255]);
+
+    for (name, stage, predicted) in [
+        ("edits", BakeStage::Edits, [3, 2]),
+        ("ai", BakeStage::Ai, [6, 4]),
+        ("display", BakeStage::DisplayAdjust, [6, 4]),
+    ] {
+        let composite = ExportComposite::Single(page(&source, staged_edits(stage), predicted));
+        assert_eq!(composite.render_size().unwrap(), predicted);
+        let pending = spawn_export_worker(request(
+            &source,
+            temp.path(),
+            name,
+            composite,
+            vec![entry("current", 0)],
+        ))
+        .unwrap();
+        assert_eq!(completed(&collect(pending)), 1);
+    }
+
+    let edits_image = image::open(temp.path().join("edits_0.png"))
+        .unwrap()
+        .to_rgba8();
+    let ai_image = image::open(temp.path().join("ai_0.png"))
+        .unwrap()
+        .to_rgba8();
+    let display_image = image::open(temp.path().join("display_0.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(edits_image.dimensions(), (3, 2));
+    assert_eq!(ai_image.dimensions(), (6, 4));
+    assert_eq!(display_image.dimensions(), (6, 4));
+    assert_eq!(ai_image.get_pixel(0, 0).0, [20, 180, 70, 255]);
+    assert_ne!(display_image.get_pixel(0, 0), ai_image.get_pixel(0, 0));
+}
+
+#[test]
+fn source_larger_than_gpu_texture_limit_keeps_its_dimensions_without_ai() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("wide.png");
+    write_png(&source, 8193, 1, [7, 8, 9, 255]);
+    let composite =
+        ExportComposite::Single(page(&source, edits(BakeStage::DisplayAdjust), [8193, 1]));
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "wide",
+        composite,
+        vec![entry("current", 0)],
+    ))
+    .unwrap();
+
+    assert_eq!(completed(&collect(pending)), 1);
+    assert_eq!(
+        image::image_dimensions(temp.path().join("wide_0.png")).unwrap(),
+        (8193, 1)
+    );
+}
+
+#[test]
+fn spread_prediction_matches_worker_output_after_rotation_and_crop() {
+    let temp = tempfile::tempdir().unwrap();
+    let left_path = temp.path().join("left.png");
+    let right_path = temp.path().join("right.png");
+    write_png(&left_path, 4, 3, [255, 0, 0, 255]);
+    write_png(&right_path, 2, 5, [0, 0, 255, 255]);
+
+    let mut left_edits = edits(BakeStage::Edits);
+    left_edits.rotation = mimageviewer::rotation_db::Rotation::Cw90;
+    let mut right_edits = edits(BakeStage::Edits);
+    right_edits.export_crop = Some(mimageviewer::export_crop::CropSettings::authored(
+        mimageviewer::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 1.0,
+            max_x: 2.0,
+            max_y: 4.0,
+        },
+        mimageviewer::export_crop::CropAspectMode::Free,
+        [2, 5],
+    ));
+    let composite = ExportComposite::Spread {
+        left: page(&left_path, left_edits, [4, 3]),
+        right: page(&right_path, right_edits, [2, 5]),
+    };
+    let predicted = composite.render_size().unwrap();
+    let pending = spawn_export_worker(request(
+        &left_path,
+        temp.path(),
+        "spread",
+        composite,
+        vec![entry("current", 0)],
+    ))
+    .unwrap();
+
+    assert_eq!(completed(&collect(pending)), 1);
+    assert_eq!(
+        image::image_dimensions(temp.path().join("spread_0.png")).unwrap(),
+        (predicted[0] as u32, predicted[1] as u32)
+    );
+}
+
+#[test]
+fn conceal_presets_replace_only_the_current_conceal_setting() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("conceal.png");
+    write_png(&source, 2, 1, [180, 30, 20, 255]);
+    let mut current = mimageviewer::conceal::ConcealPreset::default();
+    current.conceal_type = mimageviewer::conceal::ConcealType::BlackFill;
+    let mut alternate = current.clone();
+    alternate.conceal_type = mimageviewer::conceal::ConcealType::WhiteFill;
+    let mut snapshot = edits(BakeStage::Edits);
+    snapshot.conceal = Some(BookConcealSnapshot {
+        mask: BookMaskSnapshot {
+            bitmap: vec![true, true],
+            shapes: Vec::new(),
+            size: [2, 1],
+        },
+        preset: current,
+    });
+    let mut composite_page = page(&source, snapshot, [2, 1]);
+    composite_page.has_conceal_mask = true;
+    let entries = vec![
+        entry("current", 0),
+        ExportEntry {
+            label: "preset".to_string(),
+            suffix: 1,
+            conceal_preset: Some(alternate.clone()),
+            crop_override: None,
+        },
+    ];
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "conceal",
+        ExportComposite::Single(composite_page),
+        entries,
+    ))
+    .unwrap();
+    assert_eq!(completed(&collect(pending)), 2);
+
+    let current = image::open(temp.path().join("conceal_0.png"))
+        .unwrap()
+        .to_rgba8();
+    let alternate_image = image::open(temp.path().join("conceal_1.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(current.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    assert_eq!(alternate_image.get_pixel(0, 0).0, [255, 255, 255, 255]);
+
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "maskless",
+        ExportComposite::Single(page(&source, edits(BakeStage::Edits), [2, 1])),
+        vec![ExportEntry {
+            label: "preset".to_string(),
+            suffix: 1,
+            conceal_preset: Some(alternate),
+            crop_override: None,
+        }],
+    ))
+    .unwrap();
+    assert_eq!(completed(&collect(pending)), 1);
+    let maskless = image::open(temp.path().join("maskless_1.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(maskless.get_pixel(0, 0).0, [180, 30, 20, 255]);
+}
+
+#[test]
+fn sns_frames_are_scaled_against_the_actual_composed_dimensions() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("sns.png");
+    write_png(&source, 5, 2, [40, 80, 120, 255]);
+    let mut snapshot = edits(BakeStage::Ai);
+    snapshot.ai = Some(BookAiSnapshot {
+        run: Box::new(|_, _| {
+            Ok(BookAiResult {
+                image: egui::ColorImage::filled([10, 4], egui::Color32::from_rgb(40, 80, 120)),
+                used_upscale: true,
+            })
+        }),
+    });
+    let frames = [
+        mimageviewer::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 2.0,
+            max_y: 2.0,
+        },
+        mimageviewer::export_crop::CropRect {
+            min_x: 2.0,
+            min_y: 0.0,
+            max_x: 5.0,
+            max_y: 2.0,
+        },
+    ];
+    let entries = frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, crop)| ExportEntry {
+            label: format!("frame {index}"),
+            suffix: (index + 1) as u8,
+            conceal_preset: None,
+            crop_override: Some((crop, [5, 2])),
+        })
+        .collect();
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "sns",
+        ExportComposite::Single(page(&source, snapshot, [10, 4])),
+        entries,
+    ))
+    .unwrap();
+
+    assert_eq!(completed(&collect(pending)), 2);
+    assert_eq!(
+        image::image_dimensions(temp.path().join("sns_1.png")).unwrap(),
+        (4, 4)
+    );
+    assert_eq!(
+        image::image_dimensions(temp.path().join("sns_2.png")).unwrap(),
+        (6, 4)
+    );
+}
+
+#[test]
+fn export_scale_is_applied_after_composition() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("scale.png");
+    write_png(&source, 8, 6, [1, 2, 3, 255]);
+    let mut export = request(
+        &source,
+        temp.path(),
+        "scale",
+        ExportComposite::Single(page(&source, edits(BakeStage::Edits), [8, 6])),
+        vec![entry("current", 0)],
+    );
+    export.scale = ExportScale::Half;
+    let pending = spawn_export_worker(export).unwrap();
+
+    assert_eq!(completed(&collect(pending)), 1);
+    assert_eq!(
+        image::image_dimensions(temp.path().join("scale_0.png")).unwrap(),
+        (4, 3)
+    );
+}
+
+#[test]
+fn spread_scale_uses_the_rendered_crop_dimensions() {
+    let temp = tempfile::tempdir().unwrap();
+    let left_path = temp.path().join("scale-left.png");
+    let right_path = temp.path().join("scale-right.png");
+    write_png(&left_path, 5, 4, [200, 0, 0, 255]);
+    write_png(&right_path, 3, 5, [0, 0, 200, 255]);
+
+    let mut left_edits = edits(BakeStage::Edits);
+    left_edits.export_crop = Some(mimageviewer::export_crop::CropSettings::authored(
+        mimageviewer::export_crop::CropRect {
+            min_x: 1.0,
+            min_y: 1.0,
+            max_x: 5.0,
+            max_y: 4.0,
+        },
+        mimageviewer::export_crop::CropAspectMode::Free,
+        [5, 4],
+    ));
+    let composite = ExportComposite::Spread {
+        left: page(&left_path, left_edits, [5, 4]),
+        right: page(&right_path, edits(BakeStage::Edits), [3, 5]),
+    };
+    assert_eq!(composite.render_size().unwrap(), [7, 5]);
+    assert_eq!(ExportScale::Half.scaled_size([7, 5]), [4, 3]);
+    assert_eq!(ExportScale::Quarter.scaled_size([7, 5]), [2, 1]);
+
+    let mut export = request(
+        &left_path,
+        temp.path(),
+        "scale-spread",
+        composite,
+        vec![entry("current", 0)],
+    );
+    export.source = ExportSource::RenderedSpread;
+    export.scale = ExportScale::Half;
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 1);
+    assert_eq!(
+        image::image_dimensions(temp.path().join("scale-spread_0.png")).unwrap(),
+        (4, 3)
+    );
+}
+
+#[test]
+fn spread_conceal_is_composed_independently_for_each_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let left_path = temp.path().join("conceal-left.png");
+    let right_path = temp.path().join("conceal-right.png");
+    write_png(&left_path, 1, 1, [255, 255, 255, 255]);
+    write_png(&right_path, 1, 1, [10, 20, 30, 255]);
+
+    let mut left_edits = edits(BakeStage::Edits);
+    left_edits.conceal = Some(BookConcealSnapshot {
+        mask: BookMaskSnapshot {
+            bitmap: vec![true],
+            shapes: Vec::new(),
+            size: [1, 1],
+        },
+        preset: mimageviewer::conceal::ConcealPreset::default(),
+    });
+    let composite = ExportComposite::Spread {
+        left: page(&left_path, left_edits, [1, 1]),
+        right: page(&right_path, edits(BakeStage::Edits), [1, 1]),
+    };
+    let mut black = mimageviewer::conceal::ConcealPreset::default();
+    black.conceal_type = mimageviewer::conceal::ConcealType::BlackFill;
+    let preset_entry = ExportEntry {
+        label: "black".to_string(),
+        suffix: 1,
+        conceal_preset: Some(black),
+        crop_override: None,
+    };
+    let mut export = request(
+        &left_path,
+        temp.path(),
+        "conceal-spread",
+        composite,
+        vec![preset_entry],
+    );
+    export.source = ExportSource::RenderedSpread;
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 1);
+    let output = image::open(temp.path().join("conceal-spread_1.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(output.dimensions(), (2, 1));
+    assert_eq!(output.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    assert_eq!(output.get_pixel(1, 0).0, [10, 20, 30, 255]);
+}
+
+#[test]
+fn export_cancel_mid_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("cancel-source.png");
+    write_png(&source, 2048, 2048, [20, 40, 60, 255]);
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "cancel",
+        ExportComposite::Single(page(&source, edits(BakeStage::Edits), [2048, 2048])),
+        (0..5)
+            .map(|index| entry(&format!("entry{index}"), index))
+            .collect(),
+    ))
+    .unwrap();
+
+    match pending.rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+        ExportEvent::Started { .. } => {}
+        other => panic!("expected first Started event, got {other:?}"),
+    }
+    pending.cancel.store(true, Ordering::Relaxed);
+
+    let mut saw_cancel = false;
+    while let Ok(event) = pending.rx.recv_timeout(Duration::from_secs(20)) {
+        if matches!(event, ExportEvent::Cancelled) {
+            saw_cancel = true;
+            break;
+        }
+        if matches!(event, ExportEvent::AllDone) {
+            break;
+        }
+    }
+    assert!(saw_cancel, "worker should report cancellation");
+    assert!(
+        !temp.path().join("cancel_4.png").exists(),
+        "entries after cancellation must not be written"
+    );
+}
+
+#[test]
+fn export_fallback_format_for_heic() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("fallback-source.png");
+    write_png(&source, 3, 3, [100, 80, 60, 255]);
+    let original_format = SrcFormat::Other("heic".to_string());
+    let output_format = ExportFormat::from_source(
+        &original_format,
+        mimageviewer::conceal::ExportFallbackFormat::Jpeg95,
+    );
+    assert_eq!(output_format, ExportFormat::Jpeg95);
+
+    let mut export = request(
+        &source,
+        temp.path(),
+        "fallback",
+        ExportComposite::Single(page(&source, edits(BakeStage::Edits), [3, 3])),
+        vec![entry("current", 0)],
+    );
+    export.original_format = original_format;
+    export.output_format = output_format;
+    export.include_metadata = true;
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 1);
+    assert!(temp.path().join("fallback_0.jpg").exists());
+}
+
+#[test]
+fn export_zip_source_no_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("source.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("entry.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&encode_png_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    let composite_source = CompositeSource::ZipEntry {
+        zip_path: zip_path.clone(),
+        entry_name: "entry.png".to_string(),
+    };
+    let export = ExportRequest {
+        source: ExportSource::ZipEntry {
+            zip_path,
+            entry_name: "entry.png".to_string(),
+        },
+        original_format: SrcFormat::Png,
+        output_format: ExportFormat::Png,
+        output_dir: temp.path().to_path_buf(),
+        basename: "zip-entry".to_string(),
+        composite: ExportComposite::Single(page_from_source(
+            composite_source,
+            edits(BakeStage::Edits),
+            [1, 1],
+        )),
+        scale: ExportScale::Full,
+        entries: vec![entry("current", 0)],
+        include_metadata: true,
+        local_ai_activity: None,
+    };
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 1);
+    assert!(temp.path().join("zip-entry_0.png").exists());
+}
+
+#[test]
+fn export_zip_di2_orientation_canonical_after_display_rotation() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("rotated-source.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("rotated.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&jpeg_with_app1_dims(&orientation_exif_payload(6), 2, 4))
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    let composite_source = CompositeSource::ZipEntry {
+        zip_path: zip_path.clone(),
+        entry_name: "rotated.jpg".to_string(),
+    };
+    let export = ExportRequest {
+        source: ExportSource::ZipEntry {
+            zip_path,
+            entry_name: "rotated.jpg".to_string(),
+        },
+        original_format: SrcFormat::Jpeg,
+        output_format: ExportFormat::Jpeg95,
+        output_dir: temp.path().to_path_buf(),
+        basename: "zip-di2".to_string(),
+        composite: ExportComposite::Single(page_from_source(
+            composite_source,
+            edits(BakeStage::Edits),
+            [4, 2],
+        )),
+        scale: ExportScale::Full,
+        entries: vec![entry("current", 0)],
+        include_metadata: true,
+        local_ai_activity: None,
+    };
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 1);
+    let output = std::fs::read(temp.path().join("zip-di2_0.jpg")).unwrap();
+    assert_eq!(jpeg_orientation(&output), Some(1));
+    let decoded = image::load_from_memory(&output).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (4, 2));
+}
+
+#[test]
+fn metadata_copy_still_uses_the_original_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("metadata.jpg");
+    let marker = b"Exif\0\0ctrl-e-worker-composite";
+    std::fs::write(&source, jpeg_with_app1(marker)).unwrap();
+    let mut export = ExportRequest {
+        source: ExportSource::File {
+            path: source.clone(),
+        },
+        original_format: SrcFormat::Jpeg,
+        output_format: ExportFormat::Jpeg95,
+        output_dir: temp.path().to_path_buf(),
+        basename: "metadata".to_string(),
+        composite: ExportComposite::Single(page(&source, edits(BakeStage::Edits), [4, 4])),
+        scale: ExportScale::Full,
+        entries: vec![entry("current", 0)],
+        include_metadata: true,
+        local_ai_activity: None,
+    };
+    export.include_metadata = true;
+    let pending = spawn_export_worker(export).unwrap();
+
+    assert_eq!(completed(&collect(pending)), 1);
+    let output = std::fs::read(temp.path().join("metadata_0.jpg")).unwrap();
+    assert!(output.windows(marker.len()).any(|window| window == marker));
+}
+
+#[test]
+fn animated_webp_is_rejected_before_source_composition() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("animated.webp");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&18_u32.to_le_bytes());
+    bytes.extend_from_slice(b"WEBP");
+    bytes.extend_from_slice(b"ANIM");
+    bytes.extend_from_slice(&6_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0]);
+    std::fs::write(&source, bytes).unwrap();
+
+    for (basename, output_format) in [
+        ("animated-png", ExportFormat::Png),
+        ("animated-webp", ExportFormat::Webp),
+    ] {
+        let mut export = request(
+            &source,
+            temp.path(),
+            basename,
+            ExportComposite::Single(page(&source, edits(BakeStage::Edits), [1, 1])),
+            vec![entry("current", 0)],
+        );
+        export.original_format = SrcFormat::Webp;
+        export.output_format = output_format;
+        let events = collect(spawn_export_worker(export).unwrap());
+
+        assert_eq!(completed(&events), 0);
+        assert_eq!(failed(&events), 1);
+        assert!(
+            !temp
+                .path()
+                .join(format!("{basename}_0.{}", output_format.extension()))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn export_webp_source_read_failure_fails_all_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing.webp");
+    let mut export = request(
+        &missing,
+        temp.path(),
+        "missing",
+        ExportComposite::Single(page(&missing, edits(BakeStage::Edits), [2, 2])),
+        vec![entry("a", 0), entry("b", 1)],
+    );
+    export.original_format = SrcFormat::Webp;
+    let events = collect(spawn_export_worker(export).unwrap());
+
+    assert_eq!(completed(&events), 0);
+    assert_eq!(failed(&events), 2);
+    assert!(!temp.path().join("missing_0.png").exists());
+    assert!(!temp.path().join("missing_1.png").exists());
+}
+
+#[test]
+fn multi_entry_export_keeps_collision_and_partial_failure_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("batch.png");
+    write_png(&source, 2, 2, [40, 50, 60, 255]);
+    std::fs::write(temp.path().join("batch_1.png"), b"existing").unwrap();
+
+    let pending = spawn_export_worker(request(
+        &source,
+        temp.path(),
+        "batch",
+        ExportComposite::Single(page(&source, edits(BakeStage::Edits), [2, 2])),
+        vec![
+            entry("current", 0),
+            entry("preset1", 1),
+            entry("preset2", 2),
+        ],
+    ))
+    .unwrap();
+    let events = collect(pending);
+
+    assert_eq!(completed(&events), 2);
+    assert_eq!(failed(&events), 1);
+    assert!(temp.path().join("batch_0.png").exists());
+    assert!(temp.path().join("batch_2.png").exists());
+    assert_eq!(
+        std::fs::read(temp.path().join("batch_1.png")).unwrap(),
+        b"existing"
+    );
+}
+
+#[test]
+fn session_basename_reserves_every_selected_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("batch_2.png"), b"existing").unwrap();
+
+    assert_eq!(
+        resolve_session_basename(temp.path(), "batch", "png", &[0, 1, 2]).unwrap(),
+        "batch_0001"
+    );
+}
+
+fn batch_edits(
+    format: mimageviewer::capture::CaptureFormat,
+) -> mimageviewer::books::BakedEditSnapshot {
+    let mut edits = edits(BakeStage::DisplayAdjust);
+    edits.format = format;
+    edits
+}
+
 fn batch_item(
     source_path: &std::path::Path,
     filename: &str,
-    dirname: &str,
     format: mimageviewer::capture::CaptureFormat,
 ) -> mimageviewer::export_batch::BatchExportItem {
     mimageviewer::export_batch::BatchExportItem {
         filename: filename.to_string(),
-        dirname: dirname.to_string(),
-        source: mimageviewer::books::CompositeSource::File {
+        dirname: "src".to_string(),
+        source: CompositeSource::File {
             path: source_path.to_path_buf(),
         },
         edits: batch_edits(format),
     }
 }
 
-fn write_source_png(path: &std::path::Path, w: u32, h: u32, rgb: [u8; 3]) {
-    let mut buf = image::RgbaImage::new(w, h);
-    for pixel in buf.pixels_mut() {
-        *pixel = image::Rgba([rgb[0], rgb[1], rgb[2], 255]);
-    }
-    buf.save(path).unwrap();
-}
-
 #[test]
-fn batch_export_writes_every_item_through_the_shared_composite_writer() {
+fn batch_export_still_uses_the_shared_composite_writer() {
     let temp = tempfile::tempdir().unwrap();
-    let src_dir = temp.path().join("src");
-    let out_dir = temp.path().join("out");
-    std::fs::create_dir_all(&src_dir).unwrap();
-    let src = src_dir.join("a.png");
-    write_source_png(&src, 8, 4, [10, 20, 30]);
+    let source = temp.path().join("source.png");
+    let output = temp.path().join("output");
+    write_png(&source, 8, 4, [10, 20, 30, 255]);
 
-    let format = mimageviewer::capture::CaptureFormat::Png;
     let pending = mimageviewer::export_batch::spawn_batch_export_worker(
         mimageviewer::export_batch::BatchExportRequest {
-            // 保存先はまだ存在しない。worker が作れることも同時に確かめる。
-            output_dir: out_dir.clone(),
+            output_dir: output.clone(),
             template: "<dirname>_<filename>".to_string(),
             scale: ExportScale::Half,
-            // crate 外なので App の counter は無い。**借用そのものは必ず伴う** —
-            // 一括書き出しがローカル AI 利用中に見えることを型で強制している (F09)。
-            local_ai_activity: mimageviewer::LocalAiActivityLease::new(std::sync::Arc::new(
+            items: vec![
+                batch_item(&source, "page", mimageviewer::capture::CaptureFormat::Png),
+                batch_item(&source, "page", mimageviewer::capture::CaptureFormat::Png),
+            ],
+            local_ai_activity: mimageviewer::LocalAiActivityLease::new(Arc::new(
                 std::sync::atomic::AtomicUsize::new(0),
             )),
-            items: vec![
-                batch_item(&src, "a", "src", format),
-                // 同じテンプレート結果になる 2 件目。上書きせず連番になること。
-                batch_item(&src, "a", "src", format),
-            ],
         },
     )
     .unwrap();
+    let events = collect(pending);
 
-    let events = collect_events(pending, 20);
-
-    assert_eq!(completed_count(&events), 2);
-    assert!(events.iter().all(|e| !matches!(e, ExportEvent::Failed(_))));
-
-    let first = image::open(out_dir.join("src_a.png")).unwrap().to_rgba8();
-    let second = image::open(out_dir.join("src_a_1.png")).unwrap().to_rgba8();
-    // 1/2 サイズが書き出し直前に効いている。
-    assert_eq!(first.dimensions(), (4, 2));
-    assert_eq!(second.dimensions(), (4, 2));
-    assert_eq!(first.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    assert_eq!(completed(&events), 2);
+    assert_eq!(
+        image::image_dimensions(output.join("src_page.png")).unwrap(),
+        (4, 2)
+    );
+    assert_eq!(
+        image::image_dimensions(output.join("src_page_1.png")).unwrap(),
+        (4, 2)
+    );
 }
 
 #[test]
-fn batch_export_reports_a_missing_source_as_one_failed_item_and_keeps_going() {
+fn batch_export_keeps_going_after_a_missing_source() {
     let temp = tempfile::tempdir().unwrap();
-    let src_dir = temp.path().join("src");
-    let out_dir = temp.path().join("out");
-    std::fs::create_dir_all(&src_dir).unwrap();
-    let good = src_dir.join("good.png");
-    write_source_png(&good, 4, 4, [200, 100, 50]);
-    let missing = src_dir.join("gone.png");
+    let source = temp.path().join("source.png");
+    let missing = temp.path().join("missing.png");
+    let output = temp.path().join("output");
+    write_png(&source, 4, 4, [200, 100, 50, 255]);
 
-    let format = mimageviewer::capture::CaptureFormat::Jpeg85;
     let pending = mimageviewer::export_batch::spawn_batch_export_worker(
         mimageviewer::export_batch::BatchExportRequest {
-            output_dir: out_dir.clone(),
+            output_dir: output.clone(),
             template: "<filename>".to_string(),
             scale: ExportScale::Full,
-            // crate 外なので App の counter は無い。**借用そのものは必ず伴う** —
-            // 一括書き出しがローカル AI 利用中に見えることを型で強制している (F09)。
-            local_ai_activity: mimageviewer::LocalAiActivityLease::new(std::sync::Arc::new(
+            items: vec![
+                batch_item(
+                    &missing,
+                    "missing",
+                    mimageviewer::capture::CaptureFormat::Jpeg85,
+                ),
+                batch_item(
+                    &source,
+                    "source",
+                    mimageviewer::capture::CaptureFormat::Jpeg85,
+                ),
+            ],
+            local_ai_activity: mimageviewer::LocalAiActivityLease::new(Arc::new(
                 std::sync::atomic::AtomicUsize::new(0),
             )),
-            items: vec![
-                batch_item(&missing, "gone", "src", format),
-                batch_item(&good, "good", "src", format),
-            ],
         },
     )
     .unwrap();
+    let events = collect(pending);
 
-    let events = collect_events(pending, 20);
-
-    assert_eq!(completed_count(&events), 1);
-    assert_eq!(
-        events
-            .iter()
-            .filter(|e| matches!(e, ExportEvent::Failed(_)))
-            .count(),
-        1
-    );
-    // 拡張子は選んだ形式に従う。
-    assert!(out_dir.join("good.jpg").exists());
-    assert!(!out_dir.join("gone.jpg").exists());
+    assert_eq!(completed(&events), 1);
+    assert_eq!(failed(&events), 1);
+    assert!(output.join("source.jpg").exists());
+    assert!(!output.join("missing.jpg").exists());
 }

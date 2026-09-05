@@ -135,6 +135,7 @@ impl VideoScaleFallbackReason {
 pub(super) struct VideoSurfaceSizeInput {
     pub filter: VideoScaleFilter,
     pub panorama_active: bool,
+    pub video_zoom_active: bool,
     pub source_width: u32,
     pub source_height: u32,
     pub sar_num: u32,
@@ -173,7 +174,8 @@ pub(super) enum VideoSurfaceSizeDecision {
 pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSurfaceSizeDecision {
     let source_width = input.source_width.max(1);
     let source_height = input.source_height.max(1);
-    if !input.panorama_active && input.filter == VideoScaleFilter::OsDefault {
+    let full_display_region = input.panorama_active || input.video_zoom_active;
+    if !full_display_region && input.filter == VideoScaleFilter::OsDefault {
         return VideoSurfaceSizeDecision::LegacySource {
             width: source_width,
             height: source_height,
@@ -182,10 +184,10 @@ pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSu
 
     let target_rect =
         compute_video_visual_target_rect(input.viewport_width, input.viewport_height, input.layout);
-    let (target_width, target_height) = if input.panorama_active {
-        // A spherical camera view owns the full video display region. Fitting
-        // the encoded 2:1 equirectangular frame here would incorrectly retain
-        // its ordinary-playback letterbox bars.
+    let (target_width, target_height) = if full_display_region {
+        // Interactive display modes own the full video display region. Fitting
+        // the encoded frame here would retain ordinary-playback letterbox bars
+        // and force a swap-chain resize on every normal-video zoom step.
         (
             target_rect.width.round().clamp(1.0, u32::MAX as f32) as u32,
             target_rect.height.round().clamp(1.0, u32::MAX as f32) as u32,
@@ -263,6 +265,7 @@ mod tests {
         VideoSurfaceSizeInput {
             filter,
             panorama_active: false,
+            video_zoom_active: false,
             source_width: 640,
             source_height: 360,
             sar_num: 1,
@@ -315,6 +318,23 @@ mod tests {
             VideoSurfaceSizeDecision::DisplayResolution {
                 width: 1920,
                 height: 1080,
+            }
+        );
+    }
+
+    #[test]
+    fn video_zoom_uses_the_full_display_region_even_with_os_default() {
+        let mut case = input(VideoScaleFilter::OsDefault);
+        case.video_zoom_active = true;
+        case.source_width = 1920;
+        case.source_height = 1080;
+        case.viewport_width = 1000;
+        case.viewport_height = 1000;
+        assert_eq!(
+            decide_video_surface_size(case),
+            VideoSurfaceSizeDecision::DisplayResolution {
+                width: 1000,
+                height: 1000,
             }
         );
     }

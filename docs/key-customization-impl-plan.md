@@ -494,7 +494,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   - ExternalToolPicker / ExternalTool1..10 / ExternalToolForContainer も既定未割り当ての
     Grid 操作 (P)。動的 Action は作らず、固定 10 スロットを登録順のツールへ対応させる。
     ツールの並べ替えでスロットとの対応が変わるため、設定 UI では番号を明示する。
-- GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
+- GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P) /
+  GridCopyFiles `Ctrl+C` (P) / GridCutFiles `Ctrl+X` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
@@ -510,8 +511,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
-- GridClipboardCopy/Cut/Paste `Ctrl+C/X/V`、D&D、右クリック操作は
-  OS/clipboard/マウス経路を含むため本計画では固定。
+- GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
+  Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 
 ### FsSharedNavigation (画像 / 動画で実際に共有)

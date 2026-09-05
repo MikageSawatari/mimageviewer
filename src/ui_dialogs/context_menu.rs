@@ -6,8 +6,9 @@ use std::sync::mpsc;
 
 use crate::app::is_synthetic_view_path;
 use crate::context_menu_model::{
-    AssociatedAppMenuEntry, ContextMenuActionState, ContextMenuInput, ContextMenuItemKind,
-    ContextMenuSurface, ContextMenuViewFlags, ExternalToolMenuEntry, MenuCommand, MenuNode,
+    AssociatedAppMenuEntry, CheckedFileOperationSelection, ContextMenuActionState,
+    ContextMenuInput, ContextMenuItemKind, ContextMenuSurface, ContextMenuViewFlags,
+    ExternalToolMenuEntry, MenuCommand, MenuNode,
 };
 use crate::grid_item::{GridItem, checked_virtual_selection_message};
 use crate::native_context_menu::{
@@ -284,14 +285,6 @@ fn native_menu_command_closes_fullscreen(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CheckedFileOperationSelection {
-    Empty,
-    RealOnly,
-    VirtualOnly,
-    Mixed,
-}
-
 /// チェック選択全体と、ある実ファイル操作が扱える対象数の関係を分類する。
 ///
 /// 呼び出し側は `supported_count` に操作別の resolver 結果を渡す。これにより
@@ -313,6 +306,7 @@ struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
     real_paths: Vec<PathBuf>,
     delete_targets: Vec<(usize, PathBuf)>,
+    checked_file_operation_selection: CheckedFileOperationSelection,
     item: GridItem,
     item_index: Option<usize>,
     is_folder_context: bool,
@@ -1122,10 +1116,18 @@ impl crate::app::App {
         let checked_targets = has_checked
             .then(|| self.collect_checked_indexed_paths())
             .unwrap_or_default();
+        let checked_file_operation_selection = if has_checked {
+            classify_checked_file_operation_selection(self.checked.len(), checked_targets.len())
+        } else {
+            CheckedFileOperationSelection::Empty
+        };
         let real_paths: Vec<PathBuf> = if is_folder_context {
             folder_command_target.iter().cloned().collect()
         } else if has_checked {
-            self.collect_checked_paths()
+            checked_targets
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect()
         } else {
             item.drag_source_path()
                 .map(Path::to_path_buf)
@@ -1137,17 +1139,11 @@ impl crate::app::App {
                 .as_ref()
                 .map(|folder| vec![folder.clone()])
         } else if has_checked {
-            if self.checked.is_empty()
-                || self.checked.iter().any(|&idx| {
-                    self.items
-                        .get(idx)
-                        .and_then(GridItem::file_operation_path)
-                        .is_none()
-                })
-            {
-                None
-            } else {
-                Some(real_paths.clone())
+            match checked_file_operation_selection {
+                CheckedFileOperationSelection::RealOnly => Some(real_paths.clone()),
+                CheckedFileOperationSelection::Empty
+                | CheckedFileOperationSelection::VirtualOnly
+                | CheckedFileOperationSelection::Mixed => None,
             }
         } else {
             item.drag_source_path().map(|path| vec![path.to_path_buf()])
@@ -1197,6 +1193,7 @@ impl crate::app::App {
             shell_paths,
             real_paths,
             delete_targets,
+            checked_file_operation_selection,
             item,
             item_index: (!is_folder_context).then_some(idx),
             is_folder_context,
@@ -1254,6 +1251,7 @@ impl crate::app::App {
             is_folder_context: target.is_folder_context,
             has_checked: target.has_checked,
             checked_count: target.checked_count,
+            checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
@@ -1265,19 +1263,25 @@ impl crate::app::App {
             // 操作カスタマイズで変えても native / egui の両メニューに以前のキーが出る
             // (v3.5.0 レビュー F16)。面によって回転の action が違う。
             shortcuts: {
-                let (rotate_ccw, rotate_cw, deselect) = match target.surface {
+                let (cut, copy, rotate_ccw, rotate_cw, deselect) = match target.surface {
                     ContextMenuSurface::Grid => (
+                        Some(crate::keymap::KeyAction::GridCutFiles),
+                        Some(crate::keymap::KeyAction::GridCopyFiles),
                         crate::keymap::KeyAction::GridRotateCcw,
                         crate::keymap::KeyAction::GridRotateCw,
                         Some(crate::keymap::KeyAction::GridDeselect),
                     ),
                     ContextMenuSurface::Fullscreen => (
+                        None,
+                        None,
                         crate::keymap::KeyAction::FsRotateCcw,
                         crate::keymap::KeyAction::FsRotateCw,
                         None,
                     ),
                 };
                 crate::context_menu_model::ContextMenuShortcutLabels {
+                    cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
+                    copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
                     rotate_left: self.keymap.first_chord_label(rotate_ccw),
                     rotate_right: self.keymap.first_chord_label(rotate_cw),
                     deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
@@ -1385,6 +1389,31 @@ impl crate::app::App {
         command: MenuCommand,
         target: &NativeGridContextMenuTarget,
     ) -> Option<ContextMenuAction> {
+        self.dispatch_native_grid_context_command_with_shell_clipboard(
+            ctx,
+            command,
+            target,
+            |app, ctx, paths, verb| {
+                app.invoke_shell_clipboard_verb_for_paths(ctx, paths, verb);
+            },
+        )
+    }
+
+    fn dispatch_native_grid_context_command_with_shell_clipboard<F>(
+        &mut self,
+        ctx: &egui::Context,
+        command: MenuCommand,
+        target: &NativeGridContextMenuTarget,
+        invoke_shell_clipboard: F,
+    ) -> Option<ContextMenuAction>
+    where
+        F: FnOnce(
+            &mut Self,
+            &egui::Context,
+            &[PathBuf],
+            crate::native_context_menu::ShellClipboardVerb,
+        ),
+    {
         match command {
             MenuCommand::NewFolder => {
                 if target.is_folder_context
@@ -1424,12 +1453,30 @@ impl crate::app::App {
                 }
                 None
             }
+            MenuCommand::CutFiles | MenuCommand::CopyFiles => {
+                let verb = if command == MenuCommand::CutFiles {
+                    crate::native_context_menu::ShellClipboardVerb::Cut
+                } else {
+                    crate::native_context_menu::ShellClipboardVerb::Copy
+                };
+                if let Some(paths) = target.shell_paths.as_deref() {
+                    invoke_shell_clipboard(self, ctx, paths, verb);
+                } else if target.has_checked {
+                    self.show_feedback_toast(checked_virtual_selection_message("コピー / カット"));
+                } else {
+                    let message = target
+                        .item
+                        .file_operation_refusal()
+                        .unwrap_or(crate::grid_item::FileOperationRefusal::VirtualPage)
+                        .message("コピー / カット");
+                    self.show_feedback_toast(message);
+                }
+                None
+            }
             MenuCommand::CopyPath | MenuCommand::CopyRepresentativePath => {
                 if target.has_checked
-                    && classify_checked_file_operation_selection(
-                        target.checked_count,
-                        target.real_paths.len(),
-                    ) != CheckedFileOperationSelection::RealOnly
+                    && target.checked_file_operation_selection
+                        != CheckedFileOperationSelection::RealOnly
                 {
                     self.show_feedback_toast(checked_virtual_selection_message(
                         "ファイルのパスとしてコピー",
@@ -1614,10 +1661,8 @@ impl crate::app::App {
             }
             MenuCommand::MoveToRecycleBin => {
                 if target.has_checked
-                    && classify_checked_file_operation_selection(
-                        target.checked_count,
-                        target.delete_targets.len(),
-                    ) != CheckedFileOperationSelection::RealOnly
+                    && target.checked_file_operation_selection
+                        != CheckedFileOperationSelection::RealOnly
                 {
                     self.show_feedback_toast(checked_virtual_selection_message("削除"));
                     return None;
@@ -1772,23 +1817,11 @@ impl crate::app::App {
         }
         close_fullscreen
     }
-    /// チェック済みアイテムの Shell ファイル操作対象を収集する。
-    pub(crate) fn collect_checked_paths(&self) -> Vec<PathBuf> {
-        self.checked
-            .iter()
-            .filter_map(|&idx| {
-                self.items
-                    .get(idx)
-                    .and_then(GridItem::file_operation_path)
-                    .map(Path::to_path_buf)
-            })
-            .collect()
-    }
-
-    /// チェック済みアイテムの削除対象 (idx, path) を収集する (降順ソート)。
+    /// チェック済みアイテムの Shell ファイル操作対象 (idx, path) を収集する。
     ///
-    /// 通常の UI ではフォルダをチェックできないが、削除は単一選択フォルダも対象にするため、
-    /// ここも実ファイル / 実フォルダを返す `drag_source_path` に揃える。
+    /// サブフォルダ展開が使える通常のローカルフォルダ一覧では、Space でフォルダも
+    /// チェックできる。ファイルとフォルダのどちらも返す `drag_source_path` を正本の
+    /// 述語とし、削除時にインデックスがずれないよう降順で返す。
     pub(crate) fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
         let mut targets: Vec<(usize, PathBuf)> = Vec::new();
         for &idx in &self.checked {
@@ -2546,6 +2579,7 @@ mod delete_confirm_tests {
             shell_paths: path.clone().map(|path| vec![path]),
             real_paths: path.into_iter().collect(),
             delete_targets: Vec::new(),
+            checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             item,
             item_index: Some(0),
             is_folder_context: false,
@@ -2578,6 +2612,24 @@ mod delete_confirm_tests {
         commands
     }
 
+    fn menu_labels(nodes: &[MenuNode]) -> Vec<String> {
+        fn visit(nodes: &[MenuNode], labels: &mut Vec<String>) {
+            for node in nodes {
+                match node {
+                    MenuNode::Item { label, .. } => labels.push(label.clone()),
+                    MenuNode::Submenu { label, children } => {
+                        labels.push(label.clone());
+                        visit(children, labels);
+                    }
+                    MenuNode::Separator => {}
+                }
+            }
+        }
+        let mut labels = Vec::new();
+        visit(nodes, &mut labels);
+        labels
+    }
+
     #[test]
     fn checked_file_operation_selection_classifies_real_virtual_and_mixed() {
         assert_eq!(
@@ -2608,6 +2660,7 @@ mod delete_confirm_tests {
         );
         target.has_checked = true;
         target.checked_count = 2;
+        target.checked_file_operation_selection = CheckedFileOperationSelection::Mixed;
         target.real_paths = vec![PathBuf::from(r"C:\media\real.jpg")];
         target.delete_targets = vec![(0, PathBuf::from(r"C:\media\real.jpg"))];
 
@@ -2651,6 +2704,123 @@ mod delete_confirm_tests {
             "virtual_item"
         );
         assert!(!app.context_menu_nodes(&target, false).is_empty());
+    }
+
+    #[test]
+    fn checked_folder_and_file_keep_shell_paths_and_enabled_cut_copy() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder_path = PathBuf::from(r"C:\media\folder");
+        let image_path = PathBuf::from(r"C:\media\image.jpg");
+        app.items = vec![
+            GridItem::Folder(folder_path.clone()),
+            GridItem::Image(image_path.clone()),
+        ];
+        app.checked.extend([0, 1]);
+
+        let target = app.context_menu_target(
+            1,
+            app.items[1].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+
+        assert_eq!(
+            target.shell_paths,
+            Some(vec![image_path, folder_path]),
+            "Space でチェック可能なフォルダを含んでも Windows メニュー対象を失わない"
+        );
+        assert_eq!(
+            target.checked_file_operation_selection,
+            CheckedFileOperationSelection::RealOnly
+        );
+        assert_eq!(
+            native_grid_context_menu_target_kind(&target),
+            "checked_paths"
+        );
+        let nodes = app.context_menu_nodes(&target, false);
+        for command in [MenuCommand::CutFiles, MenuCommand::CopyFiles] {
+            assert!(nodes.iter().any(|node| {
+                matches!(
+                    node,
+                    MenuNode::Item {
+                        command: found,
+                        enabled: true,
+                        disabled_reason: None,
+                        ..
+                    } if *found == command
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn context_cut_copy_dispatch_use_the_resolved_keyboard_path_set_and_shell_verb() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\media\folder")),
+            GridItem::Image(PathBuf::from(r"C:\media\image.jpg")),
+        ];
+        app.checked.extend([0, 1]);
+        let target = app.context_menu_target(
+            1,
+            app.items[1].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(PathBuf::from(r"C:\media")),
+        );
+        let keyboard_paths = app.collect_shell_clipboard_paths().unwrap();
+        assert_eq!(target.shell_paths.as_ref(), Some(&keyboard_paths));
+
+        for (command, expected_verb) in [
+            (
+                MenuCommand::CutFiles,
+                crate::native_context_menu::ShellClipboardVerb::Cut,
+            ),
+            (
+                MenuCommand::CopyFiles,
+                crate::native_context_menu::ShellClipboardVerb::Copy,
+            ),
+        ] {
+            let mut invoked = None;
+            let action = app.dispatch_native_grid_context_command_with_shell_clipboard(
+                &egui::Context::default(),
+                command,
+                &target,
+                |_, _, paths, verb| invoked = Some((paths.to_vec(), verb)),
+            );
+            assert!(action.is_none());
+            assert_eq!(invoked, Some((keyboard_paths.clone(), expected_verb)));
+        }
+    }
+
+    #[test]
+    fn file_cut_copy_labels_follow_keymap_overrides_and_unbinding() {
+        let mut app = crate::app::setup_app_for_test();
+        let target = target(
+            GridItem::Image(PathBuf::from(r"C:\media\image.jpg")),
+            ContextMenuSurface::Grid,
+        );
+
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCutFiles = Alt+X\nGridCopyFiles = Alt+C\n",
+        );
+        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        assert!(labels.contains(&"切り取り (Alt+X)".to_string()));
+        assert!(labels.contains(&"コピー (Alt+C)".to_string()));
+
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCutFiles = none\nGridCopyFiles = none\n",
+        );
+        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        assert!(labels.contains(&"切り取り".to_string()));
+        assert!(labels.contains(&"コピー".to_string()));
+        assert!(!labels.iter().any(|label| label.starts_with("切り取り (")));
+        assert!(!labels.iter().any(|label| label.starts_with("コピー (")));
     }
 
     #[test]
@@ -2818,6 +2988,7 @@ mod delete_confirm_tests {
             shell_paths: Some(vec![PathBuf::from(r"C:\media\checked-other.jpg")]),
             real_paths: vec![PathBuf::from(r"C:\media\checked-other.jpg")],
             delete_targets: vec![(0, PathBuf::from(r"C:\media\checked-other.jpg"))],
+            checked_file_operation_selection: CheckedFileOperationSelection::RealOnly,
             item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             item_index: Some(0),
             is_folder_context: false,

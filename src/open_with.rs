@@ -108,7 +108,7 @@ fn enumerate_handlers_inner(
     Ok(result)
 }
 
-/// ファイル選択ダイアログで .exe を選ばせ、(表示名, exeパス) を返す。
+/// ファイル選択ダイアログで実行ファイルまたはスクリプトを選ばせ、選択結果を返す。
 /// キャンセル時は None。
 #[cfg(windows)]
 pub fn pick_exe_dialog() -> Option<PickedExecutable> {
@@ -117,14 +117,18 @@ pub fn pick_exe_dialog() -> Option<PickedExecutable> {
     };
     use windows::core::PCWSTR;
 
-    // フィルタ文字列: "実行ファイル (*.exe)\0*.exe\0\0"
-    let filter: Vec<u16> = "実行ファイル (*.exe)\0*.exe\0\0".encode_utf16().collect();
+    // 起動可否は拡張子の固定リストではなく、直接 spawn できるか、Windows に
+    // 関連付けがあるかで決まる。ここへスクリプト拡張子を列挙して第二の正本を作らない。
+    let filter: Vec<u16> = "実行ファイル (*.exe)\0*.exe\0すべてのファイル (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
 
     let mut file_buf = vec![0u16; 512];
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
     ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+    ofn.nFilterIndex = 1;
     ofn.lpstrFile = windows::core::PWSTR(file_buf.as_mut_ptr());
     ofn.nMaxFile = file_buf.len() as u32;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -686,6 +690,60 @@ fn shell_execute_with_progid(
         }
     }
     Some(outcome)
+}
+
+/// 登録されたプログラム / スクリプトを Windows の `open` verb で開く。
+///
+/// `Command::spawn` が `ERROR_BAD_EXE_FORMAT` を返した後だけ呼ぶ fallback。worker
+/// thread 上で同期的に完了させ、Shell 側のエラー UI は抑止して既存の通知経路へ返す。
+#[cfg(windows)]
+pub(crate) fn shell_execute_open(
+    file: &Path,
+    parameters: Option<&std::ffi::OsStr>,
+    working_directory: Option<&Path>,
+    show_console: bool,
+    owner_hwnd: Option<isize>,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
+    use windows::core::PCWSTR;
+
+    let _com = initialize_com_sta().map_err(|error| format!("COM を初期化できません: {error}"))?;
+    let wide = |value: &std::ffi::OsStr| {
+        value
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let file_wide = wide(file.as_os_str());
+    let parameters_wide = parameters.map(wide);
+    let directory_wide = working_directory.map(|directory| wide(directory.as_os_str()));
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: HWND(owner_hwnd.unwrap_or(0) as *mut core::ffi::c_void),
+        lpVerb: PCWSTR(verb_wide.as_ptr()),
+        lpFile: PCWSTR(file_wide.as_ptr()),
+        lpParameters: parameters_wide
+            .as_ref()
+            .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
+        lpDirectory: directory_wide
+            .as_ref()
+            .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
+        nShow: if show_console {
+            SW_SHOWNORMAL.0
+        } else {
+            SW_HIDE.0
+        },
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|error| format!("ShellExecuteEx: {error}"))
 }
 
 /// ProgID 経路の**件ごとの**結果。

@@ -584,6 +584,15 @@ fn fs_nis(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let scale = params.source_extent / vec2<f32>(params.target_size);
     let source_position =
         params.source_origin + (vec2<f32>(destination) + vec2<f32>(0.5)) * scale - vec2<f32>(0.5);
+    let raw_size = vec2<f32>(params.source_size);
+    let oriented_size = vec2<f32>(
+        dot(abs(params.inverse_x), raw_size),
+        dot(abs(params.inverse_y), raw_size),
+    );
+    if any(source_position < vec2<f32>(-0.5))
+        || any(source_position >= oriented_size - vec2<f32>(0.5)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     let source_floor = vec2<i32>(floor(source_position));
     let fraction = source_position - floor(source_position);
 
