@@ -1459,6 +1459,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-05 バックログ §1.183 で、既存の fullscreen viewport 段別計装へ
+UI thread の実行サイクル数を追加した (本依頼で ClaudeCode が計装のみ・既存境界維持を指定し、
+Codex も症状パッチではない read-only 診断追加と判定):**
+
+**触った範囲**: [src/ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`FsRenderPerfRecorder` と既存 navigation / open / page-decision / passthrough span、
+[src/app.rs](../src/app.rs) の `UpdatePerfRecorder` と
+`PassthroughRenditionPerfRecorder`。既存の各 wall-clock 境界で
+`App::thread_cycles_now()` を併記し、`ui.update_breakdown` /
+`ui.fs_render_breakdown` に `*_cycles`、`total_cycles`、`unaccounted_cycles` を出す。
+detached 述語、viewport ID / lifecycle / registry、runtime / host ownership、geometry /
+placement / focus、描画 source と処理順は変更していない。
+
+**判断理由**: 遅い frame ほど cycles/ms が低い実測から、UI thread が待っている段を
+特定するための計装だけを追加した。新しい guard / delay / retry / repaint / fallback /
+状態 field は無く、perf 無効時は wall clock と cycle counter の双方を読まない。
+したがって detached の症状を隠す変更ではなく、§2 に適合する診断追加である。
+
 **2026-09-04 バックログ §1.183 で、nav / 静止画 / seek の導出キャッシュを viewer context
 単位の owner へ集約した (本依頼で ClaudeCode が単一 owner と context ごとの所有を指定し、
 Codex も症状パッチではなく構造的修正と判定):**
