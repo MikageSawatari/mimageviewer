@@ -27,11 +27,13 @@ use std::time::{Duration, Instant};
 
 use music_core::{
     BassMarkerPlacement, KeyboardAnimationState, KeyboardFrame, KeyboardLayoutCache, KeyboardRect,
-    SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI,
-    SpectrumAnalysis, SpectrumAnalyzer, VisualizationColor, brighten_color, key_color, key_fill,
-    layout_bass_markers_into, layout_keyboard_cached, prepare_keyboard_frame_into, spectrum_color,
-    unlit_key_base, with_alpha,
+    MivSpectrumState, SPECTRUM_BAND_COUNT, SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis,
+    SpectrumAnalyzer, SpectrumVisualRect, VisualizationColor, brighten_color, key_color, key_fill,
+    layout_bass_markers_into, layout_keyboard_cached, prepare_keyboard_frame_into,
+    spectrum_axis_hz, spectrum_color, unlit_key_base, visit_miv_spectrum_primitives, with_alpha,
 };
+#[cfg(test)]
+use music_core::{SPECTRUM_BAND_MIN_MIDI, spectrum_band_hz, spectrum_band_hz_range};
 
 // ── レイアウト・解析定数 (ラボと同値) ──
 /// スペクトラムのバンド数 (E0-C#10、MIDI 半音ごと)。
@@ -40,14 +42,10 @@ const SPECTRUM_BANDS: usize = SPECTRUM_BAND_COUNT;
 const SPECTRUM_KEYBOARD_H: f32 = 34.0;
 /// スペクトラムプロットと鍵盤の間の余白 (px)。
 const SPECTRUM_PANEL_GAP: f32 = 8.0;
-const SPECTRUM_TRAIL_DECAY: f32 = 0.994;
 /// 解析窓の半径 (秒)。再生位置 ±この秒数を切り出して FFT に食わせる。
 const SPECTRUM_SNAPSHOT_RADIUS_SECS: f64 = 1.0;
 const BASS_MARKER_ALPHA_MIN: f32 = 80.0;
 const BASS_MARKER_ALPHA_MAX: f32 = 255.0;
-const SPECTRUM_ANALYSIS_MIN_HZ: f32 = 20.0;
-const SPECTRUM_AXIS_MIN_HZ: f32 = SPECTRUM_ANALYSIS_MIN_HZ;
-const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 
 /// スペクトラム更新のリクエスト間隔。再生中はフレーム毎に届くが、この間隔で throttle して
 /// 過剰リクエストを抑える (1 フレーム 1 リクエストが上限)。
@@ -180,26 +178,31 @@ struct MusicSpectrumRequest {
     center_secs: f64,
 }
 
+struct MusicSpectrumResult {
+    center_secs: f64,
+    analysis: SpectrumAnalysis,
+}
+
 /// 音楽ビュー下段スペクトラムの状態 + 常駐ワーカーのハンドル。
 ///
 /// `TimelineTextureCache` (`ui_music_timeline`) と同じく、ワーカー配線と描画状態を 1 つの
 /// 構造体に閉じて `App` を薄く保つ。
 pub struct MusicSpectrumState {
     tx: Option<mpsc::Sender<MusicSpectrumRequest>>,
-    rx: Option<mpsc::Receiver<SpectrumAnalysis>>,
+    rx: Option<mpsc::Receiver<MusicSpectrumResult>>,
     cancel: Option<Arc<AtomicBool>>,
     /// 送信済みで結果待ちのリクエストが in-flight か (常に高々 1 件)。
     pending: bool,
     last_request: Option<Instant>,
     /// 直近リクエストした中心位置 (秒)。一時停止中は変化時のみ再リクエストする。
     last_center: f64,
+    /// `bands` / `notes` を解析した音声時刻。描画状態もこの時刻だけで進める。
+    analysis_center: f64,
     // ── 描画状態 (draw で毎フレーム減衰更新) ──
     bands: Vec<f32>,
     notes: Vec<f32>,
     note_min_midi: u8,
-    trail: Vec<f32>,
-    prev_bands: Vec<f32>,
-    onsets: Vec<f32>,
+    spectrum_visual: MivSpectrumState,
     keyboard: KeyboardAnimationState,
     keyboard_frame: KeyboardFrame,
     keyboard_layout: KeyboardLayoutCache,
@@ -220,12 +223,11 @@ impl Default for MusicSpectrumState {
             pending: false,
             last_request: None,
             last_center: f64::NEG_INFINITY,
+            analysis_center: 0.0,
             bands: Vec::new(),
             notes: Vec::new(),
             note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
-            trail: Vec::new(),
-            prev_bands: Vec::new(),
-            onsets: Vec::new(),
+            spectrum_visual: MivSpectrumState::default(),
             keyboard: KeyboardAnimationState::default(),
             keyboard_frame: KeyboardFrame::default(),
             keyboard_layout: KeyboardLayoutCache::default(),
@@ -249,15 +251,14 @@ impl MusicSpectrumState {
         self.bands.clear();
         self.notes.clear();
         self.note_min_midi = SPECTRUM_NOTE_MIN_MIDI;
-        self.trail.clear();
-        self.prev_bands.clear();
-        self.onsets.clear();
+        self.spectrum_visual.clear();
         self.keyboard.clear();
         self.keyboard_layout.clear();
         self.bass_markers.clear();
         self.pending = false;
         self.last_request = None;
         self.last_center = f64::NEG_INFINITY;
+        self.analysis_center = 0.0;
         self.source_present = false;
         self.source_complete = false;
     }
@@ -283,7 +284,7 @@ impl MusicSpectrumState {
             return;
         }
         let (request_tx, request_rx) = mpsc::channel::<MusicSpectrumRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<SpectrumAnalysis>();
+        let (result_tx, result_rx) = mpsc::channel::<MusicSpectrumResult>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let spawned = std::thread::Builder::new()
@@ -357,8 +358,8 @@ impl MusicSpectrumState {
         let mut latest = None;
         loop {
             match rx.try_recv() {
-                Ok(analysis) => {
-                    latest = Some(analysis);
+                Ok(result) => {
+                    latest = Some(result);
                     self.pending = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -368,7 +369,9 @@ impl MusicSpectrumState {
                 }
             }
         }
-        if let Some(analysis) = latest {
+        if let Some(result) = latest {
+            let analysis = result.analysis;
+            self.analysis_center = result.center_secs;
             self.note_min_midi = analysis.note_min_midi;
             self.bands = analysis.bands;
             self.notes = analysis.notes;
@@ -446,72 +449,30 @@ impl MusicSpectrumState {
             }
             return;
         }
-        let band_len = self.bands.len();
-        if self.trail.len() != band_len {
-            self.trail.clear();
-            self.trail.resize(band_len, 0.0);
-        }
-        if self.prev_bands.len() != band_len {
-            self.prev_bands.clear();
-            self.prev_bands.extend_from_slice(&self.bands);
-        }
-        if self.onsets.len() != band_len {
-            self.onsets.clear();
-            self.onsets.resize(band_len, 0.0);
-        }
-
-        for i in 0..band_len {
-            let value = self.bands[i].clamp(0.0, 1.0);
-            let rise = (value - self.prev_bands[i]).max(0.0);
-            self.onsets[i] = (self.onsets[i] * 0.86).max((rise * 2.8).clamp(0.0, 1.0));
-            self.prev_bands[i] = self.prev_bands[i] * 0.25 + value * 0.75;
-            self.trail[i] = (self.trail[i] * SPECTRUM_TRAIL_DECAY).max(value);
-            let (band_low_hz, band_high_hz) = spectrum_band_hz_range(i, band_len);
-            let x0 = (spectrum_axis_x(plot, band_low_hz) + 0.25).max(plot.left());
-            let x1 = (spectrum_axis_x(plot, band_high_hz) - 0.25)
-                .max(x0 + 0.75)
-                .min(plot.right());
-            let band_corner = if x1 - x0 < 2.0 { 0.0 } else { 1.0 };
-            let ghost_h = (plot.height() - 3.0) * (self.trail[i] * 0.72).max(0.012);
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2((x0 - 0.45).max(plot.left()), plot.bottom() - 2.0 - ghost_h),
-                    egui::pos2((x1 + 0.45).min(plot.right()), plot.bottom() - 2.0),
-                ),
-                band_corner,
-                egui_color(with_alpha(spectrum_color(i, band_len, self.trail[i]), 48)),
+        let visual = self
+            .spectrum_visual
+            .frame_at(&self.bands, self.analysis_center);
+        visit_miv_spectrum_primitives(visual, spectrum_visual_rect(plot), |primitive| {
+            let mut color = spectrum_color(
+                primitive.band_index,
+                primitive.band_count,
+                primitive.color_value,
             );
-            let trail_h = (plot.height() - 3.0) * self.trail[i].max(0.015);
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2((x0 - 0.2).max(plot.left()), plot.bottom() - 2.0 - trail_h),
-                    egui::pos2((x1 + 0.2).min(plot.right()), plot.bottom() - 2.0),
-                ),
-                band_corner,
-                egui_color(with_alpha(spectrum_color(i, band_len, self.trail[i]), 100)),
-            );
-            let h = (plot.height() - 3.0) * value.max(0.015);
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x0, plot.bottom() - 2.0 - h),
-                    egui::pos2(x1, plot.bottom() - 2.0),
-                ),
-                band_corner,
-                egui_color(spectrum_color(i, band_len, value)),
-            );
-            let onset = self.onsets[i].clamp(0.0, 1.0);
-            if onset > 0.025 {
-                let accent = brighten_color(spectrum_color(i, band_len, value.max(onset)), 1.18);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x0, plot.bottom() - 2.0 - h),
-                        egui::pos2(x1, plot.bottom() - 2.0),
-                    ),
-                    band_corner,
-                    egui_color(with_alpha(accent, (24.0 + onset * 68.0) as u8)),
-                );
+            if primitive.brightness_scale != 1.0 {
+                color = brighten_color(color, primitive.brightness_scale);
             }
-        }
+            if let Some(alpha) = primitive.alpha_override {
+                color = with_alpha(color, alpha);
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(primitive.rect.left, primitive.rect.top),
+                    egui::pos2(primitive.rect.right, primitive.rect.bottom),
+                ),
+                primitive.corner_radius_px,
+                egui_color(color),
+            );
+        });
 
         if let Some(pointer) = response
             .hover_pos()
@@ -546,7 +507,7 @@ impl MusicSpectrumState {
 
 fn run_music_spectrum_worker(
     request_rx: mpsc::Receiver<MusicSpectrumRequest>,
-    result_tx: mpsc::Sender<SpectrumAnalysis>,
+    result_tx: mpsc::Sender<MusicSpectrumResult>,
     cancel: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BANDS);
@@ -562,8 +523,11 @@ fn run_music_spectrum_worker(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let analysis = compute_spectrum(&mut analyzer, &request);
-        if result_tx.send(analysis).is_err() {
+        let result = MusicSpectrumResult {
+            center_secs: request.center_secs,
+            analysis: compute_spectrum(&mut analyzer, &request),
+        };
+        if result_tx.send(result).is_err() {
             break;
         }
     }
@@ -621,7 +585,7 @@ fn spectrum_window_range(
 
 fn draw_spectrum_hover(painter: &egui::Painter, plot: egui::Rect, pointer: egui::Pos2) {
     let x = pointer.x.clamp(plot.left(), plot.right());
-    let hz = spectrum_axis_hz(plot, x);
+    let hz = spectrum_axis_hz(spectrum_visual_rect(plot), x);
     let label = format!("{:.1} Hz  {}", hz, note_label_for_hz(hz));
     painter.line_segment(
         [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
@@ -800,48 +764,8 @@ fn fill_key_gradient(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn spectrum_axis_x(rect: egui::Rect, hz: f32) -> f32 {
-    let min = SPECTRUM_AXIS_MIN_HZ;
-    let max = SPECTRUM_VIEW_MAX_HZ;
-    let t = (hz.clamp(min, max).log2() - min.log2()) / (max.log2() - min.log2());
-    rect.left() + t.clamp(0.0, 1.0) * rect.width()
-}
-
-fn spectrum_axis_hz(rect: egui::Rect, x: f32) -> f32 {
-    let min = SPECTRUM_AXIS_MIN_HZ;
-    let max = SPECTRUM_VIEW_MAX_HZ;
-    let t = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-    2.0_f32.powf(min.log2() + t * (max.log2() - min.log2()))
-}
-
-#[cfg(test)]
-fn spectrum_band_hz(index: usize, total: usize) -> f32 {
-    spectrum_band_midi(index, total).map_or(SPECTRUM_ANALYSIS_MIN_HZ, midi_to_hz)
-}
-
-fn spectrum_band_hz_range(index: usize, total: usize) -> (f32, f32) {
-    let Some(midi) = spectrum_band_midi(index, total) else {
-        let half = 2.0_f32.powf(1.0 / 24.0);
-        return (
-            SPECTRUM_ANALYSIS_MIN_HZ / half,
-            SPECTRUM_ANALYSIS_MIN_HZ * half,
-        );
-    };
-    let center = midi_to_hz(midi);
-    let half_step = 2.0_f32.powf(1.0 / 24.0);
-    (center / half_step, center * half_step)
-}
-
-fn spectrum_band_midi(index: usize, total: usize) -> Option<u8> {
-    if total == 0 || index >= total {
-        return None;
-    }
-    let midi = SPECTRUM_BAND_MIN_MIDI as usize + index;
-    (midi <= SPECTRUM_BAND_MAX_MIDI as usize).then_some(midi as u8)
-}
-
-fn midi_to_hz(midi: u8) -> f32 {
-    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+fn spectrum_visual_rect(rect: egui::Rect) -> SpectrumVisualRect {
+    SpectrumVisualRect::new(rect.left(), rect.top(), rect.right(), rect.bottom())
 }
 
 fn note_label_for_hz(hz: f32) -> String {

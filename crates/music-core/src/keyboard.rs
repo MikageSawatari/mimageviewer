@@ -6,7 +6,10 @@
 
 use std::collections::VecDeque;
 
-use crate::{SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, apply_display_gain_db};
+use crate::{
+    SPECTRUM_NOTE_MAX_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumVisualRect, apply_display_gain_db,
+    midi_to_hz, spectrum_axis_x_unclamped,
+};
 
 const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
 const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
@@ -40,8 +43,6 @@ const KEY_BLACK_WIDTH_RATIO: f32 = 0.70;
 const KEY_BLACK_HEIGHT_RATIO: f32 = 0.68;
 const KEYBOARD_DISPLAY_MIN_MIDI: u8 = 12;
 const KEYBOARD_DISPLAY_MAX_MIDI: u8 = 143;
-const SPECTRUM_AXIS_MIN_HZ: f32 = 20.0;
-const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 
 pub const KEYBOARD_NOTE_COUNT: usize =
     (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
@@ -305,7 +306,7 @@ pub fn prepare_keyboard_frame_into(
 pub fn layout_keyboard(frame: &KeyboardFrame, rect: KeyboardRect) -> KeyboardLayout {
     let mut octave_guides_x = Vec::new();
     for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
-        let x = spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
+        let x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
         if x > rect.left && x < rect.right {
             octave_guides_x.push(x);
         }
@@ -667,8 +668,8 @@ fn conventional_key_rect(rect: KeyboardRect, midi: u8, black: bool) -> Option<Ke
 }
 
 fn conventional_octave_geometry(rect: KeyboardRect, octave_c: u8) -> Option<(f32, f32)> {
-    let c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c));
-    let next_c_x = spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c.saturating_add(12)));
+    let c_x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c));
+    let next_c_x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c.saturating_add(12)));
     let octave_w = next_c_x - c_x;
     if octave_w <= 1.0 {
         return None;
@@ -677,15 +678,11 @@ fn conventional_octave_geometry(rect: KeyboardRect, octave_c: u8) -> Option<(f32
     Some((c_x - white_w * 0.5, white_w))
 }
 
-fn spectrum_axis_x_unclamped(rect: KeyboardRect, hz: f32) -> f32 {
-    let min = SPECTRUM_AXIS_MIN_HZ;
-    let max = SPECTRUM_VIEW_MAX_HZ;
-    let t = (hz.max(1.0).log2() - min.log2()) / (max.log2() - min.log2());
-    rect.left + t * rect.width()
-}
-
-fn midi_to_hz(midi: u8) -> f32 {
-    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+fn shared_spectrum_axis_x_unclamped(rect: KeyboardRect, hz: f32) -> f32 {
+    spectrum_axis_x_unclamped(
+        SpectrumVisualRect::new(rect.left, rect.top, rect.right, rect.bottom),
+        hz,
+    )
 }
 
 fn is_black_key(midi: u8) -> bool {

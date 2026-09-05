@@ -650,9 +650,13 @@ fn available_targets(layer: &Layer) -> Vec<ModulationTarget> {
         targets.push(ModulationTarget::FillBrightness);
     }
     if let LayerKind::Spectrum(spectrum) = &layer.kind {
-        targets.push(ModulationTarget::SpectrumThickness);
-        if matches!(spectrum.shape, SpectrumShape::Radial { .. }) {
-            targets.push(ModulationTarget::SpectrumRadius);
+        match spectrum.shape {
+            SpectrumShape::Bars { .. } => targets.push(ModulationTarget::SpectrumThickness),
+            SpectrumShape::Radial { .. } => {
+                targets.push(ModulationTarget::SpectrumThickness);
+                targets.push(ModulationTarget::SpectrumRadius);
+            }
+            SpectrumShape::MivHorizontal => {}
         }
     }
     targets

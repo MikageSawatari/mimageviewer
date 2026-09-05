@@ -1,4 +1,4 @@
-use music_core::{KeyboardFrame, SPECTRUM_NOTE_MIN_MIDI};
+use music_core::{KeyboardFrame, MivSpectrumFrame, SPECTRUM_NOTE_MIN_MIDI};
 
 use crate::model::{
     Fill, Fit, Glow, GradientStops, ImageId, LayerKind, ModulationTarget, ModulatorValue,
@@ -11,6 +11,7 @@ pub struct SpectrumFrame {
     pub notes: Vec<f32>,
     pub note_min_midi: u8,
     pub keyboard: KeyboardFrame,
+    pub miv_spectrum: MivSpectrumFrame,
     pub modulators: Vec<ModulatorValue>,
 }
 
@@ -21,6 +22,7 @@ impl SpectrumFrame {
             notes: Vec::new(),
             note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
             keyboard: KeyboardFrame::default(),
+            miv_spectrum: MivSpectrumFrame::default(),
             modulators: Vec::new(),
         }
     }
@@ -36,6 +38,7 @@ impl SpectrumFrame {
             notes,
             note_min_midi,
             keyboard,
+            miv_spectrum: MivSpectrumFrame::default(),
             modulators: Vec::new(),
         }
     }
@@ -70,6 +73,7 @@ pub enum SceneItemKind {
     },
     Spectrum {
         values: Vec<f32>,
+        miv_frame: MivSpectrumFrame,
         point_count: usize,
         shape: SpectrumShape,
         color_mode: MusicColorMode,
@@ -202,8 +206,15 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                     spectrum_thickness_px,
                     spectrum_radius_px,
                 );
+                let mut miv_frame = if shape == SpectrumShape::MivHorizontal {
+                    spectrum.miv_spectrum.clone()
+                } else {
+                    MivSpectrumFrame::default()
+                };
+                miv_frame.bands.truncate(layer.band_count);
                 SceneItemKind::Spectrum {
                     values,
+                    miv_frame,
                     point_count: layer.point_count.max(1),
                     shape,
                     color_mode: layer.color_mode,
@@ -304,6 +315,7 @@ fn modulate_spectrum_shape(
             sweep_deg,
             direction,
         },
+        SpectrumShape::MivHorizontal => SpectrumShape::MivHorizontal,
     }
 }
 
@@ -384,6 +396,7 @@ fn sanitize_spectrum_shape(shape: SpectrumShape) -> SpectrumShape {
             sweep_deg: finite_or(sweep_deg, 360.0),
             direction,
         },
+        SpectrumShape::MivHorizontal => SpectrumShape::MivHorizontal,
     }
 }
 

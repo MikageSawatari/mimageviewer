@@ -14,7 +14,7 @@ use musicvideo_core::{
     MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
     ModulatorSource, Project, RenderReport, ScaledImageCacheStats, Scene, SceneItemKind, Smoothing,
     SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
-    new_band_energy_modulator, norm_rect_to_pixels, render_frame,
+    new_band_energy_modulator, new_miv_spectrum_keyboard_layers, norm_rect_to_pixels, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -719,9 +719,10 @@ pub fn run_benchmark(frames: usize, font: &FontData) -> Result<(), String> {
     if frames == 0 {
         return Err("ベンチマークのフレーム数は 1 以上を指定してください".to_owned());
     }
-    let without_glow = benchmark_once(frames, font, false, false)?;
-    let with_glow = benchmark_once(frames, font, true, false)?;
-    let with_modulation = benchmark_once(frames, font, true, true)?;
+    let without_glow = benchmark_once(frames, font, false, false, false)?;
+    let with_glow = benchmark_once(frames, font, true, false, false)?;
+    let with_modulation = benchmark_once(frames, font, true, true, false)?;
+    let with_miv_spectrum = benchmark_once(frames, font, true, true, true)?;
     println!(
         "musicvideo benchmark glow_delta: composition_mean_ms={:.3} composition_p95_ms={:.3}",
         with_glow.composition.mean_ms - without_glow.composition.mean_ms,
@@ -733,6 +734,12 @@ pub fn run_benchmark(frames: usize, font: &FontData) -> Result<(), String> {
         with_modulation.composition.mean_ms - with_glow.composition.mean_ms,
         with_modulation.total.mean_ms - with_glow.total.mean_ms,
     );
+    println!(
+        "musicvideo benchmark miv_horizontal_delta: analysis_mean_ms={:.3} composition_mean_ms={:.3} total_mean_ms={:.3}",
+        with_miv_spectrum.analysis.mean_ms - with_modulation.analysis.mean_ms,
+        with_miv_spectrum.composition.mean_ms - with_modulation.composition.mean_ms,
+        with_miv_spectrum.total.mean_ms - with_modulation.total.mean_ms,
+    );
     Ok(())
 }
 
@@ -741,13 +748,19 @@ fn benchmark_once(
     font: &FontData,
     glow_enabled: bool,
     modulation_enabled: bool,
+    miv_spectrum_enabled: bool,
 ) -> Result<RenderStats, String> {
     let assets = create_assets(Some(font))?;
     assets.insert_image(
         ImageId::new(BACKGROUND_ID),
         synthetic_background(BENCHMARK_BACKGROUND_WIDTH, BENCHMARK_BACKGROUND_HEIGHT),
     );
-    let project = benchmark_project(frames as f64 / 60.0, glow_enabled, modulation_enabled);
+    let project = benchmark_project(
+        frames as f64 / 60.0,
+        glow_enabled,
+        modulation_enabled,
+        miv_spectrum_enabled,
+    );
     let pcm = synthetic_chirp_pcm(project.duration_secs + 1.0);
     let mut spectrum = SpectrumSource::new(
         BENCHMARK_SAMPLE_RATE,
@@ -805,9 +818,10 @@ fn benchmark_once(
     let cache_after_measurement = assets.scaled_image_cache_stats();
     validate_benchmark_cache(cache_after_warmup, cache_after_measurement, frames as u64)?;
     println!(
-        "musicvideo benchmark: glow={} modulation={} keyboard=on frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
+        "musicvideo benchmark: glow={} modulation={} keyboard=on miv_horizontal={} frames={} resolution={}x{} fps={:.3} analysis_mean_ms={:.3} analysis_p95_ms={:.3} composition_mean_ms={:.3} composition_p95_ms={:.3} total_mean_ms={:.3} total_p95_ms={:.3} realtime_ratio={:.3}",
         if glow_enabled { "on" } else { "off" },
         if modulation_enabled { "on" } else { "off" },
+        if miv_spectrum_enabled { "on" } else { "off" },
         stats.frames,
         stats.width,
         stats.height,
@@ -839,9 +853,19 @@ fn benchmark_once(
     Ok(stats)
 }
 
-fn benchmark_project(duration_secs: f64, glow_enabled: bool, modulation_enabled: bool) -> Project {
+fn benchmark_project(
+    duration_secs: f64,
+    glow_enabled: bool,
+    modulation_enabled: bool,
+    miv_spectrum_enabled: bool,
+) -> Project {
     let mut project = default_project(duration_secs);
-    project.layers.push(new_pitch_keyboard_layer(&project));
+    if miv_spectrum_enabled {
+        let layers = new_miv_spectrum_keyboard_layers(&project);
+        project.layers.extend(layers);
+    } else {
+        project.layers.push(new_pitch_keyboard_layer(&project));
+    }
     if !glow_enabled {
         for layer in &mut project.layers {
             layer.glow = musicvideo_core::Animatable::Const(None);
@@ -1312,7 +1336,7 @@ mod tests {
 
     #[test]
     fn benchmark_scene_includes_the_pitch_keyboard_path() {
-        let project = benchmark_project(10.0, true, true);
+        let project = benchmark_project(10.0, true, true, false);
         assert!(
             project
                 .layers
@@ -1321,6 +1345,22 @@ mod tests {
         );
         assert_eq!(project.modulators.len(), 1);
         assert_eq!(project.layers[1].modulations.len(), 1);
+    }
+
+    #[test]
+    fn benchmark_can_cover_the_shared_miv_horizontal_spectrum_path() {
+        let project = benchmark_project(10.0, true, true, true);
+        assert!(project.layers.iter().any(|layer| matches!(
+            &layer.kind,
+            LayerKind::Spectrum(spectrum)
+                if spectrum.shape == musicvideo_core::SpectrumShape::MivHorizontal
+        )));
+        assert!(
+            project
+                .layers
+                .iter()
+                .any(|layer| matches!(&layer.kind, LayerKind::PitchKeyboard(_)))
+        );
     }
 
     #[test]

@@ -17,9 +17,10 @@ pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 use egui::TextureHandle;
 use musicvideo_core::{
     Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind,
-    ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8, SpectrumDirection,
-    SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer,
-    new_linear_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
+    MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8,
+    SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat,
+    TimeTextLayer, new_linear_spectrum_layer, new_miv_spectrum_keyboard_layers,
+    new_miv_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
     new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
 
@@ -125,6 +126,8 @@ enum NewLayerPreset {
     Image,
     RadialSpectrum,
     LinearSpectrum,
+    MivSpectrum,
+    MivSpectrumKeyboard,
     PitchKeyboard,
     ProgressBar,
     TimeText,
@@ -132,10 +135,15 @@ enum NewLayerPreset {
     Solid,
 }
 
-const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 8] = [
+const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 10] = [
     (NewLayerPreset::Image, "画像"),
     (NewLayerPreset::RadialSpectrum, "円形スペクトラム"),
     (NewLayerPreset::LinearSpectrum, "直線スペクトラム"),
+    (NewLayerPreset::MivSpectrum, "mIV と同じ横長スペクトラム"),
+    (
+        NewLayerPreset::MivSpectrumKeyboard,
+        "mIV スペクトラム + 鍵盤",
+    ),
     (NewLayerPreset::PitchKeyboard, "ピッチ鍵盤"),
     (NewLayerPreset::ProgressBar, "進捗バー"),
     (NewLayerPreset::TimeText, "時間表示"),
@@ -228,19 +236,29 @@ pub fn draw_editor(
                         }
                     });
                     if let Some(preset) = new_layer {
-                        let layer = match preset {
+                        let layers = match preset {
                             NewLayerPreset::Image => {
                                 unreachable!("画像の選択は呼び出し側が所有します")
                             }
-                            NewLayerPreset::RadialSpectrum => new_radial_spectrum_layer(project),
-                            NewLayerPreset::LinearSpectrum => new_linear_spectrum_layer(project),
-                            NewLayerPreset::PitchKeyboard => new_pitch_keyboard_layer(project),
-                            NewLayerPreset::ProgressBar => new_progress_bar_layer(project),
-                            NewLayerPreset::TimeText => new_time_text_layer(project),
-                            NewLayerPreset::Text => new_text_layer(project),
-                            NewLayerPreset::Solid => new_solid_layer(project),
+                            NewLayerPreset::RadialSpectrum => {
+                                vec![new_radial_spectrum_layer(project)]
+                            }
+                            NewLayerPreset::LinearSpectrum => {
+                                vec![new_linear_spectrum_layer(project)]
+                            }
+                            NewLayerPreset::MivSpectrum => vec![new_miv_spectrum_layer(project)],
+                            NewLayerPreset::MivSpectrumKeyboard => {
+                                new_miv_spectrum_keyboard_layers(project).into()
+                            }
+                            NewLayerPreset::PitchKeyboard => {
+                                vec![new_pitch_keyboard_layer(project)]
+                            }
+                            NewLayerPreset::ProgressBar => vec![new_progress_bar_layer(project)],
+                            NewLayerPreset::TimeText => vec![new_time_text_layer(project)],
+                            NewLayerPreset::Text => vec![new_text_layer(project)],
+                            NewLayerPreset::Solid => vec![new_solid_layer(project)],
                         };
-                        project.layers.push(layer);
+                        project.layers.extend(layers);
                         state.selected_layer = project.layers.len() - 1;
                         state.selected_key = None;
                         project_changed = true;
@@ -609,33 +627,50 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
                 .prefix("解析バンド "),
         )
         .changed();
-    changed |= ui
-        .add(
-            egui::DragValue::new(&mut spectrum.point_count)
-                .range(1..=4096)
-                .prefix("描画点 "),
-        )
-        .changed();
-    let mut radial = matches!(spectrum.shape, SpectrumShape::Radial { .. });
-    let was_radial = radial;
+    if spectrum.shape != SpectrumShape::MivHorizontal {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut spectrum.point_count)
+                    .range(1..=4096)
+                    .prefix("描画点 "),
+            )
+            .changed();
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DisplayMode {
+        EqualBars,
+        MivHorizontal,
+        Radial,
+    }
+    let mut mode = match spectrum.shape {
+        SpectrumShape::Bars { .. } => DisplayMode::EqualBars,
+        SpectrumShape::MivHorizontal => DisplayMode::MivHorizontal,
+        SpectrumShape::Radial { .. } => DisplayMode::Radial,
+    };
+    let previous_mode = mode;
     ui.horizontal(|ui| {
-        ui.radio_value(&mut radial, false, "直線");
-        ui.radio_value(&mut radial, true, "円形");
+        ui.radio_value(&mut mode, DisplayMode::EqualBars, "等間隔の直線");
+        ui.radio_value(&mut mode, DisplayMode::MivHorizontal, "mIV と同じ横長");
+        ui.radio_value(&mut mode, DisplayMode::Radial, "円形");
     });
-    if radial != was_radial {
-        spectrum.shape = if radial {
-            SpectrumShape::Radial {
+    if mode != previous_mode {
+        spectrum.shape = match mode {
+            DisplayMode::Radial => SpectrumShape::Radial {
                 radius_px: 380.0,
                 thickness_px: 4.0,
                 start_angle_deg: -90.0,
                 sweep_deg: 360.0,
                 direction: SpectrumDirection::Clockwise,
-            }
-        } else {
-            SpectrumShape::Bars {
+            },
+            DisplayMode::EqualBars => SpectrumShape::Bars {
                 gap_ratio: 0.3,
                 min_height_px: 3.0,
                 thickness_px: 12.0,
+            },
+            DisplayMode::MivHorizontal => {
+                spectrum.band_count = MIV_SPECTRUM_BANDS;
+                spectrum.point_count = MIV_SPECTRUM_BANDS;
+                SpectrumShape::MivHorizontal
             }
         };
         changed = true;
@@ -679,6 +714,9 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
                     .radio_value(direction, SpectrumDirection::CounterClockwise, "反時計回り")
                     .changed();
             });
+        }
+        SpectrumShape::MivHorizontal => {
+            ui.weak("対数周波数軸・3 枚の残光・立ち上がり強調を mIV 本体と共有します");
         }
     }
     changed |= edit_music_color_mode(ui, &mut spectrum.color_mode);
@@ -881,6 +919,8 @@ mod tests {
                 "画像",
                 "円形スペクトラム",
                 "直線スペクトラム",
+                "mIV と同じ横長スペクトラム",
+                "mIV スペクトラム + 鍵盤",
                 "ピッチ鍵盤",
                 "進捗バー",
                 "時間表示",

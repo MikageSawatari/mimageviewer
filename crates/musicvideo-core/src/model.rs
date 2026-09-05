@@ -269,6 +269,8 @@ pub enum SpectrumShape {
         sweep_deg: f32,
         direction: SpectrumDirection,
     },
+    /// mIV 本体と同じ対数周波数軸・残光・立ち上がり強調の横長表示。
+    MivHorizontal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ pub const DEFAULT_OUTPUT: Output = Output {
     fps: 60.0,
 };
 pub const DEFAULT_SPECTRUM_BANDS: usize = 96;
+pub const MIV_SPECTRUM_BANDS: usize = music_core::SPECTRUM_BAND_COUNT;
 pub const PROJECT_VERSION: u32 = 1;
 pub const KICK_ATTACK_SECS: f32 = 0.015;
 pub const KICK_RELEASE_SECS: f32 = 0.18;
@@ -190,6 +191,37 @@ pub fn new_linear_spectrum_layer(project: &Project) -> Layer {
         },
         96,
     )
+}
+
+pub fn new_miv_spectrum_layer(project: &Project) -> Layer {
+    let mut layer = new_spectrum_layer(
+        project,
+        "mIV 横長スペクトラム",
+        NormRect::new(0.05, 0.55, 0.9, 0.24),
+        SpectrumShape::MivHorizontal,
+        MIV_SPECTRUM_BANDS,
+    );
+    let LayerKind::Spectrum(spectrum) = &mut layer.kind else {
+        unreachable!("new_spectrum_layer always returns a spectrum")
+    };
+    spectrum.band_count = MIV_SPECTRUM_BANDS;
+    spectrum.color_mode = MusicColorMode::Miv;
+    layer
+}
+
+/// 同じ対数周波数軸と矩形幅を共有する、mIV 横長スペクトラム + 鍵盤の組を返す。
+pub fn new_miv_spectrum_keyboard_layers(project: &Project) -> [Layer; 2] {
+    let spectrum = new_miv_spectrum_layer(project);
+    let mut with_spectrum = project.clone();
+    with_spectrum.layers.push(spectrum.clone());
+    let mut keyboard = new_pitch_keyboard_layer(&with_spectrum);
+    keyboard.name = unique_layer_name(&with_spectrum, "mIV ピッチ鍵盤");
+    keyboard.rect = Animatable::Const(NormRect::new(0.05, 0.8, 0.9, 0.08));
+    let LayerKind::PitchKeyboard(keyboard_layer) = &mut keyboard.kind else {
+        unreachable!("new_pitch_keyboard_layer always returns a keyboard")
+    };
+    keyboard_layer.color_mode = MusicColorMode::Miv;
+    [spectrum, keyboard]
 }
 
 pub fn new_radial_spectrum_layer(project: &Project) -> Layer {
@@ -424,6 +456,7 @@ mod tests {
         let presets = [
             new_radial_spectrum_layer(&project),
             new_linear_spectrum_layer(&project),
+            new_miv_spectrum_layer(&project),
             new_pitch_keyboard_layer(&project),
             new_progress_bar_layer(&project),
             new_time_text_layer(&project),
@@ -456,11 +489,20 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            &presets[2].kind,
+            LayerKind::Spectrum(SpectrumLayer {
+                shape: SpectrumShape::MivHorizontal,
+                color_mode: MusicColorMode::Miv,
+                ..
+            })
+        ));
         assert_eq!(
             presets.map(|layer| layer.name),
             [
                 "円形スペクトラム 2",
                 "直線スペクトラム",
+                "mIV 横長スペクトラム",
                 "ピッチ鍵盤",
                 "進捗バー 2",
                 "時間表示 2",
@@ -468,6 +510,27 @@ mod tests {
                 "単色",
             ]
         );
+    }
+
+    #[test]
+    fn miv_spectrum_keyboard_preset_shares_width_axis_and_unique_ids() {
+        let project = default_project(10.0);
+        let [spectrum, keyboard] = new_miv_spectrum_keyboard_layers(&project);
+        let spectrum_rect = spectrum.rect.evaluate(0.0);
+        let keyboard_rect = keyboard.rect.evaluate(0.0);
+        assert_eq!(spectrum.id, LayerId(5));
+        assert_eq!(keyboard.id, LayerId(6));
+        assert_eq!(spectrum_rect.x, keyboard_rect.x);
+        assert_eq!(spectrum_rect.width, keyboard_rect.width);
+        assert_eq!(spectrum.name, "mIV 横長スペクトラム");
+        assert_eq!(keyboard.name, "mIV ピッチ鍵盤");
+        assert!(matches!(
+            keyboard.kind,
+            LayerKind::PitchKeyboard(PitchKeyboardLayer {
+                color_mode: MusicColorMode::Miv,
+                ..
+            })
+        ));
     }
 
     #[test]

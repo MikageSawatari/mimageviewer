@@ -1,7 +1,7 @@
 use std::fmt;
 
 use music_core::{
-    KeyboardAnimationState, SpectrumAnalysis, SpectrumAnalyzer, SpectrumRange,
+    KeyboardAnimationState, MivSpectrumState, SpectrumAnalysis, SpectrumAnalyzer, SpectrumRange,
     SpectrumRangeRequest, SpectrumWeighting, apply_display_gain_db, prepare_keyboard_frame_into,
 };
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,7 @@ pub struct SpectrumSource {
     analyzer: SpectrumAnalyzer,
     analysis: SpectrumAnalysis,
     keyboard: KeyboardAnimationState,
+    miv_spectrum: MivSpectrumState,
     full_frame: SpectrumFrame,
     full_frame_valid: bool,
     full_frame_gain_bits: Option<u32>,
@@ -155,6 +156,7 @@ impl SpectrumSource {
             analyzer: SpectrumAnalyzer::new(band_count),
             analysis: SpectrumAnalysis::default(),
             keyboard: KeyboardAnimationState::default(),
+            miv_spectrum: MivSpectrumState::default(),
             full_frame: SpectrumFrame::default(),
             full_frame_valid: false,
             full_frame_gain_bits: None,
@@ -187,6 +189,10 @@ impl SpectrumSource {
             self.full_frame.bands.clone_from(&self.analysis.bands);
             self.full_frame.notes.clone_from(&self.analysis.notes);
             self.full_frame.note_min_midi = self.analysis.note_min_midi;
+            self.full_frame.miv_spectrum.clone_from(
+                self.miv_spectrum
+                    .frame_at(&self.analysis.bands, self.last_t.unwrap_or(0.0)),
+            );
             self.full_frame
                 .modulators
                 .clone_from(&self.modulator_values);
@@ -321,6 +327,7 @@ impl SpectrumSource {
         self.analyzer = SpectrumAnalyzer::new(self.band_count);
         self.analysis = SpectrumAnalysis::default();
         self.keyboard.clear();
+        self.miv_spectrum.clear();
         self.full_frame_valid = false;
         self.full_frame_gain_bits = None;
         self.modulator_values.clear();
@@ -754,6 +761,15 @@ mod tests {
         let first = source.full_frame_at(&pcm, 0.5, 0.0).clone();
         assert_eq!(first.bands.len(), 64);
         assert_eq!(first.notes.len(), music_core::KEYBOARD_NOTE_COUNT);
+        assert_eq!(first.miv_spectrum.bands.len(), 64);
+        assert!(
+            first
+                .miv_spectrum
+                .bands
+                .iter()
+                .zip(&first.bands)
+                .all(|(visual, band)| visual.value.to_bits() == band.clamp(0.0, 1.0).to_bits())
+        );
         assert_eq!(first.note_min_midi, music_core::SPECTRUM_NOTE_MIN_MIDI);
         assert_eq!(first.keyboard.note_min_midi, first.note_min_midi);
         assert!(first.keyboard.levels.iter().any(|level| level.center > 0.0));
@@ -761,6 +777,23 @@ mod tests {
         let repeated = source.full_frame_at(&pcm, 0.5, 0.0).clone();
         assert_eq!(first, repeated);
         assert_eq!(source.frame_at(&pcm, 0.5), first.bands);
+    }
+
+    #[test]
+    fn miv_visual_sequence_is_bit_exact_after_reset() {
+        let pcm = tone();
+        let times = [0.0, 1.0 / 60.0, 2.0 / 60.0, 3.0 / 60.0];
+        let mut source = SpectrumSource::new(48_000, 64, Smoothing::None).unwrap();
+        let first = times
+            .iter()
+            .map(|time| source.full_frame_at(&pcm, *time, 0.0).miv_spectrum.clone())
+            .collect::<Vec<_>>();
+        source.reset();
+        let second = times
+            .iter()
+            .map(|time| source.full_frame_at(&pcm, *time, 0.0).miv_spectrum.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first, second);
     }
 
     #[test]

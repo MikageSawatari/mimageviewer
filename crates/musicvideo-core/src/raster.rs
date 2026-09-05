@@ -6,9 +6,11 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use music_core::{
-    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, VisualizationColor,
-    key_fill as miv_key_fill, layout_keyboard_cached, lerp_color as miv_lerp_color,
-    spectrum_color as miv_spectrum_color, unlit_key_base as miv_unlit_key_base,
+    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, MivSpectrumFrame,
+    MivSpectrumPrimitive, SpectrumVisualRect, VisualizationColor,
+    brighten_color as brighten_visualization_color, key_fill as miv_key_fill,
+    layout_keyboard_cached, lerp_color as miv_lerp_color, spectrum_color as miv_spectrum_color,
+    unlit_key_base as miv_unlit_key_base, visit_miv_spectrum_primitives,
 };
 
 use crate::assets::{AssetError, Assets, ImageAsset};
@@ -253,13 +255,14 @@ fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem)
     let color = match &item.kind {
         SceneItemKind::Solid {
             fill: Fill::Solid(color),
-        }
-        | SceneItemKind::Spectrum {
+        } => *color,
+        SceneItemKind::Spectrum {
+            shape,
             color_mode: MusicColorMode::Custom,
             fill: Fill::Solid(color),
             ..
-        }
-        | SceneItemKind::TimeText {
+        } if *shape != SpectrumShape::MivHorizontal => *color,
+        SceneItemKind::TimeText {
             fill: Fill::Solid(color),
             ..
         }
@@ -342,6 +345,7 @@ fn draw_item(
         }
         SceneItemKind::Spectrum {
             values,
+            miv_frame,
             point_count,
             shape,
             color_mode,
@@ -351,6 +355,7 @@ fn draw_item(
             frame,
             rect,
             values,
+            miv_frame,
             *point_count,
             *shape,
             *color_mode,
@@ -792,6 +797,7 @@ fn spectrum_bars(
             sweep_deg,
             direction,
         ),
+        SpectrumShape::MivHorizontal => Vec::new(),
     }
 }
 
@@ -864,6 +870,7 @@ fn draw_spectrum(
     frame: &mut Frame,
     rect: PixelRect,
     values: &[f32],
+    miv_frame: &MivSpectrumFrame,
     point_count: usize,
     shape: SpectrumShape,
     color_mode: MusicColorMode,
@@ -873,6 +880,20 @@ fn draw_spectrum(
     corner_radius_px: f32,
     mask_mode: bool,
 ) {
+    if shape == SpectrumShape::MivHorizontal {
+        draw_miv_spectrum(
+            frame,
+            rect,
+            miv_frame,
+            color_mode,
+            miv_brightness,
+            fill,
+            opacity,
+            corner_radius_px,
+            mask_mode,
+        );
+        return;
+    }
     let bars = spectrum_bars(rect, values, point_count, shape);
     let sampler = FillSampler::new(fill, rect);
     for bar in bars {
@@ -888,6 +909,117 @@ fn draw_spectrum(
             mask_mode,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_miv_spectrum(
+    frame: &mut Frame,
+    clip_rect: PixelRect,
+    visual: &MivSpectrumFrame,
+    color_mode: MusicColorMode,
+    miv_brightness: f32,
+    fill: &Fill,
+    opacity: f32,
+    corner_radius_px: f32,
+    mask_mode: bool,
+) {
+    let sampler = FillSampler::new(fill, clip_rect);
+    let mut primitives = Vec::with_capacity(visual.bands.len() * 4);
+    visit_miv_spectrum_primitives(
+        visual,
+        SpectrumVisualRect::new(
+            clip_rect.x0 as f32,
+            clip_rect.y0 as f32,
+            clip_rect.x1 as f32,
+            clip_rect.y1 as f32,
+        ),
+        |primitive| primitives.push(primitive),
+    );
+    let prepared_colors = primitives
+        .iter()
+        .map(|primitive| prepare_miv_color(*primitive, color_mode, miv_brightness, mask_mode))
+        .collect::<Vec<_>>();
+    let row_bytes = frame.width as usize * 4;
+    frame
+        .rgba
+        .par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .filter(|(y, _)| *y >= clip_rect.y0 && *y < clip_rect.y1)
+        .for_each(|(y, row)| {
+            let py = y as f32 + 0.5;
+            for (primitive, prepared_color) in primitives.iter().zip(&prepared_colors) {
+                if py < primitive.rect.top || py >= primitive.rect.bottom {
+                    continue;
+                }
+                let min_x = primitive.rect.left.floor().max(clip_rect.x0 as f32) as usize;
+                let max_x = primitive.rect.right.ceil().min(clip_rect.x1 as f32) as usize;
+                let band_position = band_position(primitive.band_index, primitive.band_count);
+                for x in min_x..max_x {
+                    let px = x as f32 + 0.5;
+                    let coverage =
+                        visual_rect_coverage(px, py, primitive.rect, primitive.corner_radius_px)
+                            * rounded_rect_coverage(px, py, clip_rect, corner_radius_px);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let mut color = prepared_color
+                        .unwrap_or_else(|| sampler.sample(px, py, Some(band_position), mask_mode));
+                    if prepared_color.is_none() && primitive.brightness_scale != 1.0 {
+                        color = scale_rgb(color, primitive.brightness_scale);
+                    }
+                    if let Some(alpha) = primitive.alpha_override {
+                        color.a = alpha;
+                    }
+                    blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity * coverage);
+                }
+            }
+        });
+}
+
+fn prepare_miv_color(
+    primitive: MivSpectrumPrimitive,
+    color_mode: MusicColorMode,
+    miv_brightness: f32,
+    mask_mode: bool,
+) -> Option<Rgba8> {
+    (color_mode == MusicColorMode::Miv).then(|| {
+        let mut color = miv_spectrum_color(
+            primitive.band_index,
+            primitive.band_count,
+            primitive.color_value,
+        );
+        if primitive.brightness_scale != 1.0 {
+            color = brighten_visualization_color(color, primitive.brightness_scale);
+        }
+        let color = brighten_color(rgba8(color), miv_brightness);
+        if mask_mode {
+            Rgba8::new(255, 255, 255, color.a)
+        } else {
+            color
+        }
+    })
+}
+
+fn visual_rect_coverage(x: f32, y: f32, rect: SpectrumVisualRect, radius_px: f32) -> f32 {
+    let width = (rect.right - rect.left).max(0.0);
+    let height = (rect.bottom - rect.top).max(0.0);
+    let radius = radius_px.max(0.0).min(width.min(height) * 0.5);
+    let center_x = (rect.left + rect.right) * 0.5;
+    let center_y = (rect.top + rect.bottom) * 0.5;
+    let qx = (x - center_x).abs() - (width * 0.5 - radius);
+    let qy = (y - center_y).abs() - (height * 0.5 - radius);
+    let outside = qx.max(0.0).hypot(qy.max(0.0));
+    let inside = qx.max(qy).min(0.0);
+    (0.5 - (outside + inside - radius)).clamp(0.0, 1.0)
+}
+
+fn scale_rgb(color: Rgba8, scale: f32) -> Rgba8 {
+    Rgba8::new(
+        (f32::from(color.r) * scale).min(255.0) as u8,
+        (f32::from(color.g) * scale).min(255.0) as u8,
+        (f32::from(color.b) * scale).min(255.0) as u8,
+        color.a,
+    )
 }
 
 fn draw_spectrum_bar(
@@ -1555,6 +1687,7 @@ fn render_item_mask(
     match &item.kind {
         SceneItemKind::Spectrum {
             values,
+            miv_frame,
             point_count,
             shape,
             color_mode,
@@ -1565,6 +1698,7 @@ fn render_item_mask(
             rect.width(),
             rect.height(),
             values,
+            miv_frame,
             *point_count,
             *shape,
             *color_mode,
@@ -1689,6 +1823,7 @@ fn draw_spectrum_mask(
     width: usize,
     height: usize,
     values: &[f32],
+    miv_frame: &MivSpectrumFrame,
     point_count: usize,
     shape: SpectrumShape,
     color_mode: MusicColorMode,
@@ -1702,6 +1837,18 @@ fn draw_spectrum_mask(
         x1: width,
         y1: height,
     };
+    if shape == SpectrumShape::MivHorizontal {
+        draw_miv_spectrum_mask(
+            alpha,
+            rect,
+            miv_frame,
+            color_mode,
+            fill,
+            opacity,
+            corner_radius_px,
+        );
+        return;
+    }
     let bars = spectrum_bars(rect, values, point_count, shape);
     let sampler = FillSampler::new(fill, rect);
     let solid_alpha = match fill {
@@ -1753,6 +1900,76 @@ fn draw_spectrum_mask(
                 (source as u32 + (destination * (255 - source as u32) + 127) / 255).min(255) as u8;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_miv_spectrum_mask(
+    alpha: &mut [u8],
+    clip_rect: PixelRect,
+    visual: &MivSpectrumFrame,
+    color_mode: MusicColorMode,
+    fill: &Fill,
+    opacity: f32,
+    corner_radius_px: f32,
+) {
+    let sampler = FillSampler::new(fill, clip_rect);
+    let width = clip_rect.width();
+    let mut primitives = Vec::with_capacity(visual.bands.len() * 4);
+    visit_miv_spectrum_primitives(
+        visual,
+        SpectrumVisualRect::new(
+            0.0,
+            0.0,
+            clip_rect.width() as f32,
+            clip_rect.height() as f32,
+        ),
+        |primitive| primitives.push(primitive),
+    );
+    let prepared_alphas = primitives
+        .iter()
+        .map(|primitive| {
+            if let Some(alpha) = primitive.alpha_override {
+                Some(alpha)
+            } else if color_mode == MusicColorMode::Miv {
+                Some(
+                    miv_spectrum_color(
+                        primitive.band_index,
+                        primitive.band_count,
+                        primitive.color_value,
+                    )
+                    .a,
+                )
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    alpha
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let py = y as f32 + 0.5;
+            for (primitive, prepared_alpha) in primitives.iter().zip(&prepared_alphas) {
+                if py < primitive.rect.top || py >= primitive.rect.bottom {
+                    continue;
+                }
+                let min_x = primitive.rect.left.floor().max(0.0) as usize;
+                let max_x = primitive.rect.right.ceil().min(width as f32) as usize;
+                let band_position = band_position(primitive.band_index, primitive.band_count);
+                for x in min_x..max_x {
+                    let px = x as f32 + 0.5;
+                    let coverage =
+                        visual_rect_coverage(px, py, primitive.rect, primitive.corner_radius_px)
+                            * rounded_rect_coverage(px, py, clip_rect, corner_radius_px);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let source_alpha = prepared_alpha
+                        .unwrap_or_else(|| sampler.sample(px, py, Some(band_position), true).a);
+                    blend_mask_pixel(&mut row[x], source_alpha, opacity * coverage);
+                }
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2448,7 +2665,9 @@ mod tests {
     use crate::MAX_SCALED_IMAGE_CACHE_ENTRIES;
     use crate::model::{Fit, GradientStop, GradientStops};
     use music_core::{
-        KeyboardAnimationState, SPECTRUM_NOTE_MIN_MIDI, layout_keyboard, prepare_keyboard_frame,
+        KeyboardAnimationState, KeyboardLevels, MivSpectrumState, SPECTRUM_BAND_COUNT,
+        SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MIN_MIDI, SpectrumVisualRect, layout_keyboard,
+        midi_to_hz, prepare_keyboard_frame, spectrum_axis_x,
     };
 
     fn item(kind: SceneItemKind) -> SceneItem {
@@ -2542,6 +2761,103 @@ mod tests {
         );
         assert_eq!(resample_spectrum(&[0.4], 3), vec![0.4; 3]);
         assert_eq!(resample_spectrum(&[], 2), vec![0.0; 2]);
+    }
+
+    #[test]
+    fn miv_horizontal_peak_and_keyboard_key_share_the_same_pixel_axis() {
+        let width = 640;
+        let height = 240;
+        let spectrum_rect = NormRect::new(0.05, 0.05, 0.9, 0.55);
+        let keyboard_rect = NormRect::new(0.05, 0.65, 0.9, 0.2);
+        let spectrum_pixels = norm_rect_to_pixels(spectrum_rect, width, height);
+        let keyboard_pixels = norm_rect_to_pixels(keyboard_rect, width, height);
+        let midi = 60_u8;
+        let band_index = (midi - SPECTRUM_BAND_MIN_MIDI) as usize;
+        let mut bands = vec![0.0; SPECTRUM_BAND_COUNT];
+        bands[band_index] = 1.0;
+        let mut visual_state = MivSpectrumState::default();
+        let visual = visual_state.frame_at(&bands, 1.0).clone();
+        let mut keyboard = KeyboardFrame::default();
+        keyboard.levels[(midi - keyboard.note_min_midi) as usize] = KeyboardLevels {
+            center: 1.0,
+            even: 0.5,
+            odd: 0.5,
+        };
+
+        let axis_rect = SpectrumVisualRect::new(
+            spectrum_pixels.x0 as f32,
+            spectrum_pixels.y0 as f32,
+            spectrum_pixels.x1 as f32,
+            spectrum_pixels.y1 as f32,
+        );
+        let peak_x = spectrum_axis_x(axis_rect, midi_to_hz(midi));
+        let keyboard_layout = layout_keyboard(
+            &keyboard,
+            KeyboardRect::new(
+                keyboard_pixels.x0 as f32,
+                keyboard_pixels.y0 as f32,
+                keyboard_pixels.x1 as f32,
+                keyboard_pixels.y1 as f32,
+            ),
+        );
+        let key = keyboard_layout
+            .keys
+            .iter()
+            .find(|key| key.midi == midi)
+            .expect("C4 key is visible");
+        assert!((peak_x - key.rect.center_x()).abs() < 0.001);
+
+        let scene = Scene {
+            width,
+            height,
+            items: vec![
+                SceneItem {
+                    rect: spectrum_rect,
+                    opacity: 1.0,
+                    rotation_deg: 0.0,
+                    corner_radius_px: 0.0,
+                    glow: None,
+                    kind: SceneItemKind::Spectrum {
+                        values: bands,
+                        miv_frame: visual,
+                        point_count: SPECTRUM_BAND_COUNT,
+                        shape: SpectrumShape::MivHorizontal,
+                        color_mode: MusicColorMode::Miv,
+                        miv_brightness: 0.0,
+                        fill: Fill::Solid(Rgba8::WHITE),
+                    },
+                },
+                SceneItem {
+                    rect: keyboard_rect,
+                    opacity: 1.0,
+                    rotation_deg: 0.0,
+                    corner_radius_px: 0.0,
+                    glow: None,
+                    kind: SceneItemKind::PitchKeyboard {
+                        keyboard,
+                        background: Fill::Solid(Rgba8::new(0, 0, 0, 0)),
+                        color_mode: MusicColorMode::Miv,
+                        miv_brightness: 0.0,
+                        fill: Fill::Solid(Rgba8::WHITE),
+                    },
+                },
+            ],
+        };
+        let mut first = Frame::new(1, 1).unwrap();
+        let mut second = Frame::new(1, 1).unwrap();
+        let _ = render_frame(&scene, &Assets::default(), &mut first).unwrap();
+        let _ = render_frame(&scene, &Assets::default(), &mut second).unwrap();
+        assert_eq!(first, second);
+
+        let peak_column = peak_x.round() as usize;
+        assert!((spectrum_pixels.y0..spectrum_pixels.y1 - 3).any(|y| pixel(
+            &first,
+            peak_column,
+            y
+        ) != [0, 0, 0, 255]));
+        let key_y = ((key.rect.top + key.rect.bottom) * 0.5).round() as usize;
+        let key_pixel = pixel(&first, peak_column, key_y);
+        assert!(key_pixel[0] != key_pixel[1] || key_pixel[1] != key_pixel[2]);
     }
 
     #[test]
@@ -2647,6 +2963,7 @@ mod tests {
             items: vec![
                 item(SceneItemKind::Spectrum {
                     values: vec![0.1, 0.8, 0.3, 1.0],
+                    miv_frame: MivSpectrumFrame::default(),
                     point_count: 24,
                     shape: SpectrumShape::Bars {
                         gap_ratio: 0.25,
@@ -2901,6 +3218,7 @@ mod tests {
         .unwrap();
         let mut layer = item(SceneItemKind::Spectrum {
             values: vec![0.1, 0.8, 0.3, 1.0],
+            miv_frame: MivSpectrumFrame::default(),
             point_count: 31,
             shape: SpectrumShape::Radial {
                 radius_px: 24.0,
@@ -2944,6 +3262,7 @@ mod tests {
     fn radial_thin_bars_have_analytic_antialiasing() {
         let layer = item(SceneItemKind::Spectrum {
             values: vec![0.2, 0.8, 0.4, 1.0],
+            miv_frame: MivSpectrumFrame::default(),
             point_count: 37,
             shape: SpectrumShape::Radial {
                 radius_px: 32.0,
@@ -2993,6 +3312,7 @@ mod tests {
             values: (0..96)
                 .map(|index| 0.2 + 0.8 * (index as f32 * 0.37).sin().abs())
                 .collect(),
+            miv_frame: MivSpectrumFrame::default(),
             point_count: 200,
             shape: SpectrumShape::Radial {
                 radius_px: 380.0,
