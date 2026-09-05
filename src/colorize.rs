@@ -294,7 +294,39 @@ pub fn take_mono_tone_axis_timing() -> Option<()> {
     None
 }
 
+thread_local! {
+    /// Reused sample and residual buffers.
+    ///
+    /// Both are bounded by `MONO_SAMPLE_LIMIT`, so a fresh `Vec` each call asked the
+    /// process heap for ~200KB and ~64KB every time. Those sizes are above the low
+    /// fragmentation heap's threshold, so they take the general, lock-protected path -
+    /// contended against decode workers allocating megabytes. Measured on 2026-09-05:
+    /// the two allocating parts of this function ran at 12.2% and 11.5% busy while the
+    /// arithmetic between them ran at 98.2%. The wait was the allocator, not the work.
+    static MONO_SCRATCH: std::cell::RefCell<(Vec<[f32; 3]>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
+    // Reentrancy would only mean falling back to owned buffers, never wrong numbers.
+    MONO_SCRATCH
+        .with(|scratch| {
+            scratch.try_borrow_mut().ok().map(|mut buffers| {
+                let (samples, residuals) = &mut *buffers;
+                mono_tone_axis_with(src, samples, residuals)
+            })
+        })
+        .unwrap_or_else(|| {
+            let (mut samples, mut residuals) = (Vec::new(), Vec::new());
+            mono_tone_axis_with(src, &mut samples, &mut residuals)
+        })
+}
+
+fn mono_tone_axis_with(
+    src: &ColorImage,
+    samples: &mut Vec<[f32; 3]>,
+    residuals: &mut Vec<f32>,
+) -> Option<MonoToneAxis> {
     let total = src.pixels.len();
     if total == 0 {
         return None;
@@ -304,14 +336,16 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
     #[cfg(windows)]
     let (t_sample, c_sample) = (std::time::Instant::now(), cycles_now());
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
-    let samples: Vec<[f32; 3]> = src
-        .pixels
-        .iter()
-        .step_by(stride)
-        .filter(|pixel| pixel.a() >= 16)
-        .take(MONO_SAMPLE_LIMIT)
-        .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
-        .collect();
+    samples.clear();
+    samples.reserve(MONO_SAMPLE_LIMIT);
+    samples.extend(
+        src.pixels
+            .iter()
+            .step_by(stride)
+            .filter(|pixel| pixel.a() >= 16)
+            .take(MONO_SAMPLE_LIMIT)
+            .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32]),
+    );
     #[cfg(windows)]
     let (sample_ms, sample_cycles) = (
         t_sample.elapsed().as_secs_f64() * 1000.0,
@@ -325,14 +359,14 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
 
     let inv_n = 1.0 / samples.len() as f32;
     let mut mean = [0.0_f32; 3];
-    for sample in &samples {
+    for sample in samples.iter() {
         for channel in 0..3 {
             mean[channel] += sample[channel] * inv_n;
         }
     }
 
     let mut covariance = [[0.0_f32; 3]; 3];
-    for sample in &samples {
+    for sample in samples.iter() {
         let d = [
             sample[0] - mean[0],
             sample[1] - mean[1],
@@ -370,20 +404,19 @@ pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
     );
     #[cfg(windows)]
     let (t_res, c_res) = (std::time::Instant::now(), cycles_now());
-    let mut residuals = samples
-        .iter()
-        .map(|sample| {
-            let d = [
-                sample[0] - mean[0],
-                sample[1] - mean[1],
-                sample[2] - mean[2],
-            ];
-            let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
-            let residual_sq =
-                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
-            residual_sq.sqrt()
-        })
-        .collect::<Vec<_>>();
+    residuals.clear();
+    residuals.reserve(samples.len());
+    residuals.extend(samples.iter().map(|sample| {
+        let d = [
+            sample[0] - mean[0],
+            sample[1] - mean[1],
+            sample[2] - mean[2],
+        ];
+        let projection = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+        let residual_sq =
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+        residual_sq.sqrt()
+    }));
     let percentile_index = required_mono_inliers(residuals.len()) - 1;
     let (_, p95, _) = residuals.select_nth_unstable_by(percentile_index, |a, b| a.total_cmp(b));
     #[cfg(windows)]
