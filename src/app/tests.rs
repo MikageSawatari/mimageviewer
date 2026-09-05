@@ -20912,7 +20912,11 @@ mod favorite_adjustment_defaults_tests {
         use crate::settings::{Settings, SortOrder};
 
         let mut settings = Settings::default();
-        settings.sort_order = SortOrder::DateDesc;
+        settings.remember_favorite_view_state = true;
+        settings.sort_order = SortOrder::FileName;
+        let mut favorite_state = crate::settings::FavoriteViewState::from_settings(&settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        settings.apply_favorite_view_overlay(uuid::Uuid::new_v4(), &favorite_state);
         let display_order = settings.grid_display_order.clone();
         let names_and_mtimes = [
             ("10.jpg", 100),
@@ -20947,6 +20951,40 @@ mod favorite_adjustment_defaults_tests {
             .collect();
         assert_eq!(archive_names, ["1.jpg", "2.jpg", "10.jpg", "p03.png"]);
 
+        let mut pdf_pages = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 9,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        let mut pdf_metas = vec![Some((10, 0)), Some((20, 0))];
+        crate::grid_item::arrange_grid_items(
+            &mut pdf_pages,
+            &mut pdf_metas,
+            &display_order,
+            Some(BOOK_READING_PAGE_ORDER),
+        );
+        let pdf_page_numbers: Vec<u32> = pdf_pages
+            .iter()
+            .map(|item| match item {
+                GridItem::PdfPage { page_num, .. } => *page_num,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(pdf_page_numbers, [1, 9]);
+
+        assert_eq!(
+            folder_media_sort_order(settings.sort_order, false, true, true, true),
+            BOOK_READING_PAGE_ORDER,
+            "画像のみの本もお気に入りの一覧ソートよりページ順を優先する"
+        );
+
         let mut normal_pages: Vec<GridItem> = names_and_mtimes
             .iter()
             .map(|(name, _)| GridItem::Image(PathBuf::from(name)))
@@ -20969,6 +21007,11 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         assert_eq!(normal_names, ["2.jpg", "1.jpg", "p03.png", "10.jpg"]);
+        assert_eq!(
+            settings.sort_order,
+            SortOrder::DateDesc,
+            "通常フォルダではお気に入りの一覧ソートが有効"
+        );
     }
 
     #[test]

@@ -424,6 +424,13 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   セル外のクリックと一覧差し替えでも対を終了する。egui の triple click は一覧の起動判定には
   使わず、テキスト欄の行選択など他 widget の動作は変更しない
 - サムネイル表示では、選択中セルの下にサムネイル情報ツールチップを表示する。既定はファイル名と画像解像度、動画・音声ではファイル名と長さ、ZIP / PDF / 画像のみフォルダ / 親 ZIP 内の子 ZIP・RAR / 直読み RAR ではページ数も表示する。表示内容は環境設定 → 表示 → サムネイルで、種類 / ページ数 / サイズ / 更新日時 / 作成日時 / 動画解像度 / コーデック / 親フォルダ名 / 場所 / 閲覧履歴の最終閲覧 / 閲覧履歴の閲覧位置を切り替えられる (長さ・コーデックは動画・音声の両方)。閲覧履歴ビューでは、ホバー tooltip に場所 / 最終閲覧日時 / 閲覧位置を表示する (複数フォルダ・ドライブの同名本を場所で判別できるようにする)。ツールチップ幅はセル幅固定ではなく最大約 2.5 セル分を使い、画面右端ではセル右端に合わせて画面内に収める。ページ数や長さなど未取得の値は選択中の 1 件だけバックグラウンドで遅延取得する。詳細表示では行のテキストツールチップを出さず、列と下部情報バーで同じ情報を確認する。ただし、プレビューアイコンへ重ねたときに別 viewport で開く大きなサムネイルプレビューは維持する
+- 環境設定「表示 → サムネイル」の「お気に入りごとに表示状態を記憶する」(既定 OFF) を
+  ON にすると、最も深く一致するお気に入りごとに、サムネイル / 詳細、サムネイルサイズ、
+  比率 / 自動比率、カテゴリ表示順、一覧ソート、単ページ / 見開き、連結方式を自動記憶・復元する。
+  初回は入った直前の有効値を継承し、変更は 500ms debounce で保存する。ツールチップ項目、
+  詳細列の順序・幅・選択列は共通のまま。ZIP / CBZ / PDF / 変換書庫と画像本のページ順には
+  お気に入りソートを適用せず、既存の本ページ順を優先する。OFF は適用・更新だけを止め、記録は
+  保持する。お気に入り編集から 1 件、環境設定から全件をリセットできる
 - **仮想スクロール実装**（下記詳細参照）
 
 ---
@@ -1728,6 +1735,7 @@ Ctrl+C / Ctrl+X / Ctrl+V も同じ Shell verb ヘルパーを使い、コピー 
 |--------|-----|---------|------|
 | `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
 | `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
+| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `thumb_px` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / PageCount / Place / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |

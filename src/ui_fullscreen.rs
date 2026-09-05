@@ -29288,6 +29288,7 @@ impl App {
             return;
         }
         self.spread_mode = mode;
+        self.settings.update_active_favorite_spread_mode(mode);
         self.spread_shift_anchor_idx = None;
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
@@ -29319,6 +29320,7 @@ impl App {
             return;
         }
         self.reading_flow = flow;
+        self.settings.update_active_favorite_reading_flow(flow);
         self.spread_shift_anchor_idx = None;
         self.reset_continuous_reading_transform();
         self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
@@ -29343,6 +29345,7 @@ impl App {
             return false;
         }
         self.spread_mode = new_mode;
+        self.settings.update_active_favorite_spread_mode(new_mode);
         self.spread_shift_anchor_idx = None;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         true

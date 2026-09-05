@@ -102,6 +102,7 @@ pub mod external_links;
 pub mod external_metadata;
 pub mod external_tool;
 pub mod fast_resize;
+mod favorite_view_state;
 pub mod file_drag;
 pub mod filename_sort;
 pub mod filename_stack;
@@ -234,6 +235,8 @@ mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
 mod ui_sns_split;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]
@@ -1381,6 +1384,7 @@ pub fn run() -> eframe::Result {
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。
             let t = Instant::now();
             app.hydrate_adjustment_favorite_params();
+            app.hydrate_favorite_view_states();
             emit_startup("hydrate_adj_favs", Some(t));
             // name index supervisor を起動時に spawn (auto_index_structure=true なお気に入り)。
             // IndexerManager::sync_with_favorites がメタ側の対応処理を既に走らせているが、

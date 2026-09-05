@@ -1459,6 +1459,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-05 バックログ §1.184 で、お気に入り別表示状態の現在地 owner を
+`ViewerContextBundle` に載せた (本依頼の決定事項として ClaudeCode 側から「既存の所有境界に
+載せ、detached 述語を足さない」構造が指定され、Codex も §2 の症状パッチではないと判定):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `FavoriteViewContextState` を追加し、既存 `swap_viewer_context_bundle`
+の前で旧 context の差分を確定して共通値へ戻し、既存 field swap 後に新 context の保存値を
+適用する。[src/app.rs](../src/app.rs) の表示状態 map / DB debounce は App-global、現在地の
+最近祖先 UUID だけが context owner である。detached 述語、viewport lifecycle、window binding、
+placement、session 遷移、snapshot DTO は変更していない。
+
+**判断理由**: `Settings` の 232 箇所の直接読みを維持するため、その対象 field は現在マウント中
+context の有効値になる。一方、共通値は非永続 overlay に退避し、context swap で旧値を外してから
+新値を載せる必要がある。新しい窓種別判定や sibling guard を足すのではなく、既に全 per-context
+状態を交換している単一 ownership 境界へ 1 個の型付き owner を追加した。A/B の context を交換し、
+各 UUID の変更と共通値が相互に上書きされない回帰テストを追加した。
+
 **2026-09-05 バックログ §1.183 で、既存の fullscreen viewport 段別計装へ
 UI thread の実行サイクル数を追加した (本依頼で ClaudeCode が計装のみ・既存境界維持を指定し、
 Codex も症状パッチではない read-only 診断追加と判定):**

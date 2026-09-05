@@ -3479,6 +3479,58 @@ impl PostFilterDowngradeStash {
     }
 }
 
+/// お気に入り単位で記憶する表示状態。
+///
+/// ここに含める項目は利用者仕様で固定されている。詳細一覧の列構成やツールチップなど、
+/// 全場所で共有する設定を追加してはならない。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FavoriteViewState {
+    pub grid_view_mode: GridViewMode,
+    pub thumb_px: u32,
+    pub thumb_aspect: ThumbAspect,
+    pub thumb_aspect_auto: bool,
+    pub grid_display_order: GridDisplayOrder,
+    pub sort_order: SortOrder,
+    pub default_spread_mode: SpreadMode,
+    pub default_reading_flow: ReadingFlow,
+}
+
+impl FavoriteViewState {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            grid_view_mode: settings.grid_view_mode,
+            thumb_px: settings.thumb_px,
+            thumb_aspect: settings.thumb_aspect,
+            thumb_aspect_auto: settings.thumb_aspect_auto,
+            grid_display_order: settings.grid_display_order.clone(),
+            sort_order: settings.sort_order,
+            default_spread_mode: settings.default_spread_mode,
+            default_reading_flow: settings.default_reading_flow,
+        }
+    }
+
+    pub(crate) fn apply_to_settings(&self, settings: &mut Settings) {
+        settings.grid_view_mode = self.grid_view_mode;
+        settings.thumb_px = self.thumb_px;
+        settings.thumb_aspect = self.thumb_aspect;
+        settings.thumb_aspect_auto = self.thumb_aspect_auto;
+        settings.grid_display_order = self.grid_display_order.clone();
+        settings.sort_order = self.sort_order;
+        settings.default_spread_mode = self.default_spread_mode;
+        settings.default_reading_flow = self.default_reading_flow;
+    }
+}
+
+/// 現在 `Settings` の表示フィールドへ適用しているお気に入り overlay。
+///
+/// `common` が永続化すべき共通値の正本であり、`Settings::save_internal` は必ずこちらを
+/// 書き出す。viewer context の切替時はいったん共通値へ戻してから次の overlay を適用する。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FavoriteViewOverlay {
+    pub(crate) favorite_id: Uuid,
+    pub(crate) common: FavoriteViewState,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -3628,6 +3680,14 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
+    /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
+    #[serde(default)]
+    pub remember_favorite_view_state: bool,
+    /// 現在適用中のお気に入りと、永続化すべき共通表示状態。
+    /// DB / JSON には出さず、実行時の overlay としてだけ保持する。
+    #[serde(skip)]
+    pub(crate) favorite_view_overlay: Option<FavoriteViewOverlay>,
     /// 任意の複数実フォルダを横断して本コンテナを表示する保存済みビュー。
     #[serde(default)]
     pub smart_folders: Vec<SmartFolderDefinition>,
@@ -5964,6 +6024,8 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            remember_favorite_view_state: false,
+            favorite_view_overlay: None,
             smart_folders: Vec::new(),
             last_folder: None,
             restore_last_cursor: true,
@@ -7027,6 +7089,50 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    /// 現在の表示フィールドを共通値として退避し、お気に入り専用値を有効値へ載せる。
+    pub(crate) fn apply_favorite_view_overlay(
+        &mut self,
+        favorite_id: Uuid,
+        state: &FavoriteViewState,
+    ) {
+        self.clear_favorite_view_overlay();
+        let common = FavoriteViewState::from_settings(self);
+        state.apply_to_settings(self);
+        self.favorite_view_overlay = Some(FavoriteViewOverlay {
+            favorite_id,
+            common,
+        });
+    }
+
+    /// お気に入り専用値を外し、overlay が保持する共通値へ戻す。
+    pub(crate) fn clear_favorite_view_overlay(&mut self) {
+        let Some(overlay) = self.favorite_view_overlay.take() else {
+            return;
+        };
+        overlay.common.apply_to_settings(self);
+    }
+
+    pub(crate) fn active_favorite_view_id(&self) -> Option<Uuid> {
+        self.favorite_view_overlay
+            .as_ref()
+            .map(|overlay| overlay.favorite_id)
+    }
+
+    /// お気に入り配下の fullscreen 操作を、次に開く本へ継承する既定へ反映する。
+    /// 共通表示中は従来どおり本単位の `spread.db` だけを更新する。
+    pub(crate) fn update_active_favorite_spread_mode(&mut self, mode: SpreadMode) {
+        if self.favorite_view_overlay.is_some() {
+            self.default_spread_mode = mode;
+        }
+    }
+
+    /// [`Self::update_active_favorite_spread_mode`] の連結方式版。
+    pub(crate) fn update_active_favorite_reading_flow(&mut self, flow: ReadingFlow) {
+        if self.favorite_view_overlay.is_some() {
+            self.default_reading_flow = flow;
+        }
+    }
+
     /// 永続化用 bool から、到達可能な動画下部固定状態だけを復元する。
     pub const fn video_bottom_lock(&self) -> VideoBottomLock {
         VideoBottomLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
@@ -8156,6 +8262,7 @@ impl Settings {
         self.details_selection_bar_show_video_codec = src.details_selection_bar_show_video_codec;
         self.facet_filter = src.facet_filter.clone();
         self.thumb_aspect = src.thumb_aspect;
+        self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
@@ -8275,6 +8382,9 @@ impl Settings {
         self.window_maximized = src.window_maximized;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
+        // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
+        self.favorite_view_overlay = src.favorite_view_overlay.clone();
         // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);
         self.smart_folders = std::mem::take(&mut src.smart_folders);
@@ -8387,6 +8497,10 @@ impl Settings {
         // self は &self なので clone してから書き換える。
         let snapshot = {
             let mut s = self.clone();
+            // お気に入り配下では対象フィールドに現在の専用値が入っている。永続化だけは
+            // overlay が保持する共通値へ戻し、専用値が共通設定へ漏れる経路をここで塞ぐ。
+            // 全ての Settings::save() はこの choke point を通る。
+            s.clear_favorite_view_overlay();
             s.grid_display_order.normalize();
             s.video_loop = !matches!(s.video_loop_mode, VideoLoopMode::Off);
             let archive_handling = s.archive_file_handling_resolved();
@@ -13794,6 +13908,49 @@ mod tests {
                 loaded.last_seen_version.as_deref(),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+        }
+
+        #[test]
+        fn favorite_view_overlay_save_persists_common_values_only() {
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.remember_favorite_view_state = true;
+            settings.grid_view_mode = GridViewMode::Thumbnail;
+            settings.thumb_px = 111;
+            settings.thumb_aspect = ThumbAspect::Landscape16x9;
+            settings.thumb_aspect_auto = false;
+            settings.sort_order = SortOrder::FileName;
+            settings.default_spread_mode = SpreadMode::Single;
+            settings.default_reading_flow = ReadingFlow::Paged;
+            let common = FavoriteViewState::from_settings(&settings);
+
+            let mut favorite = common.clone();
+            favorite.grid_view_mode = GridViewMode::Details;
+            favorite.thumb_px = 333;
+            favorite.thumb_aspect = ThumbAspect::Portrait2x3;
+            favorite.thumb_aspect_auto = true;
+            favorite
+                .grid_display_order
+                .assign(GridItemDisplayKind::VideoAudio, 3);
+            favorite.sort_order = SortOrder::DateDesc;
+            favorite.default_spread_mode = SpreadMode::RtlCover;
+            favorite.default_reading_flow = ReadingFlow::Vertical;
+            settings.apply_favorite_view_overlay(Uuid::new_v4(), &favorite);
+
+            // お気に入り内の連続操作後を模す。save 後も実行中の有効値は変えない。
+            settings.thumb_px = 350;
+            assert!(settings.save_checked());
+            assert_eq!(settings.thumb_px, 350);
+            assert_eq!(settings.grid_view_mode, GridViewMode::Details);
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(FavoriteViewState::from_settings(&loaded), common);
+            assert!(loaded.remember_favorite_view_state);
+            assert!(loaded.favorite_view_overlay.is_none());
         }
 
         #[test]

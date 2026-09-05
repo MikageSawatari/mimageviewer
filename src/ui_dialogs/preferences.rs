@@ -41,6 +41,25 @@ pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::U
     pages::draw_video_thumbnail_indicator_settings(ui, &mut settings);
 }
 
+#[doc(hidden)]
+pub fn draw_favorite_view_state_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let settings = Settings {
+        remember_favorite_view_state: true,
+        ..Settings::default()
+    };
+    let mut state = PreferencesState::from_settings(
+        &settings,
+        crate::external_tool::LaunchTarget::None,
+        None,
+        false,
+        0,
+        0,
+        0,
+    );
+    state.favorite_view_state_entry_count = 3;
+    pages::page_thumbnail(ui, &mut state);
+}
+
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     let mut scroll = egui::style::ScrollStyle::solid();
     scroll.bar_width = 10.0;
@@ -767,6 +786,12 @@ pub(crate) struct PreferencesState {
     /// 直近の閲覧履歴削除結果。
     pub reading_history_clear_result: Option<String>,
 
+    // ── サムネイルページ: お気に入り別表示状態 ──────────────────
+    pub favorite_view_state_entry_count: usize,
+    pub favorite_view_state_clear_confirm_open: bool,
+    pub favorite_view_state_clear_requested: bool,
+    pub favorite_view_state_clear_result: Option<String>,
+
     // ── エクスプローラ連携ページ用 ──────────────────────────────
     /// SendTo ショートカットの状態。ページを初めて開いた時と操作後に更新する。
     pub send_to_status: Option<Result<crate::explorer_integration::SendToShortcutStatus, String>>,
@@ -1253,6 +1278,10 @@ impl PreferencesState {
             reading_history_entry_count,
             reading_history_clear_requested: false,
             reading_history_clear_result: None,
+            favorite_view_state_entry_count: 0,
+            favorite_view_state_clear_confirm_open: false,
+            favorite_view_state_clear_requested: false,
+            favorite_view_state_clear_result: None,
             send_to_status: None,
             send_to_action_message: None,
             gpu_vendor,
@@ -1919,6 +1948,7 @@ impl App {
                     .map(|db| db.count())
                     .unwrap_or(0),
             );
+            new_state.favorite_view_state_entry_count = self.favorite_view_states.len();
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
             #[cfg(windows)]
             {
@@ -1931,6 +1961,9 @@ impl App {
                 .as_mut()
                 .expect("preferences state was initialized above")
                 .right_panel_scroll_generation = generation;
+        }
+        if let Some(state) = self.pref_state.as_mut() {
+            state.favorite_view_state_entry_count = self.favorite_view_states.len();
         }
 
         if let Some(requested) = self.preferences_requested_page.take() {
@@ -2441,6 +2474,19 @@ impl App {
 
         if !close_requested_this_frame {
             self.draw_preferences_discard_confirm(ctx);
+        }
+
+        let clear_favorite_view_states_requested = self
+            .pref_state
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.favorite_view_state_clear_requested));
+        if clear_favorite_view_states_requested {
+            let deleted = self.clear_all_favorite_view_states();
+            if let Some(state) = self.pref_state.as_mut() {
+                state.favorite_view_state_entry_count = self.favorite_view_states.len();
+                state.favorite_view_state_clear_result =
+                    Some(format!("保存済みの表示状態を {deleted} 件クリアしました。"));
+            }
         }
 
         let mut clear_audio_normalize_requested = false;

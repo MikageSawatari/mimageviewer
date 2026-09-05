@@ -1347,6 +1347,68 @@ fn refresh_send_to_status(state: &mut PreferencesState) {
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.remember_favorite_view_state,
+            "お気に入りごとに表示状態を記憶する",
+        );
+        ui.small(
+            "お気に入り配下で、サムネイル／詳細、サムネイルサイズと比率、一覧の並べ方とソート、単ページ／見開き、連結方式を自動で記憶します。",
+        );
+        ui.small(
+            "ツールチップの表示項目と、詳細一覧の列設定・選択列はすべての場所で共通です。OFF にしても保存済みの状態は残ります。",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    state.favorite_view_state_entry_count > 0,
+                    egui::Button::new("保存済みの表示状態をすべてクリア…"),
+                )
+                .clicked()
+            {
+                state.favorite_view_state_clear_confirm_open = true;
+            }
+            ui.weak(format!(
+                "保存済み: {} 件",
+                state.favorite_view_state_entry_count
+            ));
+        });
+        if let Some(message) = state.favorite_view_state_clear_result.as_deref() {
+            ui.small(message);
+        }
+    });
+
+    if state.favorite_view_state_clear_confirm_open {
+        let mut clear = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("favorite_view_state_clear_confirm")).show(
+            ui.ctx(),
+            |ui| {
+                ui.set_min_width(420.0);
+                ui.heading("お気に入りの表示状態をすべてクリアしますか？");
+                ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("すべてクリア").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            },
+        );
+        if clear {
+            state.favorite_view_state_clear_requested = true;
+            state.favorite_view_state_clear_confirm_open = false;
+        } else if cancel || response.should_close() {
+            state.favorite_view_state_clear_confirm_open = false;
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/category-order", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());

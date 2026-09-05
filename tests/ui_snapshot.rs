@@ -304,6 +304,22 @@ fn preferences_video_thumbnail_indicator_dark() {
 }
 
 #[test]
+fn preferences_favorite_view_state_dark() {
+    snapshot_with_theme_at_size(
+        "preferences_favorite_view_state_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(620.0, 260.0),
+        None,
+        |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.set_width(580.0);
+                mimageviewer::draw_favorite_view_state_settings_snapshot_fixture(ui);
+            });
+        },
+    );
+}
+
+#[test]
 fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
     snapshot_with_theme_at_size(
         "video_thumbnail_indicator_modes_and_dense_badges_dark",

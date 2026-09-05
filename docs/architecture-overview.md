@@ -213,7 +213,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `adjustment.rs` | `AdjustParams` (輝度/コントラスト/γ/彩度/色温度…)、LUT 適用、オート補正 |
 | `ai/final_pipeline.rs` | fullscreen と remote AI が共有する effective upscale / denoise model 選択、native 寸法 size gate、model load、denoise → upscale 実行順の正本。任意の progress sink を受け、local は no-op、remote は model / tile phase を job progress へ投影する。model load failure 時の既存 fallback と cancel 境界を共有し、本体と remote の適用判定・出力順を分岐させない |
 | `final_composite.rs` | 静止画のページ個別 > 現在地標準 > global 解決、`FinalCompositePlan`、tone → smart sharpen → colorize → Creative LUT → post_filter の共有 CPU executor。元画像・編集結果の materialize、final AI、cache / worker / GPU upload は App / remote adapter 側に残す |
-| `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
+| `adjustment_db.rs` | ページ個別補正・お気に入り標準補正と、お気に入り UUID ごとの表示状態を `adjustment.db` に永続化。表示状態は起動時に全件ロードし、削除済み UUID を prune する |
+| `favorite_view_state.rs` | お気に入り別表示状態の 500ms debounce と SQLite 書き込み worker。メモリ正本は即時更新し、DB commit だけを UI thread 外で UUID ごとにまとめる。単一直列 queue が Set / Remove / Clear の順序を保証し、終了時は在庫を drain する |
 | `edit_bundle.rs` | ページ個別補正、消しゴム、隠蔽加工、補正レイヤー、切り取り、注釈の 6 系統を `PageEditBundle` として snapshot 化し、対象寸法への変換と 6 DB の attached transaction による全置換を担う。空 bundle も同じ経路で各行を DELETE する |
 | `edit_bundle_app.rs` | 単一ページの編集内容コピー / 貼り付けと、DB commit 成功後の sidecar、presence set、表示・比較・編集 preview cache、および置換前の対象ページ編集 Undo の無効化を担う App 接続層 |
 | `edit_bundle_bulk.rs` | チェック優先・カーソル fallback の一括対象解決、貼り付け / 7 種リセットの確認・進捗・キャンセル、および対象ごとに `edit_bundle_app` の runtime commit を再利用する逐次適用を担う。回転だけは bundle 外として UI thread で `set_image_rotation` へ渡す |
@@ -348,7 +349,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
-| `adjustment.db` | ページ個別補正 (`page_params`) とお気に入り標準補正 (`favorite_params`) | `adjustment_db.rs` |
+| `adjustment.db` | ページ個別補正 (`page_params`)、お気に入り標準補正 (`favorite_params`)、お気に入り別表示状態 (`favorite_view_states`)。表示状態の行は独自状態を持つこと自体を表し、既存テーブルを変更せず追加テーブルとして共存する | `adjustment_db.rs` |
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
 | `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |

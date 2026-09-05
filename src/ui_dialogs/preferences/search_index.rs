@@ -169,6 +169,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["送る", "エクスプローラー", "Explorer", "登録"]
     ),
     entry!(
+        "thumbnail/favorite-view-state",
+        Thumbnail,
+        "お気に入りごとに表示状態を記憶する",
+        ["場所", "表示状態", "見開き", "ソート", "リセット", "クリア"]
+    ),
+    entry!(
         "thumbnail/category-order",
         Thumbnail,
         "グリッドのカテゴリ表示順",

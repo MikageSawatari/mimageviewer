@@ -10670,6 +10670,12 @@ impl FsOverflowPanelState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FavoriteViewContextState {
+    /// 最近祖先のお気に入り。保存行の有無とは分け、初回継承を entry edge だけで行う。
+    pub(crate) location_favorite_id: Option<uuid::Uuid>,
+}
+
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
@@ -12898,6 +12904,16 @@ pub struct App {
     /// 解決は [`App::effective_params`] 参照。
     pub(crate) adjustment_favorite_params:
         std::collections::HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
+    /// お気に入り UUID ごとの表示状態。起動時に adjustment.db から全件を復元する。
+    pub(crate) favorite_view_states:
+        std::collections::HashMap<uuid::Uuid, crate::settings::FavoriteViewState>,
+    /// マウント中 viewer context のお気に入り所属。bundle swap 対象。
+    pub(crate) favorite_view_context: FavoriteViewContextState,
+    /// DB 書き込みだけをまとめる App-global debounce。表示状態のメモリ正本は即時更新する。
+    pub(crate) favorite_view_writes: crate::favorite_view_state::FavoriteViewWriteDebounce,
+    /// debounce 後の SQLite commit を UI thread 外で直列化する。初回 submit まで spawn しない。
+    pub(crate) favorite_view_store_writer:
+        Option<crate::favorite_view_state::FavoriteViewStoreWriter>,
     /// ページ個別の補正レイヤー: item_idx → LocalAdjustmentLayer 配列。
     /// フォルダロード時は `local_adjust_pages` だけを復元し、JSON 本体は
     /// フルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。表示合成は後段の
@@ -15456,6 +15472,10 @@ impl App {
             rotation_page_keys,
             export_crop_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
+            favorite_view_states: std::collections::HashMap::new(),
+            favorite_view_context: FavoriteViewContextState::default(),
+            favorite_view_writes: crate::favorite_view_state::FavoriteViewWriteDebounce::default(),
+            favorite_view_store_writer: None,
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
             export_crop_page_settings: std::collections::HashMap::new(),
@@ -20116,6 +20136,18 @@ impl App {
         {
             self.reconcile_bookmark_return_target_for_folder_load(&path);
         }
+        // owner が持つ user-facing source を優先し、変換 cache の実装パスを
+        // お気に入り解決へ混ぜない。解決規則自体は adjustment 標準と同じ最長一致。
+        let favorite_path = match &owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
+                crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
+                | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
+            },
+            OpenRequestOwner::DetachedGridArchive(detached_owner) => &detached_owner.source_path,
+            OpenRequestOwner::Navigation => &path,
+        };
+        self.transition_favorite_view_for_path(Some(favorite_path));
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
@@ -22817,6 +22849,7 @@ impl App {
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
         ));
+        self.transition_favorite_view_for_path(Some(&zip_path));
 
         #[cfg(windows)]
         {
@@ -23753,6 +23786,7 @@ impl App {
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
         ));
+        self.transition_favorite_view_for_path(Some(&pdf_path));
 
         #[cfg(windows)]
         if self.should_preserve_active_detached_image_window_for_main_context_change() {
@@ -63699,6 +63733,293 @@ impl App {
         }
     }
 
+    /// 起動時にお気に入り表示状態を全件ロードし、削除済み UUID の行を掃除する。
+    pub(crate) fn hydrate_favorite_view_states(&mut self) {
+        let Some(db) = &self.adjustment_db else {
+            return;
+        };
+        self.favorite_view_states = db.load_all_favorite_view_states();
+        let keep: std::collections::HashSet<uuid::Uuid> = self
+            .settings
+            .favorites
+            .iter()
+            .map(|favorite| favorite.id)
+            .collect();
+        if let Ok(removed) = db.prune_favorite_view_states(&keep) {
+            if removed > 0 {
+                self.favorite_view_states.retain(|id, _| keep.contains(id));
+            }
+        }
+    }
+
+    fn favorite_view_owner_for_path(&self, path: &Path) -> Option<uuid::Uuid> {
+        active_favorite_default_id_for_path(path, &self.settings.favorites, None, |_| true)
+    }
+
+    fn stored_favorite_view_id_for_path(&self, path: &Path) -> Option<uuid::Uuid> {
+        active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
+            self.favorite_view_states.contains_key(&id)
+        })
+    }
+
+    /// 適用中の値との差分をメモリ正本へ即時反映し、DB 書き込みだけを debounce する。
+    fn capture_active_favorite_view_change_at(&mut self, now: std::time::Instant) {
+        if !self.settings.remember_favorite_view_state {
+            return;
+        }
+        let Some(id) = self.settings.active_favorite_view_id() else {
+            return;
+        };
+        let state = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        if self.favorite_view_states.get(&id) == Some(&state) {
+            return;
+        }
+        self.favorite_view_states.insert(id, state.clone());
+        self.favorite_view_writes.note_at(id, state, now);
+    }
+
+    /// 現在地を切り替える ownership 境界。旧 overlay の差分を確定して共通値へ戻し、
+    /// 同じ最長一致 resolver で新しい overlay を選ぶ。
+    fn transition_favorite_view_for_path_at(
+        &mut self,
+        path: Option<&Path>,
+        now: std::time::Instant,
+    ) {
+        self.transition_favorite_view_for_path_with_inherited_at(path, now, None);
+    }
+
+    fn transition_favorite_view_for_path_with_inherited_at(
+        &mut self,
+        path: Option<&Path>,
+        now: std::time::Instant,
+        inherited_override: Option<crate::settings::FavoriteViewState>,
+    ) {
+        if !self.settings.remember_favorite_view_state {
+            self.settings.clear_favorite_view_overlay();
+            self.favorite_view_context.location_favorite_id = None;
+            return;
+        }
+
+        self.capture_active_favorite_view_change_at(now);
+        let inherited = inherited_override
+            .unwrap_or_else(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
+        self.settings.clear_favorite_view_overlay();
+
+        let owner = path.and_then(|path| self.favorite_view_owner_for_path(path));
+        let entered = owner != self.favorite_view_context.location_favorite_id;
+        self.favorite_view_context.location_favorite_id = owner;
+        if entered {
+            if let Some(id) = owner {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.favorite_view_states.entry(id)
+                {
+                    entry.insert(inherited.clone());
+                    self.favorite_view_writes.note_at(id, inherited, now);
+                }
+            }
+        }
+
+        let active_id = path.and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if let Some((id, state)) = active_id.and_then(|id| {
+            self.favorite_view_states
+                .get(&id)
+                .cloned()
+                .map(|state| (id, state))
+        }) {
+            self.settings.apply_favorite_view_overlay(id, &state);
+        }
+    }
+
+    pub(crate) fn transition_favorite_view_for_path(&mut self, path: Option<&Path>) {
+        self.transition_favorite_view_for_path_at(path, std::time::Instant::now());
+    }
+
+    fn reapply_favorite_view_without_seed(&mut self) {
+        self.settings.clear_favorite_view_overlay();
+        if !self.settings.remember_favorite_view_state {
+            return;
+        }
+        let path = self.effective_folder();
+        let active_id = path
+            .as_deref()
+            .and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if let Some((id, state)) = active_id.and_then(|id| {
+            self.favorite_view_states
+                .get(&id)
+                .cloned()
+                .map(|state| (id, state))
+        }) {
+            self.settings.apply_favorite_view_overlay(id, &state);
+        }
+    }
+
+    fn reconcile_favorite_view_for_current_context_at(&mut self, now: std::time::Instant) {
+        if !self.settings.remember_favorite_view_state {
+            self.settings.clear_favorite_view_overlay();
+            self.favorite_view_context.location_favorite_id = None;
+            return;
+        }
+        let path = self.effective_folder();
+        let owner = path
+            .as_deref()
+            .and_then(|path| self.favorite_view_owner_for_path(path));
+        let active_id = path
+            .as_deref()
+            .and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if owner != self.favorite_view_context.location_favorite_id
+            || active_id != self.settings.active_favorite_view_id()
+        {
+            self.transition_favorite_view_for_path_at(path.as_deref(), now);
+        } else {
+            self.capture_active_favorite_view_change_at(now);
+        }
+    }
+
+    fn submit_favorite_view_store(
+        &mut self,
+        command: crate::favorite_view_state::FavoriteViewStoreCommand,
+    ) -> Result<(), String> {
+        if self.adjustment_db.is_none() {
+            return Err("adjustment.db is unavailable".to_owned());
+        }
+        if self.favorite_view_store_writer.is_none() {
+            self.favorite_view_store_writer = Some(
+                crate::favorite_view_state::FavoriteViewStoreWriter::spawn(
+                    crate::adjustment_db::AdjustmentDb::db_path(),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        self.favorite_view_store_writer
+            .as_ref()
+            .expect("favorite view store writer initialized")
+            .submit(command)
+    }
+
+    fn submit_favorite_view_writes(
+        &mut self,
+        writes: Vec<(uuid::Uuid, crate::settings::FavoriteViewState)>,
+        retry: bool,
+    ) {
+        for (id, state) in writes {
+            let command = crate::favorite_view_state::FavoriteViewStoreCommand::Set {
+                id,
+                state: state.clone(),
+            };
+            if let Err(error) = self.submit_favorite_view_store(command) {
+                crate::logger::log(format!(
+                    "favorite view state submit failed id={id}: {error}"
+                ));
+                if retry {
+                    self.favorite_view_writes
+                        .note_at(id, state, std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    fn poll_favorite_view_writes(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let writes = self.favorite_view_writes.take_due_at(now);
+        self.submit_favorite_view_writes(writes, true);
+        let results: Vec<_> = self
+            .favorite_view_store_writer
+            .as_ref()
+            .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
+            .unwrap_or_default();
+        for outcome in results {
+            let Err(error) = outcome.result else {
+                continue;
+            };
+            crate::logger::log(format!("favorite view state store failed: {error}"));
+            match outcome.command {
+                crate::favorite_view_state::FavoriteViewStoreCommand::Set { id, state } => {
+                    // この Set より後に reset / clear / 新しい変更が入っていれば、古い
+                    // failure を再送して現在の意図を巻き戻してはならない。
+                    if self.favorite_view_states.get(&id) == Some(&state) {
+                        self.favorite_view_writes
+                            .note_at(id, state, std::time::Instant::now());
+                    }
+                }
+                crate::favorite_view_state::FavoriteViewStoreCommand::Remove { .. } => {
+                    self.show_feedback_toast(
+                        "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
+                    );
+                }
+                crate::favorite_view_state::FavoriteViewStoreCommand::Clear => {
+                    self.show_feedback_toast(
+                        "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
+                    );
+                    if let Some(state) = self.pref_state.as_mut() {
+                        state.favorite_view_state_clear_result =
+                            Some("保存データのクリアに失敗しました。".to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(delay) = self.favorite_view_writes.next_due_in_at(now) {
+            ctx.request_repaint_after(delay);
+        }
+        if self
+            .favorite_view_store_writer
+            .as_ref()
+            .is_some_and(|writer| writer.is_busy())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn flush_favorite_view_writes_for_exit(&mut self) {
+        self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        let writes = self.favorite_view_writes.take_all();
+        self.submit_favorite_view_writes(writes, false);
+    }
+
+    pub(crate) fn remove_favorite_view_state(&mut self, favorite_id: uuid::Uuid) -> bool {
+        self.favorite_view_writes.remove(favorite_id);
+        let existed = self.favorite_view_states.remove(&favorite_id).is_some();
+        if let Err(error) = self.submit_favorite_view_store(
+            crate::favorite_view_state::FavoriteViewStoreCommand::Remove { id: favorite_id },
+        ) {
+            crate::logger::log(format!(
+                "favorite view state remove submit failed id={favorite_id}: {error}"
+            ));
+            self.show_feedback_toast(
+                "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
+            );
+        }
+        if self.settings.active_favorite_view_id() == Some(favorite_id) {
+            self.reapply_favorite_view_without_seed();
+        }
+        existed
+    }
+
+    pub(crate) fn reset_favorite_view_state(&mut self, favorite_id: uuid::Uuid) {
+        if self.remove_favorite_view_state(favorite_id) {
+            self.show_feedback_toast("お気に入りの表示状態をリセットしました".to_owned());
+        }
+    }
+
+    pub(crate) fn clear_all_favorite_view_states(&mut self) -> usize {
+        let count = self.favorite_view_states.len();
+        self.favorite_view_writes.clear();
+        self.favorite_view_states.clear();
+        if let Err(error) = self
+            .submit_favorite_view_store(crate::favorite_view_state::FavoriteViewStoreCommand::Clear)
+        {
+            crate::logger::log(format!("favorite view state clear submit failed: {error}"));
+            self.show_feedback_toast(
+                "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
+            );
+            if let Some(state) = self.pref_state.as_mut() {
+                state.favorite_view_state_clear_result =
+                    Some("保存データのクリアに失敗しました。".to_owned());
+            }
+        }
+        self.reapply_favorite_view_without_seed();
+        count
+    }
+
     /// 保存スロット slot_idx のパラメータを `idx` のページに適用する。
     /// 見開き L/R 切替を考慮するため、適用先 idx は呼び出し元が決定する。
     pub(crate) fn apply_slot_to_idx(&mut self, slot_idx: usize, idx: usize) {
@@ -71407,6 +71728,9 @@ impl eframe::App for App {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
+        // UI の代入箇所を列挙せず、frame 終端で有効値との差分を一括検出する。
+        self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        self.poll_favorite_view_writes(ctx);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
         // ACK も落ちるので、**早期 return では飛ばせないここ**で拾う。
@@ -73307,6 +73631,137 @@ pub(crate) mod tests;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+mod favorite_view_state_tests {
+    use super::*;
+    use crate::settings::{FavoriteEntry, FavoriteViewState, GridViewMode, SortOrder};
+
+    fn state(thumb_px: u32, sort_order: SortOrder) -> FavoriteViewState {
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = thumb_px;
+        settings.sort_order = sort_order;
+        FavoriteViewState::from_settings(&settings)
+    }
+
+    #[test]
+    fn resolves_siblings_outside_and_deepest_nested_favorite() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.thumb_px = 100;
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\library"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\library\comic"));
+        let video = FavoriteEntry::new("video".to_owned(), PathBuf::from(r"C:\video"));
+        app.favorite_view_states
+            .insert(outer.id, state(160, SortOrder::DateAsc));
+        app.favorite_view_states
+            .insert(inner.id, state(280, SortOrder::Numeric));
+        app.favorite_view_states
+            .insert(video.id, state(80, SortOrder::DateDesc));
+        app.settings.favorites.extend([outer, inner, video]);
+
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\photo")));
+        assert_eq!(app.settings.thumb_px, 160);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
+        assert_eq!(app.settings.thumb_px, 80);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
+        assert_eq!(app.settings.thumb_px, 100);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\comic\book")));
+        assert_eq!(app.settings.thumb_px, 280);
+        assert_eq!(app.settings.sort_order, SortOrder::Numeric);
+
+        app.settings.favorites[2].name = "moved video".to_owned();
+        app.settings.favorites[2].path = PathBuf::from(r"C:\moved-video");
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
+        assert_eq!(
+            app.settings.thumb_px, 100,
+            "旧パスには UUID の記録を適用しない"
+        );
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\moved-video\clips")));
+        assert_eq!(
+            app.settings.thumb_px, 80,
+            "名称・パス変更後も UUID の記録を使う"
+        );
+    }
+
+    #[test]
+    fn first_entry_inherits_current_effective_state_and_updates_by_diff() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.thumb_px = 190;
+        app.settings.sort_order = SortOrder::DateAsc;
+        let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
+        let id = favorite.id;
+        app.settings.favorites.push(favorite);
+
+        app.transition_favorite_view_for_path_at(
+            Some(Path::new(r"C:\fav\child")),
+            std::time::Instant::now(),
+        );
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 190);
+        assert_eq!(
+            app.favorite_view_states[&id].grid_view_mode,
+            GridViewMode::Details
+        );
+
+        app.settings.thumb_px = 240;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 240);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
+        assert_eq!(app.settings.thumb_px, 190, "共通値へ戻る");
+    }
+
+    #[test]
+    fn disabled_mode_does_not_apply_or_update_but_keeps_records() {
+        let mut app = setup_app_for_test();
+        let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
+        let id = favorite.id;
+        app.settings.favorites.push(favorite);
+        app.settings.thumb_px = 100;
+        app.favorite_view_states
+            .insert(id, state(250, SortOrder::DateDesc));
+
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\fav")));
+        assert_eq!(app.settings.thumb_px, 100);
+        app.settings.thumb_px = 120;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 250);
+    }
+
+    #[test]
+    fn reset_falls_back_to_outer_then_common_and_clear_removes_all_rows() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.thumb_px = 100;
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\fav"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\fav\inner"));
+        app.favorite_view_states
+            .insert(outer.id, state(160, SortOrder::DateAsc));
+        app.favorite_view_states
+            .insert(inner.id, state(260, SortOrder::DateDesc));
+        app.settings
+            .favorites
+            .extend([outer.clone(), inner.clone()]);
+        app.current_folder = Some(PathBuf::from(r"C:\fav\inner"));
+        let current = app.current_folder.clone();
+        app.transition_favorite_view_for_path(current.as_deref());
+        assert_eq!(app.settings.thumb_px, 260);
+
+        app.reset_favorite_view_state(inner.id);
+        assert_eq!(app.settings.thumb_px, 160);
+        app.reset_favorite_view_state(outer.id);
+        assert_eq!(app.settings.thumb_px, 100);
+
+        app.favorite_view_states
+            .insert(outer.id, state(170, SortOrder::Numeric));
+        app.favorite_view_states
+            .insert(inner.id, state(270, SortOrder::Numeric));
+        assert_eq!(app.clear_all_favorite_view_states(), 2);
+        assert!(app.favorite_view_states.is_empty());
+        assert_eq!(app.settings.thumb_px, 100);
+    }
+}
 
 #[cfg(test)]
 mod rated_at_details_sort_tests {
