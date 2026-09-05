@@ -15,6 +15,9 @@ pub const DEFAULT_OUTPUT: Output = Output {
 };
 pub const DEFAULT_SPECTRUM_BANDS: usize = 96;
 pub const PROJECT_VERSION: u32 = 1;
+pub const KICK_ATTACK_SECS: f32 = 0.015;
+pub const KICK_RELEASE_SECS: f32 = 0.18;
+pub const KICK_THRESHOLD: f32 = 0.08;
 
 /// Builds the shared §1.4 reference scene used by preview and MP4 export.
 pub fn default_project(duration_secs: f64) -> Project {
@@ -178,17 +181,25 @@ pub fn new_band_energy_modulator(project: &Project) -> Modulator {
         .saturating_add(1);
     Modulator {
         id: ModulatorId(next_id),
-        name: format!("帯域エネルギー {next_id}"),
+        name: if next_id == 1 {
+            "キックに合わせる動き".to_owned()
+        } else {
+            format!("キックに合わせる動き {next_id}")
+        },
         source: ModulatorSource::BandEnergy {
             range: BandRange::Hz {
-                low_hz: 60.0,
+                low_hz: 40.0,
                 high_hz: 120.0,
             },
-            smoothing: Smoothing::Average { factor: 0.7 },
+            smoothing: Smoothing::Envelope {
+                attack_secs: KICK_ATTACK_SECS,
+                release_secs: KICK_RELEASE_SECS,
+            },
             weighting: BandWeighting::Raw,
-            gain_db: 0.0,
-            floor: 0.0,
-            ceiling: 1.0,
+            gain_db: 3.0,
+            floor: 0.03,
+            ceiling: 0.8,
+            threshold: KICK_THRESHOLD,
         },
     }
 }
@@ -255,5 +266,30 @@ mod tests {
             layer.kind,
             LayerKind::Image { image: stored, fit: Fit::Cover } if stored == image
         ));
+    }
+
+    #[test]
+    fn new_band_energy_modulator_is_ready_for_kick_driven_motion() {
+        let project = default_project(10.0);
+        let modulator = new_band_energy_modulator(&project);
+        assert_eq!(modulator.name, "キックに合わせる動き");
+        assert_eq!(
+            modulator.source,
+            ModulatorSource::BandEnergy {
+                range: BandRange::Hz {
+                    low_hz: 40.0,
+                    high_hz: 120.0,
+                },
+                smoothing: Smoothing::Envelope {
+                    attack_secs: KICK_ATTACK_SECS,
+                    release_secs: KICK_RELEASE_SECS,
+                },
+                weighting: BandWeighting::Raw,
+                gain_db: 3.0,
+                floor: 0.03,
+                ceiling: 0.8,
+                threshold: KICK_THRESHOLD,
+            }
+        );
     }
 }

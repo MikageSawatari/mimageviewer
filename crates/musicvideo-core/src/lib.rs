@@ -28,8 +28,8 @@ pub use model::{
 };
 pub use preset::{
     DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, DEFAULT_OUTPUT, DEFAULT_SPECTRUM_BANDS,
-    PROJECT_VERSION, default_project, new_band_energy_modulator, new_image_layer,
-    new_pitch_keyboard_layer,
+    KICK_ATTACK_SECS, KICK_RELEASE_SECS, KICK_THRESHOLD, PROJECT_VERSION, default_project,
+    new_band_energy_modulator, new_image_layer, new_pitch_keyboard_layer,
 };
 pub use raster::{
     Frame, PixelRect, RasterError, RenderReport, UnresolvedAsset, norm_rect_to_pixels, render_frame,

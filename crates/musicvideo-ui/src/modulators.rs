@@ -63,7 +63,7 @@ pub(crate) fn draw_modulators(
                     });
                 });
             }
-            if ui.button("＋ 帯域エネルギーを追加").clicked() {
+            if ui.button("＋ キックに合わせる動きを追加").clicked() {
                 project.modulators.push(new_band_energy_modulator(project));
                 changed = true;
             }
@@ -91,6 +91,7 @@ fn edit_source(
         gain_db,
         floor,
         ceiling,
+        threshold,
     } = &mut modulator.source;
     let mut changed = false;
     let mut semitone = matches!(range, BandRange::Semitone { .. });
@@ -184,25 +185,7 @@ fn edit_source(
         }
     }
 
-    ui.horizontal(|ui| {
-        ui.label("時間平滑化");
-        let mut enabled = matches!(smoothing, Smoothing::Average { .. });
-        let was_enabled = enabled;
-        ui.checkbox(&mut enabled, "EMA");
-        if enabled != was_enabled {
-            *smoothing = if enabled {
-                Smoothing::Average { factor: 0.7 }
-            } else {
-                Smoothing::None
-            };
-            changed = true;
-        }
-        if let Smoothing::Average { factor } = smoothing {
-            changed |= ui
-                .add(egui::Slider::new(factor, 0.0..=1.0).text("係数"))
-                .changed();
-        }
-    });
+    changed |= edit_smoothing(ui, smoothing);
     ui.horizontal(|ui| {
         ui.label("周波数重み");
         egui::ComboBox::from_id_salt(("band-weighting", modulator.id.0))
@@ -236,9 +219,96 @@ fn edit_source(
             .add(egui::Slider::new(ceiling, 0.001..=1.0).text("天井"))
             .changed();
     });
+    changed |= ui
+        .add(
+            egui::Slider::new(threshold, 0.0..=1.0)
+                .text("反応を始める強さ")
+                .step_by(0.01),
+        )
+        .on_hover_text("この値より弱い入力は無音として扱います")
+        .changed();
     if changed {
         *floor = floor.clamp(0.0, 0.999);
         *ceiling = ceiling.clamp(*floor + 0.001, 1.0);
+        *threshold = threshold.clamp(0.0, 1.0);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmoothingMode {
+    None,
+    Average,
+    Envelope,
+}
+
+fn edit_smoothing(ui: &mut egui::Ui, smoothing: &mut Smoothing) -> bool {
+    let mut mode = match smoothing {
+        Smoothing::None => SmoothingMode::None,
+        Smoothing::Average { .. } => SmoothingMode::Average,
+        Smoothing::Envelope { .. } => SmoothingMode::Envelope,
+    };
+    let previous_mode = mode;
+    egui::ComboBox::from_label("反応のしかた")
+        .selected_text(match mode {
+            SmoothingMode::None => "平滑化しない",
+            SmoothingMode::Average => "均等になめらか",
+            SmoothingMode::Envelope => "すばやく反応・ゆっくり戻る",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut mode, SmoothingMode::None, "平滑化しない");
+            ui.selectable_value(&mut mode, SmoothingMode::Average, "均等になめらか");
+            ui.selectable_value(
+                &mut mode,
+                SmoothingMode::Envelope,
+                "すばやく反応・ゆっくり戻る",
+            );
+        });
+    let mut changed = mode != previous_mode;
+    if changed {
+        *smoothing = match mode {
+            SmoothingMode::None => Smoothing::None,
+            SmoothingMode::Average => Smoothing::Average { factor: 0.7 },
+            SmoothingMode::Envelope => Smoothing::Envelope {
+                attack_secs: musicvideo_core::KICK_ATTACK_SECS,
+                release_secs: musicvideo_core::KICK_RELEASE_SECS,
+            },
+        };
+    }
+    match smoothing {
+        Smoothing::None => {}
+        Smoothing::Average { factor } => {
+            changed |= ui
+                .add(egui::Slider::new(factor, 0.0..=1.0).text("なめらかさ"))
+                .changed();
+        }
+        Smoothing::Envelope {
+            attack_secs,
+            release_secs,
+        } => {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(attack_secs)
+                            .range(0.001..=1.0)
+                            .speed(0.001)
+                            .prefix("反応 ")
+                            .suffix(" 秒"),
+                    )
+                    .on_hover_text("小さいほど音の立ち上がりへ速く追従します")
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(release_secs)
+                            .range(0.001..=5.0)
+                            .speed(0.005)
+                            .prefix("戻り ")
+                            .suffix(" 秒"),
+                    )
+                    .on_hover_text("大きいほど効果がゆっくり元へ戻ります")
+                    .changed();
+            });
+        }
     }
     changed
 }

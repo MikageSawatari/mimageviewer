@@ -16,7 +16,15 @@ pub const MAX_SEQUENTIAL_GAP_SECS: f64 = 0.25;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Smoothing {
     None,
-    Average { factor: f32 },
+    /// Legacy symmetric EMA. The factor is retained for project compatibility.
+    Average {
+        factor: f32,
+    },
+    /// Frame-rate independent asymmetric envelope follower.
+    Envelope {
+        attack_secs: f32,
+        release_secs: f32,
+    },
 }
 
 impl Default for Smoothing {
@@ -83,9 +91,7 @@ impl SpectrumSource {
         if !(1..=MAX_SPECTRUM_BANDS).contains(&band_count) {
             return Err(SpectrumSourceError::InvalidBandCount);
         }
-        if let Smoothing::Average { factor } = smoothing
-            && (!factor.is_finite() || !(0.0..=1.0).contains(&factor))
-        {
+        if !valid_smoothing(smoothing) {
             return Err(SpectrumSourceError::InvalidSmoothingFactor);
         }
         Ok(Self {
@@ -194,6 +200,7 @@ impl SpectrumSource {
         let range_values = analyzed.range_values;
         let analyzed = analyzed.spectrum;
         let first_frame = self.last_t.is_none();
+        let delta_secs = self.last_t.map_or(0.0, |last| (t - last).max(0.0) as f32);
         if self.analysis.bands.len() != self.band_count || self.last_t.is_none() {
             self.analysis = analyzed;
         } else {
@@ -206,12 +213,27 @@ impl SpectrumSource {
                         *previous = factor * *previous + (1.0 - factor) * current;
                     }
                 }
+                Smoothing::Envelope {
+                    attack_secs,
+                    release_secs,
+                } => {
+                    for (previous, current) in self.analysis.bands.iter_mut().zip(analyzed.bands) {
+                        *previous = follow_envelope(
+                            *previous,
+                            current,
+                            delta_secs,
+                            attack_secs,
+                            release_secs,
+                        );
+                    }
+                }
             }
         }
         update_modulator_values(
             &self.modulators,
             &range_values,
             first_frame,
+            delta_secs,
             &mut self.modulator_values,
         );
         self.last_t = Some(t);
@@ -246,6 +268,7 @@ fn modulators_are_valid(modulators: &[Modulator]) -> bool {
                 gain_db,
                 floor,
                 ceiling,
+                threshold,
                 ..
             } => {
                 valid_range(*range)
@@ -253,9 +276,11 @@ fn modulators_are_valid(modulators: &[Modulator]) -> bool {
                     && gain_db.is_finite()
                     && floor.is_finite()
                     && ceiling.is_finite()
+                    && threshold.is_finite()
                     && (0.0..1.0).contains(floor)
                     && (0.0..=1.0).contains(ceiling)
                     && ceiling > floor
+                    && (0.0..=1.0).contains(threshold)
             }
         }
     })
@@ -277,6 +302,15 @@ fn valid_smoothing(smoothing: Smoothing) -> bool {
     match smoothing {
         Smoothing::None => true,
         Smoothing::Average { factor } => factor.is_finite() && (0.0..=1.0).contains(&factor),
+        Smoothing::Envelope {
+            attack_secs,
+            release_secs,
+        } => {
+            attack_secs.is_finite()
+                && release_secs.is_finite()
+                && attack_secs > 0.0
+                && release_secs > 0.0
+        }
     }
 }
 
@@ -307,6 +341,7 @@ fn update_modulator_values(
     modulators: &[ConfiguredModulator],
     range_values: &[f32],
     first_frame: bool,
+    delta_secs: f32,
     output: &mut Vec<ModulatorValue>,
 ) {
     if output.len() != modulators.len() {
@@ -326,10 +361,16 @@ fn update_modulator_values(
             gain_db,
             floor,
             ceiling,
+            threshold,
             ..
         } = modulator.source;
         let gained = apply_display_gain_db(raw, gain_db);
-        let current = ((gained - floor) / (ceiling - floor)).clamp(0.0, 1.0);
+        let normalized = ((gained - floor) / (ceiling - floor)).clamp(0.0, 1.0);
+        let current = if normalized < threshold {
+            0.0
+        } else {
+            normalized
+        };
         state.id = modulator.id;
         state.value = match smoothing {
             Smoothing::None => current,
@@ -337,8 +378,31 @@ fn update_modulator_values(
                 factor * state.value + (1.0 - factor) * current
             }
             Smoothing::Average { .. } => current,
+            Smoothing::Envelope {
+                attack_secs,
+                release_secs,
+            } if !first_frame => {
+                follow_envelope(state.value, current, delta_secs, attack_secs, release_secs)
+            }
+            Smoothing::Envelope { .. } => current,
         };
     }
+}
+
+fn follow_envelope(
+    previous: f32,
+    current: f32,
+    delta_secs: f32,
+    attack_secs: f32,
+    release_secs: f32,
+) -> f32 {
+    let time_constant = if current > previous {
+        attack_secs
+    } else {
+        release_secs
+    };
+    let retention = (-delta_secs.max(0.0) / time_constant).exp();
+    retention * previous + (1.0 - retention) * current
 }
 
 #[cfg(test)]
@@ -440,6 +504,7 @@ mod tests {
                 gain_db: 0.0,
                 floor: 0.0,
                 ceiling: 1.0,
+                threshold: 0.0,
             },
         }
     }
@@ -496,6 +561,7 @@ mod tests {
                 gain_db: 0.0,
                 floor: 0.8,
                 ceiling: 0.2,
+                threshold: 0.0,
             },
             ..a4_modulator(Smoothing::None)
         };
@@ -508,5 +574,65 @@ mod tests {
             source.configure_modulators(&[duplicate.clone(), duplicate]),
             Err(SpectrumSourceError::InvalidModulator)
         );
+    }
+
+    #[test]
+    fn envelope_time_constants_are_frame_rate_independent() {
+        fn follow_for(
+            fps: usize,
+            duration_secs: f32,
+            start: f32,
+            target: f32,
+            attack_secs: f32,
+            release_secs: f32,
+        ) -> f32 {
+            let mut value = start;
+            let steps = (duration_secs * fps as f32).round() as usize;
+            for _ in 0..steps {
+                value = follow_envelope(value, target, 1.0 / fps as f32, attack_secs, release_secs);
+            }
+            value
+        }
+
+        let rise_30 = follow_for(30, 0.2, 0.0, 1.0, 0.05, 0.2);
+        let rise_60 = follow_for(60, 0.2, 0.0, 1.0, 0.05, 0.2);
+        let rise_120 = follow_for(120, 0.2, 0.0, 1.0, 0.05, 0.2);
+        let release_30 = follow_for(30, 0.2, 1.0, 0.0, 0.05, 0.2);
+        let release_60 = follow_for(60, 0.2, 1.0, 0.0, 0.05, 0.2);
+        let release_120 = follow_for(120, 0.2, 1.0, 0.0, 0.05, 0.2);
+
+        assert!((rise_30 - rise_60).abs() < 1.0e-6);
+        assert!((rise_60 - rise_120).abs() < 1.0e-6);
+        assert!((release_30 - release_60).abs() < 1.0e-6);
+        assert!((release_60 - release_120).abs() < 1.0e-6);
+        assert!((rise_60 - (1.0 - (-4.0_f32).exp())).abs() < 1.0e-6);
+        assert!((release_60 - (-1.0_f32).exp()).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn threshold_gates_input_before_the_envelope() {
+        let modulator = ConfiguredModulator {
+            id: ModulatorId(1),
+            source: ModulatorSource::BandEnergy {
+                range: BandRange::Hz {
+                    low_hz: 40.0,
+                    high_hz: 120.0,
+                },
+                smoothing: Smoothing::Envelope {
+                    attack_secs: 0.015,
+                    release_secs: 0.18,
+                },
+                weighting: BandWeighting::Raw,
+                gain_db: 0.0,
+                floor: 0.0,
+                ceiling: 1.0,
+                threshold: 0.1,
+            },
+        };
+        let mut output = Vec::new();
+        update_modulator_values(&[modulator.clone()], &[0.09], true, 0.0, &mut output);
+        assert_eq!(output[0].value, 0.0);
+        update_modulator_values(&[modulator], &[1.0], false, 1.0 / 60.0, &mut output);
+        assert!(output[0].value > 0.6);
     }
 }

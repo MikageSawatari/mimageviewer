@@ -54,6 +54,10 @@ pub enum ModulatorSource {
         gain_db: f32,
         floor: f32,
         ceiling: f32,
+        /// Values below this normalized 0..=1 level are treated as silence
+        /// before temporal smoothing.
+        #[serde(default)]
+        threshold: f32,
     },
 }
 

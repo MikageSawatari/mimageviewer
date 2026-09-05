@@ -8,9 +8,9 @@ use music_core::{
     SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalyzer, prepare_keyboard_frame_into,
 };
 use musicvideo_core::{
-    Assets, Frame, ImageId, ModulationBinding, ModulationCurve, ModulationTarget, Project,
-    RenderReport, ScaledImageCacheStats, Smoothing, SpectrumSource, UnresolvedAsset, evaluate,
-    new_band_energy_modulator, render_frame,
+    Assets, Frame, ImageId, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
+    ModulatorSource, Project, RenderReport, ScaledImageCacheStats, Smoothing, SpectrumSource,
+    UnresolvedAsset, evaluate, new_band_energy_modulator, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -29,6 +29,9 @@ const DISTRIBUTION_SIGNAL_AMPLITUDE: f64 = 0.0035;
 const DISTRIBUTION_GAINS_DB: [f32; 3] = [0.0, 6.0, 12.0];
 const STATIONARY_TONE_DURATION_SECS: f64 = 2.0;
 const STATIONARY_TONE_CENTER_SECS: f64 = 1.0;
+const KICK_RESPONSE_FPS: f64 = 60.0;
+const KICK_RESPONSE_DURATION_SECS: f64 = 2.0;
+const KICK_ONSET_SECS: f64 = 0.8;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimingStats {
@@ -497,6 +500,14 @@ struct StationaryNoteResponse {
     values: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct KickResponseSample {
+    time_secs: f64,
+    raw: f32,
+    average: f32,
+    envelope: f32,
+}
+
 pub fn run_keyboard_distribution() -> Result<(), String> {
     let distribution = measure_keyboard_distribution(DISTRIBUTION_DURATION_SECS, DISTRIBUTION_FPS)?;
     println!(
@@ -563,6 +574,101 @@ pub fn run_stationary_note_response() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+pub fn run_kick_envelope_response() -> Result<(), String> {
+    let samples = measure_kick_envelope_response()?;
+    println!(
+        "kick envelope response: signal=decaying_100_to_50_hz_burst onset_secs={KICK_ONSET_SECS:.3} sample_rate={BENCHMARK_SAMPLE_RATE} analysis_fps={KICK_RESPONSE_FPS:.1} range_hz=40-120 preprocessing=gain_3db_floor_0.03_ceiling_0.8_threshold_0.08 average_factor=0.7 envelope_attack_secs={:.3} envelope_release_secs={:.3}",
+        musicvideo_core::KICK_ATTACK_SECS,
+        musicvideo_core::KICK_RELEASE_SECS,
+    );
+    println!("time_secs offset_secs raw average_ema envelope");
+    for sample in samples.iter().filter(|sample| {
+        sample.time_secs >= KICK_ONSET_SECS - 0.4
+            && sample.time_secs <= KICK_ONSET_SECS + 0.8
+            && ((sample.time_secs * 20.0).round() - sample.time_secs * 20.0).abs() < 1.0e-6
+    }) {
+        println!(
+            "{:.3} {:+.3} {:.6} {:.6} {:.6}",
+            sample.time_secs,
+            sample.time_secs - KICK_ONSET_SECS,
+            sample.raw,
+            sample.average,
+            sample.envelope,
+        );
+    }
+    Ok(())
+}
+
+fn measure_kick_envelope_response() -> Result<Vec<KickResponseSample>, String> {
+    let project = default_project(KICK_RESPONSE_DURATION_SECS);
+    let mut raw = new_band_energy_modulator(&project);
+    raw.id = ModulatorId(1);
+    raw.name = "raw".to_owned();
+    let ModulatorSource::BandEnergy { smoothing, .. } = &mut raw.source;
+    *smoothing = Smoothing::None;
+
+    let mut average = raw.clone();
+    average.id = ModulatorId(2);
+    average.name = "average".to_owned();
+    let ModulatorSource::BandEnergy { smoothing, .. } = &mut average.source;
+    *smoothing = Smoothing::Average { factor: 0.7 };
+
+    let mut envelope = raw.clone();
+    envelope.id = ModulatorId(3);
+    envelope.name = "envelope".to_owned();
+    let ModulatorSource::BandEnergy { smoothing, .. } = &mut envelope.source;
+    *smoothing = Smoothing::Envelope {
+        attack_secs: musicvideo_core::KICK_ATTACK_SECS,
+        release_secs: musicvideo_core::KICK_RELEASE_SECS,
+    };
+
+    let pcm = synthetic_kick_pcm(KICK_RESPONSE_DURATION_SECS, KICK_ONSET_SECS);
+    let mut source = SpectrumSource::new(
+        BENCHMARK_SAMPLE_RATE,
+        musicvideo_core::DEFAULT_SPECTRUM_BANDS,
+        Smoothing::None,
+    )
+    .map_err(|error| format!("キック応答の解析を初期化できません: {error}"))?;
+    source
+        .configure_modulators(&[raw, average, envelope])
+        .map_err(|error| format!("キック応答の変調を初期化できません: {error}"))?;
+    let frame_count = (KICK_RESPONSE_DURATION_SECS * KICK_RESPONSE_FPS).round() as usize;
+    let mut samples = Vec::with_capacity(frame_count + 1);
+    for index in 0..=frame_count {
+        let time_secs = index as f64 / KICK_RESPONSE_FPS;
+        let values = &source.full_frame_at(&pcm, time_secs, 0.0).modulators;
+        if values.len() != 3 {
+            return Err("キック応答の変調値が 3 系統そろいませんでした".to_owned());
+        }
+        samples.push(KickResponseSample {
+            time_secs,
+            raw: values[0].value,
+            average: values[1].value,
+            envelope: values[2].value,
+        });
+    }
+    Ok(samples)
+}
+
+fn synthetic_kick_pcm(duration_secs: f64, onset_secs: f64) -> Vec<f32> {
+    let frame_count = (duration_secs * BENCHMARK_SAMPLE_RATE as f64).ceil() as usize;
+    let mut pcm = Vec::with_capacity(frame_count * 2);
+    for frame in 0..frame_count {
+        let time = frame as f64 / BENCHMARK_SAMPLE_RATE as f64;
+        let elapsed = time - onset_secs;
+        let value = if (0.0..0.25).contains(&elapsed) {
+            let attack = 1.0 - (-elapsed / 0.002).exp();
+            let decay = (-elapsed / 0.055).exp();
+            let phase = std::f64::consts::TAU * (100.0 * elapsed - 125.0 * elapsed * elapsed);
+            (phase.sin() * attack * decay * 0.9) as f32
+        } else {
+            0.0
+        };
+        pcm.extend_from_slice(&[value, value]);
+    }
+    pcm
 }
 
 fn measure_stationary_note_response(
@@ -794,5 +900,25 @@ mod tests {
             c5.mean >= c6.mean * 0.85,
             "C5-B5 should not dip below C6-B6"
         );
+    }
+
+    #[test]
+    fn kick_envelope_attacks_faster_and_releases_slower_than_average() {
+        let samples = measure_kick_envelope_response().unwrap();
+        let at = |time: f64| {
+            samples
+                .iter()
+                .find(|sample| (sample.time_secs - time).abs() < 1.0e-9)
+                .copied()
+                .unwrap()
+        };
+        let before = at(0.7);
+        let onset = at(0.8);
+        let tail = at(1.15);
+
+        assert_eq!(before.raw, 0.0);
+        assert_eq!(before.envelope, 0.0);
+        assert!(onset.envelope > onset.average + 0.3);
+        assert!(tail.envelope > tail.average + 0.3);
     }
 }

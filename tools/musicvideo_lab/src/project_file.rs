@@ -314,11 +314,15 @@ mod tests {
                 low_midi: 24,
                 high_midi: 35,
             },
-            smoothing: Smoothing::Average { factor: 0.65 },
+            smoothing: Smoothing::Envelope {
+                attack_secs: 0.02,
+                release_secs: 0.24,
+            },
             weighting: BandWeighting::MivDisplay,
             gain_db: 4.5,
             floor: 0.15,
             ceiling: 0.8,
+            threshold: 0.12,
         };
         let id = bass.id;
         project.modulators.push(bass);
@@ -345,6 +349,37 @@ mod tests {
             restored.layers[1].modulations,
             project.layers[1].modulations
         );
+    }
+
+    #[test]
+    fn legacy_average_modulator_json_defaults_the_new_threshold() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("legacy-modulator.mivmv.json");
+        let mut project = default_project(12.0);
+        let mut modulator = new_band_energy_modulator(&project);
+        let ModulatorSource::BandEnergy {
+            smoothing,
+            threshold,
+            ..
+        } = &mut modulator.source;
+        *smoothing = Smoothing::Average { factor: 0.65 };
+        *threshold = 0.5;
+        project.modulators.push(modulator);
+        let mut value = serde_json::to_value(&project).unwrap();
+        value["modulators"][0]["source"]["BandEnergy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("threshold");
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let restored = load_project(&project_path).unwrap();
+        let ModulatorSource::BandEnergy {
+            smoothing,
+            threshold,
+            ..
+        } = restored.modulators[0].source;
+        assert_eq!(smoothing, Smoothing::Average { factor: 0.65 });
+        assert_eq!(threshold, 0.0);
     }
 
     #[test]

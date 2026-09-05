@@ -20,6 +20,9 @@ const SPECTRUM_DB_FLOOR: f32 = -72.0;
 const SPECTRUM_DB_CEIL: f32 = -8.0;
 const SPECTRUM_DB_GAMMA: f32 = 1.65;
 const SPECTRUM_BLEND_HALF_OCTAVES: f32 = 0.14;
+/// Arbitrary energy ranges favor temporal resolution once the interval still
+/// spans this many FFT bins. Narrow note bands continue to use long windows.
+const SPECTRUM_RANGE_MIN_FFT_BINS: f32 = 4.0;
 const SPECTRUM_LOW_SECONDARY_WINDOW_IDX: usize = 1;
 const SPECTRUM_LOW_SECONDARY_FULL_HZ: f32 = 72.0;
 const SPECTRUM_LOW_SECONDARY_FADE_END_HZ: f32 = 90.0;
@@ -753,12 +756,25 @@ impl SpectrumAnalyzer {
             return 0.0;
         }
         let center_hz = (low_hz * high_hz).sqrt();
-        let power = self.power_for_range(center_hz, low_hz, high_hz, false);
+        let power = self.power_for_arbitrary_range(low_hz, high_hz);
         let display_gain_db = match request.weighting {
             SpectrumWeighting::None => 0.0,
             SpectrumWeighting::Display => spectrum_display_weight_db(center_hz),
         };
         power_to_display_value(power, display_gain_db)
+    }
+
+    fn power_for_arbitrary_range(&self, low_hz: f32, high_hz: f32) -> f32 {
+        let width_hz = high_hz - low_hz;
+        let window = self
+            .windows
+            .iter()
+            .rev()
+            .find(|window| width_hz / window.bin_hz >= SPECTRUM_RANGE_MIN_FFT_BINS)
+            .or_else(|| self.windows.first());
+        window.map_or(0.0, |window| {
+            range_power_from_fft(&window.powers, window.bin_hz, low_hz, high_hz)
+        })
     }
 
     fn window_weights(&self, hz: f32) -> Vec<(usize, f32)> {
@@ -1800,6 +1816,39 @@ mod tests {
         );
         assert!(result.range_values[0] > result.range_values[1]);
         assert_eq!(result.range_values[2], 0.0);
+    }
+
+    #[test]
+    fn wide_energy_range_uses_temporal_resolution_without_pretriggering_a_kick() {
+        let sample_rate = 48_000_u32;
+        let onset_secs = 0.8_f64;
+        let mut samples = Vec::with_capacity(sample_rate as usize * 2 * 2);
+        for frame in 0..sample_rate as usize * 2 {
+            let time = frame as f64 / sample_rate as f64;
+            let elapsed = time - onset_secs;
+            let value = if (0.0..0.25).contains(&elapsed) {
+                let attack = 1.0 - (-elapsed / 0.002).exp();
+                let decay = (-elapsed / 0.055).exp();
+                let phase = std::f64::consts::TAU * (100.0 * elapsed - 125.0 * elapsed * elapsed);
+                (phase.sin() * attack * decay * 0.9) as f32
+            } else {
+                0.0
+            };
+            samples.extend([value, value]);
+        }
+        let request = SpectrumRangeRequest {
+            range: SpectrumRange::Hz {
+                low_hz: 40.0,
+                high_hz: 120.0,
+            },
+            weighting: SpectrumWeighting::None,
+        };
+        let mut analyzer = SpectrumAnalyzer::new(64);
+        let before = analyzer.analyze_with_ranges(&samples, sample_rate, 0.7, &[request]);
+        let onset = analyzer.analyze_with_ranges(&samples, sample_rate, onset_secs, &[request]);
+
+        assert_eq!(before.range_values[0], 0.0);
+        assert!(onset.range_values[0] > 0.3);
     }
 
     #[test]
