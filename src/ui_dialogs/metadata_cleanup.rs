@@ -89,6 +89,7 @@ impl App {
             &mut self.conceal_page_keys,
             &mut self.comic_page_keys,
             &mut self.rotation_page_keys,
+            &mut self.export_crop_page_keys,
         ] {
             keys.retain(|key| !deleted.contains(key.as_str()));
         }

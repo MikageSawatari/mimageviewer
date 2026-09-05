@@ -53,7 +53,7 @@ const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
 const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
 const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
 const DETAILS_RATING_BEST_FIT_SEED: &str = "★★★★★";
-const DETAILS_STATE_BEST_FIT_SEED: &str = "補 レ 消 隠 文 回 ピ";
+const DETAILS_STATE_BEST_FIT_SEED: &str = "補 レ 消 隠 文 回 切 ピ";
 // ScrollArea 本体の外にある popup frame と、上下の配置余白を合わせて確保する。
 const DETAILS_COLUMN_MENU_SCREEN_MARGIN: f32 = 48.0;
 const DETAILS_COLUMN_MENU_COLUMNS_WIDTH: f32 = 240.0;
@@ -2163,7 +2163,7 @@ impl DetailsColumn {
     fn default_width(self) -> f32 {
         // `egui_kittest` で本体の既定フォント (Yu Gothic Medium) を入れ、100% scale の
         // Body text を実測した固定シード幅 + DETAILS_BEST_FIT_HORIZONTAL_PADDING の ceil。
-        // Rating: 65 + 14 = 79、State: 113 + 14 = 127。バッジ種別を増やした場合は
+        // Rating: 65 + 14 = 79、State: 130 + 14 = 144。バッジ種別を増やした場合は
         // DETAILS_STATE_BEST_FIT_SEED とこの既定幅を必ず一緒に見直す。
         match self {
             Self::Preview => 34.0,
@@ -2176,7 +2176,7 @@ impl DetailsColumn {
             Self::Place => 180.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
-            Self::State => 127.0,
+            Self::State => 144.0,
             Self::ImageDimensions => 108.0,
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
@@ -15461,6 +15461,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if badges.rotation {
             flags.push("回");
         }
+        if badges.crop {
+            flags.push("切");
+        }
         // 代表サムネピン (ネスト ZIP では本ごとピン Model B: ルート = zip_path /
         // 本の中 = 実効 prefix の book キー + ZipEntry)。
         if let (Some(pin_container), Some(src)) = (
@@ -16095,6 +16098,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         mask: badges.mask,
                                         conceal: badges.conceal,
                                         comic: badges.comic,
+                                        crop: badges.crop,
                                         pin: has_pin,
                                     },
                                     rating,
@@ -18249,9 +18253,18 @@ mod compute_cell_size_tests {
             conceal,
             comic,
             rotation,
+            crop,
         } = GridEditBadges::default();
-        let edit_badge_field_count =
-            [page_override, local_adjust, mask, conceal, comic, rotation].len();
+        let edit_badge_field_count = [
+            page_override,
+            local_adjust,
+            mask,
+            conceal,
+            comic,
+            rotation,
+            crop,
+        ]
+        .len();
         let pin_badge_count = 1;
 
         assert_eq!(

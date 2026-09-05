@@ -7,7 +7,7 @@
 //! 再レンダや AI アップスケールで手元のラスタ寸法が変わっても、適用時はこの基準寸法から
 //! 対象ラスタへ変換し、選択領域の意味を維持する。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -982,6 +982,25 @@ impl CropDb {
         self.load_by_prefix(prefix).into_keys().collect()
     }
 
+    /// 親コンテナの編集バッジ集約用に、保存済み crop の全 page key を取得する。
+    ///
+    /// `load_keys("")` でも全件を表現できるが、起動時の全体索引には他の編集 DB と同じ
+    /// 引数なし API を用意し、crop payload を読まず key 列だけを取得する。
+    pub fn load_all_keys(&self) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT page_path FROM export_crop_pages")
+        else {
+            return keys;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return keys;
+        };
+        keys.extend(rows.flatten());
+        keys
+    }
+
     pub fn load_by_prefix(&self, prefix: &str) -> HashMap<String, CropSettings> {
         let mut map = HashMap::new();
         let Ok(mut stmt) = self.conn.prepare_cached(
@@ -1575,6 +1594,29 @@ mod tests {
         db.set(key, settings).unwrap();
 
         assert_eq!(db.get(key), Some(settings));
+    }
+
+    #[test]
+    fn crop_db_load_all_keys_returns_every_page_without_prefix_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CropDb::open_at(&dir.path().join("crop.db")).unwrap();
+        let settings = CropSettings::authored(
+            CropRect {
+                min_x: 1.0,
+                min_y: 2.0,
+                max_x: 30.0,
+                max_y: 40.0,
+            },
+            CropAspectMode::Keep,
+            [100, 100],
+        );
+        db.set("c:/first/a.jpg", settings).unwrap();
+        db.set("d:/second/b.jpg", settings).unwrap();
+
+        assert_eq!(
+            db.load_all_keys(),
+            BTreeSet::from(["c:/first/a.jpg".to_string(), "d:/second/b.jpg".to_string(),])
+        );
     }
 
     #[test]

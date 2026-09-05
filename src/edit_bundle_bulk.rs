@@ -669,7 +669,7 @@ impl App {
                 conceal: self.conceal_page_keys.contains(&target.page_key),
                 local_adjust: self.local_adjust_page_keys.contains(&target.page_key),
                 comic: self.comic_page_keys.contains(&target.page_key),
-                export_crop: self.export_crop_pages.contains(&target.idx),
+                export_crop: self.export_crop_page_keys.contains(&target.page_key),
                 // get_rotation は cache miss 時に同期SELECTする。起動時に全件ロードされ、
                 // set_image_rotation でも同期される key set だけを見る。
                 rotation: self.rotation_page_keys.contains(&target.page_key),
@@ -904,7 +904,7 @@ impl App {
             {
                 target.kept_runtime_overrides.export_crop = KeptRuntimeValue::from_memory_state(
                     self.export_crop_page_settings.get(&idx).copied(),
-                    self.export_crop_pages.contains(&idx),
+                    self.export_crop_page_keys.contains(&target.page_key),
                 );
             }
             if !kinds.comic {

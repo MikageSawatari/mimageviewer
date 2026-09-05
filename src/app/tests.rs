@@ -11095,7 +11095,7 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::{App, FacetField, subfolder_expansion_synthetic_path};
+    use crate::app::{App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path};
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
     use std::path::PathBuf;
@@ -12227,6 +12227,104 @@ mod phase_c_drill_nav_tests {
             app.grid_edit_badges(7).mask,
             "内側アーカイブとして表示される ZipDir はその本全体を示す"
         );
+    }
+
+    #[test]
+    fn crop_grid_badge_tracks_pages_and_one_level_parent_containers() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let root = PathBuf::from("c:/pics");
+        let image = root.join("cropped.jpg");
+        let folder = root.join("folder");
+        let zip = root.join("book.zip");
+        app.items = vec![
+            GridItem::Image(image.clone()),
+            GridItem::Folder(folder.clone()),
+            GridItem::ZipFile(zip.clone()),
+        ];
+
+        assert!(
+            (0..app.items.len()).all(|idx| !app.grid_edit_badges(idx).crop),
+            "crop が無いページと親コンテナには「切」を出さない"
+        );
+
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(&image));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &folder.join("page.jpg"),
+            ));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "page.jpg"));
+
+        assert!(app.grid_edit_badges(0).crop, "crop 済みページ自身に出す");
+        assert!(
+            app.grid_edit_badges(1).crop,
+            "直下の crop 済みページをフォルダへ 1 段だけ集約する"
+        );
+        assert!(
+            app.grid_edit_badges(2).crop,
+            "crop 済みページを持つ ZIP へ集約する"
+        );
+    }
+
+    #[test]
+    fn crop_only_page_requests_edit_preview_through_grid_badges() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let image = PathBuf::from("c:/pics/crop-preview.jpg");
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.items = vec![GridItem::Image(image)];
+        app.export_crop_pages.clear();
+        app.export_crop_page_keys.insert(key.clone());
+        assert_eq!(
+            app.grid_edit_badges(0),
+            GridEditBadges {
+                crop: true,
+                ..GridEditBadges::default()
+            }
+        );
+
+        let mut request = crate::thumb_loader::LoadRequest {
+            idx: 0,
+            ..Default::default()
+        };
+        app.attach_edit_preview_to_request(&mut request);
+
+        assert_eq!(request.edit_preview_key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn export_crop_key_set_tracks_persistent_add_and_remove() {
+        use crate::export_crop::{CropAspectMode, CropRect, CropSettings};
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.settings.sidecar_backup_enabled = false;
+        let image = app.tmp.path().join("crop-key.jpg");
+        std::fs::write(&image, b"test").unwrap();
+        app.items = vec![GridItem::Image(image.clone())];
+        let key = crate::adjustment_db::normalize_path(&image);
+        let crop = CropSettings::authored(
+            CropRect {
+                min_x: 10.0,
+                min_y: 10.0,
+                max_x: 90.0,
+                max_y: 80.0,
+            },
+            CropAspectMode::Free,
+            [100, 100],
+        );
+
+        app.set_export_crop_for_idx(0, Some(crop), [100, 100]);
+        assert!(app.export_crop_page_keys.contains(&key));
+        assert!(app.grid_edit_badges(0).crop);
+
+        app.set_export_crop_for_idx(0, None, [100, 100]);
+        assert!(!app.export_crop_page_keys.contains(&key));
+        assert!(!app.grid_edit_badges(0).crop);
     }
 
     #[test]
@@ -48464,6 +48562,8 @@ mod still_window_mode_key_tests {
         app.adjusted_page_keys.insert(format!("{old_k}2/other.jpg"));
         app.mask_page_keys.insert(old_k.clone());
         app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
+        app.export_crop_page_keys
+            .insert(format!("{old_k}/cropped.jpg"));
         app.settings
             .video_resume_positions
             .insert(format!("{old_k}/v.mp4"), 12.0);
@@ -48487,6 +48587,14 @@ mod still_window_mode_key_tests {
         assert!(app.mask_page_keys.contains(&new_k), "exact キーも移る");
         assert!(app.comic_page_keys.contains(&format!("{new_k}::p1.jpg")));
         assert!(!app.comic_page_keys.contains(&format!("{old_k}::p1.jpg")));
+        assert!(
+            app.export_crop_page_keys
+                .contains(&format!("{new_k}/cropped.jpg"))
+        );
+        assert!(
+            !app.export_crop_page_keys
+                .contains(&format!("{old_k}/cropped.jpg"))
+        );
         assert_eq!(
             app.settings
                 .video_resume_positions
@@ -61169,6 +61277,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     app.conceal_page_keys.insert(key.clone());
     app.comic_page_keys.insert(key.clone());
     app.rotation_page_keys.insert(key.clone());
+    app.export_crop_page_keys.insert(key.clone());
     app.tags_cache.insert(key.clone(), vec!["old".into()]);
 
     app.apply_metadata_cleanup_result(&crate::metadata_cleanup::DeleteReport {
@@ -61183,6 +61292,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     assert!(!app.conceal_page_keys.contains(&key));
     assert!(!app.comic_page_keys.contains(&key));
     assert!(!app.rotation_page_keys.contains(&key));
+    assert!(!app.export_crop_page_keys.contains(&key));
     assert!(!app.tags_cache.contains_key(&key));
 }
 

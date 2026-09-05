@@ -846,6 +846,7 @@ fn bookmark_time_and_tag_badges_dark() {
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {
                         page_override: true,
+                        crop: true,
                         pin: true,
                         ..Default::default()
                     },

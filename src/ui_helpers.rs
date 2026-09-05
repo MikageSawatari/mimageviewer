@@ -1264,6 +1264,7 @@ pub fn draw_overlay_edit_badge(
         EditBadgeKind::Mask => (egui::Color32::from_rgb(200, 80, 40), egui::Color32::WHITE),
         EditBadgeKind::Conceal => (egui::Color32::from_rgb(153, 102, 204), egui::Color32::WHITE),
         EditBadgeKind::Comic => (egui::Color32::from_rgb(210, 90, 160), egui::Color32::WHITE),
+        EditBadgeKind::Crop => (egui::Color32::from_rgb(35, 145, 180), egui::Color32::WHITE),
         EditBadgeKind::Pin => (
             egui::Color32::from_rgb(230, 180, 90),
             egui::Color32::from_rgb(60, 40, 10),

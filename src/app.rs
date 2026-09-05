@@ -9581,6 +9581,7 @@ pub(crate) struct GridEditBadges {
     pub conceal: bool,
     pub comic: bool,
     pub rotation: bool,
+    pub crop: bool,
 }
 
 /// 音楽ビューのタイムライン解析結果を保持する in-memory LRU のキー。
@@ -12890,6 +12891,8 @@ pub struct App {
     pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
     /// 非破壊回転を持つ page_path / video key 集合 (状態フィルタの親コンテナ判定用)。
     pub(crate) rotation_page_keys: std::collections::BTreeSet<String>,
+    /// 最後段 crop を持つ page_path キー集合 (親コンテナへの「切」状態ロールアップ用)。
+    pub(crate) export_crop_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
     /// 起動時に `adjustment_db.load_all_favorite_params()` から復元。
     /// 解決は [`App::effective_params`] 参照。
@@ -14561,6 +14564,13 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
 
         let t = std::time::Instant::now();
+        let export_crop_page_keys = export_crop_db
+            .as_ref()
+            .map(crate::export_crop::CropDb::load_all_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_export_crop_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
@@ -15444,6 +15454,7 @@ impl App {
             conceal_page_keys,
             comic_page_keys,
             rotation_page_keys,
+            export_crop_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -28644,6 +28655,7 @@ impl App {
             &mut self.conceal_page_keys,
             &mut self.comic_page_keys,
             &mut self.rotation_page_keys,
+            &mut self.export_crop_page_keys,
         ] {
             set.retain(|key| !matches_key(key));
         }
@@ -28870,6 +28882,7 @@ impl App {
                     || self.conceal_page_keys.contains(key)
                     || self.comic_page_keys.contains(key)
                     || self.rotation_page_keys.contains(key)
+                    || self.export_crop_page_keys.contains(key)
             }) || self.adjustment_page_params.contains_key(&item_index)
                 || self.local_adjust_pages.contains(&item_index)
                 || self.export_crop_page_settings.contains_key(&item_index)
@@ -29536,6 +29549,7 @@ impl App {
         self.conceal_page_keys = snapshot.concealed;
         self.comic_page_keys = snapshot.comic;
         self.rotation_page_keys = snapshot.rotated;
+        self.export_crop_page_keys = snapshot.cropped;
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
@@ -30001,6 +30015,7 @@ impl App {
         rewrite_key_set_for_rename(&mut self.mask_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.conceal_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.comic_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.export_crop_page_keys, &old_k, &new_k);
     }
 
     /// リネームに合わせて動画再生位置の in-memory 記録キーを付け替える (DB 側は settings
@@ -32357,10 +32372,11 @@ impl App {
                 Err(e) => errors.push(format!("local_adjust: {e}")),
             }
         }
-        if let Some(db) = &self.export_crop_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("crop: {e}"));
+        if let Some(db) = &self.export_crop_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.export_crop_page_keys, from, to),
+                Err(e) => errors.push(format!("crop: {e}")),
+            }
         }
         if let Some(db) = &self.mask_db {
             match db.copy_entry_key(from, to) {
@@ -32418,10 +32434,11 @@ impl App {
                 Err(e) => errors.push(format!("local_adjust: {e}")),
             }
         }
-        if let Some(db) = &self.export_crop_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("crop: {e}"));
+        if let Some(db) = &self.export_crop_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.export_crop_page_keys, from, to),
+                Err(e) => errors.push(format!("crop: {e}")),
+            }
         }
         if let Some(db) = &self.mask_db {
             match db.move_entry_key(from, to) {
@@ -47774,6 +47791,8 @@ impl App {
             comic: self.comic_pages.contains(&idx)
                 || self.item_has_one_level_edit_key(idx, &self.comic_page_keys),
             rotation: self.item_has_one_level_rotation(idx),
+            crop: self.export_crop_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.export_crop_page_keys),
         }
     }
 
@@ -47793,12 +47812,7 @@ impl App {
             let badges = self.grid_edit_badges(req.idx);
             // 色調補正は既存の thumb_adjust_tex が安価に再現する。永続プレビューには
             // source 解像度の edit-result + 注釈 + 最後段 crop だけを含める。
-            if badges.local_adjust
-                || badges.mask
-                || badges.conceal
-                || badges.comic
-                || self.export_crop_pages.contains(&req.idx)
-            {
+            if badges.local_adjust || badges.mask || badges.conceal || badges.comic || badges.crop {
                 req.edit_preview_key = self.page_path_key(req.idx);
             }
         }
@@ -48789,6 +48803,9 @@ impl App {
         }
         if badges.rotation {
             bits |= 1 << 5;
+        }
+        if badges.crop {
+            bits |= 1 << 6;
         }
         bits
     }
@@ -56654,6 +56671,7 @@ impl App {
             );
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, true);
             if !self.edit_store_write_succeeded("切り出し範囲", written) {
                 return;
             }
@@ -56663,6 +56681,7 @@ impl App {
                 Self::edit_store_write(self.export_crop_db.as_ref().map(|db| db.remove(&key)));
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, false);
             if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
                 return;
             }
@@ -56688,6 +56707,7 @@ impl App {
         settings: Option<crate::export_crop::CropSettings>,
         image_size: [usize; 2],
     ) {
+        let key = self.page_path_key(idx);
         let normalized = settings
             .map(|settings| {
                 crate::export_crop::CropSettings::authored(
@@ -56697,12 +56717,16 @@ impl App {
                 )
             })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
+        let present = normalized.is_some();
         if let Some(settings) = normalized {
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
         } else {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
+        }
+        if let Some(key) = key {
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, present);
         }
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
@@ -62162,6 +62186,7 @@ impl App {
                 || stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
                 || stats.imported_comic > 0
             {
                 self.refresh_edit_rollup_keys_from_dbs();
@@ -62169,6 +62194,7 @@ impl App {
             if stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
             {
                 // 外部更新された sidecar はページごとの旧 preview より新しい可能性がある。
                 // import 対象キーの全列挙を UI スレッドで行わず、派生キャッシュを worker で
@@ -62892,6 +62918,11 @@ impl App {
             .rotation_db
             .as_ref()
             .map(crate::rotation_db::RotationDb::load_rotated_keys)
+            .unwrap_or_default();
+        self.export_crop_page_keys = self
+            .export_crop_db
+            .as_ref()
+            .map(crate::export_crop::CropDb::load_all_keys)
             .unwrap_or_default();
     }
 

@@ -172,13 +172,13 @@ impl App {
         }
     }
 
-    pub(crate) fn page_has_any_bundle_edit(&self, idx: usize, key: &str) -> bool {
+    pub(crate) fn page_has_any_bundle_edit(&self, _idx: usize, key: &str) -> bool {
         self.adjusted_page_keys.contains(key)
             || self.mask_page_keys.contains(key)
             || self.conceal_page_keys.contains(key)
             || self.local_adjust_page_keys.contains(key)
             || self.comic_page_keys.contains(key)
-            || self.export_crop_pages.contains(&idx)
+            || self.export_crop_page_keys.contains(key)
     }
 
     pub(crate) fn start_apply_page_edit_bundle(&mut self, request: EditBundlePasteRequest) {
@@ -268,6 +268,11 @@ impl App {
             self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
         }
 
+        set_key_presence(
+            &mut self.export_crop_page_keys,
+            key,
+            prepared.export_crop.is_some(),
+        );
         if let Some(idx) = idx {
             if let Some(crop) = prepared.export_crop {
                 self.export_crop_page_settings.insert(idx, crop);
