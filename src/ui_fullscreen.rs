@@ -16027,7 +16027,7 @@ impl App {
     /// span burned CPU or waited: a busy span reports the machine's real clock rate, a
     /// blocked one reports a small fraction of it (backlog 1.129).
     #[cfg(windows)]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         let mut cycles = 0u64;
         unsafe {
             let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
@@ -16039,7 +16039,7 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn thread_cycles_now() -> u64 {
+    pub(crate) fn thread_cycles_now() -> u64 {
         0
     }
 

@@ -13808,6 +13808,13 @@ pub struct App {
     /// `frame.begin`, which is the first moment both halves are known.
     perf_prev_update_ms: Option<f64>,
     perf_last_update_end: Option<std::time::Instant>,
+    /// Cycles the UI thread actually executed during the previous update.
+    ///
+    /// Wall time alone cannot tell a frame that computed for 15ms from one that was
+    /// descheduled for 12 of them. Dividing by the wall time gives the clock rate the
+    /// thread really got: near the machine's rate means it was busy, a fraction of it
+    /// means it was waiting or preempted. Same technique as backlog 1.129.
+    perf_prev_update_cycles: Option<u64>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
     /// 全 GPU テクスチャ会計を約 1 秒に 1 回へ間引く perf-log 専用時刻。
@@ -15656,6 +15663,7 @@ impl App {
             perf_last_frame_begin: None,
             perf_prev_update_ms: None,
             perf_last_update_end: None,
+            perf_prev_update_cycles: None,
             last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
@@ -68967,6 +68975,20 @@ impl App {
                     // spent rendering and presenting after it returned.
                     ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
                     ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
+                    (
+                        "prev_update_cycles",
+                        serde_json::Value::from(self.perf_prev_update_cycles.unwrap_or(0)),
+                    ),
+                    // Near the machine's clock rate means the frame computed; a fraction of
+                    // it means the thread spent that wall time waiting or preempted.
+                    (
+                        "prev_update_cycles_per_ms",
+                        serde_json::Value::from(if prev_update_ms > 0.0 {
+                            self.perf_prev_update_cycles.unwrap_or(0) as f64 / prev_update_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
                 ],
             );
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
@@ -71166,6 +71188,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
@@ -71183,6 +71206,8 @@ impl eframe::App for App {
             self.perf_prev_update_ms =
                 Some(end.saturating_duration_since(t0).as_secs_f64() * 1000.0);
             self.perf_last_update_end = Some(end);
+            self.perf_prev_update_cycles =
+                update_cycles_t0.map(|start| Self::thread_cycles_now().saturating_sub(start));
         }
     }
 
