@@ -66,6 +66,12 @@ pub(crate) mod seek_strip;
 pub mod seek_strip_batch;
 pub mod seek_strip_layout;
 pub(crate) mod seek_strip_thumbs;
+
+/// `bench_seek_decode` 用の公開口。デコーダーを開いたままの hw / sw 比較にだけ使う。
+#[cfg(feature = "dev-tools")]
+pub mod seek_strip_bench {
+    pub use super::seek_strip_thumbs::{SeekDecodeSample, bench_persistent_decoder};
+}
 pub(crate) mod seek_strip_wave;
 pub mod spherical_metadata;
 pub(crate) mod stream;
@@ -6335,7 +6341,8 @@ fn run_native_video_output(
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
                                 );
-                            }                            crate::video::native_presenter::NativeOverlayCommand::ToggleInfoPanelLock => {
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleInfoPanelLock => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,

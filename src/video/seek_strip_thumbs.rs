@@ -1992,6 +1992,69 @@ fn emit_decode(
     }
 }
 
+/// 1 本のデコーダーを開いたまま、指定時刻へ順にシークして 1 枚ずつ取り出す。
+///
+/// **CLI の計測とは前提が違う。** `ffmpeg -ss` はシークのたびにデコーダーを作り直すので、
+/// ハードウェア復号は D3D11 デバイス生成を毎回払う。ストリップはセッション中デコーダーを
+/// 開いたままなので、その差を含めない比較がいる (backlog §1.190)。
+#[cfg(feature = "dev-tools")]
+pub struct SeekDecodeSample {
+    pub target_secs: f64,
+    pub total_ms: f64,
+    pub seek_ms: f64,
+    pub transform_ms: f64,
+    pub decoded_frames: usize,
+    pub published: bool,
+}
+
+/// 実際の `decode_run` をそのまま使い、デコーダーを開いたまま各時刻を計測する。
+#[cfg(feature = "dev-tools")]
+pub fn bench_persistent_decoder(
+    path: &Path,
+    hw_preferred: bool,
+    keyframes_only: bool,
+    tolerance_secs: f64,
+    targets: &[f64],
+) -> Result<(String, Vec<SeekDecodeSample>), String> {
+    let mode = if keyframes_only {
+        StripDecodeMode::KeyframesOnly
+    } else {
+        StripDecodeMode::FullFrames
+    };
+    let mut decoder = SeekStripDecoder::open(path, hw_preferred, mode)?;
+    let decode_path = decoder.decode_path().to_string();
+    let requests = Mutex::new(LatestWindowRequest::default());
+    let cancel = AtomicBool::new(false);
+    let mut samples = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter().copied().enumerate() {
+        let id = StripCellId::from_secs(target).ok_or_else(|| "invalid target".to_string())?;
+        let cell = PlannedStripCell {
+            index,
+            id,
+            target_secs: target,
+            timestamp_ms: timestamp_ms(target).unwrap_or(0),
+            visible: true,
+            exact_keyframe: false,
+            frame_match_tolerance: FrameMatchTolerance::symmetric(tolerance_secs),
+        };
+        let run = StripDecodeRun { cells: vec![cell] };
+        let mut published = false;
+        let started = Instant::now();
+        let result = decoder.decode_run(&run, 0, started, &requests, &cancel, &mut |_| {
+            published = true;
+        });
+        samples.push(SeekDecodeSample {
+            target_secs: target,
+            total_ms: started.elapsed().as_secs_f64() * 1000.0,
+            seek_ms: result.metrics.seek.as_secs_f64() * 1000.0,
+            transform_ms: result.metrics.transform.as_secs_f64() * 1000.0,
+            decoded_frames: result.metrics.decoded_frames,
+            published,
+        });
+    }
+    Ok((decode_path, samples))
+}
+
 fn cancelled_or_superseded(
     cancel: &AtomicBool,
     requests: &Mutex<LatestWindowRequest>,
