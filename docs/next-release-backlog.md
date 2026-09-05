@@ -1833,11 +1833,19 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   `ensure_navigation_target_thumbnail_requests` 相当の優先経路へ載せ、Pending は placeholder、
   Ready になったセルから差し替える。数万ページでも要求数と GPU texture 数を表示幅に対して
   有界にする。アニメーションページは一覧と同じ先頭フレームのサムネイルでよい。
-- **§1.181 と同時に設計する。** 現状は fullscreen 位置へ一覧の保持帯が追随し、シーク操作で
-  サムネイル要求・texture backlog が大量に積まれて表示を引っかける。サムネイル列のために
-  この経路をさらに広げてはならない。fullscreen 中の thumbnail keep set を「一覧の仮想ページ
-  数」ではなく、現在表示とストリップの可視セルから作るか、専用の bounded consumer として
-  分離し、§1.181 の引っかかりも悪化させないことを perf log で確認する。
+- **シーク中の先読み抑制と正面衝突する。** 旧 §1.181 (シークバー操作中の先読み過多) は
+  v3.5.0 で解消済みで、`note_fullscreen_seek_activity` がシーク操作のたびに先読み時計を
+  進め、`decide_prefetch_allowed` がその間の先読み enqueue を止める。**ストリップは
+  ドラッグ中に要求を出し続ける consumer** なので、この gate を素通りさせるとドラッグ中
+  だけセルが空のままになり、逆に gate を緩めると解消済みの引っかかりが戻る。
+  ストリップを「抑制対象外の有界 consumer」として明示的に切り出すことを、実装前に決める。
+- **`keep_range` は `keep_set` の min..max を囲む bounding box である。**
+  `ensure_navigation_target_thumbnail_requests` は `keep_set` を extend した後、和集合の
+  min / max から `keep_range` と `keep_start_shared` / `keep_end_shared` を作り直す。
+  texture 数は `keep_set` が有界にするので計画どおりだが、一覧の保持帯がページ 3 に居る
+  ままページ 5,000 のストリップを載せると range が 5,000 ページに広がり、**worker 側の
+  安価なキャンセル判定が stale 要求を弾かなくなる**。ストリップはこの helper を通さないか、
+  helper が range を和集合から導出するのをやめるか、どちらかを選ぶ。
 - レイアウトは 1 つの resolved geometry から、描画、hit-test、下端 hover、タッチ除外領域、
   固定時の media rect、左右パネルの下端を解く。動画ストリップの高さ設定を共有するか、
   静止画用の高さを固定するかは実装時に UI 全体を見て決めるが、動画専用の状態や worker は
@@ -1845,7 +1853,8 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 回帰確認: 単ページ / 見開き LTR / 見開き RTL / 連結読み、通常画像 / ZIP / PDF、
   Pending→Loaded、数万ページで要求数が有界、固定 / 非固定、クリック着地、サイドパネル・
   ナビゲータ・タッチ領域との非重複を pure logic / UI snapshot で固定する。実機では cold cache
-  と warm cache のシークを `--perf-log` で比較し、§1.181 の frame gap を増やさない。
+  と warm cache のシークを `--perf-log` で比較し、v3.5.0 で解消したシーク中の frame gap を
+  戻していないことを確認する。
 - 規模 / 優先度: Medium / P2。動画のフレーム抽出より簡単だが、固定バーの動的高さと
   サムネイル保持予算を同時に扱うため、メニュー項目追加だけの Small 変更ではない。
 
