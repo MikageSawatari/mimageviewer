@@ -60610,6 +60610,124 @@ mod ctrl_f_structural_filter_tests {
         }
     }
 
+    fn png_with_xmp_tweet_id(tweet_id: &str) -> Vec<u8> {
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'>
+<xtw:TweetId>{tweet_id}</xtw:TweetId>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut payload = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        payload.extend_from_slice(xml.as_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"iTXt");
+        png.extend_from_slice(&payload);
+        png.extend_from_slice(&[0_u8; 4]);
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0_u8; 4]);
+        png
+    }
+
+    #[test]
+    fn metadata_search_parallel_pass2_deduplicates_xmp_additions_by_normalized_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("duplicate.png");
+        std::fs::write(&path, png_with_xmp_tweet_id("dedup-123")).unwrap();
+        let items = vec![GridItem::Image(path.clone()), GridItem::Image(path.clone())];
+        let tokens = crate::search_query::parse("dedup-123");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+
+        let SearchThreadResult::Done {
+            matches,
+            xmp_additions,
+        } = run_metadata_search(
+            &tokens,
+            &items,
+            &xmp,
+            None,
+            &passwords,
+            &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::XmpTweet]),
+            crate::search_query::MatchMode::And,
+            &cancel,
+            Some(&progress),
+        );
+
+        assert_eq!(matches, std::collections::HashSet::from([0, 1]));
+        assert_eq!(
+            xmp_additions.len(),
+            1,
+            "duplicate normalized path must publish only one XMP addition"
+        );
+        assert_eq!(
+            xmp_additions[0].0,
+            crate::adjustment_db::normalize_path(&path)
+        );
+        assert_eq!(
+            progress.snapshot(),
+            SearchProgressSnapshot {
+                done: 2,
+                total: 2,
+                matched: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_search_cancel_returns_completed_parallel_matches() {
+        let items: Vec<GridItem> = (0..100_000)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("C:\\\\g\\\\hit-{idx}.jpg"))))
+            .collect();
+        let tokens = crate::search_query::parse("hit-");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_metadata_search(
+                    &tokens,
+                    &items,
+                    &xmp,
+                    None,
+                    &passwords,
+                    &target,
+                    crate::search_query::MatchMode::And,
+                    &cancel,
+                    Some(&progress),
+                )
+            });
+            while progress.snapshot().done == 0 && !worker.is_finished() {
+                std::thread::yield_now();
+            }
+            cancel.store(true, Ordering::Relaxed);
+            worker.join().unwrap()
+        });
+
+        let SearchThreadResult::Done { matches, .. } = result;
+        let snapshot = progress.snapshot();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            !matches.is_empty(),
+            "matches completed before cancellation must not be discarded"
+        );
+        assert_eq!(
+            matches.len(),
+            snapshot.done,
+            "every completed filename-only item matched and must be returned"
+        );
+        assert!(snapshot.done <= snapshot.total);
+    }
+
     #[test]
     fn structural_items_filtered_by_name() {
         // §4.1: フォルダ / ZIP / 変換対象アーカイブもファイル名で一貫して絞り込む。

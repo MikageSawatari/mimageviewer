@@ -8,7 +8,7 @@
 //! - InvokeAI / SwarmUI / Fooocus 系: JSON 形式の PNG tEXt / EXIF UserComment
 //! - Midjourney: key=`Description` (平文テキスト)
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -110,19 +110,85 @@ struct ParseOutcome {
 /// IDAT の前後どちらに配置されたチャンクも読み取る（png crate は IDAT 前のみ）。
 /// 画像ピクセルはデコードしない。
 pub fn read_png_text_chunks(path: &Path) -> std::io::Result<Vec<(String, String)>> {
-    let data = std::fs::read(path)?;
-    read_png_text_chunks_raw(&data)
+    let file = std::fs::File::open(path)?;
+    read_png_text_chunks_from_reader(file)
 }
 
 /// バイト列から PNG tEXt / iTXt / zTXt チャンクを読み取る（ZIP 内画像用）。
 pub fn read_png_text_chunks_from_bytes(bytes: &[u8]) -> std::io::Result<Vec<(String, String)>> {
-    read_png_text_chunks_raw(bytes)
+    read_png_text_chunks_from_reader(std::io::Cursor::new(bytes))
 }
 
-/// PNG バイナリを直接パースして tEXt / iTXt / zTXt チャンクをすべて収集する。
-fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)>> {
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for CountingReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+struct PngTextRead {
+    chunks: Vec<(String, String)>,
+    bytes_read: u64,
+}
+
+fn read_png_text_chunks_counted(path: &Path) -> PngTextRead {
+    let Ok(file) = std::fs::File::open(path) else {
+        return PngTextRead {
+            chunks: Vec::new(),
+            bytes_read: 0,
+        };
+    };
+    let mut reader = CountingReader::new(file);
+    let chunks = scan_png_text_chunks(&mut reader).unwrap_or_default();
+    PngTextRead {
+        chunks,
+        bytes_read: reader.bytes_read,
+    }
+}
+
+/// PNG のチャンク走査を `Read + Seek` 上で一元化する。
+///
+/// path 経路は `File`、ZIP 等の bytes 経路は `Cursor<&[u8]>` を渡す。text 系
+/// payload だけを読み、IDAT を含む他チャンクは CRC とまとめて seek するため、
+/// IDAT 後方の text チャンクを取りこぼさず画像データ本体も読まない。
+fn read_png_text_chunks_from_reader<R: Read + Seek>(
+    reader: R,
+) -> std::io::Result<Vec<(String, String)>> {
+    let mut reader = CountingReader::new(reader);
+    scan_png_text_chunks(&mut reader)
+}
+
+fn scan_png_text_chunks<R: Read + Seek>(
+    reader: &mut CountingReader<R>,
+) -> std::io::Result<Vec<(String, String)>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
     // PNG signature (8 bytes)
-    if data.len() < 8 || &data[..8] != b"\x89PNG\r\n\x1a\n" {
+    let mut signature = [0_u8; 8];
+    reader.read_exact(&mut signature)?;
+    if &signature != b"\x89PNG\r\n\x1a\n" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Not a PNG file",
@@ -130,32 +196,70 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
     }
 
     let mut chunks = Vec::new();
-    let mut pos = 8; // skip signature
 
     // zlib bomb の多チャンク版への防御 (Codex P2): per-chunk 16 MiB 上限だけでは、
     // 多数の zTXt/iTXt を並べると N×16 MiB の String が積み上がる。1 ファイルあたりの
     // 累積テキスト量にも上限を設け、超えたらそれ以降のチャンクを読まない。正規メタは
     // 全チャンク合計でも数 MB 程度なので 32 MiB は十分広く、攻撃的な合計だけ弾く。
     const MAX_TOTAL_TEXT_BYTES: usize = 32 * 1024 * 1024;
+    // length は未信頼。累積出力上限を超える巨大 payload を確保せず seek で捨てる。
+    // PNG keyword の仕様上限 79 bytes と区切りを加え、上限ちょうどの本文は許可する。
+    const MAX_TEXT_CHUNK_PAYLOAD_BYTES: usize = MAX_TOTAL_TEXT_BYTES + 80;
     let mut total_text: usize = 0;
 
-    while pos + 8 <= data.len() {
+    loop {
         if total_text >= MAX_TOTAL_TEXT_BYTES {
             break;
         }
-        let length =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        let chunk_type = &data[pos + 4..pos + 8];
-        let data_start = pos + 8;
-        let data_end = data_start + length;
+        let mut header = [0_u8; 8];
+        if let Err(error) = reader.read_exact(&mut header) {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(error);
+        }
+        let length = u32::from_be_bytes(header[..4].try_into().expect("4-byte PNG length"));
+        let length_usize = length as usize;
+        let payload_start = reader.stream_position()?;
+        let Some(payload_end) = payload_start.checked_add(u64::from(length)) else {
+            break;
+        };
+        let Some(chunk_end) = payload_end.checked_add(4) else {
+            break;
+        };
+        if chunk_end > file_len {
+            break;
+        }
 
-        if data_end + 4 > data.len() {
-            break; // truncated
+        let chunk_type: &[u8; 4] = header[4..8].try_into().expect("4-byte PNG chunk type");
+        if chunk_type == b"IEND" {
+            break;
+        }
+
+        if !matches!(chunk_type, b"tEXt" | b"zTXt" | b"iTXt")
+            || length_usize > MAX_TEXT_CHUNK_PAYLOAD_BYTES
+        {
+            reader.seek(SeekFrom::Current(i64::from(length) + 4))?;
+            continue;
+        }
+
+        let mut chunk_data = Vec::new();
+        chunk_data.try_reserve_exact(length_usize).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "PNG text chunk is too large",
+            )
+        })?;
+        chunk_data.resize(length_usize, 0);
+        if let Err(error) = reader.read_exact(&mut chunk_data) {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(error);
         }
 
         match chunk_type {
             b"tEXt" => {
-                let chunk_data = &data[data_start..data_end];
                 if let Some(null_pos) = chunk_data.iter().position(|&b| b == 0) {
                     let keyword = String::from_utf8_lossy(&chunk_data[..null_pos]).to_string();
                     let text = String::from_utf8_lossy(&chunk_data[null_pos + 1..]).to_string();
@@ -164,7 +268,6 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
                 }
             }
             b"zTXt" => {
-                let chunk_data = &data[data_start..data_end];
                 if let Some(null_pos) = chunk_data.iter().position(|&b| b == 0) {
                     let keyword = String::from_utf8_lossy(&chunk_data[..null_pos]).to_string();
                     // compression method (1 byte) + compressed data
@@ -178,7 +281,6 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
                 }
             }
             b"iTXt" => {
-                let chunk_data = &data[data_start..data_end];
                 if let Some(kw_end) = chunk_data.iter().position(|&b| b == 0) {
                     let keyword = String::from_utf8_lossy(&chunk_data[..kw_end]).to_string();
                     // compression flag (1) + compression method (1) + language\0 + translated\0 + text
@@ -213,11 +315,10 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
                     }
                 }
             }
-            b"IEND" => break,
             _ => {}
         }
 
-        pos = data_end + 4; // skip CRC
+        reader.seek(SeekFrom::Current(4))?; // CRC は検証対象外なので読まずに飛ばす
     }
 
     Ok(chunks)
@@ -1022,7 +1123,7 @@ fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
 }
 
 fn extract_exif_user_comment_metadata_from_path(path: &Path) -> Option<AiMetadata> {
-    let exif = rexif::parse_file(path.to_str()?).ok()?;
+    let exif = crate::exif_reader::read_rexif_from_path(path).exif?;
     extract_exif_user_comment_metadata_from_entries(&exif.entries)
 }
 
@@ -1071,9 +1172,15 @@ fn exif_user_comment_searchable_from_bytes(bytes: &[u8]) -> Option<(String, Meta
     exif_user_comment_searchable_from_entries(&exif.entries)
 }
 
-fn exif_user_comment_searchable_from_path(path: &Path) -> Option<(String, MetadataOrigin)> {
-    let exif = rexif::parse_file(path.to_str()?).ok()?;
-    exif_user_comment_searchable_from_entries(&exif.entries)
+fn exif_user_comment_searchable_from_path_counted(
+    path: &Path,
+) -> (Option<(String, MetadataOrigin)>, u64) {
+    let read = crate::exif_reader::read_rexif_from_path(path);
+    let searchable = read
+        .exif
+        .as_ref()
+        .and_then(|exif| exif_user_comment_searchable_from_entries(&exif.entries));
+    (searchable, read.bytes_read)
 }
 
 fn decode_user_comment_entry(entry: &rexif::ExifEntry) -> Option<String> {
@@ -1704,32 +1811,65 @@ pub fn build_searchable_from_path(path: &Path) -> String {
 }
 
 pub fn build_searchable_from_path_with_origin(path: &Path) -> (String, Option<MetadataOrigin>) {
+    let read = build_searchable_from_path_counted(path);
+    (read.text, read.origin)
+}
+
+pub(crate) struct SearchableMetadataRead {
+    pub text: String,
+    pub origin: Option<MetadataOrigin>,
+    pub bytes_read: u64,
+}
+
+pub(crate) fn build_searchable_from_path_counted(path: &Path) -> SearchableMetadataRead {
     let Some(ext) = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
     else {
-        return (String::new(), None);
+        return SearchableMetadataRead {
+            text: String::new(),
+            origin: None,
+            bytes_read: 0,
+        };
     };
     match ext.as_str() {
         "png" => {
-            let chunks = read_png_text_chunks(path).unwrap_or_default();
-            if chunks.is_empty() {
+            let read = read_png_text_chunks_counted(path);
+            let (text, origin) = if read.chunks.is_empty() {
                 (String::new(), None)
             } else {
                 (
-                    build_searchable_from_chunks(&chunks),
+                    build_searchable_from_chunks(&read.chunks),
                     Some(MetadataOrigin::PngText),
                 )
+            };
+            SearchableMetadataRead {
+                text,
+                origin,
+                bytes_read: read.bytes_read,
             }
         }
         "jpg" | "jpeg" | "jfif" => {
-            let Some((text, origin)) = exif_user_comment_searchable_from_path(path) else {
-                return (String::new(), None);
+            let (searchable, bytes_read) = exif_user_comment_searchable_from_path_counted(path);
+            let Some((text, origin)) = searchable else {
+                return SearchableMetadataRead {
+                    text: String::new(),
+                    origin: None,
+                    bytes_read,
+                };
             };
-            (text, Some(origin))
+            SearchableMetadataRead {
+                text,
+                origin: Some(origin),
+                bytes_read,
+            }
         }
-        _ => (String::new(), None),
+        _ => SearchableMetadataRead {
+            text: String::new(),
+            origin: None,
+            bytes_read: 0,
+        },
     }
 }
 
@@ -2151,6 +2291,122 @@ fn extract_text_from_ref_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn fixture_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+        fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, extensions, out);
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| extensions.iter().any(|want| ext.eq_ignore_ascii_case(want)))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(root, extensions, &mut files);
+        files.sort();
+        files
+    }
+
+    fn fixture_root(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    #[test]
+    fn fixture_png_path_and_bytes_readers_match_all() {
+        let roots = [
+            fixture_root("tests/fixtures/ai_metadata"),
+            fixture_root("tests/fixtures/sd_parsers_upstream"),
+        ];
+        let mut checked = 0;
+        for root in roots {
+            for path in fixture_files(&root, &["png"]) {
+                let bytes = std::fs::read(&path).unwrap();
+                let from_path = read_png_text_chunks(&path).unwrap_or_default();
+                let from_bytes = read_png_text_chunks_from_bytes(&bytes).unwrap_or_default();
+                assert_eq!(
+                    from_path,
+                    from_bytes,
+                    "fixture mismatch: {}",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "PNG fixtures must be discovered");
+    }
+
+    #[test]
+    fn fixture_jpeg_path_and_bytes_searchable_match_all() {
+        let roots = [
+            fixture_root("tests/fixtures/ai_metadata"),
+            fixture_root("tests/fixtures/sd_parsers_upstream"),
+        ];
+        let mut checked = 0;
+        for root in roots {
+            for path in fixture_files(&root, &["jpg", "jpeg", "jfif"]) {
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(
+                    build_searchable_from_path_with_origin(&path),
+                    build_searchable_from_bytes_with_origin(&bytes),
+                    "fixture mismatch: {}",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "JPEG fixtures must be discovered");
+    }
+
+    #[test]
+    fn text_after_idat_is_read_by_seek_scanner() {
+        let path = fixture_root("tests/fixtures/ai_metadata/enc_a1111_text_after_idat.png");
+        let read = read_png_text_chunks_counted(&path);
+        assert!(
+            read.chunks
+                .iter()
+                .any(|(key, value)| key == "parameters" && !value.is_empty()),
+            "the named post-IDAT metadata fixture must remain searchable"
+        );
+        assert!(
+            read.bytes_read < std::fs::metadata(&path).unwrap().len(),
+            "IDAT payload should be skipped, not read"
+        );
+    }
+
+    #[test]
+    fn bad_image_fixtures_match_without_panicking() {
+        let root = fixture_root("tests/fixtures/sd_parsers_upstream/bad_images");
+        for path in fixture_files(&root, &["png", "jpg", "jpeg", "jfif"]) {
+            let bytes = std::fs::read(&path).unwrap();
+            let from_path = build_searchable_from_path_with_origin(&path);
+            let from_bytes = build_searchable_from_bytes_with_origin(&bytes);
+            assert_eq!(
+                from_path,
+                from_bytes,
+                "bad fixture path/bytes conclusion must match: {}",
+                path.display()
+            );
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("empty_file.png" | "empty_image.jpg")
+            ) {
+                assert_eq!(
+                    from_path,
+                    (String::new(), None),
+                    "fixture without metadata should remain empty: {}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     /// zlib bomb 防御 (post-v1.3.0 backlog): 上限 (16 MiB) を超える解凍出力は拒否し、
     /// 正規サイズはそのまま往復できる。
