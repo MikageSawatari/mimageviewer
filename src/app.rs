@@ -7386,6 +7386,126 @@ impl PassthroughUnavailable {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PassthroughRenditionPerfCall {
+    idx: usize,
+    source_width: Option<usize>,
+    source_height: Option<usize>,
+    from_edit_preview: Option<bool>,
+    pub(crate) cache_hit: Option<bool>,
+    color_adjustment_applied: Option<bool>,
+    colorize_mode: Option<crate::colorize::ColorizeMode>,
+    colorize_applicable_override: Option<bool>,
+    colorize_applied: Option<bool>,
+    creative_lut_applied: Option<bool>,
+    pixel_buffer_generated_this_call: Option<bool>,
+    catalog_texture_reused: Option<bool>,
+    texture_uploaded_this_call: Option<bool>,
+    outcome: &'static str,
+}
+
+impl PassthroughRenditionPerfCall {
+    fn new(idx: usize) -> Self {
+        Self {
+            idx,
+            source_width: None,
+            source_height: None,
+            from_edit_preview: None,
+            cache_hit: None,
+            color_adjustment_applied: None,
+            colorize_mode: None,
+            colorize_applicable_override: None,
+            colorize_applied: None,
+            creative_lut_applied: None,
+            pixel_buffer_generated_this_call: None,
+            catalog_texture_reused: None,
+            texture_uploaded_this_call: None,
+            outcome: "in_progress",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PassthroughRenditionPerfRecorder {
+    pub(crate) source_lookup: std::time::Duration,
+    pub(crate) cache_lookup: std::time::Duration,
+    pub(crate) build_pixels: std::time::Duration,
+    pub(crate) load_texture: std::time::Duration,
+    pub(crate) cache_insert: std::time::Duration,
+    pub(crate) calls: Vec<PassthroughRenditionPerfCall>,
+}
+
+impl PassthroughRenditionPerfRecorder {
+    pub(crate) fn categorized(&self) -> std::time::Duration {
+        self.source_lookup
+            + self.cache_lookup
+            + self.build_pixels
+            + self.load_texture
+            + self.cache_insert
+    }
+
+    fn add(&mut self, span: PassthroughRenditionPerfSpan, elapsed: std::time::Duration) {
+        let target = match span {
+            PassthroughRenditionPerfSpan::SourceLookup => &mut self.source_lookup,
+            PassthroughRenditionPerfSpan::CacheLookup => &mut self.cache_lookup,
+            PassthroughRenditionPerfSpan::BuildPixels => &mut self.build_pixels,
+            PassthroughRenditionPerfSpan::LoadTexture => &mut self.load_texture,
+            PassthroughRenditionPerfSpan::CacheInsert => &mut self.cache_insert,
+        };
+        *target += elapsed;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PassthroughRenditionPerfSpan {
+    SourceLookup,
+    CacheLookup,
+    BuildPixels,
+    LoadTexture,
+    CacheInsert,
+}
+
+#[inline]
+fn start_passthrough_rendition_perf_span_with(
+    recorder: Option<&PassthroughRenditionPerfRecorder>,
+    now: impl FnOnce() -> std::time::Instant,
+) -> Option<std::time::Instant> {
+    recorder.map(|_| now())
+}
+
+#[inline]
+fn start_passthrough_rendition_perf_span(
+    recorder: Option<&PassthroughRenditionPerfRecorder>,
+) -> Option<std::time::Instant> {
+    start_passthrough_rendition_perf_span_with(recorder, std::time::Instant::now)
+}
+
+#[inline]
+fn finish_passthrough_rendition_perf_span_with(
+    recorder: Option<&mut PassthroughRenditionPerfRecorder>,
+    span: PassthroughRenditionPerfSpan,
+    started_at: Option<std::time::Instant>,
+    now: impl FnOnce() -> std::time::Instant,
+) {
+    if let (Some(recorder), Some(started_at)) = (recorder, started_at) {
+        recorder.add(span, now().duration_since(started_at));
+    }
+}
+
+#[inline]
+fn finish_passthrough_rendition_perf_span(
+    recorder: Option<&mut PassthroughRenditionPerfRecorder>,
+    span: PassthroughRenditionPerfSpan,
+    started_at: Option<std::time::Instant>,
+) {
+    finish_passthrough_rendition_perf_span_with(
+        recorder,
+        span,
+        started_at,
+        std::time::Instant::now,
+    );
+}
+
 #[derive(Clone)]
 pub(crate) struct PassthroughRenditionEntry {
     /// Catalog-thumbnail pixels used to build this rendition. Pointer identity
@@ -65928,7 +66048,24 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        let outcome = match self.ensure_passthrough_rendition_inner(ctx, idx) {
+        self.ensure_passthrough_rendition_with_perf(ctx, idx, None)
+    }
+
+    pub(crate) fn ensure_passthrough_rendition_with_perf(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+    ) -> Option<egui::TextureHandle> {
+        let mut perf_call = perf
+            .as_ref()
+            .map(|_| PassthroughRenditionPerfCall::new(idx));
+        let outcome = match self.ensure_passthrough_rendition_inner(
+            ctx,
+            idx,
+            perf.as_deref_mut(),
+            perf_call.as_mut(),
+        ) {
             Ok(texture) if self.display_texture_matches_page(&texture, idx) => {
                 self.passthrough_unavailable = None;
                 Ok(texture)
@@ -65938,6 +66075,13 @@ impl App {
         };
         self.passthrough_last_call
             .insert(idx, (self.frame_counter, outcome.as_ref().err().copied()));
+        if let (Some(perf), Some(mut perf_call)) = (perf, perf_call) {
+            perf_call.outcome = match &outcome {
+                Ok(_) => "ready",
+                Err(reason) => reason.as_str(),
+            };
+            perf.calls.push(perf_call);
+        }
         match outcome {
             Ok(texture) => Some(texture),
             Err(reason) => {
@@ -65988,29 +66132,83 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
+        mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
+        mut perf_call: Option<&mut PassthroughRenditionPerfCall>,
     ) -> Result<egui::TextureHandle, PassthroughUnavailable> {
+        let source_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
             Some(crate::grid_item::ThumbnailState::Loaded {
                 tex,
                 from_edit_preview,
                 ..
             }) => (tex.clone(), *from_edit_preview),
-            _ => return Err(PassthroughUnavailable::ThumbnailNotLoaded),
+            _ => {
+                finish_passthrough_rendition_perf_span(
+                    perf.as_deref_mut(),
+                    PassthroughRenditionPerfSpan::SourceLookup,
+                    source_lookup_t0,
+                );
+                return Err(PassthroughUnavailable::ThumbnailNotLoaded);
+            }
         };
-        let source_pixels = self
-            .thumb_pixels
-            .get(&idx)
-            .ok_or(PassthroughUnavailable::ThumbnailPixelsNotResident)?
-            .clone();
+        let source_pixels = match self.thumb_pixels.get(&idx) {
+            Some(source_pixels) => source_pixels.clone(),
+            None => {
+                if let Some(perf_call) = perf_call.as_deref_mut() {
+                    perf_call.from_edit_preview = Some(from_edit_preview);
+                }
+                finish_passthrough_rendition_perf_span(
+                    perf.as_deref_mut(),
+                    PassthroughRenditionPerfSpan::SourceLookup,
+                    source_lookup_t0,
+                );
+                return Err(PassthroughUnavailable::ThumbnailPixelsNotResident);
+            }
+        };
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            let [source_width, source_height] = source_pixels.size;
+            perf_call.source_width = Some(source_width);
+            perf_call.source_height = Some(source_height);
+            perf_call.from_edit_preview = Some(from_edit_preview);
+        }
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::SourceLookup,
+            source_lookup_t0,
+        );
         let params = self.effective_params(idx).clone();
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.color_adjustment_applied = Some(!params.is_color_identity());
+            perf_call.colorize_mode = Some(params.colorize.mode);
+        }
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),
             source_pixels.size,
             &params,
         );
+        let cache_lookup_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
+            if let Some(perf_call) = perf_call.as_deref_mut() {
+                perf_call.cache_hit = Some(true);
+                perf_call.colorize_applied = Some(entry.colorize_applied);
+                perf_call.pixel_buffer_generated_this_call = Some(false);
+                perf_call.texture_uploaded_this_call = Some(false);
+            }
+            finish_passthrough_rendition_perf_span(
+                perf.as_deref_mut(),
+                PassthroughRenditionPerfSpan::CacheLookup,
+                cache_lookup_t0,
+            );
             return Ok(entry.texture);
         }
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.cache_hit = Some(false);
+        }
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::CacheLookup,
+            cache_lookup_t0,
+        );
 
         let creative_lut = if !params.creative_lut.is_identity() {
             self.creative_lut_library
@@ -66029,13 +66227,31 @@ impl App {
                 .or_else(|| self.known_monochrome_only_applicability(idx, &params))
         })
         .flatten();
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.colorize_applicable_override = colorize_applicable_override;
+            perf_call.creative_lut_applied = Some(creative_lut.is_some());
+        }
+        let build_pixels_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         let rendition = build_passthrough_rendition_pixels(
             &source_pixels,
             &params,
             creative_lut,
             colorize_applicable_override,
         );
+        finish_passthrough_rendition_perf_span(
+            perf.as_deref_mut(),
+            PassthroughRenditionPerfSpan::BuildPixels,
+            build_pixels_t0,
+        );
         let colorize_applied = rendition.colorize_applied;
+        let pixel_buffer_generated = rendition.pixels.is_some();
+        let catalog_texture_reused = !pixel_buffer_generated && !from_edit_preview;
+        if let Some(perf_call) = perf_call.as_deref_mut() {
+            perf_call.colorize_applied = Some(colorize_applied);
+            perf_call.pixel_buffer_generated_this_call = Some(pixel_buffer_generated);
+            perf_call.catalog_texture_reused = Some(catalog_texture_reused);
+            perf_call.texture_uploaded_this_call = Some(!catalog_texture_reused);
+        }
         let (pixels, texture) = if rendition.pixels.is_none() && !from_edit_preview {
             (Arc::clone(&source_pixels), catalog_texture)
         } else {
@@ -66044,16 +66260,22 @@ impl App {
                     .pixels
                     .unwrap_or_else(|| source_pixels.as_ref().clone()),
             );
-            let texture = ctx.load_texture(
-                format!(
-                    "passthrough_rendition_{}_{}_{}_{}",
-                    key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
-                ),
-                (*pixels).clone(),
-                egui::TextureOptions::LINEAR,
+            let texture_name = format!(
+                "passthrough_rendition_{}_{}_{}_{}",
+                key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+            );
+            let upload_pixels = (*pixels).clone();
+            let load_texture_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
+            let texture =
+                ctx.load_texture(texture_name, upload_pixels, egui::TextureOptions::LINEAR);
+            finish_passthrough_rendition_perf_span(
+                perf.as_deref_mut(),
+                PassthroughRenditionPerfSpan::LoadTexture,
+                load_texture_t0,
             );
             (pixels, texture)
         };
+        let cache_insert_t0 = start_passthrough_rendition_perf_span(perf.as_deref());
         self.passthrough_rendition_cache.insert(
             key,
             PassthroughRenditionEntry {
@@ -66062,6 +66284,11 @@ impl App {
                 colorize_applied,
                 texture: texture.clone(),
             },
+        );
+        finish_passthrough_rendition_perf_span(
+            perf,
+            PassthroughRenditionPerfSpan::CacheInsert,
+            cache_insert_t0,
         );
         Ok(texture)
     }

@@ -30,7 +30,8 @@ use crate::app::{
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
     FsNavigationTargetPhase, FsOpenMaterialization, FsOpenPerfRecorder, FsOpenPerfSpan,
     FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
-    FsPrefetchSideDisplay, PollPrefetchOrigin, ViewerPresentation, build_fs_prefetch_indicator,
+    FsPrefetchSideDisplay, PassthroughRenditionPerfCall, PassthroughRenditionPerfRecorder,
+    PollPrefetchOrigin, ViewerPresentation, build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -83,7 +84,7 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
-const FS_RENDER_PERF_STAGE_COUNT: usize = 51;
+const FS_RENDER_PERF_STAGE_COUNT: usize = 56;
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +109,12 @@ enum FsRenderPerfStage {
     FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
     FsNavigationLandOpenOtherPageDecisionOriginalPreview,
     FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
-    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+    FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
     FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
     FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
     FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
@@ -163,7 +169,12 @@ impl FsRenderPerfStage {
         Self::FsNavigationLandOpenOtherShouldBlockDetachedIndependentStillNavigationToVideo,
         Self::FsNavigationLandOpenOtherPageDecisionOriginalPreview,
         Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
-        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        Self::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
         Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
         Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceThumbnailRequests,
         Self::FsNavigationLandOpenOtherPageDecisionResolveSequenceRemainder,
@@ -236,6 +247,7 @@ struct FsPageTurnDecisionPerfRecorder {
     resolve_navigation_sequence_target: std::time::Duration,
     resolve_fs_display_tex: std::time::Duration,
     ensure_passthrough_rendition: std::time::Duration,
+    passthrough_rendition: PassthroughRenditionPerfRecorder,
     resolve_original_preview_tex: std::time::Duration,
     ensure_navigation_target_thumbnail_requests: std::time::Duration,
     cache_lookup: std::time::Duration,
@@ -368,6 +380,7 @@ struct FsRenderPerfRecorder {
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     next_stage: usize,
     navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
 
 impl FsRenderPerfRecorder {
@@ -378,6 +391,7 @@ impl FsRenderPerfRecorder {
             stage_ms: [0.0; FS_RENDER_PERF_STAGE_COUNT],
             next_stage: 0,
             navigation_page_turn_decision_cache_hit: None,
+            navigation_passthrough_rendition_calls: Vec::new(),
         }
     }
 
@@ -415,6 +429,13 @@ impl FsRenderPerfRecorder {
         let open_categorized = navigation.open_fullscreen.categorized();
         let land_open_other_categorized = navigation.land_open_other_categorized();
         let page_turn_decision = &navigation.land_open_other_page_turn_decision;
+        let passthrough_rendition = &page_turn_decision.passthrough_rendition;
+        debug_assert!(
+            passthrough_rendition.categorized() <= page_turn_decision.ensure_passthrough_rendition
+        );
+        let passthrough_rendition_remainder = page_turn_decision
+            .ensure_passthrough_rendition
+            .saturating_sub(passthrough_rendition.categorized());
         let resolve_sequence_categorized =
             page_turn_decision.resolve_navigation_sequence_target_categorized();
         debug_assert!(
@@ -450,6 +471,7 @@ impl FsRenderPerfRecorder {
         debug_assert!(categorized <= navigation_total);
         let remainder = navigation_total.saturating_sub(categorized);
         self.navigation_page_turn_decision_cache_hit = page_turn_decision.cache_hit;
+        self.navigation_passthrough_rendition_calls = passthrough_rendition.calls.clone();
         let stages = [
             (FsRenderPerfStage::FsNavigationClose, navigation.close),
             (
@@ -478,8 +500,28 @@ impl FsRenderPerfRecorder {
                 page_turn_decision.resolve_fs_display_tex,
             ),
             (
-                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
-                page_turn_decision.ensure_passthrough_rendition,
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+                passthrough_rendition.source_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+                passthrough_rendition.cache_lookup,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+                passthrough_rendition.build_pixels,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+                passthrough_rendition.load_texture,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+                passthrough_rendition.cache_insert,
+            ),
+            (
+                FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
+                passthrough_rendition_remainder,
             ),
             (
                 FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceOriginalPreviewTex,
@@ -634,6 +676,7 @@ impl FsRenderPerfRecorder {
             stage_ms: self.stage_ms,
             unaccounted_ms: total_ms - accounted_ms,
             navigation_page_turn_decision_cache_hit: self.navigation_page_turn_decision_cache_hit,
+            navigation_passthrough_rendition_calls: self.navigation_passthrough_rendition_calls,
         }
     }
 }
@@ -770,6 +813,7 @@ struct FsRenderPerfBreakdown {
     stage_ms: [f64; FS_RENDER_PERF_STAGE_COUNT],
     unaccounted_ms: f64,
     navigation_page_turn_decision_cache_hit: Option<bool>,
+    navigation_passthrough_rendition_calls: Vec<PassthroughRenditionPerfCall>,
 }
 
 impl FsRenderPerfBreakdown {
@@ -840,8 +884,28 @@ impl FsRenderPerfBreakdown {
             FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex,
         ),
         (
-            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
-            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRendition,
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_source_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_lookup_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheLookup,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_build_pixels_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionBuildPixels,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_load_texture_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionLoadTexture,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_insert_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionCacheInsert,
+        ),
+        (
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_remainder_ms",
+            FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder,
         ),
         (
             "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_resolve_original_preview_tex_ms",
@@ -957,7 +1021,26 @@ impl FsRenderPerfBreakdown {
     ];
 
     fn emit(&self, frame_number: u64, input_seq: u64, fs_idx: Option<usize>) {
-        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 5);
+        let passthrough_rendition_total_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| self.stage_ms[stage as usize])
+            .sum::<f64>();
+        let passthrough_rendition_cache_hits = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(true))
+            .count();
+        let passthrough_rendition_cache_misses = self
+            .navigation_passthrough_rendition_calls
+            .iter()
+            .filter(|call| call.cache_hit == Some(false))
+            .count();
+        let mut extras = Vec::with_capacity(FS_RENDER_PERF_STAGE_COUNT + 10);
         extras.push(("n", serde_json::Value::from(frame_number)));
         extras.push((
             "idx",
@@ -968,6 +1051,27 @@ impl FsRenderPerfBreakdown {
             "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_cache_hit",
             self.navigation_page_turn_decision_cache_hit
                 .map_or(serde_json::Value::Null, serde_json::Value::from),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_ms",
+            serde_json::Value::from(passthrough_rendition_total_ms),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_call_count",
+            serde_json::Value::from(self.navigation_passthrough_rendition_calls.len()),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_hit_count",
+            serde_json::Value::from(passthrough_rendition_cache_hits),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_cache_miss_count",
+            serde_json::Value::from(passthrough_rendition_cache_misses),
+        ));
+        extras.push((
+            "handle_fs_navigation_land_target_open_other_fs_page_turn_decision_for_frame_resolve_fs_navigation_sequence_target_ensure_passthrough_rendition_calls",
+            serde_json::to_value(&self.navigation_passthrough_rendition_calls)
+                .unwrap_or(serde_json::Value::Null),
         ));
         for (field, stage) in Self::EVENT_FIELDS {
             extras.push((
@@ -7466,7 +7570,10 @@ impl App {
         let rendition_ready = accept_rendition
             && target.pages.iter().all(|idx| {
                 let perf_t0 = start_fs_page_turn_decision_perf_span(perf);
-                let ready = self.ensure_passthrough_rendition(ctx, *idx).is_some();
+                let passthrough_perf = perf.as_mut().map(|perf| &mut perf.passthrough_rendition);
+                let ready = self
+                    .ensure_passthrough_rendition_with_perf(ctx, *idx, passthrough_perf)
+                    .is_some();
                 finish_fs_page_turn_decision_perf_span(
                     perf,
                     FsPageTurnDecisionPerfSpan::EnsurePassthroughRendition,
@@ -39701,17 +39808,25 @@ mod tests {
             ctrl_sibling_mouse: std::time::Duration::from_millis(3),
             page: std::time::Duration::from_millis(83),
             begin_sequence: std::time::Duration::from_millis(4),
-            land_target: std::time::Duration::from_millis(63),
+            land_target: std::time::Duration::from_millis(68),
             land_seek_continuous: std::time::Duration::ZERO,
-            land_open: std::time::Duration::from_millis(62),
+            land_open: std::time::Duration::from_millis(67),
             land_open_other_should_block_detached_independent_still_navigation_to_video:
                 std::time::Duration::from_millis(1),
-            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(20),
+            land_open_other_fs_page_turn_decision_for_frame: std::time::Duration::from_millis(25),
             land_open_other_page_turn_decision: FsPageTurnDecisionPerfRecorder {
                 original_preview_active_for_frame: std::time::Duration::from_millis(1),
-                resolve_navigation_sequence_target: std::time::Duration::from_millis(12),
+                resolve_navigation_sequence_target: std::time::Duration::from_millis(17),
                 resolve_fs_display_tex: std::time::Duration::from_millis(2),
-                ensure_passthrough_rendition: std::time::Duration::from_millis(3),
+                ensure_passthrough_rendition: std::time::Duration::from_millis(8),
+                passthrough_rendition: PassthroughRenditionPerfRecorder {
+                    source_lookup: std::time::Duration::from_millis(1),
+                    cache_lookup: std::time::Duration::from_millis(1),
+                    build_pixels: std::time::Duration::from_millis(2),
+                    load_texture: std::time::Duration::from_millis(2),
+                    cache_insert: std::time::Duration::from_millis(1),
+                    calls: Vec::new(),
+                },
                 resolve_original_preview_tex: std::time::Duration::from_millis(1),
                 ensure_navigation_target_thumbnail_requests: std::time::Duration::from_millis(2),
                 cache_lookup: std::time::Duration::from_millis(1),
@@ -39737,7 +39852,7 @@ mod tests {
 
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationPageOther as usize],
-            16.0
+            11.0
         );
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationSlideshowOther as usize],
@@ -39773,6 +39888,22 @@ mod tests {
             6.0
         );
         assert_eq!(recorder.navigation_page_turn_decision_cache_hit, Some(true));
+        let passthrough_rendition_ms = FsRenderPerfStage::ALL
+            [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionSourceLookup
+                as usize
+                ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize]
+            .iter()
+            .copied()
+            .map(|stage| recorder.stage_ms[stage as usize])
+            .sum::<f64>();
+        assert_eq!(passthrough_rendition_ms, 8.0);
+        assert_eq!(
+            recorder.stage_ms
+                [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequencePassthroughRenditionRemainder
+                    as usize],
+            1.0
+        );
         let page_turn_decision_ms = FsRenderPerfStage::ALL
             [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionOriginalPreview as usize
                 ..=FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionRemainder as usize]
@@ -39780,7 +39911,7 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(page_turn_decision_ms, 20.0);
+        assert_eq!(page_turn_decision_ms, 25.0);
         let resolve_sequence_ms = FsRenderPerfStage::ALL
             [FsRenderPerfStage::FsNavigationLandOpenOtherPageDecisionResolveSequenceDisplayTex
                 as usize
@@ -39790,7 +39921,7 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(resolve_sequence_ms, 12.0);
+        assert_eq!(resolve_sequence_ms, 17.0);
         assert_eq!(
             recorder.stage_ms[FsRenderPerfStage::FsNavigationLandOpenRemainder as usize],
             5.0
@@ -39807,7 +39938,7 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(open_other_ms, 37.0);
+        assert_eq!(open_other_ms, 42.0);
         let land_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationLandSeekContinuous
             as usize
             ..=FsRenderPerfStage::FsNavigationLandRemainder as usize]
@@ -39815,7 +39946,7 @@ mod tests {
             .copied()
             .map(|stage| recorder.stage_ms[stage as usize])
             .sum::<f64>();
-        assert_eq!(land_ms, 63.0);
+        assert_eq!(land_ms, 68.0);
         let navigation_ms = FsRenderPerfStage::ALL[FsRenderPerfStage::FsNavigationClose as usize
             ..=FsRenderPerfStage::FsNavigationRemainder as usize]
             .iter()

@@ -2851,6 +2851,31 @@ fn poll_prefetch_perf_timer_does_not_read_clock_when_disabled() {
 }
 
 #[test]
+fn passthrough_rendition_perf_timer_does_not_read_clock_when_disabled() {
+    let clock_called = Cell::new(false);
+    let mut recorder: Option<PassthroughRenditionPerfRecorder> = None;
+    for span in [
+        PassthroughRenditionPerfSpan::SourceLookup,
+        PassthroughRenditionPerfSpan::CacheLookup,
+        PassthroughRenditionPerfSpan::BuildPixels,
+        PassthroughRenditionPerfSpan::LoadTexture,
+        PassthroughRenditionPerfSpan::CacheInsert,
+    ] {
+        let started_at = start_passthrough_rendition_perf_span_with(recorder.as_ref(), || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        });
+        finish_passthrough_rendition_perf_span_with(recorder.as_mut(), span, started_at, || {
+            clock_called.set(true);
+            std::time::Instant::now()
+        });
+    }
+
+    assert!(recorder.is_none());
+    assert!(!clock_called.get());
+}
+
+#[test]
 fn poll_prefetch_perf_stages_plus_unaccounted_equal_total() {
     let started_at = std::time::Instant::now();
     let mut recorder = PollPrefetchPerfRecorder::new(PollPrefetchOrigin::TopLevel, started_at);
