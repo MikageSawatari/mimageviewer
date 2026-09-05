@@ -1345,10 +1345,7 @@ impl eframe::App for MusicVideoLabApp {
                 .pick_file()
         {
             let image_id = next_image_id(&self.project);
-            let mut layer = new_image_layer(&self.project, image_id.clone());
-            if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
-                layer.name = name.to_owned();
-            }
+            let layer = new_image_layer(&self.project, image_id.clone());
             let insertion_index = image_layer_insertion_index(&self.project);
             self.project.layers.insert(insertion_index, layer);
             self.editor_state.select_layer(insertion_index);

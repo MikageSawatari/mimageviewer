@@ -24,14 +24,15 @@ pub use model::{
     LayerKind, ModulationBinding, ModulationCurve, ModulationTarget, Modulator, ModulatorId,
     ModulatorSource, ModulatorValue, MusicColorMode, NormRect, Output, PitchKeyboardLayer,
     ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign,
-    TimeFormat, TimeTextLayer, Track, TrackError,
+    TextLayer, TimeFormat, TimeTextLayer, Track, TrackError,
 };
 pub use preset::{
     BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
     DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, DEFAULT_OUTPUT, DEFAULT_SPECTRUM_BANDS,
     KICK_ATTACK_SECS, KICK_CALIBRATION_HIGH_PERCENTILE, KICK_CALIBRATION_LOW_PERCENTILE,
     KICK_RELEASE_SECS, KICK_THRESHOLD, PROJECT_VERSION, default_project, new_band_energy_modulator,
-    new_image_layer, new_pitch_keyboard_layer,
+    new_image_layer, new_linear_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
+    new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
 pub use raster::{
     Frame, PixelRect, RasterError, RenderReport, UnresolvedAsset, norm_rect_to_pixels, render_frame,

@@ -13,6 +13,7 @@ pub enum AnimProperty {
     Rotation,
     CornerRadius,
     Glow,
+    ImageZoom,
     SolidFill,
     SpectrumFill,
     KeyboardBackground,
@@ -20,6 +21,7 @@ pub enum AnimProperty {
     ProgressFill,
     ProgressBorderFill,
     TimeTextFill,
+    TextFill,
 }
 
 impl AnimProperty {
@@ -27,10 +29,11 @@ impl AnimProperty {
         match self {
             Self::Visible => "表示",
             Self::Opacity => "不透明度",
-            Self::Rect => "位置・サイズ",
+            Self::Rect => "レイヤー矩形の位置・サイズ",
             Self::Rotation => "回転",
             Self::CornerRadius => "角丸",
             Self::Glow => "グロー",
+            Self::ImageZoom => "絵の拡大",
             Self::SolidFill => "塗り",
             Self::SpectrumFill => "スペクトラムの塗り",
             Self::KeyboardBackground => "鍵盤の背景",
@@ -38,6 +41,7 @@ impl AnimProperty {
             Self::ProgressFill => "進捗の塗り",
             Self::ProgressBorderFill => "枠の塗り",
             Self::TimeTextFill => "文字の塗り",
+            Self::TextFill => "文字の塗り",
         }
     }
 
@@ -203,7 +207,7 @@ pub fn animation_properties(layer: &Layer) -> Vec<AnimProperty> {
     ];
     match &layer.kind {
         LayerKind::Solid { .. } => properties.push(AnimProperty::SolidFill),
-        LayerKind::Image { .. } => {}
+        LayerKind::Image { .. } => properties.push(AnimProperty::ImageZoom),
         LayerKind::Spectrum(_) => properties.push(AnimProperty::SpectrumFill),
         LayerKind::PitchKeyboard(_) => {
             properties.push(AnimProperty::KeyboardBackground);
@@ -214,6 +218,7 @@ pub fn animation_properties(layer: &Layer) -> Vec<AnimProperty> {
             properties.push(AnimProperty::ProgressBorderFill);
         }
         LayerKind::TimeText(_) => properties.push(AnimProperty::TimeTextFill),
+        LayerKind::Text(_) => properties.push(AnimProperty::TextFill),
     }
     properties
 }
@@ -231,6 +236,10 @@ pub fn animation_keys(layer: &Layer, property: AnimProperty) -> Option<Vec<KeyMe
         AnimProperty::Rotation => keys!(&layer.rotation),
         AnimProperty::CornerRadius => keys!(&layer.corner_radius),
         AnimProperty::Glow => keys!(&layer.glow),
+        AnimProperty::ImageZoom => match &layer.kind {
+            LayerKind::Image { zoom, .. } => keys!(zoom),
+            _ => None,
+        },
         AnimProperty::SolidFill => match &layer.kind {
             LayerKind::Solid { fill } => keys!(fill),
             _ => None,
@@ -259,6 +268,10 @@ pub fn animation_keys(layer: &Layer, property: AnimProperty) -> Option<Vec<KeyMe
             LayerKind::TimeText(text) => keys!(&text.fill),
             _ => None,
         },
+        AnimProperty::TextFill => match &layer.kind {
+            LayerKind::Text(text) => keys!(&text.fill),
+            _ => None,
+        },
     }
 }
 
@@ -280,6 +293,10 @@ pub fn animation_value(
         AnimProperty::Rotation => value!(&layer.rotation),
         AnimProperty::CornerRadius => value!(&layer.corner_radius),
         AnimProperty::Glow => value!(&layer.glow),
+        AnimProperty::ImageZoom => match &layer.kind {
+            LayerKind::Image { zoom, .. } => value!(zoom),
+            _ => None,
+        },
         AnimProperty::SolidFill => match &layer.kind {
             LayerKind::Solid { fill } => value!(fill),
             _ => None,
@@ -308,6 +325,10 @@ pub fn animation_value(
             LayerKind::TimeText(text) => value!(&text.fill),
             _ => None,
         },
+        AnimProperty::TextFill => match &layer.kind {
+            LayerKind::Text(text) => value!(&text.fill),
+            _ => None,
+        },
     }
 }
 
@@ -334,6 +355,10 @@ pub fn apply_editor_command(
         AnimProperty::Rotation => apply!(&mut layer.rotation),
         AnimProperty::CornerRadius => apply!(&mut layer.corner_radius),
         AnimProperty::Glow => apply!(&mut layer.glow),
+        AnimProperty::ImageZoom => match &mut layer.kind {
+            LayerKind::Image { zoom, .. } => apply!(zoom),
+            _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
+        },
         AnimProperty::SolidFill => match &mut layer.kind {
             LayerKind::Solid { fill } => apply!(fill),
             _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
@@ -360,6 +385,10 @@ pub fn apply_editor_command(
         },
         AnimProperty::TimeTextFill => match &mut layer.kind {
             LayerKind::TimeText(text) => apply!(&mut text.fill),
+            _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
+        },
+        AnimProperty::TextFill => match &mut layer.kind {
+            LayerKind::Text(text) => apply!(&mut text.fill),
             _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
         },
     }

@@ -376,14 +376,14 @@ Layer {
 
 ModulationBinding {
     target: Opacity | Scale | Rotation | CornerRadius | GlowRadius | GlowAlpha |
-            FillBrightness | SpectrumThickness | SpectrumRadius,
+            FillBrightness | SpectrumThickness | SpectrumRadius | ImageZoom,
     modulator: ModulatorId,
     amount: f32,                  // 対象の単位で加算。負値も可
     curve: Linear | Squared | Sqrt,
 }
 
 LayerKind =
-  | Image        { source: ImageRef, fit: Fit, scale_percent }
+  | Image        { source: ImageRef, fit: Fit, zoom: Animatable<f32> }
   | Solid        { fill: Animatable<Fill> }
   | Spectrum     { axis: Semitone{..},          // v1 はこれだけ。Linear{min_hz,max_hz} は将来 (D5)
                    shape: Bars{..} | Radial{ radius, .. },
@@ -467,7 +467,8 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P3b** ✅ | キーフレーム: 画像切替・フェード・色変化・ON/OFF のタイムライン編集 | **完了**（2026-09-05）。共有波形解析を背景にしたタイムラインで追加・削除・移動・補間変更を行える。全 Animatable プロパティの Const↔Track、同一時刻キー、最後のキー削除時の Const 化、保存・読み込みをテスト済み |
 | **P3c** ✅ | 音声モジュレータの配管: 任意の Hz / 半音範囲のエネルギーをプロジェクト単位で定義し、レイヤのスカラーチャンネルへ加算 | **完了**（2026-09-05、`678107131`）。同じ 1 回の解析から bands / notes / 変調値を得る。無変調プロジェクトのフレームハッシュ不変、変調ありの 2 回一致、保存往復、編集 UI の現在値表示を確認 |
 | **P3d** ✅ | キック代替の追従特性: 秒指定のアタック／リリース、弱音ゲート、40–120Hz の低域プリセット | **完了**（2026-09-05、`90e4c045c`）。fps に依存しない実効時間定数、シーク時リセット、合成キックで従来 EMA より速い立ち上がりと遅い戻りを数値確認。旧 Average JSON を維持 |
-| **P3e** | 実曲向けモジュレータ調整: 全尺パーセンタイル較正、帯域の正の変化量、編集ペインのスクロール、連続編集時のプレビュー更新 | 自動範囲と手動上書きを UI に表示。実素材でレベル張り付きの解消とキック間の減衰を数値確認。処理中フレームは編集のたびに破棄せず latest-wins で更新し、完成RGBAのテキスト欠落が 0 |
+| **P3e** ✅ | 実曲向けモジュレータ調整: 全尺パーセンタイル較正、帯域の正の変化量、編集ペインのスクロール、連続編集時のプレビュー更新 | **完了**（2026-09-05、`bd46f06f6`）。自動範囲と手動上書きを UI に表示。実素材でレベル張り付きの解消とキック間の減衰を数値確認。処理中フレームは編集のたびに破棄せず latest-wins で更新し、完成 RGBA のテキスト欠落が 0 |
+| **P3f** | 実利用の編集改善: 画像内容の中心ズーム、Track のある行だけを表示するタイムライン、全レイヤー種別の追加メニュー、日本語の連番既定名 | `Scale`（矩形）と `ImageZoom`（矩形内の絵）を分離。zoom の無い version 1 JSON は 1.0 として読み、無変調の描画結果を維持する |
 | **P4** | 本体統合: mIV の編集モードとして載せる。プロジェクト保存 / 読み込み、書き出しダイアログ、keymap | [docs/ui-responsiveness.md](ui-responsiveness.md) §4 を通過。閲覧側の退行が無い |
 
 各インクリメントの終わりで実機確認 → レビュー → コミット。

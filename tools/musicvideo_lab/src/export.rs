@@ -9,11 +9,12 @@ use music_core::{
     analyze_stereo_timeline_cancellable, prepare_keyboard_frame_into,
 };
 use musicvideo_core::{
-    Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
-    BandCalibration, Frame, ImageId, MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve,
-    ModulationTarget, ModulatorId, ModulatorSource, Project, RenderReport, ScaledImageCacheStats,
-    Scene, SceneItemKind, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset,
-    calibrate_modulators, evaluate, new_band_energy_modulator, render_frame,
+    Animatable, Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
+    BAND_ENERGY_CALIBRATION_LOW_PERCENTILE, BandCalibration, Frame, ImageId, LayerKind,
+    MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
+    ModulatorSource, Project, RenderReport, ScaledImageCacheStats, Scene, SceneItemKind, Smoothing,
+    SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
+    new_band_energy_modulator, norm_rect_to_pixels, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -191,6 +192,139 @@ fn response_at(values: &[(f32, f32)], time_secs: f64) -> (f32, f32) {
         .get(index.min(values.len().saturating_sub(1)))
         .copied()
         .unwrap_or_default()
+}
+
+/// Renders the first image layer from a saved project at 1.0x and 1.2x, then
+/// verifies sampled output pixels against the center-zoom coordinate mapping.
+pub fn render_project_image_zoom_sample(
+    project_path: &Path,
+    output_directory: &Path,
+) -> Result<(), String> {
+    let mut project = load_project(project_path)?;
+    let image_layer = project
+        .layers
+        .iter()
+        .find(|layer| matches!(layer.kind, LayerKind::Image { .. }))
+        .cloned()
+        .ok_or_else(|| "プロジェクトに画像レイヤーがありません".to_owned())?;
+    let image_id = match &image_layer.kind {
+        LayerKind::Image { image, .. } => image.clone(),
+        _ => unreachable!(),
+    };
+    let reference = project
+        .images
+        .iter()
+        .find(|reference| reference.id == image_id)
+        .ok_or_else(|| format!("画像素材 {} のパスがありません", image_id.0))?;
+    let decoded = image::open(&reference.path)
+        .map_err(|error| format!("画像を開けません ({}): {error}", reference.path.display()))?
+        .to_rgba8();
+    let assets = Assets::default();
+    assets.insert_image(
+        image_id,
+        musicvideo_core::ImageAsset::new(decoded.width(), decoded.height(), decoded.into_raw())
+            .map_err(|error| format!("画像を保持できません: {error}"))?,
+    );
+    project.layers = vec![image_layer];
+    let spectrum = SpectrumFrame::default();
+    let mut rendered = Vec::new();
+    std::fs::create_dir_all(output_directory).map_err(|error| {
+        format!(
+            "サンプル出力フォルダーを作成できません ({}): {error}",
+            output_directory.display()
+        )
+    })?;
+    for (zoom_value, file_name) in [(1.0, "zoom-1.0.png"), (1.2, "zoom-1.2.png")] {
+        let LayerKind::Image { zoom, .. } = &mut project.layers[0].kind else {
+            unreachable!()
+        };
+        *zoom = Animatable::Const(zoom_value);
+        let scene = evaluate(&project, 0.0, &spectrum);
+        let mut frame = Frame::new(project.output.width, project.output.height)
+            .map_err(|error| format!("サンプルフレームを確保できません: {error}"))?;
+        let report = render_frame(&scene, &assets, &mut frame)
+            .map_err(|error| format!("画像拡大サンプルを描画できません: {error}"))?;
+        ensure_resolved(&report, "画像拡大サンプル")?;
+        let output = output_directory.join(file_name);
+        image::save_buffer_with_format(
+            &output,
+            &frame.rgba,
+            frame.width,
+            frame.height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| {
+            format!(
+                "サンプル画像を保存できません ({}): {error}",
+                output.display()
+            )
+        })?;
+        rendered.push((scene, frame, output));
+    }
+
+    let rect = norm_rect_to_pixels(
+        rendered[0].0.items[0].rect,
+        project.output.width,
+        project.output.height,
+    );
+    let base = &rendered[0].1;
+    let zoomed = &rendered[1].1;
+    let mut error_sum = 0_u64;
+    let mut samples = 0_u64;
+    for grid_y in 1..=5 {
+        for grid_x in 1..=9 {
+            let x = rect.x0 + rect.width() * grid_x / 10;
+            let y = rect.y0 + rect.height() * grid_y / 6;
+            let local_x = x - rect.x0;
+            let local_y = y - rect.y0;
+            let source_x = rect.x0 as f32
+                + (local_x as f32 + 0.5 - rect.width() as f32 * 0.5) / 1.2
+                + rect.width() as f32 * 0.5
+                - 0.5;
+            let source_y = rect.y0 as f32
+                + (local_y as f32 + 0.5 - rect.height() as f32 * 0.5) / 1.2
+                + rect.height() as f32 * 0.5
+                - 0.5;
+            for channel in 0..3 {
+                let expected = sample_frame_channel(base, source_x, source_y, channel);
+                let actual = zoomed.rgba[(y * zoomed.width as usize + x) * 4 + channel];
+                error_sum += u64::from(expected.abs_diff(actual));
+                samples += 1;
+            }
+        }
+    }
+    let changed = base
+        .rgba
+        .chunks_exact(4)
+        .zip(zoomed.rgba.chunks_exact(4))
+        .filter(|(left, right)| left != right)
+        .count();
+    println!("zoom 1.0: {}", rendered[0].2.display());
+    println!("zoom 1.2: {}", rendered[1].2.display());
+    println!(
+        "center mapping: samples={} mean_abs_error={:.6} changed_pixels={}",
+        samples,
+        error_sum as f64 / samples.max(1) as f64,
+        changed
+    );
+    Ok(())
+}
+
+fn sample_frame_channel(frame: &Frame, x: f32, y: f32, channel: usize) -> u8 {
+    let x = x.clamp(0.0, frame.width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, frame.height.saturating_sub(1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(frame.width as usize - 1);
+    let y1 = (y0 + 1).min(frame.height as usize - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let get =
+        |px: usize, py: usize| frame.rgba[(py * frame.width as usize + px) * 4 + channel] as f32;
+    let top = get(x0, y0) * (1.0 - tx) + get(x1, y0) * tx;
+    let bottom = get(x0, y1) * (1.0 - tx) + get(x1, y1) * tx;
+    (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
 }
 
 /// Replays a continuous property drag against the real project and observes

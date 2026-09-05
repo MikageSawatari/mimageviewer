@@ -644,7 +644,9 @@ fn available_targets(layer: &Layer) -> Vec<ModulationTarget> {
         ModulationTarget::GlowRadius,
         ModulationTarget::GlowAlpha,
     ];
-    if !matches!(&layer.kind, LayerKind::Image { .. }) {
+    if matches!(&layer.kind, LayerKind::Image { .. }) {
+        targets.insert(0, ModulationTarget::ImageZoom);
+    } else {
         targets.push(ModulationTarget::FillBrightness);
     }
     if let LayerKind::Spectrum(spectrum) = &layer.kind {
@@ -676,7 +678,8 @@ fn modulator_name(modulators: &[Modulator], id: ModulatorId) -> String {
 fn target_label(target: ModulationTarget) -> &'static str {
     match target {
         ModulationTarget::Opacity => "不透明度",
-        ModulationTarget::Scale => "中心基準の拡縮",
+        ModulationTarget::Scale => "レイヤー矩形の拡縮",
+        ModulationTarget::ImageZoom => "絵そのものの拡大",
         ModulationTarget::Rotation => "回転",
         ModulationTarget::CornerRadius => "角丸",
         ModulationTarget::GlowRadius => "グロー半径",
@@ -691,6 +694,7 @@ fn target_unit(target: ModulationTarget) -> &'static str {
     match target {
         ModulationTarget::Opacity
         | ModulationTarget::Scale
+        | ModulationTarget::ImageZoom
         | ModulationTarget::GlowAlpha
         | ModulationTarget::FillBrightness => "",
         ModulationTarget::Rotation => "°",
@@ -705,6 +709,7 @@ fn amount_speed(target: ModulationTarget) -> f64 {
     match target {
         ModulationTarget::Opacity
         | ModulationTarget::Scale
+        | ModulationTarget::ImageZoom
         | ModulationTarget::GlowAlpha
         | ModulationTarget::FillBrightness => 0.01,
         _ => 0.5,

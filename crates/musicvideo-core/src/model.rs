@@ -110,6 +110,7 @@ pub enum BandWeighting {
 pub enum ModulationTarget {
     Opacity,
     Scale,
+    ImageZoom,
     Rotation,
     CornerRadius,
     GlowRadius,
@@ -207,12 +208,24 @@ fn default_glow() -> Animatable<Option<Glow>> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LayerKind {
-    Solid { fill: Animatable<Fill> },
-    Image { image: ImageId, fit: Fit },
+    Solid {
+        fill: Animatable<Fill>,
+    },
+    Image {
+        image: ImageId,
+        fit: Fit,
+        #[serde(default = "default_image_zoom")]
+        zoom: Animatable<f32>,
+    },
     Spectrum(SpectrumLayer),
     PitchKeyboard(PitchKeyboardLayer),
     ProgressBar(ProgressBarLayer),
     TimeText(TimeTextLayer),
+    Text(TextLayer),
+}
+
+fn default_image_zoom() -> Animatable<f32> {
+    Animatable::Const(1.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,6 +287,15 @@ pub struct ProgressBarLayer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeTextLayer {
     pub format: TimeFormat,
+    pub font_key: String,
+    pub size_px: f32,
+    pub align: TextAlign,
+    pub fill: Animatable<Fill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextLayer {
+    pub text: String,
     pub font_key: String,
     pub size_px: f32,
     pub align: TextAlign,
@@ -551,6 +573,9 @@ mod tests {
             if let Some(keyboard) = kind.get_mut("PitchKeyboard") {
                 keyboard.as_object_mut().unwrap().remove("color_mode");
             }
+            if let Some(image) = kind.get_mut("Image") {
+                image.as_object_mut().unwrap().remove("zoom");
+            }
         }
         let restored: Project = serde_json::from_value(value).unwrap();
         assert_eq!(restored.display_gain_db, 0.0);
@@ -569,6 +594,10 @@ mod tests {
             panic!("既定シーンへ追加した 5 番目は鍵盤です");
         };
         assert_eq!(keyboard.color_mode, MusicColorMode::Custom);
+        let LayerKind::Image { zoom, .. } = &restored.layers[0].kind else {
+            panic!("既定シーンの 1 番目は画像です");
+        };
+        assert_eq!(zoom, &Animatable::Const(1.0));
     }
 }
 

@@ -160,7 +160,7 @@ pub fn render_frame(
         if index == 0
             && let Some(image) = &prepared_cover
         {
-            draw_image(frame, rect, image, 1.0, 0.0, false);
+            draw_image(frame, rect, image, 1.0, 0.0, false, 1.0);
             continue;
         }
         let rotation = normalized_rotation(item.rotation_deg);
@@ -207,8 +207,11 @@ fn opaque_cover_image(
         return Ok(None);
     }
     match &item.kind {
-        SceneItemKind::Image { image, fit } => {
+        SceneItemKind::Image { image, fit, zoom } => {
             if !matches!(fit, Fit::Stretch | Fit::Cover) {
+                return Ok(None);
+            }
+            if (*zoom - 1.0).abs() > f32::EPSILON {
                 return Ok(None);
             }
             let prepared = assets.scaled_image(image, scene.width, scene.height, *fit)?;
@@ -257,6 +260,10 @@ fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem)
             ..
         }
         | SceneItemKind::TimeText {
+            fill: Fill::Solid(color),
+            ..
+        }
+        | SceneItemKind::Text {
             fill: Fill::Solid(color),
             ..
         } => *color,
@@ -316,7 +323,7 @@ fn draw_item(
             item.corner_radius_px,
             mask_mode,
         ),
-        SceneItemKind::Image { image, fit } => {
+        SceneItemKind::Image { image, fit, zoom } => {
             if let Some(image_asset) =
                 assets.scaled_image(image, rect.width() as u32, rect.height() as u32, *fit)?
             {
@@ -327,6 +334,7 @@ fn draw_item(
                     item.opacity,
                     item.corner_radius_px,
                     mask_mode,
+                    *zoom,
                 );
             } else {
                 report.record_unresolved(UnresolvedAsset::Image(image.clone()));
@@ -387,6 +395,29 @@ fn draw_item(
             mask_mode,
         ),
         SceneItemKind::TimeText {
+            text,
+            font_key,
+            size_px,
+            align,
+            fill,
+        } => {
+            if !draw_text(
+                frame,
+                rect,
+                assets,
+                text,
+                font_key,
+                *size_px,
+                *align,
+                fill,
+                item.opacity,
+                item.corner_radius_px,
+                mask_mode,
+            ) {
+                report.record_unresolved(UnresolvedAsset::Font(font_key.clone()));
+            }
+        }
+        SceneItemKind::Text {
             text,
             font_key,
             size_px,
@@ -560,13 +591,21 @@ fn draw_image(
     opacity: f32,
     corner_radius_px: f32,
     mask_mode: bool,
+    zoom: f32,
 ) {
     if rect.is_empty() || opacity <= 0.0 {
         return;
     }
     debug_assert_eq!(image.width as usize, rect.width());
     debug_assert_eq!(image.height as usize, rect.height());
-    if !mask_mode
+    let zoom = if zoom.is_finite() {
+        zoom.max(0.01)
+    } else {
+        1.0
+    };
+    let identity_zoom = (zoom - 1.0).abs() <= f32::EPSILON;
+    if identity_zoom
+        && !mask_mode
         && corner_radius_px <= 0.0
         && rect.x0 == 0
         && rect.y0 == 0
@@ -581,7 +620,7 @@ fn draw_image(
 
     let frame_row_bytes = frame.width as usize * 4;
     let image_row_bytes = image.width as usize * 4;
-    if !mask_mode && corner_radius_px <= 0.0 && image.opaque && opacity >= 1.0 {
+    if identity_zoom && !mask_mode && corner_radius_px <= 0.0 && image.opaque && opacity >= 1.0 {
         frame
             .rgba
             .par_chunks_exact_mut(frame_row_bytes)
@@ -596,27 +635,67 @@ fn draw_image(
         return;
     }
 
+    if identity_zoom {
+        frame
+            .rgba
+            .par_chunks_exact_mut(frame_row_bytes)
+            .enumerate()
+            .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
+            .for_each(|(y, row)| {
+                let source_y = y - rect.y0;
+                for x in rect.x0..rect.x1 {
+                    let source_x = x - rect.x0;
+                    let offset = source_y * image_row_bytes + source_x * 4;
+                    let coverage = rounded_rect_coverage(
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        rect,
+                        corner_radius_px,
+                    );
+                    let color = if mask_mode {
+                        Rgba8::new(255, 255, 255, image.rgba[offset + 3])
+                    } else {
+                        Rgba8::new(
+                            image.rgba[offset],
+                            image.rgba[offset + 1],
+                            image.rgba[offset + 2],
+                            image.rgba[offset + 3],
+                        )
+                    };
+                    blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity * coverage);
+                }
+            });
+        return;
+    }
+
     frame
         .rgba
         .par_chunks_exact_mut(frame_row_bytes)
         .enumerate()
         .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
         .for_each(|(y, row)| {
-            let source_y = y - rect.y0;
+            let local_y = y - rect.y0;
+            let source_y = (local_y as f32 + 0.5 - image.height as f32 * 0.5) / zoom
+                + image.height as f32 * 0.5
+                - 0.5;
             for x in rect.x0..rect.x1 {
-                let source_x = x - rect.x0;
-                let offset = source_y * image_row_bytes + source_x * 4;
+                let local_x = x - rect.x0;
+                let source_x = (local_x as f32 + 0.5 - image.width as f32 * 0.5) / zoom
+                    + image.width as f32 * 0.5
+                    - 0.5;
                 let coverage =
                     rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, rect, corner_radius_px);
+                let sampled = sample_bilinear_rgba(
+                    &image.rgba,
+                    image.width as usize,
+                    image.height as usize,
+                    source_x,
+                    source_y,
+                );
                 let color = if mask_mode {
-                    Rgba8::new(255, 255, 255, image.rgba[offset + 3])
+                    Rgba8::new(255, 255, 255, sampled[3])
                 } else {
-                    Rgba8::new(
-                        image.rgba[offset],
-                        image.rgba[offset + 1],
-                        image.rgba[offset + 2],
-                        image.rgba[offset + 3],
-                    )
+                    Rgba8::new(sampled[0], sampled[1], sampled[2], sampled[3])
                 };
                 blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity * coverage);
             }
@@ -1532,6 +1611,29 @@ fn render_item_mask(
                 report.record_unresolved(UnresolvedAsset::Font(font_key.clone()));
             }
         }
+        SceneItemKind::Text {
+            text,
+            font_key,
+            size_px,
+            align,
+            fill,
+        } => {
+            if !draw_text_mask(
+                &mut alpha,
+                rect.width(),
+                rect.height(),
+                assets,
+                text,
+                font_key,
+                *size_px,
+                *align,
+                fill,
+                item.opacity,
+                item.corner_radius_px,
+            ) {
+                report.record_unresolved(UnresolvedAsset::Font(font_key.clone()));
+            }
+        }
         _ => return render_item_mask_fallback(rect, item, assets, report),
     }
     Ok(MaskSurface {
@@ -1927,6 +2029,28 @@ fn sample_bilinear_rgba_channel(
     let top = get(x0, y0) * (1.0 - tx) + get(x1, y0) * tx;
     let bottom = get(x0, y1) * (1.0 - tx) + get(x1, y1) * tx;
     (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
+}
+
+fn sample_bilinear_rgba(data: &[u8], width: usize, height: usize, x: f32, y: f32) -> [u8; 4] {
+    if x < -0.5 || y < -0.5 || x > width as f32 - 0.5 || y > height as f32 - 0.5 {
+        return [0; 4];
+    }
+    let x = x.clamp(0.0, width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, height.saturating_sub(1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let mut sampled = [0; 4];
+    for (channel, value) in sampled.iter_mut().enumerate() {
+        let get = |px: usize, py: usize| data[(py * width + px) * 4 + channel] as f32;
+        let top = get(x0, y0) * (1.0 - tx) + get(x1, y0) * tx;
+        let bottom = get(x0, y1) * (1.0 - tx) + get(x1, y1) * tx;
+        *value = (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    sampled
 }
 
 fn composite_rotated_body(
@@ -3023,6 +3147,7 @@ mod tests {
             item(SceneItemKind::Image {
                 image: ImageId::new(id),
                 fit,
+                zoom: 1.0,
             }),
         )
     }
@@ -3059,6 +3184,45 @@ mod tests {
         assert_eq!(after_second.scale_operations, 1);
         assert_eq!(after_second.hits, 1);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn image_zoom_resamples_about_the_center_and_is_byte_deterministic() {
+        let id = ImageId::new("zoom-source");
+        let assets = Assets::default();
+        let source = patterned_image(12, 8, 7);
+        let source_rgba = source.rgba.clone();
+        assets.insert_image(id.clone(), source);
+        let mut zoomed_scene = image_scene(12, 8, &id.0, Fit::Cover);
+        let SceneItemKind::Image { zoom, .. } = &mut zoomed_scene.items[0].kind else {
+            unreachable!()
+        };
+        *zoom = 1.2;
+        let mut first = Frame::new(1, 1).unwrap();
+        let mut second = Frame::new(1, 1).unwrap();
+        let _ = render_frame(&zoomed_scene, &assets, &mut first).unwrap();
+        let _ = render_frame(&zoomed_scene, &assets, &mut second).unwrap();
+        assert_eq!(first, second);
+
+        let x = 0;
+        let y = 0;
+        let source_x = (x as f32 + 0.5 - 6.0) / 1.2 + 6.0 - 0.5;
+        let source_y = (y as f32 + 0.5 - 4.0) / 1.2 + 4.0 - 0.5;
+        let expected = (0..4)
+            .map(|channel| {
+                sample_bilinear_rgba_channel(&source_rgba, 12, 8, source_x, source_y, channel)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pixel(&first, x, y), expected.as_slice());
+
+        let mut identity = Frame::new(1, 1).unwrap();
+        let _ = render_frame(
+            &image_scene(12, 8, &id.0, Fit::Cover),
+            &assets,
+            &mut identity,
+        )
+        .unwrap();
+        assert_ne!(pixel(&first, x, y), pixel(&identity, x, y));
     }
 
     #[test]

@@ -195,8 +195,8 @@ mod tests {
     use super::*;
     use musicvideo_core::{
         Animatable, AudioRef, BandCalibration, BandRange, BandWeighting, ImageId, ImageRef, Interp,
-        Keyframe, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, Smoothing,
-        Track, default_project, new_band_energy_modulator, new_image_layer,
+        Keyframe, LayerKind, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource,
+        Smoothing, Track, default_project, new_band_energy_modulator, new_image_layer,
     };
 
     #[test]
@@ -235,6 +235,24 @@ mod tests {
         let mut project = default_project(12.0);
         let second_image = ImageId::new("image-1");
         project.layers.push(new_image_layer(&project, second_image));
+        let LayerKind::Image { zoom, .. } = &mut project.layers[0].kind else {
+            unreachable!()
+        };
+        *zoom = Animatable::Track(
+            Track::new(vec![
+                Keyframe {
+                    t: 0.0,
+                    value: 1.0,
+                    interp: Interp::EaseOut,
+                },
+                Keyframe {
+                    t: 6.0,
+                    value: 1.2,
+                    interp: Interp::EaseInOut,
+                },
+            ])
+            .unwrap(),
+        );
         project.layers[0].opacity = Animatable::Track(
             Track::new(vec![
                 Keyframe {
@@ -344,6 +362,12 @@ mod tests {
                 curve: ModulationCurve::Sqrt,
             },
         ];
+        project.layers[0].modulations = vec![ModulationBinding {
+            target: ModulationTarget::ImageZoom,
+            modulator: id,
+            amount: 0.12,
+            curve: ModulationCurve::Squared,
+        }];
 
         save_project(&project_path, &project).unwrap();
         let restored = load_project(&project_path).unwrap();
@@ -352,6 +376,10 @@ mod tests {
         assert_eq!(
             restored.layers[1].modulations,
             project.layers[1].modulations
+        );
+        assert_eq!(
+            restored.layers[0].modulations,
+            project.layers[0].modulations
         );
     }
 

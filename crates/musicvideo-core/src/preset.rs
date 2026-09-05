@@ -2,7 +2,7 @@ use crate::model::{
     Animatable, BandCalibration, BandRange, BandWeighting, Fill, Fit, Glow, ImageId, Layer,
     LayerId, LayerKind, Modulator, ModulatorId, ModulatorSource, MusicColorMode, NormRect, Output,
     PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
-    SpectrumShape, TextAlign, TimeFormat, TimeTextLayer,
+    SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer,
 };
 use crate::spectrum::Smoothing;
 
@@ -73,6 +73,7 @@ pub fn default_project(duration_secs: f64) -> Project {
                 LayerKind::Image {
                     image: ImageId::new(DEFAULT_BACKGROUND_IMAGE_ID),
                     fit: Fit::Cover,
+                    zoom: Animatable::Const(1.0),
                 },
             ),
             layer(
@@ -138,41 +139,173 @@ pub fn default_project(duration_secs: f64) -> Project {
 }
 
 pub fn new_pitch_keyboard_layer(project: &Project) -> Layer {
-    let next_id = next_layer_id(project);
-    Layer {
-        id: LayerId(next_id),
-        name: "ピッチ鍵盤".to_owned(),
-        visible: Animatable::Const(true),
-        opacity: Animatable::Const(1.0),
-        rect: Animatable::Const(NormRect::new(0.05, 0.72, 0.9, 0.08)),
-        rotation: Animatable::Const(0.0),
-        corner_radius: Animatable::Const(4.0),
-        glow: Animatable::Const(None),
-        modulations: Vec::new(),
-        kind: LayerKind::PitchKeyboard(PitchKeyboardLayer {
+    new_layer(
+        project,
+        "ピッチ鍵盤",
+        NormRect::new(0.05, 0.72, 0.9, 0.08),
+        4.0,
+        LayerKind::PitchKeyboard(PitchKeyboardLayer {
             background: Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0))),
             color_mode: MusicColorMode::Custom,
             fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 220, 255, 255))),
         }),
-    }
+    )
 }
 
 pub fn new_image_layer(project: &Project, image: ImageId) -> Layer {
-    Layer {
-        id: LayerId(next_layer_id(project)),
-        name: format!("画像 {}", image.0),
-        visible: Animatable::Const(true),
-        opacity: Animatable::Const(1.0),
-        rect: Animatable::Const(NormRect::FULL),
-        rotation: Animatable::Const(0.0),
-        corner_radius: Animatable::Const(0.0),
-        glow: Animatable::Const(None),
-        modulations: Vec::new(),
-        kind: LayerKind::Image {
+    new_layer(
+        project,
+        "画像",
+        NormRect::FULL,
+        0.0,
+        LayerKind::Image {
             image,
             fit: Fit::Cover,
+            zoom: Animatable::Const(1.0),
         },
+    )
+}
+
+pub fn new_solid_layer(project: &Project) -> Layer {
+    new_layer(
+        project,
+        "単色",
+        NormRect::new(0.25, 0.25, 0.5, 0.5),
+        12.0,
+        LayerKind::Solid {
+            fill: Animatable::Const(Fill::Solid(Rgba8::new(64, 120, 220, 255))),
+        },
+    )
+}
+
+pub fn new_linear_spectrum_layer(project: &Project) -> Layer {
+    new_spectrum_layer(
+        project,
+        "直線スペクトラム",
+        NormRect::new(0.08, 0.62, 0.84, 0.25),
+        SpectrumShape::Bars {
+            gap_ratio: 0.3,
+            min_height_px: 3.0,
+            thickness_px: 12.0,
+        },
+        96,
+    )
+}
+
+pub fn new_radial_spectrum_layer(project: &Project) -> Layer {
+    let radius_px = project.output.width.min(project.output.height) as f32 * 0.24;
+    new_spectrum_layer(
+        project,
+        "円形スペクトラム",
+        NormRect::new(0.18, 0.08, 0.64, 0.64),
+        SpectrumShape::Radial {
+            radius_px,
+            thickness_px: 4.0,
+            start_angle_deg: -90.0,
+            sweep_deg: 360.0,
+            direction: SpectrumDirection::Clockwise,
+        },
+        200,
+    )
+}
+
+fn new_spectrum_layer(
+    project: &Project,
+    name: &str,
+    rect: NormRect,
+    shape: SpectrumShape,
+    point_count: usize,
+) -> Layer {
+    new_layer(
+        project,
+        name,
+        rect,
+        0.0,
+        LayerKind::Spectrum(SpectrumLayer {
+            band_count: DEFAULT_SPECTRUM_BANDS,
+            point_count,
+            shape,
+            color_mode: MusicColorMode::Custom,
+            fill: Animatable::Const(Fill::Solid(Rgba8::new(120, 255, 35, 255))),
+        }),
+    )
+}
+
+pub fn new_progress_bar_layer(project: &Project) -> Layer {
+    new_layer(
+        project,
+        "進捗バー",
+        NormRect::new(0.05, 0.91, 0.9, 0.035),
+        12.0,
+        LayerKind::ProgressBar(ProgressBarLayer {
+            border_thickness_px: 2.0,
+            fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+            border_fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+        }),
+    )
+}
+
+pub fn new_time_text_layer(project: &Project) -> Layer {
+    new_layer(
+        project,
+        "時間表示",
+        NormRect::new(0.74, 0.82, 0.24, 0.08),
+        0.0,
+        LayerKind::TimeText(TimeTextLayer {
+            format: TimeFormat::MmSsOfTotal,
+            font_key: DEFAULT_FONT_KEY.to_owned(),
+            size_px: 50.0,
+            align: TextAlign::Center,
+            fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+        }),
+    )
+}
+
+pub fn new_text_layer(project: &Project) -> Layer {
+    new_layer(
+        project,
+        "テキスト",
+        NormRect::new(0.2, 0.42, 0.6, 0.12),
+        0.0,
+        LayerKind::Text(TextLayer {
+            text: "テキスト".to_owned(),
+            font_key: DEFAULT_FONT_KEY.to_owned(),
+            size_px: 64.0,
+            align: TextAlign::Center,
+            fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+        }),
+    )
+}
+
+fn new_layer(
+    project: &Project,
+    base_name: &str,
+    rect: NormRect,
+    corner_radius: f32,
+    kind: LayerKind,
+) -> Layer {
+    Layer {
+        id: LayerId(next_layer_id(project)),
+        name: unique_layer_name(project, base_name),
+        visible: Animatable::Const(true),
+        opacity: Animatable::Const(1.0),
+        rect: Animatable::Const(rect),
+        rotation: Animatable::Const(0.0),
+        corner_radius: Animatable::Const(corner_radius),
+        glow: Animatable::Const(None),
+        modulations: Vec::new(),
+        kind,
     }
+}
+
+fn unique_layer_name(project: &Project, base: &str) -> String {
+    if project.layers.iter().all(|layer| layer.name != base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|number| format!("{base} {number}"))
+        .find(|candidate| project.layers.iter().all(|layer| layer.name != *candidate))
+        .expect("レイヤー名の番号は u32 より先にメモリ上限へ達する")
 }
 
 pub fn new_band_energy_modulator(project: &Project) -> Modulator {
@@ -270,10 +403,71 @@ mod tests {
         assert_eq!(layer.id, LayerId(5));
         assert_eq!(layer.rect, Animatable::Const(NormRect::FULL));
         assert_eq!(layer.opacity, Animatable::Const(1.0));
+        assert_eq!(layer.name, "画像");
         assert!(matches!(
             layer.kind,
-            LayerKind::Image { image: stored, fit: Fit::Cover } if stored == image
+            LayerKind::Image { image: stored, fit: Fit::Cover, zoom: Animatable::Const(1.0) } if stored == image
         ));
+    }
+
+    #[test]
+    fn added_layer_names_are_japanese_and_unique_and_all_presets_are_visible() {
+        let mut project = default_project(10.0);
+        let image = new_image_layer(&project, ImageId::new("asset-1"));
+        assert_eq!(image.name, "画像");
+        project.layers.push(image);
+        assert_eq!(
+            new_image_layer(&project, ImageId::new("asset-2")).name,
+            "画像 2"
+        );
+
+        let presets = [
+            new_radial_spectrum_layer(&project),
+            new_linear_spectrum_layer(&project),
+            new_pitch_keyboard_layer(&project),
+            new_progress_bar_layer(&project),
+            new_time_text_layer(&project),
+            new_text_layer(&project),
+            new_solid_layer(&project),
+        ];
+        for layer in &presets {
+            let rect = layer.rect.evaluate(0.0);
+            assert!(rect.width > 0.0 && rect.height > 0.0, "{}", layer.name);
+            assert!(
+                rect.x < 1.0
+                    && rect.y < 1.0
+                    && rect.x + rect.width > 0.0
+                    && rect.y + rect.height > 0.0,
+                "{}",
+                layer.name
+            );
+        }
+        assert!(matches!(
+            &presets[0].kind,
+            LayerKind::Spectrum(SpectrumLayer {
+                shape: SpectrumShape::Radial { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            &presets[1].kind,
+            LayerKind::Spectrum(SpectrumLayer {
+                shape: SpectrumShape::Bars { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            presets.map(|layer| layer.name),
+            [
+                "円形スペクトラム 2",
+                "直線スペクトラム",
+                "ピッチ鍵盤",
+                "進捗バー 2",
+                "時間表示 2",
+                "テキスト",
+                "単色",
+            ]
+        );
     }
 
     #[test]

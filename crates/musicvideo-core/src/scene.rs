@@ -66,6 +66,7 @@ pub enum SceneItemKind {
     Image {
         image: ImageId,
         fit: Fit,
+        zoom: f32,
     },
     Spectrum {
         values: Vec<f32>,
@@ -89,6 +90,13 @@ pub enum SceneItemKind {
         border_fill: Fill,
     },
     TimeText {
+        text: String,
+        font_key: String,
+        size_px: f32,
+        align: TextAlign,
+        fill: Fill,
+    },
+    Text {
         text: String,
         font_key: String,
         size_px: f32,
@@ -123,6 +131,10 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
         let mut opacity = layer.opacity.evaluate(time);
         let mut rect = layer.rect.evaluate(time);
         let mut scale = 1.0_f32;
+        let mut image_zoom = match &layer.kind {
+            LayerKind::Image { zoom, .. } => finite_or(zoom.evaluate(time), 1.0).max(0.01),
+            _ => 1.0,
+        };
         let mut rotation_deg = finite_or(layer.rotation.evaluate(time), 0.0);
         let mut corner_radius_px = finite_or(layer.corner_radius.evaluate(time), 0.0);
         let mut glow = layer.glow.evaluate(time).map(sanitize_glow);
@@ -137,6 +149,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             match binding.target {
                 ModulationTarget::Opacity => opacity = (opacity + amount).clamp(0.0, 1.0),
                 ModulationTarget::Scale => scale = (scale + amount).max(0.0),
+                ModulationTarget::ImageZoom => image_zoom = (image_zoom + amount).max(0.01),
                 ModulationTarget::Rotation => rotation_deg += amount,
                 ModulationTarget::CornerRadius => {
                     corner_radius_px = (corner_radius_px + amount).max(0.0)
@@ -170,9 +183,10 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             LayerKind::Solid { fill } => SceneItemKind::Solid {
                 fill: brighten_fill(fill.evaluate(time), fill_brightness),
             },
-            LayerKind::Image { image, fit } => SceneItemKind::Image {
+            LayerKind::Image { image, fit, .. } => SceneItemKind::Image {
                 image: image.clone(),
                 fit: *fit,
+                zoom: image_zoom,
             },
             LayerKind::Spectrum(layer) => {
                 let mut values = vec![0.0; layer.band_count];
@@ -212,6 +226,13 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             },
             LayerKind::TimeText(layer) => SceneItemKind::TimeText {
                 text: format_time(layer.format, time, duration),
+                font_key: layer.font_key.clone(),
+                size_px: layer.size_px.max(1.0),
+                align: layer.align,
+                fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
+            },
+            LayerKind::Text(layer) => SceneItemKind::Text {
+                text: layer.text.clone(),
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
@@ -535,5 +556,34 @@ mod tests {
 
         assert_eq!(forward, 0.5);
         assert_eq!(reversed, 0.8);
+    }
+
+    #[test]
+    fn image_zoom_modulates_the_picture_without_changing_the_layer_rect() {
+        let mut project = default_project(10.0);
+        let layer = &mut project.layers[0];
+        let base_rect = layer.rect.evaluate(0.0);
+        let LayerKind::Image { zoom, .. } = &mut layer.kind else {
+            panic!("expected image")
+        };
+        *zoom = crate::Animatable::Const(1.1);
+        layer.modulations.push(ModulationBinding {
+            target: ModulationTarget::ImageZoom,
+            modulator: ModulatorId(1),
+            amount: 0.2,
+            curve: ModulationCurve::Linear,
+        });
+        let mut frame = SpectrumFrame::default();
+        frame.modulators.push(ModulatorValue {
+            id: ModulatorId(1),
+            value: 0.5,
+        });
+
+        let item = evaluate(&project, 1.0, &frame).items.remove(0);
+        assert_eq!(item.rect, base_rect);
+        let SceneItemKind::Image { zoom, .. } = item.kind else {
+            panic!("expected image")
+        };
+        assert!((zoom - 1.2).abs() < 1.0e-6);
     }
 }

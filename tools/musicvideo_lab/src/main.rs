@@ -103,6 +103,21 @@ fn main() {
         }
         return;
     }
+    if command.as_deref() == Some("--project-image-zoom-sample") {
+        let Some(path) = args.next().map(PathBuf::from) else {
+            eprintln!("--project-image-zoom-sample には project.mivmv.json のパスが必要です");
+            std::process::exit(2);
+        };
+        let output = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/musicvideo-image-zoom"));
+        if let Err(error) = export::render_project_image_zoom_sample(&path, &output) {
+            eprintln!("実素材の画像拡大サンプルに失敗しました: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = run_gui() {
         eprintln!("musicvideo_lab を起動できません: {error}");
     }

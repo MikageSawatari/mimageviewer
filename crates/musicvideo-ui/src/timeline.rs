@@ -60,20 +60,11 @@ pub fn draw_timeline(
 
     draw_waveform_lane(ui, duration, position_secs, waveform, &mut response);
 
-    let rows = project
-        .layers
-        .iter()
-        .flat_map(|layer| {
-            animation_properties(layer)
-                .into_iter()
-                .map(|property| RowSnapshot {
-                    layer: layer.id,
-                    layer_name: layer.name.clone(),
-                    property,
-                    keys: animation_keys(layer, property).unwrap_or_default(),
-                })
-        })
-        .collect::<Vec<_>>();
+    let rows = tracked_rows(project);
+
+    if rows.is_empty() {
+        ui.weak("キーのあるプロパティだけ、ここに表示されます");
+    }
 
     egui::ScrollArea::vertical()
         .id_salt("musicvideo-keyframe-rows")
@@ -93,6 +84,26 @@ pub fn draw_timeline(
         });
     draw_key_inspector(ui, project, state, duration, &mut response);
     response
+}
+
+fn tracked_rows(project: &Project) -> Vec<RowSnapshot> {
+    project
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            animation_properties(layer)
+                .into_iter()
+                .filter_map(|property| {
+                    let keys = animation_keys(layer, property).unwrap_or_default();
+                    (!keys.is_empty()).then(|| RowSnapshot {
+                        layer: layer.id,
+                        layer_name: layer.name.clone(),
+                        property,
+                        keys,
+                    })
+                })
+        })
+        .collect()
 }
 
 fn draw_waveform_lane(
@@ -457,6 +468,8 @@ fn interp_label(interp: Interp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyframes::{AnimProperty, EditorCommand, apply_editor_command};
+    use musicvideo_core::default_project;
 
     #[test]
     fn waveform_constructor_sanitizes_duration_without_touching_samples() {
@@ -472,5 +485,32 @@ mod tests {
         assert_eq!(time_to_x(rect, 10.0, -1.0), 10.0);
         assert_eq!(time_to_x(rect, 10.0, 11.0), 110.0);
         assert_eq!(x_to_time(rect, 10.0, 60.0), 5.0);
+    }
+
+    #[test]
+    fn timeline_only_contains_properties_with_keys_and_hides_last_deleted_track() {
+        let mut project = default_project(10.0);
+        assert_eq!(tracked_rows(&project).len(), 0);
+        let layer = project.layers[0].id;
+        apply_editor_command(
+            &mut project,
+            &EditorCommand::AddKey {
+                layer,
+                property: AnimProperty::Opacity,
+                t: 2.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(tracked_rows(&project).len(), 1);
+        apply_editor_command(
+            &mut project,
+            &EditorCommand::DeleteKey {
+                layer,
+                property: AnimProperty::Opacity,
+                key_index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(tracked_rows(&project).len(), 0);
     }
 }

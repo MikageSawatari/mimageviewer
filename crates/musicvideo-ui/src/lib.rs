@@ -18,7 +18,9 @@ use egui::TextureHandle;
 use musicvideo_core::{
     Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind,
     ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8, SpectrumDirection,
-    SpectrumLayer, SpectrumShape, new_pitch_keyboard_layer,
+    SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer,
+    new_linear_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
+    new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
 
 use modulators::ModulatorEditorState;
@@ -118,6 +120,29 @@ pub struct EditorResponse {
     pub add_image_layer_requested: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewLayerPreset {
+    Image,
+    RadialSpectrum,
+    LinearSpectrum,
+    PitchKeyboard,
+    ProgressBar,
+    TimeText,
+    Text,
+    Solid,
+}
+
+const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 8] = [
+    (NewLayerPreset::Image, "画像"),
+    (NewLayerPreset::RadialSpectrum, "円形スペクトラム"),
+    (NewLayerPreset::LinearSpectrum, "直線スペクトラム"),
+    (NewLayerPreset::PitchKeyboard, "ピッチ鍵盤"),
+    (NewLayerPreset::ProgressBar, "進捗バー"),
+    (NewLayerPreset::TimeText, "時間表示"),
+    (NewLayerPreset::Text, "テキスト"),
+    (NewLayerPreset::Solid, "単色"),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingImageNotice {
     pub id: ImageId,
@@ -188,13 +213,38 @@ pub fn draw_editor(
                         }
                     }
 
-                    if ui.button("＋ ピッチ鍵盤を追加").clicked() {
-                        project.layers.push(new_pitch_keyboard_layer(project));
+                    let mut new_layer = None;
+                    let mut add_image_layer_requested = false;
+                    ui.menu_button("＋ レイヤーを追加", |ui| {
+                        for (preset, label) in NEW_LAYER_PRESETS {
+                            if ui.button(label).clicked() {
+                                if preset == NewLayerPreset::Image {
+                                    add_image_layer_requested = true;
+                                } else {
+                                    new_layer = Some(preset);
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                    if let Some(preset) = new_layer {
+                        let layer = match preset {
+                            NewLayerPreset::Image => {
+                                unreachable!("画像の選択は呼び出し側が所有します")
+                            }
+                            NewLayerPreset::RadialSpectrum => new_radial_spectrum_layer(project),
+                            NewLayerPreset::LinearSpectrum => new_linear_spectrum_layer(project),
+                            NewLayerPreset::PitchKeyboard => new_pitch_keyboard_layer(project),
+                            NewLayerPreset::ProgressBar => new_progress_bar_layer(project),
+                            NewLayerPreset::TimeText => new_time_text_layer(project),
+                            NewLayerPreset::Text => new_text_layer(project),
+                            NewLayerPreset::Solid => new_solid_layer(project),
+                        };
+                        project.layers.push(layer);
                         state.selected_layer = project.layers.len() - 1;
                         state.selected_key = None;
                         project_changed = true;
                     }
-                    let add_image_layer_requested = ui.button("＋ 画像レイヤーを追加").clicked();
                     ui.separator();
                     let mut commands = Vec::new();
                     let output = project.output;
@@ -303,7 +353,7 @@ fn edit_layer_properties(
     }
     ui.separator();
     changed |= match &mut layer.kind {
-        LayerKind::Solid { .. } | LayerKind::Image { .. } | LayerKind::TimeText(_) => false,
+        LayerKind::Solid { .. } | LayerKind::Image { .. } => false,
         LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
         LayerKind::PitchKeyboard(keyboard) => edit_music_color_mode(ui, &mut keyboard.color_mode),
         LayerKind::ProgressBar(progress) => ui
@@ -313,6 +363,8 @@ fn edit_layer_properties(
                     .suffix(" px 枠"),
             )
             .changed(),
+        LayerKind::TimeText(text) => edit_time_text(ui, text),
+        LayerKind::Text(text) => edit_text(ui, text),
     };
     changed |= modulators::draw_bindings(ui, layer, modulators, modulator_values);
     LayerEditResult { changed, commands }
@@ -342,7 +394,10 @@ fn edit_animatable_property(
         .id_salt(("animatable-property", layer.id.0, property))
         .default_open(matches!(
             property,
-            AnimProperty::Visible | AnimProperty::Opacity | AnimProperty::Rect
+            AnimProperty::Visible
+                | AnimProperty::Opacity
+                | AnimProperty::Rect
+                | AnimProperty::ImageZoom
         ))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -395,6 +450,10 @@ fn edit_animation_value(
         (AnimProperty::Opacity, AnimationValue::Float(value)) => ui
             .add(egui::Slider::new(value, 0.0..=1.0).text("不透明度"))
             .changed(),
+        (AnimProperty::ImageZoom, AnimationValue::Float(value)) => ui
+            .add(egui::Slider::new(value, 0.1..=4.0).text("絵そのものの拡大"))
+            .on_hover_text("レイヤーの矩形は動かさず、その内側で画像だけを中心基準に拡大します")
+            .changed(),
         (AnimProperty::Rotation, AnimationValue::Float(value)) => ui
             .add(
                 egui::DragValue::new(value)
@@ -412,6 +471,51 @@ fn edit_animation_value(
         (_, AnimationValue::Fill(fill)) => edit_fill(ui, fill),
         _ => false,
     }
+}
+
+fn edit_time_text(ui: &mut egui::Ui, text: &mut TimeTextLayer) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("表示形式");
+        egui::ComboBox::from_id_salt("time-text-format")
+            .selected_text(match text.format {
+                TimeFormat::MmSs => "経過時間",
+                TimeFormat::MmSsOfTotal => "経過時間 / 全体",
+            })
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut text.format, TimeFormat::MmSs, "経過時間")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut text.format, TimeFormat::MmSsOfTotal, "経過時間 / 全体")
+                    .changed();
+            });
+    });
+    changed |= edit_text_layout(ui, &mut text.size_px, &mut text.align);
+    changed
+}
+
+fn edit_text(ui: &mut egui::Ui, text: &mut TextLayer) -> bool {
+    let mut changed = ui.text_edit_singleline(&mut text.text).changed();
+    changed |= edit_text_layout(ui, &mut text.size_px, &mut text.align);
+    changed
+}
+
+fn edit_text_layout(ui: &mut egui::Ui, size_px: &mut f32, align: &mut TextAlign) -> bool {
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(size_px)
+                .range(1.0..=1000.0)
+                .suffix(" px 文字サイズ"),
+        )
+        .changed();
+    ui.horizontal(|ui| {
+        ui.label("文字揃え");
+        changed |= ui.radio_value(align, TextAlign::Start, "左").changed();
+        changed |= ui.radio_value(align, TextAlign::Center, "中央").changed();
+        changed |= ui.radio_value(align, TextAlign::End, "右").changed();
+    });
+    changed
 }
 
 fn edit_rect(
@@ -766,6 +870,23 @@ mod tests {
         assert_eq!(
             keyboard.background,
             Animatable::Const(Fill::Solid(Rgba8::new(0, 0, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn add_layer_menu_lists_every_model_layer_type() {
+        assert_eq!(
+            NEW_LAYER_PRESETS.map(|(_, label)| label),
+            [
+                "画像",
+                "円形スペクトラム",
+                "直線スペクトラム",
+                "ピッチ鍵盤",
+                "進捗バー",
+                "時間表示",
+                "テキスト",
+                "単色",
+            ]
         );
     }
 }
