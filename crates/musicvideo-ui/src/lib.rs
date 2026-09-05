@@ -16,10 +16,10 @@ pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use egui::TextureHandle;
 use musicvideo_core::{
-    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind,
+    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricsLayer,
     MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project, Rgba8,
     SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat,
-    TimeTextLayer, new_linear_spectrum_layer, new_miv_spectrum_keyboard_layers,
+    TimeTextLayer, new_linear_spectrum_layer, new_lyrics_layer, new_miv_spectrum_keyboard_layers,
     new_miv_spectrum_layer, new_pitch_keyboard_layer, new_progress_bar_layer,
     new_radial_spectrum_layer, new_solid_layer, new_text_layer, new_time_text_layer,
 };
@@ -33,11 +33,21 @@ struct KeySelection {
     key_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LyricSelection {
+    layer: LayerId,
+    line_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorState {
     selected_layer: usize,
     selected_key: Option<KeySelection>,
     dragging_key: Option<KeySelection>,
+    selected_lyric: Option<LyricSelection>,
+    dragging_lyric: Option<LyricSelection>,
+    last_lyric_stamp: Option<LyricSelection>,
+    lyrics_notice: Option<(LayerId, String)>,
     pending_layer_delete: Option<LayerId>,
     modulator_editor: ModulatorEditorState,
 }
@@ -48,6 +58,10 @@ impl Default for EditorState {
             selected_layer: 1,
             selected_key: None,
             dragging_key: None,
+            selected_lyric: None,
+            dragging_lyric: None,
+            last_lyric_stamp: None,
+            lyrics_notice: None,
             pending_layer_delete: None,
             modulator_editor: ModulatorEditorState::default(),
         }
@@ -70,6 +84,10 @@ impl EditorState {
             .min(project.layers.len().saturating_sub(1));
         self.selected_key = None;
         self.dragging_key = None;
+        self.selected_lyric = None;
+        self.dragging_lyric = None;
+        self.last_lyric_stamp = None;
+        self.lyrics_notice = None;
         self.pending_layer_delete = None;
         self.modulator_editor = ModulatorEditorState::default();
     }
@@ -89,6 +107,29 @@ impl EditorState {
         if !selection_exists {
             self.selected_key = None;
             self.dragging_key = None;
+        }
+        let lyric_exists = self.selected_lyric.is_some_and(|selection| {
+            project
+                .layers
+                .iter()
+                .find(|layer| layer.id == selection.layer)
+                .and_then(|layer| match &layer.kind {
+                    LayerKind::Lyrics(lyrics) => lyrics.lines.get(selection.line_index),
+                    _ => None,
+                })
+                .is_some()
+        });
+        if !lyric_exists {
+            self.selected_lyric = None;
+            self.dragging_lyric = None;
+        }
+        if self.last_lyric_stamp.is_some_and(|selection| {
+            !project.layers.iter().any(|layer| {
+                layer.id == selection.layer
+                    && matches!(&layer.kind, LayerKind::Lyrics(lyrics) if selection.line_index < lyrics.lines.len())
+            })
+        }) {
+            self.last_lyric_stamp = None;
         }
         if self
             .pending_layer_delete
@@ -114,6 +155,8 @@ impl EditorState {
             return false;
         };
         if let Some((layer, property)) = animation_target {
+            self.selected_lyric = None;
+            self.dragging_lyric = None;
             if result.clear_selection
                 && self.selected_key.is_some_and(|selected| {
                     selected.layer == layer && selected.property == property
@@ -140,7 +183,19 @@ impl EditorState {
             }
             self.reconcile(project);
         }
+        if matches!(
+            command,
+            EditorCommand::ReplaceLyrics { .. } | EditorCommand::ReplaceLyricsText { .. }
+        ) {
+            self.selected_lyric = None;
+            self.dragging_lyric = None;
+            self.last_lyric_stamp = None;
+        }
         result.changed
+    }
+
+    pub fn set_lyrics_notice(&mut self, layer: LayerId, notice: String) {
+        self.lyrics_notice = Some((layer, notice));
     }
 }
 
@@ -148,6 +203,8 @@ impl EditorState {
 pub struct EditorResponse {
     pub project_changed: bool,
     pub add_image_layer_requested: bool,
+    pub import_lrc_requested: Option<LayerId>,
+    pub export_lrc_requested: Option<LayerId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,10 +218,11 @@ enum NewLayerPreset {
     ProgressBar,
     TimeText,
     Text,
+    Lyrics,
     Solid,
 }
 
-const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 10] = [
+const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 11] = [
     (NewLayerPreset::Image, "画像"),
     (NewLayerPreset::RadialSpectrum, "円形スペクトラム"),
     (NewLayerPreset::LinearSpectrum, "直線スペクトラム"),
@@ -177,6 +235,7 @@ const NEW_LAYER_PRESETS: [(NewLayerPreset, &str); 10] = [
     (NewLayerPreset::ProgressBar, "進捗バー"),
     (NewLayerPreset::TimeText, "時間表示"),
     (NewLayerPreset::Text, "テキスト"),
+    (NewLayerPreset::Lyrics, "歌詞"),
     (NewLayerPreset::Solid, "単色"),
 ];
 
@@ -343,6 +402,7 @@ pub fn draw_editor(
                             }
                             NewLayerPreset::TimeText => vec![new_time_text_layer(project)],
                             NewLayerPreset::Text => vec![new_text_layer(project)],
+                            NewLayerPreset::Lyrics => vec![new_lyrics_layer(project)],
                             NewLayerPreset::Solid => vec![new_solid_layer(project)],
                         };
                         project.layers.extend(layers);
@@ -352,13 +412,15 @@ pub fn draw_editor(
                     }
                     ui.separator();
                     let mut commands = Vec::new();
+                    let mut import_lrc_requested = None;
+                    let mut export_lrc_requested = None;
                     let output = project.output;
                     let modulators = project.modulators.clone();
                     if let Some(layer) = project.layers.get_mut(state.selected_layer) {
                         let result = edit_layer_properties(
                             ui,
                             layer,
-                            state.selected_key,
+                            state,
                             current_time_secs,
                             output.width,
                             output.height,
@@ -367,6 +429,8 @@ pub fn draw_editor(
                         );
                         project_changed |= result.changed;
                         commands = result.commands;
+                        import_lrc_requested = result.import_lrc_requested;
+                        export_lrc_requested = result.export_lrc_requested;
                     }
                     for command in commands {
                         project_changed |= state.apply_command(project, &command);
@@ -374,6 +438,8 @@ pub fn draw_editor(
                     EditorResponse {
                         project_changed,
                         add_image_layer_requested,
+                        import_lrc_requested,
+                        export_lrc_requested,
                     }
                 })
                 .inner;
@@ -477,12 +543,14 @@ pub fn draw_missing_images(ui: &mut egui::Ui, notices: &[MissingImageNotice]) ->
 struct LayerEditResult {
     changed: bool,
     commands: Vec<EditorCommand>,
+    import_lrc_requested: Option<LayerId>,
+    export_lrc_requested: Option<LayerId>,
 }
 
 fn edit_layer_properties(
     ui: &mut egui::Ui,
     layer: &mut Layer,
-    selected_key: Option<KeySelection>,
+    state: &mut EditorState,
     current_time_secs: f64,
     output_width: u32,
     output_height: u32,
@@ -491,12 +559,14 @@ fn edit_layer_properties(
 ) -> LayerEditResult {
     let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
     let mut commands = Vec::new();
+    let mut import_lrc_requested = None;
+    let mut export_lrc_requested = None;
     for property in keyframes::animation_properties(layer) {
         edit_animatable_property(
             ui,
             layer,
             property,
-            selected_key,
+            state.selected_key,
             current_time_secs,
             output_width,
             output_height,
@@ -517,9 +587,27 @@ fn edit_layer_properties(
             .changed(),
         LayerKind::TimeText(text) => edit_time_text(ui, text),
         LayerKind::Text(text) => edit_text(ui, text),
+        LayerKind::Lyrics(lyrics) => {
+            let result = edit_lyrics(
+                ui,
+                layer.id,
+                lyrics,
+                state,
+                current_time_secs,
+                &mut commands,
+            );
+            import_lrc_requested = result.import_requested.then_some(layer.id);
+            export_lrc_requested = result.export_requested.then_some(layer.id);
+            result.changed
+        }
     };
     changed |= modulators::draw_bindings(ui, layer, modulators, modulator_values);
-    LayerEditResult { changed, commands }
+    LayerEditResult {
+        changed,
+        commands,
+        import_lrc_requested,
+        export_lrc_requested,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -651,6 +739,198 @@ fn edit_text(ui: &mut egui::Ui, text: &mut TextLayer) -> bool {
     let mut changed = ui.text_edit_singleline(&mut text.text).changed();
     changed |= edit_text_layout(ui, &mut text.size_px, &mut text.align);
     changed
+}
+
+#[derive(Default)]
+struct LyricsEditResult {
+    changed: bool,
+    import_requested: bool,
+    export_requested: bool,
+}
+
+fn edit_lyrics(
+    ui: &mut egui::Ui,
+    layer_id: LayerId,
+    lyrics: &mut LyricsLayer,
+    state: &mut EditorState,
+    current_time_secs: f64,
+    commands: &mut Vec<EditorCommand>,
+) -> LyricsEditResult {
+    let mut result = LyricsEditResult::default();
+    ui.heading("歌詞");
+    ui.small(
+        "1 行ずつ貼り付け、再生しながら「次の行へ」で時刻を付けます。空行は歌詞を消す区間です。",
+    );
+
+    let mut block = lyrics
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if ui
+        .add(
+            egui::TextEdit::multiline(&mut block)
+                .desired_rows(7)
+                .desired_width(f32::INFINITY)
+                .hint_text("ここに歌詞をまとめて貼り付け"),
+        )
+        .changed()
+    {
+        commands.push(EditorCommand::ReplaceLyricsText {
+            layer: layer_id,
+            text: block,
+        });
+    }
+
+    let next_unset = lyrics
+        .lines
+        .iter()
+        .position(|line| line.time_secs.is_none());
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(next_unset.is_some(), egui::Button::new("次の行へ"))
+            .on_hover_text("次の未設定行へ、音声の現在時刻を記録します")
+            .clicked()
+            && let Some(line_index) = next_unset
+        {
+            let selection = LyricSelection {
+                layer: layer_id,
+                line_index,
+            };
+            commands.push(EditorCommand::SetLyricTime {
+                layer: layer_id,
+                line_index,
+                time_secs: Some(current_time_secs),
+            });
+            state.selected_lyric = Some(selection);
+            state.selected_key = None;
+            state.last_lyric_stamp = Some(selection);
+        }
+        let can_step_back = state
+            .last_lyric_stamp
+            .is_some_and(|selection| selection.layer == layer_id);
+        if ui
+            .add_enabled(can_step_back, egui::Button::new("1 つ前に戻す"))
+            .on_hover_text("直前に「次の行へ」で付けた時刻だけを取り消します")
+            .clicked()
+            && let Some(selection) = state.last_lyric_stamp.take()
+        {
+            commands.push(EditorCommand::SetLyricTime {
+                layer: selection.layer,
+                line_index: selection.line_index,
+                time_secs: None,
+            });
+            state.selected_lyric = Some(selection);
+        }
+    });
+    if let Some(index) = next_unset {
+        let preview = lyrics.lines[index].text.replace('\n', " ");
+        ui.small(format!("次: {} / {}", index + 1, preview));
+    } else {
+        ui.small("すべての行に時刻が設定されています");
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("LRC を読み込む…").clicked() {
+            result.import_requested = true;
+        }
+        if ui.button("LRC に書き出す…").clicked() {
+            result.export_requested = true;
+        }
+    });
+    if let Some((_, notice)) = state
+        .lyrics_notice
+        .as_ref()
+        .filter(|(notice_layer, _)| *notice_layer == layer_id)
+    {
+        ui.small(notice);
+    }
+
+    ui.collapsing("行ごとの時刻を修正", |ui| {
+        for (line_index, line) in lyrics.lines.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let selected = state.selected_lyric
+                    == Some(LyricSelection {
+                        layer: layer_id,
+                        line_index,
+                    });
+                if ui
+                    .selectable_label(selected, format!("{}", line_index + 1))
+                    .clicked()
+                {
+                    state.selected_lyric = Some(LyricSelection {
+                        layer: layer_id,
+                        line_index,
+                    });
+                    state.selected_key = None;
+                }
+                if let Some(original_time) = line.time_secs {
+                    let mut time = original_time;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut time)
+                                .range(0.0..=f64::MAX)
+                                .speed(0.01)
+                                .suffix(" 秒"),
+                        )
+                        .changed()
+                    {
+                        commands.push(EditorCommand::SetLyricTime {
+                            layer: layer_id,
+                            line_index,
+                            time_secs: Some(time),
+                        });
+                        state.last_lyric_stamp = None;
+                    }
+                    if ui.small_button("未設定に戻す").clicked() {
+                        commands.push(EditorCommand::SetLyricTime {
+                            layer: layer_id,
+                            line_index,
+                            time_secs: None,
+                        });
+                        state.last_lyric_stamp = None;
+                    }
+                } else {
+                    ui.weak("未設定");
+                    if ui.small_button("現在時刻を設定").clicked() {
+                        commands.push(EditorCommand::SetLyricTime {
+                            layer: layer_id,
+                            line_index,
+                            time_secs: Some(current_time_secs),
+                        });
+                        state.last_lyric_stamp = None;
+                    }
+                }
+                let text = if line.text.is_empty() {
+                    "（空行）"
+                } else {
+                    line.text.as_str()
+                };
+                ui.label(text);
+            });
+        }
+    });
+
+    ui.separator();
+    result.changed |= ui
+        .add(
+            egui::DragValue::new(&mut lyrics.fade_in_secs)
+                .range(0.0..=10.0)
+                .speed(0.01)
+                .suffix(" 秒 フェードイン"),
+        )
+        .changed();
+    result.changed |= ui
+        .add(
+            egui::DragValue::new(&mut lyrics.fade_out_secs)
+                .range(0.0..=10.0)
+                .speed(0.01)
+                .suffix(" 秒 フェードアウト"),
+        )
+        .changed();
+    result.changed |= edit_text_layout(ui, &mut lyrics.size_px, &mut lyrics.align);
+    result
 }
 
 fn edit_text_layout(ui: &mut egui::Ui, size_px: &mut f32, align: &mut TextAlign) -> bool {
@@ -1059,6 +1339,7 @@ mod tests {
                 "進捗バー",
                 "時間表示",
                 "テキスト",
+                "歌詞",
                 "単色",
             ]
         );

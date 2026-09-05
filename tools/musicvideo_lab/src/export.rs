@@ -12,9 +12,10 @@ use musicvideo_core::{
     Animatable, Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
     BAND_ENERGY_CALIBRATION_LOW_PERCENTILE, BandCalibration, Frame, ImageId, LayerKind,
     MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
-    ModulatorSource, Project, RenderReport, ScaledImageCacheStats, Scene, SceneItemKind, Smoothing,
-    SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
-    new_band_energy_modulator, new_miv_spectrum_keyboard_layers, norm_rect_to_pixels, render_frame,
+    ModulatorSource, NormRect, Project, RenderReport, Rgba8, ScaledImageCacheStats, Scene,
+    SceneItemKind, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators,
+    evaluate, new_band_energy_modulator, new_lyrics_layer, new_miv_spectrum_keyboard_layers,
+    new_solid_layer, norm_rect_to_pixels, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -710,6 +711,73 @@ pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String>
     .map_err(|error| {
         format!(
             "サンプル画像を保存できません ({}): {error}",
+            output.display()
+        )
+    })
+}
+
+pub fn render_lyrics_sample(output: &Path, font: &FontData) -> Result<(), String> {
+    let assets = create_assets(Some(font))?;
+    let mut project = default_project(6.0);
+    project.output.width = 1280;
+    project.output.height = 720;
+    project.layers.clear();
+    let mut background = new_solid_layer(&project);
+    background.rect = Animatable::Const(NormRect::FULL);
+    background.corner_radius = Animatable::Const(0.0);
+    background.kind = LayerKind::Solid {
+        fill: Animatable::Const(musicvideo_core::Fill::Solid(Rgba8::new(22, 28, 48, 255))),
+    };
+    project.layers.push(background);
+    let mut lyrics_layer = new_lyrics_layer(&project);
+    lyrics_layer.rect = Animatable::Const(NormRect::new(0.08, 0.68, 0.84, 0.15));
+    lyrics_layer.glow = Animatable::Const(Some(musicvideo_core::Glow {
+        color: Rgba8::new(20, 30, 60, 220),
+        radius_px: 10.0,
+        spread_px: 1.0,
+    }));
+    let LayerKind::Lyrics(lyrics) = &mut lyrics_layer.kind else {
+        unreachable!()
+    };
+    lyrics.lines = vec![musicvideo_core::LyricLine {
+        text: "星降る夜に、君と歌う".to_owned(),
+        time_secs: Some(1.0),
+    }];
+    project.layers.push(lyrics_layer);
+
+    let scene = evaluate(&project, 2.0, &SpectrumFrame::default());
+    let mut frame = Frame::new(project.output.width, project.output.height)
+        .map_err(|error| format!("歌詞サンプル用フレームを確保できません: {error}"))?;
+    let report = render_frame(&scene, &assets, &mut frame)
+        .map_err(|error| format!("歌詞サンプルを合成できません: {error}"))?;
+    ensure_resolved(&report, "歌詞サンプル")?;
+    let mut repeated = Frame::new(project.output.width, project.output.height)
+        .map_err(|error| format!("歌詞サンプルの再描画フレームを確保できません: {error}"))?;
+    let repeated_report = render_frame(&scene, &assets, &mut repeated)
+        .map_err(|error| format!("歌詞サンプルを再描画できません: {error}"))?;
+    ensure_resolved(&repeated_report, "歌詞サンプルの再描画")?;
+    if frame.rgba != repeated.rgba {
+        return Err("同じ時刻の歌詞サンプルを再描画した結果が一致しません".to_owned());
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "歌詞サンプルの出力フォルダーを作成できません ({}): {error}",
+                parent.display()
+            )
+        })?;
+    }
+    image::save_buffer_with_format(
+        output,
+        &frame.rgba,
+        frame.width,
+        frame.height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| {
+        format!(
+            "歌詞サンプルを保存できません ({}): {error}",
             output.display()
         )
     })

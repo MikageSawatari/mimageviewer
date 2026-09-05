@@ -1,8 +1,8 @@
 use crate::model::{
     Animatable, BandCalibration, BandRange, BandWeighting, Fill, Fit, Glow, ImageId, Layer,
-    LayerId, LayerKind, Modulator, ModulatorId, ModulatorSource, MusicColorMode, NormRect, Output,
-    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
-    SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer,
+    LayerId, LayerKind, LyricsLayer, Modulator, ModulatorId, ModulatorSource, MusicColorMode,
+    NormRect, Output, PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection,
+    SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer,
 };
 use crate::spectrum::Smoothing;
 
@@ -309,6 +309,24 @@ pub fn new_text_layer(project: &Project) -> Layer {
     )
 }
 
+pub fn new_lyrics_layer(project: &Project) -> Layer {
+    new_layer(
+        project,
+        "歌詞",
+        NormRect::new(0.08, 0.78, 0.84, 0.1),
+        0.0,
+        LayerKind::Lyrics(LyricsLayer {
+            lines: Vec::new(),
+            fade_in_secs: 0.12,
+            fade_out_secs: 0.12,
+            font_key: DEFAULT_FONT_KEY.to_owned(),
+            size_px: 64.0,
+            align: TextAlign::Center,
+            fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+        }),
+    )
+}
+
 fn new_layer(
     project: &Project,
     base_name: &str,
@@ -461,6 +479,7 @@ mod tests {
             new_progress_bar_layer(&project),
             new_time_text_layer(&project),
             new_text_layer(&project),
+            new_lyrics_layer(&project),
             new_solid_layer(&project),
         ];
         for layer in &presets {
@@ -507,6 +526,7 @@ mod tests {
                 "進捗バー 2",
                 "時間表示 2",
                 "テキスト",
+                "歌詞",
                 "単色",
             ]
         );

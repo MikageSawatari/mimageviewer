@@ -42,6 +42,12 @@ struct RowSnapshot {
     keys: Vec<KeyMeta>,
 }
 
+struct LyricRowSnapshot {
+    layer: LayerId,
+    layer_name: String,
+    markers: Vec<(usize, f64, String)>,
+}
+
 pub fn draw_timeline(
     ui: &mut egui::Ui,
     project: &mut Project,
@@ -53,17 +59,18 @@ pub fn draw_timeline(
     let duration = project.duration_secs.max(0.001);
     let mut response = TimelineResponse::default();
     ui.horizontal(|ui| {
-        ui.strong("キーフレーム");
+        ui.strong("タイムライン");
         ui.label(format!("{position_secs:.3} 秒"));
-        ui.weak("波形または行をドラッグしてシーク / ◆をドラッグして移動");
+        ui.weak("波形または行をドラッグしてシーク / ◆をドラッグしてキー・歌詞を移動");
     });
 
     draw_waveform_lane(ui, duration, position_secs, waveform, &mut response);
 
     let rows = tracked_rows(project);
+    let lyric_rows = lyric_rows(project);
 
-    if rows.is_empty() {
-        ui.weak("キーのあるプロパティだけ、ここに表示されます");
+    if rows.is_empty() && lyric_rows.is_empty() {
+        ui.weak("キーのあるプロパティと歌詞レイヤーが、ここに表示されます");
     }
 
     egui::ScrollArea::vertical()
@@ -81,9 +88,46 @@ pub fn draw_timeline(
                     &mut response,
                 );
             }
+            for row in lyric_rows {
+                draw_lyric_row(
+                    ui,
+                    project,
+                    state,
+                    duration,
+                    position_secs,
+                    row,
+                    &mut response,
+                );
+            }
         });
     draw_key_inspector(ui, project, state, duration, &mut response);
     response
+}
+
+fn lyric_rows(project: &Project) -> Vec<LyricRowSnapshot> {
+    project
+        .layers
+        .iter()
+        .filter_map(|layer| {
+            let musicvideo_core::LayerKind::Lyrics(lyrics) = &layer.kind else {
+                return None;
+            };
+            Some(LyricRowSnapshot {
+                layer: layer.id,
+                layer_name: layer.name.clone(),
+                markers: lyrics
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        line.time_secs
+                            .filter(|time| time.is_finite())
+                            .map(|time| (index, time, line.text.clone()))
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 fn tracked_rows(project: &Project) -> Vec<RowSnapshot> {
@@ -270,6 +314,7 @@ fn draw_property_row(
                 key_index: index,
             };
             state.selected_key = Some(selection);
+            state.selected_lyric = None;
             state.dragging_key = Some(selection);
             state.select_layer_id(project, row.layer);
         } else {
@@ -283,6 +328,7 @@ fn draw_property_row(
                 property: row.property,
                 key_index: index,
             });
+            state.selected_lyric = None;
             state.select_layer_id(project, row.layer);
             output.seek_to = Some(row.keys[index].t);
         } else if let Some(pointer) = pointer.filter(|pointer| axis.contains(*pointer)) {
@@ -314,6 +360,128 @@ fn draw_property_row(
     }
 }
 
+fn draw_lyric_row(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    state: &mut EditorState,
+    duration: f64,
+    position_secs: f64,
+    row: LyricRowSnapshot,
+    output: &mut TimelineResponse,
+) {
+    let width = ui.available_width().max(LABEL_WIDTH + 80.0);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click_and_drag());
+    let axis = timeline_axis(rect);
+    let selected = state
+        .selected_lyric
+        .is_some_and(|selected| selected.layer == row.layer);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        0.0,
+        if selected {
+            Color32::from_gray(42)
+        } else {
+            Color32::from_gray(29)
+        },
+    );
+    painter.text(
+        Pos2::new(rect.min.x + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{} / 歌詞", row.layer_name),
+        egui::FontId::proportional(11.0),
+        Color32::LIGHT_GRAY,
+    );
+    painter.rect_filled(axis, 0.0, Color32::from_gray(20));
+    draw_playhead(painter, axis, duration, position_secs);
+
+    let pointer = response.interact_pointer_pos();
+    let hovered = pointer.and_then(|pointer| {
+        row.markers
+            .iter()
+            .rev()
+            .find(|(_, time, _)| (pointer.x - time_to_x(axis, duration, *time)).abs() <= 7.0)
+    });
+    for (line_index, time, text) in &row.markers {
+        let center = Pos2::new(time_to_x(axis, duration, *time), rect.center().y);
+        let is_selected = state.selected_lyric
+            == Some(crate::LyricSelection {
+                layer: row.layer,
+                line_index: *line_index,
+            });
+        let radius = if is_selected { 6.0 } else { 4.5 };
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(center.x, center.y - radius),
+                Pos2::new(center.x + radius, center.y),
+                Pos2::new(center.x, center.y + radius),
+                Pos2::new(center.x - radius, center.y),
+            ],
+            if is_selected {
+                Color32::YELLOW
+            } else if text.is_empty() {
+                Color32::from_rgb(180, 125, 215)
+            } else {
+                Color32::from_rgb(255, 155, 105)
+            },
+            Stroke::NONE,
+        ));
+    }
+
+    if response.drag_started() {
+        if let Some((line_index, _, _)) = hovered {
+            let selection = crate::LyricSelection {
+                layer: row.layer,
+                line_index: *line_index,
+            };
+            state.selected_lyric = Some(selection);
+            state.selected_key = None;
+            state.dragging_lyric = Some(selection);
+            state.last_lyric_stamp = None;
+            state.select_layer_id(project, row.layer);
+        } else {
+            state.dragging_lyric = None;
+        }
+    }
+    if response.clicked() {
+        if let Some((line_index, time, _)) = hovered {
+            state.selected_lyric = Some(crate::LyricSelection {
+                layer: row.layer,
+                line_index: *line_index,
+            });
+            state.selected_key = None;
+            state.select_layer_id(project, row.layer);
+            output.seek_to = Some(*time);
+        } else if let Some(pointer) = pointer.filter(|pointer| axis.contains(*pointer)) {
+            output.seek_to = Some(x_to_time(axis, duration, pointer.x));
+        }
+    }
+    if response.dragged()
+        && let Some(pointer) = pointer
+    {
+        if let Some(dragging) = state.dragging_lyric
+            && dragging.layer == row.layer
+        {
+            let time = x_to_time(axis, duration, pointer.x);
+            output.project_changed |= state.apply_command(
+                project,
+                &EditorCommand::SetLyricTime {
+                    layer: row.layer,
+                    line_index: dragging.line_index,
+                    time_secs: Some(time),
+                },
+            );
+            output.seek_to = Some(time);
+        } else if axis.contains(pointer) {
+            output.seek_to = Some(x_to_time(axis, duration, pointer.x));
+        }
+    }
+    if response.drag_stopped() {
+        state.dragging_lyric = None;
+    }
+}
+
 fn draw_key_inspector(
     ui: &mut egui::Ui,
     project: &mut Project,
@@ -321,8 +489,12 @@ fn draw_key_inspector(
     duration: f64,
     output: &mut TimelineResponse,
 ) {
+    if let Some(selection) = state.selected_lyric {
+        draw_lyric_inspector(ui, project, state, selection, duration, output);
+        return;
+    }
     let Some(selection) = state.selected_key else {
-        ui.small("◆を選ぶと、時刻・補間・削除を編集できます");
+        ui.small("◆を選ぶと、キーまたは歌詞の時刻を編集できます");
         return;
     };
     let Some((layer_name, key)) = project
@@ -391,6 +563,74 @@ fn draw_key_inspector(
                 property: selection.property,
                 key_index: selection.key_index,
             });
+        }
+    });
+    if let Some(command) = command {
+        output.project_changed |= state.apply_command(project, &command);
+    }
+}
+
+fn draw_lyric_inspector(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    state: &mut EditorState,
+    selection: crate::LyricSelection,
+    duration: f64,
+    output: &mut TimelineResponse,
+) {
+    let Some((layer_name, text, original_time)) = project
+        .layers
+        .iter()
+        .find(|layer| layer.id == selection.layer)
+        .and_then(|layer| match &layer.kind {
+            musicvideo_core::LayerKind::Lyrics(lyrics) => {
+                lyrics.lines.get(selection.line_index).and_then(|line| {
+                    line.time_secs
+                        .map(|time| (layer.name.clone(), line.text.clone(), time))
+                })
+            }
+            _ => None,
+        })
+    else {
+        state.selected_lyric = None;
+        return;
+    };
+    let mut command = None;
+    ui.horizontal(|ui| {
+        let label = if text.is_empty() {
+            "（空行）"
+        } else {
+            &text
+        };
+        ui.label(format!(
+            "選択: {layer_name} / {} 行目 / {label}",
+            selection.line_index + 1
+        ));
+        let mut time = original_time;
+        if ui
+            .add(
+                egui::DragValue::new(&mut time)
+                    .range(0.0..=duration)
+                    .speed(0.01)
+                    .suffix(" 秒"),
+            )
+            .changed()
+        {
+            command = Some(EditorCommand::SetLyricTime {
+                layer: selection.layer,
+                line_index: selection.line_index,
+                time_secs: Some(time),
+            });
+            output.seek_to = Some(time);
+            state.last_lyric_stamp = None;
+        }
+        if ui.button("時刻を未設定に戻す").clicked() {
+            command = Some(EditorCommand::SetLyricTime {
+                layer: selection.layer,
+                line_index: selection.line_index,
+                time_secs: None,
+            });
+            state.last_lyric_stamp = None;
         }
     });
     if let Some(command) = command {
@@ -469,7 +709,7 @@ fn interp_label(interp: Interp) -> &'static str {
 mod tests {
     use super::*;
     use crate::keyframes::{AnimProperty, EditorCommand, apply_editor_command};
-    use musicvideo_core::default_project;
+    use musicvideo_core::{default_project, new_lyrics_layer};
 
     #[test]
     fn waveform_constructor_sanitizes_duration_without_touching_samples() {
@@ -512,5 +752,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tracked_rows(&project).len(), 0);
+    }
+
+    #[test]
+    fn lyrics_have_one_timeline_row_with_only_timed_markers() {
+        let mut project = default_project(10.0);
+        let mut layer = new_lyrics_layer(&project);
+        let musicvideo_core::LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+            unreachable!()
+        };
+        lyrics.lines = vec![
+            musicvideo_core::LyricLine {
+                text: "一".into(),
+                time_secs: Some(1.0),
+            },
+            musicvideo_core::LyricLine {
+                text: "未設定".into(),
+                time_secs: None,
+            },
+            musicvideo_core::LyricLine {
+                text: String::new(),
+                time_secs: Some(2.0),
+            },
+        ];
+        project.layers.push(layer);
+        let rows = lyric_rows(&project);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].markers.len(), 2);
+        assert_eq!(rows[0].markers[1].2, "");
     }
 }

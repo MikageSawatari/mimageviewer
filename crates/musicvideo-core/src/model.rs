@@ -222,6 +222,7 @@ pub enum LayerKind {
     ProgressBar(ProgressBarLayer),
     TimeText(TimeTextLayer),
     Text(TextLayer),
+    Lyrics(LyricsLayer),
 }
 
 fn default_image_zoom() -> Animatable<f32> {
@@ -302,6 +303,23 @@ pub struct TextLayer {
     pub size_px: f32,
     pub align: TextAlign,
     pub fill: Animatable<Fill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LyricsLayer {
+    pub lines: Vec<LyricLine>,
+    pub fade_in_secs: f32,
+    pub fade_out_secs: f32,
+    pub font_key: String,
+    pub size_px: f32,
+    pub align: TextAlign,
+    pub fill: Animatable<Fill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LyricLine {
+    pub text: String,
+    pub time_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

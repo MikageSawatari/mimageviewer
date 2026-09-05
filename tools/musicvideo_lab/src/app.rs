@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, ModulatorCalibration,
-    ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport, Smoothing, SpectrumFrame,
-    SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
-    modulator_calibration_requests, new_image_layer, render_frame,
+    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, LrcParseReport,
+    ModulatorCalibration, ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport,
+    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
+    modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
 };
 use musicvideo_ui::{
-    EditorState, MissingImageNotice, TimelineWaveform, draw_editor, draw_missing_images,
-    draw_preview, draw_timeline,
+    EditorCommand, EditorState, MissingImageNotice, TimelineWaveform, apply_editor_command,
+    draw_editor, draw_missing_images, draw_preview, draw_timeline,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -163,6 +163,15 @@ struct ProjectSavePending {
     rx: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
+struct LrcLoadPending {
+    layer: musicvideo_core::LayerId,
+    rx: mpsc::Receiver<Result<(PathBuf, LrcParseReport), String>>,
+}
+
+struct LrcSavePending {
+    rx: mpsc::Receiver<Result<(PathBuf, usize), String>>,
+}
+
 struct PreviewPending {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<Result<PreviewResult, String>>,
@@ -211,6 +220,8 @@ pub struct MusicVideoLabApp {
     editor_state: EditorState,
     project_load_pending: Option<ProjectLoadPending>,
     project_save_pending: Option<ProjectSavePending>,
+    lrc_load_pending: Option<LrcLoadPending>,
+    lrc_save_pending: Option<LrcSavePending>,
     preview_benchmark_target: Option<usize>,
 }
 
@@ -251,6 +262,8 @@ impl MusicVideoLabApp {
             editor_state: EditorState::default(),
             project_load_pending: None,
             project_save_pending: None,
+            lrc_load_pending: None,
+            lrc_save_pending: None,
             preview_benchmark_target: None,
         }
     }
@@ -930,6 +943,161 @@ impl MusicVideoLabApp {
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
     }
+
+    fn start_lrc_load(
+        &mut self,
+        layer: musicvideo_core::LayerId,
+        path: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        if self.lrc_load_pending.is_some() || self.lrc_save_pending.is_some() {
+            return;
+        }
+        let worker_ctx = ctx.clone();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("musicvideo-lrc-load".to_owned())
+            .spawn(move || {
+                let result = std::fs::read(&worker_path)
+                    .map_err(|error| {
+                        format!("LRC を読み込めません ({}): {error}", worker_path.display())
+                    })
+                    .and_then(|bytes| {
+                        parse_lrc(&bytes)
+                            .map(|report| (worker_path.clone(), report))
+                            .map_err(|error| {
+                                format!("LRC を解釈できません ({}): {error}", worker_path.display())
+                            })
+                    });
+                let _ = tx.send(result);
+                worker_ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.status = format!("LRC を読み込んでいます: {}", path.display());
+                self.lrc_load_pending = Some(LrcLoadPending { layer, rx });
+            }
+            Err(error) => self.status = format!("LRC 読込ワーカーを開始できません: {error}"),
+        }
+    }
+
+    fn start_lrc_save(
+        &mut self,
+        layer: musicvideo_core::LayerId,
+        path: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        if self.lrc_load_pending.is_some() || self.lrc_save_pending.is_some() {
+            return;
+        }
+        let Some(lines) = self
+            .project
+            .layers
+            .iter()
+            .find(|candidate| candidate.id == layer)
+            .and_then(|layer| match &layer.kind {
+                LayerKind::Lyrics(lyrics) => Some(lyrics.lines.clone()),
+                _ => None,
+            })
+        else {
+            self.status = "LRC の書き出し対象が見つかりません".to_owned();
+            return;
+        };
+        let worker_ctx = ctx.clone();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("musicvideo-lrc-save".to_owned())
+            .spawn(move || {
+                let (text, report) = write_lrc(&lines);
+                let result = std::fs::write(&worker_path, text.as_bytes())
+                    .map(|()| (worker_path.clone(), report.skipped_unset_lines))
+                    .map_err(|error| {
+                        format!("LRC を書き出せません ({}): {error}", worker_path.display())
+                    });
+                let _ = tx.send(result);
+                worker_ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.status = format!("LRC を書き出しています: {}", path.display());
+                self.lrc_save_pending = Some(LrcSavePending { rx });
+            }
+            Err(error) => self.status = format!("LRC 書出ワーカーを開始できません: {error}"),
+        }
+    }
+
+    fn poll_lrc(&mut self) {
+        let load_result = self
+            .lrc_load_pending
+            .as_ref()
+            .map(|pending| (pending.layer, pending.rx.try_recv()));
+        match load_result {
+            Some((layer, Ok(Ok((path, report))))) => {
+                self.lrc_load_pending = None;
+                let notice = format!(
+                    "{} として読込 / {} 行 / 読み飛ばし: メタ情報 {}、未対応 {}、行内時刻 {} / offset {:+} ms",
+                    report.encoding.label(),
+                    report.lines.len(),
+                    report.skipped_metadata_tags,
+                    report.skipped_unsupported_tags,
+                    report.inline_time_tags_removed,
+                    report.offset_millis,
+                );
+                match apply_editor_command(
+                    &mut self.project,
+                    &EditorCommand::ReplaceLyrics {
+                        layer,
+                        lines: report.lines,
+                    },
+                ) {
+                    Ok(result) => {
+                        self.editor_state.set_lyrics_notice(layer, notice.clone());
+                        self.status =
+                            format!("LRC を読み込みました ({}): {notice}", path.display());
+                        if result.changed {
+                            self.schedule_project_edit_preview();
+                        }
+                    }
+                    Err(error) => self.status = format!("LRC を反映できません: {error}"),
+                }
+            }
+            Some((_, Ok(Err(error)))) => {
+                self.lrc_load_pending = None;
+                self.status = error;
+            }
+            Some((_, Err(mpsc::TryRecvError::Disconnected))) => {
+                self.lrc_load_pending = None;
+                self.status = "LRC 読込ワーカーが終了しました".to_owned();
+            }
+            Some((_, Err(mpsc::TryRecvError::Empty))) | None => {}
+        }
+
+        let save_result = self
+            .lrc_save_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv());
+        match save_result {
+            Some(Ok(Ok((path, skipped)))) => {
+                self.lrc_save_pending = None;
+                self.status = format!(
+                    "LRC を UTF-8 で書き出しました: {} (時刻未設定 {} 行は出力しませんでした)",
+                    path.display(),
+                    skipped
+                );
+            }
+            Some(Ok(Err(error))) => {
+                self.lrc_save_pending = None;
+                self.status = error;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.lrc_save_pending = None;
+                self.status = "LRC 書出ワーカーが終了しました".to_owned();
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
 }
 
 fn load_project_bundle(path: PathBuf, cancel: &AtomicBool) -> Result<LoadedProject, String> {
@@ -998,6 +1166,17 @@ fn next_image_id(project: &Project) -> ImageId {
     unreachable!("u64 image ID space is exhausted")
 }
 
+fn ensure_lrc_extension(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lrc"))
+    {
+        path.set_extension("lrc");
+    }
+    path
+}
+
 fn image_layer_insertion_index(project: &Project) -> usize {
     project
         .layers
@@ -1055,6 +1234,7 @@ impl eframe::App for MusicVideoLabApp {
         let mut displayed_perf = self.poll_preview(ctx);
         self.poll_export();
         self.poll_projects();
+        self.poll_lrc();
 
         let audio_sync_started = Instant::now();
         let playback = self
@@ -1071,6 +1251,8 @@ impl eframe::App for MusicVideoLabApp {
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
         let mut replacement_request = None;
         let mut add_image_layer_requested = false;
+        let mut import_lrc_requested = None;
+        let mut export_lrc_requested = None;
         let mut reset_preview_perf = false;
 
         let egui_layout_started = Instant::now();
@@ -1081,7 +1263,9 @@ impl eframe::App for MusicVideoLabApp {
                         self.project_load_pending.is_none()
                             && self.export_pending.is_none()
                             && self.audio_pending.is_none()
-                            && self.image_pending.is_none(),
+                            && self.image_pending.is_none()
+                            && self.lrc_load_pending.is_none()
+                            && self.lrc_save_pending.is_none(),
                         egui::Button::new("プロジェクトを開く"),
                     )
                     .clicked()
@@ -1334,10 +1518,28 @@ impl eframe::App for MusicVideoLabApp {
                     })
                     .inner;
                 add_image_layer_requested = response.add_image_layer_requested;
+                import_lrc_requested = response.import_lrc_requested;
+                export_lrc_requested = response.export_lrc_requested;
                 if response.project_changed {
                     self.schedule_project_edit_preview();
                 }
             });
+
+        if let Some(layer) = import_lrc_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("時間入り歌詞", &["lrc", "txt"])
+                .pick_file()
+        {
+            self.start_lrc_load(layer, path, ctx);
+        }
+        if let Some(layer) = export_lrc_requested
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("時間入り歌詞", &["lrc"])
+                .set_file_name("lyrics.lrc")
+                .save_file()
+        {
+            self.start_lrc_save(layer, ensure_lrc_extension(path), ctx);
+        }
 
         if add_image_layer_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -1388,6 +1590,8 @@ impl eframe::App for MusicVideoLabApp {
             || self.export_pending.is_some()
             || self.project_load_pending.is_some()
             || self.project_save_pending.is_some()
+            || self.lrc_load_pending.is_some()
+            || self.lrc_save_pending.is_some()
             || self.calibration_pending.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(50));

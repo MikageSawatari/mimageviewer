@@ -1,5 +1,6 @@
 use music_core::{KeyboardFrame, MivSpectrumFrame, SPECTRUM_NOTE_MIN_MIDI};
 
+use crate::lyrics::active_lyric_at;
 use crate::model::{
     Fill, Fit, Glow, GradientStops, ImageId, LayerKind, ModulationTarget, ModulatorValue,
     MusicColorMode, NormRect, Project, Rgba8, SpectrumShape, TextAlign, TimeFormat,
@@ -179,6 +180,19 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             }
         }
         rect = scale_rect_from_center(rect, scale);
+        let active_lyric = match &layer.kind {
+            LayerKind::Lyrics(lyrics) => {
+                let Some(active) = active_lyric_at(lyrics, time) else {
+                    continue;
+                };
+                if active.text.is_empty() {
+                    continue;
+                }
+                opacity *= active.opacity;
+                Some(active)
+            }
+            _ => None,
+        };
         let opacity = opacity.clamp(0.0, 1.0);
         if opacity <= 0.0 {
             continue;
@@ -244,6 +258,16 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             },
             LayerKind::Text(layer) => SceneItemKind::Text {
                 text: layer.text.clone(),
+                font_key: layer.font_key.clone(),
+                size_px: layer.size_px.max(1.0),
+                align: layer.align,
+                fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
+            },
+            LayerKind::Lyrics(layer) => SceneItemKind::Text {
+                text: active_lyric
+                    .expect("lyrics without an active line were skipped")
+                    .text
+                    .to_owned(),
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
@@ -598,5 +622,66 @@ mod tests {
             panic!("expected image")
         };
         assert!((zoom - 1.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn lyrics_use_the_existing_text_item_and_common_properties() {
+        let mut project = default_project(10.0);
+        let mut layer = crate::new_lyrics_layer(&project);
+        let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+            unreachable!()
+        };
+        lyrics.lines = vec![
+            crate::LyricLine {
+                text: "前".to_owned(),
+                time_secs: Some(1.0),
+            },
+            crate::LyricLine {
+                text: "日本語の歌詞".to_owned(),
+                time_secs: Some(2.0),
+            },
+        ];
+        lyrics.fill = crate::Animatable::Const(Fill::Solid(Rgba8::new(64, 64, 64, 255)));
+        layer.opacity = crate::Animatable::Const(0.8);
+        layer.rotation = crate::Animatable::Const(12.0);
+        layer.glow = crate::Animatable::Const(Some(Glow {
+            color: Rgba8::WHITE,
+            radius_px: 8.0,
+            spread_px: 1.0,
+        }));
+        layer.modulations = vec![
+            ModulationBinding {
+                target: ModulationTarget::Scale,
+                modulator: ModulatorId(7),
+                amount: 0.2,
+                curve: ModulationCurve::Linear,
+            },
+            ModulationBinding {
+                target: ModulationTarget::FillBrightness,
+                modulator: ModulatorId(7),
+                amount: 0.2,
+                curve: ModulationCurve::Linear,
+            },
+        ];
+        let base_rect = layer.rect.evaluate(0.0);
+        project.layers.push(layer);
+
+        let mut spectrum = SpectrumFrame::default();
+        spectrum.modulators.push(ModulatorValue {
+            id: ModulatorId(7),
+            value: 0.5,
+        });
+        let scene = evaluate(&project, 2.06, &spectrum);
+        assert_eq!(scene, evaluate(&project, 2.06, &spectrum));
+        let item = scene.items.last().unwrap();
+        assert!((item.opacity - 0.4).abs() < 1.0e-5);
+        assert!((item.rect.width - base_rect.width * 1.1).abs() < 1.0e-6);
+        assert_eq!(item.rotation_deg, 12.0);
+        assert_eq!(item.glow.as_ref().unwrap().radius_px, 8.0);
+        let SceneItemKind::Text { text, fill, .. } = &item.kind else {
+            panic!("lyrics must share the text rendering path");
+        };
+        assert_eq!(text, "日本語の歌詞");
+        assert_eq!(*fill, Fill::Solid(Rgba8::new(90, 90, 90, 255)));
     }
 }

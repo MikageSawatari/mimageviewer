@@ -49,6 +49,22 @@ fn main() {
         println!("サンプル画像を書き出しました: {}", output.display());
         return;
     }
+    if command.as_deref() == Some("--lyrics-sample") {
+        let output = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/musicvideo-lyrics-sample.png"));
+        let Some(font) = project::load_default_font() else {
+            eprintln!("歌詞サンプルに必要な Windows 日本語フォントが見つかりません");
+            std::process::exit(1);
+        };
+        if let Err(error) = export::render_lyrics_sample(&output, &font) {
+            eprintln!("歌詞サンプル描画に失敗しました: {error}");
+            std::process::exit(1);
+        }
+        println!("歌詞サンプル画像を書き出しました: {}", output.display());
+        return;
+    }
     if command.as_deref() == Some("--preview-benchmark") {
         let frames = args
             .next()

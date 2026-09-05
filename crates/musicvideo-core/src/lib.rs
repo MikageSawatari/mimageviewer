@@ -7,6 +7,7 @@
 
 pub mod anim;
 pub mod assets;
+pub mod lyrics;
 pub mod model;
 pub mod preset;
 pub mod raster;
@@ -18,20 +19,24 @@ pub use anim::{Interpolate, easing_amount, evaluate_track};
 pub use assets::{
     AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,
 };
+pub use lyrics::{
+    ActiveLyric, LrcEncoding, LrcParseError, LrcParseReport, LrcWriteReport, active_lyric_at,
+    parse_lrc, write_lrc,
+};
 pub use model::{
     Animatable, AudioRef, BandCalibration, BandRange, BandWeighting, Fill, Fit, Glow, GradientStop,
     GradientStops, GradientStopsError, ImageId, ImageRef, Interp, Keyframe, Layer, LayerId,
-    LayerKind, ModulationBinding, ModulationCurve, ModulationTarget, Modulator, ModulatorId,
-    ModulatorSource, ModulatorValue, MusicColorMode, NormRect, Output, PitchKeyboardLayer,
-    ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign,
-    TextLayer, TimeFormat, TimeTextLayer, Track, TrackError,
+    LayerKind, LyricLine, LyricsLayer, ModulationBinding, ModulationCurve, ModulationTarget,
+    Modulator, ModulatorId, ModulatorSource, ModulatorValue, MusicColorMode, NormRect, Output,
+    PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
+    SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer, Track, TrackError,
 };
 pub use preset::{
     BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
     DEFAULT_BACKGROUND_IMAGE_ID, DEFAULT_FONT_KEY, DEFAULT_OUTPUT, DEFAULT_SPECTRUM_BANDS,
     KICK_ATTACK_SECS, KICK_CALIBRATION_HIGH_PERCENTILE, KICK_CALIBRATION_LOW_PERCENTILE,
     KICK_RELEASE_SECS, KICK_THRESHOLD, MIV_SPECTRUM_BANDS, PROJECT_VERSION, default_project,
-    new_band_energy_modulator, new_image_layer, new_linear_spectrum_layer,
+    new_band_energy_modulator, new_image_layer, new_linear_spectrum_layer, new_lyrics_layer,
     new_miv_spectrum_keyboard_layers, new_miv_spectrum_layer, new_pitch_keyboard_layer,
     new_progress_bar_layer, new_radial_spectrum_layer, new_solid_layer, new_text_layer,
     new_time_text_layer,

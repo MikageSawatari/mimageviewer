@@ -15,6 +15,7 @@ path = "src/lib.rs"
 comic-core = { path = "../comic-core" }
 # スペクトラム解析は music-core をそのまま呼ぶ (D5: 既定は半音バンド + 等ラウドネス重み)。
 music-core = { path = "../music-core" }
+encoding_rs = "0.8"
 # フレーム合成のレイヤ内並列。
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

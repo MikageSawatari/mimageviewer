@@ -195,8 +195,9 @@ mod tests {
     use super::*;
     use musicvideo_core::{
         Animatable, AudioRef, BandCalibration, BandRange, BandWeighting, ImageId, ImageRef, Interp,
-        Keyframe, LayerKind, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource,
-        Smoothing, Track, default_project, new_band_energy_modulator, new_image_layer,
+        Keyframe, LayerKind, LyricLine, ModulationBinding, ModulationCurve, ModulationTarget,
+        ModulatorSource, Smoothing, Track, default_project, new_band_energy_modulator,
+        new_image_layer, new_lyrics_layer,
     };
 
     #[test]
@@ -381,6 +382,48 @@ mod tests {
             restored.layers[0].modulations,
             project.layers[0].modulations
         );
+    }
+
+    #[test]
+    fn lyrics_round_trip_preserves_unset_empty_and_duplicate_times() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("lyrics.mivmv.json");
+        let mut project = default_project(12.0);
+        let mut layer = new_lyrics_layer(&project);
+        let LayerKind::Lyrics(lyrics) = &mut layer.kind else {
+            unreachable!()
+        };
+        lyrics.lines = vec![
+            LyricLine {
+                text: "未設定".into(),
+                time_secs: None,
+            },
+            LyricLine {
+                text: String::new(),
+                time_secs: Some(2.0),
+            },
+            LyricLine {
+                text: "同時の前".into(),
+                time_secs: Some(4.0),
+            },
+            LyricLine {
+                text: "同時の後".into(),
+                time_secs: Some(4.0),
+            },
+        ];
+        project.layers.push(layer);
+
+        save_project(&project_path, &project).unwrap();
+        let restored = load_project(&project_path).unwrap();
+        assert_eq!(restored, project);
+        let LayerKind::Lyrics(lyrics) = &restored.layers.last().unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(lyrics.lines[0].time_secs, None);
+        assert_eq!(lyrics.lines[1].text, "");
+        assert_eq!(lyrics.lines[2].time_secs, lyrics.lines[3].time_secs);
+        assert_eq!(lyrics.lines[2].text, "同時の前");
+        assert_eq!(lyrics.lines[3].text, "同時の後");
     }
 
     #[test]
