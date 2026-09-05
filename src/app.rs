@@ -11395,7 +11395,8 @@ pub struct App {
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
     pub(crate) preferences_right_panel_scroll_sequence: u64,
     /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
-    pub(crate) preferences_requested_page: Option<crate::ui_dialogs::preferences::PreferencesPage>,
+    pub(crate) preferences_requested_page:
+        Option<crate::ui_dialogs::preferences::PreferencesOpenRequest>,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
     pub(crate) show_preferences_discard_confirm: bool,

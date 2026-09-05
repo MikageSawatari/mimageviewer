@@ -153,6 +153,45 @@ pub(crate) enum PreferencesPage {
     Developer,
 }
 
+/// 環境設定を「どこを開くか」まで含めて要求する。
+///
+/// ページだけを指す場合と、ページ内の特定項目まで指す場合がある。呼び出し側が
+/// `PreferencesPage` と anchor を別々に持つと、ページを移した項目への導線が黙って
+/// 別ページへ着地する。要求を 1 つの値にまとめ、対応表は下の定数だけが持つ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreferencesOpenRequest {
+    pub(crate) page: PreferencesPage,
+    /// 検索索引の anchor。指定するとその項目までスクロールし、一時的に強調する。
+    /// ページ全体が答えになる導線 (同名ファイル設定など) では `None` にする。
+    pub(crate) anchor: Option<&'static str>,
+}
+
+impl PreferencesOpenRequest {
+    pub(crate) const fn page(page: PreferencesPage) -> Self {
+        Self { page, anchor: None }
+    }
+
+    const fn anchored(page: PreferencesPage, anchor: &'static str) -> Self {
+        Self {
+            page,
+            anchor: Some(anchor),
+        }
+    }
+
+    /// 同名ファイル処理。ページ内の 4 項目すべてが同名の設定なので、先頭へ寄せずに
+    /// ページごと開く。
+    pub(crate) const DUPLICATE_FILES: Self = Self::page(PreferencesPage::DuplicateFiles);
+
+    /// 変換対象書庫の扱い。キャッシュページの下の方にあり、ページを開いただけでは
+    /// 画面に入らない (2026-09-05 利用者報告) ので anchor まで指定する。
+    pub(crate) const ARCHIVE_HANDLING: Self =
+        Self::anchored(PreferencesPage::Cache, "cache/archive-handling");
+
+    /// 隠しファイル・フォルダの表示。
+    pub(crate) const HIDDEN_FILES: Self =
+        Self::anchored(PreferencesPage::Folder, "folder/hidden-files");
+}
+
 impl PreferencesPage {
     #[cfg(test)]
     const ALL: &'static [Self] = &[
@@ -1791,7 +1830,11 @@ fn prepare_preferences_settings_for_commit(
 
 impl App {
     pub(crate) fn open_preferences_page(&mut self, page: PreferencesPage) {
-        self.preferences_requested_page = Some(page);
+        self.open_preferences_request(PreferencesOpenRequest::page(page));
+    }
+
+    pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        self.preferences_requested_page = Some(request);
         self.show_preferences = true;
     }
 
@@ -1936,12 +1979,19 @@ impl App {
         if let Some(requested) = self.preferences_requested_page.take() {
             if let Some(state) = self.pref_state.as_mut() {
                 let previous = state.selected;
-                state.selected = requested;
+                state.selected = requested.page;
                 advance_preferences_scroll_generation(
                     previous,
                     state.selected,
                     &mut state.right_panel_scroll_generation,
                 );
+                // 項目まで指定された要求は、検索結果から飛んだときと同じ
+                // スクロール + 一時強調を通す。ここで別の見せ方を作らない。
+                if let Some(anchor) = requested.anchor {
+                    state.pending_anchor = Some(anchor);
+                    state.highlight = None;
+                    state.showing_results = false;
+                }
             }
         }
 

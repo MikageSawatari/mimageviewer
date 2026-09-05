@@ -1437,7 +1437,7 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
 fn draw_omitted_entries_chip(
     ui: &mut egui::Ui,
     counts: crate::app::OmittedFolderEntryCounts,
-) -> Option<crate::ui_dialogs::preferences::PreferencesPage> {
+) -> Option<crate::ui_dialogs::preferences::PreferencesOpenRequest> {
     let Some(label) = omitted_entries_chip_label(counts) else {
         return None;
     };
@@ -1458,7 +1458,7 @@ fn draw_omitted_entries_chip(
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
             open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesPage::DuplicateFiles);
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
             ui.close();
         }
         if counts.ignored_archive > 0 {
@@ -1467,7 +1467,8 @@ fn draw_omitted_entries_chip(
                 .link(format!("「{archive_labels} の処理」を設定する"))
                 .clicked()
             {
-                open_preferences = Some(crate::ui_dialogs::preferences::PreferencesPage::Cache);
+                open_preferences =
+                    Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
                 ui.close();
             }
         }
@@ -1476,7 +1477,8 @@ fn draw_omitted_entries_chip(
                 .link("「隠しファイル・フォルダを表示する」を設定する")
                 .clicked()
         {
-            open_preferences = Some(crate::ui_dialogs::preferences::PreferencesPage::Folder);
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::HIDDEN_FILES);
             ui.close();
         }
     });
@@ -12204,8 +12206,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 result
             })
             .inner;
-        if let Some(page) = open_preferences {
-            self.open_preferences_page(page);
+        if let Some(request) = open_preferences {
+            self.open_preferences_request(request);
         }
         result
     }
@@ -16920,7 +16922,7 @@ mod facet_filter_bar_tests {
     fn assert_omitted_settings_link_route(
         counts: crate::app::OmittedFolderEntryCounts,
         link_label: &str,
-        expected: crate::ui_dialogs::preferences::PreferencesPage,
+        expected: crate::ui_dialogs::preferences::PreferencesOpenRequest,
     ) {
         use egui_kittest::{Harness, kittest::Queryable};
         use std::sync::{Arc, Mutex};
@@ -16932,8 +16934,8 @@ mod facet_filter_bar_tests {
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if let Some(page) = draw_omitted_entries_chip(ui, counts) {
-                        *opened_for_ui.lock().unwrap() = Some(page);
+                    if let Some(request) = draw_omitted_entries_chip(ui, counts) {
+                        *opened_for_ui.lock().unwrap() = Some(request);
                     }
                 });
             });
@@ -16948,7 +16950,7 @@ mod facet_filter_bar_tests {
 
     #[test]
     fn omitted_chip_routes_each_breakdown_link_to_its_settings_page() {
-        use crate::ui_dialogs::preferences::PreferencesPage;
+        use crate::ui_dialogs::preferences::PreferencesOpenRequest;
 
         assert_omitted_settings_link_route(
             crate::app::OmittedFolderEntryCounts {
@@ -16959,7 +16961,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             "同名ファイル設定を開く",
-            PreferencesPage::DuplicateFiles,
+            PreferencesOpenRequest::DUPLICATE_FILES,
         );
         let archive_link = format!(
             "「{} の処理」を設定する",
@@ -16974,7 +16976,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             &archive_link,
-            PreferencesPage::Cache,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
         );
         assert_omitted_settings_link_route(
             crate::app::OmittedFolderEntryCounts {
@@ -16985,7 +16987,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             "「隠しファイル・フォルダを表示する」を設定する",
-            PreferencesPage::Folder,
+            PreferencesOpenRequest::HIDDEN_FILES,
         );
     }
 

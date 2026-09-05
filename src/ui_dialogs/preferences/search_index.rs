@@ -1026,6 +1026,47 @@ mod tests {
         );
     }
 
+    /// `PreferencesOpenRequest` の定数は、ページと anchor を手で組にして持っている。
+    /// 項目を別ページへ移したときに定数だけ古くなると、導線が**黙って別ページへ着地する**
+    /// (押した利用者には「設定が見つからない」としか見えない)。索引を正本として組を照合する。
+    #[test]
+    fn preferences_open_request_constants_point_at_indexed_anchors() {
+        use super::super::{PreferencesOpenRequest, PreferencesPage};
+
+        for request in [
+            PreferencesOpenRequest::DUPLICATE_FILES,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
+            PreferencesOpenRequest::HIDDEN_FILES,
+        ] {
+            let Some(anchor) = request.anchor else {
+                // ページ全体が答えになる導線。ページが実在することだけ確かめる。
+                assert!(
+                    PREF_SEARCH_INDEX
+                        .iter()
+                        .any(|entry| entry.page == request.page),
+                    "{:?} に索引項目が 1 つもありません",
+                    request.page
+                );
+                continue;
+            };
+            let entry = PREF_SEARCH_INDEX
+                .iter()
+                .find(|entry| entry.anchor == anchor)
+                .unwrap_or_else(|| panic!("anchor `{anchor}` が索引にありません"));
+            assert_eq!(
+                entry.page, request.page,
+                "anchor `{anchor}` は {:?} にありますが、定数は {:?} を指しています",
+                entry.page, request.page
+            );
+        }
+
+        // 上のループが空回りしていないことの保険 (variant を消したときに気付ける)。
+        assert_eq!(
+            PreferencesOpenRequest::ARCHIVE_HANDLING.page,
+            PreferencesPage::Cache
+        );
+    }
+
     #[test]
     fn index_entries_are_unique_valid_and_placed_in_pages() {
         let mut anchors = HashSet::new();
