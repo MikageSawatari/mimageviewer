@@ -402,6 +402,7 @@ rhai = "1"
 # (ReDoS 不可) なのでユーザー入力パターンでも安全。tantivy 等が間接依存しているが
 # スクリプトヘルパーで直接使うため明示依存にする。
 regex = "1"
+mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
