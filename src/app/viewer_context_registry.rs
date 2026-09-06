@@ -3683,7 +3683,7 @@ mod tests {
     fn favorite_view_state_is_isolated_by_bundle_swap() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let a = crate::settings::FavoriteEntry::new(
             "a".to_owned(),
             std::path::PathBuf::from(r"C:\favorite-a"),
@@ -3693,30 +3693,30 @@ mod tests {
             std::path::PathBuf::from(r"C:\favorite-b"),
         );
         let mut a_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
-        a_state.thumb_px = 160;
+        a_state.grid_cols = 4;
         let mut b_state = a_state.clone();
-        b_state.thumb_px = 260;
+        b_state.grid_cols = 7;
         app.favorite_view_states.insert(a.id, a_state);
         app.favorite_view_states.insert(b.id, b_state);
         app.settings.favorites.extend([a.clone(), b.clone()]);
         app.current_folder = Some(a.path.clone());
         app.transition_favorite_view_for_path(Some(&a.path));
-        app.settings.thumb_px = 170;
+        app.settings.grid_cols = 9;
 
         let mut parked = ViewerContextBundle::empty();
         parked.current_folder = Some(b.path.clone());
         app.swap_viewer_context_bundle(&mut parked);
-        assert_eq!(app.settings.thumb_px, 260);
-        assert_eq!(app.favorite_view_states[&a.id].thumb_px, 170);
+        assert_eq!(app.settings.grid_cols, 7);
+        assert_eq!(app.favorite_view_states[&a.id].grid_cols, 9);
 
-        app.settings.thumb_px = 270;
+        app.settings.grid_cols = 10;
         app.swap_viewer_context_bundle(&mut parked);
-        assert_eq!(app.settings.thumb_px, 170);
-        assert_eq!(app.favorite_view_states[&b.id].thumb_px, 270);
+        assert_eq!(app.settings.grid_cols, 9);
+        assert_eq!(app.favorite_view_states[&b.id].grid_cols, 10);
 
         app.transition_favorite_view_for_path(Some(std::path::Path::new(r"C:\outside")));
         assert_eq!(
-            app.settings.thumb_px, 100,
+            app.settings.grid_cols, 3,
             "共通状態はどちらの窓にも上書きされない"
         );
     }

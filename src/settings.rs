@@ -3486,7 +3486,9 @@ impl PostFilterDowngradeStash {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FavoriteViewState {
     pub grid_view_mode: GridViewMode,
-    pub thumb_px: u32,
+    /// 画面上の列数。利用者から見た「サムネイルサイズ」はこれで決まる。
+    /// デコード解像度 (`Settings::thumb_px`) は画質の設定なので、全場所で共通のまま。
+    pub grid_cols: usize,
     pub thumb_aspect: ThumbAspect,
     pub thumb_aspect_auto: bool,
     pub grid_display_order: GridDisplayOrder,
@@ -3499,7 +3501,7 @@ impl FavoriteViewState {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
             grid_view_mode: settings.grid_view_mode,
-            thumb_px: settings.thumb_px,
+            grid_cols: settings.grid_cols,
             thumb_aspect: settings.thumb_aspect,
             thumb_aspect_auto: settings.thumb_aspect_auto,
             grid_display_order: settings.grid_display_order.clone(),
@@ -3511,7 +3513,7 @@ impl FavoriteViewState {
 
     pub(crate) fn apply_to_settings(&self, settings: &mut Settings) {
         settings.grid_view_mode = self.grid_view_mode;
-        settings.thumb_px = self.thumb_px;
+        settings.grid_cols = self.grid_cols;
         settings.thumb_aspect = self.thumb_aspect;
         settings.thumb_aspect_auto = self.thumb_aspect_auto;
         settings.grid_display_order = self.grid_display_order.clone();
@@ -14271,7 +14273,7 @@ mod tests {
             let mut settings = Settings::default();
             settings.remember_favorite_view_state = true;
             settings.grid_view_mode = GridViewMode::Thumbnail;
-            settings.thumb_px = 111;
+            settings.grid_cols = 3;
             settings.thumb_aspect = ThumbAspect::Landscape16x9;
             settings.thumb_aspect_auto = false;
             settings.sort_order = SortOrder::FileName;
@@ -14281,7 +14283,7 @@ mod tests {
 
             let mut favorite = common.clone();
             favorite.grid_view_mode = GridViewMode::Details;
-            favorite.thumb_px = 333;
+            favorite.grid_cols = 7;
             favorite.thumb_aspect = ThumbAspect::Portrait2x3;
             favorite.thumb_aspect_auto = true;
             favorite
@@ -14293,9 +14295,9 @@ mod tests {
             settings.apply_favorite_view_overlay(Uuid::new_v4(), &favorite);
 
             // お気に入り内の連続操作後を模す。save 後も実行中の有効値は変えない。
-            settings.thumb_px = 350;
+            settings.grid_cols = 9;
             assert!(settings.save_checked());
-            assert_eq!(settings.thumb_px, 350);
+            assert_eq!(settings.grid_cols, 9);
             assert_eq!(settings.grid_view_mode, GridViewMode::Details);
 
             reset_backup_state_for_test();

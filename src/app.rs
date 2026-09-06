@@ -64173,6 +64173,10 @@ impl App {
             self.apply_grid_view_mode_runtime(current.grid_view_mode);
         }
 
+        // 列数はセルの大きさそのもので、グリッドは毎フレーム `settings.grid_cols` から
+        // 組み直す。通常の列数変更 (`change_grid_cols_by` / メニュー) も設定を書くだけ
+        // なので、ここでも再構築や scroll 補正は足さない。
+
         if previous.thumb_aspect != current.thumb_aspect
             || previous.thumb_aspect_auto != current.thumb_aspect_auto
         {
@@ -74086,9 +74090,9 @@ mod favorite_view_state_tests {
         panic!("current view order refresh did not finish");
     }
 
-    fn state(thumb_px: u32, sort_order: SortOrder) -> FavoriteViewState {
+    fn state(grid_cols: usize, sort_order: SortOrder) -> FavoriteViewState {
         let mut settings = crate::settings::Settings::default();
-        settings.thumb_px = thumb_px;
+        settings.grid_cols = grid_cols;
         settings.sort_order = sort_order;
         FavoriteViewState::from_settings(&settings)
     }
@@ -74097,38 +74101,38 @@ mod favorite_view_state_tests {
     fn resolves_siblings_outside_and_deepest_nested_favorite() {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\library"));
         let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\library\comic"));
         let video = FavoriteEntry::new("video".to_owned(), PathBuf::from(r"C:\video"));
         app.favorite_view_states
-            .insert(outer.id, state(160, SortOrder::DateAsc));
+            .insert(outer.id, state(4, SortOrder::DateAsc));
         app.favorite_view_states
-            .insert(inner.id, state(280, SortOrder::Numeric));
+            .insert(inner.id, state(8, SortOrder::Numeric));
         app.favorite_view_states
-            .insert(video.id, state(80, SortOrder::DateDesc));
+            .insert(video.id, state(2, SortOrder::DateDesc));
         app.settings.favorites.extend([outer, inner, video]);
 
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\photo")));
-        assert_eq!(app.settings.thumb_px, 160);
+        assert_eq!(app.settings.grid_cols, 4);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
-        assert_eq!(app.settings.thumb_px, 80);
+        assert_eq!(app.settings.grid_cols, 2);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\comic\book")));
-        assert_eq!(app.settings.thumb_px, 280);
+        assert_eq!(app.settings.grid_cols, 8);
         assert_eq!(app.settings.sort_order, SortOrder::Numeric);
 
         app.settings.favorites[2].name = "moved video".to_owned();
         app.settings.favorites[2].path = PathBuf::from(r"C:\moved-video");
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
         assert_eq!(
-            app.settings.thumb_px, 100,
+            app.settings.grid_cols, 3,
             "旧パスには UUID の記録を適用しない"
         );
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\moved-video\clips")));
         assert_eq!(
-            app.settings.thumb_px, 80,
+            app.settings.grid_cols, 2,
             "名称・パス変更後も UUID の記録を使う"
         );
     }
@@ -74138,7 +74142,7 @@ mod favorite_view_state_tests {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
         app.settings.grid_view_mode = GridViewMode::Details;
-        app.settings.thumb_px = 190;
+        app.settings.grid_cols = 5;
         app.settings.sort_order = SortOrder::DateAsc;
         let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
         let id = favorite.id;
@@ -74148,26 +74152,26 @@ mod favorite_view_state_tests {
             Some(Path::new(r"C:\fav\child")),
             std::time::Instant::now(),
         );
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 190);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 5);
         assert_eq!(
             app.favorite_view_states[&id].grid_view_mode,
             GridViewMode::Details
         );
 
-        app.settings.thumb_px = 240;
+        app.settings.grid_cols = 6;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 240);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 6);
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
-        assert_eq!(app.settings.thumb_px, 190, "共通値へ戻る");
+        assert_eq!(app.settings.grid_cols, 5, "共通値へ戻る");
     }
 
     #[test]
     fn preferences_standard_update_does_not_feed_back_into_the_active_favorite() {
         let mut app = setup_app_for_test();
         let id = uuid::Uuid::new_v4();
-        let common = state(100, SortOrder::FileName);
-        let favorite = state(180, SortOrder::DateDesc);
-        let edited_standard = state(240, SortOrder::Numeric);
+        let common = state(3, SortOrder::FileName);
+        let favorite = state(5, SortOrder::DateDesc);
+        let edited_standard = state(6, SortOrder::Numeric);
 
         app.settings.remember_favorite_view_state = true;
         common.apply_to_settings(&mut app.settings);
@@ -74197,9 +74201,9 @@ mod favorite_view_state_tests {
                 .is_none()
         );
 
-        app.settings.thumb_px = 260;
+        app.settings.grid_cols = 7;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 260);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 7);
         assert!(
             app.favorite_view_writes
                 .next_due_in_at(std::time::Instant::now())
@@ -74213,48 +74217,48 @@ mod favorite_view_state_tests {
         let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
         let id = favorite.id;
         app.settings.favorites.push(favorite);
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         app.favorite_view_states
-            .insert(id, state(250, SortOrder::DateDesc));
+            .insert(id, state(10, SortOrder::DateDesc));
 
         app.transition_favorite_view_for_path(Some(Path::new(r"C:\fav")));
-        assert_eq!(app.settings.thumb_px, 100);
-        app.settings.thumb_px = 120;
+        assert_eq!(app.settings.grid_cols, 3);
+        app.settings.grid_cols = 9;
         app.capture_active_favorite_view_change_at(std::time::Instant::now());
-        assert_eq!(app.favorite_view_states[&id].thumb_px, 250);
+        assert_eq!(app.favorite_view_states[&id].grid_cols, 10);
     }
 
     #[test]
     fn reset_falls_back_to_outer_then_common_and_clear_removes_all_rows() {
         let mut app = setup_app_for_test();
         app.settings.remember_favorite_view_state = true;
-        app.settings.thumb_px = 100;
+        app.settings.grid_cols = 3;
         let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\fav"));
         let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\fav\inner"));
         app.favorite_view_states
-            .insert(outer.id, state(160, SortOrder::DateAsc));
+            .insert(outer.id, state(4, SortOrder::DateAsc));
         app.favorite_view_states
-            .insert(inner.id, state(260, SortOrder::DateDesc));
+            .insert(inner.id, state(7, SortOrder::DateDesc));
         app.settings
             .favorites
             .extend([outer.clone(), inner.clone()]);
         app.current_folder = Some(PathBuf::from(r"C:\fav\inner"));
         let current = app.current_folder.clone();
         app.transition_favorite_view_for_path(current.as_deref());
-        assert_eq!(app.settings.thumb_px, 260);
+        assert_eq!(app.settings.grid_cols, 7);
 
         app.reset_favorite_view_state(inner.id);
-        assert_eq!(app.settings.thumb_px, 160);
+        assert_eq!(app.settings.grid_cols, 4);
         app.reset_favorite_view_state(outer.id);
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
 
         app.favorite_view_states
-            .insert(outer.id, state(170, SortOrder::Numeric));
+            .insert(outer.id, state(9, SortOrder::Numeric));
         app.favorite_view_states
-            .insert(inner.id, state(270, SortOrder::Numeric));
+            .insert(inner.id, state(10, SortOrder::Numeric));
         assert_eq!(app.clear_all_favorite_view_states(), 2);
         assert!(app.favorite_view_states.is_empty());
-        assert_eq!(app.settings.thumb_px, 100);
+        assert_eq!(app.settings.grid_cols, 3);
     }
 
     #[test]
@@ -74359,7 +74363,7 @@ mod favorite_view_state_tests {
     }
 
     #[test]
-    fn reset_projects_layout_fields_without_rebuilding_for_cache_or_book_defaults() {
+    fn reset_projects_layout_fields_and_leaves_the_common_quality_alone() {
         use crate::settings::{ReadingFlow, SpreadMode, ThumbAspect};
 
         let mut app = setup_app_for_test();
@@ -74367,6 +74371,8 @@ mod favorite_view_state_tests {
         write_sort_fixture(&folder);
         app.settings.remember_favorite_view_state = true;
         app.settings.grid_view_mode = GridViewMode::Thumbnail;
+        app.settings.grid_cols = 3;
+        // 画質は記憶項目ではないので、お気に入りの出入りで動いてはならない。
         app.settings.thumb_px = 512;
         app.settings.thumb_aspect = ThumbAspect::Square;
         app.settings.thumb_aspect_auto = true;
@@ -74377,7 +74383,7 @@ mod favorite_view_state_tests {
         let id = favorite.id;
         let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
         favorite_state.grid_view_mode = GridViewMode::Details;
-        favorite_state.thumb_px = 128;
+        favorite_state.grid_cols = 7;
         favorite_state.thumb_aspect = ThumbAspect::Portrait3x4;
         favorite_state.thumb_aspect_auto = false;
         favorite_state.default_spread_mode = SpreadMode::Rtl;
@@ -74387,6 +74393,8 @@ mod favorite_view_state_tests {
 
         app.load_folder(folder);
         assert_eq!(app.settings.grid_view_mode, GridViewMode::Details);
+        assert_eq!(app.settings.grid_cols, 7, "列数はお気に入りの値になる");
+        assert_eq!(app.settings.thumb_px, 512, "画質は共通のまま");
         assert!(!app.details_order.is_empty());
         app.last_cell_size = 120.0;
         app.last_cell_h = 160.0;
@@ -74402,7 +74410,8 @@ mod favorite_view_state_tests {
         assert_eq!(app.auto_aspect.current, None);
         assert_eq!(app.last_cell_h, 120.0, "manual aspect must update layout");
         assert_eq!(app.items_generation, generation);
-        assert_eq!(app.settings.thumb_px, 512);
+        assert_eq!(app.settings.grid_cols, 3, "列数は共通の値へ戻る");
+        assert_eq!(app.settings.thumb_px, 512, "画質は一度も動かない");
         assert_eq!(app.spread_mode, SpreadMode::Rtl);
         assert_eq!(app.reading_flow, ReadingFlow::Vertical);
     }

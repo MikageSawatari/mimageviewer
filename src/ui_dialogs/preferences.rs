@@ -3717,7 +3717,7 @@ mod tests {
         match variant {
             0 => FavoriteViewState {
                 grid_view_mode: GridViewMode::Thumbnail,
-                thumb_px: 100,
+                grid_cols: 3,
                 thumb_aspect: ThumbAspect::Square,
                 thumb_aspect_auto: false,
                 grid_display_order: GridDisplayOrder::default(),
@@ -3727,7 +3727,7 @@ mod tests {
             },
             1 => FavoriteViewState {
                 grid_view_mode: GridViewMode::Details,
-                thumb_px: 180,
+                grid_cols: 5,
                 thumb_aspect: ThumbAspect::Landscape16x9,
                 thumb_aspect_auto: true,
                 grid_display_order: GridDisplayOrder::from_rows([
@@ -3742,7 +3742,7 @@ mod tests {
             },
             _ => FavoriteViewState {
                 grid_view_mode: GridViewMode::Thumbnail,
-                thumb_px: 240,
+                grid_cols: 6,
                 thumb_aspect: ThumbAspect::Portrait2x3,
                 thumb_aspect_auto: false,
                 grid_display_order: GridDisplayOrder::from_rows([
