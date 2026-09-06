@@ -12489,6 +12489,8 @@ pub struct App {
     pub(crate) fs_vertical_scroll: f32,
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
     pub(crate) fs_seek_drag_active: bool,
+    /// 静止画ページシーク行で始まったドラッグの決着状態。動画と同じ状態機械を共有する。
+    pub(crate) fs_seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
     /// フルスクリーン下部シークバー / 混在サマリをこのフレームで表示しているか。
     /// 左下ステータスをバーの上へ逃がすために使う。
     pub(crate) fs_seek_overlay_visible: bool,
@@ -15353,6 +15355,7 @@ impl App {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
+            fs_seek_row_gesture: None,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             continuous_page_transitions: std::collections::HashMap::new(),
@@ -45665,6 +45668,7 @@ impl App {
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_row_gesture = None;
         self.fs_seek_overlay_visible = false;
         self.clear_still_seek_thumbnail_requests();
         self.fs_vertical_cache_keep_set.clear();
@@ -54083,6 +54087,7 @@ impl App {
         self.fs_middle_zoom_drag = None;
         self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_row_gesture = None;
         self.fs_seek_overlay_visible = false;
         self.clear_still_seek_thumbnail_requests();
         self.fs_context_menu_idx = None;

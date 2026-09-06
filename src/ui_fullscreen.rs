@@ -3145,6 +3145,8 @@ pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
 const FS_SEEK_HOVER_MARGIN: f32 = 40.0;
 const STILL_SEEK_STRIP_CELL_GAP: f32 = 4.0;
 const STILL_SEEK_STRIP_OVERSCAN_CELLS: usize = 2;
+/// 極端に縦長なページでも、操作可能なセル幅を高さの 35% は残す。
+const STILL_SEEK_STRIP_MIN_CELL_ASPECT: f32 = 0.35;
 const STILL_SEEK_PREVIEW_MAX_WIDTH: f32 = 240.0;
 /// 見開きプレビューの 2 枚の間隔。本の綴じ目に相当するので詰めておく。
 const STILL_SEEK_PREVIEW_PANE_GAP: f32 = 3.0;
@@ -3258,6 +3260,27 @@ fn still_seek_strip_window(
             .saturating_add(STILL_SEEK_STRIP_OVERSCAN_CELLS)
             .min(total),
     }
+}
+
+/// 現在ページの比率から、ストリップ全体で共有するセル幅を解決する。
+///
+/// 比率がまだ分からない間は従来のプリセット幅を保つ。分かった後も横長ページで
+/// プリセット幅を超えず、極端な縦長ページではセル高さの 35% を下限にする。
+fn resolved_still_seek_cell_width(
+    cell_height: f32,
+    configured_cell_width: f32,
+    current_page_size: Option<egui::Vec2>,
+    available_width: f32,
+) -> f32 {
+    let max_width = configured_cell_width.max(1.0).min(available_width.max(1.0));
+    let min_width = (cell_height.max(1.0) * STILL_SEEK_STRIP_MIN_CELL_ASPECT).min(max_width);
+    let aspect = current_page_size.and_then(|size| {
+        (size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0)
+            .then_some(size.x / size.y)
+    });
+    aspect.map_or(max_width, |aspect| {
+        (cell_height * aspect).clamp(min_width, max_width)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12340,9 +12363,14 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
     );
     let strip = geometry.strip_rect(full_rect).unwrap();
     let row = strip.shrink2(egui::vec2(18.0, 5.0));
-    let cell_width = 58.0;
     let cell_height =
         strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
+    let cell_width = resolved_still_seek_cell_width(
+        cell_height,
+        crate::video::seek_strip_layout::SeekStripHeight::Medium.window_cell_width_points(),
+        Some(egui::vec2(2.0, 3.0)),
+        row.width(),
+    );
     let colors = [
         egui::Color32::from_rgb(64, 87, 118),
         egui::Color32::from_rgb(118, 80, 64),
@@ -16120,14 +16148,12 @@ impl App {
         // 問題も併せて解消される)。
         if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
             self.fs_seek_drag_active = false;
+            self.fs_seek_row_gesture = None;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
-        if !primary_down {
-            self.fs_seek_drag_active = false;
-        }
         let locked = self.settings.fullscreen_seek_bar_locked;
         let geometry = self.still_seek_geometry_for_idx(fs_idx, false);
 
@@ -16166,6 +16192,7 @@ impl App {
 
         let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
             self.fs_seek_drag_active = false;
+            self.fs_seek_row_gesture = None;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         };
@@ -16321,16 +16348,24 @@ impl App {
                 .settings
                 .still_seek_strip_height
                 .window_cell_width_points();
-            let cell_width = configured_cell_width.min(strip_content.width().max(1.0));
             let cell_height = (strip_rect.height()
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
-            let window = still_seek_strip_window(
-                total,
-                info.current_pos,
-                strip_content.width(),
+            let current_page_size = self.thumbnails.get(fs_idx).and_then(|state| {
+                if let ThumbnailState::Loaded { tex, .. } = state {
+                    Some(tex.size_vec2())
+                } else {
+                    None
+                }
+            });
+            let cell_width = resolved_still_seek_cell_width(
+                cell_height,
                 configured_cell_width,
+                current_page_size,
+                strip_content.width(),
             );
+            let window =
+                still_seek_strip_window(total, info.current_pos, strip_content.width(), cell_width);
             requested_pages.extend(
                 info.image_indices[window.request_start..window.request_end]
                     .iter()
@@ -16357,6 +16392,22 @@ impl App {
             let pointer = strip_response
                 .interact_pointer_pos()
                 .or_else(|| strip_response.hover_pos());
+            // 動画ストリップと同じ順序で、まず下方向 close を決める。close でなければ
+            // 従来どおりポインタ下のセルへ横ドラッグで移動する。
+            let strip_closed_by_drag = strip_response.dragged()
+                && pointer.is_some_and(|pointer| {
+                    let origin = pointer - strip_response.total_drag_delta().unwrap_or_default();
+                    crate::video::seek_strip::strip_drag_closes_downward(
+                        origin,
+                        pointer,
+                        strip_rect.max.y,
+                    )
+                });
+            if strip_closed_by_drag {
+                self.settings.still_seek_strip_visible = false;
+                self.settings.save();
+                ctx.request_repaint();
+            }
             let pointed_source_pos = pointer.and_then(|pointer| {
                 still_seek_source_position_at_x(row_rect, window, cell_width, pointer.x, is_rtl)
             });
@@ -16372,7 +16423,8 @@ impl App {
                 );
                 preview_pointer_x = pointer.map(|p| p.x);
             }
-            if (strip_response.clicked() || strip_response.dragged())
+            if !strip_closed_by_drag
+                && (strip_response.clicked() || strip_response.dragged())
                 && let Some(source_pos) = pointed_source_pos
                 && let Some(resolved) = resolve_still_seek_target(
                     &info.image_indices,
@@ -16496,40 +16548,88 @@ impl App {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
 
-                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
-                if let Some(pointer_pos) = response
+                let pointer_pos = response
                     .interact_pointer_pos()
-                    .or_else(|| response.hover_pos())
-                    && (response.hovered() || response.dragged())
-                {
+                    .or_else(|| response.hover_pos());
+                let resolved_at_pointer = pointer_pos.and_then(|pointer_pos| {
                     let fraction =
                         fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
-                    let resolved = resolve_still_seek_target(
+                    resolve_still_seek_target(
                         &info.image_indices,
                         spread_units,
                         preview_units,
                         StillSeekPosition::TrackFraction(fraction),
-                    );
+                    )
+                });
+
+                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
+                if (response.hovered() || response.dragged())
+                    && let (Some(pointer_pos), Some(resolved)) =
+                        (pointer_pos, resolved_at_pointer.as_ref())
+                {
                     if self
                         .settings
                         .still_seek_hover_preview_mode
                         .is_visible(strip_visible)
                     {
-                        preview = resolved.clone();
+                        preview = Some(resolved.clone());
                         preview_pointer_x = Some(pointer_pos.x);
                     }
-                    if (response.clicked() || response.dragged())
-                        && let Some(resolved) = resolved
-                    {
-                        if response.dragged() {
-                            self.fs_seek_drag_active = true;
-                            self.note_fullscreen_seek_activity();
-                        }
+                }
+
+                if response.drag_started()
+                    && let Some(origin) = response.interact_pointer_pos()
+                {
+                    self.fs_seek_row_gesture =
+                        Some(crate::video::seek_strip::SeekRowGesture::new(origin));
+                }
+                if response.clicked() {
+                    if let Some(resolved) = resolved_at_pointer.as_ref() {
                         display_pos = resolved.display_pos;
                         if resolved.landing_idx != fs_idx || continuous_label_mode {
                             target = Some(resolved.landing_idx);
                         }
                     }
+                } else if response.dragged()
+                    && let Some(pointer_pos) = response.interact_pointer_pos()
+                {
+                    self.fs_seek_drag_active = true;
+                    self.note_fullscreen_seek_activity();
+                    let decision = self
+                        .fs_seek_row_gesture
+                        .as_mut()
+                        .map(|gesture| gesture.update(pointer_pos));
+                    match decision {
+                        Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
+                            if !self.settings.still_seek_strip_visible {
+                                self.settings.still_seek_strip_visible = true;
+                                self.settings.save();
+                                ctx.request_repaint();
+                            }
+                        }
+                        Some(crate::video::seek_strip::SeekRowDecision::Scrub) => {
+                            if let Some(resolved) = resolved_at_pointer.as_ref() {
+                                display_pos = resolved.display_pos;
+                                if resolved.landing_idx != fs_idx || continuous_label_mode {
+                                    target = Some(resolved.landing_idx);
+                                }
+                            }
+                        }
+                        Some(crate::video::seek_strip::SeekRowDecision::Undecided) | None => {}
+                    }
+                }
+                if response.drag_stopped() {
+                    if matches!(
+                        self.fs_seek_row_gesture,
+                        Some(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+                    ) && let Some(resolved) = resolved_at_pointer.as_ref()
+                    {
+                        display_pos = resolved.display_pos;
+                        if resolved.landing_idx != fs_idx || continuous_label_mode {
+                            target = Some(resolved.landing_idx);
+                        }
+                    }
+                    self.fs_seek_row_gesture = None;
                 }
 
                 painter.rect_filled(
@@ -16658,6 +16758,9 @@ impl App {
         }
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
+        }
+        if !primary_down {
+            self.fs_seek_row_gesture = None;
         }
         target
     }
@@ -52548,6 +52651,45 @@ mod tests {
     }
 
     #[test]
+    fn still_seek_portrait_cell_width_uses_current_page_aspect_with_a_lower_bound() {
+        let portrait =
+            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(2.0, 3.0)), 1920.0);
+        assert_f32_close(portrait, 94.0 * 2.0 / 3.0);
+        assert_f32_close(
+            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(1.0, 10.0)), 1920.0),
+            94.0 * STILL_SEEK_STRIP_MIN_CELL_ASPECT,
+        );
+    }
+
+    #[test]
+    fn still_seek_cell_width_never_exceeds_preset_and_falls_back_when_unknown() {
+        assert_f32_close(
+            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(16.0, 9.0)), 1920.0),
+            152.0,
+        );
+        assert_f32_close(
+            resolved_still_seek_cell_width(94.0, 152.0, None, 1920.0),
+            152.0,
+        );
+    }
+
+    #[test]
+    fn portrait_still_seek_strip_requests_remain_bounded_by_view_width() {
+        let cell_width =
+            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(2.0, 3.0)), 1920.0);
+        let window = still_seek_strip_window(50_000, 25_000, 1_920.0, cell_width);
+        let visible = window.visible_end - window.visible_start;
+        let visible_bound = ((1_920.0 + STILL_SEEK_STRIP_CELL_GAP)
+            / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
+            .floor() as usize;
+        assert!(visible <= visible_bound.max(1));
+        assert!(
+            window.request_end - window.request_start
+                <= visible + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2
+        );
+    }
+
+    #[test]
     fn still_seek_strip_visual_order_mirrors_source_positions_for_rtl() {
         let window = StillSeekStripWindow {
             visible_start: 10,
@@ -52572,6 +52714,58 @@ mod tests {
             still_seek_source_position_at_x(row, window, 45.0, 195.0, true),
             Some(10)
         );
+    }
+
+    #[test]
+    fn portrait_still_seek_hit_test_uses_the_resolved_shared_cell_width() {
+        let cell_width = 60.0;
+        let window = StillSeekStripWindow {
+            visible_start: 10,
+            visible_end: 14,
+            request_start: 8,
+            request_end: 16,
+        };
+        let row_width = 4.0 * cell_width + 3.0 * STILL_SEEK_STRIP_CELL_GAP;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(row_width, 94.0));
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, cell_width, 61.0, false),
+            Some(10)
+        );
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, cell_width, 65.0, false),
+            Some(11)
+        );
+        assert_eq!(
+            still_seek_source_position_at_x(row, window, cell_width, 65.0, true),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn still_seek_bar_and_strip_share_video_gesture_decisions() {
+        let mut horizontal =
+            crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            horizontal.update(egui::pos2(130.0, 104.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub
+        );
+
+        let mut upward = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            upward.update(egui::pos2(104.0, 70.0)),
+            crate::video::seek_strip::SeekRowDecision::OpenStrip
+        );
+
+        assert!(crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(104.0, 100.0),
+            94.0,
+        ));
+        assert!(!crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(140.0, 100.0),
+            94.0,
+        ));
     }
 
     #[test]

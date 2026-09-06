@@ -1286,6 +1286,10 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
 クリック先が逆になるような独立判定を置かない。
+サムネイル列の等幅セルは現在ページのロード済みサムネイル比率から列全体で 1 度だけ解決し、
+可視窓計算、描画、pointer hit test が同じ幅を見る。未ロード時は高さプリセットの従来幅へ戻し、
+解決後はプリセット幅を上限、高さの 35% を下限とする。ページシーク行の上ドラッグと列の
+下ドラッグは動画の `SeekRowGesture` / `strip_drag_closes_downward` を共有し、横ドラッグ契約は変えない。
 通常の左右カーソルキーによるページ移動は
 `fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、

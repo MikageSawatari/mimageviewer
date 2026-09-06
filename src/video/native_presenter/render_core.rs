@@ -142,10 +142,52 @@ impl Drop for NativeAnime4kMeasurement {
 pub const HUD_SEEK_ROW_HEIGHT: f32 = 24.0;
 pub const HUD_CONTROLS_ROW_HEIGHT: f32 = 40.0;
 pub const HUD_BOTTOM_HEIGHT: f32 = HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT;
+
+pub(crate) const fn resolved_video_bottom_bar_height(normal_seek_bar_visible: bool) -> f32 {
+    if normal_seek_bar_visible {
+        HUD_BOTTOM_HEIGHT
+    } else {
+        0.0
+    }
+}
 pub const HUD_TOP_HEIGHT: f32 = 54.0;
 pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
 const SEEK_STRIP_LOCK_BUTTON_SIZE: f32 = 28.0;
 const SEEK_STRIP_RIGHT_INSET: f32 = 7.0;
+
+/// 動画下端の通常バー高と、その上に置くストリップ寸法を一度に解決した値。
+///
+/// `HUD_BOTTOM_HEIGHT` を条件付きで足す判断はここだけが所有し、描画・入力・固定映像領域・
+/// パネル配置はこの値を受け取る。音声波形は `normal_seek_bar_visible=true` で従来高を保つ。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoSeekGeometry {
+    normal_seek_bar_visible: bool,
+    normal_bar_height: f32,
+    strip_layout: crate::video::seek_strip_layout::SeekStripLayout,
+}
+
+impl VideoSeekGeometry {
+    fn resolve(
+        overlay_size: egui::Vec2,
+        normal_seek_bar_visible: bool,
+        strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+        span: crate::video::seek_strip_layout::SeekStripSpan,
+        aspect: Option<f32>,
+    ) -> Self {
+        let normal_bar_height = resolved_video_bottom_bar_height(normal_seek_bar_visible);
+        Self {
+            normal_seek_bar_visible,
+            normal_bar_height,
+            strip_layout: crate::video::seek_strip_layout::SeekStripLayout::resolve(
+                overlay_size,
+                normal_bar_height,
+                strip_height,
+                span,
+                aspect,
+            ),
+        }
+    }
+}
 const SEEK_STRIP_LOCK_TOP_INSET: f32 = 4.0;
 const SEEK_STRIP_RANGE_LOCK_GAP: f32 = 6.0;
 const SEEK_PREVIEW_GAP: f32 = 14.0;
@@ -2797,16 +2839,17 @@ struct NativeTouchPanelHandleInputs {
 fn native_touch_panel_handle_hud_rects(
     width: f32,
     height: f32,
+    bottom_bar_height: f32,
     input: NativeTouchPanelHandleInputs,
 ) -> [Option<egui::Rect>; 2] {
     if !input.chrome_latched || input.blocked {
         return [None, None];
     }
     let left = (!input.left_panel_open)
-        .then(|| native_touch_panel_handle_rect(width, height, true))
+        .then(|| native_touch_panel_handle_rect(width, height, bottom_bar_height, true))
         .filter(egui::Rect::is_positive);
     let right = (input.right_panel_available && !input.right_panel_open)
-        .then(|| native_touch_panel_handle_rect(width, height, false))
+        .then(|| native_touch_panel_handle_rect(width, height, bottom_bar_height, false))
         .filter(egui::Rect::is_positive);
     [left, right]
 }
@@ -6732,6 +6775,16 @@ impl NativeRenderCore {
     }
 
     fn video_visual_layout(&self) -> VideoVisualLayout {
+        let bottom_bar_height =
+            self.egui_overlay
+                .as_ref()
+                .map_or(resolved_video_bottom_bar_height(true), |overlay| {
+                    let overlay_size = egui::vec2(
+                        self.width as f32 / overlay.pixels_per_point,
+                        self.height as f32 / overlay.pixels_per_point,
+                    );
+                    overlay.seek_geometry(overlay_size).normal_bar_height
+                });
         VideoVisualLayout {
             compact: self.video_compact,
             pixels_per_point: self
@@ -6741,6 +6794,7 @@ impl NativeRenderCore {
                 .unwrap_or(1.0),
             top_bar_locked: self.video_top_bar_locked,
             bottom_lock: self.video_bottom_lock,
+            bottom_bar_height,
             // 高さの正本は overlay が持つ (設定から `set_bar_lock_state` で届く)。
             // presenter 側に写しを置くと、どちらが本当か決められない値が 2 つになる。
             seek_strip_visible_points: self
@@ -8327,25 +8381,33 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    /// 帯の矩形とセル寸法。**この 1 つの値を描画・入力・予約が共有する。**
+    /// 下端の通常バー高、帯の矩形、セル寸法。**この 1 つの値を描画・入力・予約が共有する。**
     ///
     /// 高さは設定から届いた値、表示範囲とセルの縦横比は表示中のスナップショットから取る。
     /// スナップショットが無い間 (動画の切替中) も高さは変わらないので、予約は保たれる。
-    fn seek_strip_layout(
-        &self,
-        overlay_size: egui::Vec2,
-    ) -> crate::video::seek_strip_layout::SeekStripLayout {
+    fn seek_geometry(&self, overlay_size: egui::Vec2) -> VideoSeekGeometry {
         let (span, aspect) = self.seek_strip.as_ref().map_or(
             (crate::video::seek_strip_layout::SeekStripSpan::Window, None),
             |strip| (strip.span, strip.cell_aspect),
         );
-        crate::video::seek_strip_layout::SeekStripLayout::resolve(
+        let thumbnail_strip_visible = self.seek_strip.as_ref().is_some_and(|strip| {
+            strip.center.mode() == crate::settings::VideoSeekStripMode::Thumbnails
+        }) && self.tile_overlay.is_none();
+        let normal_seek_bar_visible = self.seek_bar_with_strip.is_visible(thumbnail_strip_visible);
+        VideoSeekGeometry::resolve(
             overlay_size,
-            HUD_BOTTOM_HEIGHT,
+            normal_seek_bar_visible,
             self.seek_strip_height,
             span,
             aspect,
         )
+    }
+
+    fn seek_strip_layout(
+        &self,
+        overlay_size: egui::Vec2,
+    ) -> crate::video::seek_strip_layout::SeekStripLayout {
+        self.seek_geometry(overlay_size).strip_layout
     }
 
     /// いまストリップが占めている高さ (points)。占めていないときは 0。
@@ -8370,6 +8432,9 @@ impl NativeEguiOverlay {
             pixels_per_point: 1.0,
             top_bar_locked: self.top_bar_locked,
             bottom_lock: self.bottom_lock,
+            bottom_bar_height: self
+                .seek_geometry(egui::vec2(overlay_w, overlay_h))
+                .normal_bar_height,
             seek_strip_visible_points: self.seek_strip_visible_points(),
             fixed_bar_gap_px: self.fixed_bar_gap_px,
             info_panel_reserved: self.right_panel_reserves_space(),
@@ -9149,6 +9214,8 @@ impl NativeEguiOverlay {
         let to_px = |pt: f32| -> i32 { (pt * ppp).round() as i32 };
         let width_points = (self.width as f32 / ppp).max(1.0);
         let height_points = (self.height as f32 / ppp).max(1.0);
+        let seek_geometry = self.seek_geometry(egui::vec2(width_points, height_points));
+        let bottom_bar_height = seek_geometry.normal_bar_height;
         // Codex CP9 実機 P1 #3 反映: egui::Rect → physical RECT 変換 helper。
         // panel 概算値ではなく `overlay_draw::native_*_rect` を直接物理ピクセルに変換することで、
         // 実 UI rect と region が一致して境界振動を起こさない。
@@ -9221,9 +9288,8 @@ impl NativeEguiOverlay {
             });
         }
 
-        // 下 HUD (seek 行 + コントロール 行) 表示中。**実描画 HUD_BOTTOM_HEIGHT (= 64pt) 帯**
-        // (= `fixed_pos(0, height - HUD_BOTTOM_HEIGHT)` + `set_min_size(W, HUD_BOTTOM_HEIGHT)` と一致、
-        // 動画 HUD 2 段化リデザインで旧 46pt から拡張)。
+        // 下 HUD (seek 行 + コントロール 行) 表示中。実描画する解決済みの帯だけを region にする。
+        // 通常バーを隠す設定では 0pt、表示する場合と音声波形では従来の 64pt になる。
         //
         // ## region サイズの選択 (Codex 2026-05-12 P1 反映)
         //
@@ -9233,19 +9299,18 @@ impl NativeEguiOverlay {
         // 「下半分の VST ボタンが押せない」の主因)。
         // 活性化判定は presenter wndproc 経由の pointer_pos で維持されるので region は不要。
         if bottom_hud_visible {
-            let bottom_band_top = (height_px - to_px(HUD_BOTTOM_HEIGHT)).max(0);
-            regions.push(RECT {
-                left: 0,
-                top: bottom_band_top,
-                right: width_px,
-                bottom: height_px,
-            });
+            if bottom_bar_height > 0.0 {
+                let bottom_band_top = (height_px - to_px(bottom_bar_height)).max(0);
+                regions.push(RECT {
+                    left: 0,
+                    top: bottom_band_top,
+                    right: width_px,
+                    bottom: height_px,
+                });
+            }
         }
         if bottom_hud_visible && self.seek_strip.is_some() && !tile_overlay_visible {
-            regions.push(rect_to_px(
-                self.seek_strip_layout(egui::vec2(width_points, height_points))
-                    .rect,
-            ));
+            regions.push(rect_to_px(seek_geometry.strip_layout.rect));
         }
 
         // Center status (error / preparing / slow seek): `draw_native_center_status`
@@ -9275,6 +9340,7 @@ impl NativeEguiOverlay {
             regions.push(rect_to_px(super::overlay_draw::native_metadata_panel_rect(
                 width_points,
                 height_points,
+                bottom_bar_height,
             )));
         }
 
@@ -9283,6 +9349,7 @@ impl NativeEguiOverlay {
         if jump_panel_visible_flag {
             regions.push(rect_to_px(super::overlay_draw::native_jump_panel_rect(
                 height_points,
+                bottom_bar_height,
             )));
         }
 
@@ -9385,7 +9452,12 @@ impl NativeEguiOverlay {
         if let Some(panel) = self.vst3_panel.as_ref() {
             if panel.visible {
                 let rect = self.last_drawn_vst3_panel_rect.unwrap_or_else(|| {
-                    super::overlay_draw::native_vst3_panel_rect(width_points, height_points, panel)
+                    super::overlay_draw::native_vst3_panel_rect(
+                        width_points,
+                        height_points,
+                        bottom_bar_height,
+                        panel,
+                    )
                 });
                 regions.push(rect_to_px(rect));
             }
@@ -9396,7 +9468,7 @@ impl NativeEguiOverlay {
                 let popup_w = 356.0_f32.min((width_points - 16.0).max(180.0));
                 let popup_h = 74.0;
                 let popup_x = (width_points - popup_w - 8.0).max(8.0);
-                let popup_y = (height_points - HUD_BOTTOM_HEIGHT - popup_h - 6.0).max(8.0);
+                let popup_y = (height_points - bottom_bar_height - popup_h - 6.0).max(8.0);
                 egui::Rect::from_min_size(
                     egui::pos2(popup_x, popup_y),
                     egui::vec2(popup_w, popup_h),
@@ -9709,6 +9781,9 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        let bottom_bar_height = self
+            .seek_geometry(egui::vec2(overlay_width_points, overlay_height_points))
+            .normal_bar_height;
         // ホバー帯は「いま帯が描かれているか」で決まる。映像の予約 (ピン) とは別の問い
         // なので述語は分けたまま、高さだけを同じ 1 か所から取る。
         let seek_strip_drawn = self.seek_strip.is_some()
@@ -9719,12 +9794,17 @@ impl NativeEguiOverlay {
         } else {
             0.0
         };
-        let hover_bottom = native_panel_hover_bottom(overlay_height_points, strip_points);
+        let hover_bottom =
+            native_panel_hover_bottom(overlay_height_points, bottom_bar_height, strip_points);
         let trigger = crate::ui_helpers::panel_edge_trigger_px(overlay_width_points);
         let margin = crate::ui_helpers::panel_hover_sustain_px(overlay_width_points);
         let in_band = |p: egui::Pos2| p.y >= 0.0 && p.y <= hover_bottom;
 
-        let right_panel = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
+        let right_panel = native_metadata_panel_rect(
+            overlay_width_points,
+            overlay_height_points,
+            bottom_bar_height,
+        );
         let right_open = self
             .pointer_pos
             .is_some_and(|p| p.x >= overlay_width_points - trigger && in_band(p));
@@ -9735,7 +9815,7 @@ impl NativeEguiOverlay {
         self.right_panel_hover_latched =
             self.pointer_pos.is_some() && (right_open || right_sustain);
 
-        let left_panel = native_jump_panel_rect(overlay_height_points);
+        let left_panel = native_jump_panel_rect(overlay_height_points, bottom_bar_height);
         let left_open = self
             .pointer_pos
             .is_some_and(|p| p.x <= trigger && in_band(p));
@@ -9806,9 +9886,13 @@ impl NativeEguiOverlay {
     fn touch_panel_handle_rects(&self) -> [Option<egui::Rect>; 2] {
         let width = self.width as f32 / self.pixels_per_point;
         let height = self.height as f32 / self.pixels_per_point;
+        let bottom_bar_height = self
+            .seek_geometry(egui::vec2(width, height))
+            .normal_bar_height;
         native_touch_panel_handle_hud_rects(
             width,
             height,
+            bottom_bar_height,
             NativeTouchPanelHandleInputs {
                 chrome_latched: self.native_touch.chrome_latched(),
                 blocked: self.audio_only
@@ -9862,10 +9946,18 @@ impl NativeEguiOverlay {
     fn pointer_over_scroll_panel(&self, pos: egui::Pos2) -> bool {
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        (self.jump_panel_visible() && native_jump_panel_rect(overlay_height_points).contains(pos))
+        let bottom_bar_height = self
+            .seek_geometry(egui::vec2(overlay_width_points, overlay_height_points))
+            .normal_bar_height;
+        (self.jump_panel_visible()
+            && native_jump_panel_rect(overlay_height_points, bottom_bar_height).contains(pos))
             || (self.right_panel_visible()
-                && native_metadata_panel_rect(overlay_width_points, overlay_height_points)
-                    .contains(pos))
+                && native_metadata_panel_rect(
+                    overlay_width_points,
+                    overlay_height_points,
+                    bottom_bar_height,
+                )
+                .contains(pos))
     }
 
     fn configure(&self) -> Result<(), String> {
@@ -9967,8 +10059,10 @@ impl NativeEguiOverlay {
         let overlay_height_points = self.height as f32 / ppp;
         // 帯の寸法は 1 フレームに 1 回だけ解決し、描画・入力・プレビューの逃げ場が
         // 同じ矩形を見るようにする。
-        let seek_strip_layout =
-            self.seek_strip_layout(egui::vec2(overlay_width_points, overlay_height_points));
+        let seek_geometry =
+            self.seek_geometry(egui::vec2(overlay_width_points, overlay_height_points));
+        let seek_strip_layout = seek_geometry.strip_layout;
+        let bottom_bar_height = seek_geometry.normal_bar_height;
         // 切替中のプレビューは映像と同じ場所に置く。closure の前に確定させる。
         let navigation_preview_content_rect =
             self.video_content_rect_points(overlay_width_points, overlay_height_points);
@@ -10071,7 +10165,6 @@ impl NativeEguiOverlay {
         let top_bar_locked = self.top_bar_locked;
         let bottom_lock = self.bottom_lock;
         let seek_hover_preview_mode = self.seek_hover_preview_mode;
-        let seek_bar_with_strip = self.seek_bar_with_strip;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
@@ -10087,7 +10180,7 @@ impl NativeEguiOverlay {
         let thumbnail_strip_visible = seek_strip.as_ref().is_some_and(|strip| {
             strip.center.mode() == crate::settings::VideoSeekStripMode::Thumbnails
         }) && !tile_overlay_visible;
-        let normal_seek_bar_visible = seek_bar_with_strip.is_visible(thumbnail_strip_visible);
+        let normal_seek_bar_visible = seek_geometry.normal_seek_bar_visible;
         let navigation_preview_visible = navigation_preview.is_some();
         let raw_seek_status_visible = seek_status_active
             && !tile_overlay_visible
@@ -10454,6 +10547,7 @@ impl NativeEguiOverlay {
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    bottom_bar_height,
                     panel,
                     &mut commands,
                     &mut last_emitted_vst3_panel_pos,
@@ -10490,6 +10584,7 @@ impl NativeEguiOverlay {
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    bottom_bar_height,
                     metadata,
                     &mut self.tag_picker_open,
                     &mut self.tag_picker_input,
@@ -10508,6 +10603,7 @@ impl NativeEguiOverlay {
                 let close_left = draw_native_video_left_panel(
                     ctx,
                     overlay_height_points,
+                    bottom_bar_height,
                     position_secs,
                     &jump_entries,
                     &jump_texture_ids,
@@ -10655,9 +10751,11 @@ impl NativeEguiOverlay {
                     });
                 let banner_height = 26.0;
                 let banner_gap = 6.0;
-                let banner_y =
-                    (overlay_height_points - HUD_BOTTOM_HEIGHT - banner_height - banner_gap)
-                        .max(0.0);
+                let banner_y = (overlay_height_points
+                    - bottom_bar_height
+                    - banner_height
+                    - banner_gap)
+                    .max(0.0);
                 // 左パネル幅の右端から 12pt 右、シークバー直上に配置。
                 // ユーザー案の図 (左パネル + 動画 + シークバー上にバナー) に合わせる。
                 let banner_x = native_jump_panel_width() + 12.0;
@@ -10720,15 +10818,15 @@ impl NativeEguiOverlay {
                 }
             }
 
-            if bottom_hud_visible {
+            if bottom_hud_visible && normal_seek_bar_visible {
                 egui::Area::new(egui::Id::new("native_video_seek_hud"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(
                         0.0,
-                        (overlay_height_points - HUD_BOTTOM_HEIGHT).max(0.0),
+                        (overlay_height_points - bottom_bar_height).max(0.0),
                     ))
                     .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(overlay_width_points, HUD_BOTTOM_HEIGHT));
+                        ui.set_min_size(egui::vec2(overlay_width_points, bottom_bar_height));
                         let hud_rect = ui.min_rect();
                         let painter = ui.painter().clone();
                         let painter = &painter;
@@ -11398,10 +11496,12 @@ impl NativeEguiOverlay {
                         let seek_lock_rect = native_seek_bar_lock_button_rect(
                             overlay_width_points,
                             overlay_height_points,
+                            bottom_bar_height,
                         );
                         let seek_strip_selector_rect = native_seek_strip_selector_button_rect(
                             overlay_width_points,
                             overlay_height_points,
+                            bottom_bar_height,
                         );
 
                         if normal_seek_bar_visible {
@@ -12860,6 +12960,8 @@ pub(super) struct VideoVisualLayout {
     pub(super) pixels_per_point: f32,
     pub(super) top_bar_locked: bool,
     pub(super) bottom_lock: VideoBottomLock,
+    /// 表示方針を反映した通常下部バーの高さ。サムネイルストリップ中は 0 になり得る。
+    pub(super) bottom_bar_height: f32,
     /// いまストリップが占めている高さ (points)。出ていないときは 0。
     ///
     /// bool ではなく量を持つ。高さがプリセットで変わるので、「表示中か」だけを運ぶと
@@ -12881,6 +12983,7 @@ impl From<bool> for VideoVisualLayout {
             pixels_per_point: 1.0,
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
+            bottom_bar_height: resolved_video_bottom_bar_height(true),
             seek_strip_visible_points: 0.0,
             fixed_bar_gap_px: 0,
             info_panel_reserved: false,
@@ -12925,7 +13028,7 @@ pub(super) fn video_bar_reserved_points(layout: VideoVisualLayout) -> (f32, f32)
         } else {
             0.0
         };
-        HUD_BOTTOM_HEIGHT + gap_points + strip_height
+        layout.bottom_bar_height.max(0.0) + gap_points + strip_height
     } else {
         0.0
     };
@@ -14193,6 +14296,7 @@ mod tests {
             crate::video::native_presenter::overlay_draw::native_seek_bar_lock_button_rect(
                 overlay_size.x,
                 overlay_size.y,
+                HUD_BOTTOM_HEIGHT,
             );
         let pointer = lock_rect.center();
 
@@ -14341,6 +14445,7 @@ mod tests {
             crate::video::native_presenter::overlay_draw::native_seek_bar_lock_button_rect(
                 overlay_size.x,
                 overlay_size.y,
+                HUD_BOTTOM_HEIGHT,
             );
         let pointer = lock_rect.center();
 
@@ -15297,7 +15402,8 @@ mod tests {
             right_panel_open: false,
             right_panel_available: true,
         };
-        let [left, right] = native_touch_panel_handle_hud_rects(1200.0, 600.0, input);
+        let [left, right] =
+            native_touch_panel_handle_hud_rects(1200.0, 600.0, HUD_BOTTOM_HEIGHT, input);
         let left = left.unwrap();
         let right = right.unwrap();
         assert_eq!(left.width(), NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT);
@@ -15323,12 +15429,13 @@ mod tests {
             right_panel_available: true,
         };
         assert_eq!(
-            native_touch_panel_handle_hud_rects(1000.0, 800.0, input),
+            native_touch_panel_handle_hud_rects(1000.0, 800.0, HUD_BOTTOM_HEIGHT, input),
             [None, None]
         );
         let [left, right] = native_touch_panel_handle_hud_rects(
             1000.0,
             800.0,
+            HUD_BOTTOM_HEIGHT,
             NativeTouchPanelHandleInputs {
                 chrome_latched: true,
                 left_panel_open: true,
@@ -15340,6 +15447,7 @@ mod tests {
         let [left, right] = native_touch_panel_handle_hud_rects(
             1000.0,
             800.0,
+            HUD_BOTTOM_HEIGHT,
             NativeTouchPanelHandleInputs {
                 chrome_latched: true,
                 right_panel_available: false,
@@ -15579,6 +15687,7 @@ mod tests {
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
                 bottom_lock: VideoBottomLock::None,
+                bottom_bar_height: HUD_BOTTOM_HEIGHT,
                 seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 0,
                 info_panel_reserved: false,
@@ -15854,6 +15963,7 @@ mod tests {
                     pixels_per_point: 1.0,
                     top_bar_locked: true,
                     bottom_lock: VideoBottomLock::BarAndStrip,
+                    bottom_bar_height: HUD_BOTTOM_HEIGHT,
                     seek_strip_visible_points: if seek_strip_reserves_space(has_strip, availability)
                     {
                         STRIP_HEIGHT
@@ -15926,6 +16036,7 @@ mod tests {
             pixels_per_point,
             top_bar_locked: false,
             bottom_lock: VideoBottomLock::None,
+            bottom_bar_height: HUD_BOTTOM_HEIGHT,
             seek_strip_visible_points: 0.0,
             fixed_bar_gap_px: 0,
             info_panel_reserved,
@@ -15966,6 +16077,7 @@ mod tests {
                     pixels_per_point: 1.0,
                     top_bar_locked,
                     bottom_lock,
+                    bottom_bar_height: HUD_BOTTOM_HEIGHT,
                     seek_strip_visible_points: if seek_strip_visible {
                         STRIP_HEIGHT
                     } else {
@@ -16061,6 +16173,7 @@ mod tests {
                             pixels_per_point: 1.0,
                             top_bar_locked: false,
                             bottom_lock,
+                            bottom_bar_height: HUD_BOTTOM_HEIGHT,
                             seek_strip_visible_points,
                             fixed_bar_gap_px: 0,
                             info_panel_reserved: false,
@@ -16078,6 +16191,77 @@ mod tests {
     }
 
     #[test]
+    fn resolved_video_seek_height_drives_strip_fixed_media_and_panel_bottoms() {
+        let overlay_size = egui::vec2(1280.0, 720.0);
+        let strip_height = crate::video::seek_strip_layout::SeekStripHeight::Medium;
+        let span = crate::video::seek_strip_layout::SeekStripSpan::Window;
+        let shown = super::VideoSeekGeometry::resolve(overlay_size, true, strip_height, span, None);
+        let hidden =
+            super::VideoSeekGeometry::resolve(overlay_size, false, strip_height, span, None);
+        let legacy = crate::video::seek_strip_layout::SeekStripLayout::resolve(
+            overlay_size,
+            HUD_BOTTOM_HEIGHT,
+            strip_height,
+            span,
+            None,
+        );
+
+        assert_eq!(shown.normal_bar_height, HUD_BOTTOM_HEIGHT);
+        assert_eq!(shown.strip_layout, legacy);
+        assert_eq!(hidden.normal_bar_height, 0.0);
+        assert_eq!(hidden.strip_layout.rect.bottom(), overlay_size.y);
+        assert_eq!(
+            hidden.strip_layout.rect.bottom() - shown.strip_layout.rect.bottom(),
+            HUD_BOTTOM_HEIGHT
+        );
+
+        let target = |geometry: super::VideoSeekGeometry| {
+            compute_video_visual_target_rect(
+                1280,
+                720,
+                VideoVisualLayout {
+                    compact: false,
+                    pixels_per_point: 1.0,
+                    top_bar_locked: false,
+                    bottom_lock: VideoBottomLock::BarAndStrip,
+                    bottom_bar_height: geometry.normal_bar_height,
+                    seek_strip_visible_points: geometry.strip_layout.rect.height(),
+                    fixed_bar_gap_px: 0,
+                    info_panel_reserved: false,
+                },
+            )
+        };
+        assert_eq!(
+            target(hidden).height - target(shown).height,
+            HUD_BOTTOM_HEIGHT
+        );
+
+        let shown_panel = crate::video::native_presenter::overlay_draw::native_jump_panel_rect(
+            overlay_size.y,
+            shown.normal_bar_height,
+        );
+        let hidden_panel = crate::video::native_presenter::overlay_draw::native_jump_panel_rect(
+            overlay_size.y,
+            hidden.normal_bar_height,
+        );
+        assert_eq!(
+            hidden_panel.bottom() - shown_panel.bottom(),
+            HUD_BOTTOM_HEIGHT
+        );
+    }
+
+    #[test]
+    fn hidden_thumbnail_bar_policy_does_not_hide_waveform_bar_space() {
+        let policy = crate::settings::VideoSeekBarWithStrip::Hide;
+        assert!(!policy.is_visible(true));
+        assert!(policy.is_visible(false));
+        assert_eq!(
+            super::resolved_video_bottom_bar_height(policy.is_visible(false)),
+            HUD_BOTTOM_HEIGHT
+        );
+    }
+
+    #[test]
     fn compact_video_uses_the_upper_right_quarter_of_the_reserved_bar_target() {
         let target = compute_video_visual_target_rect(
             1920,
@@ -16087,6 +16271,7 @@ mod tests {
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
                 bottom_lock: VideoBottomLock::BarOnly,
+                bottom_bar_height: HUD_BOTTOM_HEIGHT,
                 seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 10,
                 info_panel_reserved: false,
@@ -16134,8 +16319,9 @@ mod tests {
             egui::pos2(width, height),
         );
         let top_lock = native_top_bar_lock_button_rect(width);
-        let seek_lock = native_seek_bar_lock_button_rect(width, height);
-        let seek_strip_selector = native_seek_strip_selector_button_rect(width, height);
+        let seek_lock = native_seek_bar_lock_button_rect(width, height, HUD_BOTTOM_HEIGHT);
+        let seek_strip_selector =
+            native_seek_strip_selector_button_rect(width, height, HUD_BOTTOM_HEIGHT);
 
         assert!(top_region.contains(top_lock.min) && top_region.contains(top_lock.max));
         assert!(bottom_region.contains(seek_lock.min) && bottom_region.contains(seek_lock.max));

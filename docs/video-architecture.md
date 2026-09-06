@@ -842,6 +842,11 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
 サムネイル軸、2 種類の worker を 1 session として所有する。
 
+通常バーの表示方針とストリップ配置は presenter の `VideoSeekGeometry::resolve` が一度だけ解決する。
+場面サムネイル表示中に通常バーを隠す場合は `normal_bar_height = 0` とし、ストリップ矩形、HUD の
+入力領域、固定映像領域、下端ホバー、左右 / VST パネルが同じ解決値を見る。表示する場合と音声波形
+表示中は `HUD_BOTTOM_HEIGHT` を保つため、従来座標と予約高を変えない。
+
 **全体表示では中心位置は状態ではなく導出値**で、`pin_whole_center` だけが書く。軸の真ん中
 (場面) / 尺の真ん中 (波形) へ固定することで、セル ⇔ ポインタ ⇔ 時刻の写像を周辺表示と共有した
 まま、中身を止めて赤線だけを動かせる。場面の軸は `StripAxis::whole` (尺を帯のセル数で等分した

@@ -3215,11 +3215,20 @@ impl App {
             self.settings.ui_scale_factor,
         );
         let top_band_px = (62.0_f32 * overlay_ppp).round() as i32; // 54pt + 8pt margin
-        // 動画 HUD 2 段化リデザイン (Phase 3): HUD_BOTTOM_HEIGHT = 64pt + 8pt margin = 72pt。
-        // 旧 1 段では 46+8=54pt だった。
-        let bottom_band_px = ((crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 8.0)
-            * overlay_ppp)
-            .round() as i32;
+        let thumbnail_strip_visible = !self.video_tile_mode_active
+            && matches!(
+                self.video_seek_strip_view().mode(),
+                Some(crate::settings::VideoSeekStripMode::Thumbnails)
+            );
+        let normal_seek_bar_visible = self
+            .settings
+            .video_seek_bar_with_strip
+            .is_visible(thumbnail_strip_visible);
+        let bottom_bar_height = crate::video::native_presenter::resolved_video_bottom_bar_height(
+            normal_seek_bar_visible,
+        );
+        let bottom_margin = if bottom_bar_height > 0.0 { 8.0 } else { 0.0 };
+        let bottom_band_px = ((bottom_bar_height + bottom_margin) * overlay_ppp).round() as i32;
         // VST editor は bridge 所有の別 HWND なのでアプリ内 UI 倍率を掛けない。
         let titlebar_px = (30.0_f32 * os_ppp).round() as i32;
         let presenter_top = presenter_rect.top;

@@ -442,6 +442,7 @@ pub(super) enum NativeVideoAdjustmentTab {
 pub(super) fn draw_native_video_left_panel(
     ctx: &egui::Context,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
     position_secs: f64,
     entries: &[NativeOverlayJumpEntry],
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
@@ -461,7 +462,7 @@ pub(super) fn draw_native_video_left_panel(
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
 ) -> bool {
-    let panel_rect = native_jump_panel_rect(overlay_height_points);
+    let panel_rect = native_jump_panel_rect(overlay_height_points, bottom_bar_height);
     let mut close_clicked = false;
 
     egui::Area::new(egui::Id::new("native_video_jump_panel"))
@@ -2470,10 +2471,11 @@ pub(super) fn native_top_bar_lock_button_rect(overlay_width_points: f32) -> egui
 pub(super) fn native_seek_bar_lock_button_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
 ) -> egui::Rect {
     let button_size = 28.0;
     let side_pad = 10.0;
-    let controls_top = (overlay_height_points - crate::video::native_presenter::HUD_BOTTOM_HEIGHT
+    let controls_top = (overlay_height_points - bottom_bar_height
         + crate::video::native_presenter::HUD_SEEK_ROW_HEIGHT)
         .max(0.0);
     let y = controls_top
@@ -2487,8 +2489,13 @@ pub(super) fn native_seek_bar_lock_button_rect(
 pub(super) fn native_seek_strip_selector_button_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
 ) -> egui::Rect {
-    let lock = native_seek_bar_lock_button_rect(overlay_width_points, overlay_height_points);
+    let lock = native_seek_bar_lock_button_rect(
+        overlay_width_points,
+        overlay_height_points,
+        bottom_bar_height,
+    );
     egui::Rect::from_min_size(
         egui::pos2(lock.min.x - lock.width() - 8.0, lock.min.y),
         lock.size(),
@@ -2653,11 +2660,11 @@ pub(super) const NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT: f32 = 48.0;
 pub(super) fn native_touch_panel_handle_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
     left: bool,
 ) -> egui::Rect {
     let safe_top = native_panel_top().min(overlay_height_points.max(0.0));
-    let safe_bottom =
-        (overlay_height_points - crate::video::native_presenter::HUD_BOTTOM_HEIGHT).max(0.0);
+    let safe_bottom = (overlay_height_points - bottom_bar_height).max(0.0);
     if safe_bottom <= safe_top {
         return egui::Rect::NOTHING;
     }
@@ -4828,11 +4835,17 @@ pub(super) fn draw_native_vst3_panel(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
     panel: &NativeOverlayVst3Panel,
     commands: &mut Vec<NativeOverlayCommand>,
     last_emitted_panel_pos: &mut Option<[f32; 2]>,
 ) -> Option<egui::Rect> {
-    let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel);
+    let rect = native_vst3_panel_rect(
+        overlay_width_points,
+        overlay_height_points,
+        bottom_bar_height,
+        panel,
+    );
     // 実機修正 (2026-05-12 A): `fixed_pos` → `default_pos` + `movable(true)` でドラッグ可能化。
     // egui が internal memory に position を保存するので、`Id` が同じ限りフレーム間で位置維持。
     // 戻り値の actual rect を `compute_hud_regions` に渡して region を実位置に追従させる。
@@ -5577,6 +5590,7 @@ pub(super) fn draw_native_metadata_panel(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
     metadata: &NativeOverlayMetadata,
     tag_picker_open: &mut bool,
     tag_picker_input: &mut String,
@@ -5590,7 +5604,11 @@ pub(super) fn draw_native_metadata_panel(
     click_to_show: bool,
     info_panel_locked: bool,
 ) {
-    let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
+    let rect = native_metadata_panel_rect(
+        overlay_width_points,
+        overlay_height_points,
+        bottom_bar_height,
+    );
     egui::Area::new(egui::Id::new("native_video_metadata_panel"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -6238,23 +6256,26 @@ pub(super) fn native_panel_top() -> f32 {
     56.0
 }
 
-pub(super) fn native_panel_hover_bottom(overlay_height_points: f32, seek_strip_points: f32) -> f32 {
+pub(super) fn native_panel_hover_bottom(
+    overlay_height_points: f32,
+    bottom_bar_height: f32,
+    seek_strip_points: f32,
+) -> f32 {
     // シーク HUD または、その直上に表示中のシークストリップの上に 2pt の隙間を保つ。
     // ストリップ非表示時は従来の HUD top - 2pt を変えない。高さはプリセットで変わるので、
     // ここでは量をそのまま受け取る (定数を読み直さない)。
     let strip_height = seek_strip_points.max(0.0);
-    (overlay_height_points
-        - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + strip_height + 2.0))
-        .max(native_panel_top())
+    (overlay_height_points - (bottom_bar_height + strip_height + 2.0)).max(native_panel_top())
 }
 
-pub(super) fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
+pub(super) fn native_jump_panel_rect(
+    overlay_height_points: f32,
+    bottom_bar_height: f32,
+) -> egui::Rect {
     let top = native_panel_top();
-    // 動画 HUD 2 段化リデザイン (Phase 3): パネル底辺 = HUD top - 2pt の隙間
-    // (= overlay_h - HUD_BOTTOM_HEIGHT - 2)。`native_panel_hover_bottom` と一致させる。
-    let panel_h =
-        (overlay_height_points - top - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
-            .max(240.0);
+    // パネル底辺 = 解決済みの通常バー上端 - 2pt の隙間。
+    // `native_panel_hover_bottom` と同じ bottom_bar_height を使う。
+    let panel_h = (overlay_height_points - top - (bottom_bar_height + 2.0)).max(240.0);
     egui::Rect::from_min_size(
         egui::pos2(0.0, top),
         egui::vec2(native_jump_panel_width(), panel_h),
@@ -6264,12 +6285,11 @@ pub(super) fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
 pub(super) fn native_metadata_panel_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
 ) -> egui::Rect {
     let panel_w = native_metadata_panel_width().min(overlay_width_points * 0.5);
     let top = native_panel_top();
-    let panel_h =
-        (overlay_height_points - top - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
-            .max(260.0);
+    let panel_h = (overlay_height_points - top - (bottom_bar_height + 2.0)).max(260.0);
     egui::Rect::from_min_size(
         egui::pos2(overlay_width_points - panel_w, top),
         egui::vec2(panel_w, panel_h),
@@ -6279,19 +6299,16 @@ pub(super) fn native_metadata_panel_rect(
 pub(super) fn native_vst3_panel_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
+    bottom_bar_height: f32,
     panel: &NativeOverlayVst3Panel,
 ) -> egui::Rect {
     let width = 380.0_f32.min((overlay_width_points - 32.0).max(260.0));
     let row_count = panel.slots.len().max(1).min(10) as f32;
     let desired_height = 154.0 + row_count * 28.0;
-    // 動画 HUD 2 段化リデザイン (Phase 3): パネル下端 = HUD top - 10pt の隙間
-    // (= overlay_h - HUD_BOTTOM_HEIGHT - 10)。パネル top は native_panel_top()+10 なので
-    // max_height = overlay_h - (native_panel_top()+10) - (HUD_BOTTOM_HEIGHT+10) と等価。
-    // 簡単のため (HUD_BOTTOM_HEIGHT + 10.0) で底辺余白を取る。
-    let max_height = (overlay_height_points
-        - native_panel_top()
-        - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 10.0))
-        .max(240.0);
+    // パネル下端 = 解決済みの通常バー上端 - 10pt の隙間。
+    // 通常バーを隠す場合も、同じ bottom_bar_height から最大高を解く。
+    let max_height =
+        (overlay_height_points - native_panel_top() - (bottom_bar_height + 10.0)).max(240.0);
     let height = desired_height.clamp(236.0, max_height.min(620.0));
     egui::Rect::from_min_size(
         egui::pos2(18.0, native_panel_top() + 10.0),
@@ -7446,6 +7463,7 @@ mod tests {
                 draw_native_video_left_panel(
                     ctx,
                     650.0,
+                    crate::video::native_presenter::HUD_BOTTOM_HEIGHT,
                     0.0,
                     &entries,
                     &jump_texture_ids,
@@ -7736,9 +7754,9 @@ mod tests {
         let overlay_h = 1080.0_f32;
         let overlay_w = 1920.0_f32;
 
-        let hover_bottom = native_panel_hover_bottom(overlay_h, 0.0);
-        let jump = native_jump_panel_rect(overlay_h);
-        let meta = native_metadata_panel_rect(overlay_w, overlay_h);
+        let hover_bottom = native_panel_hover_bottom(overlay_h, HUD_BOTTOM_HEIGHT, 0.0);
+        let jump = native_jump_panel_rect(overlay_h, HUD_BOTTOM_HEIGHT);
+        let meta = native_metadata_panel_rect(overlay_w, overlay_h, HUD_BOTTOM_HEIGHT);
 
         assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
@@ -7752,7 +7770,7 @@ mod tests {
     fn the_navigation_preview_stays_inside_the_place_the_video_will_use() {
         use crate::settings::VideoBottomLock;
         use crate::video::native_presenter::render_core::{
-            VideoVisualLayout, video_bar_reserved_points,
+            HUD_BOTTOM_HEIGHT, VideoVisualLayout, video_bar_reserved_points,
         };
 
         let overlay_w = 1920.0_f32;
@@ -7762,6 +7780,7 @@ mod tests {
             pixels_per_point: 1.0,
             top_bar_locked: true,
             bottom_lock: VideoBottomLock::BarAndStrip,
+            bottom_bar_height: HUD_BOTTOM_HEIGHT,
             seek_strip_visible_points: crate::video::seek_strip_layout::SeekStripHeight::Large
                 .points(),
             fixed_bar_gap_px: 0,
@@ -7794,12 +7813,13 @@ mod tests {
         use crate::video::seek_strip_layout::SeekStripHeight;
         let overlay_h = 1080.0_f32;
 
-        let without_strip = native_panel_hover_bottom(overlay_h, 0.0);
+        let without_strip = native_panel_hover_bottom(overlay_h, HUD_BOTTOM_HEIGHT, 0.0);
         assert_eq!(without_strip, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
 
         // どの高さを選んでも、帯の上端の 2pt 上で帯が終わる。
         for height in SeekStripHeight::ALL {
-            let with_strip = native_panel_hover_bottom(overlay_h, height.points());
+            let with_strip =
+                native_panel_hover_bottom(overlay_h, HUD_BOTTOM_HEIGHT, height.points());
             assert_eq!(
                 with_strip,
                 overlay_h - (HUD_BOTTOM_HEIGHT + height.points() + 2.0)
