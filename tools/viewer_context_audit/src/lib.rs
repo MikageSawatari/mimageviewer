@@ -17,6 +17,14 @@ use syn::{
 const REGISTRY_PATH: &str = "src/app/viewer_context_registry.rs";
 const APP_TESTS_PATH: &str = "src/app/tests.rs";
 
+/// A6 asks whether a `*_for_test` call sits under `cfg(test)`, but it reads one file at a
+/// time, so a module whose `#[cfg(test)]` attribute lives in the parent file looks like
+/// production code. Name those files here: `src/app/tests.rs`, and anything a `tests`
+/// directory under `src` holds.
+fn is_cfg_test_module_file(relative: &str) -> bool {
+    relative == APP_TESTS_PATH || relative.split('/').any(|segment| segment == "tests")
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Rule {
     A1,
@@ -307,7 +315,7 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
         violations.extend(analyze_test_api(
             &relative,
             &source,
-            relative == APP_TESTS_PATH,
+            is_cfg_test_module_file(&relative),
         )?);
     }
     violations.sort_by(|left, right| {
@@ -2062,6 +2070,36 @@ mod tests {
         assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
+    #[test]
+    fn a6_treats_a_tests_directory_module_as_cfg_test() {
+        // `src/ui_fullscreen/tests/*.rs` carries its `#[cfg(test)]` in the parent file, so
+        // reading the module alone must not report its test-only calls as production ones.
+        assert!(is_cfg_test_module_file(APP_TESTS_PATH));
+        assert!(is_cfg_test_module_file(
+            "src/ui_fullscreen/tests/still_seek_rotation.rs"
+        ));
+        assert!(!is_cfg_test_module_file("src/ui_fullscreen.rs"));
+        assert!(!is_cfg_test_module_file("src/tests_helper.rs"));
+
+        let source = r#"
+            fn reads_the_owner(app: &mut App) {
+                app.helper_for_test();
+            }
+        "#;
+        assert!(has_rule(
+            &analyze_test_api("src/fixture.rs", source, false).unwrap(),
+            Rule::A6,
+        ));
+        assert!(!has_rule(
+            &analyze_test_api(
+                "src/ui_fullscreen/tests/still_seek_rotation.rs",
+                source,
+                true,
+            )
+            .unwrap(),
+            Rule::A6,
+        ));
+    }
     #[test]
     fn a2a_flags_bundle_field_swap_but_not_an_unrelated_field() {
         assert_flagged_and_clear(
