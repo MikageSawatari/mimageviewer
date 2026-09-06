@@ -195,6 +195,7 @@ pub mod rating_write_worker;
 mod remote_ipc;
 pub mod rename_key_migration;
 pub mod ring_shortcut;
+mod rotation_cache;
 pub mod rotation_db;
 pub mod save_with_metadata;
 pub mod search_index_db;

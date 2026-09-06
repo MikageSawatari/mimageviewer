@@ -218,7 +218,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `edit_bundle.rs` | ページ個別補正、消しゴム、隠蔽加工、補正レイヤー、切り取り、注釈の 6 系統を `PageEditBundle` として snapshot 化し、対象寸法への変換と 6 DB の attached transaction による全置換を担う。空 bundle も同じ経路で各行を DELETE する |
 | `edit_bundle_app.rs` | 単一ページの編集内容コピー / 貼り付けと、DB commit 成功後の sidecar、presence set、表示・比較・編集 preview cache、および置換前の対象ページ編集 Undo の無効化を担う App 接続層 |
 | `edit_bundle_bulk.rs` | チェック優先・カーソル fallback の一括対象解決、貼り付け / 7 種リセットの確認・進捗・キャンセル、および対象ごとに `edit_bundle_app` の runtime commit を再利用する逐次適用を担う。回転だけは bundle 外として UI thread で `set_image_rotation` へ渡す |
-| `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
+| `rotation_db.rs` / `rotation_cache.rs` | 非破壊回転の SQLite 永続化と context 所有の回転 memo。静止画シークの未読値は pending reader が非同期取得し、cache と要求寿命を一緒に交換・失効・破棄する |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |

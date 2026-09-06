@@ -11971,7 +11971,7 @@ pub struct App {
     /// 回転情報 DB (全体で 1 ファイル)
     pub(crate) rotation_db: Option<crate::rotation_db::RotationDb>,
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
-    pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    pub(crate) rotation_cache: crate::rotation_cache::RotationCache,
     /// 一度判明したページ寸法をテクスチャの退去後も保持する per-context cache。
     pub(crate) page_dims_cache: crate::page_dims::PageDimsCache,
     /// 見開き表示単位列と、nav・横長性・回転の context-local invalidation 状態。
@@ -15172,7 +15172,7 @@ impl App {
             search_target: crate::fts_index::SearchTarget::All,
             search_or_mode: false,
             rotation_db,
-            rotation_cache: std::collections::HashMap::new(),
+            rotation_cache: crate::rotation_cache::RotationCache::default(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
             spread_display_units_cache: crate::ui_fullscreen::SpreadDisplayUnitsCache::default(),
             audio_normalize_db,
@@ -29498,7 +29498,7 @@ impl App {
             self.mask_pages = page.mask_pages;
             self.conceal_pages = page.conceal_pages;
             self.comic_pages = page.comic_pages;
-            self.rotation_cache = page.rotation_cache;
+            self.rotation_cache = page.rotation_cache.into();
             self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
             self.thumb_adjust_tex.clear();
@@ -34018,6 +34018,7 @@ impl App {
     /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
     /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
     fn clear_still_seek_thumbnail_requests(&mut self) {
+        self.rotation_cache.cancel_still_seek_rotations();
         self.still_seek_thumbnail_pages.clear();
         if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
             shared.clear();
@@ -34029,6 +34030,9 @@ impl App {
         ctx: &egui::Context,
         pages: &[usize],
     ) {
+        if pages.is_empty() {
+            self.rotation_cache.cancel_still_seek_rotations();
+        }
         let next = pages
             .iter()
             .copied()
@@ -49387,6 +49391,38 @@ impl App {
         }
     }
 
+    pub(crate) fn poll_still_seek_rotations(&mut self) {
+        let updated = self
+            .rotation_cache
+            .poll_still_seek_rotations(self.items_generation);
+        for idx in updated {
+            self.reconcile_spread_landscape_for_idx(idx);
+        }
+    }
+
+    /// Snapshot only keys; SQLite open/SELECT belongs to the cache-owned worker.
+    /// Even a whole-book spread dependency submits at most 256 keys per batch.
+    pub(crate) fn start_still_seek_rotations(&mut self, ctx: &egui::Context, indices: &[usize]) {
+        let requests = indices
+            .iter()
+            .copied()
+            .filter(|idx| !self.rotation_cache.contains_key(idx))
+            .filter_map(|idx| self.rotation_key_for_idx(idx).map(|key| (idx, key)))
+            .take(256)
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            self.rotation_cache.cancel_still_seek_rotations();
+            return;
+        }
+        let path = self
+            .rotation_db
+            .as_ref()
+            .and_then(crate::rotation_db::RotationDb::file_path)
+            .unwrap_or_else(crate::rotation_db::RotationDb::db_path);
+        self.rotation_cache
+            .start_still_seek_rotations(self.items_generation, requests, path, ctx);
+    }
+
     /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
     pub(crate) fn get_rotation(&mut self, idx: usize) -> crate::rotation_db::Rotation {
         if let Some(&rot) = self.rotation_cache.get(&idx) {
@@ -49440,6 +49476,9 @@ impl App {
             }
         }
 
+        if missing.is_empty() {
+            return rotations;
+        }
         let loaded = self
             .rotation_db
             .as_ref()

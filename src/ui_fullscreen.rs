@@ -3936,6 +3936,30 @@ fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect 
     egui::Rect::from_center_size(bounds.center(), size.min(bounds.size()))
 }
 
+struct StillSeekPreviewPage {
+    texture: egui::TextureHandle,
+    rotation: crate::rotation_db::Rotation,
+}
+
+enum StillSeekSpreadPreparation {
+    Single,
+    Ready(Arc<Vec<SpreadDisplayUnit>>),
+    Refreshing {
+        nav: Arc<Vec<usize>>,
+        displayed: Arc<Vec<SpreadDisplayUnit>>,
+    },
+}
+
+impl StillSeekSpreadPreparation {
+    fn units(&self) -> Option<&Arc<Vec<SpreadDisplayUnit>>> {
+        match self {
+            Self::Single => None,
+            Self::Ready(units) => Some(units),
+            Self::Refreshing { displayed, .. } => Some(displayed),
+        }
+    }
+}
+
 /// シーク位置のプレビューを描く。
 ///
 /// `textures` は**着地後に表示されるページと同じ枚数・同じ並び**を受け取る
@@ -3946,7 +3970,7 @@ fn paint_still_seek_preview(
     full_rect: egui::Rect,
     panel_top: f32,
     pointer_x: f32,
-    textures: &[Option<egui::TextureHandle>],
+    textures: &[Option<StillSeekPreviewPage>],
     label: &str,
 ) {
     let pane_count = textures.len().max(1);
@@ -3958,8 +3982,8 @@ fn paint_still_seek_preview(
     let pane_size = textures
         .iter()
         .filter_map(|tex| tex.as_ref())
-        .map(|tex| {
-            let size = tex.size_vec2();
+        .map(|page| {
+            let size = rotated_display_size(page.texture.size_vec2(), page.rotation);
             let scale = (per_pane_max_width / size.x.max(1.0))
                 .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
             size * scale
@@ -4017,12 +4041,15 @@ fn paint_still_seek_preview(
             egui::vec2(pane_width, image_bounds.height()),
         );
         match texture {
-            Some(tex) => {
-                painter.image(
-                    tex.id(),
-                    fit_texture_rect(tex.size_vec2(), pane_bounds),
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+            Some(page) => {
+                crate::app::draw_rotated_image(
+                    painter,
+                    page.texture.id(),
+                    fit_texture_rect(
+                        rotated_display_size(page.texture.size_vec2(), page.rotation),
+                        pane_bounds,
+                    ),
+                    page.rotation,
                 );
             }
             None => {
@@ -11335,6 +11362,26 @@ pub(crate) struct SpreadDisplayUnitsCache {
 }
 
 impl SpreadDisplayUnitsCache {
+    /// A rotation reload does not erase the already displayed unit mapping.
+    /// Keep its input widgets/targets alive until the new metadata is ready, but
+    /// never reuse it across a different book, order, mode, or shift anchor.
+    fn units_during_rotation_reload(
+        &self,
+        nav: &[usize],
+        generation: u64,
+        mode: SpreadMode,
+        shift_anchor: Option<usize>,
+    ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
+        self.token
+            .as_ref()
+            .filter(|token| {
+                token.identifies_nav(nav, generation)
+                    && token.spread_mode == mode
+                    && token.shift_anchor_idx == shift_anchor
+            })
+            .map(|_| Arc::clone(&self.units))
+    }
+
     fn get(
         &self,
         nav: &[usize],
@@ -16555,6 +16602,39 @@ impl App {
         format_fullscreen_page_number_label(total, &positions)
     }
 
+    /// Labels in the seek overlay consume its prepared unit snapshot. Calling the
+    /// general resolver here would reopen the synchronous rotation-read path.
+    fn still_seek_label_for_prepared_units(
+        &self,
+        page_idx: usize,
+        info: &FsSeekInfo,
+        continuous: bool,
+        units: Option<&[SpreadDisplayUnit]>,
+    ) -> Option<String> {
+        let pair = if continuous || !self.spread_mode.is_spread() {
+            SpreadPair::Single
+        } else if let Some((left, right)) = self.fullscreen_page_layout.spread_pair()
+            && (page_idx == left || page_idx == right)
+        {
+            SpreadPair::Double { left, right }
+        } else {
+            units
+                .and_then(|units| find_spread_display_unit(units, page_idx))
+                .map_or(SpreadPair::Single, |(_, unit)| {
+                    unit.spread_pair(self.spread_mode)
+                })
+        };
+        let pages = match pair {
+            SpreadPair::Single => vec![page_idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        let positions = pages
+            .into_iter()
+            .filter_map(|idx| image_reading_position(&info.image_indices, idx))
+            .collect::<Vec<_>>();
+        format_fullscreen_page_number_label(info.image_indices.len(), &positions)
+    }
+
     pub(crate) fn fullscreen_page_number_label(&mut self, fs_idx: usize) -> Option<String> {
         // 毎フレーム呼ばれる (overlay 既定 ON)。display order の clone + 全 items の
         // filter+collect を避け、シークバーと共有のキャッシュ済み reading indices を使う。
@@ -16706,6 +16786,7 @@ impl App {
         touch_chrome_latched: bool,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
+        self.poll_still_seek_rotations();
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
@@ -16869,10 +16950,41 @@ impl App {
         let strip_is_rtl = directions.strip_rtl;
         let bar_is_rtl = directions.bar_rtl;
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
+        // The shared spread resolver also reads rotations on a cache miss. Prepare
+        // its complete dependency before invoking it, so this overlay cannot reach
+        // SQLite indirectly via pairing or page-number labels either. A reload
+        // retains the displayed mapping so it cannot swallow a release event.
+        let spread_preparation = if self.spread_mode.is_spread() {
+            let nav = self.get_nav_indices();
+            if self.rotation_cache.has_rotations_for_nav(&nav) {
+                StillSeekSpreadPreparation::Ready(self.build_spread_display_units_for_nav(&nav))
+            } else if let Some(displayed) = self
+                .spread_display_units_cache
+                .units_during_rotation_reload(
+                    &nav,
+                    self.items_generation,
+                    self.spread_mode,
+                    self.spread_shift_anchor_idx,
+                )
+            {
+                StillSeekSpreadPreparation::Refreshing { nav, displayed }
+            } else {
+                self.start_still_seek_rotations(ctx, &nav);
+                painter.text(
+                    content_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読み込み中…",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(170),
+                );
+                return None;
+            }
+        } else {
+            StillSeekSpreadPreparation::Single
+        };
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
-            let nav = self.get_nav_indices();
-            let units = self.build_spread_display_units_for_nav(&nav);
+            let units = Arc::clone(spread_preparation.units().expect("prepared spread"));
             match find_spread_display_unit(&units, fs_idx) {
                 Some((unit_index, _)) => Some((units, unit_index)),
                 None => None,
@@ -16885,8 +16997,7 @@ impl App {
         // (`continuous_reading_units_and_pos` が見開きユニットで段を組む)。シークの粒度は
         // ページのままにしつつ、プレビューの枚数だけはその並びに合わせる。
         let continuous_preview_units = if continuous_label_mode && self.spread_mode.is_spread() {
-            let nav = self.get_nav_indices();
-            Some(self.build_spread_display_units_for_nav(&nav))
+            spread_preparation.units().cloned()
         } else {
             None
         };
@@ -16899,6 +17010,7 @@ impl App {
             .into_iter()
             .collect();
         let mut requested_pages = Vec::new();
+        let mut requested_rotations = Vec::new();
         let mut preview: Option<ResolvedStillSeekTarget> = None;
         let mut preview_pointer_x = None;
         let mut target = None;
@@ -16924,17 +17036,15 @@ impl App {
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
             let strip_layout_center = self.fs_seek_gesture.strip_layout_center(info.current_pos);
-            // 回転取得は &mut self を取るため、列が参照し得る数十件を先に既存の一括 cache
-            // 経路で取り出す。レイアウト closure 内では DB / App を一切参照しない。
+            // Layout reads memory only. Unknown rotation stops growth on that
+            // side, rather than briefly placing a cell with the wrong aspect.
             let rotation_candidates = still_seek_strip_rotation_candidates(
                 &info.image_indices,
                 strip_layout_center,
                 strip_content.width(),
                 cell_height,
             );
-            let rotations = self.get_rotations_for_indices(&rotation_candidates);
-            let strip_rotations: HashMap<usize, crate::rotation_db::Rotation> =
-                rotation_candidates.into_iter().zip(rotations).collect();
+            requested_rotations.extend(rotation_candidates);
             let layout = still_seek_strip_layout(
                 &info.image_indices,
                 strip_layout_center,
@@ -16942,13 +17052,12 @@ impl App {
                 cell_height,
                 strip_is_rtl,
                 |idx| match self.thumbnails.get(idx) {
-                    Some(ThumbnailState::Loaded { tex, .. }) => StillSeekStripThumbnail::Loaded(
-                        tex.size_vec2(),
-                        strip_rotations
-                            .get(&idx)
-                            .copied()
-                            .unwrap_or(crate::rotation_db::Rotation::None),
-                    ),
+                    Some(ThumbnailState::Loaded { tex, .. }) => self
+                        .rotation_cache
+                        .get(&idx)
+                        .map_or(StillSeekStripThumbnail::Unavailable, |&rotation| {
+                            StillSeekStripThumbnail::Loaded(tex.size_vec2(), rotation)
+                        }),
                     Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
                     Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
                         StillSeekStripThumbnail::Unavailable
@@ -17294,7 +17403,12 @@ impl App {
                     |(units, _)| units[display_pos].anchor_idx(),
                 );
                 let label = self
-                    .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
+                    .still_seek_label_for_prepared_units(
+                        label_idx,
+                        &info,
+                        continuous_label_mode,
+                        preview_units,
+                    )
                     .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
                 painter.text(
                     label_rect.center(),
@@ -17308,20 +17422,33 @@ impl App {
 
         if let Some(preview) = preview.as_ref() {
             requested_pages.extend(preview.preview_pages.iter().copied());
+            requested_rotations.extend(preview.preview_pages.iter().copied());
         }
         self.ensure_still_seek_thumbnail_requests(ctx, &requested_pages);
+        requested_rotations.sort_unstable();
+        requested_rotations.dedup();
+        let rotation_indices = match &spread_preparation {
+            StillSeekSpreadPreparation::Refreshing { nav, .. } => nav.as_slice(),
+            _ => &requested_rotations,
+        };
+        self.start_still_seek_rotations(ctx, rotation_indices);
         if let Some(preview) = preview.as_ref() {
             // 画面上の並びに合わせる。右→左読みでは元ページ順の逆から見える。
             let mut pages = preview.preview_pages.clone();
             if strip_is_rtl {
                 pages.reverse();
             }
-            let textures: Vec<Option<egui::TextureHandle>> = pages
+            let textures: Vec<Option<StillSeekPreviewPage>> = pages
                 .iter()
                 .map(|idx| {
                     self.thumbnails.get(*idx).and_then(|state| {
                         if let ThumbnailState::Loaded { tex, .. } = state {
-                            Some(tex.clone())
+                            self.rotation_cache
+                                .get(idx)
+                                .map(|&rotation| StillSeekPreviewPage {
+                                    texture: tex.clone(),
+                                    rotation,
+                                })
                         } else {
                             None
                         }
@@ -17331,10 +17458,11 @@ impl App {
             // ラベルは着地先から作る。見開きなら既存のページ番号表記がそのまま
             // ペア表記 (`12-13 / 180` / `13,12 / 180`) になる。
             let label = self
-                .fullscreen_page_number_label_for_info(
+                .still_seek_label_for_prepared_units(
                     preview.landing_idx,
                     &info,
                     continuous_label_mode,
+                    preview_units,
                 )
                 .unwrap_or_default();
             paint_still_seek_preview(
@@ -41497,6 +41625,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    mod still_seek_rotation;
     use super::*;
 
     #[test]
@@ -54130,6 +54259,12 @@ mod tests {
             .collect();
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
         app.image_metas = vec![Some((0, 0)); app.items.len()];
+        // This fixture exercises thumbnail request lifetime with known metadata.
+        // Cold rotation reads now have their own asynchronous regression fixture.
+        app.rotation_cache = (0..app.items.len())
+            .map(|idx| (idx, crate::rotation_db::Rotation::None))
+            .collect::<HashMap<_, _>>()
+            .into();
         app.visible_indices = (0..app.items.len()).collect();
         app.details_order = app.visible_indices.clone();
         app.fullscreen_idx = Some(3);
