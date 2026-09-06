@@ -275,7 +275,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `name_bulk_indexer.rs` | Ctrl+S 初期バルクスキャンの本体 |
 | `global_search.rs` | Ctrl+G streaming クエリワーカー (Searcher snapshot 固定 + ページング post-filter) |
 | `global_search_ui.rs` | Ctrl+G 検索バー + drill-down ビュー + Aggregated / DrilledInto 集約 |
-| `similar_image.rs` / `similar_index.rs` | 画像ファイル・ZIP ページ・PDF ページを共通 Proxy に変換する入口と、`auto_index_similar` が有効なお気に入りの差分照合・線形検索。対象変更と watcher 通知は単一 scheduler に coalesce し、UI スレッドでは I/O しない。走査は全体 16・同一ドライブまたは UNC server/share 8 まで並列化し、操作中は既存 `ActivityGate` で 1 / 1、明示的一時停止中は 0 / 0 に落とす。本は 1 冊を同じ作業単位に保ち、全ページを新 generation へ書いてから Complete を原子的に公開する |
+| `similar_image.rs` / `similar_index.rs` | 画像ファイル・ZIP ページ・PDF ページを共通 Proxy に変換する入口と、`auto_index_similar` が有効なお気に入りの差分照合・線形検索。対象変更と watcher 通知は単一 scheduler に coalesce し、UI スレッドでは I/O しない。単体照会は origin key + memory epoch の 1 件 cache を持ち、同じ結果の全件走査と hit 文字列 clone を repaint ごとに繰り返さない。走査中は Complete 済みのメモリ snapshot を保持し、最後の pass が終わった時だけ破棄・再読込する。走査は全体 16・同一ドライブまたは UNC server/share 8 まで並列化し、操作中は既存 `ActivityGate` で 1 / 1、明示的一時停止中は 0 / 0 に落とす。本は 1 冊を同じ作業単位に保ち、全ページを新 generation へ書いてから Complete を原子的に公開する |
 | `similar_db.rs` | 別バージョン検索用 `similar.db`。PDQ-256、品質値、寸法・形式・保存場所を保持し、本のページは新 generation を作り終えてから Complete へ原子的に公開する |
 | `io_semaphore.rs` | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 (Low/Normal/High) |
 | `tags_db.rs` | `%APPDATA%/mimageviewer/tags.db`。`item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本。最初のタグ書き込み前に `tags.db.bak1..bak10` の世代バックアップをローテート。設定 ON 時だけ `mimageviewer.dat` に実ファイルタグをバックアップし、import 同期状態はタグ用に独立管理する |

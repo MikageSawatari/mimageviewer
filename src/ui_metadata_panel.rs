@@ -195,15 +195,15 @@ impl SimilarPanelState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SimilarPanelModel {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimilarPanelModel<'a> {
     NoIndex,
     Preparing,
     NotIndexed,
     Featureless,
     Empty,
-    Results(Vec<crate::similar_index::QueryHit>),
-    Failed(String),
+    Results(&'a [crate::similar_index::QueryHit]),
+    Failed(&'a str),
 }
 
 #[derive(Default)]
@@ -213,7 +213,7 @@ struct SimilarPanelActions {
     hovered_hit: Option<crate::similar_index::QueryHit>,
 }
 
-fn similar_panel_model(query: crate::similar_index::ItemQuery) -> SimilarPanelModel {
+fn similar_panel_model(query: &crate::similar_index::ItemQuery) -> SimilarPanelModel<'_> {
     match query {
         crate::similar_index::ItemQuery::NoIndex => SimilarPanelModel::NoIndex,
         crate::similar_index::ItemQuery::Preparing => SimilarPanelModel::Preparing,
@@ -248,10 +248,19 @@ fn similar_location_line(hit: &crate::similar_index::QueryHit) -> String {
         return hit.item_key.clone();
     };
     match target {
-        crate::similar_index::SimilarItemTarget::File(path) => path
-            .parent()
-            .map(|parent| parent.display().to_string())
-            .unwrap_or_else(|| path.display().to_string()),
+        crate::similar_index::SimilarItemTarget::File(path) => {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            path.parent().map_or(file_name.clone(), |parent| {
+                format!(
+                    "{} / {}",
+                    file_name,
+                    crate::ui_dialogs::context_menu::native_path_text(parent)
+                )
+            })
+        }
         crate::similar_index::SimilarItemTarget::ZipPage {
             zip_path,
             entry_name,
@@ -259,6 +268,30 @@ fn similar_location_line(hit: &crate::similar_index::QueryHit) -> String {
         crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => {
             format!("{} / Page {}", pdf_path.display(), page_num + 1)
         }
+    }
+}
+
+fn similar_copy_path_text(hit: &crate::similar_index::QueryHit) -> String {
+    let Some(target) = crate::similar_index::target_for_hit(hit) else {
+        return hit.item_key.clone();
+    };
+    match target {
+        crate::similar_index::SimilarItemTarget::File(path) => {
+            crate::ui_dialogs::context_menu::native_path_text(&path)
+        }
+        crate::similar_index::SimilarItemTarget::ZipPage {
+            zip_path,
+            entry_name,
+        } => format!(
+            "{}:{}",
+            crate::ui_dialogs::context_menu::native_path_text(&zip_path),
+            entry_name
+        ),
+        crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, page_num } => format!(
+            "{}:Page {}",
+            crate::ui_dialogs::context_menu::native_path_text(&pdf_path),
+            page_num + 1
+        ),
     }
 }
 
@@ -790,15 +823,16 @@ impl App {
                         .as_ref()
                         .and_then(crate::app::similar_index_item_key);
                     self.similar_panel.begin_origin(origin_key);
-                    let query = current_item
-                        .as_ref()
-                        .map_or(crate::similar_index::ItemQuery::NotIndexed, |item| {
-                            self.query_similar_item(item)
-                        });
-                    let model = similar_panel_model(query);
+                    let query = current_item.as_ref().map_or_else(
+                        || std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed),
+                        |item| self.query_similar_item(item),
+                    );
+                    let results_are_stale = self.similar_query_results_are_stale();
+                    let model = similar_panel_model(query.as_ref());
                     draw_similar_panel(
                         ui,
-                        &model,
+                        model,
+                        results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
                         self.settings.thumb_quality,
@@ -1895,7 +1929,8 @@ fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
 #[allow(clippy::too_many_arguments)]
 fn draw_similar_panel(
     ui: &mut egui::Ui,
-    model: &SimilarPanelModel,
+    model: SimilarPanelModel<'_>,
+    results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
     thumb_quality: u8,
@@ -1904,6 +1939,21 @@ fn draw_similar_panel(
     ctx: &egui::Context,
     actions: &mut SimilarPanelActions,
 ) {
+    if results_are_stale
+        && !matches!(
+            model,
+            SimilarPanelModel::NoIndex
+                | SimilarPanelModel::Preparing
+                | SimilarPanelModel::Failed(_)
+        )
+    {
+        ui.label(
+            egui::RichText::new("索引を更新中です。変更は更新完了後に結果へ反映されます")
+                .color(DIM_COLOR)
+                .size(11.0),
+        );
+        ui.add_space(8.0);
+    }
     match model {
         SimilarPanelModel::NoIndex => {
             ui.label("索引がありません");
@@ -2036,6 +2086,12 @@ fn draw_similar_panel(
                     .response
                     .interact(egui::Sense::click());
                 let response = response.on_hover_text("クリックで移動 / X で比較画像に設定");
+                response.context_menu(|ui| {
+                    if ui.button("パスをコピー").clicked() {
+                        ctx.copy_text(similar_copy_path_text(hit));
+                        ui.close();
+                    }
+                });
                 if response.clicked() {
                     actions.open_hit = Some(hit.clone());
                 }
@@ -2126,7 +2182,8 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
             let ctx = ui.ctx().clone();
             draw_similar_panel(
                 ui,
-                &SimilarPanelModel::Results(hits),
+                SimilarPanelModel::Results(&hits),
+                true,
                 &mut state,
                 72,
                 85,
@@ -2986,7 +3043,10 @@ mod format_datetime_tests {
 
 #[cfg(test)]
 mod similar_panel_tests {
-    use super::{SimilarPanelModel, similar_difference_line, similar_panel_model};
+    use super::{
+        SimilarPanelModel, similar_copy_path_text, similar_difference_line, similar_location_line,
+        similar_panel_model,
+    };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
     use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
@@ -3013,25 +3073,39 @@ mod similar_panel_tests {
     #[test]
     fn five_empty_states_remain_distinct_typed_models() {
         assert_eq!(
-            similar_panel_model(ItemQuery::NoIndex),
+            similar_panel_model(&ItemQuery::NoIndex),
             SimilarPanelModel::NoIndex
         );
         assert_eq!(
-            similar_panel_model(ItemQuery::Preparing),
+            similar_panel_model(&ItemQuery::Preparing),
             SimilarPanelModel::Preparing
         );
         assert_eq!(
-            similar_panel_model(ItemQuery::NotIndexed),
+            similar_panel_model(&ItemQuery::NotIndexed),
             SimilarPanelModel::NotIndexed
         );
         assert_eq!(
-            similar_panel_model(ItemQuery::Featureless),
+            similar_panel_model(&ItemQuery::Featureless),
             SimilarPanelModel::Featureless
         );
         assert_eq!(
-            similar_panel_model(ItemQuery::Ready(Vec::new())),
+            similar_panel_model(&ItemQuery::Ready(Vec::new())),
             SimilarPanelModel::Empty
         );
+    }
+
+    #[test]
+    fn loose_image_location_names_the_file_and_copy_uses_the_full_path() {
+        let hit = hit(ItemKind::Image, SimilarImageFormat::Png);
+        let location = similar_location_line(&hit);
+        assert!(location.starts_with("copy.png / "), "{location}");
+        assert!(location.contains("pictures"), "{location}");
+
+        let copied = similar_copy_path_text(&hit);
+        assert!(copied.ends_with("copy.png"), "{copied}");
+        assert!(copied.contains("pictures"), "{copied}");
+        #[cfg(windows)]
+        assert!(!copied.contains('/'), "{copied}");
     }
 
     #[test]

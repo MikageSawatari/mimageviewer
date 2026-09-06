@@ -463,7 +463,7 @@ fn build_delete_confirm_label(
     label
 }
 
-fn native_path_text(path: &Path) -> String {
+pub(crate) fn native_path_text(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
     #[cfg(windows)]
     {

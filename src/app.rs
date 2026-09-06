@@ -20663,11 +20663,18 @@ impl App {
         self.similar_index.progress()
     }
 
-    pub(crate) fn query_similar_item(&self, item: &GridItem) -> crate::similar_index::ItemQuery {
+    pub(crate) fn query_similar_item(
+        &self,
+        item: &GridItem,
+    ) -> Arc<crate::similar_index::ItemQuery> {
         let Some(key) = similar_index_item_key(item) else {
-            return crate::similar_index::ItemQuery::NotIndexed;
+            return Arc::new(crate::similar_index::ItemQuery::NotIndexed);
         };
         self.similar_index.query_item(&key)
+    }
+
+    pub(crate) fn similar_query_results_are_stale(&self) -> bool {
+        self.similar_index.query_results_are_stale()
     }
 
     pub(crate) fn query_similar_book(&self, item: &GridItem) -> crate::similar_index::BookQuery {

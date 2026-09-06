@@ -166,6 +166,7 @@ pub struct SimilarIndexManager {
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
+    item_query: Mutex<ItemQueryCache>,
     book_query: Arc<Mutex<BookQueryState>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
     scheduler: Arc<SimilarIndexScheduler>,
@@ -198,6 +199,7 @@ impl SimilarIndexManager {
             memory,
             summary,
             memory_epoch,
+            item_query: Mutex::new(ItemQueryCache::default()),
             book_query,
             enabled_roots,
             scheduler,
@@ -241,34 +243,48 @@ impl SimilarIndexManager {
             .clone()
     }
 
-    pub fn query_item(&self, item_key: &str) -> ItemQuery {
-        if !self.item_is_enabled(item_key) {
-            return ItemQuery::NotIndexed;
-        }
-        let running = matches!(self.progress(), IndexProgress::Running(_));
-        let mut state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        match &*state {
-            MemoryState::Unloaded => {
-                self.start_memory_load(&mut state);
-                ItemQuery::Preparing
+    /// 同じ表示項目と同じメモリ snapshot への照会は Arc ごと再利用する。
+    /// 数百万件の線形走査と hit の文字列 clone を repaint ごとに繰り返さない。
+    pub fn query_item(&self, item_key: &str) -> Arc<ItemQuery> {
+        let epoch = self.memory_epoch.load(Ordering::Acquire);
+        cached_item_query(&self.item_query, item_key, epoch, || {
+            if !self.item_is_enabled(item_key) {
+                return ItemQuery::NotIndexed;
             }
-            MemoryState::Missing if running => ItemQuery::Preparing,
-            MemoryState::Missing => ItemQuery::NoIndex,
-            MemoryState::Loading => ItemQuery::Preparing,
-            MemoryState::Failed(error) => ItemQuery::Failed(error.clone()),
-            MemoryState::Ready(index) => {
-                let mut result = query_item_ready(index, item_key);
-                if let ItemQuery::Ready(hits) = &mut result {
-                    let roots = self.enabled_roots.read().unwrap_or_else(|e| e.into_inner());
-                    hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
-                }
-                if running && matches!(result, ItemQuery::NotIndexed) {
+            let running = matches!(self.progress(), IndexProgress::Running(_));
+            let mut state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+            match &*state {
+                MemoryState::Unloaded => {
+                    self.start_memory_load(&mut state);
                     ItemQuery::Preparing
-                } else {
-                    result
+                }
+                MemoryState::Missing if running => ItemQuery::Preparing,
+                MemoryState::Missing => ItemQuery::NoIndex,
+                MemoryState::Loading => ItemQuery::Preparing,
+                MemoryState::Failed(error) => ItemQuery::Failed(error.clone()),
+                MemoryState::Ready(index) => {
+                    let mut result = query_item_ready(index, item_key);
+                    if let ItemQuery::Ready(hits) = &mut result {
+                        let roots = self.enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+                        hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
+                    }
+                    if running && matches!(result, ItemQuery::NotIndexed) {
+                        ItemQuery::Preparing
+                    } else {
+                        result
+                    }
                 }
             }
-        }
+        })
+    }
+
+    /// 走査中に Complete 済みの旧 snapshot を表示しているかを UI へ伝える。
+    pub fn query_results_are_stale(&self) -> bool {
+        matches!(self.progress(), IndexProgress::Running(_))
+            && matches!(
+                &*self.memory.lock().unwrap_or_else(|e| e.into_inner()),
+                MemoryState::Ready(_)
+            )
     }
 
     /// お気に入り編集の状態表示用集計。署名本体は読まず、DB I/O は専用 worker で行う。
@@ -392,14 +408,17 @@ impl SimilarIndexManager {
                 })
             }
             .map_err(|error| format!("similar index load failed: {error}"));
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             if epoch_guard.load(Ordering::Acquire) != epoch {
                 return;
             }
-            *state.lock().unwrap_or_else(|e| e.into_inner()) = match loaded {
+            *state = match loaded {
                 Ok(Some(index)) => MemoryState::Ready(index),
                 Ok(None) => MemoryState::Missing,
                 Err(error) => MemoryState::Failed(error),
             };
+            // Preparing を含む item query cache を次の repaint で更新させる。
+            epoch_guard.fetch_add(1, Ordering::AcqRel);
         });
     }
 
@@ -499,7 +518,7 @@ impl SimilarIndexScheduler {
         if !roots_changed {
             return;
         }
-        self.invalidate_loaded_state();
+        self.retain_loaded_snapshot_during_run();
         // 対象変更時だけ現在の旧 snapshot 走査を止める。watcher 通知は coalesce し、
         // 進行中の一巡を完了させてから最新状態をもう一度照合する。
         if let Some(cancel) = self
@@ -596,6 +615,7 @@ impl SimilarIndexScheduler {
         *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
         register_prefill_db(&db, &self.enabled_roots);
 
+        let mut first_pass = true;
         loop {
             let (revision, config, cancel, purge_roots) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -619,6 +639,12 @@ impl SimilarIndexScheduler {
                     current_path: None,
                     report: IndexReport::default(),
                 });
+            if first_pass {
+                // Running への遷移も NotIndexed/NoIndex の意味を変える。snapshot 本体は保持したまま
+                // epoch を進め、開始直前に cache された状態だけを 1 回更新する。
+                self.retain_loaded_snapshot_during_run();
+                first_pass = false;
+            }
             let keep_roots = config
                 .roots
                 .iter()
@@ -645,8 +671,6 @@ impl SimilarIndexScheduler {
                         report
                     })
                 });
-            self.invalidate_loaded_state();
-
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.shutdown {
                 return;
@@ -663,9 +687,19 @@ impl SimilarIndexScheduler {
             };
             state.worker_running = false;
             *self.active_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            drop(state);
+            // coalesce された中間 pass では旧 snapshot を保持する。最後の pass が全 in-flight
+            // を回収した後だけ捨てるため、更新中の照会が SQLite 全件 reload を繰り返さない。
+            self.invalidate_loaded_state();
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
             return;
         }
+    }
+
+    fn retain_loaded_snapshot_during_run(&self) {
+        self.memory_epoch.fetch_add(1, Ordering::AcqRel);
+        retain_ready_memory_or_unload(&mut self.memory.lock().unwrap_or_else(|e| e.into_inner()));
+        *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
     }
 
     fn invalidate_loaded_state(&self) {
@@ -722,6 +756,49 @@ enum BookQueryState {
     Idle,
     Loading { item_key: String },
     Ready { item_key: String, result: BookQuery },
+}
+
+#[derive(Default)]
+struct ItemQueryCache {
+    entry: Option<CachedItemQuery>,
+}
+
+struct CachedItemQuery {
+    item_key: String,
+    memory_epoch: u64,
+    result: Arc<ItemQuery>,
+}
+
+fn cached_item_query(
+    cache: &Mutex<ItemQueryCache>,
+    item_key: &str,
+    memory_epoch: u64,
+    compute: impl FnOnce() -> ItemQuery,
+) -> Arc<ItemQuery> {
+    if let Some(result) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry
+        .as_ref()
+        .filter(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
+        .map(|entry| Arc::clone(&entry.result))
+    {
+        return result;
+    }
+
+    let result = Arc::new(compute());
+    cache.lock().unwrap_or_else(|e| e.into_inner()).entry = Some(CachedItemQuery {
+        item_key: item_key.to_owned(),
+        memory_epoch,
+        result: Arc::clone(&result),
+    });
+    result
+}
+
+fn retain_ready_memory_or_unload(state: &mut MemoryState) {
+    if !matches!(state, MemoryState::Ready(_)) {
+        *state = MemoryState::Unloaded;
+    }
 }
 
 struct MemoryIndex {
@@ -2425,6 +2502,59 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    #[ignore = "manual measurement against a caller-selected similar.db"]
+    fn measure_real_store_load_and_uncached_query() {
+        let db_path = std::env::var_os("MIV_SIMILAR_BENCH_DB")
+            .map(PathBuf::from)
+            .expect("set MIV_SIMILAR_BENCH_DB");
+        let load_started = std::time::Instant::now();
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        let rows = db.load_search_rows(current_hash_version()).unwrap();
+        let row_count = rows.len();
+        let index = MemoryIndex::from_rows(rows);
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let origin_key = std::env::var("MIV_SIMILAR_BENCH_ORIGIN").unwrap_or_else(|_| {
+            index
+                .rows
+                .values()
+                .filter(|item| item.quality > 0)
+                .map(|item| &item.item_key)
+                .min()
+                .expect("store has no non-featureless item")
+                .clone()
+        });
+        let mut query_ms = Vec::new();
+        let mut hit_count = 0;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let result = std::hint::black_box(query_item_ready(&index, &origin_key));
+            query_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            hit_count = match result {
+                ItemQuery::Ready(hits) => hits.len(),
+                other => panic!("unexpected benchmark result: {other:?}"),
+            };
+        }
+        let cache = Mutex::new(ItemQueryCache::default());
+        let cache_miss_started = std::time::Instant::now();
+        let cached = cached_item_query(&cache, &origin_key, 7, || {
+            query_item_ready(&index, &origin_key)
+        });
+        let cache_miss_ms = cache_miss_started.elapsed().as_secs_f64() * 1000.0;
+        let mut cache_hit_ms = Vec::new();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let again = std::hint::black_box(cached_item_query(&cache, &origin_key, 7, || {
+                panic!("cache hit recomputed the query")
+            }));
+            cache_hit_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert!(Arc::ptr_eq(&cached, &again));
+        }
+        eprintln!(
+            "similar_query_measurement rows={row_count} load_ms={load_ms:.3} query_ms={query_ms:?} cache_miss_ms={cache_miss_ms:.3} cache_hit_ms={cache_hit_ms:?} hits={hit_count} origin={origin_key:?}"
+        );
+    }
+
     #[derive(Default)]
     struct StubConcurrency {
         current_global: usize,
@@ -2666,6 +2796,60 @@ mod tests {
     fn featureless_origin_is_typed_not_an_empty_result() {
         let index = MemoryIndex::from_rows(vec![row(1, "blank", [0; 32], 0)]);
         assert_eq!(query_item_ready(&index, "blank"), ItemQuery::Featureless);
+    }
+
+    #[test]
+    fn item_query_cache_changes_only_with_origin_or_memory_epoch() {
+        let cache = Mutex::new(ItemQueryCache::default());
+        let computes = AtomicUsize::new(0);
+        let compute = || {
+            computes.fetch_add(1, Ordering::Relaxed);
+            ItemQuery::Ready(Vec::new())
+        };
+
+        let first = cached_item_query(&cache, "origin-a", 4, compute);
+        let same = cached_item_query(&cache, "origin-a", 4, compute);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(computes.load(Ordering::Relaxed), 1);
+
+        let other_origin = cached_item_query(&cache, "origin-b", 4, compute);
+        assert!(!Arc::ptr_eq(&same, &other_origin));
+        let other_epoch = cached_item_query(&cache, "origin-b", 5, compute);
+        assert!(!Arc::ptr_eq(&other_origin, &other_epoch));
+        assert_eq!(computes.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn active_run_keeps_only_a_complete_loaded_snapshot() {
+        let ready = Arc::new(MemoryIndex::from_rows(vec![row(1, "origin", [0; 32], 1)]));
+        let mut state = MemoryState::Ready(Arc::clone(&ready));
+        retain_ready_memory_or_unload(&mut state);
+        let MemoryState::Ready(retained) = state else {
+            panic!("complete snapshot was dropped");
+        };
+        assert!(Arc::ptr_eq(&ready, &retained));
+
+        let mut loading = MemoryState::Loading;
+        retain_ready_memory_or_unload(&mut loading);
+        assert!(matches!(loading, MemoryState::Unloaded));
+    }
+
+    #[test]
+    fn stale_indicator_requires_a_running_job_and_a_loaded_snapshot() {
+        let manager = SimilarIndexManager::new(PathBuf::from("unused-test-data-dir"));
+        *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
+            stage: IndexStage::Scanning,
+            current_path: None,
+            report: IndexReport::default(),
+        });
+        assert!(!manager.query_results_are_stale());
+
+        *manager.memory.lock().unwrap() = MemoryState::Ready(Arc::new(MemoryIndex::from_rows(
+            vec![row(1, "origin", [0; 32], 1)],
+        )));
+        assert!(manager.query_results_are_stale());
+        *manager.progress.lock().unwrap() = IndexProgress::Idle;
+        assert!(!manager.query_results_are_stale());
     }
 
     #[test]

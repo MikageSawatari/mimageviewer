@@ -319,7 +319,7 @@ fn metadata_panel_similar_results_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_similar_results_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        egui::vec2(400.0, 390.0),
+        egui::vec2(400.0, 430.0),
         None,
         |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
     );
