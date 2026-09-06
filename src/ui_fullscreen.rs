@@ -3279,17 +3279,32 @@ struct ResolvedStillSeekTarget {
     display_pos: usize,
 }
 
+/// シーク位置から、プレビューに出すページと着地先を解く。
+///
+/// **ユニットを 2 つ受ける。** 連結読みではシークがページ単位なのに、見開き設定なら
+/// 画面には 2 ページ並ぶ (`continuous_reading_units_and_pos` が見開きユニットで段を組む)。
+/// 着地の粒度 (`landing_units`) と、プレビューの枚数 (`preview_units`) は同じではない。
+/// 1 つにまとめていた版は、連結読み + 見開きでプレビューが 1 枚になった
+/// (2026-09-05 利用者報告)。ページ送りの挙動は `landing_units` 側だけが決める。
 fn resolve_still_seek_target(
     image_indices: &[usize],
-    spread_units: Option<&[SpreadDisplayUnit]>,
+    landing_units: Option<&[SpreadDisplayUnit]>,
+    preview_units: Option<&[SpreadDisplayUnit]>,
     position: StillSeekPosition,
 ) -> Option<ResolvedStillSeekTarget> {
     if image_indices.is_empty() {
         return None;
     }
+    /// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
+    fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
+        units
+            .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
+            .map(|unit| unit.pages.clone())
+            .unwrap_or_else(|| vec![idx])
+    }
     match position {
         StillSeekPosition::TrackFraction(fraction) => {
-            if let Some(units) = spread_units.filter(|units| !units.is_empty()) {
+            if let Some(units) = landing_units.filter(|units| !units.is_empty()) {
                 let display_pos = spread_seek_unit_from_fraction(fraction, units.len());
                 let landing_idx = units[display_pos].anchor_idx();
                 Some(ResolvedStillSeekTarget {
@@ -3306,7 +3321,7 @@ fn resolve_still_seek_target(
                 .min(image_indices.len() - 1);
                 let landing_idx = image_indices[display_pos];
                 Some(ResolvedStillSeekTarget {
-                    preview_pages: vec![landing_idx],
+                    preview_pages: pages_on_screen_with(landing_idx, preview_units),
                     landing_idx,
                     display_pos,
                 })
@@ -3315,7 +3330,7 @@ fn resolve_still_seek_target(
         StillSeekPosition::SourcePosition(source_pos) => {
             let source_pos = source_pos.min(image_indices.len() - 1);
             let pointed_idx = image_indices[source_pos];
-            let unit = spread_units.and_then(|units| {
+            let unit = landing_units.and_then(|units| {
                 units.iter().enumerate().find_map(|(unit_pos, unit)| {
                     unit.pages
                         .contains(&pointed_idx)
@@ -3324,7 +3339,11 @@ fn resolve_still_seek_target(
             });
             let (preview_pages, landing_idx, display_pos) = match unit {
                 Some((unit_pos, unit)) => (unit.pages.clone(), unit.anchor_idx(), unit_pos),
-                None => (vec![pointed_idx], pointed_idx, source_pos),
+                None => (
+                    pages_on_screen_with(pointed_idx, preview_units),
+                    pointed_idx,
+                    source_pos,
+                ),
             };
             Some(ResolvedStillSeekTarget {
                 preview_pages,
@@ -16269,6 +16288,20 @@ impl App {
             None
         };
         let spread_units = spread_seek.as_ref().map(|(units, _)| units.as_slice());
+        // 連結読みでも見開き設定なら画面には 2 ページ並ぶ
+        // (`continuous_reading_units_and_pos` が見開きユニットで段を組む)。シークの粒度は
+        // ページのままにしつつ、プレビューの枚数だけはその並びに合わせる。
+        let continuous_preview_units = if continuous_label_mode && self.spread_mode.is_spread() {
+            let nav = self.get_nav_indices();
+            Some(self.build_spread_display_units_for_nav(&nav))
+        } else {
+            None
+        };
+        let preview_units = spread_units.or_else(|| {
+            continuous_preview_units
+                .as_ref()
+                .map(|units| units.as_slice())
+        });
         let highlighted_pages: HashSet<usize> = spread_seek
             .as_ref()
             .map(|(units, unit_index)| units[*unit_index].pages.iter().copied().collect())
@@ -16334,6 +16367,7 @@ impl App {
                 preview = resolve_still_seek_target(
                     &info.image_indices,
                     spread_units,
+                    preview_units,
                     StillSeekPosition::SourcePosition(source_pos),
                 );
                 preview_pointer_x = pointer.map(|p| p.x);
@@ -16343,6 +16377,7 @@ impl App {
                 && let Some(resolved) = resolve_still_seek_target(
                     &info.image_indices,
                     spread_units,
+                    preview_units,
                     StillSeekPosition::SourcePosition(source_pos),
                 )
             {
@@ -16472,6 +16507,7 @@ impl App {
                     let resolved = resolve_still_seek_target(
                         &info.image_indices,
                         spread_units,
+                        preview_units,
                         StillSeekPosition::TrackFraction(fraction),
                     );
                     if self
@@ -52551,12 +52587,20 @@ mod tests {
                 pages: vec![6, 7],
             },
         ];
-        let track =
-            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::TrackFraction(1.0))
-                .unwrap();
-        let cell =
-            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::SourcePosition(3))
-                .unwrap();
+        let track = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::TrackFraction(1.0),
+        )
+        .unwrap();
+        let cell = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::SourcePosition(3),
+        )
+        .unwrap();
         assert_eq!(track.landing_idx, 6);
         assert_eq!(cell.landing_idx, track.landing_idx);
         // **プレビューは着地後に見えるページと同じ枚数にする。** 7 を指しても、
@@ -52569,7 +52613,8 @@ mod tests {
     fn single_page_reading_previews_exactly_the_page_under_the_pointer() {
         let images = [4, 5, 6, 7];
         let resolved =
-            resolve_still_seek_target(&images, None, StillSeekPosition::SourcePosition(2)).unwrap();
+            resolve_still_seek_target(&images, None, None, StillSeekPosition::SourcePosition(2))
+                .unwrap();
         assert_eq!(resolved.preview_pages, vec![6]);
         assert_eq!(resolved.landing_idx, 6);
     }
@@ -52588,9 +52633,13 @@ mod tests {
                 pages: vec![6],
             },
         ];
-        let resolved =
-            resolve_still_seek_target(&images, Some(&units), StillSeekPosition::SourcePosition(2))
-                .unwrap();
+        let resolved = resolve_still_seek_target(
+            &images,
+            Some(&units),
+            Some(&units),
+            StillSeekPosition::SourcePosition(2),
+        )
+        .unwrap();
         assert_eq!(resolved.preview_pages, vec![6]);
         assert_eq!(resolved.landing_idx, 6);
     }

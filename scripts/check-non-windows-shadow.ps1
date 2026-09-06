@@ -12,6 +12,15 @@ This catches cfg leaks in this repository. It cannot make dependency crates
 compile as if rustc itself targeted Linux, so platform leaks inside dependencies
 (for example wgpu_hal::dx12) remain CI's responsibility. CI is the final word.
 
+The same limit applies to the standard library, and it produces one known false
+positive worth recognising on sight: code under cfg(not(windows)) that names
+std::os::unix fails here with "could not find `unix` in `os`", because rustc is
+still building for Windows whose std gates that module out. The error text says
+so - it points at std's own os/mod.rs with "found an item that was configured
+out". On Linux the module exists and the same code compiles. Do not "fix" the
+source for this; check the rest of the output for real errors instead, and let
+CI judge that line.
+
 CARGO_TARGET_DIR deliberately uses a short path because deep paths can make
 MSBuild FileTracker fail with FTK1011 on Windows.
 #>
@@ -225,11 +234,42 @@ try {
         # deep MSBuild/FileTracker paths during a cold shadow check.
         $env:CARGO_BUILD_JOBS = "1"
     }
-    & cargo check --locked --bin mimageviewer-core --features portable
-    if ($LASTEXITCODE -ne 0) {
-        throw "non-Windows shadow cargo check failed with exit code $LASTEXITCODE"
+    # Capture so the known host-std false positive can be told apart from real
+    # errors. Without this the check is permanently red for any cfg(not(windows))
+    # code that names std::os::unix, and a gate nobody can pass is a gate nobody runs.
+    #
+    # cargo writes diagnostics to stderr, so send stderr to a FILE. Do not use
+    # `2>&1` here: Windows PowerShell 5.1 wraps each native stderr line in an
+    # ErrorRecord and trips -ErrorAction Stop even when cargo exits 0
+    # (CLAUDE.md, "Release Build stderr Trap").
+    $diagnosticsPath = Join-Path ([System.IO.Path]::GetTempPath()) "miv-non-windows-shadow.log"
+    & cargo check --locked --bin mimageviewer-core --features portable 2> $diagnosticsPath
+    $checkExit = $LASTEXITCODE
+    $checkOutput = if (Test-Path $diagnosticsPath) { Get-Content -LiteralPath $diagnosticsPath } else { @() }
+    $checkOutput | ForEach-Object { Write-Output $_ }
+    if ($checkExit -ne 0) {
+        $errorLines = @($checkOutput | Where-Object { "$_" -match "^error(\[E[0-9]+\])?:" })
+        $hostStdOnly = @($errorLines | Where-Object {
+                "$_" -notmatch "could not find ``unix`` in ``os``" -and
+                "$_" -notmatch "^error: could not compile"
+            })
+        if ($errorLines.Count -gt 0 -and $hostStdOnly.Count -eq 0) {
+            Write-Output ""
+            Write-Output "[non-windows-shadow] The only errors are the known host-std limitation:"
+            Write-Output "[non-windows-shadow] rustc still targets Windows here, whose std gates"
+            Write-Output "[non-windows-shadow] out std::os::unix, so cfg(not(windows)) code that"
+            Write-Output "[non-windows-shadow] names it cannot compile on this host. On Linux it"
+            Write-Output "[non-windows-shadow] does. Treating this run as a pass; CI is the judge"
+            Write-Output "[non-windows-shadow] of those lines."
+            $checkPassed = $true
+        }
+        else {
+            throw "non-Windows shadow cargo check failed with exit code $checkExit"
+        }
     }
-    $checkPassed = $true
+    else {
+        $checkPassed = $true
+    }
 }
 finally {
     Pop-Location

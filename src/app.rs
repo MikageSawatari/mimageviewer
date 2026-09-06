@@ -52193,6 +52193,30 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    /// ページ読み込みスケジューラへ渡す viewer context の識別子。
+    ///
+    /// **複数ウィンドウ (detached viewer) は Windows 専用**なので、
+    /// `viewer_contexts` レジストリと `projected_viewer_context_id` は
+    /// `#[cfg(windows)]` にある。非 Windows では context が常に 1 つしかないため、
+    /// 固定値で「同じ context」を表す。スケジューラは serial を等値比較にしか
+    /// 使わない (`supersede_waiting_for_latest_seek` の対象選別) ので、値が何かは
+    /// 問われない。
+    ///
+    /// **`projected_viewer_context_id()` を cfg なしで呼ぶと非 Windows ビルドが壊れる。**
+    /// 2026-09-06 に `scripts/check-non-windows-shadow.ps1` が実際に検出した
+    /// (CI の ubuntu ジョブと同じ種類の失敗)。呼び出しをここへ集約して、次に
+    /// スケジューラを使う人が同じ穴を掘らないようにする。
+    fn fs_page_load_context_serial(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            self.projected_viewer_context_id().serial()
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
     pub(crate) fn fs_pdf_render_context_epoch(_priority: crate::pdf_loader::JobPriority) -> u64 {
         // Fullscreen fs_load is scoped to the open viewer context, not to the main
         // grid context. fs_pending cancel tokens own its lifetime.
@@ -52542,7 +52566,7 @@ impl App {
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
         let ticket = self.fs_page_load_scheduler.request(
-            self.projected_viewer_context_id().serial(),
+            self.fs_page_load_context_serial(),
             idx,
             scheduler_priority,
             contract,
@@ -53230,7 +53254,7 @@ impl App {
             FsPageLoadPriority::Normal
         };
         let ticket = self.fs_page_load_scheduler.request(
-            self.projected_viewer_context_id().serial(),
+            self.fs_page_load_context_serial(),
             idx,
             scheduler_priority,
             FsPageLoadContract::Sequential,
@@ -59813,7 +59837,7 @@ impl App {
                 .is_some_and(|pending| pending.promote_to_high(contract));
         if contract == FsPageLoadContract::LatestSeek && !promoted_waiting {
             self.fs_page_load_scheduler
-                .supersede_waiting_for_latest_seek(self.projected_viewer_context_id().serial());
+                .supersede_waiting_for_latest_seek(self.fs_page_load_context_serial());
         }
     }
 
