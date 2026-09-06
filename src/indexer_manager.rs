@@ -1108,6 +1108,20 @@ mod tests {
         drop(mgr);
     }
 
+    /// 条件が満たされるまで待つ。締切は**ハングの検出だけ**を目的とし、処理の速さは測らない。
+    ///
+    /// 完全な lib テストは 7,500 件超を並列に走らせるので、worker が CPU を得るまでの待ちは
+    /// 機械の混み具合で決まる。単体で 1.3 秒の初回照合が、混雑した完走で 20 秒の締切を一度
+    /// 超えた。締切を機械の負荷が届かない位置へ置き、締切が鳴ったら本当に止まっている、と
+    /// 読めるようにする。
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !ready() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn similar_only_favorite_uses_existing_supervisor_watcher() {
         let tmp = TempDir::new().unwrap();
@@ -1146,26 +1160,16 @@ mod tests {
         );
 
         assert_eq!(manager.supervisor_count(), 1);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !manager.all_supervisors_idle() {
-            assert!(
-                Instant::now() < deadline,
-                "similar-only watcher did not start"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("similar-only watcher did not start", || {
+            manager.all_supervisors_idle()
+        });
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(
-            similar.progress(),
-            crate::similar_index::IndexProgress::Complete(_)
-        ) {
-            assert!(
-                Instant::now() < deadline,
-                "initial similar reconciliation did not complete"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("initial similar reconciliation did not complete", || {
+            matches!(
+                similar.progress(),
+                crate::similar_index::IndexProgress::Complete(_)
+            )
+        });
 
         // 同じ supervisor の watcher が追加と変更を類似索引へ渡すことを確認する。
         // 類似索引用の watcher を別に作る実装では、この結合テストを満たせない。
@@ -1178,23 +1182,12 @@ mod tests {
         let db_path = crate::similar_db::SimilarDb::db_path_at(&similar_data);
         let db = crate::similar_db::SimilarDb::open_at(&db_path).unwrap();
         let item_key = crate::similar_index::item_key_for_file(&image_path);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let rows = db
-                .load_search_rows(crate::similar_db::current_hash_version())
-                .unwrap();
-            if rows
+        wait_until("shared watcher did not reconcile an added image", || {
+            db.load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap()
                 .iter()
                 .any(|row| row.item.item_key == item_key && row.item.width == 24)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "shared watcher did not reconcile an added image"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        });
 
         image::RgbImage::from_fn(37, 31, |x, y| {
             image::Rgb([
@@ -1205,23 +1198,12 @@ mod tests {
         })
         .save(&image_path)
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let rows = db
-                .load_search_rows(crate::similar_db::current_hash_version())
-                .unwrap();
-            if rows
+        wait_until("shared watcher did not reconcile a changed image", || {
+            db.load_search_rows(crate::similar_db::current_hash_version())
+                .unwrap()
                 .iter()
                 .any(|row| row.item.item_key == item_key && row.item.width == 37)
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "shared watcher did not reconcile a changed image"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        });
     }
 
     #[test]
@@ -1233,15 +1215,8 @@ mod tests {
 
         spawn_reconciliation(meta, fts, vec![], Arc::clone(&flag));
         // 完了で false に戻る
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if !flag.load(Ordering::SeqCst) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!("reconciliation flag did not reset");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("reconciliation flag did not reset", || {
+            !flag.load(Ordering::SeqCst)
+        });
     }
 }
