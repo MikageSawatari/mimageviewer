@@ -1695,6 +1695,12 @@ impl MetadataSearchPass2<'_> {
         } else {
             (String::new(), None)
         };
+        // 1 項目のうちに最大 4 回 file を読むので、読み終えるたびに取消を見る。
+        // これが無いと、取り消した検索の worker が残りの読みを最後まで続け、
+        // 次の検索が新しい pool を建てるたびに並列読みが積み上がる。
+        if self.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let name_for_hay = if self.use_name { name.as_str() } else { "" };
         let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
         let matched = match crate::search_query::decide_partial_with_mode(
@@ -1704,6 +1710,9 @@ impl MetadataSearchPass2<'_> {
         ) {
             crate::search_query::PartialResult::Decided(value) => value,
             crate::search_query::PartialResult::NeedsMore => {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let key = crate::adjustment_db::normalize_path(path);
                 let xmp_opt = if self.use_xmp {
                     if let Some(cached) = self.xmp_snapshot.get(&key) {
@@ -1730,6 +1739,9 @@ impl MetadataSearchPass2<'_> {
                     None
                 };
 
+                if self.cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let mut extended_meta = meta_text;
                 if is_image && self.use_exif {
                     let read = crate::exif_reader::read_exif_counted(path, &[]);
@@ -1748,6 +1760,9 @@ impl MetadataSearchPass2<'_> {
                         }
                     }
                 }
+                if self.cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 if !is_image && self.use_video_meta {
                     // FFmpeg の demux I/O バイト数は取得できないが、file read 件数には含める。
                     read_any = true;
@@ -1759,6 +1774,9 @@ impl MetadataSearchPass2<'_> {
                         }
                         extended_meta.push_str(&video_meta);
                     }
+                }
+                if self.cancel.load(Ordering::Relaxed) {
+                    return None;
                 }
                 if is_image && self.use_sidecar {
                     let read = crate::external_metadata::read_search_text_counted(path);
@@ -2113,6 +2131,63 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pass 2 は 1 項目のうちに複数の file を読む。取消を見ずに読みを続けると、
+    /// 取り消した検索の worker が残り、次の検索の pool と並んで走ってしまう。
+    /// 「どの読みの直前にも、その読みより後に評価される取消の観測がある」ことを
+    /// 本文から固定する。
+    #[test]
+    fn every_pass2_read_is_preceded_by_a_cancel_check() {
+        const SOURCE: &str = include_str!("metadata_ops.rs");
+        const READS: [&str; 5] = [
+            "build_searchable_from_path_counted",
+            "read_tweet_info_counted",
+            "read_exif_counted",
+            "build_video_metadata_text",
+            "read_search_text_counted",
+        ];
+        const CANCEL: &str = "self.cancel.load(";
+
+        let start = SOURCE
+            .find("    fn process(&self, idx: usize, item: &GridItem)")
+            .expect("pass 2 item entry point");
+        let end = start
+            + SOURCE[start..]
+                .find(
+                    "
+    }
+",
+                )
+                .expect("end of the item entry point");
+        let body = &SOURCE[start..end];
+
+        let mut events: Vec<(usize, &str)> = Vec::new();
+        for (offset, _) in body.match_indices(CANCEL) {
+            events.push((offset, CANCEL));
+        }
+        for read in READS {
+            let mut found = false;
+            for (offset, _) in body.match_indices(read) {
+                events.push((offset, read));
+                found = true;
+            }
+            assert!(found, "{read} should still be read from pass 2");
+        }
+        events.sort_by_key(|(offset, _)| *offset);
+
+        let mut cancel_since_last_read = 0_usize;
+        for (_, kind) in events {
+            if kind == CANCEL {
+                cancel_since_last_read += 1;
+                continue;
+            }
+            assert!(
+                cancel_since_last_read > 0,
+                "{kind} runs without observing the cancel flag since the previous read"
+            );
+            cancel_since_last_read = 0;
+        }
+    }
 
     fn write_zip_with_nested_images(path: &Path) {
         use std::io::Write as _;
