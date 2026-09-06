@@ -19,7 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -54263,7 +54263,7 @@ mod tests {
         // Cold rotation reads now have their own asynchronous regression fixture.
         app.rotation_cache = (0..app.items.len())
             .map(|idx| (idx, crate::rotation_db::Rotation::None))
-            .collect::<HashMap<_, _>>()
+            .collect::<std::collections::HashMap<_, _>>()
             .into();
         app.visible_indices = (0..app.items.len()).collect();
         app.details_order = app.visible_indices.clone();

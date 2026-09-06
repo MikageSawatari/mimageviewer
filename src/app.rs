@@ -4393,6 +4393,26 @@ pub(crate) struct FolderPaneOpenPending {
     purpose: FolderOpenScanPurpose,
 }
 
+#[derive(Clone)]
+pub(crate) struct CurrentViewOrderSnapshot {
+    sort_order: crate::settings::SortOrder,
+    grid_display_order: crate::settings::GridDisplayOrder,
+}
+
+impl CurrentViewOrderSnapshot {
+    fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            sort_order: settings.sort_order,
+            grid_display_order: settings.grid_display_order.clone(),
+        }
+    }
+
+    fn matches(&self, settings: &crate::settings::Settings) -> bool {
+        self.sort_order == settings.sort_order
+            && self.grid_display_order == settings.grid_display_order
+    }
+}
+
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
     /// A grid `Folder` requested while always-new mode is active. The main context
@@ -4403,6 +4423,17 @@ pub(crate) enum FolderOpenScanPurpose {
     DetachedImage {
         image_path: PathBuf,
     },
+    /// 現在の物理フォルダを、変更済みの表示順設定で再構築するための事前走査。
+    /// path と並び設定の snapshot が一致する owning context だけが完了を適用する。
+    CurrentViewOrderRefresh {
+        order: CurrentViewOrderSnapshot,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PhysicalFolderSortReload {
+    Immediate,
+    WorkerScan,
 }
 
 /// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
@@ -19278,6 +19309,17 @@ impl App {
     /// - **Ctrl+G 検索結果ビュー**: 検索結果の並べ替えに反映 (実フォルダを再ロードしない)。
     /// - **通常フォルダ**: スクロール履歴を捨てて先頭から再ロード。
     pub(crate) fn apply_sort_change_reload(&mut self) {
+        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::Immediate);
+    }
+
+    fn apply_sort_change_reload_without_ui_io(&mut self) {
+        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::WorkerScan);
+    }
+
+    fn apply_sort_change_reload_with_physical_mode(
+        &mut self,
+        physical_mode: PhysicalFolderSortReload,
+    ) {
         if self.zip_nav.is_some() {
             self.zip_nav_show_current_level();
             return;
@@ -19345,7 +19387,30 @@ impl App {
         }
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
-            self.load_folder(path);
+            match physical_mode {
+                PhysicalFolderSortReload::Immediate => self.load_folder(path),
+                PhysicalFolderSortReload::WorkerScan => {
+                    // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
+                    // sort / category order のどちらも materialize 結果を変えない。
+                    // ファイル path を directory scan worker へ渡してエラーにしない。
+                    if path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                        && self
+                            .items
+                            .iter()
+                            .all(|item| matches!(item, GridItem::PdfPage { .. }))
+                    {
+                        return;
+                    }
+                    let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+                    self.start_folder_open_scan(
+                        path,
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order },
+                    );
+                }
+            }
         }
     }
 
@@ -36874,6 +36939,9 @@ impl App {
                         FolderOpenScanPurpose::GridFolderCandidate => "grid-folder-candidate",
                         FolderOpenScanPurpose::DetachedFolder => "detached-folder",
                         FolderOpenScanPurpose::DetachedImage { .. } => "detached-image",
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. } => {
+                            "current-view-order-refresh"
+                        }
                     }
                 ));
                 self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
@@ -36932,7 +37000,30 @@ impl App {
                 ));
                 None
             }
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                self.apply_current_view_order_refresh(ready.path, scan, order);
+                None
+            }
         }
+    }
+
+    fn apply_current_view_order_refresh(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        order: CurrentViewOrderSnapshot,
+    ) -> bool {
+        if !self
+            .current_folder
+            .as_deref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
+            || !order.matches(&self.settings)
+        {
+            return false;
+        }
+        self.preserve_cursor_hint_for_reload();
+        self.load_folder_with_scan(path, Some(scan));
+        true
     }
 
     /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
@@ -37014,6 +37105,13 @@ impl App {
                     ready.path.display()
                 ));
                 DetachedPhysicalFolderOpenPoll::Failed
+            }
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                if self.apply_current_view_order_refresh(ready.path, scan, order) {
+                    DetachedPhysicalFolderOpenPoll::Applied
+                } else {
+                    DetachedPhysicalFolderOpenPoll::Failed
+                }
             }
         }
     }
@@ -48610,6 +48708,11 @@ impl App {
             return;
         }
         self.settings.grid_view_mode = mode;
+        self.apply_grid_view_mode_runtime(mode);
+        self.settings.save();
+    }
+
+    fn apply_grid_view_mode_runtime(&mut self, mode: crate::settings::GridViewMode) {
         self.details_thumb_suppression_applied = false;
         match mode {
             crate::settings::GridViewMode::Details => {
@@ -48628,7 +48731,6 @@ impl App {
             }
         }
         self.scroll_to_selected = true;
-        self.settings.save();
     }
 
     pub(crate) fn toggle_grid_details_view(&mut self) {
@@ -64055,29 +64157,74 @@ impl App {
         self.transition_favorite_view_for_path_at(path, std::time::Instant::now());
     }
 
+    /// overlay の値変更を、現在すでに materialize 済みの一覧へ反映する単一の所有者。
+    ///
+    /// 場所の通常ロード中は、そのロード自身が新しい設定で一覧を構築するため呼ばない。
+    /// リセット / OFF / 現在地に対する favorite owner の変更のように、後続ロードを伴わない
+    /// overlay 変更だけがここを通る。
+    fn reflect_favorite_view_change(
+        &mut self,
+        previous: &crate::settings::FavoriteViewState,
+        previous_effective_aspect: crate::settings::ThumbAspect,
+    ) {
+        let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
+
+        if previous.grid_view_mode != current.grid_view_mode {
+            self.apply_grid_view_mode_runtime(current.grid_view_mode);
+        }
+
+        if previous.thumb_aspect != current.thumb_aspect
+            || previous.thumb_aspect_auto != current.thumb_aspect_auto
+        {
+            if current.thumb_aspect_auto {
+                let was_off = !previous.thumb_aspect_auto;
+                self.auto_aspect.reset_decision_only();
+                if was_off {
+                    self.rebuild_auto_aspect_samples_from_loaded();
+                }
+                self.maybe_apply_auto_aspect(true);
+            }
+            let current_effective_aspect = self.effective_thumb_aspect();
+            if previous_effective_aspect != current_effective_aspect {
+                self.fixup_scroll_for_aspect_change(current_effective_aspect);
+            }
+        }
+
+        if previous.sort_order != current.sort_order
+            || previous.grid_display_order != current.grid_display_order
+        {
+            self.apply_sort_change_reload_without_ui_io();
+        }
+    }
+
     fn reapply_favorite_view_without_seed(&mut self) {
+        let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let previous_effective_aspect = self.effective_thumb_aspect();
         self.settings.clear_favorite_view_overlay();
-        if !self.settings.remember_favorite_view_state {
-            return;
+        if self.settings.remember_favorite_view_state {
+            let path = self.effective_folder();
+            let active_id = path
+                .as_deref()
+                .and_then(|path| self.stored_favorite_view_id_for_path(path));
+            if let Some((id, state)) = active_id.and_then(|id| {
+                self.favorite_view_states
+                    .get(&id)
+                    .cloned()
+                    .map(|state| (id, state))
+            }) {
+                self.settings.apply_favorite_view_overlay(id, &state);
+            }
         }
-        let path = self.effective_folder();
-        let active_id = path
-            .as_deref()
-            .and_then(|path| self.stored_favorite_view_id_for_path(path));
-        if let Some((id, state)) = active_id.and_then(|id| {
-            self.favorite_view_states
-                .get(&id)
-                .cloned()
-                .map(|state| (id, state))
-        }) {
-            self.settings.apply_favorite_view_overlay(id, &state);
-        }
+        self.reflect_favorite_view_change(&previous, previous_effective_aspect);
     }
 
     fn reconcile_favorite_view_for_current_context_at(&mut self, now: std::time::Instant) {
         if !self.settings.remember_favorite_view_state {
+            let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+            let previous_effective_aspect = self.effective_thumb_aspect();
             self.settings.clear_favorite_view_overlay();
             self.favorite_view_context.location_favorite_id = None;
+            self.reflect_favorite_view_change(&previous, previous_effective_aspect);
             return;
         }
         let path = self.effective_folder();
@@ -64090,7 +64237,10 @@ impl App {
         if owner != self.favorite_view_context.location_favorite_id
             || active_id != self.settings.active_favorite_view_id()
         {
+            let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
+            let previous_effective_aspect = self.effective_thumb_aspect();
             self.transition_favorite_view_for_path_at(path.as_deref(), now);
+            self.reflect_favorite_view_change(&previous, previous_effective_aspect);
         } else {
             self.capture_active_favorite_view_change_at(now);
         }
@@ -71366,15 +71516,24 @@ impl App {
                 }
                 #[cfg(not(windows))]
                 {
-                    match ready.scan {
-                        Ok(scan) => {
-                            navigate_pre_scan = Some(scan);
-                            Some(ready.path)
+                    let FolderPaneOpenReady {
+                        path,
+                        scan,
+                        purpose,
+                    } = ready;
+                    match (purpose, scan) {
+                        (FolderOpenScanPurpose::CurrentViewOrderRefresh { order }, Ok(scan)) => {
+                            self.apply_current_view_order_refresh(path, scan, order);
+                            None
                         }
-                        Err(error) => {
+                        (_, Ok(scan)) => {
+                            navigate_pre_scan = Some(scan);
+                            Some(path)
+                        }
+                        (_, Err(error)) => {
                             crate::logger::log(format!(
-                                "folder pane scan failed path={} error={error}",
-                                ready.path.display()
+                                "folder open scan failed path={} error={error}",
+                                path.display()
                             ));
                             self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
                             None
@@ -73856,7 +74015,76 @@ pub(crate) use tests::phase_c_support::{
 #[cfg(test)]
 mod favorite_view_state_tests {
     use super::*;
-    use crate::settings::{FavoriteEntry, FavoriteViewState, GridViewMode, SortOrder};
+    use crate::settings::{
+        FavoriteEntry, FavoriteViewState, GridDisplayOrder, GridItemDisplayKind, GridViewMode,
+        SortOrder,
+    };
+
+    fn write_sort_fixture(folder: &Path) {
+        std::fs::create_dir_all(folder.join("folder")).unwrap();
+        for (name, modified_secs) in [("a.jpg", 1_600_000_000), ("b.jpg", 1_700_000_000)] {
+            let file = std::fs::File::create(folder.join(name)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs),
+            ))
+            .unwrap();
+        }
+    }
+
+    fn image_names(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn image_first_order() -> GridDisplayOrder {
+        GridDisplayOrder::from_rows([
+            vec![GridItemDisplayKind::Image],
+            vec![
+                GridItemDisplayKind::Folder,
+                GridItemDisplayKind::Archive,
+                GridItemDisplayKind::VideoAudio,
+            ],
+            Vec::new(),
+            Vec::new(),
+        ])
+    }
+
+    fn assert_common_actual_order(app: &App) {
+        assert!(matches!(app.items.first(), Some(GridItem::Folder(_))));
+        assert_eq!(image_names(app), ["a.jpg", "b.jpg"]);
+    }
+
+    fn finish_current_view_order_refresh(app: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..1_000 {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                #[cfg(windows)]
+                {
+                    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+                }
+                #[cfg(not(windows))]
+                {
+                    let scan = ready.scan.unwrap();
+                    match ready.purpose {
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
+                            assert!(app.apply_current_view_order_refresh(ready.path, scan, order));
+                        }
+                        _ => panic!("unexpected folder scan purpose"),
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("current view order refresh did not finish");
+    }
 
     fn state(thumb_px: u32, sort_order: SortOrder) -> FavoriteViewState {
         let mut settings = crate::settings::Settings::default();
@@ -74027,6 +74255,156 @@ mod favorite_view_state_tests {
         assert_eq!(app.clear_all_favorite_view_states(), 2);
         assert!(app.favorite_view_states.is_empty());
         assert_eq!(app.settings.thumb_px, 100);
+    }
+
+    #[test]
+    fn reset_rebuilds_actual_items_with_common_view_order() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-reset");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+        app.settings.grid_display_order = GridDisplayOrder::default();
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        favorite_state.grid_display_order = image_first_order();
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.reset_favorite_view_state(id);
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_eq!(app.settings.grid_display_order, GridDisplayOrder::default());
+        assert_common_actual_order(&app);
+    }
+
+    #[test]
+    fn disabling_memory_rebuilds_actual_items_with_common_view_order() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-off");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+        app.settings.grid_display_order = GridDisplayOrder::default();
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        favorite_state.grid_display_order = image_first_order();
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.settings.remember_favorite_view_state = false;
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_common_actual_order(&app);
+        assert!(app.favorite_view_states.contains_key(&id));
+
+        app.settings.remember_favorite_view_state = true;
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        finish_current_view_order_refresh(&mut app);
+
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+    }
+
+    #[test]
+    fn moving_between_favorites_and_common_context_keeps_actual_order_in_sync() {
+        let mut app = setup_app_for_test();
+        let favorite_a_path = app.tmp.path().join("favorite-a");
+        let favorite_b_path = app.tmp.path().join("favorite-b");
+        let common_path = app.tmp.path().join("common");
+        for folder in [&favorite_a_path, &favorite_b_path, &common_path] {
+            write_sort_fixture(folder);
+        }
+        app.settings.remember_favorite_view_state = true;
+        app.settings.sort_order = SortOrder::FileName;
+
+        let favorite_a = FavoriteEntry::new("a".to_owned(), favorite_a_path.clone());
+        let favorite_b = FavoriteEntry::new("b".to_owned(), favorite_b_path.clone());
+        let mut state_a = FavoriteViewState::from_settings(&app.settings);
+        state_a.sort_order = SortOrder::DateDesc;
+        let mut state_b = FavoriteViewState::from_settings(&app.settings);
+        state_b.sort_order = SortOrder::DateAsc;
+        app.favorite_view_states.insert(favorite_a.id, state_a);
+        app.favorite_view_states.insert(favorite_b.id, state_b);
+        app.settings.favorites.extend([favorite_a, favorite_b]);
+
+        app.load_folder(favorite_a_path);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
+
+        app.load_folder(favorite_b_path);
+        assert_eq!(app.settings.sort_order, SortOrder::DateAsc);
+        assert_eq!(image_names(&app), ["a.jpg", "b.jpg"]);
+
+        app.load_folder(common_path);
+        assert_eq!(app.settings.sort_order, SortOrder::FileName);
+        assert_common_actual_order(&app);
+    }
+
+    #[test]
+    fn reset_projects_layout_fields_without_rebuilding_for_cache_or_book_defaults() {
+        use crate::settings::{ReadingFlow, SpreadMode, ThumbAspect};
+
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("favorite-layout");
+        write_sort_fixture(&folder);
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_view_mode = GridViewMode::Thumbnail;
+        app.settings.thumb_px = 512;
+        app.settings.thumb_aspect = ThumbAspect::Square;
+        app.settings.thumb_aspect_auto = true;
+        app.settings.default_spread_mode = SpreadMode::Single;
+        app.settings.default_reading_flow = ReadingFlow::Paged;
+
+        let favorite = FavoriteEntry::new("fav".to_owned(), folder.clone());
+        let id = favorite.id;
+        let mut favorite_state = FavoriteViewState::from_settings(&app.settings);
+        favorite_state.grid_view_mode = GridViewMode::Details;
+        favorite_state.thumb_px = 128;
+        favorite_state.thumb_aspect = ThumbAspect::Portrait3x4;
+        favorite_state.thumb_aspect_auto = false;
+        favorite_state.default_spread_mode = SpreadMode::Rtl;
+        favorite_state.default_reading_flow = ReadingFlow::Vertical;
+        app.settings.favorites.push(favorite);
+        app.favorite_view_states.insert(id, favorite_state);
+
+        app.load_folder(folder);
+        assert_eq!(app.settings.grid_view_mode, GridViewMode::Details);
+        assert!(!app.details_order.is_empty());
+        app.last_cell_size = 120.0;
+        app.last_cell_h = 160.0;
+        app.spread_mode = SpreadMode::Rtl;
+        app.reading_flow = ReadingFlow::Vertical;
+        let generation = app.items_generation;
+
+        app.reset_favorite_view_state(id);
+
+        assert_eq!(app.settings.grid_view_mode, GridViewMode::Thumbnail);
+        assert!(app.details_order.is_empty());
+        assert!(app.settings.thumb_aspect_auto);
+        assert_eq!(app.auto_aspect.current, None);
+        assert_eq!(app.last_cell_h, 120.0, "manual aspect must update layout");
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.settings.thumb_px, 512);
+        assert_eq!(app.spread_mode, SpreadMode::Rtl);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
     }
 }
 

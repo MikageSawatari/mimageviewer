@@ -100,6 +100,7 @@ fn main() {
     let mut cur_total = Vec::new();
     let mut bytes_len = Vec::new();
     mimageviewer::zip_loader::clear_nested_cache();
+    mimageviewer::zip_loader::clear_archive_directory_cache_for_benchmark();
     for name in &targets {
         let t = Instant::now();
         let buf = mimageviewer::zip_loader::read_entry_bytes(path, name).unwrap();
@@ -167,6 +168,7 @@ fn main() {
         }
         let path_buf = path.to_path_buf();
         mimageviewer::zip_loader::clear_nested_cache();
+        mimageviewer::zip_loader::clear_archive_directory_cache_for_benchmark();
         let parse_count_before = mimageviewer::zip_loader::archive_directory_parse_count();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
         let t = Instant::now();

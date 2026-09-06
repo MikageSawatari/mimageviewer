@@ -191,7 +191,8 @@ UI スレッドでは待たない。
 `(path, mtime, size)` の照合と per-key slot 取得だけ、初回解析は lock 外で行う。同じ key の
 cold miss だけを `Condvar` で single-flight にし、ready 後は request 用 clone の一瞬だけ
 slot lock を握る。エントリ I/O は lock 外で並行する。上限は 8 書庫で、既存の
-`clear_nested_cache` (= フォルダ / 外側コンテナ切替境界) がこの cache も破棄する。
+`clear_nested_cache` (= フォルダ / 外側コンテナ切替境界) は内側 ZIP bytes だけを破棄する。
+解析済み目次はプロセス共有なので、別 viewer context の通常移動では破棄しない。
 
 同日の `bench_zip_seek` (10,000 entries / 30 pages) では、本番経路 [2] の合計 p50 が
 **60.06ms → 1.98ms**、比較対象 [3] は 1.97ms だった。後測定の mean 3.91ms / max 60.74ms は
@@ -208,7 +209,10 @@ clone ごとに独立に持つ。`ZipArchive` の clone は「`Arc` 2 本 + `u64
 有界ハンドルプール案 ((b)) は目次を枠数ぶん複製する (10,000 エントリ × 6) ので採らない。
 
 - キャッシュは `(パス, mtime, サイズ)` を鍵にし、**引くたびに `metadata` で照合して失効させる**
-  (数十 µs なので 56ms に対して無視できる)。書庫数で有界にし、フォルダ移動で捨てる。
+  (数十 µs なので 56ms に対して無視できる)。書庫数は 8 で有界にし、フォルダ移動では
+  捨てない。同一 path・同一サイズで filesystem の mtime 粒度内に差し替えた場合は同じ identity
+  と見なす残余を許容する。明示再読み込みも兄弟 context の共有 template を破棄せず、mtime または
+  サイズの変化、LRU eviction、プロセス再起動で更新する。
 - **`std::os::windows::fs::FileExt::seek_read` は現在位置を動かさず offset 指定で読む**ので、
   同じ `File` を複数 clone が同時に使っても読む内容は競合しない。
   **`cfg(not(windows))` でもビルドが通ること** (CI の ubuntu `cargo check` が番人)。

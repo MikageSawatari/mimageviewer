@@ -2370,7 +2370,7 @@ pub fn bench_persistent_decoder(
         let run = StripDecodeRun { cells: vec![cell] };
         let mut published = false;
         let started = Instant::now();
-        let result = decoder.decode_run(&run, 0, started, &requests, &cancel, &mut |_| {
+        let result = decoder.decode_run(&run, 0, &requests, &cancel, &mut |_| {
             published = true;
         });
         samples.push(SeekDecodeSample {
