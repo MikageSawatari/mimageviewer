@@ -430,15 +430,15 @@ mod tests {
         let bottom_reserved = (HUD_BOTTOM_HEIGHT + fixed_bar_gap_px as f32) * pixels_per_point;
 
         for (top_bar_locked, bottom_lock, reserved_height) in [
-            (true, crate::settings::VideoBottomLock::None, top_reserved),
+            (true, crate::settings::BottomBarLock::None, top_reserved),
             (
                 false,
-                crate::settings::VideoBottomLock::BarOnly,
+                crate::settings::BottomBarLock::BarOnly,
                 bottom_reserved,
             ),
             (
                 true,
-                crate::settings::VideoBottomLock::BarOnly,
+                crate::settings::BottomBarLock::BarOnly,
                 top_reserved + bottom_reserved,
             ),
         ] {

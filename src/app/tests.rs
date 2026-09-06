@@ -70168,7 +70168,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
     fn the_presenter_config_carries_the_requested_lock() {
         let requested = crate::video::NativeBarLockState {
             top_locked: true,
-            bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
+            bottom_lock: crate::settings::BottomBarLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
@@ -70182,7 +70182,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
     fn the_gap_is_clamped_the_same_way_it_is_after_a_later_change() {
         let requested = crate::video::NativeBarLockState {
             top_locked: false,
-            bottom_lock: crate::settings::VideoBottomLock::BarOnly,
+            bottom_lock: crate::settings::BottomBarLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
@@ -70201,7 +70201,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         let mut app = setup_app();
         app.settings.video_top_bar_locked = true;
         app.settings
-            .set_video_bottom_lock(crate::settings::VideoBottomLock::BarAndStrip);
+            .set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
         app.settings.fullscreen_fixed_bar_gap_px = 6;
 
         let state = app.native_bar_lock_state();
@@ -70209,7 +70209,7 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
         assert!(state.top_locked);
         assert_eq!(
             state.bottom_lock,
-            crate::settings::VideoBottomLock::BarAndStrip
+            crate::settings::BottomBarLock::BarAndStrip
         );
         assert_eq!(state.fixed_bar_gap_px, 6);
     }

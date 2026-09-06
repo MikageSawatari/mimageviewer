@@ -4304,6 +4304,10 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
+    /// 静止画のサムネイル列が表示中なら、その領域も画像から除外する。
+    /// 下部バー固定との到達可能な組み合わせは `BottomBarLock` が所有する。
+    #[serde(default)]
+    pub still_seek_strip_locked: bool,
     /// 静止画ページシークバーに source page 単位のサムネイル列を表示する。
     #[serde(default = "default_still_seek_strip_visible")]
     pub still_seek_strip_visible: bool,
@@ -4785,7 +4789,7 @@ pub struct Settings {
     #[serde(default)]
     pub video_seek_bar_locked: bool,
     /// シークストリップが表示中なら、その領域も常時確保して映像から除外する。
-    /// 下部バー固定との到達可能な組み合わせは `VideoBottomLock` が所有する。
+    /// 下部バー固定との到達可能な組み合わせは `BottomBarLock` が所有する。
     #[serde(default)]
     pub video_seek_strip_locked: bool,
     /// 動画シークのマウスオーバープレビュー表示方針。
@@ -5475,18 +5479,18 @@ fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
 }
 
-/// 動画下部の固定状態。
+/// 下部バーと、その上に表示するストリップの固定状態。
 ///
 /// 到達できるのはこの 3 つだけで、「バー非固定 + ストリップ固定」は表現できない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VideoBottomLock {
+pub enum BottomBarLock {
     #[default]
     None,
     BarOnly,
     BarAndStrip,
 }
 
-impl VideoBottomLock {
+impl BottomBarLock {
     /// 永続化用の 2 つの bool から実行時の固定状態を復元する。
     ///
     /// `(false, true)` はストリップ固定の前提となるバー固定がない無効値なので、
@@ -6286,6 +6290,7 @@ impl Default for Settings {
             panorama_projection: crate::panorama::PanoProjection::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
+            still_seek_strip_locked: false,
             still_seek_strip_visible: default_still_seek_strip_visible(),
             still_seek_strip_height: default_still_seek_strip_height(),
             still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
@@ -7317,13 +7322,50 @@ impl Settings {
         }
     }
 
+    /// 永続化用 bool から、到達可能な静止画下部固定状態だけを復元する。
+    pub const fn still_bottom_lock(&self) -> BottomBarLock {
+        BottomBarLock::from_settings(
+            self.fullscreen_seek_bar_locked,
+            self.still_seek_strip_locked,
+        )
+    }
+
+    /// 静止画下部の固定状態を唯一の遷移 owner から永続化用 bool へ反映する。
+    pub fn set_still_bottom_lock(&mut self, lock: BottomBarLock) {
+        let (bar_locked, strip_locked) = lock.to_settings();
+        self.fullscreen_seek_bar_locked = bar_locked;
+        self.still_seek_strip_locked = strip_locked;
+    }
+
+    /// 静止画の下部バー固定を切り替える。OFF は列固定も同時に外す。
+    pub fn set_still_seek_bar_locked(&mut self, locked: bool) {
+        self.set_still_bottom_lock(self.still_bottom_lock().with_bar(locked));
+    }
+
+    /// 静止画のサムネイル列固定を切り替える。ON はバー固定と列表示も含意する。
+    pub fn set_still_seek_strip_locked(&mut self, locked: bool) {
+        let lock = self.still_bottom_lock().with_strip(locked);
+        self.set_still_bottom_lock(lock);
+        if lock.strip_locked() {
+            self.still_seek_strip_visible = true;
+        }
+    }
+
+    /// 静止画のサムネイル列を開閉する。閉じる操作は列固定も解除する。
+    pub fn set_still_seek_strip_visible(&mut self, visible: bool) {
+        if !visible {
+            self.set_still_seek_strip_locked(false);
+        }
+        self.still_seek_strip_visible = visible;
+    }
+
     /// 永続化用 bool から、到達可能な動画下部固定状態だけを復元する。
-    pub const fn video_bottom_lock(&self) -> VideoBottomLock {
-        VideoBottomLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
+    pub const fn video_bottom_lock(&self) -> BottomBarLock {
+        BottomBarLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
     }
 
     /// 動画下部の固定状態を唯一の遷移 owner から永続化用 bool へ反映する。
-    pub fn set_video_bottom_lock(&mut self, lock: VideoBottomLock) {
+    pub fn set_video_bottom_lock(&mut self, lock: BottomBarLock) {
         let (bar_locked, strip_locked) = lock.to_settings();
         self.video_seek_bar_locked = bar_locked;
         self.video_seek_strip_locked = strip_locked;
@@ -8091,6 +8133,10 @@ impl Settings {
             } else {
                 VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
             };
+        // 永続化は互換性のため 2 bool だが、実行時に無効な
+        // 「バー非固定 + ストリップ固定」を持ち回らない。
+        self.set_still_bottom_lock(self.still_bottom_lock());
+        self.set_video_bottom_lock(self.video_bottom_lock());
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
             .last_choice(self.video_seek_strip_last_choice);
@@ -8945,6 +8991,7 @@ mod tests {
     #[test]
     fn still_and_video_seek_display_settings_have_compatible_defaults_and_round_trip() {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.still_seek_strip_locked);
         assert!(!loaded.still_seek_strip_visible);
         assert_eq!(
             loaded.still_seek_strip_height,
@@ -10011,7 +10058,7 @@ mod tests {
         assert!(!defaults.video_top_bar_locked);
         assert!(!defaults.video_seek_bar_locked);
         assert!(!defaults.video_seek_strip_locked);
-        assert_eq!(defaults.video_bottom_lock(), VideoBottomLock::None);
+        assert_eq!(defaults.video_bottom_lock(), BottomBarLock::None);
 
         let loaded: Settings =
             serde_json::from_str(r#"{"video_top_bar_locked":true,"video_seek_bar_locked":false}"#)
@@ -10022,14 +10069,78 @@ mod tests {
     }
 
     #[test]
+    fn bottom_lock_three_states_round_trip_through_the_persisted_bools() {
+        for lock in [
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
+        ] {
+            let (bar_locked, strip_locked) = lock.to_settings();
+            assert_eq!(BottomBarLock::from_settings(bar_locked, strip_locked), lock);
+        }
+    }
+
+    #[test]
+    fn still_bottom_lock_defaults_off_and_normalizes_strip_without_bar_on_load() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.still_bottom_lock(), BottomBarLock::None);
+        assert!(!defaults.fullscreen_seek_bar_locked);
+        assert!(!defaults.still_seek_strip_locked);
+
+        let mut loaded: Settings = serde_json::from_str(
+            r#"{"fullscreen_seek_bar_locked":false,"still_seek_strip_locked":true}"#,
+        )
+        .unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.still_bottom_lock(), BottomBarLock::None);
+        assert_eq!(
+            (
+                loaded.fullscreen_seek_bar_locked,
+                loaded.still_seek_strip_locked
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn still_bottom_lock_bar_and_strip_transitions_share_the_invariant() {
+        let mut settings = Settings::default();
+        settings.set_still_seek_bar_locked(true);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarOnly);
+
+        settings.set_still_seek_strip_locked(true);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarAndStrip);
+        assert!(settings.still_seek_strip_visible);
+
+        settings.set_still_seek_bar_locked(false);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::None);
+        assert_eq!(
+            (
+                settings.fullscreen_seek_bar_locked,
+                settings.still_seek_strip_locked
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn still_seek_closing_the_strip_unlocks_only_the_strip() {
+        let mut settings = Settings::default();
+        settings.set_still_seek_strip_locked(true);
+        settings.set_still_seek_strip_visible(false);
+        assert!(!settings.still_seek_strip_visible);
+        assert_eq!(settings.still_bottom_lock(), BottomBarLock::BarOnly);
+    }
+
+    #[test]
     fn video_bottom_lock_with_strip_always_locks_the_bar() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             let updated = lock.with_strip(true);
-            assert_eq!(updated, VideoBottomLock::BarAndStrip);
+            assert_eq!(updated, BottomBarLock::BarAndStrip);
             assert!(updated.bar_locked());
             assert!(updated.strip_locked());
         }
@@ -10038,12 +10149,12 @@ mod tests {
     #[test]
     fn video_bottom_lock_unlocking_the_bar_always_unlocks_the_strip() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             let updated = lock.with_bar(false);
-            assert_eq!(updated, VideoBottomLock::None);
+            assert_eq!(updated, BottomBarLock::None);
             assert!(!updated.bar_locked());
             assert!(!updated.strip_locked());
         }
@@ -10052,9 +10163,9 @@ mod tests {
     #[test]
     fn video_bottom_lock_never_serializes_the_unreachable_bool_pair() {
         for lock in [
-            VideoBottomLock::None,
-            VideoBottomLock::BarOnly,
-            VideoBottomLock::BarAndStrip,
+            BottomBarLock::None,
+            BottomBarLock::BarOnly,
+            BottomBarLock::BarAndStrip,
         ] {
             assert_ne!(lock.to_settings(), (false, true));
         }
@@ -10068,7 +10179,7 @@ mod tests {
             ..Settings::default()
         };
         settings.set_video_seek_strip_locked(true);
-        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarAndStrip);
+        assert_eq!(settings.video_bottom_lock(), BottomBarLock::BarAndStrip);
         assert_eq!(
             settings.video_seek_strip_state,
             VideoSeekStripState::Waveform,
@@ -10099,7 +10210,7 @@ mod tests {
         };
         settings.set_video_seek_strip_locked(true);
         settings.set_video_seek_strip_locked(false);
-        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarOnly);
+        assert_eq!(settings.video_bottom_lock(), BottomBarLock::BarOnly);
         assert_eq!(
             settings.video_seek_strip_state,
             VideoSeekStripState::Thumbnails,
@@ -10110,8 +10221,8 @@ mod tests {
     #[test]
     fn video_bottom_lock_normalizes_strip_without_bar_to_none() {
         assert_eq!(
-            VideoBottomLock::from_settings(false, true),
-            VideoBottomLock::None
+            BottomBarLock::from_settings(false, true),
+            BottomBarLock::None
         );
     }
 
@@ -11518,6 +11629,7 @@ mod tests {
             DOWNSCALE_SMOOTHING_PERCENT_MIN
         );
         assert!(!s.fullscreen_seek_bar_locked);
+        assert!(!s.still_seek_strip_locked);
         assert!(!s.fullscreen_top_bar_locked);
         assert_eq!(s.fullscreen_fixed_bar_gap_px, 0);
         assert_eq!(

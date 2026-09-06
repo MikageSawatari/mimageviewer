@@ -7768,7 +7768,7 @@ mod tests {
     /// プレビューは映像と同じ場所に置く (backlog §1.162)。
     #[test]
     fn the_navigation_preview_stays_inside_the_place_the_video_will_use() {
-        use crate::settings::VideoBottomLock;
+        use crate::settings::BottomBarLock;
         use crate::video::native_presenter::render_core::{
             HUD_BOTTOM_HEIGHT, VideoVisualLayout, video_bar_reserved_points,
         };
@@ -7779,7 +7779,7 @@ mod tests {
             compact: false,
             pixels_per_point: 1.0,
             top_bar_locked: true,
-            bottom_lock: VideoBottomLock::BarAndStrip,
+            bottom_lock: BottomBarLock::BarAndStrip,
             bottom_bar_height: HUD_BOTTOM_HEIGHT,
             seek_strip_visible_points: crate::video::seek_strip_layout::SeekStripHeight::Large
                 .points(),

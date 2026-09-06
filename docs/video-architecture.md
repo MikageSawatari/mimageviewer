@@ -322,7 +322,7 @@ VST3 パネル表示中は callout を描画せず、HUD region にも含めな�
 
 上部情報バーの固定状態は動画専用の `video_top_bar_locked`、動画下部は永続化用の
 `video_seek_bar_locked` / `video_seek_strip_locked` を Settings の正本とする。下部の変更経路は
-`VideoBottomLock::{None, BarOnly, BarAndStrip}` に復元してから App → native command → presenter →
+静止画とも共有する `BottomBarLock::{None, BarOnly, BarAndStrip}` に復元してから App → native command → presenter →
 overlay / layout まで同期し、「バー非固定 + ストリップ固定」を実行時の型で表現しない。
 既定の固定なしは従来の上下端 hover と touch chrome latch による自動表示を維持する。
 上部だけを固定しても下部は固定されず、
@@ -354,7 +354,7 @@ HUD ボタンが表示中ずっと hover もクリックもできなくなる (�
 
 各バーとシークストリップには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
 `ui_fullscreen::draw_icons::draw_seek_lock_icon` を共有し、native 側で同じベクター形状を複製しない。
-クリックは typed overlay command で App へ戻し、下部は `VideoBottomLock` の遷移で永続 bool を更新して
+クリックは typed overlay command で App へ戻し、下部は `BottomBarLock` の遷移で永続 bool を更新して
 `save()` した後、最新の固定状態と余白を presenter へ再同期する。ストリップ鍵は右上 28pt 角、
 現在の範囲表示はその左へ置き、鍵矩形は seek / drag の開始対象から除外する。wheel は鍵上でも
 ストリップの範囲変更として消費する。鍵はストリップ全面の `click_and_drag` と重なるので、

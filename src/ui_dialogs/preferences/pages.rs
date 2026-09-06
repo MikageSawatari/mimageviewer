@@ -8568,18 +8568,32 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.add_space(8.0);
     anchored(ui, state, "spread/seek-bar", |ui, state| {
         let s = &mut state.settings;
-        ui.checkbox(
-            &mut s.fullscreen_seek_bar_locked,
-            "下部ページシークバーを固定表示",
-        );
+        let bottom_lock = s.still_bottom_lock();
+        let mut bar_locked = bottom_lock.bar_locked();
+        if ui
+            .checkbox(&mut bar_locked, "下部ページシークバーを固定表示")
+            .changed()
+        {
+            s.set_still_bottom_lock(bottom_lock.with_bar(bar_locked));
+        }
         ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
     });
     anchored(ui, state, "spread/seek-strip", |ui, state| {
         let s = &mut state.settings;
-        ui.checkbox(
-            &mut s.still_seek_strip_visible,
-            "ページシークバーにサムネイル列を表示",
-        );
+        let mut strip_visible = s.still_seek_strip_visible;
+        if ui
+            .checkbox(&mut strip_visible, "ページシークバーにサムネイル列を表示")
+            .changed()
+        {
+            s.set_still_seek_strip_visible(strip_visible);
+        }
+        let mut strip_locked = s.still_bottom_lock().strip_locked();
+        if ui
+            .checkbox(&mut strip_locked, "サムネイル列を固定表示")
+            .changed()
+        {
+            s.set_still_seek_strip_locked(strip_locked);
+        }
         ui.horizontal(|ui| {
             ui.label("サムネイル列の高さ");
             ui.add_enabled_ui(s.still_seek_strip_visible, |ui| {
@@ -8596,7 +8610,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     });
             });
         });
-        ui.small("元ページを現在位置の前後へ並べます。固定表示中はサムネイル列も画像領域から除外します。");
+        ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
     });
     anchored(ui, state, "spread/seek-preview", |ui, state| {
         let s = &mut state.settings;

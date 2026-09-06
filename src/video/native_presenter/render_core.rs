@@ -36,7 +36,7 @@ use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
 use crate::panorama::{PanoPose, PanoUvTransform};
-use crate::settings::{FsSidePanelMode, VideoBottomLock, VideoScaleFilter};
+use crate::settings::{BottomBarLock, FsSidePanelMode, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
@@ -1382,7 +1382,7 @@ pub struct NativeRenderCore {
     last_pixel_probe: Option<Instant>,
     video_compact: bool,
     video_top_bar_locked: bool,
-    video_bottom_lock: VideoBottomLock,
+    video_bottom_lock: BottomBarLock,
     fullscreen_fixed_bar_gap_px: u32,
     /// 右情報パネルが場所を占めているか (= 固定中かつ描ける)。overlay 内部の状態でも
     /// 変わるので、`reconcile_info_panel_reservation` が突き合わせて覚える。
@@ -1868,7 +1868,7 @@ struct NativeEguiOverlay {
     jump_panel_visible: bool,
     /// App settings から同期される、上部バーと動画下部の固定状態。
     top_bar_locked: bool,
-    bottom_lock: VideoBottomLock,
+    bottom_lock: BottomBarLock,
     /// 固定バーと映像のあいだに置く隙間 (px)。overlay が「映像の場所」を
     /// 自分で求める (`video_content_rect_points`) ために持つ。
     fixed_bar_gap_px: u32,
@@ -7418,7 +7418,7 @@ impl NativeEguiOverlay {
             right_panel_visible: false,
             jump_panel_visible: false,
             top_bar_locked: false,
-            bottom_lock: VideoBottomLock::None,
+            bottom_lock: BottomBarLock::None,
             fixed_bar_gap_px: 0,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Always,
@@ -12971,7 +12971,7 @@ pub(super) struct VideoVisualLayout {
     pub(super) compact: bool,
     pub(super) pixels_per_point: f32,
     pub(super) top_bar_locked: bool,
-    pub(super) bottom_lock: VideoBottomLock,
+    pub(super) bottom_lock: BottomBarLock,
     /// 表示方針を反映した通常下部バーの高さ。サムネイルストリップ中は 0 になり得る。
     pub(super) bottom_bar_height: f32,
     /// いまストリップが占めている高さ (points)。出ていないときは 0。
@@ -12994,7 +12994,7 @@ impl From<bool> for VideoVisualLayout {
             compact,
             pixels_per_point: 1.0,
             top_bar_locked: false,
-            bottom_lock: VideoBottomLock::None,
+            bottom_lock: BottomBarLock::None,
             bottom_bar_height: resolved_video_bottom_bar_height(true),
             seek_strip_visible_points: 0.0,
             fixed_bar_gap_px: 0,
@@ -13371,7 +13371,7 @@ mod tests {
         video_zoom_takes_the_wheel,
     };
     use crate::panorama::{PanoPose, PanoUvTransform};
-    use crate::settings::{FsSidePanelMode, VideoBottomLock};
+    use crate::settings::{BottomBarLock, FsSidePanelMode};
     use crate::video::native_presenter::overlay_draw::{
         NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
         native_panel_callout_bar_rect, native_panel_top, native_seek_bar_lock_button_rect,
@@ -15700,7 +15700,7 @@ mod tests {
                 compact: false,
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
-                bottom_lock: VideoBottomLock::None,
+                bottom_lock: BottomBarLock::None,
                 bottom_bar_height: HUD_BOTTOM_HEIGHT,
                 seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 0,
@@ -15976,7 +15976,7 @@ mod tests {
                     compact: false,
                     pixels_per_point: 1.0,
                     top_bar_locked: true,
-                    bottom_lock: VideoBottomLock::BarAndStrip,
+                    bottom_lock: BottomBarLock::BarAndStrip,
                     bottom_bar_height: HUD_BOTTOM_HEIGHT,
                     seek_strip_visible_points: if seek_strip_reserves_space(has_strip, availability)
                     {
@@ -16049,7 +16049,7 @@ mod tests {
             compact,
             pixels_per_point,
             top_bar_locked: false,
-            bottom_lock: VideoBottomLock::None,
+            bottom_lock: BottomBarLock::None,
             bottom_bar_height: HUD_BOTTOM_HEIGHT,
             seek_strip_visible_points: 0.0,
             fixed_bar_gap_px: 0,
@@ -16104,7 +16104,7 @@ mod tests {
         };
 
         assert_eq!(
-            target(false, VideoBottomLock::None, false, 0),
+            target(false, BottomBarLock::None, false, 0),
             VideoVisualTargetRect {
                 x: 0.0,
                 y: 0.0,
@@ -16113,7 +16113,7 @@ mod tests {
             }
         );
         assert_eq!(
-            target(true, VideoBottomLock::None, false, 0),
+            target(true, BottomBarLock::None, false, 0),
             VideoVisualTargetRect {
                 x: 0.0,
                 y: HUD_TOP_HEIGHT,
@@ -16122,7 +16122,7 @@ mod tests {
             }
         );
         assert_eq!(
-            target(false, VideoBottomLock::BarOnly, false, 0),
+            target(false, BottomBarLock::BarOnly, false, 0),
             VideoVisualTargetRect {
                 x: 0.0,
                 y: 0.0,
@@ -16131,7 +16131,7 @@ mod tests {
             }
         );
         assert_eq!(
-            target(true, VideoBottomLock::BarOnly, false, 0),
+            target(true, BottomBarLock::BarOnly, false, 0),
             VideoVisualTargetRect {
                 x: 0.0,
                 y: HUD_TOP_HEIGHT,
@@ -16142,7 +16142,7 @@ mod tests {
 
         let max_gap = crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX;
         assert_eq!(
-            target(true, VideoBottomLock::BarOnly, false, max_gap),
+            target(true, BottomBarLock::BarOnly, false, max_gap),
             VideoVisualTargetRect {
                 x: 0.0,
                 y: HUD_TOP_HEIGHT + max_gap as f32,
@@ -16151,8 +16151,8 @@ mod tests {
             }
         );
         assert_eq!(
-            target(true, VideoBottomLock::BarOnly, false, max_gap + 900),
-            target(true, VideoBottomLock::BarOnly, false, max_gap),
+            target(true, BottomBarLock::BarOnly, false, max_gap + 900),
+            target(true, BottomBarLock::BarOnly, false, max_gap),
             "余白は静止画と同じ上限で clamp する"
         );
     }
@@ -16162,13 +16162,13 @@ mod tests {
     fn video_bottom_lock_reserves_the_strip_only_for_the_visible_locked_strip() {
         let expected = |strip_points: f32| {
             [
-                (VideoBottomLock::None, 0.0, 0.0),
-                (VideoBottomLock::None, strip_points, 0.0),
-                (VideoBottomLock::BarOnly, 0.0, HUD_BOTTOM_HEIGHT),
-                (VideoBottomLock::BarOnly, strip_points, HUD_BOTTOM_HEIGHT),
-                (VideoBottomLock::BarAndStrip, 0.0, HUD_BOTTOM_HEIGHT),
+                (BottomBarLock::None, 0.0, 0.0),
+                (BottomBarLock::None, strip_points, 0.0),
+                (BottomBarLock::BarOnly, 0.0, HUD_BOTTOM_HEIGHT),
+                (BottomBarLock::BarOnly, strip_points, HUD_BOTTOM_HEIGHT),
+                (BottomBarLock::BarAndStrip, 0.0, HUD_BOTTOM_HEIGHT),
                 (
-                    VideoBottomLock::BarAndStrip,
+                    BottomBarLock::BarAndStrip,
                     strip_points,
                     HUD_BOTTOM_HEIGHT + strip_points,
                 ),
@@ -16242,7 +16242,7 @@ mod tests {
                     compact: false,
                     pixels_per_point: 1.0,
                     top_bar_locked: false,
-                    bottom_lock: VideoBottomLock::BarAndStrip,
+                    bottom_lock: BottomBarLock::BarAndStrip,
                     bottom_bar_height: geometry.normal_bar_height,
                     seek_strip_visible_points: geometry.strip_layout.rect.height(),
                     fixed_bar_gap_px: 0,
@@ -16326,7 +16326,7 @@ mod tests {
                 compact: true,
                 pixels_per_point: 1.0,
                 top_bar_locked: true,
-                bottom_lock: VideoBottomLock::BarOnly,
+                bottom_lock: BottomBarLock::BarOnly,
                 bottom_bar_height: HUD_BOTTOM_HEIGHT,
                 seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px: 10,

@@ -3157,6 +3157,8 @@ struct StillSeekGeometry {
     bar_height: f32,
     strip_height: f32,
     total_height: f32,
+    /// `BottomBarLock` に従って画像領域から除く高さ。
+    reserved_height: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3194,6 +3196,7 @@ impl StillSeekGeometry {
         strip_visible: bool,
         strip_height: crate::video::seek_strip_layout::SeekStripHeight,
         bar_with_strip: crate::settings::StillSeekBarWithStrip,
+        bottom_lock: crate::settings::BottomBarLock,
     ) -> Self {
         let strip_height = if strip_visible {
             strip_height.points()
@@ -3205,10 +3208,17 @@ impl StillSeekGeometry {
         } else {
             0.0
         };
+        let total_height = bar_height + strip_height;
+        let reserved_height = match bottom_lock {
+            crate::settings::BottomBarLock::None => 0.0,
+            crate::settings::BottomBarLock::BarOnly => bar_height,
+            crate::settings::BottomBarLock::BarAndStrip => total_height,
+        };
         Self {
             bar_height,
             strip_height,
-            total_height: bar_height + strip_height,
+            total_height,
+            reserved_height,
         }
     }
 
@@ -3217,6 +3227,7 @@ impl StillSeekGeometry {
             false,
             crate::video::seek_strip_layout::SeekStripHeight::Large,
             crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarOnly,
         )
     }
 
@@ -12599,6 +12610,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         true,
         crate::video::seek_strip_layout::SeekStripHeight::Medium,
         crate::settings::StillSeekBarWithStrip::Show,
+        crate::settings::BottomBarLock::BarAndStrip,
     );
     let panel = geometry.panel_rect(full_rect);
     ui.painter().rect_filled(
@@ -16054,26 +16066,34 @@ impl App {
     }
 
     fn fullscreen_seek_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.settings.fullscreen_seek_bar_locked
-            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
+        self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
+            && self.settings.still_bottom_lock().bar_locked()
     }
 
     fn still_seek_geometry_for_idx(&self, fs_idx: usize, is_video: bool) -> StillSeekGeometry {
-        let strip_visible = self.settings.still_seek_strip_visible
-            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
+        let allowed = self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
+        let strip_visible = self.settings.still_seek_strip_visible && allowed;
+        let bottom_lock = if allowed {
+            self.settings.still_bottom_lock()
+        } else {
+            crate::settings::BottomBarLock::None
+        };
         StillSeekGeometry::resolve(
             strip_visible,
             self.settings.still_seek_strip_height,
             self.settings.still_seek_bar_with_strip,
+            bottom_lock,
         )
     }
 
     /// サムネイル列の全入口（ボタン、上下ドラッグ、キー）から同じ設定を更新する。
     fn set_still_seek_strip_visible(&mut self, ctx: &egui::Context, visible: bool) {
-        if self.settings.still_seek_strip_visible == visible {
+        let changed = self.settings.still_seek_strip_visible != visible
+            || (!visible && self.settings.still_bottom_lock().strip_locked());
+        if !changed {
             return;
         }
-        self.settings.still_seek_strip_visible = visible;
+        self.settings.set_still_seek_strip_visible(visible);
         self.settings.save();
         ctx.request_repaint();
     }
@@ -16182,8 +16202,8 @@ impl App {
         fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full_rect,
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
-            self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
-            seek_geometry.total_height,
+            seek_geometry.reserved_height > 0.0,
+            seek_geometry.reserved_height,
             self.settings.fullscreen_fixed_bar_gap_px,
             self.locked_info_panel_reserved_width_effective(full_rect, fs_idx, is_video),
         )
@@ -16434,7 +16454,9 @@ impl App {
         }
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let locked = self.settings.fullscreen_seek_bar_locked;
+        let bottom_lock = self.settings.still_bottom_lock();
+        let locked = bottom_lock.bar_locked();
+        let strip_locked = bottom_lock.strip_locked();
         let geometry = self.still_seek_geometry_for_idx(fs_idx, false);
 
         let bottom_band = egui::Rect::from_min_max(
@@ -16549,7 +16571,7 @@ impl App {
                 "シークバーを固定表示"
             });
             if lock_resp.clicked() {
-                self.settings.fullscreen_seek_bar_locked = !locked;
+                self.settings.set_still_seek_bar_locked(!locked);
                 self.settings.save();
                 ctx.request_repaint();
             }
@@ -16793,8 +16815,8 @@ impl App {
                 );
             }
 
-            // body より後に登録し、鍵の当たり判定をセル操作へ渡さない。位置と見た目は
-            // 動画ストリップと共有し、状態だけ既存のページシークバー固定へ載せる。
+            // body より後に登録し、鍵の当たり判定をセル操作へ渡さない。位置と見た目、
+            // および 3 状態の固定モデルは動画ストリップと共有する。
             let strip_lock_response = ui
                 .interact(
                     strip_lock_rect,
@@ -16806,15 +16828,15 @@ impl App {
                 painter,
                 strip_lock_rect,
                 strip_lock_response.hovered(),
-                locked,
+                strip_locked,
             );
-            let strip_lock_response = strip_lock_response.hover_tip_dark(if locked {
+            let strip_lock_response = strip_lock_response.hover_tip_dark(if strip_locked {
                 "サムネイル列の固定を解除"
             } else {
                 "サムネイル列を固定表示"
             });
             if strip_lock_response.clicked() {
-                self.settings.fullscreen_seek_bar_locked = !locked;
+                self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
                 ctx.request_repaint();
             }
@@ -26691,7 +26713,7 @@ impl App {
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
-                && (self.settings.fullscreen_seek_bar_locked
+                && (self.settings.still_bottom_lock().bar_locked()
                     || self.fs_seek_drag_active
                     || touch_chrome_latched
                     || ctx.input(|i| {
@@ -53386,21 +53408,51 @@ mod tests {
             true,
             crate::video::seek_strip_layout::SeekStripHeight::Medium,
             crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarAndStrip,
         );
         let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full,
             false,
-            true,
-            geometry.total_height,
+            geometry.reserved_height > 0.0,
+            geometry.reserved_height,
             0,
             0.0,
         );
         let left = adjustment_panel_rect_with_seek_height(full, geometry.total_height);
         let right = metadata_panel_rect_with_seek_height(full, geometry.total_height);
         assert_eq!(geometry.total_height, 110.0);
+        assert_eq!(geometry.reserved_height, 110.0);
         assert_eq!(media.bottom(), geometry.panel_rect(full).top());
         assert_eq!(left.bottom(), media.bottom());
         assert_eq!(right.bottom(), media.bottom());
+    }
+
+    #[test]
+    fn still_seek_bar_only_is_reachable_and_does_not_reserve_the_visible_strip() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for (lock, expected_reserved) in [
+            (crate::settings::BottomBarLock::None, 0.0),
+            (crate::settings::BottomBarLock::BarOnly, FS_SEEK_BAR_HEIGHT),
+            (crate::settings::BottomBarLock::BarAndStrip, 110.0),
+        ] {
+            let geometry = StillSeekGeometry::resolve(
+                true,
+                crate::video::seek_strip_layout::SeekStripHeight::Medium,
+                crate::settings::StillSeekBarWithStrip::Show,
+                lock,
+            );
+            assert_eq!(geometry.total_height, 110.0);
+            assert_eq!(geometry.reserved_height, expected_reserved);
+            let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
+                full,
+                false,
+                geometry.reserved_height > 0.0,
+                geometry.reserved_height,
+                0,
+                0.0,
+            );
+            assert_eq!(media.bottom(), full.bottom() - expected_reserved);
+        }
     }
 
     #[test]
