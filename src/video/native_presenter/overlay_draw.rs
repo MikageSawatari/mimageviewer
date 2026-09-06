@@ -2475,9 +2475,9 @@ pub(super) fn native_seek_bar_lock_button_rect(
 ) -> egui::Rect {
     let button_size = 28.0;
     let side_pad = 10.0;
-    let controls_top = (overlay_height_points - bottom_bar_height
-        + crate::video::native_presenter::HUD_SEEK_ROW_HEIGHT)
-        .max(0.0);
+    let seek_row_height =
+        (bottom_bar_height - crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT).max(0.0);
+    let controls_top = (overlay_height_points - bottom_bar_height + seek_row_height).max(0.0);
     let y = controls_top
         + (crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT - button_size) * 0.5;
     egui::Rect::from_min_size(

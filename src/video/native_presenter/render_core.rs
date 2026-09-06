@@ -147,18 +147,17 @@ pub(crate) const fn resolved_video_bottom_bar_height(normal_seek_bar_visible: bo
     if normal_seek_bar_visible {
         HUD_BOTTOM_HEIGHT
     } else {
-        0.0
+        HUD_CONTROLS_ROW_HEIGHT
     }
 }
 pub const HUD_TOP_HEIGHT: f32 = 54.0;
 pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
-const SEEK_STRIP_LOCK_BUTTON_SIZE: f32 = 28.0;
-const SEEK_STRIP_RIGHT_INSET: f32 = 7.0;
 
 /// 動画下端の通常バー高と、その上に置くストリップ寸法を一度に解決した値。
 ///
-/// `HUD_BOTTOM_HEIGHT` を条件付きで足す判断はここだけが所有し、描画・入力・固定映像領域・
-/// パネル配置はこの値を受け取る。音声波形は `normal_seek_bar_visible=true` で従来高を保つ。
+/// シーク行を表示するかに応じて 64pt / 40pt を解決する判断はここだけが所有し、
+/// 描画・入力・固定映像領域・パネル配置はこの値を受け取る。コントロール行は常に残し、
+/// 音声波形は `normal_seek_bar_visible=true` で従来の 64pt を保つ。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VideoSeekGeometry {
     normal_seek_bar_visible: bool,
@@ -188,24 +187,13 @@ impl VideoSeekGeometry {
         }
     }
 }
-const SEEK_STRIP_LOCK_TOP_INSET: f32 = 4.0;
 const SEEK_STRIP_RANGE_LOCK_GAP: f32 = 6.0;
 const SEEK_PREVIEW_GAP: f32 = 14.0;
 const SEEK_PREVIEW_SCREEN_MARGIN: f32 = 8.0;
 const SEEK_PREVIEW_ACTION_BAR_HEIGHT: f32 = 38.0;
 
-fn native_seek_strip_lock_button_rect(strip_rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(
-            strip_rect.max.x - SEEK_STRIP_RIGHT_INSET - SEEK_STRIP_LOCK_BUTTON_SIZE,
-            strip_rect.min.y + SEEK_STRIP_LOCK_TOP_INSET,
-        ),
-        egui::vec2(SEEK_STRIP_LOCK_BUTTON_SIZE, SEEK_STRIP_LOCK_BUTTON_SIZE),
-    )
-}
-
 fn native_seek_strip_range_text_pos(strip_rect: egui::Rect) -> egui::Pos2 {
-    let lock_rect = native_seek_strip_lock_button_rect(strip_rect);
+    let lock_rect = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect);
     egui::pos2(
         lock_rect.min.x - SEEK_STRIP_RANGE_LOCK_GAP,
         strip_rect.min.y + 5.0,
@@ -317,7 +305,8 @@ fn native_seek_strip_preview_hover(
         return NativeSeekStripPreviewHover::Outside;
     }
     if strip_rect.contains(pointer)
-        && native_seek_strip_lock_button_rect(strip_rect).contains(pointer)
+        && crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect)
+            .contains(pointer)
     {
         return NativeSeekStripPreviewHover::Suppress;
     }
@@ -382,22 +371,10 @@ fn draw_native_seek_strip_lock_button(
             egui::Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    // 下部 HUD のボタンは暗い HUD 帯の上に乗るので `draw_overlay_button_bg` の
-    // 「非 hover は透明」で読める。ストリップのボタンはサムネイルのセルの上に乗るため、
-    // 透明のままだと明るい絵に埋もれる。常に暗い下敷きと薄い縁を敷いてから、
-    // hover / active の色を同じ helper で重ねる。
-    painter.rect_filled(lock_rect, 4.0, egui::Color32::from_black_alpha(170));
-    draw_overlay_button_bg(painter, lock_rect, response.hovered(), strip_locked);
-    painter.rect_stroke(
-        lock_rect,
-        4.0,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(46)),
-        egui::StrokeKind::Inside,
-    );
-    crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
+    crate::ui_fullscreen::draw_icons::draw_seek_strip_lock_button_visual(
         painter,
-        lock_rect.center(),
-        lock_rect.width().min(lock_rect.height()) * 0.28,
+        lock_rect,
+        response.hovered(),
         strip_locked,
     );
     let response = response.hover_tip_dark(if strip_locked {
@@ -806,7 +783,8 @@ fn draw_native_seek_strip(
                 );
             }
 
-            let lock_rect = native_seek_strip_lock_button_rect(local_rect);
+            let lock_rect =
+                crate::video::seek_strip_layout::seek_strip_lock_button_rect(local_rect);
             let response = ui.interact(
                 local_rect,
                 egui::Id::new("native_video_seek_strip_drag"),
@@ -10818,7 +10796,7 @@ impl NativeEguiOverlay {
                 }
             }
 
-            if bottom_hud_visible && normal_seek_bar_visible {
+            if bottom_hud_visible && bottom_bar_height > 0.0 {
                 egui::Area::new(egui::Id::new("native_video_seek_hud"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(egui::pos2(
@@ -10840,9 +10818,14 @@ impl NativeEguiOverlay {
                         // - コントロール行 (下段、`HUD_CONTROLS_ROW_HEIGHT` = 40pt): ボタン群 + 音量
                         // `center_y` はコントロール行内の縦中央 (= ボタン群の Y 基準) として使う。
                         // 旧 1 段構造の bar Y 共有から外し、bar は seek_row_rect 内に独立配置する。
+                        let seek_row_height = if normal_seek_bar_visible {
+                            HUD_SEEK_ROW_HEIGHT
+                        } else {
+                            0.0
+                        };
                         let seek_row_rect = egui::Rect::from_min_max(
                             hud_rect.min,
-                            egui::pos2(hud_rect.max.x, hud_rect.min.y + HUD_SEEK_ROW_HEIGHT),
+                            egui::pos2(hud_rect.max.x, hud_rect.min.y + seek_row_height),
                         );
                         let controls_row_rect = egui::Rect::from_min_max(
                             egui::pos2(hud_rect.min.x, seek_row_rect.max.y),
@@ -13338,12 +13321,12 @@ mod tests {
     }
 
     use super::{
-        HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT, NativeBarVisibilitySnapshot, NativeEguiOverlay,
-        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativeOverlaySeekStrip,
-        NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
-        PreparedVideoScaleSettings, VideoOrientation, VideoScalePreparationSignature,
-        VideoSurfaceContent, VideoVisualLayout, VideoVisualTargetRect,
-        close_panorama_projection_popup_for_context, compare_pixel_probe,
+        HUD_BOTTOM_HEIGHT, HUD_CONTROLS_ROW_HEIGHT, HUD_SEEK_ROW_HEIGHT, HUD_TOP_HEIGHT,
+        NativeBarVisibilitySnapshot, NativeEguiOverlay, NativeJumpPanelVisibilityInputs,
+        NativeOverlayInputRouting, NativeOverlaySeekStrip, NativePixelSample,
+        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, PreparedVideoScaleSettings,
+        VideoOrientation, VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
+        VideoVisualTargetRect, close_panorama_projection_popup_for_context, compare_pixel_probe,
         compute_video_visual_target_rect, compute_video_visual_transform,
         compute_video_visual_transform_for_surface, configure_overlay_style,
         copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
@@ -13629,7 +13612,7 @@ mod tests {
                 &strip,
                 rect,
                 super::SEEK_STRIP_CELL_WIDTH,
-                super::native_seek_strip_lock_button_rect(rect).center(),
+                crate::video::seek_strip_layout::seek_strip_lock_button_rect(rect).center(),
                 true,
             ),
             super::NativeSeekStripPreviewHover::Suppress
@@ -13686,7 +13669,7 @@ mod tests {
         // must not swallow the wheel.
         for pointer in [
             strip_rect.center(),
-            super::native_seek_strip_lock_button_rect(strip_rect).center(),
+            crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect).center(),
         ] {
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
@@ -14121,7 +14104,7 @@ mod tests {
     fn seek_strip_lock_layout_keeps_the_button_out_of_the_seek_body() {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_rect = test_strip_layout(overlay_size).rect;
-        let lock_rect = super::native_seek_strip_lock_button_rect(strip_rect);
+        let lock_rect = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect);
         let range_pos = super::native_seek_strip_range_text_pos(strip_rect);
         assert_eq!(lock_rect.min, egui::pos2(1245.0, 556.0));
         assert_eq!(lock_rect.max, egui::pos2(1273.0, 584.0));
@@ -14189,7 +14172,8 @@ mod tests {
 
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_rect = test_strip_layout(overlay_size).rect;
-        let lock_center = super::native_seek_strip_lock_button_rect(strip_rect).center();
+        let lock_center =
+            crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip_rect).center();
         let body_center = strip_rect.center();
 
         let click_at = |pointer: egui::Pos2| {
@@ -14382,9 +14366,10 @@ mod tests {
             // Reach the HUD lock the way the report did: click the strip's own lock first,
             // then move down to the bar's lock and click once.
             if with_strip {
-                let strip_lock =
-                    super::native_seek_strip_lock_button_rect(test_strip_layout(overlay_size).rect)
-                        .center();
+                let strip_lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(
+                    test_strip_layout(overlay_size).rect,
+                )
+                .center();
                 harness.hover_at(strip_lock);
                 harness.run();
                 for pressed in [true, false] {
@@ -16208,11 +16193,15 @@ mod tests {
 
         assert_eq!(shown.normal_bar_height, HUD_BOTTOM_HEIGHT);
         assert_eq!(shown.strip_layout, legacy);
-        assert_eq!(hidden.normal_bar_height, 0.0);
-        assert_eq!(hidden.strip_layout.rect.bottom(), overlay_size.y);
+        assert_eq!(
+            HUD_BOTTOM_HEIGHT,
+            HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT
+        );
+        assert_eq!(shown.normal_bar_height, 64.0);
+        assert_eq!(hidden.normal_bar_height, 40.0);
         assert_eq!(
             hidden.strip_layout.rect.bottom() - shown.strip_layout.rect.bottom(),
-            HUD_BOTTOM_HEIGHT
+            HUD_SEEK_ROW_HEIGHT
         );
 
         let target = |geometry: super::VideoSeekGeometry| {
@@ -16233,7 +16222,7 @@ mod tests {
         };
         assert_eq!(
             target(hidden).height - target(shown).height,
-            HUD_BOTTOM_HEIGHT
+            HUD_SEEK_ROW_HEIGHT
         );
 
         let shown_panel = crate::video::native_presenter::overlay_draw::native_jump_panel_rect(
@@ -16246,7 +16235,7 @@ mod tests {
         );
         assert_eq!(
             hidden_panel.bottom() - shown_panel.bottom(),
-            HUD_BOTTOM_HEIGHT
+            HUD_SEEK_ROW_HEIGHT
         );
     }
 
@@ -16322,6 +16311,10 @@ mod tests {
         let seek_lock = native_seek_bar_lock_button_rect(width, height, HUD_BOTTOM_HEIGHT);
         let seek_strip_selector =
             native_seek_strip_selector_button_rect(width, height, HUD_BOTTOM_HEIGHT);
+        let hidden_seek_lock =
+            native_seek_bar_lock_button_rect(width, height, HUD_CONTROLS_ROW_HEIGHT);
+        let hidden_seek_strip_selector =
+            native_seek_strip_selector_button_rect(width, height, HUD_CONTROLS_ROW_HEIGHT);
 
         assert!(top_region.contains(top_lock.min) && top_region.contains(top_lock.max));
         assert!(bottom_region.contains(seek_lock.min) && bottom_region.contains(seek_lock.max));
@@ -16330,6 +16323,8 @@ mod tests {
                 && bottom_region.contains(seek_strip_selector.max)
         );
         assert!(seek_strip_selector.max.x < seek_lock.min.x);
+        assert_eq!(hidden_seek_lock, seek_lock);
+        assert_eq!(hidden_seek_strip_selector, seek_strip_selector);
     }
 
     /// Compact mode (VST3 panel 表示時の 1/4 領域) でも SAR 補正が正しく適用される。

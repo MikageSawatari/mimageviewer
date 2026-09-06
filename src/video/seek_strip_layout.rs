@@ -74,6 +74,22 @@ const SEEK_STRIP_CELL_WIDTH_SMALLEST: f32 = 45.0;
 /// 帯の高さとセルの高さの差 (上下の余白の合計)。
 pub(crate) const SEEK_STRIP_CELL_VERTICAL_INSET: f32 = 10.0;
 
+/// 動画・静止画で共有するストリップ右上の鍵ボタン寸法。
+pub(crate) const SEEK_STRIP_LOCK_BUTTON_SIZE: f32 = 28.0;
+const SEEK_STRIP_LOCK_RIGHT_INSET: f32 = 7.0;
+const SEEK_STRIP_LOCK_TOP_INSET: f32 = 4.0;
+
+/// ストリップ右上の鍵ボタン位置。動画と静止画で描画・当たり判定を同じ座標へ揃える。
+pub(crate) fn seek_strip_lock_button_rect(strip_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            strip_rect.max.x - SEEK_STRIP_LOCK_RIGHT_INSET - SEEK_STRIP_LOCK_BUTTON_SIZE,
+            strip_rect.min.y + SEEK_STRIP_LOCK_TOP_INSET,
+        ),
+        egui::vec2(SEEK_STRIP_LOCK_BUTTON_SIZE, SEEK_STRIP_LOCK_BUTTON_SIZE),
+    )
+}
+
 /// 周辺表示のセル間隔 (points)。出荷済みの見た目。
 const SEEK_STRIP_WINDOW_CELL_GAP: f32 = 4.0;
 /// 全体表示のセル間隔 (points)。区切りが分かる最小限に留め、帯を連続した 1 本に見せる。

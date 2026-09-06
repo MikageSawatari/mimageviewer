@@ -19,7 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -3159,6 +3159,36 @@ struct StillSeekGeometry {
     total_height: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekDirections {
+    strip_rtl: bool,
+    bar_rtl: bool,
+}
+
+fn resolve_still_seek_directions(
+    reading_direction: ReadingDirection,
+    bar_direction: crate::settings::FullscreenSeekDirection,
+) -> StillSeekDirections {
+    StillSeekDirections {
+        strip_rtl: reading_direction == ReadingDirection::Rtl,
+        bar_rtl: bar_direction.is_rtl(reading_direction),
+    }
+}
+
+fn draw_still_seek_strip_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    for offset in [-0.68_f32, 0.0, 0.68] {
+        painter.rect_stroke(
+            egui::Rect::from_center_size(
+                center + egui::vec2(offset * radius, 0.0),
+                egui::vec2(radius * 0.55, radius * 1.15),
+            ),
+            1.0,
+            egui::Stroke::new(1.2, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 impl StillSeekGeometry {
     fn resolve(
         strip_visible: bool,
@@ -3228,6 +3258,8 @@ struct StillSeekStripCell {
     source_pos: usize,
     /// `App::items` / `App::thumbnails` 上の位置。
     idx: usize,
+    /// セル幅とテクスチャ描画の両方に適用するページ回転。
+    rotation: crate::rotation_db::Rotation,
     rect: egui::Rect,
 }
 
@@ -3242,7 +3274,7 @@ struct StillSeekStripLayout {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StillSeekStripThumbnail {
-    Loaded(egui::Vec2),
+    Loaded(egui::Vec2, crate::rotation_db::Rotation),
     Failed,
     Unavailable,
 }
@@ -3279,12 +3311,13 @@ enum StillSeekStripGrowth {
     Stopped,
 }
 
-fn still_seek_strip_cell_width(
+fn still_seek_strip_cell_geometry(
     thumbnail: StillSeekStripThumbnail,
     cell_height: f32,
-) -> Option<f32> {
+) -> Option<(f32, crate::rotation_db::Rotation)> {
     match thumbnail {
-        StillSeekStripThumbnail::Loaded(size) => {
+        StillSeekStripThumbnail::Loaded(size, rotation) => {
+            let size = rotated_display_size(size, rotation);
             let aspect = if size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0
             {
                 size.x / size.y
@@ -3293,9 +3326,12 @@ fn still_seek_strip_cell_width(
                 // 列を永久停止させない。
                 1.0
             };
-            Some((cell_height * aspect).max(cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT))
+            Some((
+                (cell_height * aspect).max(cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT),
+                rotation,
+            ))
         }
-        StillSeekStripThumbnail::Failed => Some(cell_height),
+        StillSeekStripThumbnail::Failed => Some((cell_height, crate::rotation_db::Rotation::None)),
         StillSeekStripThumbnail::Unavailable => None,
     }
 }
@@ -3317,7 +3353,9 @@ fn grow_still_seek_strip_side(
         return None;
     };
     let idx = image_indices[next_source_pos];
-    let Some(cell_width) = still_seek_strip_cell_width(thumbnail_for_idx(idx), cell_height) else {
+    let Some((cell_width, rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(idx), cell_height)
+    else {
         *growth = StillSeekStripGrowth::Stopped;
         return None;
     };
@@ -3364,6 +3402,7 @@ fn grow_still_seek_strip_side(
     Some(StillSeekStripCell {
         source_pos: next_source_pos,
         idx,
+        rotation,
         rect,
     })
 }
@@ -3391,8 +3430,8 @@ fn still_seek_strip_layout(
     let total = image_indices.len();
     let current_pos = current_pos.min(total - 1);
     let current_idx = image_indices[current_pos];
-    let Some(current_width) =
-        still_seek_strip_cell_width(thumbnail_for_idx(current_idx), cell_height)
+    let Some((current_width, current_rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(current_idx), cell_height)
     else {
         return StillSeekStripLayout {
             cells: Vec::new(),
@@ -3467,6 +3506,7 @@ fn still_seek_strip_layout(
     cells.push(StillSeekStripCell {
         source_pos: current_pos,
         idx: current_idx,
+        rotation: current_rotation,
         rect: current_rect,
     });
     cells.extend(right_cells);
@@ -3509,6 +3549,15 @@ struct ResolvedStillSeekTarget {
     display_pos: usize,
 }
 
+/// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
+/// 強調とプレビューはこの同じ表示ユニット解決を使う。
+fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
+    units
+        .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
+        .map(|unit| unit.pages.clone())
+        .unwrap_or_else(|| vec![idx])
+}
+
 /// シーク位置から、プレビューに出すページと着地先を解く。
 ///
 /// **ユニットを 2 つ受ける。** 連結読みではシークがページ単位なのに、見開き設定なら
@@ -3524,13 +3573,6 @@ fn resolve_still_seek_target(
 ) -> Option<ResolvedStillSeekTarget> {
     if image_indices.is_empty() {
         return None;
-    }
-    /// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
-    fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
-        units
-            .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
-            .map(|unit| unit.pages.clone())
-            .unwrap_or_else(|| vec![idx])
     }
     match position {
         StillSeekPosition::TrackFraction(fraction) => {
@@ -3593,6 +3635,31 @@ fn still_seek_source_position_at_pointer(
         .iter()
         .find(|cell| cell.rect.contains(pointer))
         .map(|cell| cell.source_pos)
+}
+
+/// レイアウト closure が参照し得る source page だけを、中央から左右へ有界に集める。
+/// 現在セルは常に帯の中央なので、片側が読む最大数は帯幅の半分とセル幅下限から決まる。
+fn still_seek_strip_rotation_candidates(
+    image_indices: &[usize],
+    current_pos: usize,
+    row_width: f32,
+    cell_height: f32,
+) -> Vec<usize> {
+    if image_indices.is_empty() {
+        return Vec::new();
+    }
+    let current_pos = current_pos.min(image_indices.len() - 1);
+    let min_step = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT + STILL_SEEK_STRIP_CELL_GAP;
+    let per_side = if row_width.is_finite() && cell_height.is_finite() && min_step > 0.0 {
+        ((row_width.max(0.0) * 0.5 / min_step).ceil() as usize).saturating_add(2)
+    } else {
+        2
+    };
+    let start = current_pos.saturating_sub(per_side);
+    let end = current_pos
+        .saturating_add(per_side + 1)
+        .min(image_indices.len());
+    image_indices[start..end].to_vec()
 }
 
 fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
@@ -12540,7 +12607,11 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         egui::Color32::from_rgba_unmultiplied(8, 10, 14, 244),
     );
     let strip = geometry.strip_rect(full_rect).unwrap();
-    let row = strip.shrink2(egui::vec2(18.0, 5.0));
+    let strip_lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+    let row = egui::Rect::from_min_max(
+        strip.min + egui::vec2(18.0, 5.0),
+        egui::pos2(strip_lock.left() - 6.0, strip.bottom() - 5.0),
+    );
     let cell_height =
         strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
     let colors = [
@@ -12560,8 +12631,16 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         egui::vec2(2.0, 3.0),
         egui::vec2(2.0, 3.0),
     ];
+    let rotations = [
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::Cw90,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+    ];
     let layout = still_seek_strip_layout(&image_indices, 2, row, cell_height, false, |idx| {
-        StillSeekStripThumbnail::Loaded(sizes[idx])
+        StillSeekStripThumbnail::Loaded(sizes[idx], rotations[idx])
     });
     for cell in &layout.cells {
         let rect = cell.rect;
@@ -12596,6 +12675,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
             egui::StrokeKind::Inside,
         );
     }
+    draw_seek_strip_lock_button_visual(ui.painter(), strip_lock, false, true);
     let bar = geometry.bar_rect(full_rect).unwrap();
     let track = egui::Rect::from_center_size(
         egui::pos2(full_rect.center().x - 28.0, bar.center().y),
@@ -16401,34 +16481,33 @@ impl App {
             ),
         );
 
-        let control_rect = geometry
-            .bar_rect(full_rect)
-            .or_else(|| geometry.strip_rect(full_rect))
-            .unwrap_or(panel_rect);
-        let lock_x = control_rect.right() - BAR_BUTTON_SIZE - 6.0;
-        let toggle_x = lock_x - BAR_BUTTON_SIZE - 4.0;
-        let lock_y = control_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+        let bar_rect = geometry.bar_rect(full_rect);
+        let strip_rect = geometry.strip_rect(full_rect);
+        let strip_lock_rect =
+            strip_rect.map(crate::video::seek_strip_layout::seek_strip_lock_button_rect);
+        let toggle_x = if let Some(bar_rect) = bar_rect {
+            bar_rect.right() - BAR_BUTTON_SIZE * 2.0 - 10.0
+        } else {
+            strip_lock_rect.map_or(panel_rect.right() - BAR_BUTTON_SIZE - 6.0, |lock_rect| {
+                lock_rect.left() - BAR_BUTTON_SIZE - 4.0
+            })
+        };
+        let toggle_y = bar_rect.map_or_else(
+            || {
+                strip_lock_rect.map_or(panel_rect.center().y, |rect| rect.center().y)
+                    - BAR_BUTTON_SIZE * 0.5
+            },
+            |rect| rect.center().y - BAR_BUTTON_SIZE * 0.5,
+        );
         let strip_visible = self.settings.still_seek_strip_visible;
         let strip_resp = draw_bar_button(
             ui,
             toggle_x,
-            lock_y,
+            toggle_y,
             "fullscreen_still_seek_strip",
             |hovered| bar_button_bg(hovered, strip_visible),
             strip_visible,
-            |painter, center, r| {
-                for offset in [-0.68_f32, 0.0, 0.68] {
-                    painter.rect_stroke(
-                        egui::Rect::from_center_size(
-                            center + egui::vec2(offset * r, 0.0),
-                            egui::vec2(r * 0.55, r * 1.15),
-                        ),
-                        1.0,
-                        egui::Stroke::new(1.2, egui::Color32::WHITE),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            },
+            draw_still_seek_strip_icon,
         )
         .hover_tip_dark(if strip_visible {
             "サムネイル列を隠す"
@@ -16440,30 +16519,37 @@ impl App {
             self.settings.save();
             ctx.request_repaint();
         }
-        let lock_resp = draw_bar_button(
-            ui,
-            lock_x,
-            lock_y,
-            "fullscreen_seek_lock",
-            |hovered| bar_button_bg(hovered, locked),
-            locked,
-            |p, c, r| draw_seek_lock_icon(p, c, r, locked),
-        );
-        let lock_resp = lock_resp.hover_tip_dark(if locked {
-            "シークバー固定を解除"
-        } else {
-            "シークバーを固定表示"
-        });
-        if lock_resp.clicked() {
-            self.settings.fullscreen_seek_bar_locked = !locked;
-            self.settings.save();
-            ctx.request_repaint();
+        if let Some(bar_rect) = bar_rect {
+            let lock_x = bar_rect.right() - BAR_BUTTON_SIZE - 6.0;
+            let lock_y = bar_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+            let lock_resp = draw_bar_button(
+                ui,
+                lock_x,
+                lock_y,
+                "fullscreen_seek_lock",
+                |hovered| bar_button_bg(hovered, locked),
+                locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+            );
+            let lock_resp = lock_resp.hover_tip_dark(if locked {
+                "シークバー固定を解除"
+            } else {
+                "シークバーを固定表示"
+            });
+            if lock_resp.clicked() {
+                self.settings.fullscreen_seek_bar_locked = !locked;
+                self.settings.save();
+                ctx.request_repaint();
+            }
         }
 
-        let content_right = (toggle_x - 6.0).max(panel_rect.left());
+        let bar_content_right = bar_rect.map_or(panel_rect.right(), |_| toggle_x - 6.0);
         let content_rect = egui::Rect::from_min_max(
-            geometry.bar_rect(full_rect).unwrap_or(panel_rect).min,
-            egui::pos2(content_right, panel_rect.bottom()),
+            bar_rect.unwrap_or(panel_rect).min,
+            egui::pos2(
+                bar_content_right.max(panel_rect.left()),
+                panel_rect.bottom(),
+            ),
         );
         let painter = ui.painter();
 
@@ -16483,11 +16569,14 @@ impl App {
         }
 
         let total = info.image_indices.len();
-        // レイアウト、pointer→page、fill、knob の全経路で同じ実効方向を共有する。
-        let is_rtl = self
-            .settings
-            .fullscreen_seek_direction
-            .is_rtl(self.reading_direction);
+        let directions = resolve_still_seek_directions(
+            self.reading_direction,
+            self.settings.fullscreen_seek_direction,
+        );
+        // サムネイル列のページ順とセルの pointer→page は本の読み方向に従う。
+        // 通常バーのクリック、塗り、つまみ、プレビュー位置は独立したシークバー方向設定に従う。
+        let strip_is_rtl = directions.strip_rtl;
+        let bar_is_rtl = directions.bar_rtl;
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
@@ -16515,34 +16604,57 @@ impl App {
                 .as_ref()
                 .map(|units| units.as_slice())
         });
-        let highlighted_pages: HashSet<usize> = spread_seek
-            .as_ref()
-            .map(|(units, unit_index)| units[*unit_index].pages.iter().copied().collect())
-            .unwrap_or_else(|| HashSet::from([fs_idx]));
+        let highlighted_pages: HashSet<usize> = pages_on_screen_with(fs_idx, preview_units)
+            .into_iter()
+            .collect();
         let mut requested_pages = Vec::new();
         let mut preview: Option<ResolvedStillSeekTarget> = None;
         let mut preview_pointer_x = None;
         let mut target = None;
         let mut strip_display_pos = None;
 
-        if let Some(strip_rect) = geometry.strip_rect(full_rect) {
+        if let Some(strip_rect) = strip_rect {
+            let strip_lock_rect = strip_lock_rect.expect("visible strip has a lock button rect");
+            let strip_content_right = if bar_rect.is_some() {
+                strip_lock_rect.left() - 6.0
+            } else {
+                toggle_x - 6.0
+            };
             let strip_content = egui::Rect::from_min_max(
                 strip_rect.min + egui::vec2(6.0, 5.0),
-                egui::pos2(content_right - 6.0, strip_rect.bottom() - 5.0),
+                egui::pos2(
+                    strip_content_right.max(strip_rect.left() + 6.0),
+                    strip_rect.bottom() - 5.0,
+                ),
             );
             let cell_height = (strip_rect.height()
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
+            // 回転取得は &mut self を取るため、列が参照し得る数十件を先に既存の一括 cache
+            // 経路で取り出す。レイアウト closure 内では DB / App を一切参照しない。
+            let rotation_candidates = still_seek_strip_rotation_candidates(
+                &info.image_indices,
+                info.current_pos,
+                strip_content.width(),
+                cell_height,
+            );
+            let rotations = self.get_rotations_for_indices(&rotation_candidates);
+            let strip_rotations: HashMap<usize, crate::rotation_db::Rotation> =
+                rotation_candidates.into_iter().zip(rotations).collect();
             let layout = still_seek_strip_layout(
                 &info.image_indices,
                 info.current_pos,
                 strip_content,
                 cell_height,
-                is_rtl,
+                strip_is_rtl,
                 |idx| match self.thumbnails.get(idx) {
-                    Some(ThumbnailState::Loaded { tex, .. }) => {
-                        StillSeekStripThumbnail::Loaded(tex.size_vec2())
-                    }
+                    Some(ThumbnailState::Loaded { tex, .. }) => StillSeekStripThumbnail::Loaded(
+                        tex.size_vec2(),
+                        strip_rotations
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                    ),
                     Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
                     Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
                         StillSeekStripThumbnail::Unavailable
@@ -16639,11 +16751,12 @@ impl App {
             for cell in &layout.cells {
                 strip_painter.rect_filled(cell.rect, 3.0, egui::Color32::from_gray(30));
                 if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(cell.idx) {
-                    strip_painter.image(
+                    let display_size = rotated_display_size(tex.size_vec2(), cell.rotation);
+                    crate::app::draw_rotated_image(
+                        &strip_painter,
                         tex.id(),
-                        fit_texture_rect(tex.size_vec2(), cell.rect.shrink(2.0)),
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        fit_texture_rect(display_size, cell.rect.shrink(2.0)),
+                        cell.rotation,
                     );
                 } else {
                     strip_painter.text(
@@ -16668,6 +16781,32 @@ impl App {
                     ),
                     egui::StrokeKind::Inside,
                 );
+            }
+
+            // body より後に登録し、鍵の当たり判定をセル操作へ渡さない。位置と見た目は
+            // 動画ストリップと共有し、状態だけ既存のページシークバー固定へ載せる。
+            let strip_lock_response = ui
+                .interact(
+                    strip_lock_rect,
+                    egui::Id::new("fullscreen_still_seek_strip_lock"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            draw_seek_strip_lock_button_visual(
+                painter,
+                strip_lock_rect,
+                strip_lock_response.hovered(),
+                locked,
+            );
+            let strip_lock_response = strip_lock_response.hover_tip_dark(if locked {
+                "サムネイル列の固定を解除"
+            } else {
+                "サムネイル列を固定表示"
+            });
+            if strip_lock_response.clicked() {
+                self.settings.fullscreen_seek_bar_locked = !locked;
+                self.settings.save();
+                ctx.request_repaint();
             }
         }
         if geometry.bar_height > 0.0 {
@@ -16694,7 +16833,7 @@ impl App {
                 .max(64.0)
                 .min((inner.width() * 0.32).max(64.0));
             let gap = 12.0;
-            let (label_rect, track_rect) = if is_rtl {
+            let (label_rect, track_rect) = if bar_is_rtl {
                 let label_rect =
                     egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
                 let track_rect = egui::Rect::from_min_max(
@@ -16737,7 +16876,7 @@ impl App {
                     .or_else(|| response.hover_pos());
                 let resolved_at_pointer = pointer_pos.and_then(|pointer_pos| {
                     let fraction =
-                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
+                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, bar_is_rtl);
                     resolve_still_seek_target(
                         &info.image_indices,
                         spread_units,
@@ -16829,8 +16968,8 @@ impl App {
                 } else {
                     display_pos as f32 / (total - 1) as f32
                 };
-                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
-                let filled_rect = if is_rtl {
+                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, bar_is_rtl);
+                let filled_rect = if bar_is_rtl {
                     egui::Rect::from_min_max(
                         egui::pos2(knob_x, track_rect.top()),
                         track_rect.right_bottom(),
@@ -16851,7 +16990,7 @@ impl App {
                     track_rect.width(),
                     crate::seek_ruler::SEEK_RULER_MIN_SPACING,
                 ) {
-                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
+                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, bar_is_rtl);
                     let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
                     let (height, gray) = if tick.major {
                         (
@@ -16907,7 +17046,7 @@ impl App {
         if let Some(preview) = preview.as_ref() {
             // 画面上の並びに合わせる。右→左読みでは元ページ順の逆から見える。
             let mut pages = preview.preview_pages.clone();
-            if is_rtl {
+            if strip_is_rtl {
                 pages.reverse();
             }
             let textures: Vec<Option<egui::TextureHandle>> = pages
@@ -52803,6 +52942,10 @@ mod tests {
         );
     }
 
+    fn loaded_still_seek_thumbnail(size: egui::Vec2) -> StillSeekStripThumbnail {
+        StillSeekStripThumbnail::Loaded(size, crate::rotation_db::Rotation::None)
+    }
+
     #[test]
     fn spread_seek_maps_two_units_to_discrete_endpoints() {
         assert_eq!(spread_seek_unit_fraction(0, 2), 0.0);
@@ -52828,8 +52971,12 @@ mod tests {
         let images = (0..50_000).collect::<Vec<_>>();
         let cell_height = 94.0;
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_920.0, cell_height));
-        let layout = still_seek_strip_layout(&images, 25_000, row, cell_height, false, |_| {
-            StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 100.0))
+        let rotation_candidates =
+            still_seek_strip_rotation_candidates(&images, 25_000, row.width(), cell_height);
+        assert!(rotation_candidates.len() <= 64);
+        let layout = still_seek_strip_layout(&images, 25_000, row, cell_height, false, |idx| {
+            assert!(rotation_candidates.contains(&idx));
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 100.0))
         });
         let min_cell_width = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT;
         let visible_bound = ((row.width() + STILL_SEEK_STRIP_CELL_GAP)
@@ -52847,11 +52994,11 @@ mod tests {
     fn still_seek_cells_use_each_pages_own_aspect_with_a_lower_bound() {
         let images = [0, 1, 2, 3, 4];
         let states = [
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(3.0, 2.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 10.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(3.0, 2.0)),
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 10.0)),
         ];
         let cell_height = 94.0;
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, cell_height));
@@ -52872,16 +53019,53 @@ mod tests {
     }
 
     #[test]
+    fn still_seek_layout_swaps_width_and_height_for_quarter_turns() {
+        let images = [0, 1, 2];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(
+                egui::vec2(2.0, 3.0),
+                crate::rotation_db::Rotation::Cw90,
+            ),
+        ];
+        let cell_height = 90.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 1, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
+        };
+        assert_f32_close(width(0), 60.0);
+        assert_f32_close(width(2), 135.0);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 2)
+                .unwrap()
+                .rotation,
+            crate::rotation_db::Rotation::Cw90
+        );
+    }
+
+    #[test]
     fn still_seek_unavailable_pages_stop_growth_but_remain_in_overscan_requests() {
         let images = [0, 1, 2, 3, 4, 5, 6];
         let states = [
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
             StillSeekStripThumbnail::Unavailable,
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
             StillSeekStripThumbnail::Unavailable,
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
         ];
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
         let layout = still_seek_strip_layout(&images, 3, row, 94.0, false, |idx| states[idx]);
@@ -52910,9 +53094,9 @@ mod tests {
         let states = [
             StillSeekStripThumbnail::Unavailable,
             StillSeekStripThumbnail::Unavailable,
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
             StillSeekStripThumbnail::Failed,
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
         ];
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 94.0));
         let layout = still_seek_strip_layout(&images, 2, row, 94.0, false, |idx| states[idx]);
@@ -52942,13 +53126,13 @@ mod tests {
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
         let initial = still_seek_strip_layout(&images, 4, row, 94.0, false, |idx| {
             if (2..=6).contains(&idx) {
-                StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0))
+                loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
             } else {
                 StillSeekStripThumbnail::Unavailable
             }
         });
         let grown = still_seek_strip_layout(&images, 4, row, 94.0, false, |_| {
-            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0))
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
         });
         for original in &initial.cells {
             let after = grown
@@ -52962,10 +53146,40 @@ mod tests {
     }
 
     #[test]
-    fn still_seek_strip_visual_order_mirrors_source_positions_for_rtl() {
+    fn still_seek_strip_and_bar_resolve_their_two_direction_axes_independently() {
         let images = [10, 11, 12, 13];
         let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 40.0));
-        let loaded = |_| StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 1.0));
+        let loaded = |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0));
+        let cases = [
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::LeftToRight,
+                true,
+                false,
+            ),
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                true,
+                true,
+            ),
+            (
+                ReadingDirection::Ltr,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                false,
+                false,
+            ),
+        ];
+        for (reading, bar_setting, expected_strip_rtl, expected_bar_rtl) in cases {
+            assert_eq!(
+                resolve_still_seek_directions(reading, bar_setting),
+                StillSeekDirections {
+                    strip_rtl: expected_strip_rtl,
+                    bar_rtl: expected_bar_rtl,
+                }
+            );
+        }
+
         let ltr = still_seek_strip_layout(&images, 1, row, 40.0, false, loaded);
         let rtl = still_seek_strip_layout(&images, 1, row, 40.0, true, loaded);
         assert_eq!(
@@ -52998,6 +53212,34 @@ mod tests {
                 None
             );
         }
+
+        let track = egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(110.0, 8.0));
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, false), 0.0);
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, true), 1.0);
+    }
+
+    #[test]
+    fn still_seek_strip_lock_stays_outside_cell_hit_testing() {
+        let strip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 72.0));
+        let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+        let row = egui::Rect::from_min_max(
+            strip.min + egui::vec2(6.0, 5.0),
+            egui::pos2(lock.left() - 6.0, strip.bottom() - 5.0),
+        );
+        let images = [0, 1, 2, 3, 4, 5];
+        let layout = still_seek_strip_layout(&images, 2, row, 62.0, false, |_| {
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+        });
+        assert!(
+            layout
+                .cells
+                .iter()
+                .all(|cell| cell.rect.right() <= row.right())
+        );
+        assert_eq!(
+            still_seek_source_position_at_pointer(&layout, lock.center()),
+            None
+        );
     }
 
     #[test]
@@ -53060,6 +53302,31 @@ mod tests {
         // 開けば 6 と 7 の見開きになるので 2 枚を出す (2026-09-05 利用者報告)。
         assert_eq!(cell.preview_pages, vec![6, 7]);
         assert_eq!(track.preview_pages, cell.preview_pages);
+    }
+
+    #[test]
+    fn still_seek_continuous_spread_highlight_and_preview_use_the_same_display_unit() {
+        let images = [4, 5, 6, 7];
+        let preview_units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6, 7],
+            },
+        ];
+        let highlighted = pages_on_screen_with(6, Some(&preview_units));
+        let resolved = resolve_still_seek_target(
+            &images,
+            None,
+            Some(&preview_units),
+            StillSeekPosition::SourcePosition(2),
+        )
+        .unwrap();
+        assert_eq!(highlighted, vec![6, 7]);
+        assert_eq!(highlighted, resolved.preview_pages);
     }
 
     #[test]
