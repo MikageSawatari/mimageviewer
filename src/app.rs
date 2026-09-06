@@ -10878,6 +10878,13 @@ pub struct App {
     /// ★フィルタや Ctrl+F で疎になった `visible_indices` でも、非可視 idx が
     /// 先読みキューに流入しないよう、raw range ではなく set 判定に統一する。
     pub(crate) keep_set: std::collections::HashSet<usize>,
+    /// 静止画ページシークのストリップ / hover preview が現在保持する exact set。
+    /// `keep_set` には合流するが、worker の `keep_range` bounding box には合流させない。
+    pub(crate) still_seek_thumbnail_pages: std::collections::HashSet<usize>,
+    /// `still_seek_thumbnail_pages` の worker 可視な read-only projection。
+    /// pop 後や重い I/O 後にも、bbox を広げず stale な前面要求を取り消す。
+    pub(crate) still_seek_thumbnail_pages_shared:
+        Arc<std::sync::RwLock<std::collections::HashSet<usize>>>,
     /// 範囲外サムネイルを全件照合済みの `items_generation`。
     ///
     /// 同一世代の通常フレームでは、前回 keep_set から外れた少数の idx だけを退去させる。
@@ -11402,7 +11409,8 @@ pub struct App {
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
     pub(crate) preferences_right_panel_scroll_sequence: u64,
     /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
-    pub(crate) preferences_requested_page: Option<crate::ui_dialogs::preferences::PreferencesPage>,
+    pub(crate) preferences_requested_page:
+        Option<crate::ui_dialogs::preferences::PreferencesOpenRequest>,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
     pub(crate) show_preferences_discard_confirm: bool,
@@ -14748,6 +14756,10 @@ impl App {
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages_shared: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
@@ -19673,6 +19685,7 @@ impl App {
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.keep_start_shared.store(0, Ordering::Relaxed);
         self.keep_end_shared.store(0, Ordering::Relaxed);
         self.visible_end_shared.store(0, Ordering::Relaxed);
@@ -20353,10 +20366,12 @@ impl App {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
             crate::logger::log(format!(
-                "omitted entries: same_name={} hidden={} unsupported={} system={} chip={} \
+                "omitted entries: same_name={} hidden={} ignored_archive={} unsupported={} \
+                 system={} chip={} \
                  published={} surface={:?}",
                 omitted_entries.same_name,
                 omitted_entries.hidden,
+                omitted_entries.ignored_archive,
                 omitted_entries.unsupported,
                 omitted_entries.system,
                 omitted_entries.primary_count(),
@@ -25132,6 +25147,7 @@ impl App {
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.metadata_cache.clear();
         self.exif_cache.clear();
@@ -27762,6 +27778,7 @@ impl App {
         self.checked.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.keep_start_shared.store(0, Ordering::Relaxed);
         self.keep_end_shared.store(0, Ordering::Relaxed);
@@ -33039,6 +33056,7 @@ impl App {
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
         let keep_start_shared = Arc::clone(&self.keep_start_shared);
         let keep_end_shared = Arc::clone(&self.keep_end_shared);
+        let still_seek_thumbnail_pages_shared = Arc::clone(&self.still_seek_thumbnail_pages_shared);
         let visible_end_shared = Arc::clone(&self.visible_end_shared);
         let edit_preview_db = self.edit_preview_cache.as_ref().map(|service| service.db());
 
@@ -33060,6 +33078,7 @@ impl App {
             let stats_w = Arc::clone(&stats);
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
+            let still_seek_pages_w = Arc::clone(&still_seek_thumbnail_pages_shared);
             let ve_w = Arc::clone(&visible_end_shared);
             // pin-aware auto-pick 用に worker thread にも pin DB を共有する。
             // 内部 Mutex<Connection> で並列読みは serialize されるが、cascade lookup
@@ -33109,7 +33128,20 @@ impl App {
 
                     let ks = ks_w.load(Ordering::Relaxed);
                     let ke = ke_w.load(Ordering::Relaxed);
-                    if req.idx < ks || req.idx >= ke {
+                    let still_seek_exact = req.priority
+                        && still_seek_pages_w
+                            .read()
+                            .map(|pages| pages.contains(&req.idx))
+                            .unwrap_or(false);
+                    // Foreground requests (navigation target, still seek strip / preview)
+                    // deliberately use the exact keep_set without widening this grid bbox.
+                    if !crate::thumb_loader::thumbnail_request_in_keep(
+                        req.priority,
+                        still_seek_exact,
+                        req.idx,
+                        ks,
+                        ke,
+                    ) {
                         crate::logger::log(format!(
                             "  {tag} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
                             req.idx,
@@ -33186,6 +33218,7 @@ impl App {
                         Some(&cancel_w),
                         &ks_w,
                         &ke_w,
+                        Some(&still_seek_pages_w),
                         pin_db_w.as_deref(),
                         edit_preview_db_w.as_ref(),
                         adjustment_db_w.as_ref(),
@@ -33943,10 +33976,8 @@ impl App {
             return;
         }
         self.keep_set.extend(pages.iter().copied());
-        if let (Some(start), Some(end)) = (
-            self.keep_set.iter().min().copied(),
-            self.keep_set.iter().max().copied(),
-        ) {
+        if let (Some(start), Some(end)) = (pages.iter().min().copied(), pages.iter().max().copied())
+        {
             self.keep_range = (start, end.saturating_add(1));
             self.keep_start_shared.store(start, Ordering::Relaxed);
             self.keep_end_shared
@@ -33971,6 +34002,66 @@ impl App {
             self.last_promoted_visible_keys = Some(pdf_keys);
         }
         if pages.iter().any(|idx| self.requested.contains_key(idx)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    /// 静止画ページシーク UI が必要とする bounded exact set を前面要求へ載せる。
+    ///
+    /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
+    /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
+    fn clear_still_seek_thumbnail_requests(&mut self) {
+        self.still_seek_thumbnail_pages.clear();
+        if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+            shared.clear();
+        }
+    }
+
+    pub(crate) fn ensure_still_seek_thumbnail_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+    ) {
+        let next = pages
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.items.len())
+            .collect::<HashSet<_>>();
+        if self.still_seek_thumbnail_pages != next {
+            self.still_seek_thumbnail_pages = next;
+            if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+                shared.clone_from(&self.still_seek_thumbnail_pages);
+            }
+        }
+        self.keep_set
+            .extend(self.still_seek_thumbnail_pages.iter().copied());
+        let request_pages = self
+            .still_seek_thumbnail_pages
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for idx in request_pages.iter().copied() {
+            self.enqueue_priority_thumbnail(idx);
+        }
+        let pdf_keys = request_pages
+            .iter()
+            .filter_map(|idx| match self.items.get(*idx) {
+                Some(GridItem::PdfFile(path)) => Some(crate::grid_item::pdf_page_perf_key(path, 0)),
+                Some(GridItem::PdfPage {
+                    pdf_path, page_num, ..
+                }) => Some(crate::grid_item::pdf_page_perf_key(pdf_path, *page_num)),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if !pdf_keys.is_empty() {
+            let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
+            self.promote_retry_pending = stats.not_found_keys > 0;
+            self.last_promoted_visible_keys = Some(pdf_keys);
+        }
+        if request_pages
+            .iter()
+            .any(|idx| self.requested.contains_key(idx))
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -34114,6 +34205,8 @@ impl App {
         {
             let previous_keep_set = std::mem::take(&mut self.keep_set);
             self.keep_set.extend(navigation_pages.iter().copied());
+            self.keep_set
+                .extend(self.still_seek_thumbnail_pages.iter().copied());
             let start = navigation_pages.iter().min().copied().unwrap_or(0);
             let end = navigation_pages
                 .iter()
@@ -34140,17 +34233,23 @@ impl App {
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
             if self.details_thumb_suppression_applied
                 && self.thumbnail_eviction_generation == Some(self.items_generation)
+                && self.still_seek_thumbnail_pages.is_empty()
             {
                 return;
             }
             let previous_keep_set = std::mem::take(&mut self.keep_set);
+            self.keep_set
+                .extend(self.still_seek_thumbnail_pages.iter().copied());
             self.keep_range = (0, 0);
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
-            self.thumb_pixels.clear();
+            self.thumb_pixels
+                .retain(|idx, _| self.keep_set.contains(idx));
             self.passthrough_rendition_cache.clear();
-            self.thumb_edit_preview_layers.clear();
-            self.thumb_adjust_tex.clear();
+            self.thumb_edit_preview_layers
+                .retain(|idx, _| self.keep_set.contains(idx));
+            self.thumb_adjust_tex
+                .retain(|idx, _| self.keep_set.contains(idx));
             let force_full_reconcile =
                 self.thumbnail_eviction_generation != Some(self.items_generation);
             self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
@@ -34158,18 +34257,30 @@ impl App {
             if let Some(queue_arc) = self.reload_queue.clone() {
                 let (ref mtx, _) = *queue_arc;
                 let mut q = mtx.lock().unwrap();
-                for r in q.drain(..) {
-                    self.requested.remove(&r.idx);
-                }
+                q.retain_mut(|r| {
+                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
+                    if keep {
+                        r.priority = true;
+                    } else {
+                        self.requested.remove(&r.idx);
+                    }
+                    keep
+                });
             }
             if let Some(queue_arc) = self.heavy_io_queue.clone() {
                 let (ref mtx, _) = *queue_arc;
                 let mut q = mtx.lock().unwrap();
-                for r in q.drain(..) {
-                    self.requested.remove(&r.idx);
-                }
+                q.retain_mut(|r| {
+                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
+                    if keep {
+                        r.priority = true;
+                    } else {
+                        self.requested.remove(&r.idx);
+                    }
+                    keep
+                });
             }
-            self.details_thumb_suppression_applied = true;
+            self.details_thumb_suppression_applied = self.still_seek_thumbnail_pages.is_empty();
             return;
         }
         self.details_thumb_suppression_applied = false;
@@ -34180,6 +34291,7 @@ impl App {
             // 古い enqueue 済みリクエストが in-range 判定で処理されてしまう。
             self.keep_range = (0, 0);
             self.keep_set.clear();
+            self.clear_still_seek_thumbnail_requests();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumbnail_eviction_generation = Some(self.items_generation);
@@ -34319,8 +34431,11 @@ impl App {
             .unwrap_or(&[]);
         let previous_keep_set = std::mem::take(&mut self.keep_set);
         self.keep_set.extend(keep_slice.iter().copied());
+        self.keep_set
+            .extend(self.still_seek_thumbnail_pages.iter().copied());
 
-        // keep_range: keep_set の bounding box。worker atomic キャンセル判定で使われる。
+        // keep_range: grid keep_slice の bounding box。worker atomic キャンセル判定で使う。
+        // still seek の bounded exact set は shared set で別判定し、ここを広げない。
         // `visible_indices` は `rebuild_visible_indices` が `for i in 0..n { push(i) }` で
         // 構築するため昇順。その部分列である `keep_slice` も昇順なので、min/max は
         // 端の要素を直接参照すれば O(1)。将来 display list をソート以外の順で構築する
@@ -34555,7 +34670,8 @@ impl App {
             {
                 req.force_cache = true;
             }
-            req.priority = i >= visible_raw_start && i < visible_raw_end;
+            req.priority = (i >= visible_raw_start && i < visible_raw_end)
+                || self.still_seek_thumbnail_pages.contains(&i);
             // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
             // enqueue しない。visible (= priority=true) は常に enqueue する。
             // SourceOnly は idle upgrade 経路 (本 PR scope 外) なので素通し。
@@ -34628,6 +34744,7 @@ impl App {
             // 非可視 + !SourceOnly (= grid prefetch) は prefetch_ok=false なら prune。
             // SourceOnly は idle upgrade 経路で本 PR scope 外。
             let keep_set = &self.keep_set;
+            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34636,7 +34753,8 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let is_grid_prefetch = !now_visible && !r.source_policy.bypasses_cache();
+                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
                     pruned_regular += 1;
@@ -34645,7 +34763,8 @@ impl App {
                 true
             });
             for r in q.iter_mut() {
-                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
+                    || still_seek_thumbnail_pages.contains(&r.idx);
             }
             let _q_before = q.len();
             for r in new_regular {
@@ -34663,6 +34782,7 @@ impl App {
             let (ref mtx, ref cvar) = *hq;
             let mut q = mtx.lock().unwrap();
             let keep_set = &self.keep_set;
+            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34671,7 +34791,8 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let is_grid_prefetch = !now_visible && !r.source_policy.bypasses_cache();
+                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
                     pruned_heavy += 1;
@@ -34680,7 +34801,8 @@ impl App {
                 true
             });
             for r in q.iter_mut() {
-                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
+                    || still_seek_thumbnail_pages.contains(&r.idx);
             }
             for r in new_heavy {
                 requested.insert(r.idx, false);
@@ -37965,20 +38087,20 @@ impl App {
             .blocks_legacy_main_shortcuts()
     }
 
-    fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
+    pub(crate) fn collect_shell_clipboard_paths(
+        &self,
+    ) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
         if !self.checked.is_empty() {
-            let mut paths = Vec::with_capacity(self.checked.len());
-            for &idx in &self.checked {
-                let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
-                    return Err(ShellClipboardSelectionError::UncopyableItem(
-                        self.items
-                            .get(idx)
-                            .and_then(GridItem::file_operation_refusal),
-                    ));
-                };
-                paths.push(path.to_path_buf());
+            let indexed_paths = self.collect_checked_indexed_paths();
+            if indexed_paths.len() != self.checked.len() {
+                let refusal = self.checked.iter().find_map(|&idx| {
+                    self.items
+                        .get(idx)
+                        .and_then(GridItem::file_operation_refusal)
+                });
+                return Err(ShellClipboardSelectionError::UncopyableItem(refusal));
             }
-            return Ok(paths);
+            return Ok(indexed_paths.into_iter().map(|(_, path)| path).collect());
         }
 
         let Some(idx) = self.selected else {
@@ -38016,6 +38138,18 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        self.invoke_shell_clipboard_verb_for_paths(ctx, &paths, verb);
+    }
+
+    pub(crate) fn invoke_shell_clipboard_verb_for_paths(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
         let Some(hwnd) = self.main_hwnd else {
             crate::logger::log(format!(
                 "shell_clipboard: {verb:?} skipped; main HWND unavailable"
@@ -38032,7 +38166,7 @@ impl App {
             crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         }
 
-        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb);
+        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb);
         Self::resync_egui_modifiers_from_os(ctx);
         match result {
             Ok(()) => ctx.request_repaint(),
@@ -38131,7 +38265,7 @@ impl App {
             return;
         }
 
-        let (ctrl_c, ctrl_x) = ctx.input(|i| {
+        let (egui_copy, egui_cut) = ctx.input(|i| {
             let mut c = false;
             let mut x = false;
             for event in &i.events {
@@ -38160,8 +38294,21 @@ impl App {
             false
         };
 
-        if ctrl_c || ctrl_x {
-            let verb = if ctrl_x {
+        let copy_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCopyFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::C));
+        let cut_accepts_semantic_event = self
+            .keymap
+            .effective_chords(KeyAction::GridCutFiles)
+            .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::X));
+        let copy_requested = self.keymap.pressed_action(ctx, KeyAction::GridCopyFiles)
+            || (egui_copy && copy_accepts_semantic_event);
+        let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
+            || (egui_cut && cut_accepts_semantic_event);
+
+        if copy_requested || cut_requested {
+            let verb = if cut_requested {
                 crate::native_context_menu::ShellClipboardVerb::Cut
             } else {
                 crate::native_context_menu::ShellClipboardVerb::Copy
@@ -45519,6 +45666,7 @@ impl App {
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
+        self.clear_still_seek_thumbnail_requests();
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.fs_free_rotation = 0.0;
@@ -53912,6 +54060,7 @@ impl App {
         self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
+        self.clear_still_seek_thumbnail_requests();
         self.fs_context_menu_idx = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]

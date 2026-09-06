@@ -70,8 +70,12 @@ Useful existing facts:
   stack, one global recent-folder list, and one `suppress_folder_nav_record_once`
   flag. A/B quick folders should factor this into reusable history state rather
   than duplicating ad hoc path stacks.
-- `GridItem::file_operation_path()` currently excludes folders, while
-  `GridItem::drag_source_path()` includes folders.
+- `GridItem::file_operation_path()` excludes folders, while
+  `GridItem::drag_source_path()` includes folders. Shell clipboard / native menu / delete の
+  checked 対象解決は `collect_checked_indexed_paths()` と後者へ統一済み。
+- 実ファイル / 実フォルダの右クリック先頭には mIV の「切り取り」「コピー」を常に出し、
+  `GridCutFiles` / `GridCopyFiles` と同じ Shell clipboard helper を使う。仮想単一では隠し、
+  仮想だけまたは実 / 仮想混在の checked では理由付き disabled にする。
 - ZIP/PDF virtual items (`ZipImage`, `ZipDir`, `PdfPage`) have stable mIV
   identity keys but not independent filesystem paths.
 
@@ -82,7 +86,7 @@ Useful existing facts:
 | `Image`, `Video`, `ZipFile`, `PdfFile`, `ConvertibleArchive` | Native mIV + Shell menu | Yes | Real file paths. |
 | `Folder` tile or background current folder | Native mIV + Shell menu | Yes | Re-enable folder copy/paste/delete only through Shell-safe paths. |
 | `SearchContainer` | egui fallback for now | Maybe later | The stored path is real, but search views need extra "go to folder" semantics and must not paste into stale `current_folder`. |
-| Checked selection, all real paths | Native mIV + Shell menu | Yes | Include folders only after selection model is updated to allow folder checks. |
+| Checked selection, all real paths | Native mIV + Shell menu | Yes | サブフォルダ展開可能な一覧では Space で Folder もチェックでき、他の実 path と同じ対象に含める。 |
 | Checked selection mixed real + virtual | egui fallback for now | No Shell menu | Avoid silently applying Shell verbs to only part of the selection. |
 | `ZipImage` | Native mIV custom menu | No | May offer copy rendered image and virtual path only. |
 | `PdfPage` | Native mIV custom menu | No | May add rendered page image copy as a future command. |

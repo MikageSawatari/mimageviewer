@@ -36,6 +36,18 @@ pub fn worker_priority_key(
     }
 }
 
+/// Grid prefetch is bounded by the worker bbox. Foreground requests use the exact
+/// App-owned keep set and must not force that bbox to span distant seek pages.
+pub fn thumbnail_request_in_keep(
+    priority: bool,
+    still_seek_exact: bool,
+    idx: usize,
+    keep_start: usize,
+    keep_end: usize,
+) -> bool {
+    (idx >= keep_start && idx < keep_end) || (priority && still_seek_exact)
+}
+
 // -----------------------------------------------------------------------
 // キャッシュキー定数 (app.rs / ベンチマーク bin から参照)
 // -----------------------------------------------------------------------
@@ -506,13 +518,23 @@ fn read_exif_orientation(path: &std::path::Path) -> u16 {
     1 // デフォルト: 回転なし
 }
 
+/// ファイルから Orientation タグだけを読む。
+///
+/// **デコーダが既に 1 回読んだファイルを、タグ 1 個のためにもう 1 回丸ごと読まない。**
+/// `rexif::parse_file` はファイル全体をメモリへ載せるので、3 MB の JPEG を開くと
+/// 合計 6 MB 読んでいた。ページ送りのたびに起きる (バックログ §1.0n)。
+/// `read_rexif_from_path` は JPEG なら SOS の手前まで、TIFF 系 (CR2 / NEF などの RAW を
+/// 含む) は従来どおり全体を読む。どちらでもない形式では `None` を返し、呼び出し元が
+/// これまでどおり WIC へ回す。
 fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
-    rexif::parse_file(path.to_str()?).ok().and_then(|exif| {
-        exif.entries
-            .iter()
-            .find(|e| e.ifd.tag == 274)
-            .and_then(orientation_from_rexif_entry)
-    })
+    crate::exif_reader::read_rexif_from_path(path)
+        .exif
+        .and_then(|exif| {
+            exif.entries
+                .iter()
+                .find(|e| e.ifd.tag == 274)
+                .and_then(orientation_from_rexif_entry)
+        })
 }
 
 pub(crate) fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
@@ -989,6 +1011,7 @@ pub fn process_load_request(
     cancel: Option<&Arc<AtomicBool>>,
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
+    still_seek_thumbnail_pages: Option<&Arc<std::sync::RwLock<std::collections::HashSet<usize>>>>,
     // pin-aware auto-pick 用の DB ハンドル。`resolve_folder_thumb_image` が
     // recursive auto-pick の各段でサブフォルダの pin を引いて leaf 画像へ
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
@@ -1383,7 +1406,11 @@ pub fn process_load_request(
     if needs_heavy_io {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        if req.idx < ks || req.idx >= ke {
+        let still_seek_exact = req.priority
+            && still_seek_thumbnail_pages
+                .and_then(|shared| shared.read().ok())
+                .is_some_and(|pages| pages.contains(&req.idx));
+        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (after I/O resolve)  {}",
                 req.idx,
@@ -1511,7 +1538,11 @@ pub fn process_load_request(
     if req.pdf_page.is_some() && req.source_policy.allows_cache() {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        if req.idx < ks || req.idx >= ke {
+        let still_seek_exact = req.priority
+            && still_seek_thumbnail_pages
+                .and_then(|shared| shared.read().ok())
+                .is_some_and(|pages| pages.contains(&req.idx));
+        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (pdf before render)  {}",
                 req.idx,
@@ -3208,6 +3239,14 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn foreground_thumbnail_requests_do_not_need_a_widened_worker_bbox() {
+        assert!(!thumbnail_request_in_keep(false, false, 5_000, 2, 8));
+        assert!(!thumbnail_request_in_keep(true, false, 5_000, 2, 8));
+        assert!(thumbnail_request_in_keep(true, true, 5_000, 2, 8));
+        assert!(thumbnail_request_in_keep(false, false, 4, 2, 8));
+    }
+
+    #[test]
     fn unmeasured_time_is_all_of_it_when_nothing_was_timed() {
         assert_eq!(ThumbLoadPhases::default().unaccounted_ms(12.5), 12.5);
     }
@@ -3347,6 +3386,37 @@ mod tests {
         for orientation in 1..=8 {
             let bytes = jpeg_with_orientation(orientation);
             assert_eq!(super::read_exif_orientation_from_bytes(&bytes), orientation);
+        }
+    }
+
+    /// ファイル経路と bytes 経路が同じ向きを返すこと。
+    ///
+    /// ファイル経路は §1.0n で全体読みから prefix 読みへ変えた。読む範囲を変えたので、
+    /// **8 値すべてで bytes 経路と一致すること**を固定する。走査データを後ろへ足しても
+    /// 結果が変わらないことも見る (prefix が SOS の手前で止まっている証拠になる)。
+    #[test]
+    fn file_and_bytes_orientation_paths_agree_even_with_trailing_scan_data() {
+        let dir = TempDir::new().expect("tempdir");
+        for orientation in 1..=8 {
+            let bytes = jpeg_with_orientation(orientation);
+
+            let path = dir.path().join(format!("o{orientation}.jpg"));
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                super::read_exif_orientation_from_file(&path),
+                Some(orientation),
+                "file path disagreed for orientation {orientation}"
+            );
+
+            let padded_path = dir.path().join(format!("o{orientation}_padded.jpg"));
+            let mut padded = bytes.clone();
+            padded.extend(std::iter::repeat_n(0_u8, 256 * 1024));
+            std::fs::write(&padded_path, &padded).unwrap();
+            assert_eq!(
+                super::read_exif_orientation_from_file(&padded_path),
+                Some(orientation),
+                "trailing scan data changed the answer for orientation {orientation}"
+            );
         }
     }
 
@@ -3692,6 +3762,8 @@ mod tests {
             let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
             let keep_start = Arc::new(AtomicUsize::new(0));
             let keep_end = Arc::new(AtomicUsize::new(1));
+            let still_seek_thumbnail_pages =
+                Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
             let req = LoadRequest {
                 idx: 0,
                 path: img_path.clone(),
@@ -3715,6 +3787,7 @@ mod tests {
                 None,
                 &keep_start,
                 &keep_end,
+                Some(&still_seek_thumbnail_pages),
                 None,
                 None,
                 Some(&adjustment_db),

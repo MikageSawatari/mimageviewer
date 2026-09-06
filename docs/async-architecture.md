@@ -72,7 +72,8 @@
 | 音楽ビュー row raster | `std::thread` (`miv-music-timeline-raster`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`TimelineTextureCache`) | `TimelineAnalysis` から DJ 風波形タイムラインを **1 行 (row) ずつ** `egui::ColorImage` にラスタライズ。UI は request に `Arc<TimelineAnalysis>` を渡すだけ (行ウィンドウ切り出しは worker 側で zero-copy) で、結果は generation / row_version / key が現要求と一致するものだけを 1 フレーム 1 枚 `load_texture` する。旧 key / generation の結果は採用側で破棄。`ensure` (key 変更) / `clear` (ファイル変更・close) で worker を作り直す。詳細は [`src/ui_music_timeline.rs`](../src/ui_music_timeline.rs) |
 | 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` (E0-C#10 の MIDI 半音バー、多解像度 FFT) を所有し、UI から `Arc<MusicPcm>` + `center_secs` を受けて再生位置周辺 **±1 秒**の窓を worker 側でスライス (`copy_window`、lock 下で ~1MB 未満コピー) → `analyze_moving_window`。cpal ring buffer は約 100ms 分しか無く ±1s 窓に足りないため、ラボと同じく展開済み PCM をスライスする (案A、[music-integration-plan.md](music-integration-plan.md) §11)。**`MusicPcm` は追記式共有バッファ (`RwLock<Vec<f32>>` + `complete: AtomicBool`)**: 解析ワーカーがデコード進行に合わせて末尾 `append` (write) し、spectrum worker は現デコード済み範囲から窓を read で取る (未デコード領域が中心なら `None`)。`RwLock` = 長い解析 read と spectrum 窓コピー read を並行させ spectrum を固まらせない。高々 1 リクエスト in-flight + 溜まった分は最新へ coalesce。UI (`update`) は playing / 位置変化時に throttle (16ms) 付きで送り、pending / 再生中は `request_repaint_after(16ms)`。窓がまだ取れない間は空バンド = 鍵盤ベースライン + 「解析中…」表示 (`source_complete` で抑制)。新ファイル / close で `clear`。詳細は [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
-| メタ索引 supervisor (Ctrl+F/G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
+| Ctrl+F メタデータフィルター | `std::thread` (`metadata-search`) + request 専用 `rayon::ThreadPool` | 外側 1 本 + Pass 2 最大 8 本 | Pass 1 の構造項目は逐次、画像 / 動画の on-demand メタ読みだけ 8 並列。前面検索なので `ActivityGate` は使わない。cancel 後は未開始 item を止め、開始済み item の結果までを部分結果として返す。XMP cache miss は正規化 path ごとの `OnceLock` で重複排除 |
+| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
 | メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
 | メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
@@ -550,6 +551,12 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 - 3 箇所とも `canceled=true` を送信して `requested` cleanup する。`continue` だけでは
   `requested` に残って「再エンキューされない idx=Pending」状態で固まる。
 
+静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
+要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
+を `keep_set` へ合流する。要求は priority とし、worker は同 set の read-only shared
+projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
+間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
+
 **なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
 DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
 cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、
@@ -626,8 +633,10 @@ mImageViewer は 2 つのリストを使い分ける:
 
 具体像:
 
-- **`App::keep_range: (usize, usize)`** — `keep_set` の bounding box。worker 側で
-  atomic に読める `keep_start_shared` / `keep_end_shared` の値を供給する。
+- **`App::keep_range: (usize, usize)`** — グリッド保持帯（または明示的なナビゲーション
+  対象）の bounding box。worker 側で atomic に読める
+  `keep_start_shared` / `keep_end_shared` の値を供給する。静止画シークの遠隔 exact set
+  はここへ合流せず、上記の shared projection で別に判定する。
   疎な keep_set に対しては「広め」の判定になるので、worker が稀に非可視 idx を
   掴んでしまうが、main thread 側で enqueue しなければほぼ発生しない。
 - **`App::keep_set: HashSet<usize>`** — 実際に prefetch / 保持したい idx 集合。

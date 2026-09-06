@@ -7231,6 +7231,8 @@ impl App {
             bottom_lock: self.settings.video_bottom_lock(),
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
             seek_strip_height: self.settings.video_seek_strip_height,
+            seek_hover_preview_mode: self.settings.video_seek_hover_preview_mode,
+            seek_bar_with_strip: self.settings.video_seek_bar_with_strip,
         }
     }
 

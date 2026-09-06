@@ -4404,14 +4404,16 @@ fn fullscreen_pdf_interrupted_render_is_cancel_like() {
 }
 
 #[test]
-fn scan_directory_can_ignore_convertible_archives() {
+fn folder_scan_can_ignore_convertible_archives() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
     std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
 
-    let scan = scan_directory_with_convertible_archives(tmp.path(), false, false).unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
     assert!(scan.folders.iter().any(|(item, _)| matches!(item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
     assert!(
@@ -4421,6 +4423,91 @@ fn scan_directory_can_ignore_convertible_archives() {
             .any(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. })),
         "convertible archives should be hidden from the folder list"
     );
+    assert_eq!(
+        scan.omitted.ignored_archive, 3,
+        "RAR / 7z / LZH は設定で無視した書庫として数える"
+    );
+    assert_eq!(
+        scan.omitted.unsupported, 0,
+        "設定で無視した書庫を対象外へ二重計上しない"
+    );
+    assert_eq!(
+        scan.omitted.primary_count(),
+        3,
+        "旧 unsupported 3 件だった主数字を維持する"
+    );
+}
+
+#[test]
+fn folder_scan_lists_convertible_archives_for_ask_and_convert() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("book.rar"), b"rar").unwrap();
+    std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
+    std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
+
+    for handling in [
+        crate::settings::ArchiveFileHandling::Ask,
+        crate::settings::ArchiveFileHandling::Convert,
+    ] {
+        let mut settings = crate::settings::Settings::default();
+        settings.set_archive_file_handling(handling);
+        let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+        let archive_count = scan
+            .folders
+            .iter()
+            .filter(|(item, _)| matches!(item, GridItem::ConvertibleArchive { .. }))
+            .count();
+
+        assert_eq!(
+            archive_count, 3,
+            "{handling:?} では変換対象書庫を一覧へ出す"
+        );
+        assert_eq!(
+            scan.omitted,
+            crate::app::folder_scan::OmittedFolderEntryCounts::default(),
+            "{handling:?} では内訳を増やさない"
+        );
+    }
+}
+
+#[test]
+fn folder_scan_keeps_unsupported_files_out_of_ignored_archive_bucket() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("notes.txt"), b"text").unwrap();
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.unsupported, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.primary_count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn folder_scan_classifies_hidden_archive_before_ignore_setting() {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let tmp = TempDir::new().expect("tempdir");
+    let mut archive = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN)
+        .open(tmp.path().join("hidden.rar"))
+        .unwrap();
+    archive.write_all(b"rar").unwrap();
+    drop(archive);
+    let mut settings = crate::settings::Settings::default();
+    settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+    let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
+
+    assert_eq!(scan.omitted.hidden, 1);
+    assert_eq!(scan.omitted.ignored_archive, 0);
+    assert_eq!(scan.omitted.unsupported, 0);
 }
 
 #[test]
@@ -5886,6 +5973,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
         same_name: 3,
         hidden: 2,
+        ignored_archive: 4,
         unsupported: 5,
         system: 1,
     };
@@ -23148,6 +23236,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             None,
             None,
+            None,
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
@@ -23188,6 +23277,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -24427,6 +24517,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -59827,11 +59918,11 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_keep_delete_targets_real_only() {
+    fn checked_file_operation_paths_include_real_files_and_folders_only() {
         let mut app = setup_app();
 
-        // collect_checked_paths は Shell メニュー用の従来 helper なのでフォルダを除外する。
-        // 削除ターゲット helper は Del キーと同じく実フォルダも受け付ける。
+        // Shell クリップボードと削除が共有する正本 helper は、実ファイルと
+        // Space でチェック可能な実フォルダを含み、仮想ページだけを除外する。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -59870,19 +59961,6 @@ mod file_operation_selection_tests {
             app.checked.insert(idx);
         }
 
-        let mut paths = app.collect_checked_paths();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(r"C:\books\a.7z"),
-                PathBuf::from(r"C:\books\a.jpg"),
-                PathBuf::from(r"C:\books\a.mp4"),
-                PathBuf::from(r"C:\books\a.pdf"),
-                PathBuf::from(r"C:\books\a.zip"),
-            ]
-        );
-
         let targets = app.collect_checked_indexed_paths();
         assert_eq!(
             targets,
@@ -59894,7 +59972,7 @@ mod file_operation_selection_tests {
                 (image, PathBuf::from(r"C:\books\a.jpg")),
                 (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and include real folders while excluding virtual pages",
+            "shared targets are sorted by descending index and include real folders while excluding virtual pages",
         );
     }
 
@@ -60010,6 +60088,42 @@ mod file_operation_selection_tests {
             ))),
             "a selected virtual item should produce the same visible rejection path",
         );
+    }
+
+    #[test]
+    fn shell_clipboard_semantic_copy_event_respects_keymap_unbinding() {
+        let mut app = setup_app();
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        app.selected = Some(image);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Grid]\nGridCopyFiles = none\nGridCutFiles = none\n",
+        );
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "割り当て解除後の egui Copy event は既定 Ctrl+C を復活させない"
+        );
+
+        app.keymap = crate::keymap::Keymap::from_ini_str("");
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+        app.handle_clipboard_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast
+                .0
+                .contains("OSクリップボード操作を開始できませんでした")
+        }));
     }
 
     #[test]
@@ -60648,6 +60762,124 @@ mod ctrl_f_structural_filter_tests {
         ) {
             SearchThreadResult::Done { matches, .. } => (matches, progress.snapshot()),
         }
+    }
+
+    fn png_with_xmp_tweet_id(tweet_id: &str) -> Vec<u8> {
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'>
+<xtw:TweetId>{tweet_id}</xtw:TweetId>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut payload = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        payload.extend_from_slice(xml.as_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"iTXt");
+        png.extend_from_slice(&payload);
+        png.extend_from_slice(&[0_u8; 4]);
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0_u8; 4]);
+        png
+    }
+
+    #[test]
+    fn metadata_search_parallel_pass2_deduplicates_xmp_additions_by_normalized_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("duplicate.png");
+        std::fs::write(&path, png_with_xmp_tweet_id("dedup-123")).unwrap();
+        let items = vec![GridItem::Image(path.clone()), GridItem::Image(path.clone())];
+        let tokens = crate::search_query::parse("dedup-123");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+
+        let SearchThreadResult::Done {
+            matches,
+            xmp_additions,
+        } = run_metadata_search(
+            &tokens,
+            &items,
+            &xmp,
+            None,
+            &passwords,
+            &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::XmpTweet]),
+            crate::search_query::MatchMode::And,
+            &cancel,
+            Some(&progress),
+        );
+
+        assert_eq!(matches, std::collections::HashSet::from([0, 1]));
+        assert_eq!(
+            xmp_additions.len(),
+            1,
+            "duplicate normalized path must publish only one XMP addition"
+        );
+        assert_eq!(
+            xmp_additions[0].0,
+            crate::adjustment_db::normalize_path(&path)
+        );
+        assert_eq!(
+            progress.snapshot(),
+            SearchProgressSnapshot {
+                done: 2,
+                total: 2,
+                matched: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_search_cancel_returns_completed_parallel_matches() {
+        let items: Vec<GridItem> = (0..100_000)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("C:\\\\g\\\\hit-{idx}.jpg"))))
+            .collect();
+        let tokens = crate::search_query::parse("hit-");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_metadata_search(
+                    &tokens,
+                    &items,
+                    &xmp,
+                    None,
+                    &passwords,
+                    &target,
+                    crate::search_query::MatchMode::And,
+                    &cancel,
+                    Some(&progress),
+                )
+            });
+            while progress.snapshot().done == 0 && !worker.is_finished() {
+                std::thread::yield_now();
+            }
+            cancel.store(true, Ordering::Relaxed);
+            worker.join().unwrap()
+        });
+
+        let SearchThreadResult::Done { matches, .. } = result;
+        let snapshot = progress.snapshot();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            !matches.is_empty(),
+            "matches completed before cancellation must not be discarded"
+        );
+        assert_eq!(
+            matches.len(),
+            snapshot.done,
+            "every completed filename-only item matched and must be returned"
+        );
+        assert!(snapshot.done <= snapshot.total);
     }
 
     #[test]
@@ -69894,6 +70126,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
         assert_eq!(config_for(requested).bar_lock, requested);
     }
@@ -69906,6 +70140,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
             config_for(requested).bar_lock.fixed_bar_gap_px,

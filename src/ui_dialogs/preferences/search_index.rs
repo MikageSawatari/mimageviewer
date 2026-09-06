@@ -612,6 +612,33 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["ページバー", "下部バー", "固定"]
     ),
     entry!(
+        "spread/seek-strip",
+        SpreadMode,
+        "ページシークバーにサムネイル列を表示",
+        [
+            "静止画",
+            "漫画",
+            "サムネイル",
+            "高さ",
+            "大",
+            "中",
+            "小",
+            "最小"
+        ]
+    ),
+    entry!(
+        "spread/seek-preview",
+        SpreadMode,
+        "マウスオーバーのサムネイル",
+        ["静止画", "プレビュー", "サムネイル列", "常に表示"]
+    ),
+    entry!(
+        "spread/seek-bar-with-strip",
+        SpreadMode,
+        "サムネイル列表示中の通常シークバー",
+        ["静止画", "ページシークバー", "表示しない"]
+    ),
+    entry!(
         "spread/seek-direction",
         SpreadMode,
         "ページシークバーの方向",
@@ -815,7 +842,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "固定表示",
             "鍵",
             "領域を確保",
-            "余白"
+            "余白",
+            "マウスオーバーのサムネイル",
+            "サムネイルストリップ表示中の通常シークバー"
         ]
     ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
@@ -1006,6 +1035,71 @@ mod tests {
                         .all(|character| character == '_' || character.is_ascii_alphanumeric())
             })
             .collect()
+    }
+
+    /// 変換対象形式の名前は、`ArchiveFormat` を単一の持ち主として 3 か所に出る:
+    /// 設定ページの見出し (`page_cache` のリテラル)、この検索索引の title、そして
+    /// `非表示 N 件` の内訳とその設定リンク (`ui_main::omitted_entries_breakdown_label`)。
+    ///
+    /// 前 2 つは `index_entries_are_unique_valid_and_placed_in_pages` が
+    /// 「索引の title が pages.rs のソースに出ること」で結び付けている。ここでは残る 1 本、
+    /// **索引の title が `ArchiveFormat` 由来の名前を使っていること**を固定する。
+    /// これで形式を足したときに、内訳側だけが新しくなって設定ページと索引が古いまま、
+    /// という分かれ方をしない。
+    #[test]
+    fn the_archive_handling_title_spells_the_formats_the_way_archive_format_does() {
+        let labels = crate::archive_converter::ArchiveFormat::convertible_labels();
+        let entry = PREF_SEARCH_INDEX
+            .iter()
+            .find(|entry| entry.anchor == "cache/archive-handling")
+            .expect("cache/archive-handling が索引にありません");
+        assert!(
+            entry.title.contains(&labels),
+            "索引の title `{}` が ArchiveFormat 由来の形式名 `{labels}` を含んでいません。
+             形式を追加したら、設定ページの見出しと索引の title も同時に直すこと。",
+            entry.title
+        );
+    }
+
+    /// `PreferencesOpenRequest` の定数は、ページと anchor を手で組にして持っている。
+    /// 項目を別ページへ移したときに定数だけ古くなると、導線が**黙って別ページへ着地する**
+    /// (押した利用者には「設定が見つからない」としか見えない)。索引を正本として組を照合する。
+    #[test]
+    fn preferences_open_request_constants_point_at_indexed_anchors() {
+        use super::super::{PreferencesOpenRequest, PreferencesPage};
+
+        for request in [
+            PreferencesOpenRequest::DUPLICATE_FILES,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
+            PreferencesOpenRequest::HIDDEN_FILES,
+        ] {
+            let Some(anchor) = request.anchor else {
+                // ページ全体が答えになる導線。ページが実在することだけ確かめる。
+                assert!(
+                    PREF_SEARCH_INDEX
+                        .iter()
+                        .any(|entry| entry.page == request.page),
+                    "{:?} に索引項目が 1 つもありません",
+                    request.page
+                );
+                continue;
+            };
+            let entry = PREF_SEARCH_INDEX
+                .iter()
+                .find(|entry| entry.anchor == anchor)
+                .unwrap_or_else(|| panic!("anchor `{anchor}` が索引にありません"));
+            assert_eq!(
+                entry.page, request.page,
+                "anchor `{anchor}` は {:?} にありますが、定数は {:?} を指しています",
+                entry.page, request.page
+            );
+        }
+
+        // 上のループが空回りしていないことの保険 (variant を消したときに気付ける)。
+        assert_eq!(
+            PreferencesOpenRequest::ARCHIVE_HANDLING.page,
+            PreferencesPage::Cache
+        );
     }
 
     #[test]

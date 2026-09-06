@@ -31,7 +31,7 @@
 #   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
 #   OS が予約しているショートカットは keymap.ini では上書きできません。
-# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、
+# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui の貼り付け、
 #   IME 確定、右クリックメニュー、Escape ナビゲーション、修飾なし矢印ナビゲーション、
 #   サムネイル一覧の Shift+矢印範囲選択は固定です。
 #
@@ -180,6 +180,8 @@
 # GridSelectAll = Ctrl+A ; 表示中のチェック可能な項目をすべてチェックする
 # GridDeselect.1 = Ctrl+D ; チェックをすべて解除する
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
+# GridCutFiles = Ctrl+X ; 選択中またはチェック済みの実ファイル/実フォルダを切り取る
+# GridCopyFiles = Ctrl+C ; 選択中またはチェック済みの実ファイル/実フォルダをコピーする
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridRename = none ; 選択中の実ファイル/実フォルダの名前を変更する

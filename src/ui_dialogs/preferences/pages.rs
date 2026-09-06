@@ -7037,6 +7037,25 @@ pub(super) fn draw_video_bar_visibility_settings(
     }
     ui.small("ON にするとストリップを開いたままにし、下部シークバーも固定して、ストリップの領域を映像から除外します。ストリップ右上の鍵アイコンからも切り替えできます。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
+    ui.add_space(6.0);
+    egui::ComboBox::from_label("マウスオーバーのサムネイル")
+        .selected_text(settings.video_seek_hover_preview_mode.label())
+        .show_ui(ui, |ui| {
+            for mode in crate::settings::VideoSeekHoverPreviewMode::ALL {
+                ui.selectable_value(
+                    &mut settings.video_seek_hover_preview_mode,
+                    mode,
+                    mode.label(),
+                );
+            }
+        });
+    egui::ComboBox::from_label("サムネイルストリップ表示中の通常シークバー")
+        .selected_text(settings.video_seek_bar_with_strip.label())
+        .show_ui(ui, |ui| {
+            for mode in crate::settings::VideoSeekBarWithStrip::ALL {
+                ui.selectable_value(&mut settings.video_seek_bar_with_strip, mode, mode.label());
+            }
+        });
 }
 
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -8554,6 +8573,50 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             "下部ページシークバーを固定表示",
         );
         ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    });
+    anchored(ui, state, "spread/seek-strip", |ui, state| {
+        let s = &mut state.settings;
+        ui.checkbox(
+            &mut s.still_seek_strip_visible,
+            "ページシークバーにサムネイル列を表示",
+        );
+        ui.horizontal(|ui| {
+            ui.label("サムネイル列の高さ");
+            ui.add_enabled_ui(s.still_seek_strip_visible, |ui| {
+                egui::ComboBox::from_id_salt("still_seek_strip_height")
+                    .selected_text(s.still_seek_strip_height.label())
+                    .show_ui(ui, |ui| {
+                        for preset in crate::video::seek_strip_layout::SeekStripHeight::ALL {
+                            ui.selectable_value(
+                                &mut s.still_seek_strip_height,
+                                preset,
+                                preset.label(),
+                            );
+                        }
+                    });
+            });
+        });
+        ui.small("元ページを現在位置の前後へ並べます。固定表示中はサムネイル列も画像領域から除外します。");
+    });
+    anchored(ui, state, "spread/seek-preview", |ui, state| {
+        let s = &mut state.settings;
+        egui::ComboBox::from_label("マウスオーバーのサムネイル")
+            .selected_text(s.still_seek_hover_preview_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::StillSeekHoverPreviewMode::ALL {
+                    ui.selectable_value(&mut s.still_seek_hover_preview_mode, mode, mode.label());
+                }
+            });
+    });
+    anchored(ui, state, "spread/seek-bar-with-strip", |ui, state| {
+        let s = &mut state.settings;
+        egui::ComboBox::from_label("サムネイル列表示中の通常シークバー")
+            .selected_text(s.still_seek_bar_with_strip.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::StillSeekBarWithStrip::ALL {
+                    ui.selectable_value(&mut s.still_seek_bar_with_strip, mode, mode.label());
+                }
+            });
     });
     anchored(ui, state, "spread/seek-direction", |ui, state| {
         let s = &mut state.settings;

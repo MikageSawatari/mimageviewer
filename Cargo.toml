@@ -108,6 +108,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "bench_seek_decode"
+path = "src/bin/bench_seek_decode.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "probe_spherical"
 path = "src/bin/probe_spherical.rs"
 test = false

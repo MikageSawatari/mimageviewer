@@ -1407,28 +1407,41 @@ fn omitted_entries_chip_label(counts: crate::app::OmittedFolderEntryCounts) -> O
     (primary > 0).then(|| format!("非表示 {primary} 件"))
 }
 
+/// 内訳の区切りは `/` ではなく `、` を使う。
+///
+/// 書庫の分類名が `RAR / 7z / LZH` を含むので、区切りも `/` にすると
+/// `隠し項目 2 / RAR / 7z / LZH（設定で無視） 4` のどこが区切りなのか読めなくなる。
+/// 形式名は設定ページの見出しと揃える必要がある側なので、譲るのは区切りの方。
 fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts) -> String {
-    let mut label = format!(
-        "同名など {} / 隠し項目 {} / 対象外 {}",
-        counts.same_name, counts.hidden, counts.unsupported
-    );
+    let mut parts = vec![
+        format!("同名など {}", counts.same_name),
+        format!("隠し項目 {}", counts.hidden),
+    ];
+    if counts.ignored_archive > 0 {
+        let archive_labels = crate::archive_converter::ArchiveFormat::convertible_labels();
+        parts.push(format!(
+            "{archive_labels}（設定で無視） {}",
+            counts.ignored_archive
+        ));
+    }
+    parts.push(format!("対象外 {}", counts.unsupported));
     if counts.system > 0 {
         // システムファイルは主数字に入れないので、内訳でも別立てにして誤解を防ぐ。
-        label.push_str(&format!(" / システム {}", counts.system));
+        parts.push(format!("システム {}", counts.system));
     }
-    label
+    parts.join("、")
 }
 
 /// 走査時に確定した内訳だけを描画する。ここからファイルシステムを再走査しない。
-/// 戻り値は「同名ファイル設定を開く」が押されたかどうか。
+/// 戻り値は、内訳に対応する設定リンクが押された場合の遷移先。
 fn draw_omitted_entries_chip(
     ui: &mut egui::Ui,
     counts: crate::app::OmittedFolderEntryCounts,
-) -> bool {
+) -> Option<crate::ui_dialogs::preferences::PreferencesOpenRequest> {
     let Some(label) = omitted_entries_chip_label(counts) else {
-        return false;
+        return None;
     };
-    let mut open_settings = false;
+    let mut open_preferences = None;
     let button_label = egui::RichText::new(label).small().strong();
     let (response, _) = egui::containers::menu::MenuButton::new(button_label).ui(ui, |ui| {
         ui.set_min_width(300.0);
@@ -1440,15 +1453,38 @@ fn draw_omitted_entries_chip(
             .small()
             .weak(),
         );
-        ui.separator();
-        if ui.link("同名ファイル設定を開く").clicked() {
-            open_settings = true;
+        if counts.same_name > 0 || counts.ignored_archive > 0 || counts.hidden > 0 {
+            ui.separator();
+        }
+        if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
+            ui.close();
+        }
+        if counts.ignored_archive > 0 {
+            let archive_labels = crate::archive_converter::ArchiveFormat::convertible_labels();
+            if ui
+                .link(format!("「{archive_labels} の処理」を設定する"))
+                .clicked()
+            {
+                open_preferences =
+                    Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
+                ui.close();
+            }
+        }
+        if counts.hidden > 0
+            && ui
+                .link("「隠しファイル・フォルダを表示する」を設定する")
+                .clicked()
+        {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::HIDDEN_FILES);
             ui.close();
         }
     });
     let response = response.hover_tip("一覧に表示していない項目の内訳を表示");
     suppress_menu_button_wheel_passthrough(ui.ctx(), &response);
-    open_settings
+    open_preferences
 }
 
 /// ツールバーの文字幅を、確保せずに測る。
@@ -11491,7 +11527,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .show_address_bar_omitted_entries
             .then(|| self.current_normal_folder_omitted_counts())
             .flatten();
-        let mut open_duplicate_settings = false;
+        let mut open_preferences = None;
         let result = egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
@@ -11875,7 +11911,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // TextEdit は available width いっぱいに広がる。
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(counts) = omitted_counts {
-                            open_duplicate_settings |= draw_omitted_entries_chip(ui, counts);
+                            if let Some(page) = draw_omitted_entries_chip(ui, counts) {
+                                open_preferences = Some(page);
+                            }
                             if omitted_entries_chip_label(counts).is_some() {
                                 ui.add_space(4.0);
                             }
@@ -12168,10 +12206,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 result
             })
             .inner;
-        if open_duplicate_settings {
-            self.open_preferences_page(
-                crate::ui_dialogs::preferences::PreferencesPage::DuplicateFiles,
-            );
+        if let Some(request) = open_preferences {
+            self.open_preferences_request(request);
         }
         result
     }
@@ -16776,7 +16812,8 @@ mod facet_filter_bar_tests {
         let counts = crate::app::OmittedFolderEntryCounts {
             same_name: 3,
             hidden: 2,
-            unsupported: 5,
+            ignored_archive: 4,
+            unsupported: 1,
             system: 4,
         };
         assert_eq!(
@@ -16785,12 +16822,13 @@ mod facet_filter_bar_tests {
         );
         assert_eq!(
             omitted_entries_breakdown_label(counts),
-            "同名など 3 / 隠し項目 2 / 対象外 5 / システム 4"
+            "同名など 3、隠し項目 2、RAR / 7z / LZH（設定で無視） 4、対象外 1、システム 4"
         );
 
         let unsupported_only = crate::app::OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
+            ignored_archive: 0,
             unsupported: 5,
             system: 0,
         };
@@ -16801,13 +16839,14 @@ mod facet_filter_bar_tests {
         );
         assert_eq!(
             omitted_entries_breakdown_label(unsupported_only),
-            "同名など 0 / 隠し項目 0 / 対象外 5",
+            "同名など 0、隠し項目 0、対象外 5",
             "システム 0 件のときは内訳から省く"
         );
 
         let system_only = crate::app::OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
+            ignored_archive: 0,
             unsupported: 0,
             system: 9,
         };
@@ -16820,13 +16859,14 @@ mod facet_filter_bar_tests {
     }
 
     #[test]
-    fn omitted_chip_opens_breakdown_and_same_name_settings_link() {
+    fn omitted_chip_shows_only_relevant_settings_links() {
         use egui_kittest::{Harness, kittest::Queryable};
 
         let counts = crate::app::OmittedFolderEntryCounts {
             same_name: 3,
             hidden: 2,
-            unsupported: 5,
+            ignored_archive: 4,
+            unsupported: 1,
             system: 0,
         };
         let mut harness = Harness::builder()
@@ -16842,10 +16882,117 @@ mod facet_filter_bar_tests {
 
         assert!(
             harness
-                .query_by_label("同名など 3 / 隠し項目 2 / 対象外 5")
+                .query_by_label("同名など 3、隠し項目 2、RAR / 7z / LZH（設定で無視） 4、対象外 1")
                 .is_some()
         );
         assert!(harness.query_by_label("同名ファイル設定を開く").is_some());
+        let archive_link = format!(
+            "「{} の処理」を設定する",
+            crate::archive_converter::ArchiveFormat::convertible_labels()
+        );
+        assert!(harness.query_by_label(&archive_link).is_some());
+        assert!(
+            harness
+                .query_by_label("「隠しファイル・フォルダを表示する」を設定する")
+                .is_some()
+        );
+
+        let unsupported_only = crate::app::OmittedFolderEntryCounts {
+            same_name: 0,
+            hidden: 0,
+            ignored_archive: 0,
+            unsupported: 1,
+            system: 0,
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 240.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = draw_omitted_entries_chip(ui, unsupported_only);
+                });
+            });
+        harness.run();
+        harness.get_by_label("非表示 1 件").click();
+        harness.run();
+        assert!(harness.query_by_label("同名ファイル設定を開く").is_none());
+        assert!(harness.query_by_label(&archive_link).is_none());
+        assert!(
+            harness
+                .query_by_label("「隠しファイル・フォルダを表示する」を設定する")
+                .is_none()
+        );
+    }
+
+    fn assert_omitted_settings_link_route(
+        counts: crate::app::OmittedFolderEntryCounts,
+        link_label: &str,
+        expected: crate::ui_dialogs::preferences::PreferencesOpenRequest,
+    ) {
+        use egui_kittest::{Harness, kittest::Queryable};
+        use std::sync::{Arc, Mutex};
+
+        let opened = Arc::new(Mutex::new(None));
+        let opened_for_ui = Arc::clone(&opened);
+        let chip_label = omitted_entries_chip_label(counts).expect("chip label");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(640.0, 240.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(request) = draw_omitted_entries_chip(ui, counts) {
+                        *opened_for_ui.lock().unwrap() = Some(request);
+                    }
+                });
+            });
+        harness.run();
+        harness.get_by_label(&chip_label).click();
+        harness.run();
+        harness.get_by_label(link_label).click();
+        harness.run();
+
+        assert_eq!(*opened.lock().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn omitted_chip_routes_each_breakdown_link_to_its_settings_page() {
+        use crate::ui_dialogs::preferences::PreferencesOpenRequest;
+
+        assert_omitted_settings_link_route(
+            crate::app::OmittedFolderEntryCounts {
+                same_name: 1,
+                hidden: 0,
+                ignored_archive: 0,
+                unsupported: 0,
+                system: 0,
+            },
+            "同名ファイル設定を開く",
+            PreferencesOpenRequest::DUPLICATE_FILES,
+        );
+        let archive_link = format!(
+            "「{} の処理」を設定する",
+            crate::archive_converter::ArchiveFormat::convertible_labels()
+        );
+        assert_omitted_settings_link_route(
+            crate::app::OmittedFolderEntryCounts {
+                same_name: 0,
+                hidden: 0,
+                ignored_archive: 1,
+                unsupported: 0,
+                system: 0,
+            },
+            &archive_link,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
+        );
+        assert_omitted_settings_link_route(
+            crate::app::OmittedFolderEntryCounts {
+                same_name: 0,
+                hidden: 1,
+                ignored_archive: 0,
+                unsupported: 0,
+                system: 0,
+            },
+            "「隠しファイル・フォルダを表示する」を設定する",
+            PreferencesOpenRequest::HIDDEN_FILES,
+        );
     }
 
     fn collect_shape_text(shape: &egui::epaint::Shape, text: &mut String) {

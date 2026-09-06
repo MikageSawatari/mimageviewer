@@ -14,13 +14,15 @@ pub(crate) enum ScanMediaKind {
 
 /// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
 ///
-/// `hidden` / `unsupported` / `system` は既存の `read_dir` ループ内で分類し、`same_name` は
-/// 同名設定の filter が実際に除いた差分を加算する。件数表示のための追加走査や metadata I/O は
-/// 行わない。
+/// `hidden` / `ignored_archive` / `unsupported` / `system` は既存の `read_dir` ループ内で
+/// 分類し、`same_name` は同名設定の filter が実際に除いた差分を加算する。件数表示のための
+/// 追加走査や metadata I/O は行わない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OmittedFolderEntryCounts {
     pub(crate) same_name: usize,
     pub(crate) hidden: usize,
+    /// 環境設定の書庫処理が「無視する」のため一覧へ出さなかった変換対象書庫。
+    pub(crate) ignored_archive: usize,
     pub(crate) unsupported: usize,
     /// OS / エクスプローラーが勝手に作る付随ファイル。利用者の持ち物ではないので主数字から外す。
     pub(crate) system: usize,
@@ -36,6 +38,7 @@ impl OmittedFolderEntryCounts {
     pub(crate) fn primary_count(self) -> usize {
         self.same_name
             .saturating_add(self.hidden)
+            .saturating_add(self.ignored_archive)
             .saturating_add(self.unsupported)
     }
 }
@@ -407,17 +410,20 @@ where
                 folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
             } else if ext_lower == "pdf" {
                 folders.push((GridItem::PdfFile(p), Some((mtime, file_size))));
-            } else if include_convertible_archives
-                && let Some(fmt) =
-                    crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
+            } else if let Some(fmt) =
+                crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
-                folders.push((
-                    GridItem::ConvertibleArchive {
-                        path: p,
-                        format: fmt,
-                    },
-                    Some((mtime, file_size)),
-                ));
+                if include_convertible_archives {
+                    folders.push((
+                        GridItem::ConvertibleArchive {
+                            path: p,
+                            format: fmt,
+                        },
+                        Some((mtime, file_size)),
+                    ));
+                } else {
+                    omitted.ignored_archive = omitted.ignored_archive.saturating_add(1);
+                }
             } else if is_system_file {
                 omitted.system = omitted.system.saturating_add(1);
             } else {
@@ -864,6 +870,7 @@ mod page_count_tests {
         let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
 
         assert_eq!(listing.omitted.same_name, 1, "001.jpg が png に負ける");
+        assert_eq!(listing.omitted.ignored_archive, 0);
         assert_eq!(listing.omitted.unsupported, 1, "notes.txt");
         assert_eq!(listing.omitted.system, 1, "Thumbs.db");
         assert_eq!(listing.items.len(), 1, "残るのは 001.png だけ");
@@ -874,6 +881,7 @@ mod page_count_tests {
         let counts = OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
+            ignored_archive: 0,
             unsupported: 5,
             system: 0,
         };
@@ -886,6 +894,7 @@ mod page_count_tests {
         let system_only = OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
+            ignored_archive: 0,
             unsupported: 0,
             system: 7,
         };
@@ -893,6 +902,38 @@ mod page_count_tests {
             system_only.primary_count(),
             0,
             "Thumbs.db だけのフォルダでチップを点けない"
+        );
+    }
+
+    #[test]
+    fn ignored_archive_reclassification_preserves_the_primary_total() {
+        let counts = OmittedFolderEntryCounts {
+            same_name: 3,
+            hidden: 2,
+            ignored_archive: 4,
+            unsupported: 1,
+            system: 7,
+        };
+        let before_reclassification = counts
+            .same_name
+            .saturating_add(counts.hidden)
+            .saturating_add(counts.unsupported.saturating_add(counts.ignored_archive));
+        let current_breakdown_sum = counts
+            .same_name
+            .saturating_add(counts.hidden)
+            .saturating_add(counts.ignored_archive)
+            .saturating_add(counts.unsupported);
+
+        assert_eq!(counts.primary_count(), 10);
+        assert_eq!(
+            counts.primary_count(),
+            before_reclassification,
+            "旧 unsupported に含まれていた書庫を分離しても主数字は変えない"
+        );
+        assert_eq!(
+            counts.primary_count(),
+            current_breakdown_sum,
+            "主数字は現在の主内訳の和と一致する"
         );
     }
 
