@@ -1286,10 +1286,16 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
 クリック先が逆になるような独立判定を置かない。
-サムネイル列の等幅セルは現在ページのロード済みサムネイル比率から列全体で 1 度だけ解決し、
-可視窓計算、描画、pointer hit test が同じ幅を見る。未ロード時は高さプリセットの従来幅へ戻し、
-解決後はプリセット幅を上限、高さの 35% を下限とする。ページシーク行の上ドラッグと列の
-下ドラッグは動画の `SeekRowGesture` / `strip_drag_closes_downward` を共有し、横ドラッグ契約は変えない。
+サムネイル列は現在ページを帯の中央へ置き、左右へ交互に 1 ページずつ広げる。各セル幅は
+そのページ自身のロード済み `ThumbnailState::Loaded` texture の縦横比 × セル高で決め、
+セル高の 35% を下限とする（横長側の上限は設けない）。`Pending` / `Evicted` へ当たった側は
+セルを置かずに成長を止め、`Failed` は結果確定済みとしてセル高と同じ正方形を置いて先へ進む。
+配置済みセルの source 範囲から両端へ `STILL_SEEK_STRIP_OVERSCAN_CELLS` だけ広げた範囲を
+priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
+セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
+同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
+ページシーク行の上ドラッグと列の下ドラッグは動画の `SeekRowGesture` /
+`strip_drag_closes_downward` を共有し、横ドラッグ契約は変えない。
 通常の左右カーソルキーによるページ移動は
 `fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、

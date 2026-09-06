@@ -448,6 +448,7 @@ mod tests {
                 pixels_per_point,
                 top_bar_locked,
                 bottom_lock,
+                bottom_bar_height: HUD_BOTTOM_HEIGHT,
                 seek_strip_visible_points: 0.0,
                 fixed_bar_gap_px,
                 info_panel_reserved: false,

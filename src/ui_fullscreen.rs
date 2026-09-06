@@ -3222,65 +3222,272 @@ impl StillSeekGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StillSeekStripWindow {
-    visible_start: usize,
-    visible_end: usize,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillSeekStripCell {
+    /// `FullscreenSeekInfo::image_indices` 上の位置。
+    source_pos: usize,
+    /// `App::items` / `App::thumbnails` 上の位置。
+    idx: usize,
+    rect: egui::Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StillSeekStripLayout {
+    /// 画面上の左から右の順。
+    cells: Vec<StillSeekStripCell>,
+    /// `FullscreenSeekInfo::image_indices` 上の半開区間。overscan を含む。
     request_start: usize,
     request_end: usize,
 }
 
-fn still_seek_strip_window(
-    total: usize,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripThumbnail {
+    Loaded(egui::Vec2),
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripSourceStep {
+    TowardStart,
+    TowardEnd,
+}
+
+impl StillSeekStripSourceStep {
+    fn next(self, source_pos: usize, total: usize) -> Option<usize> {
+        match self {
+            Self::TowardStart => source_pos.checked_sub(1),
+            Self::TowardEnd => source_pos.checked_add(1).filter(|next| *next < total),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripScreenSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripGrowth {
+    Active {
+        next_source_pos: usize,
+        outer_edge: f32,
+        source_step: StillSeekStripSourceStep,
+        screen_side: StillSeekStripScreenSide,
+    },
+    Stopped,
+}
+
+fn still_seek_strip_cell_width(
+    thumbnail: StillSeekStripThumbnail,
+    cell_height: f32,
+) -> Option<f32> {
+    match thumbnail {
+        StillSeekStripThumbnail::Loaded(size) => {
+            let aspect = if size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0
+            {
+                size.x / size.y
+            } else {
+                // TextureHandle の寸法は通常必ず正だが、終端状態を未読み込み扱いにして
+                // 列を永久停止させない。
+                1.0
+            };
+            Some((cell_height * aspect).max(cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT))
+        }
+        StillSeekStripThumbnail::Failed => Some(cell_height),
+        StillSeekStripThumbnail::Unavailable => None,
+    }
+}
+
+fn grow_still_seek_strip_side(
+    growth: &mut StillSeekStripGrowth,
+    image_indices: &[usize],
+    row_rect: egui::Rect,
+    cell_height: f32,
+    thumbnail_for_idx: &mut impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> Option<StillSeekStripCell> {
+    let StillSeekStripGrowth::Active {
+        next_source_pos,
+        outer_edge,
+        source_step,
+        screen_side,
+    } = *growth
+    else {
+        return None;
+    };
+    let idx = image_indices[next_source_pos];
+    let Some(cell_width) = still_seek_strip_cell_width(thumbnail_for_idx(idx), cell_height) else {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    };
+    let rect = match screen_side {
+        StillSeekStripScreenSide::Left => egui::Rect::from_min_max(
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP - cell_width,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y + cell_height * 0.5,
+            ),
+        ),
+        StillSeekStripScreenSide::Right => egui::Rect::from_min_size(
+            egui::pos2(
+                outer_edge + STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::vec2(cell_width, cell_height),
+        ),
+    };
+    let fits = match screen_side {
+        StillSeekStripScreenSide::Left => rect.left() >= row_rect.left(),
+        StillSeekStripScreenSide::Right => rect.right() <= row_rect.right(),
+    };
+    if !fits {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    }
+
+    *growth = match source_step.next(next_source_pos, image_indices.len()) {
+        Some(next_source_pos) => StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: match screen_side {
+                StillSeekStripScreenSide::Left => rect.left(),
+                StillSeekStripScreenSide::Right => rect.right(),
+            },
+            source_step,
+            screen_side,
+        },
+        None => StillSeekStripGrowth::Stopped,
+    };
+    Some(StillSeekStripCell {
+        source_pos: next_source_pos,
+        idx,
+        rect,
+    })
+}
+
+/// 現在ページを帯の中央へ置き、ロード済みのページだけで左右へ 1 枚ずつ成長させる。
+///
+/// セル幅・位置・表示順・要求範囲をここで一度だけ決め、描画と当たり判定は完成した
+/// `cells` を共有する。未読み込みに当たった側は止めるが、要求範囲は配置済み範囲から
+/// overscan ぶん外へ延ばすため、停止位置のページがロードされれば次フレームで成長する。
+fn still_seek_strip_layout(
+    image_indices: &[usize],
     current_pos: usize,
-    width: f32,
-    cell_width: f32,
-) -> StillSeekStripWindow {
-    if total == 0 {
-        return StillSeekStripWindow {
-            visible_start: 0,
-            visible_end: 0,
+    row_rect: egui::Rect,
+    cell_height: f32,
+    rtl: bool,
+    mut thumbnail_for_idx: impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> StillSeekStripLayout {
+    if image_indices.is_empty() {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
             request_start: 0,
             request_end: 0,
         };
     }
-    let visible_count = ((width + STILL_SEEK_STRIP_CELL_GAP)
-        / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
-        .floor()
-        .max(1.0) as usize;
-    let visible_count = visible_count.min(total);
-    let desired_start = current_pos.min(total - 1).saturating_sub(visible_count / 2);
-    let visible_start = desired_start.min(total - visible_count);
-    let visible_end = visible_start + visible_count;
-    StillSeekStripWindow {
-        visible_start,
-        visible_end,
+    let total = image_indices.len();
+    let current_pos = current_pos.min(total - 1);
+    let current_idx = image_indices[current_pos];
+    let Some(current_width) =
+        still_seek_strip_cell_width(thumbnail_for_idx(current_idx), cell_height)
+    else {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
+            request_start: current_pos.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
+            request_end: current_pos
+                .saturating_add(1 + STILL_SEEK_STRIP_OVERSCAN_CELLS)
+                .min(total),
+        };
+    };
+
+    let current_rect =
+        egui::Rect::from_center_size(row_rect.center(), egui::vec2(current_width, cell_height));
+    let source_step_left = if rtl {
+        StillSeekStripSourceStep::TowardEnd
+    } else {
+        StillSeekStripSourceStep::TowardStart
+    };
+    let source_step_right = if rtl {
+        StillSeekStripSourceStep::TowardStart
+    } else {
+        StillSeekStripSourceStep::TowardEnd
+    };
+    let mut left_growth = source_step_left.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.left(),
+            source_step: source_step_left,
+            screen_side: StillSeekStripScreenSide::Left,
+        },
+    );
+    let mut right_growth = source_step_right.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.right(),
+            source_step: source_step_right,
+            screen_side: StillSeekStripScreenSide::Right,
+        },
+    );
+    let mut left_cells = Vec::new();
+    let mut right_cells = Vec::new();
+    loop {
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut left_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            left_cells.push(cell);
+        }
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut right_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            right_cells.push(cell);
+        }
+        if matches!(left_growth, StillSeekStripGrowth::Stopped)
+            && matches!(right_growth, StillSeekStripGrowth::Stopped)
+        {
+            break;
+        }
+    }
+
+    left_cells.reverse();
+    let mut cells = Vec::with_capacity(left_cells.len() + 1 + right_cells.len());
+    cells.extend(left_cells);
+    cells.push(StillSeekStripCell {
+        source_pos: current_pos,
+        idx: current_idx,
+        rect: current_rect,
+    });
+    cells.extend(right_cells);
+    let visible_start = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .min()
+        .unwrap_or(current_pos);
+    let visible_end = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .max()
+        .unwrap_or(current_pos)
+        .saturating_add(1);
+    StillSeekStripLayout {
+        cells,
         request_start: visible_start.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
         request_end: visible_end
             .saturating_add(STILL_SEEK_STRIP_OVERSCAN_CELLS)
             .min(total),
     }
-}
-
-/// 現在ページの比率から、ストリップ全体で共有するセル幅を解決する。
-///
-/// 比率がまだ分からない間は従来のプリセット幅を保つ。分かった後も横長ページで
-/// プリセット幅を超えず、極端な縦長ページではセル高さの 35% を下限にする。
-fn resolved_still_seek_cell_width(
-    cell_height: f32,
-    configured_cell_width: f32,
-    current_page_size: Option<egui::Vec2>,
-    available_width: f32,
-) -> f32 {
-    let max_width = configured_cell_width.max(1.0).min(available_width.max(1.0));
-    let min_width = (cell_height.max(1.0) * STILL_SEEK_STRIP_MIN_CELL_ASPECT).min(max_width);
-    let aspect = current_page_size.and_then(|size| {
-        (size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0)
-            .then_some(size.x / size.y)
-    });
-    aspect.map_or(max_width, |aspect| {
-        (cell_height * aspect).clamp(min_width, max_width)
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3377,44 +3584,15 @@ fn resolve_still_seek_target(
     }
 }
 
-fn still_seek_cell_rect(
-    row_rect: egui::Rect,
-    visual_slot: usize,
-    cell_width: f32,
-    cell_height: f32,
-) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(
-            row_rect.left() + visual_slot as f32 * (cell_width + STILL_SEEK_STRIP_CELL_GAP),
-            row_rect.center().y - cell_height * 0.5,
-        ),
-        egui::vec2(cell_width, cell_height),
-    )
-}
-
-fn still_seek_source_position_at_x(
-    row_rect: egui::Rect,
-    window: StillSeekStripWindow,
-    cell_width: f32,
-    pointer_x: f32,
-    rtl: bool,
+fn still_seek_source_position_at_pointer(
+    layout: &StillSeekStripLayout,
+    pointer: egui::Pos2,
 ) -> Option<usize> {
-    if window.visible_start >= window.visible_end
-        || pointer_x < row_rect.left()
-        || pointer_x > row_rect.right()
-    {
-        return None;
-    }
-    let count = window.visible_end - window.visible_start;
-    let slot = ((pointer_x - row_rect.left()) / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
-        .floor()
-        .max(0.0) as usize;
-    let slot = slot.min(count - 1);
-    Some(if rtl {
-        window.visible_end - 1 - slot
-    } else {
-        window.visible_start + slot
-    })
+    layout
+        .cells
+        .iter()
+        .find(|cell| cell.rect.contains(pointer))
+        .map(|cell| cell.source_pos)
 }
 
 fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
@@ -12365,12 +12543,6 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
     let row = strip.shrink2(egui::vec2(18.0, 5.0));
     let cell_height =
         strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
-    let cell_width = resolved_still_seek_cell_width(
-        cell_height,
-        crate::video::seek_strip_layout::SeekStripHeight::Medium.window_cell_width_points(),
-        Some(egui::vec2(2.0, 3.0)),
-        row.width(),
-    );
     let colors = [
         egui::Color32::from_rgb(64, 87, 118),
         egui::Color32::from_rgb(118, 80, 64),
@@ -12379,11 +12551,21 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         egui::Color32::from_rgb(120, 112, 70),
         egui::Color32::from_rgb(65, 105, 115),
     ];
-    let row_width =
-        colors.len() as f32 * cell_width + (colors.len() - 1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
-    let row = egui::Rect::from_center_size(row.center(), egui::vec2(row_width, row.height()));
-    for (slot, color) in colors.into_iter().enumerate() {
-        let rect = still_seek_cell_rect(row, slot, cell_width, cell_height);
+    let image_indices = [0, 1, 2, 3, 4, 5];
+    let sizes = [
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(3.0, 2.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+    ];
+    let layout = still_seek_strip_layout(&image_indices, 2, row, cell_height, false, |idx| {
+        StillSeekStripThumbnail::Loaded(sizes[idx])
+    });
+    for cell in &layout.cells {
+        let rect = cell.rect;
+        let color = colors[cell.idx];
         ui.painter().rect_filled(rect, 3.0, color);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_top()],
@@ -12392,7 +12574,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            (slot + 18).to_string(),
+            (cell.source_pos + 18).to_string(),
             egui::FontId::monospace(14.0),
             egui::Color32::WHITE,
         );
@@ -12400,8 +12582,12 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
             rect,
             3.0,
             egui::Stroke::new(
-                if slot == 2 || slot == 3 { 3.0 } else { 1.0 },
-                if slot == 2 || slot == 3 {
+                if cell.source_pos == 2 || cell.source_pos == 3 {
+                    3.0
+                } else {
+                    1.0
+                },
+                if cell.source_pos == 2 || cell.source_pos == 3 {
                     egui::Color32::from_rgb(112, 174, 255)
                 } else {
                     egui::Color32::from_gray(76)
@@ -16344,40 +16530,47 @@ impl App {
                 strip_rect.min + egui::vec2(6.0, 5.0),
                 egui::pos2(content_right - 6.0, strip_rect.bottom() - 5.0),
             );
-            let configured_cell_width = self
-                .settings
-                .still_seek_strip_height
-                .window_cell_width_points();
             let cell_height = (strip_rect.height()
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
-            let current_page_size = self.thumbnails.get(fs_idx).and_then(|state| {
-                if let ThumbnailState::Loaded { tex, .. } = state {
-                    Some(tex.size_vec2())
-                } else {
-                    None
-                }
-            });
-            let cell_width = resolved_still_seek_cell_width(
+            let layout = still_seek_strip_layout(
+                &info.image_indices,
+                info.current_pos,
+                strip_content,
                 cell_height,
-                configured_cell_width,
-                current_page_size,
-                strip_content.width(),
+                is_rtl,
+                |idx| match self.thumbnails.get(idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => {
+                        StillSeekStripThumbnail::Loaded(tex.size_vec2())
+                    }
+                    Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
+                    Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
+                        StillSeekStripThumbnail::Unavailable
+                    }
+                },
             );
-            let window =
-                still_seek_strip_window(total, info.current_pos, strip_content.width(), cell_width);
             requested_pages.extend(
-                info.image_indices[window.request_start..window.request_end]
+                info.image_indices[layout.request_start..layout.request_end]
                     .iter()
                     .copied(),
             );
-            let visible_count = window.visible_end - window.visible_start;
-            let row_width = visible_count as f32 * cell_width
-                + visible_count.saturating_sub(1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
-            let row_rect = egui::Rect::from_center_size(
-                strip_content.center(),
-                egui::vec2(row_width.min(strip_content.width()), strip_content.height()),
-            );
+            let row_rect = layout
+                .cells
+                .first()
+                .zip(layout.cells.last())
+                .map(|(first, last)| {
+                    egui::Rect::from_min_max(
+                        egui::pos2(first.rect.left(), strip_content.top()),
+                        egui::pos2(last.rect.right(), strip_content.bottom()),
+                    )
+                    .intersect(strip_content)
+                })
+                .unwrap_or_else(|| {
+                    egui::Rect::from_center_size(
+                        strip_content.center(),
+                        egui::vec2(0.0, strip_content.height()),
+                    )
+                });
             let strip_response = ui.interact(
                 row_rect,
                 ui.make_persistent_id("fullscreen_still_seek_strip_row"),
@@ -16408,9 +16601,8 @@ impl App {
                 self.settings.save();
                 ctx.request_repaint();
             }
-            let pointed_source_pos = pointer.and_then(|pointer| {
-                still_seek_source_position_at_x(row_rect, window, cell_width, pointer.x, is_rtl)
-            });
+            let pointed_source_pos =
+                pointer.and_then(|pointer| still_seek_source_position_at_pointer(&layout, pointer));
             if (strip_response.hovered() || strip_response.dragged())
                 && self.settings.still_seek_hover_preview_mode.is_visible(true)
                 && let Some(source_pos) = pointed_source_pos
@@ -16443,36 +16635,28 @@ impl App {
                 }
             }
 
-            for visual_slot in 0..visible_count {
-                let source_pos = if is_rtl {
-                    window.visible_end - 1 - visual_slot
-                } else {
-                    window.visible_start + visual_slot
-                };
-                let idx = info.image_indices[source_pos];
-                let cell_rect =
-                    still_seek_cell_rect(row_rect, visual_slot, cell_width, cell_height)
-                        .intersect(strip_content);
-                painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(30));
-                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(idx) {
-                    painter.image(
+            let strip_painter = painter.with_clip_rect(strip_content);
+            for cell in &layout.cells {
+                strip_painter.rect_filled(cell.rect, 3.0, egui::Color32::from_gray(30));
+                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(cell.idx) {
+                    strip_painter.image(
                         tex.id(),
-                        fit_texture_rect(tex.size_vec2(), cell_rect.shrink(2.0)),
+                        fit_texture_rect(tex.size_vec2(), cell.rect.shrink(2.0)),
                         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
                 } else {
-                    painter.text(
-                        cell_rect.center(),
+                    strip_painter.text(
+                        cell.rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "…",
                         egui::FontId::proportional(18.0),
                         egui::Color32::from_gray(150),
                     );
                 }
-                let selected = highlighted_pages.contains(&idx);
-                painter.rect_stroke(
-                    cell_rect,
+                let selected = highlighted_pages.contains(&cell.idx);
+                strip_painter.rect_stroke(
+                    cell.rect,
                     3.0,
                     egui::Stroke::new(
                         if selected { 3.0 } else { 1.0 },
@@ -52641,104 +52825,179 @@ mod tests {
 
     #[test]
     fn still_seek_strip_requests_are_bounded_by_view_width_for_fifty_thousand_pages() {
-        let window = still_seek_strip_window(50_000, 25_000, 1_920.0, 45.0);
-        let visible = window.visible_end - window.visible_start;
-        let requested = window.request_end - window.request_start;
-        assert!(visible <= 40);
-        assert!(requested <= visible + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2);
-        assert!(window.visible_start <= 25_000);
-        assert!(window.visible_end > 25_000);
-    }
-
-    #[test]
-    fn still_seek_portrait_cell_width_uses_current_page_aspect_with_a_lower_bound() {
-        let portrait =
-            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(2.0, 3.0)), 1920.0);
-        assert_f32_close(portrait, 94.0 * 2.0 / 3.0);
-        assert_f32_close(
-            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(1.0, 10.0)), 1920.0),
-            94.0 * STILL_SEEK_STRIP_MIN_CELL_ASPECT,
-        );
-    }
-
-    #[test]
-    fn still_seek_cell_width_never_exceeds_preset_and_falls_back_when_unknown() {
-        assert_f32_close(
-            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(16.0, 9.0)), 1920.0),
-            152.0,
-        );
-        assert_f32_close(
-            resolved_still_seek_cell_width(94.0, 152.0, None, 1920.0),
-            152.0,
-        );
-    }
-
-    #[test]
-    fn portrait_still_seek_strip_requests_remain_bounded_by_view_width() {
-        let cell_width =
-            resolved_still_seek_cell_width(94.0, 152.0, Some(egui::vec2(2.0, 3.0)), 1920.0);
-        let window = still_seek_strip_window(50_000, 25_000, 1_920.0, cell_width);
-        let visible = window.visible_end - window.visible_start;
-        let visible_bound = ((1_920.0 + STILL_SEEK_STRIP_CELL_GAP)
-            / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
+        let images = (0..50_000).collect::<Vec<_>>();
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_920.0, cell_height));
+        let layout = still_seek_strip_layout(&images, 25_000, row, cell_height, false, |_| {
+            StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 100.0))
+        });
+        let min_cell_width = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT;
+        let visible_bound = ((row.width() + STILL_SEEK_STRIP_CELL_GAP)
+            / (min_cell_width + STILL_SEEK_STRIP_CELL_GAP))
             .floor() as usize;
-        assert!(visible <= visible_bound.max(1));
+        assert!(layout.cells.len() <= visible_bound);
         assert!(
-            window.request_end - window.request_start
-                <= visible + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2
+            layout.request_end - layout.request_start
+                <= layout.cells.len() + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2
         );
+        assert!(layout.cells.iter().any(|cell| cell.source_pos == 25_000));
+    }
+
+    #[test]
+    fn still_seek_cells_use_each_pages_own_aspect_with_a_lower_bound() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(3.0, 2.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 10.0)),
+        ];
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 2, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
+        };
+        assert_f32_close(width(1), cell_height * 2.0 / 3.0);
+        assert_f32_close(width(3), cell_height * 3.0 / 2.0);
+        assert_f32_close(width(4), cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT);
+    }
+
+    #[test]
+    fn still_seek_unavailable_pages_stop_growth_but_remain_in_overscan_requests() {
+        let images = [0, 1, 2, 3, 4, 5, 6];
+        let states = [
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 3, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(layout.request_start, 1);
+        assert_eq!(layout.request_end, 7);
+
+        let current_unavailable = still_seek_strip_layout(&images, 3, row, 94.0, false, |_| {
+            StillSeekStripThumbnail::Unavailable
+        });
+        assert!(current_unavailable.cells.is_empty());
+        assert_eq!(current_unavailable.request_start, 1);
+        assert_eq!(current_unavailable.request_end, 6);
+    }
+
+    #[test]
+    fn still_seek_failed_pages_are_square_and_do_not_stop_growth() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Failed,
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 2, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_f32_close(
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 3)
+                .unwrap()
+                .rect
+                .width(),
+            94.0,
+        );
+    }
+
+    #[test]
+    fn still_seek_placed_cells_do_not_move_when_outer_pages_load() {
+        let images = (0..9).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let initial = still_seek_strip_layout(&images, 4, row, 94.0, false, |idx| {
+            if (2..=6).contains(&idx) {
+                StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0))
+            } else {
+                StillSeekStripThumbnail::Unavailable
+            }
+        });
+        let grown = still_seek_strip_layout(&images, 4, row, 94.0, false, |_| {
+            StillSeekStripThumbnail::Loaded(egui::vec2(2.0, 3.0))
+        });
+        for original in &initial.cells {
+            let after = grown
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == original.source_pos)
+                .unwrap();
+            assert_eq!(after.rect, original.rect);
+        }
+        assert!(grown.cells.len() > initial.cells.len());
     }
 
     #[test]
     fn still_seek_strip_visual_order_mirrors_source_positions_for_rtl() {
-        let window = StillSeekStripWindow {
-            visible_start: 10,
-            visible_end: 14,
-            request_start: 8,
-            request_end: 16,
-        };
-        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(196.0, 40.0));
+        let images = [10, 11, 12, 13];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 40.0));
+        let loaded = |_| StillSeekStripThumbnail::Loaded(egui::vec2(1.0, 1.0));
+        let ltr = still_seek_strip_layout(&images, 1, row, 40.0, false, loaded);
+        let rtl = still_seek_strip_layout(&images, 1, row, 40.0, true, loaded);
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 1.0, false),
-            Some(10)
+            ltr.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
         );
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 1.0, true),
-            Some(13)
+            rtl.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1, 0]
         );
-        assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 195.0, false),
-            Some(13)
-        );
-        assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 195.0, true),
-            Some(10)
-        );
-    }
-
-    #[test]
-    fn portrait_still_seek_hit_test_uses_the_resolved_shared_cell_width() {
-        let cell_width = 60.0;
-        let window = StillSeekStripWindow {
-            visible_start: 10,
-            visible_end: 14,
-            request_start: 8,
-            request_end: 16,
-        };
-        let row_width = 4.0 * cell_width + 3.0 * STILL_SEEK_STRIP_CELL_GAP;
-        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(row_width, 94.0));
-        assert_eq!(
-            still_seek_source_position_at_x(row, window, cell_width, 61.0, false),
-            Some(10)
-        );
-        assert_eq!(
-            still_seek_source_position_at_x(row, window, cell_width, 65.0, false),
-            Some(11)
-        );
-        assert_eq!(
-            still_seek_source_position_at_x(row, window, cell_width, 65.0, true),
-            Some(12)
-        );
+        for layout in [&ltr, &rtl] {
+            for cell in &layout.cells {
+                assert_eq!(
+                    still_seek_source_position_at_pointer(layout, cell.rect.center()),
+                    Some(cell.source_pos)
+                );
+            }
+            let gap_x = (layout.cells[0].rect.right() + layout.cells[1].rect.left()) * 0.5;
+            assert_eq!(
+                still_seek_source_position_at_pointer(
+                    layout,
+                    egui::pos2(gap_x, layout.cells[0].rect.center().y),
+                ),
+                None
+            );
+        }
     }
 
     #[test]
