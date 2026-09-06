@@ -3438,7 +3438,7 @@ mod tests {
         let b = app.build_window_context_for_test(704, |app| {
             app.fs_seek_gesture = crate::ui_fullscreen::StillSeekGesture::Strip {
                 origin_center_pos: 3,
-                origin_pointer_x: 100.0,
+                origin_pointer: egui::pos2(100.0, 80.0),
                 layout_center_pos: 440,
                 page_pos_at_origin: 3,
             };

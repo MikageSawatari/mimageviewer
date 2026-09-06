@@ -1249,7 +1249,8 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 生成元となった source pixel 領域の x / y / width / height を記録する。
 
 静止画の最終フィット矩形は `fullscreen_media_rect` が所有する。下部ページシークバー固定時は
-`FS_SEEK_BAR_HEIGHT`、上部情報バー固定時は `TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
+実表示と固定状態から解決した `StillSeekGeometry::reserved_height`、上部情報バー固定時は
+`TOP_BAR_HEIGHT` をそれぞれ `full_rect` から除外し、
 両方固定なら上下を同時に除外した同一矩形を、単ページ・見開き・連結読み・入力座標へ渡す。
 固定領域の予約は各バーの描画可否と同じ述語を使う。特に編集／注釈・範囲キャプチャ・音楽ビューで
 上部バーを抑止するときは `TOP_BAR_HEIGHT` も予約せず、非表示バー由来の黒帯を残さない。
@@ -1286,6 +1287,13 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して
 クリック先が逆になるような独立判定を置かない。
+列を描画できるナビゲーションかどうかは、キャッシュ済み `FsSeekInfo` の
+`has_page_strip_content()` が一元判定する。geometry と内容描画は同じ述語を読み、
+画像・動画などの混在時は列高を予約せず、通常バーの件数サマリーだけを表示する。
+この判定は初回の画像フィット計算でもキャッシュを解決して使うため、描画後の情報に依存しない。
+通常バー非表示時の右下ページ番号は固定状態でも表示し、固定された通常バーが実際に表示される
+フレームだけ重複を抑止する。
+
 サムネイル列は現在ページを帯の中央へ置き、左右へ交互に 1 ページずつ広げる。各セル幅は
 そのページ自身のロード済み `ThumbnailState::Loaded` texture の縦横比 × セル高で決め、
 セル高の 35% を下限とする（横長側の上限は設けない）。`Pending` / `Evicted` へ当たった側は
@@ -1294,11 +1302,17 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
-列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer x を
+列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer の X/Y を
 保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ押下時点からの総 x 移動量と
 同じ高さ preset の `window_cell_width_points()` を渡し、整数 source position へ丸めて先頭 / 末尾で
 clamp する。右へ引くと中央 source position は小さくなる。判定順序も動画と同じく、まず
 `strip_drag_closes_downward` で下ドラッグ close を決め、close でない場合だけ中央を動かす。
+静止画側の呼び出し境界は `min(strip_rect.bottom(), full_rect.bottom() - 1 / pixels_per_point)`
+とし、通常バーを隠して列下端が画面下端になる場合も、最後の物理ピクセルで close できる。
+共有関数の既存条件（押下原点から 24pt 超、下方向の移動量が横方向を上回る）は維持する。
+release フレームも最終 pointer を使って close / 中央確定を判定し、通常バーの横シークも
+`Track(Scrub)` の release で最終位置へ着地する。egui の `total_drag_delta()` は release 時に
+取得できないため、close の方向はジェスチャが保持した押下原点から計算する。
 横ドラッグ中はページを移動せず、release は `StripCommitted` としてその中央を保持する。セルの
 click だけが従来のページ着地を行う。実際の現在ページが変わった次の描画では committed center を
 破棄して新しい `current_pos` へ戻す一方、現在ページの強調は帯の中央とは独立して常に実際の
