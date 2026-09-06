@@ -1289,3 +1289,27 @@ files/s は「小さいファイルの区間」を有利に見せるだけの指
 - 右パネルには、更新中の変更が完了後に結果へ反映されることを表示する。
 - 行はルーズ画像でもファイル名と親フォルダを両方表示し、右クリックから画像 / ZIP entry /
   PDF page の識別用パスをコピーできる。
+
+### 20.8 462 万件の常駐表縮小と実パス復元 (2026-09-06 実測)
+
+20.7 と同じ 4,627,166 行の作業用 DB、同じ `dev-runtime` 条件、同じ origin key で、
+全 `item_key` / `container_key` を常駐させる構造と compact 構造を比較した。Working Set は
+テストプロセス内でロード直前・直後の `GetProcessMemoryInfo` を読み、その差を記録した。
+
+| 処理 | 全文字列を常駐 | compact 常駐表 |
+| --- | ---: | ---: |
+| SQLite ロード + メモリ表構築 | 16,851.7 ms | **4,081.1 ms** |
+| Working Set 増分 | 4,177,711,104 bytes (約 3.89 GiB) | **243,421,184 bytes (約 232 MiB)** |
+| 未キャッシュ照会 (19 hits) | 54.0〜59.6 ms | **50.9〜53.2 ms** |
+| cache hit | 0.0001 ms | 0.0000〜0.0172 ms |
+
+常駐表は線形走査用の `(PDQ-256, rowid)` と origin 探索用の
+`(process-random 64-bit key hash, rowid)` だけにした。hash 一致は候補抽出にしか使わず、
+SQLite から行を point lookup して `item_key` を一致確認するため、衝突を別画像として解決しない。
+hit の詳細も線形走査後の少数候補だけ SQLite から読む。問い合わせ全体は worker 上で行い、
+同じ origin key + memory epoch の結果をパネルが再利用する。
+
+メモリ表のロードはパネルを初めて開いた時ではなく、`auto_index_similar` の対象が構成されて
+索引が利用可能になった時点と、最終走査 pass の公開後に開始する。画像 / ZIP / PDF の遷移先は、
+問い合わせ worker が既存 DB key から一度だけ実在パスへ戻して cache 済み hit に保持する。
+対象が消失していれば正規化 key を fallback とする。この修正に DB 列追加や再索引はない。

@@ -1,6 +1,7 @@
 //! お気に入り配下の「別バージョン」索引ジョブと遅延ロード線形検索。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, RandomState};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -100,6 +101,9 @@ pub struct QueryHit {
     pub format: SimilarImageFormat,
     pub origin_width: u32,
     pub origin_height: u32,
+    /// 問い合わせ worker が一度だけ実在パスへ戻した表示・遷移先。
+    /// 消失済みなら正規化 key から組み立てた fallback を保持する。
+    pub target: Option<SimilarItemTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +170,7 @@ pub struct SimilarIndexManager {
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
-    item_query: Mutex<ItemQueryCache>,
+    item_query: Arc<Mutex<ItemQueryCache>>,
     book_query: Arc<Mutex<BookQueryState>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
     scheduler: Arc<SimilarIndexScheduler>,
@@ -179,6 +183,7 @@ impl SimilarIndexManager {
         let memory = Arc::new(Mutex::new(MemoryState::Unloaded));
         let summary = Arc::new(Mutex::new(SummaryState::Unloaded));
         let memory_epoch = Arc::new(AtomicU64::new(0));
+        let item_query = Arc::new(Mutex::new(ItemQueryCache::default()));
         let book_query = Arc::new(Mutex::new(BookQueryState::Idle));
         let enabled_roots = Arc::new(RwLock::new(Vec::new()));
         let scheduler = Arc::new(SimilarIndexScheduler {
@@ -187,6 +192,7 @@ impl SimilarIndexManager {
             memory: Arc::clone(&memory),
             summary: Arc::clone(&summary),
             memory_epoch: Arc::clone(&memory_epoch),
+            item_query: Arc::clone(&item_query),
             book_query: Arc::clone(&book_query),
             prefill_db: Arc::new(Mutex::new(None)),
             enabled_roots: Arc::clone(&enabled_roots),
@@ -199,7 +205,7 @@ impl SimilarIndexManager {
             memory,
             summary,
             memory_epoch,
-            item_query: Mutex::new(ItemQueryCache::default()),
+            item_query,
             book_query,
             enabled_roots,
             scheduler,
@@ -214,13 +220,22 @@ impl SimilarIndexManager {
         pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
         activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
     ) {
-        let roots = favorites
+        let roots: Vec<PathBuf> = favorites
             .iter()
             .filter(|favorite| favorite.auto_index_similar)
             .map(|favorite| favorite.path.clone())
             .collect();
+        let should_load = !roots.is_empty();
         self.scheduler
             .configure(roots, pdf_passwords, activity_gate);
+        if should_load {
+            start_memory_load(
+                &self.data_dir,
+                &self.memory,
+                &self.memory_epoch,
+                &self.item_query,
+            );
+        }
     }
 
     /// favorite を OFF にしたとき、その範囲だけを worker 上で即時削除する。
@@ -244,38 +259,79 @@ impl SimilarIndexManager {
     }
 
     /// 同じ表示項目と同じメモリ snapshot への照会は Arc ごと再利用する。
-    /// 数百万件の線形走査と hit の文字列 clone を repaint ごとに繰り返さない。
+    /// 線形走査と SQLite point lookup は worker 上だけで行う。
     pub fn query_item(&self, item_key: &str) -> Arc<ItemQuery> {
-        let epoch = self.memory_epoch.load(Ordering::Acquire);
-        cached_item_query(&self.item_query, item_key, epoch, || {
-            if !self.item_is_enabled(item_key) {
-                return ItemQuery::NotIndexed;
-            }
-            let running = matches!(self.progress(), IndexProgress::Running(_));
-            let mut state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.item_is_enabled(item_key) {
+            return Arc::new(ItemQuery::NotIndexed);
+        }
+        let running = matches!(self.progress(), IndexProgress::Running(_));
+        let index = {
+            let state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
                 MemoryState::Unloaded => {
-                    self.start_memory_load(&mut state);
-                    ItemQuery::Preparing
+                    drop(state);
+                    start_memory_load(
+                        &self.data_dir,
+                        &self.memory,
+                        &self.memory_epoch,
+                        &self.item_query,
+                    );
+                    return Arc::new(ItemQuery::Preparing);
                 }
-                MemoryState::Missing if running => ItemQuery::Preparing,
-                MemoryState::Missing => ItemQuery::NoIndex,
-                MemoryState::Loading => ItemQuery::Preparing,
-                MemoryState::Failed(error) => ItemQuery::Failed(error.clone()),
-                MemoryState::Ready(index) => {
-                    let mut result = query_item_ready(index, item_key);
-                    if let ItemQuery::Ready(hits) = &mut result {
-                        let roots = self.enabled_roots.read().unwrap_or_else(|e| e.into_inner());
-                        hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
-                    }
-                    if running && matches!(result, ItemQuery::NotIndexed) {
-                        ItemQuery::Preparing
-                    } else {
-                        result
-                    }
-                }
+                MemoryState::Missing if running => return Arc::new(ItemQuery::Preparing),
+                MemoryState::Missing => return Arc::new(ItemQuery::NoIndex),
+                MemoryState::Loading => return Arc::new(ItemQuery::Preparing),
+                MemoryState::Failed(error) => return Arc::new(ItemQuery::Failed(error.clone())),
+                MemoryState::Ready(index) => Arc::clone(index),
             }
-        })
+        };
+        let epoch = self.memory_epoch.load(Ordering::Acquire);
+        if let Some(result) = cached_item_query(&self.item_query, item_key, epoch) {
+            if running && matches!(result.as_ref(), ItemQuery::NotIndexed) {
+                return Arc::new(ItemQuery::Preparing);
+            }
+            return result;
+        }
+
+        let preparing = Arc::new(ItemQuery::Preparing);
+        store_cached_item_query(&self.item_query, item_key, epoch, Arc::clone(&preparing));
+        let cache = Arc::clone(&self.item_query);
+        let epoch_guard = Arc::clone(&self.memory_epoch);
+        let enabled_roots = Arc::clone(&self.enabled_roots);
+        let db_path = SimilarDb::db_path_at(&self.data_dir);
+        let query_key = item_key.to_owned();
+        let spawn_result = std::thread::Builder::new()
+            .name("similar-item-query".to_owned())
+            .spawn(move || {
+                let mut result = SimilarDb::open_at(&db_path)
+                    .map_err(db_error)
+                    .map_or_else(ItemQuery::Failed, |db| {
+                        query_item_ready(&db, &index, &query_key)
+                    });
+                if let ItemQuery::Ready(hits) = &mut result {
+                    let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
+                    hits.retain(|hit| key_is_under_any(&hit.item_key, &roots));
+                }
+                if running && matches!(result, ItemQuery::NotIndexed) {
+                    result = ItemQuery::Preparing;
+                }
+                if epoch_guard.load(Ordering::Acquire) == epoch {
+                    replace_cached_item_query_if_current(
+                        &cache,
+                        &query_key,
+                        epoch,
+                        Arc::new(result),
+                    );
+                }
+            });
+        if let Err(error) = spawn_result {
+            let failed = Arc::new(ItemQuery::Failed(format!(
+                "similar item query worker start failed: {error}"
+            )));
+            store_cached_item_query(&self.item_query, item_key, epoch, Arc::clone(&failed));
+            return failed;
+        }
+        preparing
     }
 
     /// 走査中に Complete 済みの旧 snapshot を表示しているかを UI へ伝える。
@@ -332,23 +388,25 @@ impl SimilarIndexManager {
             return BookQuery::NotIndexed;
         }
         let running = matches!(self.progress(), IndexProgress::Running(_));
-        let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        let index = match &*memory {
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        match &*memory {
             MemoryState::Unloaded => {
-                self.start_memory_load(&mut memory);
+                drop(memory);
+                start_memory_load(
+                    &self.data_dir,
+                    &self.memory,
+                    &self.memory_epoch,
+                    &self.item_query,
+                );
                 return BookQuery::Preparing;
             }
             MemoryState::Missing if running => return BookQuery::Preparing,
             MemoryState::Missing => return BookQuery::NotIndexed,
             MemoryState::Loading => return BookQuery::Preparing,
             MemoryState::Failed(error) => return BookQuery::Failed(error.clone()),
-            MemoryState::Ready(index) => Arc::clone(index),
+            MemoryState::Ready(_) => {}
         };
         drop(memory);
-        if running && !index.row_for_key.contains_key(item_key) {
-            return BookQuery::Preparing;
-        }
-
         let mut query = self.book_query.lock().unwrap_or_else(|e| e.into_inner());
         match &*query {
             BookQueryState::Loading { item_key: active } if active == item_key => {
@@ -368,8 +426,16 @@ impl SimilarIndexManager {
         let query_key = item_key.to_owned();
         let epoch = self.memory_epoch.load(Ordering::Acquire);
         let epoch_guard = Arc::clone(&self.memory_epoch);
+        let db_path = SimilarDb::db_path_at(&self.data_dir);
         std::thread::spawn(move || {
-            let mut result = query_book_ready(&index, &query_key);
+            // 本単位 UI は後続 step。常駐 index を膨らませず、要求された時だけ詳細表を読む。
+            let mut result = SimilarDb::open_at(&db_path)
+                .and_then(|db| db.load_search_rows(current_hash_version()))
+                .map(MemoryIndex::detailed_from_rows)
+                .map_or_else(
+                    |error| BookQuery::Failed(db_error(error)),
+                    |details| query_book_ready(&details, &query_key),
+                );
             if let BookQuery::Ready(hits) = &mut result {
                 let roots = enabled_roots.read().unwrap_or_else(|e| e.into_inner());
                 hits.retain(|hit| key_is_under_any(&hit.other_container_key, &roots));
@@ -390,22 +456,42 @@ impl SimilarIndexManager {
         BookQuery::Preparing
     }
 
-    fn start_memory_load(&self, state: &mut MemoryState) {
+    fn item_is_enabled(&self, item_key: &str) -> bool {
+        key_is_under_any(
+            item_key,
+            &self.enabled_roots.read().unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+}
+
+fn start_memory_load(
+    data_dir: &Path,
+    memory: &Arc<Mutex<MemoryState>>,
+    memory_epoch: &Arc<AtomicU64>,
+    item_query: &Arc<Mutex<ItemQueryCache>>,
+) {
+    let epoch = memory_epoch.load(Ordering::Acquire);
+    {
+        let mut state = memory.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*state, MemoryState::Unloaded) {
+            return;
+        }
         *state = MemoryState::Loading;
-        let db_path = SimilarDb::db_path_at(&self.data_dir);
-        let state = Arc::clone(&self.memory);
-        let epoch = self.memory_epoch.load(Ordering::Acquire);
-        let epoch_guard = Arc::clone(&self.memory_epoch);
-        std::thread::spawn(move || {
+    }
+    let db_path = SimilarDb::db_path_at(data_dir);
+    let state = Arc::clone(memory);
+    let epoch_guard = Arc::clone(memory_epoch);
+    let cache = Arc::clone(item_query);
+    let spawn_result = std::thread::Builder::new()
+        .name("similar-index-load".to_owned())
+        .spawn(move || {
             let loaded = if !db_path.is_file() {
                 Ok(None)
             } else {
-                SimilarDb::open_at(&db_path).and_then(|db| {
-                    db.load_search_rows(current_hash_version())
-                        .map(MemoryIndex::from_rows)
-                        .map(Arc::new)
-                        .map(Some)
-                })
+                SimilarDb::open_at(&db_path)
+                    .and_then(|db| MemoryIndex::load(&db))
+                    .map(Arc::new)
+                    .map(Some)
             }
             .map_err(|error| format!("similar index load failed: {error}"));
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -417,16 +503,13 @@ impl SimilarIndexManager {
                 Ok(None) => MemoryState::Missing,
                 Err(error) => MemoryState::Failed(error),
             };
-            // Preparing を含む item query cache を次の repaint で更新させる。
+            drop(state);
+            cache.lock().unwrap_or_else(|e| e.into_inner()).entry = None;
             epoch_guard.fetch_add(1, Ordering::AcqRel);
         });
-    }
-
-    fn item_is_enabled(&self, item_key: &str) -> bool {
-        key_is_under_any(
-            item_key,
-            &self.enabled_roots.read().unwrap_or_else(|e| e.into_inner()),
-        )
+    if let Err(error) = spawn_result {
+        *memory.lock().unwrap_or_else(|e| e.into_inner()) =
+            MemoryState::Failed(format!("similar index load worker start failed: {error}"));
     }
 }
 
@@ -458,6 +541,7 @@ struct SimilarIndexScheduler {
     memory: Arc<Mutex<MemoryState>>,
     summary: Arc<Mutex<SummaryState>>,
     memory_epoch: Arc<AtomicU64>,
+    item_query: Arc<Mutex<ItemQueryCache>>,
     book_query: Arc<Mutex<BookQueryState>>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
@@ -615,7 +699,6 @@ impl SimilarIndexScheduler {
         *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
         register_prefill_db(&db, &self.enabled_roots);
 
-        let mut first_pass = true;
         loop {
             let (revision, config, cancel, purge_roots) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -639,12 +722,6 @@ impl SimilarIndexScheduler {
                     current_path: None,
                     report: IndexReport::default(),
                 });
-            if first_pass {
-                // Running への遷移も NotIndexed/NoIndex の意味を変える。snapshot 本体は保持したまま
-                // epoch を進め、開始直前に cache された状態だけを 1 回更新する。
-                self.retain_loaded_snapshot_during_run();
-                first_pass = false;
-            }
             let keep_roots = config
                 .roots
                 .iter()
@@ -692,6 +769,12 @@ impl SimilarIndexScheduler {
             // を回収した後だけ捨てるため、更新中の照会が SQLite 全件 reload を繰り返さない。
             self.invalidate_loaded_state();
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = next;
+            start_memory_load(
+                &self.data_dir,
+                &self.memory,
+                &self.memory_epoch,
+                &self.item_query,
+            );
             return;
         }
     }
@@ -703,8 +786,8 @@ impl SimilarIndexScheduler {
     }
 
     fn invalidate_loaded_state(&self) {
-        self.memory_epoch.fetch_add(1, Ordering::AcqRel);
         *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = MemoryState::Unloaded;
+        self.memory_epoch.fetch_add(1, Ordering::AcqRel);
         *self.summary.lock().unwrap_or_else(|e| e.into_inner()) = SummaryState::Unloaded;
         *self.book_query.lock().unwrap_or_else(|e| e.into_inner()) = BookQueryState::Idle;
     }
@@ -773,26 +856,42 @@ fn cached_item_query(
     cache: &Mutex<ItemQueryCache>,
     item_key: &str,
     memory_epoch: u64,
-    compute: impl FnOnce() -> ItemQuery,
-) -> Arc<ItemQuery> {
-    if let Some(result) = cache
+) -> Option<Arc<ItemQuery>> {
+    cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry
         .as_ref()
         .filter(|entry| entry.item_key == item_key && entry.memory_epoch == memory_epoch)
         .map(|entry| Arc::clone(&entry.result))
-    {
-        return result;
-    }
+}
 
-    let result = Arc::new(compute());
+fn store_cached_item_query(
+    cache: &Mutex<ItemQueryCache>,
+    item_key: &str,
+    memory_epoch: u64,
+    result: Arc<ItemQuery>,
+) {
     cache.lock().unwrap_or_else(|e| e.into_inner()).entry = Some(CachedItemQuery {
         item_key: item_key.to_owned(),
         memory_epoch,
-        result: Arc::clone(&result),
+        result,
     });
-    result
+}
+
+fn replace_cached_item_query_if_current(
+    cache: &Mutex<ItemQueryCache>,
+    item_key: &str,
+    memory_epoch: u64,
+    result: Arc<ItemQuery>,
+) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = cache.entry.as_mut() else {
+        return;
+    };
+    if entry.item_key == item_key && entry.memory_epoch == memory_epoch {
+        entry.result = result;
+    }
 }
 
 fn retain_ready_memory_or_unload(state: &mut MemoryState) {
@@ -804,12 +903,71 @@ fn retain_ready_memory_or_unload(state: &mut MemoryState) {
 struct MemoryIndex {
     /// ブリーフどおり、索引構造を持たない 36-byte/件の線形表。
     signatures: Vec<([u8; 32], u32)>,
+    /// origin の point lookup 候補だけを持つ。hash 一致後は SQLite の実 key で確認する。
+    key_rows: Vec<(u64, u32)>,
+    key_hash_builder: RandomState,
+}
+
+struct DetailedMemoryIndex {
+    signatures: Vec<([u8; 32], u32)>,
     rows: HashMap<u32, StoredItem>,
     row_for_key: HashMap<String, u32>,
     book_ids: BTreeMap<String, u32>,
 }
 
 impl MemoryIndex {
+    fn load(db: &SimilarDb) -> rusqlite::Result<Self> {
+        let key_hash_builder = RandomState::new();
+        let compact = db.load_compact_search_rows(current_hash_version(), |key| {
+            key_hash_builder.hash_one(key)
+        })?;
+        let mut key_rows = compact.key_rows;
+        key_rows.sort_unstable();
+        Ok(Self {
+            signatures: compact.signatures,
+            key_rows,
+            key_hash_builder,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_rows(rows: Vec<SearchRow>) -> Self {
+        let key_hash_builder = RandomState::new();
+        let mut signatures = Vec::with_capacity(rows.len());
+        let mut key_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            signatures.push((row.item.pdq256, row.row_id));
+            key_rows.push((key_hash_builder.hash_one(&row.item.item_key), row.row_id));
+        }
+        signatures.sort_unstable_by_key(|(_, row_id)| *row_id);
+        key_rows.sort_unstable();
+        Self {
+            signatures,
+            key_rows,
+            key_hash_builder,
+        }
+    }
+
+    fn candidate_rows_for_key(&self, item_key: &str) -> &[(u64, u32)] {
+        let hash = self.key_hash_builder.hash_one(item_key);
+        let start = self.key_rows.partition_point(|(value, _)| *value < hash);
+        let end = self.key_rows.partition_point(|(value, _)| *value <= hash);
+        &self.key_rows[start..end]
+    }
+
+    fn signature_for_row(&self, row_id: u32) -> Option<&[u8; 32]> {
+        self.signatures
+            .binary_search_by_key(&row_id, |(_, id)| *id)
+            .ok()
+            .map(|index| &self.signatures[index].0)
+    }
+
+    fn detailed_from_rows(rows: Vec<SearchRow>) -> DetailedMemoryIndex {
+        DetailedMemoryIndex::from_rows(rows)
+    }
+}
+
+impl DetailedMemoryIndex {
     fn from_rows(rows: Vec<SearchRow>) -> Self {
         let mut signatures = Vec::with_capacity(rows.len());
         let mut by_id = HashMap::with_capacity(rows.len());
@@ -837,15 +995,41 @@ impl MemoryIndex {
     }
 }
 
-fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
-    let Some(origin_id) = index.row_for_key.get(item_key).copied() else {
+fn query_item_ready(db: &SimilarDb, index: &MemoryIndex, item_key: &str) -> ItemQuery {
+    query_item_ready_with(index, item_key, |row_id| {
+        db.load_item_by_row_id(row_id, current_hash_version())
+            .map_err(db_error)
+    })
+}
+
+fn query_item_ready_with(
+    index: &MemoryIndex,
+    item_key: &str,
+    mut load_row: impl FnMut(u32) -> Result<Option<SearchRow>, String>,
+) -> ItemQuery {
+    let mut origin_row = None;
+    for (_, row_id) in index.candidate_rows_for_key(item_key) {
+        match load_row(*row_id) {
+            Ok(Some(row)) if row.item.item_key == item_key => {
+                origin_row = Some(row);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => return ItemQuery::Failed(error),
+        }
+    }
+    let Some(origin_row) = origin_row else {
         return ItemQuery::NotIndexed;
     };
-    let origin = &index.rows[&origin_id];
+    let origin_id = origin_row.row_id;
+    let origin = origin_row.item;
+    if index.signature_for_row(origin_id) != Some(&origin.pdq256) {
+        return ItemQuery::NotIndexed;
+    }
     if origin.quality == 0 {
         return ItemQuery::Featureless;
     }
-    let mut hits = Vec::new();
+    let mut candidates = Vec::new();
     for (signature, row_id) in &index.signatures {
         if *row_id == origin_id {
             continue;
@@ -854,9 +1038,18 @@ fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
         let Some(band) = match_band(distance) else {
             continue;
         };
-        let item = &index.rows[row_id];
+        candidates.push((*row_id, *signature, distance, band));
+    }
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (row_id, signature, distance, band) in candidates {
+        let item = match load_row(row_id) {
+            Ok(Some(row)) if row.item.pdq256 == signature => row.item,
+            Ok(_) => continue,
+            Err(error) => return ItemQuery::Failed(error),
+        };
+        let target = resolved_target_for_item(&item);
         hits.push(QueryHit {
-            row_id: *row_id,
+            row_id,
             item_key: item.item_key.clone(),
             kind: item.kind,
             container_key: item.container_key.clone(),
@@ -870,6 +1063,7 @@ fn query_item_ready(index: &MemoryIndex, item_key: &str) -> ItemQuery {
             format: SimilarImageFormat::from_i64(item.format),
             origin_width: origin.width,
             origin_height: origin.height,
+            target,
         });
     }
     hits.sort_by(|left, right| {
@@ -890,29 +1084,58 @@ pub const fn match_band(distance: u32) -> Option<MatchBand> {
     }
 }
 
-pub fn target_for_hit(hit: &QueryHit) -> Option<SimilarItemTarget> {
-    match hit.kind {
-        ItemKind::Image => Some(SimilarItemTarget::File(PathBuf::from(&hit.item_key))),
+pub fn target_for_hit(hit: &QueryHit) -> Option<&SimilarItemTarget> {
+    hit.target.as_ref()
+}
+
+fn resolved_target_for_item(item: &StoredItem) -> Option<SimilarItemTarget> {
+    match item.kind {
+        ItemKind::Image => Some(SimilarItemTarget::File(recover_existing_path(Path::new(
+            &item.item_key,
+        )))),
         ItemKind::ZipPage => {
-            let (zip_path, entry_name) =
-                hit.item_key.split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
+            let (zip_path, entry_name) = item
+                .item_key
+                .split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
             Some(SimilarItemTarget::ZipPage {
-                zip_path: PathBuf::from(zip_path),
+                zip_path: recover_existing_path(Path::new(zip_path)),
                 entry_name: entry_name.to_owned(),
             })
         }
         ItemKind::PdfPage => {
-            let (pdf_path, page) = hit.item_key.split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
+            let (pdf_path, page) = item
+                .item_key
+                .split_once(crate::search_norm::ZIP_ENTRY_SEP)?;
             let page_num = page.strip_prefix("pdf:")?.parse().ok()?;
             Some(SimilarItemTarget::PdfPage {
-                pdf_path: PathBuf::from(pdf_path),
+                pdf_path: recover_existing_path(Path::new(pdf_path)),
                 page_num,
             })
         }
     }
 }
 
-fn query_book_ready(index: &MemoryIndex, item_key: &str) -> BookQuery {
+fn recover_existing_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .map(strip_windows_verbatim_prefix)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+fn query_book_ready(index: &DetailedMemoryIndex, item_key: &str) -> BookQuery {
     let Some(origin_id) = index.row_for_key.get(item_key).copied() else {
         return BookQuery::NotIndexed;
     };
@@ -1006,7 +1229,7 @@ fn query_book_ready(index: &MemoryIndex, item_key: &str) -> BookQuery {
     BookQuery::Ready(hits)
 }
 
-fn book_pages(index: &MemoryIndex) -> HashMap<u32, Vec<dupe::book::BookPage>> {
+fn book_pages(index: &DetailedMemoryIndex) -> HashMap<u32, Vec<dupe::book::BookPage>> {
     let mut books = HashMap::<u32, Vec<dupe::book::BookPage>>::new();
     for item in index.rows.values() {
         let (Some(container), Some(page_index)) = (&item.container_key, item.page_index) else {
@@ -1029,7 +1252,7 @@ fn book_pages(index: &MemoryIndex) -> HashMap<u32, Vec<dupe::book::BookPage>> {
 }
 
 fn add_page_neighborhood(
-    index: &MemoryIndex,
+    index: &DetailedMemoryIndex,
     page: &dupe::book::BookPage,
     seen_pages: &mut HashSet<(u32, u32)>,
     corpus: &mut Vec<dupe::book::BookPage>,
@@ -2502,33 +2725,85 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[cfg(windows)]
+    fn current_working_set_bytes() -> usize {
+        use std::ffi::c_void;
+
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut c_void;
+        }
+        #[link(name = "psapi")]
+        unsafe extern "system" {
+            fn GetProcessMemoryInfo(
+                process: *mut c_void,
+                counters: *mut ProcessMemoryCounters,
+                size: u32,
+            ) -> i32;
+        }
+
+        let mut counters = ProcessMemoryCounters {
+            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+        };
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "GetProcessMemoryInfo failed");
+        counters.working_set_size
+    }
+
+    #[cfg(not(windows))]
+    fn current_working_set_bytes() -> usize {
+        0
+    }
+
     #[test]
     #[ignore = "manual measurement against a caller-selected similar.db"]
     fn measure_real_store_load_and_uncached_query() {
         let db_path = std::env::var_os("MIV_SIMILAR_BENCH_DB")
             .map(PathBuf::from)
             .expect("set MIV_SIMILAR_BENCH_DB");
+        let resident_before = current_working_set_bytes();
         let load_started = std::time::Instant::now();
         let db = SimilarDb::open_at(&db_path).unwrap();
-        let rows = db.load_search_rows(current_hash_version()).unwrap();
-        let row_count = rows.len();
-        let index = MemoryIndex::from_rows(rows);
+        let index = MemoryIndex::load(&db).unwrap();
+        let row_count = index.signatures.len();
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
-        let origin_key = std::env::var("MIV_SIMILAR_BENCH_ORIGIN").unwrap_or_else(|_| {
-            index
-                .rows
-                .values()
-                .filter(|item| item.quality > 0)
-                .map(|item| &item.item_key)
-                .min()
-                .expect("store has no non-featureless item")
-                .clone()
-        });
+        let resident_after = current_working_set_bytes();
+        let origin_key = std::env::var("MIV_SIMILAR_BENCH_ORIGIN")
+            .expect("set MIV_SIMILAR_BENCH_ORIGIN to an indexed non-featureless item key");
         let mut query_ms = Vec::new();
         let mut hit_count = 0;
         for _ in 0..3 {
             let started = std::time::Instant::now();
-            let result = std::hint::black_box(query_item_ready(&index, &origin_key));
+            let result = std::hint::black_box(query_item_ready(&db, &index, &origin_key));
             query_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             hit_count = match result {
                 ItemQuery::Ready(hits) => hits.len(),
@@ -2537,21 +2812,21 @@ mod tests {
         }
         let cache = Mutex::new(ItemQueryCache::default());
         let cache_miss_started = std::time::Instant::now();
-        let cached = cached_item_query(&cache, &origin_key, 7, || {
-            query_item_ready(&index, &origin_key)
-        });
+        let cached = Arc::new(query_item_ready(&db, &index, &origin_key));
+        store_cached_item_query(&cache, &origin_key, 7, Arc::clone(&cached));
         let cache_miss_ms = cache_miss_started.elapsed().as_secs_f64() * 1000.0;
         let mut cache_hit_ms = Vec::new();
         for _ in 0..3 {
             let started = std::time::Instant::now();
-            let again = std::hint::black_box(cached_item_query(&cache, &origin_key, 7, || {
-                panic!("cache hit recomputed the query")
-            }));
+            let again = std::hint::black_box(
+                cached_item_query(&cache, &origin_key, 7).expect("cache hit missing"),
+            );
             cache_hit_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             assert!(Arc::ptr_eq(&cached, &again));
         }
         eprintln!(
-            "similar_query_measurement rows={row_count} load_ms={load_ms:.3} query_ms={query_ms:?} cache_miss_ms={cache_miss_ms:.3} cache_hit_ms={cache_hit_ms:?} hits={hit_count} origin={origin_key:?}"
+            "similar_query_measurement rows={row_count} load_ms={load_ms:.3} resident_before_bytes={resident_before} resident_after_bytes={resident_after} resident_delta_bytes={} query_ms={query_ms:?} cache_miss_ms={cache_miss_ms:.3} cache_hit_ms={cache_hit_ms:?} hits={hit_count} origin={origin_key:?}",
+            resident_after.saturating_sub(resident_before)
         );
     }
 
@@ -2792,31 +3067,54 @@ mod tests {
         }
     }
 
+    fn query_test_rows(index: &MemoryIndex, rows: &[SearchRow], item_key: &str) -> ItemQuery {
+        query_item_ready_with(index, item_key, |row_id| {
+            Ok(rows.iter().find(|row| row.row_id == row_id).cloned())
+        })
+    }
+
     #[test]
     fn featureless_origin_is_typed_not_an_empty_result() {
-        let index = MemoryIndex::from_rows(vec![row(1, "blank", [0; 32], 0)]);
-        assert_eq!(query_item_ready(&index, "blank"), ItemQuery::Featureless);
+        let rows = vec![row(1, "blank", [0; 32], 0)];
+        let index = MemoryIndex::from_rows(rows.clone());
+        assert_eq!(
+            query_test_rows(&index, &rows, "blank"),
+            ItemQuery::Featureless
+        );
     }
 
     #[test]
     fn item_query_cache_changes_only_with_origin_or_memory_epoch() {
         let cache = Mutex::new(ItemQueryCache::default());
-        let computes = AtomicUsize::new(0);
-        let compute = || {
-            computes.fetch_add(1, Ordering::Relaxed);
-            ItemQuery::Ready(Vec::new())
-        };
-
-        let first = cached_item_query(&cache, "origin-a", 4, compute);
-        let same = cached_item_query(&cache, "origin-a", 4, compute);
+        let first = Arc::new(ItemQuery::Ready(Vec::new()));
+        store_cached_item_query(&cache, "origin-a", 4, Arc::clone(&first));
+        let same = cached_item_query(&cache, "origin-a", 4).unwrap();
         assert!(Arc::ptr_eq(&first, &same));
-        assert_eq!(computes.load(Ordering::Relaxed), 1);
+        assert!(cached_item_query(&cache, "origin-b", 4).is_none());
+        assert!(cached_item_query(&cache, "origin-a", 5).is_none());
+    }
 
-        let other_origin = cached_item_query(&cache, "origin-b", 4, compute);
-        assert!(!Arc::ptr_eq(&same, &other_origin));
-        let other_epoch = cached_item_query(&cache, "origin-b", 5, compute);
-        assert!(!Arc::ptr_eq(&other_origin, &other_epoch));
-        assert_eq!(computes.load(Ordering::Relaxed), 3);
+    #[test]
+    fn stale_item_query_worker_cannot_replace_a_newer_origin() {
+        let cache = Mutex::new(ItemQueryCache::default());
+        store_cached_item_query(
+            &cache,
+            "origin-b",
+            7,
+            Arc::new(ItemQuery::Ready(Vec::new())),
+        );
+        replace_cached_item_query_if_current(
+            &cache,
+            "origin-a",
+            7,
+            Arc::new(ItemQuery::Featureless),
+        );
+
+        assert!(matches!(
+            cached_item_query(&cache, "origin-b", 7).as_deref(),
+            Some(ItemQuery::Ready(_))
+        ));
+        assert!(cached_item_query(&cache, "origin-a", 7).is_none());
     }
 
     #[test]
@@ -2899,13 +3197,14 @@ mod tests {
             *byte = 0xff;
         }
         let unrelated = [0xff; 32];
-        let index = MemoryIndex::from_rows(vec![
+        let rows = vec![
             row(1, "origin", [0; 32], 1),
             row(2, "near", nearly, 1),
             row(3, "version", version, 1),
             row(4, "far", unrelated, 1),
-        ]);
-        let ItemQuery::Ready(hits) = query_item_ready(&index, "origin") else {
+        ];
+        let index = MemoryIndex::from_rows(rows.clone());
+        let ItemQuery::Ready(hits) = query_test_rows(&index, &rows, "origin") else {
             panic!("expected ready query");
         };
         assert_eq!(hits.len(), 2);
@@ -2913,6 +3212,123 @@ mod tests {
         assert_eq!(hits[0].distance, 8);
         assert_eq!(hits[1].band, MatchBand::OtherVersion);
         assert_eq!(hits[1].distance, 16);
+    }
+
+    #[test]
+    fn origin_hash_candidate_is_confirmed_against_the_stored_key() {
+        let rows = vec![row(1, "actual-key", [0; 32], 1)];
+        let mut index = MemoryIndex::from_rows(rows.clone());
+        let requested = "different-key-with-the-same-hash-candidate";
+        let forced_hash = index.key_hash_builder.hash_one(requested);
+        index.key_rows[0] = (forced_hash, 1);
+
+        assert_eq!(
+            query_test_rows(&index, &rows, requested),
+            ItemQuery::NotIndexed
+        );
+    }
+
+    #[test]
+    fn item_query_runs_off_thread_and_publishes_the_cached_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = SimilarDb::db_path_at(temp.path());
+        let db = SimilarDb::open_at(&db_path).unwrap();
+        let origin = row(1, "c:/library/origin.png", [0; 32], 1).item;
+        let mut near_signature = [0; 32];
+        near_signature[0] = 0xff;
+        let near = row(2, "c:/library/near.png", near_signature, 1).item;
+        db.upsert_loose_item(&origin).unwrap();
+        db.upsert_loose_item(&near).unwrap();
+        let index = Arc::new(MemoryIndex::load(&db).unwrap());
+
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.memory.lock().unwrap() = MemoryState::Ready(index);
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        assert_eq!(*manager.query_item(&origin.item_key), ItemQuery::Preparing);
+
+        for _ in 0..100 {
+            let result = manager.query_item(&origin.item_key);
+            if let ItemQuery::Ready(hits) = result.as_ref() {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].item_key, near.item_key);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("item query worker did not publish its result");
+    }
+
+    #[test]
+    fn enabling_a_favorite_starts_memory_load_before_any_panel_query() {
+        let temp = tempfile::tempdir().unwrap();
+        SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        let library = temp.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let mut favorite = crate::settings::FavoriteEntry::new("library".to_owned(), library);
+        favorite.auto_index_similar = true;
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+
+        manager.configure(
+            &[favorite],
+            crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            None,
+        );
+
+        assert!(!matches!(
+            *manager.memory.lock().unwrap(),
+            MemoryState::Unloaded
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn query_target_recovers_real_case_once_and_falls_back_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("MixedCaseFolder");
+        std::fs::create_dir(&directory).unwrap();
+        let actual = directory.join("ActualName.JpG");
+        std::fs::write(&actual, b"not decoded by this test").unwrap();
+        let normalized = crate::search_index_db::normalize_path(&actual);
+        let mut item = row(1, &normalized, [0; 32], 1).item;
+
+        let Some(SimilarItemTarget::File(resolved)) = resolved_target_for_item(&item) else {
+            panic!("expected file target");
+        };
+        assert_eq!(resolved.file_name().unwrap(), "ActualName.JpG");
+        assert_eq!(
+            resolved.parent().unwrap().file_name().unwrap(),
+            "MixedCaseFolder"
+        );
+
+        let zip = directory.join("ArchiveBook.ZIP");
+        std::fs::write(&zip, b"not opened by this test").unwrap();
+        item.kind = ItemKind::ZipPage;
+        item.item_key = item_key_for_zip_page(&zip, "Page01.JPG");
+        let Some(SimilarItemTarget::ZipPage { zip_path, .. }) = resolved_target_for_item(&item)
+        else {
+            panic!("expected zip target");
+        };
+        assert_eq!(zip_path.file_name().unwrap(), "ArchiveBook.ZIP");
+
+        let pdf = directory.join("PrintedBook.PDF");
+        std::fs::write(&pdf, b"not opened by this test").unwrap();
+        item.kind = ItemKind::PdfPage;
+        item.item_key = item_key_for_pdf_page(&pdf, 4);
+        let Some(SimilarItemTarget::PdfPage { pdf_path, page_num }) =
+            resolved_target_for_item(&item)
+        else {
+            panic!("expected pdf target");
+        };
+        assert_eq!(pdf_path.file_name().unwrap(), "PrintedBook.PDF");
+        assert_eq!(page_num, 4);
+
+        std::fs::remove_file(&actual).unwrap();
+        item.kind = ItemKind::Image;
+        item.item_key = normalized.clone();
+        assert_eq!(
+            resolved_target_for_item(&item),
+            Some(SimilarItemTarget::File(PathBuf::from(normalized)))
+        );
     }
 
     #[test]
@@ -3006,7 +3422,7 @@ mod tests {
                 row_id += 1;
             }
         }
-        let index = MemoryIndex::from_rows(rows);
+        let index = DetailedMemoryIndex::from_rows(rows);
         let BookQuery::Ready(relations) = query_book_ready(&index, "book-a/0") else {
             panic!("expected a book result");
         };

@@ -91,7 +91,7 @@ impl SimilarPanelState {
         if self.thumbnails.contains_key(&hit.item_key) {
             return;
         }
-        let Some(target) = crate::similar_index::target_for_hit(hit) else {
+        let Some(target) = crate::similar_index::target_for_hit(hit).cloned() else {
             self.thumbnails
                 .insert(hit.item_key.clone(), SimilarThumbState::Failed);
             return;
@@ -299,7 +299,7 @@ fn similar_copy_path_text(hit: &crate::similar_index::QueryHit) -> String {
 fn similar_open_target(
     hit: &crate::similar_index::QueryHit,
 ) -> Option<(PathBuf, crate::snapshot::SnapshotTarget)> {
-    match crate::similar_index::target_for_hit(hit)? {
+    match crate::similar_index::target_for_hit(hit).cloned()? {
         crate::similar_index::SimilarItemTarget::File(path) => Some((
             path.parent()?.to_path_buf(),
             crate::snapshot::SnapshotTarget::Fs(path),
@@ -327,6 +327,7 @@ fn prepare_similar_compare_result(
     pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
 ) -> Result<crate::app::ComparePinResult, String> {
     let target = crate::similar_index::target_for_hit(&hit)
+        .cloned()
         .ok_or_else(|| "比較画像の場所を解決できません".to_string())?;
     let (display_name, pixels) = match target {
         crate::similar_index::SimilarItemTarget::File(path) => {
@@ -2159,6 +2160,9 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     format: crate::similar_image::SimilarImageFormat::Png,
                     origin_width: 1200,
                     origin_height: 1600,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(
+                        PathBuf::from(r"C:\Pictures\edits\sample.png"),
+                    )),
                 },
                 crate::similar_index::QueryHit {
                     row_id: 3,
@@ -2177,6 +2181,9 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     format: crate::similar_image::SimilarImageFormat::WebP,
                     origin_width: 1200,
                     origin_height: 1600,
+                    target: Some(crate::similar_index::SimilarItemTarget::File(
+                        PathBuf::from(r"D:\Archive\sample.webp"),
+                    )),
                 },
             ];
             let mut state = SimilarPanelState::default();
@@ -3050,6 +3057,8 @@ mod format_datetime_tests {
 
 #[cfg(test)]
 mod similar_panel_tests {
+    use std::path::PathBuf;
+
     use super::{
         SimilarPanelModel, similar_copy_path_text, similar_difference_line, similar_location_line,
         similar_panel_model,
@@ -3074,6 +3083,9 @@ mod similar_panel_tests {
             format,
             origin_width: 1200,
             origin_height: 1600,
+            target: Some(crate::similar_index::SimilarItemTarget::File(
+                PathBuf::from(r"C:\Pictures\copy.png"),
+            )),
         }
     }
 
@@ -3106,11 +3118,11 @@ mod similar_panel_tests {
         let hit = hit(ItemKind::Image, SimilarImageFormat::Png);
         let location = similar_location_line(&hit);
         assert!(location.starts_with("copy.png / "), "{location}");
-        assert!(location.contains("pictures"), "{location}");
+        assert!(location.to_lowercase().contains("pictures"), "{location}");
 
         let copied = similar_copy_path_text(&hit);
         assert!(copied.ends_with("copy.png"), "{copied}");
-        assert!(copied.contains("pictures"), "{copied}");
+        assert!(copied.to_lowercase().contains("pictures"), "{copied}");
         #[cfg(windows)]
         assert!(!copied.contains('/'), "{copied}");
     }

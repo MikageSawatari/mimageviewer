@@ -98,6 +98,12 @@ pub struct SearchRow {
     pub item: StoredItem,
 }
 
+#[derive(Debug)]
+pub struct CompactSearchRows {
+    pub signatures: Vec<([u8; 32], u32)>,
+    pub key_rows: Vec<(u64, u32)>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompletedIndexStats {
     pub password_required_pdfs: u64,
@@ -573,6 +579,57 @@ impl SimilarDb {
             .collect()
     }
 
+    /// 線形照合に必要な署名と、origin 探索用の 64-bit key hash だけを常駐用に読む。
+    /// `item_key` は SQLite の行を処理している間だけ借用し、全件分の文字列を作らない。
+    pub fn load_compact_search_rows(
+        &self,
+        hash_version: i64,
+        mut hash_key: impl FnMut(&str) -> u64,
+    ) -> rusqlite::Result<CompactSearchRows> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let count_i64 = conn.query_row(
+            "SELECT COUNT(*) FROM item i
+             LEFT JOIN container c ON c.container_key = i.container_key
+             WHERE i.hash_version = ?1
+               AND (i.container_key IS NULL OR c.scan_state = ?2)",
+            params![hash_version, ScanState::Complete as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let count = usize::try_from(count_i64)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count_i64))?;
+        let mut signatures = Vec::with_capacity(count);
+        let mut key_rows = Vec::with_capacity(count);
+        let mut statement = conn.prepare(
+            "SELECT i.rowid, i.item_key, i.pdq256
+             FROM item i
+             LEFT JOIN container c ON c.container_key = i.container_key
+             WHERE i.hash_version = ?1
+               AND (i.container_key IS NULL OR c.scan_state = ?2)
+             ORDER BY i.rowid",
+        )?;
+        let mut rows = statement.query(params![hash_version, ScanState::Complete as i64])?;
+        while let Some(row) = rows.next()? {
+            let row_id_i64 = row.get::<_, i64>(0)?;
+            let row_id = u32::try_from(row_id_i64)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, row_id_i64))?;
+            let item_key = row.get_ref(1)?.as_str()?;
+            let pdq = row.get_ref(2)?.as_blob()?;
+            let signature: [u8; 32] = pdq.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    pdq.len(),
+                    rusqlite::types::Type::Blob,
+                    "pdq256 must contain 32 bytes".into(),
+                )
+            })?;
+            signatures.push((signature, row_id));
+            key_rows.push((hash_key(item_key), row_id));
+        }
+        Ok(CompactSearchRows {
+            signatures,
+            key_rows,
+        })
+    }
+
     /// 完走した索引ジョブの表示用集計を、公開済み行数と同じ transaction で記録する。
     /// キャンセル・失敗したジョブからは呼ばないため、「最終更新」は完走時だけ進む。
     pub fn record_completed_index(
@@ -668,6 +725,27 @@ impl SimilarDb {
              WHERE i.item_key = ?1 AND i.hash_version = ?2
                AND (i.container_key IS NULL OR c.scan_state = ?3)",
             params![item_key, hash_version, ScanState::Complete as i64],
+            row_to_search_row,
+        )
+        .optional()
+    }
+
+    /// compact memory index の候補 rowid を実データで照合するための point lookup。
+    pub fn load_item_by_row_id(
+        &self,
+        row_id: u32,
+        hash_version: i64,
+    ) -> rusqlite::Result<Option<SearchRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT i.rowid, i.item_key, i.kind, i.container_key, i.page_index,
+                    i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
+                    i.width, i.height, i.format
+             FROM item i
+             LEFT JOIN container c ON c.container_key = i.container_key
+             WHERE i.rowid = ?1 AND i.hash_version = ?2
+               AND (i.container_key IS NULL OR c.scan_state = ?3)",
+            params![i64::from(row_id), hash_version, ScanState::Complete as i64],
             row_to_search_row,
         )
         .optional()
@@ -1046,6 +1124,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            db.load_compact_search_rows(current_hash_version(), |_| 0)
+                .unwrap()
+                .signatures
+                .is_empty()
+        );
         assert_eq!(db.count_staged(), 1);
         db.cleanup_incomplete().unwrap();
         assert_eq!(db.count_staged(), 0);
@@ -1065,6 +1149,19 @@ mod tests {
         db.stage_item(first, &item("old", Some("book"), Some(0), 1))
             .unwrap();
         db.complete_container("book", first).unwrap();
+        let compact = db
+            .load_compact_search_rows(current_hash_version(), |key| key.len() as u64)
+            .unwrap();
+        assert_eq!(compact.signatures.len(), 1);
+        let old_row_id = compact.signatures[0].1;
+        assert_eq!(
+            db.load_item_by_row_id(old_row_id, current_hash_version())
+                .unwrap()
+                .unwrap()
+                .item
+                .item_key,
+            "old"
+        );
 
         let second = db
             .begin_container_build("book", ContainerKind::ImageFolder, 2, 2, 0)
