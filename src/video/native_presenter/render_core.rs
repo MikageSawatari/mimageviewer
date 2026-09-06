@@ -156,13 +156,13 @@ pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
 /// 動画下端の通常バー高と、その上に置くストリップ寸法を一度に解決した値。
 ///
 /// シーク行を表示するかに応じて 64pt / 40pt を解決する判断はここだけが所有し、
-/// 描画・入力・固定映像領域・パネル配置はこの値を受け取る。コントロール行は常に残し、
-/// 音声波形は `normal_seek_bar_visible=true` で従来の 64pt を保つ。
+/// 描画・入力・固定映像領域・パネル配置はこの値を受け取る。コントロール行は常に残す。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VideoSeekGeometry {
     normal_seek_bar_visible: bool,
     normal_bar_height: f32,
     strip_layout: crate::video::seek_strip_layout::SeekStripLayout,
+    thumbnail_strip_visible_for_preview_policy: bool,
 }
 
 impl VideoSeekGeometry {
@@ -172,6 +172,7 @@ impl VideoSeekGeometry {
         strip_height: crate::video::seek_strip_layout::SeekStripHeight,
         span: crate::video::seek_strip_layout::SeekStripSpan,
         aspect: Option<f32>,
+        thumbnail_strip_visible_for_preview_policy: bool,
     ) -> Self {
         let normal_bar_height = resolved_video_bottom_bar_height(normal_seek_bar_visible);
         Self {
@@ -184,7 +185,33 @@ impl VideoSeekGeometry {
                 span,
                 aspect,
             ),
+            thumbnail_strip_visible_for_preview_policy,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoSeekStripPolicyVisibility {
+    /// 場面サムネイルが並んでいるか。波形中もプレビューを使えるよう、波形は含めない。
+    thumbnail_strip_visible_for_preview_policy: bool,
+    /// 通常シーク行と同じ場所を補うストリップがあるか。場面サムネイルと波形を含める。
+    seek_strip_visible_for_seek_bar_policy: bool,
+}
+
+/// ストリップ表示を参照する 2 つの設定へ、それぞれの問いに対応する述語を返す。
+///
+/// tile overlay 中はストリップ自体を描画しないため、どちらの設定にも非表示として渡す。
+const fn video_seek_strip_policy_visibility(
+    mode: Option<crate::settings::VideoSeekStripMode>,
+    tile_overlay_visible: bool,
+) -> VideoSeekStripPolicyVisibility {
+    let seek_strip_visible_for_seek_bar_policy = mode.is_some() && !tile_overlay_visible;
+    VideoSeekStripPolicyVisibility {
+        thumbnail_strip_visible_for_preview_policy: matches!(
+            mode,
+            Some(crate::settings::VideoSeekStripMode::Thumbnails)
+        ) && !tile_overlay_visible,
+        seek_strip_visible_for_seek_bar_policy,
     }
 }
 const SEEK_STRIP_RANGE_LOCK_GAP: f32 = 6.0;
@@ -8368,16 +8395,20 @@ impl NativeEguiOverlay {
             (crate::video::seek_strip_layout::SeekStripSpan::Window, None),
             |strip| (strip.span, strip.cell_aspect),
         );
-        let thumbnail_strip_visible = self.seek_strip.as_ref().is_some_and(|strip| {
-            strip.center.mode() == crate::settings::VideoSeekStripMode::Thumbnails
-        }) && self.tile_overlay.is_none();
-        let normal_seek_bar_visible = self.seek_bar_with_strip.is_visible(thumbnail_strip_visible);
+        let strip_policy_visibility = video_seek_strip_policy_visibility(
+            self.seek_strip.as_ref().map(|strip| strip.center.mode()),
+            self.tile_overlay.is_some(),
+        );
+        let normal_seek_bar_visible = self
+            .seek_bar_with_strip
+            .is_visible(strip_policy_visibility.seek_strip_visible_for_seek_bar_policy);
         VideoSeekGeometry::resolve(
             overlay_size,
             normal_seek_bar_visible,
             self.seek_strip_height,
             span,
             aspect,
+            strip_policy_visibility.thumbnail_strip_visible_for_preview_policy,
         )
     }
 
@@ -10154,10 +10185,8 @@ impl NativeEguiOverlay {
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
         let seek_strip_visible = seek_strip.is_some() && !tile_overlay_visible;
-        // Waveform is intentionally not a thumbnail strip for either display policy.
-        let thumbnail_strip_visible = seek_strip.as_ref().is_some_and(|strip| {
-            strip.center.mode() == crate::settings::VideoSeekStripMode::Thumbnails
-        }) && !tile_overlay_visible;
+        let thumbnail_strip_visible_for_preview_policy =
+            seek_geometry.thumbnail_strip_visible_for_preview_policy;
         let normal_seek_bar_visible = seek_geometry.normal_seek_bar_visible;
         let navigation_preview_visible = navigation_preview.is_some();
         let raw_seek_status_visible = seek_status_active
@@ -11638,7 +11667,7 @@ impl NativeEguiOverlay {
                             audio_only,
                             video_speed_popup_open,
                             seek_hover_preview_mode,
-                            thumbnail_strip_visible,
+                            thumbnail_strip_visible_for_preview_policy,
                         );
                         let strip_preview_active = if seek_preview_allowed {
                             match seek_strip_preview_hover {
@@ -16180,9 +16209,10 @@ mod tests {
         let overlay_size = egui::vec2(1280.0, 720.0);
         let strip_height = crate::video::seek_strip_layout::SeekStripHeight::Medium;
         let span = crate::video::seek_strip_layout::SeekStripSpan::Window;
-        let shown = super::VideoSeekGeometry::resolve(overlay_size, true, strip_height, span, None);
+        let shown =
+            super::VideoSeekGeometry::resolve(overlay_size, true, strip_height, span, None, false);
         let hidden =
-            super::VideoSeekGeometry::resolve(overlay_size, false, strip_height, span, None);
+            super::VideoSeekGeometry::resolve(overlay_size, false, strip_height, span, None, false);
         let legacy = crate::video::seek_strip_layout::SeekStripLayout::resolve(
             overlay_size,
             HUD_BOTTOM_HEIGHT,
@@ -16240,13 +16270,50 @@ mod tests {
     }
 
     #[test]
-    fn hidden_thumbnail_bar_policy_does_not_hide_waveform_bar_space() {
-        let policy = crate::settings::VideoSeekBarWithStrip::Hide;
-        assert!(!policy.is_visible(true));
-        assert!(policy.is_visible(false));
+    fn waveform_strip_uses_distinct_preview_and_seek_bar_policy_predicates() {
+        use crate::settings::{
+            VideoSeekBarWithStrip, VideoSeekHoverPreviewMode, VideoSeekStripMode,
+        };
+
+        let waveform =
+            super::video_seek_strip_policy_visibility(Some(VideoSeekStripMode::Waveform), false);
+        assert!(!waveform.thumbnail_strip_visible_for_preview_policy);
+        assert!(waveform.seek_strip_visible_for_seek_bar_policy);
+
+        // プレビュー設定は従来どおり波形を除外するので、波形中も表示できる。
+        assert!(
+            VideoSeekHoverPreviewMode::HideWithThumbnailStrip
+                .is_visible(waveform.thumbnail_strip_visible_for_preview_policy)
+        );
+        // 通常シーク行の設定は波形もストリップとして扱う。
+        assert!(
+            VideoSeekBarWithStrip::Show.is_visible(waveform.seek_strip_visible_for_seek_bar_policy)
+        );
+        assert!(
+            !VideoSeekBarWithStrip::Hide
+                .is_visible(waveform.seek_strip_visible_for_seek_bar_policy)
+        );
         assert_eq!(
-            super::resolved_video_bottom_bar_height(policy.is_visible(false)),
-            HUD_BOTTOM_HEIGHT
+            super::resolved_video_bottom_bar_height(
+                VideoSeekBarWithStrip::Hide
+                    .is_visible(waveform.seek_strip_visible_for_seek_bar_policy)
+            ),
+            HUD_CONTROLS_ROW_HEIGHT
+        );
+
+        let thumbnails =
+            super::video_seek_strip_policy_visibility(Some(VideoSeekStripMode::Thumbnails), false);
+        assert!(thumbnails.thumbnail_strip_visible_for_preview_policy);
+        assert!(thumbnails.seek_strip_visible_for_seek_bar_policy);
+
+        let hidden_by_tile =
+            super::video_seek_strip_policy_visibility(Some(VideoSeekStripMode::Waveform), true);
+        assert_eq!(
+            hidden_by_tile,
+            super::VideoSeekStripPolicyVisibility {
+                thumbnail_strip_visible_for_preview_policy: false,
+                seek_strip_visible_for_seek_bar_policy: false,
+            }
         );
     }
 

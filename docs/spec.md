@@ -1931,7 +1931,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_seek_hover_preview_mode` | enum | `always` | 動画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never`。波形表示は thumbnail strip と数えない |
-| `video_seek_bar_with_strip` | enum | `show` | 動画の場面サムネイルストリップ表示中の通常シーク行。`show` / `hide`。`hide` でも再生・音量・時刻等の40ptコントロール行は残り、24ptのシーク行だけを映像領域へ返す。波形表示には適用せず64pt（24+40）のまま |
+| `video_seek_bar_with_strip` | enum | `show` | 動画の場面サムネイルまたは音声波形のストリップ表示中の通常シーク行。`show` / `hide`。`hide` でも再生・音量・時刻等の40ptコントロール行は残り、24ptのシーク行だけを映像領域へ返す |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |

@@ -65659,6 +65659,51 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
 }
 
 #[test]
+fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Image(PathBuf::new()));
+    app.fullscreen_idx = Some(idx);
+    app.settings.still_seek_strip_visible = false;
+    let ctx = egui::Context::default();
+
+    let press = |app: &mut App, key: egui::Key, modifiers: egui::Modifiers| {
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let _ = app.handle_fs_key_input(&ctx, idx, false);
+        let _ = ctx.end_pass();
+    };
+    let shift = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+
+    press(&mut app, egui::Key::S, shift);
+    assert!(app.settings.still_seek_strip_visible);
+    press(&mut app, egui::Key::S, shift);
+    assert!(!app.settings.still_seek_strip_visible);
+
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = F13\n");
+    press(&mut app, egui::Key::S, shift);
+    assert!(!app.settings.still_seek_strip_visible);
+    press(&mut app, egui::Key::F13, egui::Modifiers::NONE);
+    assert!(app.settings.still_seek_strip_visible);
+
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = none\n");
+    press(&mut app, egui::Key::S, shift);
+    assert!(app.settings.still_seek_strip_visible);
+}
+
+#[test]
 fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();

@@ -1584,6 +1584,7 @@ pub enum KeyAction {
     FsSpreadShiftPrev,
     FsSpreadShiftNext,
     FsSlideshow,
+    FsSeekStripToggle,
     FsSpaceCheck,
     FsCapture,
     FsAddToActiveBook,
@@ -2073,6 +2074,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
     KeyAction::FsSlideshow,
+    KeyAction::FsSeekStripToggle,
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
     KeyAction::FsAddToActiveBook,
@@ -3667,6 +3669,7 @@ impl KeyAction {
             FsSpreadShiftPrev => "FsSpreadShiftPrev",
             FsSpreadShiftNext => "FsSpreadShiftNext",
             FsSlideshow => "FsSlideshow",
+            FsSeekStripToggle => "FsSeekStripToggle",
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
             FsAddToActiveBook => "FsAddToActiveBook",
@@ -4267,6 +4270,7 @@ impl KeyAction {
             FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
             FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
+            FsSeekStripToggle => "画像フルスクリーンのサムネイル列表示を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
@@ -4722,6 +4726,7 @@ impl KeyAction {
             | FsStackJumpPrev
             | FsStackJumpNext
             | FsSlideshow
+            | FsSeekStripToggle
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
@@ -5155,6 +5160,7 @@ impl KeyAction {
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
             | FsSlideshow
+            | FsSeekStripToggle
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
@@ -5625,6 +5631,7 @@ impl KeyAction {
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
             FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
+            FsSeekStripToggle => ChordList::one(Chord::shift(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
@@ -9455,6 +9462,54 @@ mod tests {
                 action.ini_name()
             );
         }
+    }
+
+    #[test]
+    fn still_seek_strip_toggle_has_fs_image_shift_s_contract_without_video_conflict() {
+        let action = KeyAction::FsSeekStripToggle;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::S)]
+        );
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            KeyAction::VideoSeekStripCycle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(!command_scopes_overlap(
+            action.context(),
+            KeyAction::VideoSeekStripCycle.context()
+        ));
+
+        let rebound = Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = F13\n");
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F13)]
+        );
+        let disabled = Keymap::from_ini_str("[FsImage]\nFsSeekStripToggle = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
+
+        let same_chord_in_disjoint_contexts = Keymap::from_ini_str(
+            "[FsImage]\nFsSeekStripToggle = Shift+S\n\
+             [FsVideo]\nVideoSeekStripCycle = Shift+S\n",
+        );
+        assert!(
+            !same_chord_in_disjoint_contexts
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| {
+                    (conflict.action == action
+                        && conflict.other_action == Some(KeyAction::VideoSeekStripCycle))
+                        || (conflict.action == KeyAction::VideoSeekStripCycle
+                            && conflict.other_action == Some(action))
+                })
+        );
     }
 
     #[test]

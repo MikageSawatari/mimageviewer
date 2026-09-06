@@ -16068,6 +16068,20 @@ impl App {
         )
     }
 
+    /// サムネイル列の全入口（ボタン、上下ドラッグ、キー）から同じ設定を更新する。
+    fn set_still_seek_strip_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        if self.settings.still_seek_strip_visible == visible {
+            return;
+        }
+        self.settings.still_seek_strip_visible = visible;
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
+    fn toggle_still_seek_strip_visible(&mut self, ctx: &egui::Context) {
+        self.set_still_seek_strip_visible(ctx, !self.settings.still_seek_strip_visible);
+    }
+
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
     /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
     /// leave an empty strip at the top of the fullscreen canvas.
@@ -16515,9 +16529,7 @@ impl App {
             "サムネイル列を表示"
         });
         if strip_resp.clicked() {
-            self.settings.still_seek_strip_visible = !strip_visible;
-            self.settings.save();
-            ctx.request_repaint();
+            self.toggle_still_seek_strip_visible(ctx);
         }
         if let Some(bar_rect) = bar_rect {
             let lock_x = bar_rect.right() - BAR_BUTTON_SIZE - 6.0;
@@ -16709,9 +16721,7 @@ impl App {
                     )
                 });
             if strip_closed_by_drag {
-                self.settings.still_seek_strip_visible = false;
-                self.settings.save();
-                ctx.request_repaint();
+                self.set_still_seek_strip_visible(ctx, false);
             }
             let pointed_source_pos =
                 pointer.and_then(|pointer| still_seek_source_position_at_pointer(&layout, pointer));
@@ -16924,11 +16934,7 @@ impl App {
                         .map(|gesture| gesture.update(pointer_pos));
                     match decision {
                         Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
-                            if !self.settings.still_seek_strip_visible {
-                                self.settings.still_seek_strip_visible = true;
-                                self.settings.save();
-                                ctx.request_repaint();
-                            }
+                            self.set_still_seek_strip_visible(ctx, true);
                         }
                         Some(crate::video::seek_strip::SeekRowDecision::Scrub) => {
                             if let Some(resolved) = resolved_at_pointer.as_ref() {
@@ -23934,6 +23940,11 @@ impl App {
         // 画像スライドショーに参加しない。
         let key_s =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_seek_strip_toggle = self.fs_context_menu_idx.is_none()
+            && self.fullscreen_seek_overlay_allowed(fs_idx, current_item_is_video)
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSeekStripToggle);
         let key_r = !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
@@ -24845,6 +24856,10 @@ impl App {
                 self.slideshow_playing = true;
                 self.schedule_next_slideshow_from_now();
             }
+        }
+
+        if key_seek_strip_toggle {
+            self.toggle_still_seek_strip_visible(ctx);
         }
 
         // Space: スライドショー中→停止、停止中→画像をチェック。

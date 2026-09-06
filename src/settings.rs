@@ -5698,7 +5698,7 @@ impl VideoSeekHoverPreviewMode {
     }
 }
 
-/// 動画サムネイルストリップ表示中の通常シークバー表示方針。
+/// 動画シークストリップ表示中の通常シークバー表示方針。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoSeekBarWithStrip {
@@ -5710,8 +5710,8 @@ pub enum VideoSeekBarWithStrip {
 impl VideoSeekBarWithStrip {
     pub const ALL: [Self; 2] = [Self::Show, Self::Hide];
 
-    pub const fn is_visible(self, thumbnail_strip_visible: bool) -> bool {
-        !thumbnail_strip_visible || matches!(self, Self::Show)
+    pub const fn is_visible(self, seek_strip_visible: bool) -> bool {
+        !seek_strip_visible || matches!(self, Self::Show)
     }
 
     pub const fn label(self) -> &'static str {
