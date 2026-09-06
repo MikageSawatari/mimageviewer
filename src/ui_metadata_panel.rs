@@ -2144,7 +2144,7 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
 
             let hits = vec![
                 crate::similar_index::QueryHit {
-                    row_id: 2,
+                    item_id: 2,
                     item_key: crate::similar_index::item_key_for_file(Path::new(
                         r"C:\Pictures\edits\sample.png",
                     )),
@@ -2165,7 +2165,7 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                     )),
                 },
                 crate::similar_index::QueryHit {
-                    row_id: 3,
+                    item_id: 3,
                     item_key: crate::similar_index::item_key_for_file(Path::new(
                         r"D:\Archive\sample.webp",
                     )),
@@ -3069,7 +3069,7 @@ mod similar_panel_tests {
 
     fn hit(kind: ItemKind, format: SimilarImageFormat) -> QueryHit {
         QueryHit {
-            row_id: 2,
+            item_id: 2,
             item_key: "c:/pictures/copy.png".to_string(),
             kind,
             container_key: None,

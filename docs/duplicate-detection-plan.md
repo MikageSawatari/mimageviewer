@@ -1446,3 +1446,56 @@ DB 作成が競合し、`Missing` で終わる余地があった。存在確認�
 mIV には path-keyed ストアをファイル移動時に追随させる既存の仕組みがあるのに、
 この DB だけ外れている。索引は最終的に再照合で直るが、**移動のたびに再ハッシュが走る**。
 タグ・評価と同じ扱いにすべきかを判断する必要がある。
+
+### 21.8 Step 5 実装記録 (2026-09-07)
+
+`similar.db` を schema version 2、`HASH_ALGORITHM_VERSION` を 2 へ上げ、旧 schema は
+移行せず再作成することにした。`item.item_id INTEGER PRIMARY KEY AUTOINCREMENT` と
+`revision`、同一 transaction で書く `item_change` を正本とする。追加・更新だけでなく削除も
+履歴へ残し、コンテナは staging の Complete 公開 transaction でページ群と履歴を同時に確定する。
+旧 `rowid` ベースの `similar.compact` は起動 worker で破棄する。
+
+検索配列は 48 byte レコードの `similar.base`、在メモリ delta、base 上書きを示す bitset から
+成る。base / delta / bitset は公開後に変更せず、更新 worker は新しい snapshot を作って差し替える。
+base は mmap せず逐次読みし、delta の永続ファイルは作らない。統合は temp を fsync して atomic
+rename した後、新 base と統合開始後の delta を組み合わせた snapshot を公開し、それが成功して
+から `item_change` を削除する。履歴欠落時は旧 Ready snapshot を維持したまま SQLite から
+新 base を作る。
+
+単体画像検索では origin を `item_key` で SQLite から直接読み、配列走査後に origin と全候補を
+一つの read transaction で再取得する。候補の `item_id`、`revision`、署名、Complete 公開状態、
+`hash_version` を照合し、距離・帯・順位・表示情報をその read snapshot の値だけから決める。
+配列の署名が古い候補は捨て、検証前の件数制限は置かない。
+
+`rename_key_migration::STORES` には `similar.db` を**この Step では追加しない**。ただし
+理由は「配列が古くなるから」ではない。**配列レコードは path を持たない** (`item_id` / 署名 /
+`quality` / `revision` のみ) ので、rename は配列のどのレコードも無効にせず、`item_change` を
+書く必要もない。表示パスは検証時の read snapshot から取るため、rename 直後でも正しい。
+
+追加しない実際の理由は登録先の形が合わないことにある。generic 記述子は **1 file につき 1 列**
+を書き換えるが、`similar.db` は path を `item.item_key` / `item.container_key` /
+`container.container_key` に加え、**staging 世代の `item_build` / `container_build` にも**
+持つ。走査中の未公開世代を共通 migration が黙って書き換えると、Complete 公開の単位が壊れる。
+追随させるなら、公開済み世代だけを対象にすることを明示した専用記述子が要る。
+
+それまでは移動後の再ハッシュを受け入れる。索引は再生成可能で、誤答にはならない。
+
+4,627,166 行の合成 SQLite store を Windows 上の `dev-runtime` (opt-level 2) で測った。
+データ数、固定長レコード、検索走査、候補の SQLite 再検証は実運用経路と同じである。キー長と
+ストレージ状態は実 store と異なるため、絶対値より更新方式間の差を見る計測とする。
+
+| 指標 | 実測 |
+| --- | ---: |
+| base あり: 起動から検索可能 | 119.8 ms |
+| base なし: SQLite から base 作成、検索可能 | 1,423.2 ms |
+| 1 件 commit から、その項目を含む次の検索結果 | **61.0 ms** |
+| 4,627,167 件への統合 + base 書き出し | 317.9 ms |
+| 統合発生点 | 65,536 change seq (この件数では上限値) |
+| base ファイル | 222,104,112 byte (211.8 MiB) |
+| 1 snapshot 読込後の RSS 増分 | 225,329,152 byte (214.9 MiB) |
+| 統合中の一時 RSS 増分 | 449,458,176 byte (428.6 MiB、旧 base + 新 base) |
+
+同じ合成 store の全 base 再作成 1,423.2 ms と比べて単件反映は 23.3 倍短い。利用者環境で
+観測された従来の約 10 秒の全件再構築と比べると 163.9 倍、約 2.2 桁短い。通常検索の線形走査
+自体が約 50 ms なので、61.0 ms の大半は元から必要な次回検索であり、変更反映のための全件再構築は
+待たない。

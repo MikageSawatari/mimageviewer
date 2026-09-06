@@ -213,6 +213,7 @@ pub mod sidecar;
 pub mod similar_db;
 pub mod similar_image;
 pub mod similar_index;
+mod similar_search_array;
 pub mod single_instance;
 pub mod snapshot;
 mod sns_split;

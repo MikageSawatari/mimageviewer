@@ -9,7 +9,8 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-pub const HASH_ALGORITHM_VERSION: u32 = 1;
+const SCHEMA_VERSION: i64 = 2;
+pub const HASH_ALGORITHM_VERSION: u32 = 2;
 
 pub const fn current_hash_version() -> i64 {
     hash_version(HASH_ALGORITHM_VERSION, crate::dupe::PROXY_VERSION)
@@ -94,27 +95,61 @@ pub struct StoredContainer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchRow {
-    pub row_id: u32,
+    pub item_id: u64,
+    pub revision: u32,
     pub item: StoredItem,
 }
 
 #[derive(Debug)]
-pub struct CompactSearchRows {
-    pub stamp: SearchContentStamp,
-    pub records: Vec<CompactSearchRow>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompactSearchRow {
-    pub signature: [u8; 32],
-    pub row_id: u32,
-    pub key_hash: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SearchContentStamp {
+pub struct BaseSearchRows {
     pub store_id: [u8; 16],
-    pub generation: u64,
+    pub applied_seq: u64,
+    pub records: Vec<BaseSearchRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseSearchRow {
+    pub item_id: u64,
+    pub signature: [u8; 32],
+    pub quality: u8,
+    pub revision: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemChangeOp {
+    Add,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemChange {
+    pub seq: u64,
+    pub item_id: u64,
+    pub op: ItemChangeOp,
+    pub revision: Option<u32>,
+    pub signature: Option<[u8; 32]>,
+    pub quality: Option<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ItemChangeBatch {
+    pub latest_seq: u64,
+    pub first_available_seq: Option<u64>,
+    pub changes: Vec<ItemChange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateIdentity {
+    pub item_id: u64,
+    pub revision: u32,
+    pub signature: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct VerifiedCandidates {
+    pub origin: SearchRow,
+    pub candidates: Vec<SearchRow>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -183,16 +218,16 @@ impl SimilarDb {
         let transaction = conn.transaction()?;
         let staged = transaction.execute("DELETE FROM item_build", [])?;
         transaction.execute("DELETE FROM container_build", [])?;
-        transaction.execute(
-            "DELETE FROM item WHERE container_key IN (SELECT container_key FROM container WHERE scan_state = ?1)",
-            [ScanState::Building as i64],
-        )?;
+        let unpublished = load_items_for_container_state(&transaction, ScanState::Building)?;
+        for row in &unpublished {
+            delete_item_with_change(&transaction, row)?;
+        }
         let containers = transaction.execute(
             "DELETE FROM container WHERE scan_state = ?1",
             [ScanState::Building as i64],
         )?;
         transaction.commit()?;
-        Ok(staged + containers)
+        Ok(staged + containers + unpublished.len())
     }
 
     pub fn item_freshness(
@@ -276,19 +311,19 @@ impl SimilarDb {
     /// 単独画像を差分 upsert する。戻り値は再計算した行なら true。
     pub fn upsert_loose_item(&self, item: &StoredItem) -> rusqlite::Result<bool> {
         debug_assert!(item.container_key.is_none());
-        let existing = self.load_item(&item.item_key, item.hash_version)?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let existing = load_item_raw(&transaction, &item.item_key)?;
         if existing.as_ref().is_some_and(|existing| {
             existing.item.container_key.is_none()
                 && existing.item.page_index == item.page_index
                 && existing.item.mtime == item.mtime
                 && existing.item.file_size == item.file_size
+                && existing.item.hash_version == item.hash_version
         }) {
             return Ok(false);
         }
-        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
-        upsert_item(&transaction, item)?;
-        bump_search_content_generation(&transaction)?;
+        publish_item(&transaction, existing.as_ref(), item)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -472,22 +507,21 @@ impl SimilarDb {
         if actual != expected {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        transaction.execute("DELETE FROM item WHERE container_key = ?1", [container_key])?;
-        transaction.execute(
-            "DELETE FROM item WHERE item_key IN (
-               SELECT item_key FROM item_build WHERE container_key = ?1 AND generation = ?2
-             )",
-            params![container_key, generation],
-        )?;
-        transaction.execute(
-            "INSERT INTO item
-             (item_key, kind, container_key, page_index, mtime, file_size, hash_version,
-              pdq256, quality, width, height, format)
-             SELECT item_key, kind, container_key, page_index, mtime, file_size, hash_version,
-                    pdq256, quality, width, height, format
-             FROM item_build WHERE container_key = ?1 AND generation = ?2",
-            params![container_key, generation],
-        )?;
+        let staged = load_staged_items(&transaction, container_key, generation)?;
+        let staged_keys = staged
+            .iter()
+            .map(|item| item.item_key.as_str())
+            .collect::<HashSet<_>>();
+        let old_container_rows = load_items_for_container_raw(&transaction, container_key)?;
+        for old in old_container_rows {
+            if !staged_keys.contains(old.item.item_key.as_str()) {
+                delete_item_with_change(&transaction, &old)?;
+            }
+        }
+        for item in &staged {
+            let existing = load_item_raw(&transaction, &item.item_key)?;
+            publish_item(&transaction, existing.as_ref(), item)?;
+        }
         transaction.execute(
             "INSERT INTO container
              (container_key, kind, page_count, scan_state, generation, mtime, file_size)
@@ -507,7 +541,6 @@ impl SimilarDb {
             "DELETE FROM container_build WHERE container_key = ?1 AND generation = ?2",
             params![container_key, generation],
         )?;
-        bump_search_content_generation(&transaction)?;
         transaction.commit()
     }
 
@@ -579,14 +612,14 @@ impl SimilarDb {
     pub fn load_search_rows(&self, hash_version: i64) -> rusqlite::Result<Vec<SearchRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = conn.prepare(
-            "SELECT i.rowid, i.item_key, i.kind, i.container_key, i.page_index,
+            "SELECT i.item_id, i.revision, i.item_key, i.kind, i.container_key, i.page_index,
                     i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
                     i.width, i.height, i.format
              FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
              WHERE i.hash_version = ?1
                AND (i.container_key IS NULL OR c.scan_state = ?2)
-             ORDER BY i.rowid",
+             ORDER BY i.item_id",
         )?;
         statement
             .query_map(
@@ -596,16 +629,12 @@ impl SimilarDb {
             .collect()
     }
 
-    /// 線形照合に必要な署名と、origin 探索用の 64-bit key hash だけを常駐用に読む。
-    /// `item_key` は SQLite の行を処理している間だけ借用し、全件分の文字列を作らない。
-    pub fn load_compact_search_rows(
-        &self,
-        hash_version: i64,
-        mut hash_key: impl FnMut(&str) -> u64,
-    ) -> rusqlite::Result<CompactSearchRows> {
+    /// SQLite の一つの read snapshot から、不変 base とその適用済み change seq を作る。
+    pub fn load_base_search_rows(&self, hash_version: i64) -> rusqlite::Result<BaseSearchRows> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let transaction = conn.transaction()?;
-        let stamp = search_content_stamp(&transaction)?;
+        let store_id = search_store_id(&transaction)?;
+        let applied_seq = latest_change_seq(&transaction)?;
         let count_i64 = transaction.query_row(
             "SELECT COUNT(*) FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
@@ -618,20 +647,17 @@ impl SimilarDb {
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count_i64))?;
         let mut records = Vec::with_capacity(count);
         let mut statement = transaction.prepare(
-            "SELECT i.rowid, i.item_key, i.pdq256
+            "SELECT i.item_id, i.pdq256, i.quality, i.revision
              FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
              WHERE i.hash_version = ?1
                AND (i.container_key IS NULL OR c.scan_state = ?2)
-             ORDER BY i.rowid",
+             ORDER BY i.item_id",
         )?;
         let mut rows = statement.query(params![hash_version, ScanState::Complete as i64])?;
         while let Some(row) = rows.next()? {
-            let row_id_i64 = row.get::<_, i64>(0)?;
-            let row_id = u32::try_from(row_id_i64)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, row_id_i64))?;
-            let item_key = row.get_ref(1)?.as_str()?;
-            let pdq = row.get_ref(2)?.as_blob()?;
+            let item_id = i64_to_u64(row.get(0)?, 0)?;
+            let pdq = row.get_ref(1)?.as_blob()?;
             let signature: [u8; 32] = pdq.try_into().map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
                     pdq.len(),
@@ -639,21 +665,95 @@ impl SimilarDb {
                     "pdq256 must contain 32 bytes".into(),
                 )
             })?;
-            records.push(CompactSearchRow {
+            let quality_i64 = row.get::<_, i64>(2)?;
+            records.push(BaseSearchRow {
+                item_id,
                 signature,
-                row_id,
-                key_hash: hash_key(item_key),
+                quality: u8::try_from(quality_i64)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, quality_i64))?,
+                revision: i64_to_u32(row.get(3)?, 3)?,
             });
         }
         drop(rows);
         drop(statement);
         transaction.commit()?;
-        Ok(CompactSearchRows { stamp, records })
+        Ok(BaseSearchRows {
+            store_id,
+            applied_seq,
+            records,
+        })
     }
 
-    pub fn search_content_stamp(&self) -> rusqlite::Result<SearchContentStamp> {
+    pub fn search_store_id(&self) -> rusqlite::Result<[u8; 16]> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        search_content_stamp(&conn)
+        search_store_id(&conn)
+    }
+
+    pub fn load_item_changes_after(&self, after_seq: u64) -> rusqlite::Result<ItemChangeBatch> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let latest_seq = latest_change_seq(&transaction)?;
+        let first_available_seq = transaction
+            .query_row("SELECT MIN(seq) FROM item_change", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })?
+            .map(|value| i64_to_u64(value, 0))
+            .transpose()?;
+        let after_i64 = i64::try_from(after_seq).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
+        })?;
+        let mut statement = transaction.prepare(
+            "SELECT seq, item_id, op, revision, pdq256, quality
+             FROM item_change WHERE seq > ?1 ORDER BY seq",
+        )?;
+        let changes = statement
+            .query_map([after_i64], row_to_item_change)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        transaction.commit()?;
+        Ok(ItemChangeBatch {
+            latest_seq,
+            first_available_seq,
+            changes,
+        })
+    }
+
+    pub fn prune_item_changes_through(&self, through_seq: u64) -> rusqlite::Result<usize> {
+        let through = i64::try_from(through_seq).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure("change seq exceeds SQLite INTEGER".into())
+        })?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM item_change WHERE seq <= ?1", [through])
+    }
+
+    /// origin と全候補を同じ SQLite read snapshot で検証する。
+    pub fn verify_item_candidates(
+        &self,
+        item_key: &str,
+        hash_version: i64,
+        candidates: &[CandidateIdentity],
+    ) -> rusqlite::Result<Option<VerifiedCandidates>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let Some(origin) = load_search_item_by_key(&transaction, item_key, hash_version)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let mut verified = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(row) = load_search_item_by_id(&transaction, candidate.item_id, hash_version)?
+            else {
+                continue;
+            };
+            if row.revision == candidate.revision && row.item.pdq256 == candidate.signature {
+                verified.push(row);
+            }
+        }
+        transaction.commit()?;
+        Ok(Some(VerifiedCandidates {
+            origin,
+            candidates: verified,
+        }))
     }
 
     /// 完走した索引ジョブの表示用集計を、公開済み行数と同じ transaction で記録する。
@@ -743,7 +843,7 @@ impl SimilarDb {
     ) -> rusqlite::Result<Option<SearchRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
-            "SELECT i.rowid, i.item_key, i.kind, i.container_key, i.page_index,
+            "SELECT i.item_id, i.revision, i.item_key, i.kind, i.container_key, i.page_index,
                     i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
                     i.width, i.height, i.format
              FROM item i
@@ -756,22 +856,24 @@ impl SimilarDb {
         .optional()
     }
 
-    /// compact memory index の候補 rowid を実データで照合するための point lookup。
-    pub fn load_item_by_row_id(
+    pub fn load_item_by_id(
         &self,
-        row_id: u32,
+        item_id: u64,
         hash_version: i64,
     ) -> rusqlite::Result<Option<SearchRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let item_id = i64::try_from(item_id).map_err(|_| {
+            rusqlite::Error::ToSqlConversionFailure("item_id exceeds SQLite INTEGER".into())
+        })?;
         conn.query_row(
-            "SELECT i.rowid, i.item_key, i.kind, i.container_key, i.page_index,
+            "SELECT i.item_id, i.revision, i.item_key, i.kind, i.container_key, i.page_index,
                     i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
                     i.width, i.height, i.format
              FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
-             WHERE i.rowid = ?1 AND i.hash_version = ?2
+             WHERE i.item_id = ?1 AND i.hash_version = ?2
                AND (i.container_key IS NULL OR c.scan_state = ?3)",
-            params![i64::from(row_id), hash_version, ScanState::Complete as i64],
+            params![item_id, hash_version, ScanState::Complete as i64],
             row_to_search_row,
         )
         .optional()
@@ -834,19 +936,21 @@ impl SimilarDb {
         let mut removed = 0;
         for key in item_keys {
             if !seen_items.contains(&key) {
-                removed += transaction.execute("DELETE FROM item WHERE item_key = ?1", [&key])?;
+                if let Some(row) = load_item_raw(&transaction, &key)? {
+                    delete_item_with_change(&transaction, &row)?;
+                    removed += 1;
+                }
             }
         }
         for key in container_keys {
             if !seen_containers.contains(&key) {
-                removed +=
-                    transaction.execute("DELETE FROM item WHERE container_key = ?1", [&key])?;
+                for row in load_items_for_container_raw(&transaction, &key)? {
+                    delete_item_with_change(&transaction, &row)?;
+                    removed += 1;
+                }
                 removed += transaction
                     .execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
             }
-        }
-        if removed > 0 {
-            bump_search_content_generation(&transaction)?;
         }
         transaction.commit()?;
         Ok(removed)
@@ -880,10 +984,16 @@ impl SimilarDb {
 
         let mut removed = 0;
         for key in item_keys.into_iter().filter(|key| should_purge(key)) {
-            removed += transaction.execute("DELETE FROM item WHERE item_key = ?1", [&key])?;
+            if let Some(row) = load_item_raw(&transaction, &key)? {
+                delete_item_with_change(&transaction, &row)?;
+                removed += 1;
+            }
         }
         for key in container_keys.into_iter().filter(|key| should_purge(key)) {
-            removed += transaction.execute("DELETE FROM item WHERE container_key = ?1", [&key])?;
+            for row in load_items_for_container_raw(&transaction, &key)? {
+                delete_item_with_change(&transaction, &row)?;
+                removed += 1;
+            }
             removed +=
                 transaction.execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
         }
@@ -917,9 +1027,6 @@ impl SimilarDb {
              WHERE singleton = 1",
             [ScanState::Complete as i64],
         )?;
-        if removed > 0 {
-            bump_search_content_generation(&transaction)?;
-        }
         transaction.commit()?;
         Ok(removed)
     }
@@ -984,26 +1091,98 @@ fn item_params(item: &StoredItem, generation: Option<i64>) -> Vec<rusqlite::type
     values
 }
 
-fn upsert_item(conn: &Connection, item: &StoredItem) -> rusqlite::Result<()> {
+fn publish_item(
+    conn: &Connection,
+    existing: Option<&SearchRow>,
+    item: &StoredItem,
+) -> rusqlite::Result<SearchRow> {
+    let (item_id, revision, op) = if let Some(existing) = existing {
+        let revision = existing.revision.checked_add(1).ok_or_else(|| {
+            rusqlite::Error::ToSqlConversionFailure("item revision exhausted".into())
+        })?;
+        conn.execute(
+            "UPDATE item SET revision=?2, item_key=?3, kind=?4, container_key=?5,
+               page_index=?6, mtime=?7, file_size=?8, hash_version=?9, pdq256=?10,
+               quality=?11, width=?12, height=?13, format=?14 WHERE item_id=?1",
+            params![
+                i64::try_from(existing.item_id).unwrap_or(i64::MAX),
+                i64::from(revision),
+                item.item_key,
+                item.kind as i64,
+                item.container_key,
+                item.page_index.map(i64::from),
+                item.mtime,
+                item.file_size,
+                item.hash_version,
+                item.pdq256.as_slice(),
+                i64::from(item.quality),
+                i64::from(item.width),
+                i64::from(item.height),
+                item.format,
+            ],
+        )?;
+        (existing.item_id, revision, ItemChangeOp::Update)
+    } else {
+        conn.execute(
+            "INSERT INTO item
+             (revision, item_key, kind, container_key, page_index, mtime, file_size,
+              hash_version, pdq256, quality, width, height, format)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params_from_iter(item_params(item, None)),
+        )?;
+        (
+            i64_to_u64(conn.last_insert_rowid(), 0)?,
+            1,
+            ItemChangeOp::Add,
+        )
+    };
+    insert_item_change(conn, item_id, op, Some(revision), Some(item))?;
+    Ok(SearchRow {
+        item_id,
+        revision,
+        item: item.clone(),
+    })
+}
+
+fn delete_item_with_change(conn: &Connection, row: &SearchRow) -> rusqlite::Result<()> {
+    insert_item_change(conn, row.item_id, ItemChangeOp::Delete, None, None)?;
     conn.execute(
-        "INSERT INTO item
-         (item_key, kind, container_key, page_index, mtime, file_size, hash_version,
-          pdq256, quality, width, height, format)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT(item_key) DO UPDATE SET
-           kind=excluded.kind, container_key=excluded.container_key,
-           page_index=excluded.page_index, mtime=excluded.mtime,
-           file_size=excluded.file_size, hash_version=excluded.hash_version,
-           pdq256=excluded.pdq256, quality=excluded.quality,
-           width=excluded.width, height=excluded.height, format=excluded.format",
-        rusqlite::params_from_iter(item_params(item, None)),
+        "DELETE FROM item WHERE item_id = ?1",
+        [i64::try_from(row.item_id).unwrap_or(i64::MAX)],
+    )?;
+    Ok(())
+}
+
+fn insert_item_change(
+    conn: &Connection,
+    item_id: u64,
+    op: ItemChangeOp,
+    revision: Option<u32>,
+    item: Option<&StoredItem>,
+) -> rusqlite::Result<()> {
+    let op = match op {
+        ItemChangeOp::Add => 0,
+        ItemChangeOp::Update => 1,
+        ItemChangeOp::Delete => 2,
+    };
+    conn.execute(
+        "INSERT INTO item_change (item_id, op, revision, pdq256, quality)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            i64::try_from(item_id).unwrap_or(i64::MAX),
+            op,
+            revision.map(i64::from),
+            item.map(|item| item.pdq256.as_slice()),
+            item.map(|item| i64::from(item.quality)),
+        ],
     )?;
     Ok(())
 }
 
 fn row_to_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRow> {
-    let row_id_i64 = row.get::<_, i64>(0)?;
-    let pdq = row.get::<_, Vec<u8>>(8)?;
+    let item_id = i64_to_u64(row.get(0)?, 0)?;
+    let revision = i64_to_u32(row.get(1)?, 1)?;
+    let pdq = row.get::<_, Vec<u8>>(9)?;
     let pdq256: [u8; 32] = pdq.try_into().map_err(|value: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
             value.len(),
@@ -1011,29 +1190,189 @@ fn row_to_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRow> {
             "pdq256 must contain 32 bytes".into(),
         )
     })?;
-    let quality_i64 = row.get::<_, i64>(9)?;
+    let quality_i64 = row.get::<_, i64>(10)?;
     Ok(SearchRow {
-        row_id: u32::try_from(row_id_i64)
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, row_id_i64))?,
+        item_id,
+        revision,
         item: StoredItem {
-            item_key: row.get(1)?,
-            kind: ItemKind::from_i64(row.get(2)?)?,
-            container_key: row.get(3)?,
+            item_key: row.get(2)?,
+            kind: ItemKind::from_i64(row.get(3)?)?,
+            container_key: row.get(4)?,
             page_index: row
-                .get::<_, Option<i64>>(4)?
+                .get::<_, Option<i64>>(5)?
                 .map(u32::try_from)
                 .transpose()
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, -1))?,
-            mtime: row.get(5)?,
-            file_size: row.get(6)?,
-            hash_version: row.get(7)?,
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, -1))?,
+            mtime: row.get(6)?,
+            file_size: row.get(7)?,
+            hash_version: row.get(8)?,
             pdq256,
             quality: u8::try_from(quality_i64)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, quality_i64))?,
-            width: i64_to_u32(row.get(10)?, 10)?,
-            height: i64_to_u32(row.get(11)?, 11)?,
-            format: row.get(12)?,
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, quality_i64))?,
+            width: i64_to_u32(row.get(11)?, 11)?,
+            height: i64_to_u32(row.get(12)?, 12)?,
+            format: row.get(13)?,
         },
+    })
+}
+
+const SEARCH_ROW_SELECT: &str =
+    "SELECT i.item_id, i.revision, i.item_key, i.kind, i.container_key, i.page_index,
+            i.mtime, i.file_size, i.hash_version, i.pdq256, i.quality,
+            i.width, i.height, i.format FROM item i";
+
+fn load_item_raw(conn: &Connection, item_key: &str) -> rusqlite::Result<Option<SearchRow>> {
+    conn.query_row(
+        &format!("{SEARCH_ROW_SELECT} WHERE i.item_key = ?1"),
+        [item_key],
+        row_to_search_row,
+    )
+    .optional()
+}
+
+fn load_search_item_by_key(
+    conn: &Connection,
+    item_key: &str,
+    hash_version: i64,
+) -> rusqlite::Result<Option<SearchRow>> {
+    conn.query_row(
+        &format!(
+            "{SEARCH_ROW_SELECT} LEFT JOIN container c ON c.container_key=i.container_key
+             WHERE i.item_key=?1 AND i.hash_version=?2
+               AND (i.container_key IS NULL OR c.scan_state=?3)"
+        ),
+        params![item_key, hash_version, ScanState::Complete as i64],
+        row_to_search_row,
+    )
+    .optional()
+}
+
+fn load_search_item_by_id(
+    conn: &Connection,
+    item_id: u64,
+    hash_version: i64,
+) -> rusqlite::Result<Option<SearchRow>> {
+    conn.query_row(
+        &format!(
+            "{SEARCH_ROW_SELECT} LEFT JOIN container c ON c.container_key=i.container_key
+             WHERE i.item_id=?1 AND i.hash_version=?2
+               AND (i.container_key IS NULL OR c.scan_state=?3)"
+        ),
+        params![
+            i64::try_from(item_id).unwrap_or(i64::MAX),
+            hash_version,
+            ScanState::Complete as i64
+        ],
+        row_to_search_row,
+    )
+    .optional()
+}
+
+fn load_items_for_container_raw(
+    conn: &Connection,
+    container_key: &str,
+) -> rusqlite::Result<Vec<SearchRow>> {
+    let mut statement = conn.prepare(&format!(
+        "{SEARCH_ROW_SELECT} WHERE i.container_key=?1 ORDER BY i.item_id"
+    ))?;
+    statement
+        .query_map([container_key], row_to_search_row)?
+        .collect()
+}
+
+fn load_items_for_container_state(
+    conn: &Connection,
+    state: ScanState,
+) -> rusqlite::Result<Vec<SearchRow>> {
+    let mut statement = conn.prepare(&format!(
+        "{SEARCH_ROW_SELECT} JOIN container c ON c.container_key=i.container_key
+         WHERE c.scan_state=?1 ORDER BY i.item_id"
+    ))?;
+    statement
+        .query_map([state as i64], row_to_search_row)?
+        .collect()
+}
+
+fn load_staged_items(
+    conn: &Connection,
+    container_key: &str,
+    generation: u64,
+) -> rusqlite::Result<Vec<StoredItem>> {
+    let mut statement = conn.prepare(
+        "SELECT item_key, kind, container_key, page_index, mtime, file_size, hash_version,
+                pdq256, quality, width, height, format
+         FROM item_build WHERE container_key=?1 AND generation=?2 ORDER BY page_index",
+    )?;
+    statement
+        .query_map(params![container_key, generation], row_to_stored_item)?
+        .collect()
+}
+
+fn row_to_stored_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredItem> {
+    let pdq = row.get::<_, Vec<u8>>(7)?;
+    let pdq256: [u8; 32] = pdq.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Blob,
+            "pdq256 must contain 32 bytes".into(),
+        )
+    })?;
+    let quality = row.get::<_, i64>(8)?;
+    Ok(StoredItem {
+        item_key: row.get(0)?,
+        kind: ItemKind::from_i64(row.get(1)?)?,
+        container_key: row.get(2)?,
+        page_index: row
+            .get::<_, Option<i64>>(3)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, -1))?,
+        mtime: row.get(4)?,
+        file_size: row.get(5)?,
+        hash_version: row.get(6)?,
+        pdq256,
+        quality: u8::try_from(quality)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, quality))?,
+        width: i64_to_u32(row.get(9)?, 9)?,
+        height: i64_to_u32(row.get(10)?, 10)?,
+        format: row.get(11)?,
+    })
+}
+
+fn row_to_item_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemChange> {
+    let op_value = row.get::<_, i64>(2)?;
+    let op = match op_value {
+        0 => ItemChangeOp::Add,
+        1 => ItemChangeOp::Update,
+        2 => ItemChangeOp::Delete,
+        _ => return Err(rusqlite::Error::IntegralValueOutOfRange(2, op_value)),
+    };
+    let signature = row
+        .get::<_, Option<Vec<u8>>>(4)?
+        .map(|bytes| {
+            let len = bytes.len();
+            bytes.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    len,
+                    rusqlite::types::Type::Blob,
+                    "pdq256 must contain 32 bytes".into(),
+                )
+            })
+        })
+        .transpose()?;
+    let quality_value = row.get::<_, Option<i64>>(5)?;
+    Ok(ItemChange {
+        seq: i64_to_u64(row.get(0)?, 0)?,
+        item_id: i64_to_u64(row.get(1)?, 1)?,
+        op,
+        revision: row
+            .get::<_, Option<i64>>(3)?
+            .map(|v| i64_to_u32(v, 3))
+            .transpose()?,
+        signature,
+        quality: quality_value
+            .map(|v| u8::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, v)))
+            .transpose()?,
     })
 }
 
@@ -1045,11 +1384,11 @@ fn i64_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
-fn search_content_stamp(conn: &Connection) -> rusqlite::Result<SearchContentStamp> {
-    let (store_id, generation) = conn.query_row(
-        "SELECT store_id, generation FROM search_content_state WHERE singleton = 1",
+fn search_store_id(conn: &Connection) -> rusqlite::Result<[u8; 16]> {
+    let store_id = conn.query_row(
+        "SELECT store_id FROM search_content_state WHERE singleton = 1",
         [],
-        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        |row| row.get::<_, Vec<u8>>(0),
     )?;
     let store_id: [u8; 16] = store_id.try_into().map_err(|value: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1058,29 +1397,40 @@ fn search_content_stamp(conn: &Connection) -> rusqlite::Result<SearchContentStam
             "search content store_id must contain 16 bytes".into(),
         )
     })?;
-    Ok(SearchContentStamp {
-        store_id,
-        generation: i64_to_u64(generation, 1)?,
-    })
+    Ok(store_id)
 }
 
-/// 検索対象として公開済みの行集合を変える transaction 内だけで進める。
-/// sidecar はこの値まで含めて照合するため、DB の commit と世代の公開が分離しない。
-fn bump_search_content_generation(conn: &Connection) -> rusqlite::Result<()> {
-    let changed = conn.execute(
-        "UPDATE search_content_state SET generation = generation + 1 WHERE singleton = 1",
-        [],
-    )?;
-    if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
-    }
-    Ok(())
+fn latest_change_seq(conn: &Connection) -> rusqlite::Result<u64> {
+    let seq = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'item_change'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    i64_to_u64(seq, 0)
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if user_version != SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS item_change;
+             DROP TABLE IF EXISTS item_build;
+             DROP TABLE IF EXISTS item_prefill;
+             DROP TABLE IF EXISTS container_build;
+             DROP TABLE IF EXISTS item;
+             DROP TABLE IF EXISTS container;
+             DROP TABLE IF EXISTS index_run;
+             DROP TABLE IF EXISTS search_content_state;",
+        )?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS item (
-           item_key TEXT PRIMARY KEY,
+           item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+           item_key TEXT NOT NULL UNIQUE,
+           revision INTEGER NOT NULL CHECK(revision > 0),
            kind INTEGER NOT NULL,
            container_key TEXT,
            page_index INTEGER,
@@ -1094,6 +1444,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
            format INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS item_container_idx ON item(container_key, page_index);
+         CREATE TABLE IF NOT EXISTS item_change (
+           seq INTEGER PRIMARY KEY AUTOINCREMENT,
+           item_id INTEGER NOT NULL,
+           op INTEGER NOT NULL CHECK(op IN (0, 1, 2)),
+           revision INTEGER,
+           pdq256 BLOB CHECK(pdq256 IS NULL OR length(pdq256) = 32),
+           quality INTEGER,
+           CHECK((op = 2 AND revision IS NULL AND pdq256 IS NULL AND quality IS NULL)
+              OR (op IN (0, 1) AND revision IS NOT NULL AND pdq256 IS NOT NULL AND quality IS NOT NULL))
+         );
          CREATE TABLE IF NOT EXISTS container (
            container_key TEXT PRIMARY KEY,
            kind INTEGER NOT NULL,
@@ -1152,14 +1512,14 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS search_content_state (
            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-           store_id BLOB NOT NULL CHECK(length(store_id) = 16),
-           generation INTEGER NOT NULL CHECK(generation >= 0)
-         );",
+           store_id BLOB NOT NULL CHECK(length(store_id) = 16)
+         );
+         PRAGMA user_version = 2;",
     )?;
     let store_id = *uuid::Uuid::new_v4().as_bytes();
     conn.execute(
-        "INSERT OR IGNORE INTO search_content_state (singleton, store_id, generation)
-         VALUES (1, ?1, 0)",
+        "INSERT OR IGNORE INTO search_content_state (singleton, store_id)
+         VALUES (1, ?1)",
         [store_id.as_slice()],
     )?;
     Ok(())
@@ -1201,7 +1561,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            db.load_compact_search_rows(current_hash_version(), |_| 0)
+            db.load_base_search_rows(current_hash_version())
                 .unwrap()
                 .records
                 .is_empty()
@@ -1217,49 +1577,82 @@ mod tests {
     }
 
     #[test]
-    fn search_content_generation_changes_only_with_the_published_search_set() {
+    fn item_change_tracks_only_published_changes() {
         let db = SimilarDb::open_in_memory().unwrap();
-        let initial = db.search_content_stamp().unwrap();
+        let initial_store = db.search_store_id().unwrap();
+        assert_eq!(db.load_item_changes_after(0).unwrap().latest_seq, 0);
 
         let generation = db
             .begin_container_build("book", ContainerKind::ImageFolder, 1, 1, 0)
             .unwrap();
         db.stage_item(generation, &item("page", Some("book"), Some(0), 1))
             .unwrap();
-        assert_eq!(db.search_content_stamp().unwrap(), initial);
+        assert_eq!(db.load_item_changes_after(0).unwrap().latest_seq, 0);
 
         db.complete_container("book", generation).unwrap();
-        let after_publish = db.search_content_stamp().unwrap();
-        assert_eq!(after_publish.store_id, initial.store_id);
-        assert_eq!(after_publish.generation, initial.generation + 1);
+        let after_publish = db.load_item_changes_after(0).unwrap();
+        assert_eq!(db.search_store_id().unwrap(), initial_store);
+        assert_eq!(after_publish.changes.len(), 1);
+        assert_eq!(after_publish.changes[0].op, ItemChangeOp::Add);
 
         let loose = item("loose", None, None, 2);
         assert!(db.upsert_loose_item(&loose).unwrap());
-        let after_loose = db.search_content_stamp().unwrap();
-        assert_eq!(after_loose.generation, after_publish.generation + 1);
+        let after_loose = db.load_item_changes_after(0).unwrap();
+        assert_eq!(after_loose.latest_seq, after_publish.latest_seq + 1);
         assert!(!db.upsert_loose_item(&loose).unwrap());
-        assert_eq!(db.search_content_stamp().unwrap(), after_loose);
+        assert_eq!(db.load_item_changes_after(0).unwrap(), after_loose);
 
         let seen_items = HashSet::from(["loose".to_owned()]);
         let seen_containers = HashSet::new();
         assert!(db.prune_except_seen(&seen_items, &seen_containers).unwrap() > 0);
-        assert_eq!(
-            db.search_content_stamp().unwrap().generation,
-            after_loose.generation + 1
+        let after_prune = db.load_item_changes_after(0).unwrap();
+        assert!(after_prune.latest_seq > after_loose.latest_seq);
+        assert!(
+            after_prune
+                .changes
+                .iter()
+                .any(|change| change.op == ItemChangeOp::Delete)
         );
+    }
+
+    #[test]
+    fn item_and_change_log_roll_back_together() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_item_change
+                 BEFORE INSERT ON item_change
+                 BEGIN
+                   SELECT RAISE(ABORT, 'test item_change failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.upsert_loose_item(&item("never-published", None, None, 1))
+                .is_err()
+        );
+        assert!(
+            db.load_item("never-published", current_hash_version())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.load_item_changes_after(0).unwrap().latest_seq, 0);
     }
 
     #[test]
     fn each_store_gets_a_distinct_content_identity() {
         let first = SimilarDb::open_in_memory()
             .unwrap()
-            .search_content_stamp()
+            .search_store_id()
             .unwrap();
         let second = SimilarDb::open_in_memory()
             .unwrap()
-            .search_content_stamp()
+            .search_store_id()
             .unwrap();
-        assert_ne!(first.store_id, second.store_id);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1271,13 +1664,11 @@ mod tests {
         db.stage_item(first, &item("old", Some("book"), Some(0), 1))
             .unwrap();
         db.complete_container("book", first).unwrap();
-        let compact = db
-            .load_compact_search_rows(current_hash_version(), |key| key.len() as u64)
-            .unwrap();
+        let compact = db.load_base_search_rows(current_hash_version()).unwrap();
         assert_eq!(compact.records.len(), 1);
-        let old_row_id = compact.records[0].row_id;
+        let old_item_id = compact.records[0].item_id;
         assert_eq!(
-            db.load_item_by_row_id(old_row_id, current_hash_version())
+            db.load_item_by_id(old_item_id, current_hash_version())
                 .unwrap()
                 .unwrap()
                 .item
@@ -1358,6 +1749,38 @@ mod tests {
         assert_eq!(
             db.load_search_rows(current_hash_version()).unwrap().len(),
             1
+        );
+        let changes = db.load_item_changes_after(0).unwrap();
+        assert_eq!(changes.changes.len(), 2);
+        assert_eq!(changes.changes[0].item_id, changes.changes[1].item_id);
+        assert_eq!(changes.changes[1].revision, Some(2));
+    }
+
+    #[test]
+    fn deleted_item_id_is_never_reused_for_the_same_key() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        db.upsert_loose_item(&item("same", None, None, 1)).unwrap();
+        let first_id = db
+            .load_item("same", current_hash_version())
+            .unwrap()
+            .unwrap()
+            .item_id;
+        assert_eq!(
+            db.prune_except_seen(&HashSet::new(), &HashSet::new())
+                .unwrap(),
+            1
+        );
+        db.upsert_loose_item(&item("same", None, None, 2)).unwrap();
+        let second_id = db
+            .load_item("same", current_hash_version())
+            .unwrap()
+            .unwrap()
+            .item_id;
+        assert!(second_id > first_id);
+        let changes = db.load_item_changes_after(0).unwrap();
+        assert_eq!(
+            changes.changes.iter().map(|c| c.op).collect::<Vec<_>>(),
+            vec![ItemChangeOp::Add, ItemChangeOp::Delete, ItemChangeOp::Add]
         );
     }
 
