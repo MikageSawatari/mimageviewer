@@ -12490,6 +12490,12 @@ pub struct App {
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
     pub(crate) fs_seek_drag_active: bool,
     /// 静止画ページシーク行で始まったドラッグの決着状態。動画と同じ状態機械を共有する。
+    ///
+    /// 通常の寿命を持つのは `handle_still_seek_track_response` だけ。生成は `drag_started`、
+    /// 破棄は `drag_stopped` で行い、fullscreen 自体の teardown だけが強制終了できる。
+    /// シークによるページ切替や overlay の描画可否 / cache miss は同じ pointer gesture の
+    /// 途中で起きるため、ここを破棄してはならない。ページ切替側でも破棄すると、egui が
+    /// `dragged=true, drag_started=false` を返す次フレームから操作を継続できなくなる。
     pub(crate) fs_seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
     /// フルスクリーン下部シークバー / 混在サマリをこのフレームで表示しているか。
     /// 左下ステータスをバーの上へ逃がすために使う。
@@ -45667,8 +45673,6 @@ impl App {
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        self.fs_seek_drag_active = false;
-        self.fs_seek_row_gesture = None;
         self.fs_seek_overlay_visible = false;
         self.clear_still_seek_thumbnail_requests();
         self.fs_vertical_cache_keep_set.clear();

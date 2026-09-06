@@ -16514,8 +16514,6 @@ impl App {
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
         if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
-            self.fs_seek_drag_active = false;
-            self.fs_seek_row_gesture = None;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
@@ -16560,8 +16558,6 @@ impl App {
         }
 
         let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
-            self.fs_seek_drag_active = false;
-            self.fs_seek_row_gesture = None;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         };
@@ -17146,9 +17142,6 @@ impl App {
         }
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
-        }
-        if !primary_down {
-            self.fs_seek_row_gesture = None;
         }
         target
     }
@@ -53459,6 +53452,122 @@ mod tests {
         assert!(!release_frame.primary_down);
         assert!(release_frame.drag_stopped);
         assert_eq!(release_frame.action, StillSeekTrackAction::None);
+    }
+
+    /// The first scrub frame lands through fullscreen page navigation. That page switch must not
+    /// end the gesture, because later held frames have `dragged=true, drag_started=false`.
+    #[test]
+    fn still_seek_drag_survives_the_page_navigation_it_triggers() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.image_metas = vec![None; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.details_order = vec![0, 1, 2];
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+
+        let mut gesture = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(80.0, 96.0));
+        gesture.update(egui::pos2(160.0, 96.0));
+        app.fs_seek_row_gesture = Some(gesture);
+        app.fs_seek_drag_active = true;
+
+        let mut perf = None;
+        app.land_still_page_navigation_target(
+            &ctx,
+            0,
+            1,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            &mut perf,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.fs_seek_row_gesture.is_some());
+        assert!(app.fs_seek_drag_active);
+
+        // Neither render-suppression return may become a second gesture owner. Both can happen
+        // transiently between the first landing frame and the next held-pointer frame.
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        app.analysis_mode = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+        assert!(app.fs_seek_row_gesture.is_some());
+
+        app.analysis_mode = false;
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarOnly);
+        app.visible_indices = vec![0, 2];
+        app.viewer_navigation_caches.invalidate();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+
+        let gesture = app
+            .fs_seek_row_gesture
+            .as_mut()
+            .expect("the first scrub frame's page switch must preserve the gesture");
+        assert_eq!(
+            gesture.update(egui::pos2(240.0, 96.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub,
+            "the held second frame must continue the same scrub"
+        );
+    }
+
+    /// **ドラッグを続けている間ずっとシークできること。**
+    ///
+    /// 実機では「1 ページだけ進んで、その後は動かない」という形で壊れていた
+    /// (2026-09-06)。最初の 1 フレームだけを見るテストは通り続けていたので、
+    /// 継続するフレームを跨いで観測する。ジェスチャは一度 `Scrub` に決まったら
+    /// 離すまでその状態で居続けるのが契約で、途中で誰かが捨てたらここが落ちる。
+    #[test]
+    fn still_seek_track_horizontal_drag_keeps_seeking_across_frames() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+
+        let mut pages = Vec::new();
+        for x in [160.0_f32, 240.0, 320.0, 400.0] {
+            harness.hover_at(egui::pos2(x, 96.0));
+            harness.step();
+            let frame = harness.state().observations.last().unwrap();
+            assert_eq!(
+                frame.action,
+                StillSeekTrackAction::Seek,
+                "drag frame at x={x} stopped seeking: {:?}",
+                harness.state().observations
+            );
+            pages.push(harness.state().page);
+        }
+
+        still_seek_track_pointer_button(&mut harness, egui::pos2(400.0, 96.0), false);
+
+        let mut sorted = pages.clone();
+        sorted.dedup();
+        assert_eq!(
+            sorted, pages,
+            "each drag frame must land on its own page, got {pages:?}"
+        );
+        assert!(
+            pages.windows(2).all(|w| w[1] > w[0]),
+            "dragging right must keep advancing, got {pages:?}"
+        );
     }
 
     #[test]
