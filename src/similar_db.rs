@@ -100,8 +100,21 @@ pub struct SearchRow {
 
 #[derive(Debug)]
 pub struct CompactSearchRows {
-    pub signatures: Vec<([u8; 32], u32)>,
-    pub key_rows: Vec<(u64, u32)>,
+    pub stamp: SearchContentStamp,
+    pub records: Vec<CompactSearchRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactSearchRow {
+    pub signature: [u8; 32],
+    pub row_id: u32,
+    pub key_hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchContentStamp {
+    pub store_id: [u8; 16],
+    pub generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -272,8 +285,11 @@ impl SimilarDb {
         }) {
             return Ok(false);
         }
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        upsert_item(&conn, item)?;
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        upsert_item(&transaction, item)?;
+        bump_search_content_generation(&transaction)?;
+        transaction.commit()?;
         Ok(true)
     }
 
@@ -491,6 +507,7 @@ impl SimilarDb {
             "DELETE FROM container_build WHERE container_key = ?1 AND generation = ?2",
             params![container_key, generation],
         )?;
+        bump_search_content_generation(&transaction)?;
         transaction.commit()
     }
 
@@ -586,8 +603,10 @@ impl SimilarDb {
         hash_version: i64,
         mut hash_key: impl FnMut(&str) -> u64,
     ) -> rusqlite::Result<CompactSearchRows> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let count_i64 = conn.query_row(
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let transaction = conn.transaction()?;
+        let stamp = search_content_stamp(&transaction)?;
+        let count_i64 = transaction.query_row(
             "SELECT COUNT(*) FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
              WHERE i.hash_version = ?1
@@ -597,9 +616,8 @@ impl SimilarDb {
         )?;
         let count = usize::try_from(count_i64)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count_i64))?;
-        let mut signatures = Vec::with_capacity(count);
-        let mut key_rows = Vec::with_capacity(count);
-        let mut statement = conn.prepare(
+        let mut records = Vec::with_capacity(count);
+        let mut statement = transaction.prepare(
             "SELECT i.rowid, i.item_key, i.pdq256
              FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
@@ -621,13 +639,21 @@ impl SimilarDb {
                     "pdq256 must contain 32 bytes".into(),
                 )
             })?;
-            signatures.push((signature, row_id));
-            key_rows.push((hash_key(item_key), row_id));
+            records.push(CompactSearchRow {
+                signature,
+                row_id,
+                key_hash: hash_key(item_key),
+            });
         }
-        Ok(CompactSearchRows {
-            signatures,
-            key_rows,
-        })
+        drop(rows);
+        drop(statement);
+        transaction.commit()?;
+        Ok(CompactSearchRows { stamp, records })
+    }
+
+    pub fn search_content_stamp(&self) -> rusqlite::Result<SearchContentStamp> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        search_content_stamp(&conn)
     }
 
     /// 完走した索引ジョブの表示用集計を、公開済み行数と同じ transaction で記録する。
@@ -819,6 +845,9 @@ impl SimilarDb {
                     .execute("DELETE FROM container WHERE container_key = ?1", [&key])?;
             }
         }
+        if removed > 0 {
+            bump_search_content_generation(&transaction)?;
+        }
         transaction.commit()?;
         Ok(removed)
     }
@@ -888,6 +917,9 @@ impl SimilarDb {
              WHERE singleton = 1",
             [ScanState::Complete as i64],
         )?;
+        if removed > 0 {
+            bump_search_content_generation(&transaction)?;
+        }
         transaction.commit()?;
         Ok(removed)
     }
@@ -1013,6 +1045,38 @@ fn i64_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
+fn search_content_stamp(conn: &Connection) -> rusqlite::Result<SearchContentStamp> {
+    let (store_id, generation) = conn.query_row(
+        "SELECT store_id, generation FROM search_content_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let store_id: [u8; 16] = store_id.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Blob,
+            "search content store_id must contain 16 bytes".into(),
+        )
+    })?;
+    Ok(SearchContentStamp {
+        store_id,
+        generation: i64_to_u64(generation, 1)?,
+    })
+}
+
+/// 検索対象として公開済みの行集合を変える transaction 内だけで進める。
+/// sidecar はこの値まで含めて照合するため、DB の commit と世代の公開が分離しない。
+fn bump_search_content_generation(conn: &Connection) -> rusqlite::Result<()> {
+    let changed = conn.execute(
+        "UPDATE search_content_state SET generation = generation + 1 WHERE singleton = 1",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS item (
@@ -1085,8 +1149,20 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
            zero_page_containers INTEGER NOT NULL,
            decode_failures INTEGER NOT NULL,
            io_failures INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS search_content_state (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           store_id BLOB NOT NULL CHECK(length(store_id) = 16),
+           generation INTEGER NOT NULL CHECK(generation >= 0)
          );",
-    )
+    )?;
+    let store_id = *uuid::Uuid::new_v4().as_bytes();
+    conn.execute(
+        "INSERT OR IGNORE INTO search_content_state (singleton, store_id, generation)
+         VALUES (1, ?1, 0)",
+        [store_id.as_slice()],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1127,7 +1203,7 @@ mod tests {
         assert!(
             db.load_compact_search_rows(current_hash_version(), |_| 0)
                 .unwrap()
-                .signatures
+                .records
                 .is_empty()
         );
         assert_eq!(db.count_staged(), 1);
@@ -1138,6 +1214,52 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn search_content_generation_changes_only_with_the_published_search_set() {
+        let db = SimilarDb::open_in_memory().unwrap();
+        let initial = db.search_content_stamp().unwrap();
+
+        let generation = db
+            .begin_container_build("book", ContainerKind::ImageFolder, 1, 1, 0)
+            .unwrap();
+        db.stage_item(generation, &item("page", Some("book"), Some(0), 1))
+            .unwrap();
+        assert_eq!(db.search_content_stamp().unwrap(), initial);
+
+        db.complete_container("book", generation).unwrap();
+        let after_publish = db.search_content_stamp().unwrap();
+        assert_eq!(after_publish.store_id, initial.store_id);
+        assert_eq!(after_publish.generation, initial.generation + 1);
+
+        let loose = item("loose", None, None, 2);
+        assert!(db.upsert_loose_item(&loose).unwrap());
+        let after_loose = db.search_content_stamp().unwrap();
+        assert_eq!(after_loose.generation, after_publish.generation + 1);
+        assert!(!db.upsert_loose_item(&loose).unwrap());
+        assert_eq!(db.search_content_stamp().unwrap(), after_loose);
+
+        let seen_items = HashSet::from(["loose".to_owned()]);
+        let seen_containers = HashSet::new();
+        assert!(db.prune_except_seen(&seen_items, &seen_containers).unwrap() > 0);
+        assert_eq!(
+            db.search_content_stamp().unwrap().generation,
+            after_loose.generation + 1
+        );
+    }
+
+    #[test]
+    fn each_store_gets_a_distinct_content_identity() {
+        let first = SimilarDb::open_in_memory()
+            .unwrap()
+            .search_content_stamp()
+            .unwrap();
+        let second = SimilarDb::open_in_memory()
+            .unwrap()
+            .search_content_stamp()
+            .unwrap();
+        assert_ne!(first.store_id, second.store_id);
     }
 
     #[test]
@@ -1152,8 +1274,8 @@ mod tests {
         let compact = db
             .load_compact_search_rows(current_hash_version(), |key| key.len() as u64)
             .unwrap();
-        assert_eq!(compact.signatures.len(), 1);
-        let old_row_id = compact.signatures[0].1;
+        assert_eq!(compact.records.len(), 1);
+        let old_row_id = compact.records[0].row_id;
         assert_eq!(
             db.load_item_by_row_id(old_row_id, current_hash_version())
                 .unwrap()

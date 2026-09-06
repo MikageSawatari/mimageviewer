@@ -1,7 +1,8 @@
 //! お気に入り配下の「別バージョン」索引ジョブと遅延ロード線形検索。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::hash::{BuildHasher, RandomState};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -10,10 +11,12 @@ use std::sync::{
 use std::time::Duration;
 
 use image::GenericImageView;
+use sha2::{Digest, Sha256};
 
 use crate::dupe::{self, Algo, Sig};
 use crate::similar_db::{
-    CompletedIndexStats, ContainerKind, Freshness, ItemKind, SearchRow, SimilarDb, StoredItem,
+    CompactSearchRow as CompactIndexRecord, CompactSearchRows, CompletedIndexStats, ContainerKind,
+    Freshness, ItemKind, SearchContentStamp, SearchRow, SimilarDb, StoredItem,
     current_hash_version,
 };
 use crate::similar_image::{
@@ -39,6 +42,14 @@ const INDEX_PER_VOLUME_OUTSTANDING_LIMIT: usize = 8;
 const INDEX_ACTIVE_GLOBAL_OUTSTANDING_LIMIT: usize = 1;
 const INDEX_ACTIVE_PER_VOLUME_OUTSTANDING_LIMIT: usize = 1;
 const INDEX_LIMIT_RECHECK: Duration = Duration::from_millis(50);
+
+const COMPACT_SIDECAR_FILE: &str = "similar.compact";
+const COMPACT_SIDECAR_MAGIC: [u8; 8] = *b"MIVSIMC1";
+const COMPACT_SIDECAR_FORMAT_VERSION: u32 = 1;
+const COMPACT_SIDECAR_HEADER_LEN: usize = 104;
+const COMPACT_SIDECAR_RECORD_LEN: usize = 44;
+const COMPACT_SIDECAR_IO_RECORDS: usize = 16 * 1024;
+static COMPACT_SIDECAR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexStage {
@@ -234,6 +245,7 @@ impl SimilarIndexManager {
                 &self.memory,
                 &self.memory_epoch,
                 &self.item_query,
+                MemoryLoadTrigger::Configure,
             );
         }
     }
@@ -269,12 +281,16 @@ impl SimilarIndexManager {
             let state = self.memory.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
                 MemoryState::Unloaded => {
+                    if running {
+                        return Arc::new(ItemQuery::Preparing);
+                    }
                     drop(state);
                     start_memory_load(
                         &self.data_dir,
                         &self.memory,
                         &self.memory_epoch,
                         &self.item_query,
+                        MemoryLoadTrigger::QueryFallback,
                     );
                     return Arc::new(ItemQuery::Preparing);
                 }
@@ -391,12 +407,16 @@ impl SimilarIndexManager {
         let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         match &*memory {
             MemoryState::Unloaded => {
+                if running {
+                    return BookQuery::Preparing;
+                }
                 drop(memory);
                 start_memory_load(
                     &self.data_dir,
                     &self.memory,
                     &self.memory_epoch,
                     &self.item_query,
+                    MemoryLoadTrigger::BookQueryFallback,
                 );
                 return BookQuery::Preparing;
             }
@@ -469,6 +489,7 @@ fn start_memory_load(
     memory: &Arc<Mutex<MemoryState>>,
     memory_epoch: &Arc<AtomicU64>,
     item_query: &Arc<Mutex<ItemQueryCache>>,
+    trigger: MemoryLoadTrigger,
 ) {
     let epoch = memory_epoch.load(Ordering::Acquire);
     {
@@ -479,20 +500,33 @@ fn start_memory_load(
         *state = MemoryState::Loading;
     }
     let db_path = SimilarDb::db_path_at(data_dir);
+    let sidecar_path = compact_sidecar_path(data_dir);
     let state = Arc::clone(memory);
     let epoch_guard = Arc::clone(memory_epoch);
     let cache = Arc::clone(item_query);
     let spawn_result = std::thread::Builder::new()
         .name("similar-index-load".to_owned())
         .spawn(move || {
-            let loaded = if !db_path.is_file() {
+            let started = std::time::Instant::now();
+            let loaded = (if !trigger.create_if_missing() && !db_path.is_file() {
                 Ok(None)
             } else {
                 SimilarDb::open_at(&db_path)
-                    .and_then(|db| MemoryIndex::load(&db))
-                    .map(Arc::new)
+                    .map_err(db_error)
+                    .and_then(|db| MemoryIndex::load_cached(&db, &sidecar_path))
                     .map(Some)
-            }
+            })
+            .map(|loaded| {
+                loaded.map(|loaded| {
+                    crate::logger::log(format!(
+                        "similar memory load: trigger={trigger:?} source={:?} rows={} elapsed_ms={:.1}",
+                        loaded.source,
+                        loaded.index.records.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ));
+                    Arc::new(loaded.index)
+                })
+            })
             .map_err(|error| format!("similar index load failed: {error}"));
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             if epoch_guard.load(Ordering::Acquire) != epoch {
@@ -510,6 +544,24 @@ fn start_memory_load(
     if let Err(error) = spawn_result {
         *memory.lock().unwrap_or_else(|e| e.into_inner()) =
             MemoryState::Failed(format!("similar index load worker start failed: {error}"));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryLoadTrigger {
+    Configure,
+    IndexRunOpen,
+    IndexRunFinished,
+    QueryFallback,
+    BookQueryFallback,
+}
+
+impl MemoryLoadTrigger {
+    fn create_if_missing(self) -> bool {
+        matches!(
+            self,
+            Self::Configure | Self::IndexRunOpen | Self::IndexRunFinished
+        )
     }
 }
 
@@ -698,6 +750,15 @@ impl SimilarIndexScheduler {
         };
         *self.prefill_db.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&db));
         register_prefill_db(&db, &self.enabled_roots);
+        // configure と DB 作成が競合しても、実行中の worker が必ず eager load を開始する。
+        // この呼び出しは既に Loading / Ready なら no-op で、パネル照会には依存しない。
+        start_memory_load(
+            &self.data_dir,
+            &self.memory,
+            &self.memory_epoch,
+            &self.item_query,
+            MemoryLoadTrigger::IndexRunOpen,
+        );
 
         loop {
             let (revision, config, cancel, purge_roots) = {
@@ -774,6 +835,7 @@ impl SimilarIndexScheduler {
                 &self.memory,
                 &self.memory_epoch,
                 &self.item_query,
+                MemoryLoadTrigger::IndexRunFinished,
             );
             return;
         }
@@ -901,11 +963,30 @@ fn retain_ready_memory_or_unload(state: &mut MemoryState) {
 }
 
 struct MemoryIndex {
-    /// ブリーフどおり、索引構造を持たない 36-byte/件の線形表。
-    signatures: Vec<([u8; 32], u32)>,
-    /// origin の point lookup 候補だけを持つ。hash 一致後は SQLite の実 key で確認する。
-    key_rows: Vec<(u64, u32)>,
-    key_hash_builder: RandomState,
+    /// 線形照合と origin 候補探索に必要な値だけを保持する。
+    /// sidecar 上は padding のない 44-byte/件で、key hash 順に並ぶ。
+    records: Vec<CompactIndexRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryLoadSource {
+    Sidecar,
+    Sqlite,
+}
+
+struct LoadedMemoryIndex {
+    index: MemoryIndex,
+    source: MemoryLoadSource,
+}
+
+#[derive(Clone, Copy)]
+struct CompactSidecarHeader {
+    hash_version: i64,
+    proxy_version: u32,
+    row_count: u64,
+    body_len: u64,
+    stamp: SearchContentStamp,
+    body_sha256: [u8; 32],
 }
 
 struct DetailedMemoryIndex {
@@ -916,55 +997,315 @@ struct DetailedMemoryIndex {
 }
 
 impl MemoryIndex {
+    #[cfg(test)]
     fn load(db: &SimilarDb) -> rusqlite::Result<Self> {
-        let key_hash_builder = RandomState::new();
-        let compact = db.load_compact_search_rows(current_hash_version(), |key| {
-            key_hash_builder.hash_one(key)
-        })?;
-        let mut key_rows = compact.key_rows;
-        key_rows.sort_unstable();
-        Ok(Self {
-            signatures: compact.signatures,
-            key_rows,
-            key_hash_builder,
+        db.load_compact_search_rows(current_hash_version(), stable_item_key_hash)
+            .map(Self::from_compact_rows)
+    }
+
+    fn load_cached(db: &SimilarDb, sidecar_path: &Path) -> Result<LoadedMemoryIndex, String> {
+        let expected_stamp = db.search_content_stamp().map_err(db_error)?;
+        match read_compact_sidecar(sidecar_path, expected_stamp) {
+            Ok(index) => {
+                // 読んでいる間に writer が公開集合を変えていないことを再確認する。
+                // header 一致だけで採用すると、read 中に世代が進んだ sidecar を公開し得る。
+                if db.search_content_stamp().map_err(db_error)? == expected_stamp {
+                    return Ok(LoadedMemoryIndex {
+                        index,
+                        source: MemoryLoadSource::Sidecar,
+                    });
+                }
+                crate::logger::log(
+                    "similar compact sidecar ignored: database generation changed during read",
+                );
+            }
+            Err(error) => crate::logger::log(format!(
+                "similar compact sidecar ignored ({}): {error}",
+                sidecar_path.display()
+            )),
+        }
+
+        // sidecar は派生物なので、欠損・不一致・破損のどれも DB snapshot へ戻す。
+        let compact = db
+            .load_compact_search_rows(current_hash_version(), stable_item_key_hash)
+            .map_err(db_error)?;
+        let stamp = compact.stamp;
+        let index = Self::from_compact_rows(compact);
+        // 書き終わるまで DB が同じ世代ならだけ publish する。失敗しても今回の
+        // メモリ snapshot は利用でき、次回も SQLite fallback になるだけである。
+        if let Err(error) = write_compact_sidecar_if_current(db, sidecar_path, stamp, &index) {
+            crate::logger::log(format!(
+                "similar compact sidecar rebuild skipped ({}): {error}",
+                sidecar_path.display()
+            ));
+        }
+        Ok(LoadedMemoryIndex {
+            index,
+            source: MemoryLoadSource::Sqlite,
         })
+    }
+
+    fn from_compact_rows(compact: CompactSearchRows) -> Self {
+        let mut records = compact.records;
+        records.sort_unstable_by_key(|record| (record.key_hash, record.row_id));
+        Self { records }
     }
 
     #[cfg(test)]
     fn from_rows(rows: Vec<SearchRow>) -> Self {
-        let key_hash_builder = RandomState::new();
-        let mut signatures = Vec::with_capacity(rows.len());
-        let mut key_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            signatures.push((row.item.pdq256, row.row_id));
-            key_rows.push((key_hash_builder.hash_one(&row.item.item_key), row.row_id));
-        }
-        signatures.sort_unstable_by_key(|(_, row_id)| *row_id);
-        key_rows.sort_unstable();
-        Self {
-            signatures,
-            key_rows,
-            key_hash_builder,
-        }
+        let mut records = rows
+            .into_iter()
+            .map(|row| CompactIndexRecord {
+                signature: row.item.pdq256,
+                row_id: row.row_id,
+                key_hash: stable_item_key_hash(&row.item.item_key),
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| (record.key_hash, record.row_id));
+        Self { records }
     }
 
-    fn candidate_rows_for_key(&self, item_key: &str) -> &[(u64, u32)] {
-        let hash = self.key_hash_builder.hash_one(item_key);
-        let start = self.key_rows.partition_point(|(value, _)| *value < hash);
-        let end = self.key_rows.partition_point(|(value, _)| *value <= hash);
-        &self.key_rows[start..end]
-    }
-
-    fn signature_for_row(&self, row_id: u32) -> Option<&[u8; 32]> {
-        self.signatures
-            .binary_search_by_key(&row_id, |(_, id)| *id)
-            .ok()
-            .map(|index| &self.signatures[index].0)
+    fn candidate_records_for_key(&self, item_key: &str) -> &[CompactIndexRecord] {
+        let hash = stable_item_key_hash(item_key);
+        let start = self
+            .records
+            .partition_point(|record| record.key_hash < hash);
+        let end = self
+            .records
+            .partition_point(|record| record.key_hash <= hash);
+        &self.records[start..end]
     }
 
     fn detailed_from_rows(rows: Vec<SearchRow>) -> DetailedMemoryIndex {
         DetailedMemoryIndex::from_rows(rows)
     }
+}
+
+/// プロセスごとに seed が変わる `RandomState` は永続 sidecar に使えない。
+/// 形式 version でアルゴリズムを固定した FNV-1a とし、候補取得後は必ず SQLite の
+/// `item_key` 実値を比較するため、64-bit collision が別画像へ解決されることはない。
+fn stable_item_key_hash(item_key: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in item_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn compact_sidecar_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(COMPACT_SIDECAR_FILE)
+}
+
+impl CompactSidecarHeader {
+    fn encode(self) -> [u8; COMPACT_SIDECAR_HEADER_LEN] {
+        let mut bytes = [0u8; COMPACT_SIDECAR_HEADER_LEN];
+        bytes[0..8].copy_from_slice(&COMPACT_SIDECAR_MAGIC);
+        bytes[8..12].copy_from_slice(&COMPACT_SIDECAR_FORMAT_VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(COMPACT_SIDECAR_HEADER_LEN as u32).to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.hash_version.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.proxy_version.to_le_bytes());
+        bytes[28..32].copy_from_slice(&(COMPACT_SIDECAR_RECORD_LEN as u32).to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.row_count.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.body_len.to_le_bytes());
+        bytes[48..64].copy_from_slice(&self.stamp.store_id);
+        bytes[64..72].copy_from_slice(&self.stamp.generation.to_le_bytes());
+        bytes[72..104].copy_from_slice(&self.body_sha256);
+        bytes
+    }
+
+    fn decode(bytes: &[u8; COMPACT_SIDECAR_HEADER_LEN]) -> Result<Self, String> {
+        if bytes[0..8] != COMPACT_SIDECAR_MAGIC {
+            return Err("compact sidecar magic mismatch".to_owned());
+        }
+        let format_version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let record_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        if format_version != COMPACT_SIDECAR_FORMAT_VERSION
+            || header_len != COMPACT_SIDECAR_HEADER_LEN as u32
+            || record_len != COMPACT_SIDECAR_RECORD_LEN as u32
+        {
+            return Err("compact sidecar format mismatch".to_owned());
+        }
+        let mut store_id = [0u8; 16];
+        store_id.copy_from_slice(&bytes[48..64]);
+        let mut body_sha256 = [0u8; 32];
+        body_sha256.copy_from_slice(&bytes[72..104]);
+        Ok(Self {
+            hash_version: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            proxy_version: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            row_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            body_len: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            stamp: SearchContentStamp {
+                store_id,
+                generation: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            },
+            body_sha256,
+        })
+    }
+}
+
+fn encode_compact_record(record: CompactIndexRecord) -> [u8; COMPACT_SIDECAR_RECORD_LEN] {
+    let mut bytes = [0u8; COMPACT_SIDECAR_RECORD_LEN];
+    bytes[0..32].copy_from_slice(&record.signature);
+    bytes[32..36].copy_from_slice(&record.row_id.to_le_bytes());
+    bytes[36..44].copy_from_slice(&record.key_hash.to_le_bytes());
+    bytes
+}
+
+fn read_compact_sidecar(
+    path: &Path,
+    expected_stamp: SearchContentStamp,
+) -> Result<MemoryIndex, String> {
+    let file = File::open(path).map_err(|error| format!("compact sidecar open failed: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("compact sidecar metadata failed: {error}"))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut header_bytes = [0u8; COMPACT_SIDECAR_HEADER_LEN];
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(|error| format!("compact sidecar header is short: {error}"))?;
+    let header = CompactSidecarHeader::decode(&header_bytes)?;
+    let expected_body_len = header
+        .row_count
+        .checked_mul(COMPACT_SIDECAR_RECORD_LEN as u64)
+        .ok_or_else(|| "compact sidecar row count overflow".to_owned())?;
+    let expected_file_len = (COMPACT_SIDECAR_HEADER_LEN as u64)
+        .checked_add(expected_body_len)
+        .ok_or_else(|| "compact sidecar file length overflow".to_owned())?;
+    if header.hash_version != current_hash_version()
+        || header.proxy_version != dupe::PROXY_VERSION
+        || header.stamp != expected_stamp
+        || header.body_len != expected_body_len
+        || file_len != expected_file_len
+    {
+        return Err("compact sidecar stamp or length mismatch".to_owned());
+    }
+    let row_count = usize::try_from(header.row_count)
+        .map_err(|_| "compact sidecar row count does not fit memory".to_owned())?;
+    let mut records = Vec::with_capacity(row_count);
+    let mut digest = Sha256::new();
+    let mut body_buffer =
+        Vec::with_capacity(COMPACT_SIDECAR_IO_RECORDS.saturating_mul(COMPACT_SIDECAR_RECORD_LEN));
+    let mut previous_order = None;
+    let mut remaining = row_count;
+    while remaining > 0 {
+        let chunk_records = remaining.min(COMPACT_SIDECAR_IO_RECORDS);
+        body_buffer.resize(chunk_records * COMPACT_SIDECAR_RECORD_LEN, 0);
+        reader
+            .read_exact(&mut body_buffer)
+            .map_err(|error| format!("compact sidecar body is short: {error}"))?;
+        digest.update(&body_buffer);
+        for record_bytes in body_buffer.chunks_exact(COMPACT_SIDECAR_RECORD_LEN) {
+            let mut signature = [0u8; 32];
+            signature.copy_from_slice(&record_bytes[0..32]);
+            let record = CompactIndexRecord {
+                signature,
+                row_id: u32::from_le_bytes(record_bytes[32..36].try_into().unwrap()),
+                key_hash: u64::from_le_bytes(record_bytes[36..44].try_into().unwrap()),
+            };
+            if record.row_id == 0
+                || previous_order
+                    .is_some_and(|previous| previous > (record.key_hash, record.row_id))
+            {
+                return Err("compact sidecar record order is invalid".to_owned());
+            }
+            previous_order = Some((record.key_hash, record.row_id));
+            records.push(record);
+        }
+        remaining -= chunk_records;
+    }
+    let actual_digest: [u8; 32] = digest.finalize().into();
+    if actual_digest != header.body_sha256 {
+        return Err("compact sidecar checksum mismatch".to_owned());
+    }
+    Ok(MemoryIndex { records })
+}
+
+fn write_compact_sidecar_if_current(
+    db: &SimilarDb,
+    path: &Path,
+    stamp: SearchContentStamp,
+    index: &MemoryIndex,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "compact sidecar has no parent directory".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("compact sidecar directory create failed: {error}"))?;
+    let sequence = COMPACT_SIDECAR_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{COMPACT_SIDECAR_FILE}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let write_result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| format!("compact sidecar temp create failed: {error}"))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(&[0u8; COMPACT_SIDECAR_HEADER_LEN])
+            .map_err(|error| format!("compact sidecar header reserve failed: {error}"))?;
+        let mut digest = Sha256::new();
+        let mut body_buffer = Vec::with_capacity(
+            COMPACT_SIDECAR_IO_RECORDS.saturating_mul(COMPACT_SIDECAR_RECORD_LEN),
+        );
+        for records in index.records.chunks(COMPACT_SIDECAR_IO_RECORDS) {
+            body_buffer.clear();
+            for record in records {
+                body_buffer.extend_from_slice(&encode_compact_record(*record));
+            }
+            writer
+                .write_all(&body_buffer)
+                .map_err(|error| format!("compact sidecar body write failed: {error}"))?;
+            digest.update(&body_buffer);
+        }
+        let row_count = u64::try_from(index.records.len())
+            .map_err(|_| "compact sidecar row count does not fit u64".to_owned())?;
+        let body_len = row_count
+            .checked_mul(COMPACT_SIDECAR_RECORD_LEN as u64)
+            .ok_or_else(|| "compact sidecar body length overflow".to_owned())?;
+        let header = CompactSidecarHeader {
+            hash_version: current_hash_version(),
+            proxy_version: dupe::PROXY_VERSION,
+            row_count,
+            body_len,
+            stamp,
+            body_sha256: digest.finalize().into(),
+        };
+        writer
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| writer.write_all(&header.encode()))
+            .and_then(|_| writer.flush())
+            .map_err(|error| format!("compact sidecar header publish failed: {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("compact sidecar sync failed: {error}"))?;
+
+        if db.search_content_stamp().map_err(db_error)? != stamp {
+            return Err("compact sidecar source generation changed while writing".to_owned());
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("compact sidecar old file remove failed: {error}"));
+            }
+        }
+        std::fs::rename(&temp_path, path)
+            .map_err(|error| format!("compact sidecar rename failed: {error}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 impl DetailedMemoryIndex {
@@ -1008,10 +1349,12 @@ fn query_item_ready_with(
     mut load_row: impl FnMut(u32) -> Result<Option<SearchRow>, String>,
 ) -> ItemQuery {
     let mut origin_row = None;
-    for (_, row_id) in index.candidate_rows_for_key(item_key) {
-        match load_row(*row_id) {
+    let mut origin_signature = None;
+    for record in index.candidate_records_for_key(item_key) {
+        match load_row(record.row_id) {
             Ok(Some(row)) if row.item.item_key == item_key => {
                 origin_row = Some(row);
+                origin_signature = Some(record.signature);
                 break;
             }
             Ok(_) => {}
@@ -1023,22 +1366,22 @@ fn query_item_ready_with(
     };
     let origin_id = origin_row.row_id;
     let origin = origin_row.item;
-    if index.signature_for_row(origin_id) != Some(&origin.pdq256) {
+    if origin_signature != Some(origin.pdq256) {
         return ItemQuery::NotIndexed;
     }
     if origin.quality == 0 {
         return ItemQuery::Featureless;
     }
     let mut candidates = Vec::new();
-    for (signature, row_id) in &index.signatures {
-        if *row_id == origin_id {
+    for record in &index.records {
+        if record.row_id == origin_id {
             continue;
         }
-        let distance = hamming256(&origin.pdq256, signature);
+        let distance = hamming256(&origin.pdq256, &record.signature);
         let Some(band) = match_band(distance) else {
             continue;
         };
-        candidates.push((*row_id, *signature, distance, band));
+        candidates.push((record.row_id, record.signature, distance, band));
     }
     let mut hits = Vec::with_capacity(candidates.len());
     for (row_id, signature, distance, band) in candidates {
@@ -2790,15 +3133,37 @@ mod tests {
         let db_path = std::env::var_os("MIV_SIMILAR_BENCH_DB")
             .map(PathBuf::from)
             .expect("set MIV_SIMILAR_BENCH_DB");
+        let mode = std::env::var("MIV_SIMILAR_BENCH_LOAD").unwrap_or_else(|_| "sqlite".to_owned());
+        let sidecar = db_path.with_extension("compact");
+        if mode == "rebuild" {
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("sidecar reset failed: {error}"),
+            }
+        }
         let resident_before = current_working_set_bytes();
         let load_started = std::time::Instant::now();
         let db = SimilarDb::open_at(&db_path).unwrap();
-        let index = MemoryIndex::load(&db).unwrap();
-        let row_count = index.signatures.len();
+        let (index, load_source) = match mode.as_str() {
+            "sqlite" => (MemoryIndex::load(&db).unwrap(), MemoryLoadSource::Sqlite),
+            "rebuild" | "sidecar" => {
+                let loaded = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+                (loaded.index, loaded.source)
+            }
+            other => panic!("unknown MIV_SIMILAR_BENCH_LOAD mode: {other}"),
+        };
+        let row_count = index.records.len();
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
         let resident_after = current_working_set_bytes();
-        let origin_key = std::env::var("MIV_SIMILAR_BENCH_ORIGIN")
-            .expect("set MIV_SIMILAR_BENCH_ORIGIN to an indexed non-featureless item key");
+        let Some(origin_key) = std::env::var("MIV_SIMILAR_BENCH_ORIGIN").ok() else {
+            eprintln!(
+                "similar_load_measurement rows={row_count} mode={mode} source={load_source:?} load_ms={load_ms:.3} resident_before_bytes={resident_before} resident_after_bytes={resident_after} resident_delta_bytes={} sidecar_bytes={}",
+                resident_after.saturating_sub(resident_before),
+                std::fs::metadata(sidecar).map_or(0, |metadata| metadata.len())
+            );
+            return;
+        };
         let mut query_ms = Vec::new();
         let mut hit_count = 0;
         for _ in 0..3 {
@@ -2825,8 +3190,9 @@ mod tests {
             assert!(Arc::ptr_eq(&cached, &again));
         }
         eprintln!(
-            "similar_query_measurement rows={row_count} load_ms={load_ms:.3} resident_before_bytes={resident_before} resident_after_bytes={resident_after} resident_delta_bytes={} query_ms={query_ms:?} cache_miss_ms={cache_miss_ms:.3} cache_hit_ms={cache_hit_ms:?} hits={hit_count} origin={origin_key:?}",
-            resident_after.saturating_sub(resident_before)
+            "similar_query_measurement rows={row_count} mode={mode} source={load_source:?} load_ms={load_ms:.3} resident_before_bytes={resident_before} resident_after_bytes={resident_after} resident_delta_bytes={} query_ms={query_ms:?} cache_miss_ms={cache_miss_ms:.3} cache_hit_ms={cache_hit_ms:?} hits={hit_count} origin={origin_key:?} sidecar_bytes={}",
+            resident_after.saturating_sub(resident_before),
+            std::fs::metadata(sidecar).map_or(0, |metadata| metadata.len())
         );
     }
 
@@ -3219,8 +3585,7 @@ mod tests {
         let rows = vec![row(1, "actual-key", [0; 32], 1)];
         let mut index = MemoryIndex::from_rows(rows.clone());
         let requested = "different-key-with-the-same-hash-candidate";
-        let forced_hash = index.key_hash_builder.hash_one(requested);
-        index.key_rows[0] = (forced_hash, 1);
+        index.records[0].key_hash = stable_item_key_hash(requested);
 
         assert_eq!(
             query_test_rows(&index, &rows, requested),
@@ -3259,9 +3624,122 @@ mod tests {
     }
 
     #[test]
+    fn compact_sidecar_round_trips_and_deletion_is_harmless() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        db.upsert_loose_item(&row(1, "a", [1; 32], 1).item).unwrap();
+        db.upsert_loose_item(&row(2, "b", [2; 32], 1).item).unwrap();
+        let sidecar = compact_sidecar_path(temp.path());
+
+        let first = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(first.source, MemoryLoadSource::Sqlite);
+        assert!(sidecar.is_file());
+        let second = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(second.source, MemoryLoadSource::Sidecar);
+        assert_eq!(first.index.records, second.index.records);
+
+        std::fs::remove_file(&sidecar).unwrap();
+        let after_delete = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(after_delete.source, MemoryLoadSource::Sqlite);
+        assert_eq!(after_delete.index.records, first.index.records);
+        assert!(sidecar.is_file());
+    }
+
+    #[test]
+    fn compact_sidecar_header_stamps_every_compatibility_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        db.upsert_loose_item(&row(1, "a", [1; 32], 1).item).unwrap();
+        let sidecar = compact_sidecar_path(temp.path());
+        MemoryIndex::load_cached(&db, &sidecar).unwrap();
+
+        let mut file = File::open(&sidecar).unwrap();
+        let mut bytes = [0u8; COMPACT_SIDECAR_HEADER_LEN];
+        file.read_exact(&mut bytes).unwrap();
+        let header = CompactSidecarHeader::decode(&bytes).unwrap();
+        assert_eq!(header.hash_version, current_hash_version());
+        assert_eq!(header.proxy_version, dupe::PROXY_VERSION);
+        assert_eq!(header.row_count, 1);
+        assert_eq!(header.body_len, COMPACT_SIDECAR_RECORD_LEN as u64);
+        assert_eq!(header.stamp, db.search_content_stamp().unwrap());
+        assert_ne!(header.body_sha256, [0; 32]);
+
+        let wrong_generation = SearchContentStamp {
+            generation: header.stamp.generation + 1,
+            ..header.stamp
+        };
+        assert!(read_compact_sidecar(&sidecar, wrong_generation).is_err());
+    }
+
+    #[test]
+    fn compact_sidecar_rejects_short_corrupt_and_stale_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
+        db.upsert_loose_item(&row(1, "a", [1; 32], 1).item).unwrap();
+        let sidecar = compact_sidecar_path(temp.path());
+        MemoryIndex::load_cached(&db, &sidecar).unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_len((COMPACT_SIDECAR_HEADER_LEN + 3) as u64)
+            .unwrap();
+        let repaired = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(repaired.source, MemoryLoadSource::Sqlite);
+        assert_eq!(repaired.index.records.len(), 1);
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().len(),
+            (COMPACT_SIDECAR_HEADER_LEN + COMPACT_SIDECAR_RECORD_LEN) as u64
+        );
+
+        let mut bytes = std::fs::read(&sidecar).unwrap();
+        bytes[COMPACT_SIDECAR_HEADER_LEN] ^= 0xff;
+        std::fs::write(&sidecar, bytes).unwrap();
+        let checksum_repaired = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(checksum_repaired.source, MemoryLoadSource::Sqlite);
+
+        db.upsert_loose_item(&row(2, "b", [2; 32], 1).item).unwrap();
+        let stale_rebuilt = MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        assert_eq!(stale_rebuilt.source, MemoryLoadSource::Sqlite);
+        assert_eq!(stale_rebuilt.index.records.len(), 2);
+        assert_eq!(
+            MemoryIndex::load_cached(&db, &sidecar).unwrap().source,
+            MemoryLoadSource::Sidecar
+        );
+    }
+
+    #[test]
+    fn compact_sidecar_rejects_a_different_database_with_the_same_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = SimilarDb::db_path_at(temp.path());
+        let sidecar = compact_sidecar_path(temp.path());
+        {
+            let db = SimilarDb::open_at(&db_path).unwrap();
+            db.upsert_loose_item(&row(1, "old", [1; 32], 1).item)
+                .unwrap();
+            MemoryIndex::load_cached(&db, &sidecar).unwrap();
+        }
+        std::fs::remove_file(&db_path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", db_path.display(), suffix));
+        }
+        let replacement = SimilarDb::open_at(&db_path).unwrap();
+        replacement
+            .upsert_loose_item(&row(1, "new", [2; 32], 1).item)
+            .unwrap();
+        let loaded = MemoryIndex::load_cached(&replacement, &sidecar).unwrap();
+        assert_eq!(loaded.source, MemoryLoadSource::Sqlite);
+        assert_eq!(loaded.index.records.len(), 1);
+        assert_eq!(
+            query_test_rows(&loaded.index, &[row(1, "new", [2; 32], 1)], "old"),
+            ItemQuery::NotIndexed
+        );
+    }
+
+    #[test]
     fn enabling_a_favorite_starts_memory_load_before_any_panel_query() {
         let temp = tempfile::tempdir().unwrap();
-        SimilarDb::open_at(&SimilarDb::db_path_at(temp.path())).unwrap();
         let library = temp.path().join("library");
         std::fs::create_dir(&library).unwrap();
         let mut favorite = crate::settings::FavoriteEntry::new("library".to_owned(), library);
@@ -3278,6 +3756,67 @@ mod tests {
             *manager.memory.lock().unwrap(),
             MemoryState::Unloaded
         ));
+    }
+
+    #[test]
+    fn index_worker_open_also_starts_memory_load_without_a_panel_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+
+        // Manager::configure 側の eager 呼び出しを通さず、scheduler の実行開始だけを使う。
+        manager.scheduler.configure(
+            vec![library],
+            crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+            None,
+        );
+
+        for _ in 0..100 {
+            if !matches!(*manager.memory.lock().unwrap(), MemoryState::Unloaded) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("index worker DB open did not start the eager memory load");
+    }
+
+    #[test]
+    fn panel_query_during_a_run_does_not_start_the_eager_load() {
+        let manager = SimilarIndexManager::new(PathBuf::from("unused-test-data-dir"));
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        *manager.progress.lock().unwrap() = IndexProgress::Running(RunningProgress {
+            stage: IndexStage::Scanning,
+            current_path: None,
+            report: IndexReport::default(),
+        });
+
+        assert_eq!(
+            manager.query_item("c:/library/page.jpg").as_ref(),
+            &ItemQuery::Preparing
+        );
+        assert!(matches!(
+            *manager.memory.lock().unwrap(),
+            MemoryState::Unloaded
+        ));
+    }
+
+    #[test]
+    fn missing_store_remains_a_distinct_no_index_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SimilarIndexManager::new(temp.path().to_path_buf());
+        *manager.enabled_roots.write().unwrap() = vec!["c:/library".to_owned()];
+        assert_eq!(
+            manager.query_item("c:/library/page.jpg").as_ref(),
+            &ItemQuery::Preparing
+        );
+        for _ in 0..100 {
+            if manager.query_item("c:/library/page.jpg").as_ref() == &ItemQuery::NoIndex {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("missing store did not publish the typed NoIndex result");
     }
 
     #[cfg(windows)]

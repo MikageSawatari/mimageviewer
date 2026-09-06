@@ -276,8 +276,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `name_bulk_indexer.rs` | Ctrl+S 初期バルクスキャンの本体 |
 | `global_search.rs` | Ctrl+G streaming クエリワーカー (Searcher snapshot 固定 + ページング post-filter) |
 | `global_search_ui.rs` | Ctrl+G 検索バー + drill-down ビュー + Aggregated / DrilledInto 集約 |
-| `similar_image.rs` / `similar_index.rs` | 画像ファイル・ZIP ページ・PDF ページを共通 Proxy に変換する入口と、`auto_index_similar` が有効なお気に入りの差分照合・線形検索。対象変更と watcher 通知は単一 scheduler に coalesce し、UI スレッドでは I/O しない。常駐表は PDQ-256 + rowid と origin 探索用 64-bit key hash + rowid だけで、key hash 候補は SQLite の実 key と照合する。単体照会は worker で線形走査と origin / hit の point lookup を行い、origin key + memory epoch の 1 件 cache を再利用する。メモリ表は索引が利用可能になった時点で先行ロードする。走査中は Complete 済み snapshot を保持し、最後の pass が終わった時だけ破棄・再読込する。走査は全体 16・同一ドライブまたは UNC server/share 8 まで並列化し、操作中は既存 `ActivityGate` で 1 / 1、明示的一時停止中は 0 / 0 に落とす。本は 1 冊を同じ作業単位に保ち、全ページを新 generation へ書いてから Complete を原子的に公開する |
-| `similar_db.rs` | 別バージョン検索用 `similar.db`。PDQ-256、品質値、寸法・形式・保存場所を保持し、本のページは新 generation を作り終えてから Complete へ原子的に公開する |
+| `similar_image.rs` / `similar_index.rs` | 画像ファイル・ZIP ページ・PDF ページを共通 Proxy に変換する入口と、`auto_index_similar` が有効なお気に入りの差分照合・線形検索。対象変更と watcher 通知は単一 scheduler に coalesce し、UI スレッドでは I/O しない。常駐表は PDQ-256 + rowid + 固定 64-bit key hash だけで、key hash 候補は SQLite の実 key と照合する。この 44-byte/件の並びを `similar.compact` に派生 cache として保存し、DB store ID・内容世代・行数・hash/proxy version・本文 SHA-256 が全て一致するときだけ順次ロードする。単体照会は worker で線形走査と origin / hit の point lookup を行い、origin key + memory epoch の 1 件 cache を再利用する。メモリ表は索引が利用可能になった時点で先行ロードし、索引 worker の DB open 時にも開始を保証する。走査中は Complete 済み snapshot を保持し、最後の pass が終わった時だけ破棄・再読込する。走査は全体 16・同一ドライブまたは UNC server/share 8 まで並列化し、操作中は既存 `ActivityGate` で 1 / 1、明示的一時停止中は 0 / 0 に落とす。本は 1 冊を同じ作業単位に保ち、全ページを新 generation へ書いてから Complete を原子的に公開する |
+| `similar_db.rs` | 別バージョン検索用 `similar.db`。PDQ-256、品質値、寸法・形式・保存場所を保持し、本のページは新 generation を作り終えてから Complete へ原子的に公開する。検索可能な行集合の変更と同じ transaction で store 内容世代を進め、派生 sidecar の鮮度根拠にする |
 | `io_semaphore.rs` | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 (Low/Normal/High) |
 | `tags_db.rs` | `%APPDATA%/mimageviewer/tags.db`。`item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本。最初のタグ書き込み前に `tags.db.bak1..bak10` の世代バックアップをローテート。設定 ON 時だけ `mimageviewer.dat` に実ファイルタグをバックアップし、import 同期状態はタグ用に独立管理する |
 | `tag_ops.rs` | UI からのタグ操作ファサード。6 種の実パス item を対象に all-or-nothing 付与/削除を決め、worker へ投入 |
@@ -351,7 +351,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
-| `similar.db` | 別バージョン検索用。お気に入り単位で有効化し、PDQ-256、品質値、寸法・形式・保存場所と Complete な本 generation を保存する。ファイルの追加・変更・削除はアイテム索引と同じ favorite watcher から差分照合を要求する | `similar_db.rs` + `similar_index.rs` |
+| `similar.db` / `similar.compact` | 別バージョン検索用。`similar.db` が唯一の正本で、お気に入り単位で有効化した PDQ-256、品質値、寸法・形式・保存場所と Complete な本 generation を保存する。`similar.compact` は検索用 44-byte record の再生成可能な派生 cache で、欠損・短縮・破損・DB 世代不一致なら無視する。ファイルの追加・変更・削除はアイテム索引と同じ favorite watcher から差分照合を要求する | `similar_db.rs` + `similar_index.rs` |
 | `adjustment.db` | ページ個別補正 (`page_params`)、お気に入り標準補正 (`favorite_params`)、お気に入り別表示状態 (`favorite_view_states`)。表示状態の行は独自状態を持つこと自体を表し、既存テーブルを変更せず追加テーブルとして共存する | `adjustment_db.rs` || `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
 | `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |

@@ -1313,3 +1313,44 @@ hit の詳細も線形走査後の少数候補だけ SQLite から読む。問�
 索引が利用可能になった時点と、最終走査 pass の公開後に開始する。画像 / ZIP / PDF の遷移先は、
 問い合わせ worker が既存 DB key から一度だけ実在パスへ戻して cache 済み hit に保持する。
 対象が消失していれば正規化 key を fallback とする。この修正に DB 列追加や再索引はない。
+
+### 20.9 462 万件の派生 sidecar と eager load 境界 (2026-09-07 実測)
+
+20.8 と同じ 4,627,166 行の作業用 DB を `dev-runtime` profile で測定した。
+`similar.db` の全行を SQLite から decode して compact 表を作る経路と、同じ表を
+padding なし 44-byte record で保存した `similar.compact` の順次読込を分けた。
+
+| 経路 | ロード時間 | Working Set 増分 |
+| --- | ---: | ---: |
+| 20.8 の SQLite compact 表 | 4,081.1 ms | 243,421,184 bytes |
+| 今回の SQLite fallback（同一実装） | 5,559.9 ms | 225,095,680 bytes |
+| SQLite fallback + sidecar 初回生成 | 5,710.5 ms | 226,156,544 bytes |
+| **検証済み sidecar の順次読込** | **134.2 ms** | **224,018,432 bytes** |
+
+sidecar は 203,595,408 bytes（104-byte header + 4,627,166 × 44-byte record）だった。
+同じ実装の SQLite fallback との比較では約 5.43 秒、97.6% を除き、初回生成の追加費用は
+約 0.15 秒だった。したがって支配項は SQLite の全行 decode であり、sidecar 化がロード短縮の
+主因である。20.8 との差は測定揺れと常駐 record 配置変更を含むため、回帰判定には今回の
+5,559.9 ms と 134.2 ms を使う。
+
+`similar.compact` は正本ではない。header に sidecar format version、`hash_version`、
+`PROXY_VERSION`、行数、本文長、DB 固有の 16-byte store ID、検索内容 generation、本文
+SHA-256 を持つ。本文は `(PDQ-256, rowid, stable 64-bit key hash)` を key hash 順に並べる。
+完全長・record 順序・SHA-256・全 stamp が一致し、さらに読込前後で DB stamp が変わって
+いない場合だけ採用する。欠損、短縮、破損、別 DB、旧 hash/proxy version、世代不一致は
+全て SQLite snapshot へ fallback し、同じ世代が sidecar 書込完了まで維持された場合だけ
+一時ファイルを置換公開する。削除しても次回に再生成される。key hash は候補抽出だけに使い、
+候補の `item_key` を SQLite から読んで実値比較するため collision を別項目へ解決しない。
+
+内容 generation は、ルーズ画像 upsert、本 generation の Complete 公開、prune、favorite OFF
+purge と同じ transaction 内だけで進める。本の build/stage 中は進めず、Complete だけが検索・
+sidecar の対象になるため、container atomicity は変わらない。
+
+ロード開始時点もコード経路を確認した。通常起動では最初の `App::update` が
+`kick_off_startup_init` を呼び、起動 overlay を描く前に `similar_index.configure` が
+`similar-index-load` worker を開始する。索引が途中の状態でも同じであり、パネルを開くまで
+待ってはいなかった。ただし DB がまだ無い初回起動では configure 側の存在確認と索引 worker の
+DB 作成が競合し、`Missing` で終わる余地があった。存在確認をやめ、configure の worker が DB を
+開くようにし、さらに索引 worker の DB open 直後にも同じ eager load を冪等に要求する。
+索引実行中にパネルが `Unloaded` を見てもロードは開始せず「準備中」を返す回帰テストを置いた。
+この eager 修正は 134.2 ms という処理時間自体には寄与せず、開始時点を保証する変更である。
