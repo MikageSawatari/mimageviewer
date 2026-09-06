@@ -1449,8 +1449,40 @@ mIV には path-keyed ストアをファイル移動時に追随させる既存�
 
 ### 21.8 Step 5 実装記録 (2026-09-07)
 
-`similar.db` を schema version 2、`HASH_ALGORITHM_VERSION` を 2 へ上げ、旧 schema は
-移行せず再作成することにした。`item.item_id INTEGER PRIMARY KEY AUTOINCREMENT` と
+`similar.db` を schema version 2 へ上げ、**旧 schema は移行する**。`HASH_ALGORITHM_VERSION`
+は 1 のまま据え置く — Step 5 で `src/dupe/` は一行も変わっておらず、保存済みの PDQ 署名と
+`quality` の意味は v1 と同一だからである。当初は「索引は再生成可能」として作り直す実装に
+したが、実店 4,628,611 行の再デコードに約 11.6 時間かかる一方、v1 と v2 の差は `item` に
+`item_id` / `revision` が増えたことと `search_content_state` から未使用の `generation` が
+消えたことだけで、他の表は定義が一致する。同じ値を再計算する理由がないため移行を選んだ。
+**実店の複製で 4,628,611 行を 38.9 秒で移行**でき、全件が検索対象のまま `store_id` と
+`index_run` も引き継がれた。
+
+移行の判定は世代番号ではなく**形**で行う。旧 `init_schema` は `PRAGMA user_version` を
+書いておらず、実店を読むと 0 だった。新規ファイルも 0 なので番号では区別できない。
+`item` があって `item_id` を持たず、`search_content_state` も揃っている店だけを v1 と見なし、
+それ以外の読めない世代は従来どおり作り直す。移行は退避・作成・移送・世代更新を一つの
+transaction に入れ、中断しても v1 のまま残るか v2 へ移り切るかのどちらかにする。
+
+**書き込み transaction は DEFERRED を使わない。** WAL では、読み取りで始まった transaction が
+後から書こうとしたときに別の接続が書いていると、SQLite は待たずに SQLITE_BUSY を返す。
+`busy_timeout` はこの昇格を待てないので、「database is locked」がそのまま呼び出し側の失敗になる。
+Step 5 で配列更新 worker が履歴削除という 2 人目の writer になったため、索引 worker との間で
+この形が実際に踏めるようになった。`similar_db` の書き込み 8 経路と `init_schema` は
+IMMEDIATE で始め、読み取り 3 経路は DEFERRED のまま「ここで書くなら替えること」と注記した。
+8 スレッドが同じ店を 20 回ずつ同時に開いて書く回帰テストを置いた。修正前はこれが
+「database is locked」で落ち、修正後は 5 回連続で通る。
+
+`init_schema` は**世代が一致していれば書き込みロックを一切取らない**。以前は開くたびに
+`PRAGMA user_version = 2` を書いていたため、別々の接続でこの店を開く 4 つの経路
+(索引 worker / 配列更新 worker / パネル照会 / 集計) が、開くだけで互いに待っていた。
+
+`open_at` の `busy_timeout` を 180 秒にした。既定の 5 秒では 38.9 秒の移行を待ち切れず、
+その間に別 worker が開くと `init_schema` の DDL が書き込みロックを取れずに失敗する。開くのは
+常に worker なので、待っても UI は止まらない。移行後の書き込みはどれも短く、この時間が実際に
+使われるのは最初の一度だけになる。移行はファイル内の旧ページを解放するが OS へは返さないため、
+2.20 GB の店は 3.92 GB になる。解放分は索引の成長で再利用されるので VACUUM は行わない。
+`item.item_id INTEGER PRIMARY KEY AUTOINCREMENT` と
 `revision`、同一 transaction で書く `item_change` を正本とする。追加・更新だけでなく削除も
 履歴へ残し、コンテナは staging の Complete 公開 transaction でページ群と履歴を同時に確定する。
 旧 `rowid` ベースの `similar.compact` は起動 worker で破棄する。

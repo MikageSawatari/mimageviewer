@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const SCHEMA_VERSION: i64 = 2;
-pub const HASH_ALGORITHM_VERSION: u32 = 2;
+pub const HASH_ALGORITHM_VERSION: u32 = 1;
 
 pub const fn current_hash_version() -> i64 {
     hash_version(HASH_ALGORITHM_VERSION, crate::dupe::PROXY_VERSION)
@@ -188,17 +188,22 @@ impl SimilarDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        init_schema(&conn)?;
+        // 既定の 5 秒では v1 からの一括移行を待ち切れない。実店 4,628,611 行の移行は 38.9 秒
+        // かかり、その間に別 worker がこの店を開くと `init_schema` の DDL が書き込みロックを
+        // 取れずに失敗する。開くのは常に worker なので、待つことで UI は止まらない。移行後の
+        // 書き込みはどれも短いため、この時間が実際に使われるのは最初の一度だけになる。
+        conn.busy_timeout(std::time::Duration::from_secs(180))?;
+        init_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        init_schema(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        init_schema(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -215,7 +220,7 @@ impl SimilarDb {
     /// 前回停止時に公開されなかった世代だけを掃除する。
     pub fn cleanup_incomplete(&self) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let staged = transaction.execute("DELETE FROM item_build", [])?;
         transaction.execute("DELETE FROM container_build", [])?;
         let unpublished = load_items_for_container_state(&transaction, ScanState::Building)?;
@@ -312,7 +317,7 @@ impl SimilarDb {
     pub fn upsert_loose_item(&self, item: &StoredItem) -> rusqlite::Result<bool> {
         debug_assert!(item.container_key.is_none());
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let existing = load_item_raw(&transaction, &item.item_key)?;
         if existing.as_ref().is_some_and(|existing| {
             existing.item.container_key.is_none()
@@ -408,7 +413,7 @@ impl SimilarDb {
         file_size: i64,
     ) -> rusqlite::Result<u64> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let active_generation = transaction
             .query_row(
                 "SELECT generation FROM container WHERE container_key = ?1",
@@ -497,7 +502,7 @@ impl SimilarDb {
     /// staging 行数を確認し、公開世代を 1 transaction で置換する。
     pub fn complete_container(&self, container_key: &str, generation: u64) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let expected = building_page_count(&transaction, container_key, generation)?;
         let actual = transaction.query_row(
             "SELECT COUNT(*) FROM item_build WHERE container_key = ?1 AND generation = ?2",
@@ -547,7 +552,7 @@ impl SimilarDb {
     /// 失敗した新規 container は Failed として残す。再索引なら旧 Complete を保つ。
     pub fn fail_container(&self, container_key: &str, generation: u64) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         transaction.execute(
             "UPDATE container SET scan_state = ?3
              WHERE container_key = ?1 AND generation = ?2 AND scan_state = ?4",
@@ -632,6 +637,7 @@ impl SimilarDb {
     /// SQLite の一つの read snapshot から、不変 base とその適用済み change seq を作る。
     pub fn load_base_search_rows(&self, hash_version: i64) -> rusqlite::Result<BaseSearchRows> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 読み取り専用。ここで書くなら `write_transaction` に替えること。
         let transaction = conn.transaction()?;
         let store_id = search_store_id(&transaction)?;
         let applied_seq = latest_change_seq(&transaction)?;
@@ -691,6 +697,7 @@ impl SimilarDb {
 
     pub fn load_item_changes_after(&self, after_seq: u64) -> rusqlite::Result<ItemChangeBatch> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 読み取り専用。ここで書くなら `write_transaction` に替えること。
         let transaction = conn.transaction()?;
         let latest_seq = latest_change_seq(&transaction)?;
         let first_available_seq = transaction
@@ -734,6 +741,7 @@ impl SimilarDb {
         candidates: &[CandidateIdentity],
     ) -> rusqlite::Result<Option<VerifiedCandidates>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // 読み取り専用。ここで書くなら `write_transaction` に替えること。
         let transaction = conn.transaction()?;
         let Some(origin) = load_search_item_by_key(&transaction, item_key, hash_version)? else {
             transaction.commit()?;
@@ -765,7 +773,7 @@ impl SimilarDb {
         stats: CompletedIndexStats,
     ) -> rusqlite::Result<StoredIndexSummary> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let registered_items = transaction.query_row(
             "SELECT COUNT(*) FROM item i
              LEFT JOIN container c ON c.container_key = i.container_key
@@ -920,7 +928,7 @@ impl SimilarDb {
         seen_containers: &HashSet<String>,
     ) -> rusqlite::Result<usize> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let item_keys = {
             let mut statement = transaction.prepare("SELECT item_key FROM item")?;
             statement
@@ -970,7 +978,7 @@ impl SimilarDb {
         }
 
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let transaction = conn.transaction()?;
+        let transaction = write_transaction(&mut conn)?;
         let should_purge =
             |key: &str| key_is_under_any(key, purge_roots) && !key_is_under_any(key, keep_roots);
 
@@ -1412,10 +1420,103 @@ fn latest_change_seq(conn: &Connection) -> rusqlite::Result<u64> {
     i64_to_u64(seq, 0)
 }
 
-fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if user_version != SCHEMA_VERSION {
-        conn.execute_batch(
+/// Step 5 より前の店かどうかを、世代番号ではなく**形**で見る。
+///
+/// 旧 `init_schema` は `PRAGMA user_version` を一度も書いておらず、実店を読むと 0 だった。
+/// 新規ファイルも 0 なので番号では区別できない。v1 にしかない形 ——`item` はあるが `item_id`
+/// を持たない—— で判定し、`search_content_state` の同居も要求する。片方しかない店は v1 として
+/// 読まず、未知の世代と同じく作り直す。
+fn is_v1_layout(conn: &Connection) -> rusqlite::Result<bool> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    if !table_exists("item")? || !table_exists("search_content_state")? {
+        return Ok(false);
+    }
+    let has_item_id: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('item') WHERE name = 'item_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!has_item_id)
+}
+
+/// v1 の店を v2 へ移す。**署名は作り直さない。**
+///
+/// `dupe` は Step 5 で一行も変わっていないので、保存された PDQ 署名と `quality` の意味は
+/// v1 と同一である。v1 と v2 の違いは `item` が `item_id` と `revision` を得たことと、
+/// `search_content_state` が使わなくなった `generation` を落としたことだけで、他のテーブルは
+/// 定義が一致する。値が同じものを再デコードする理由はない (実店で約 11.6 時間かかる)。
+///
+/// 旧表をここで退避し、共通の CREATE が新しい形を作った後に [`copy_v1_rows_into_v2`] が
+/// 中身を移す。`ALTER TABLE ... RENAME` は索引を連れて行かないため、同名で作り直せるよう
+/// 旧索引を先に落とす。
+fn move_v1_tables_aside(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE item RENAME TO item_v1;
+         DROP INDEX IF EXISTS item_container_idx;
+         ALTER TABLE search_content_state RENAME TO search_content_state_v1;",
+    )
+}
+
+/// 退避した v1 の行を新しい表へ移し、旧表を捨てる。
+///
+/// `item_id` は AUTOINCREMENT が採番し、`revision` は 1 から始める。`item_change` は空のまま
+/// なので、最初の配列構築が SQLite から base を作り直す。`store_id` は引き継ぐ。
+fn copy_v1_rows_into_v2(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "INSERT INTO item (item_key, revision, kind, container_key, page_index, mtime,
+                           file_size, hash_version, pdq256, quality, width, height, format)
+           SELECT item_key, 1, kind, container_key, page_index, mtime,
+                  file_size, hash_version, pdq256, quality, width, height, format
+           FROM item_v1;
+         INSERT INTO search_content_state (singleton, store_id)
+           SELECT singleton, store_id FROM search_content_state_v1;
+         DROP TABLE item_v1;
+         DROP TABLE search_content_state_v1;",
+    )
+}
+
+/// 書き込みを行う transaction。**DEFERRED を使わない。**
+///
+/// WAL では、読み取りで始まった transaction が後から書こうとしたときに別の接続が書いていると、
+/// SQLite は待たずに SQLITE_BUSY を返す。`busy_timeout` はこの昇格を待てないので、
+/// 「database is locked」がそのまま呼び出し側の失敗になる。索引 worker と配列更新 worker は
+/// どちらもこの店へ書くため、書く側は最初から書き込みロックを取って順番に待つ。
+fn write_transaction(conn: &mut Connection) -> rusqlite::Result<Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
+fn stored_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+}
+
+fn init_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    // 定常状態では書き込みロックを一切取らない。索引 worker・配列更新 worker・パネル照会・
+    // 集計はそれぞれ別の接続でこの店を開くので、開くこと自体が writer になると互いに競合する。
+    if stored_schema_version(conn)? == SCHEMA_VERSION {
+        return Ok(());
+    }
+    // 作成と移行は writer なので、読んでから書きへ上げない。WAL の deferred transaction は
+    // 読み取り後に別の接続が書いていると SQLITE_BUSY を即返し、これは busy_timeout では
+    // 待てない (「database is locked」で開けなくなる)。最初から IMMEDIATE を取る。
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let user_version = stored_schema_version(&transaction)?;
+    if user_version == SCHEMA_VERSION {
+        // ロックを待っている間に、別の接続が作成か移行を終えていた。
+        return transaction.commit();
+    }
+    // 中断しても v1 のまま残るか v2 へ移り切るかのどちらかになるよう、退避・作成・移送・
+    // user_version の更新を一つの transaction に入れる。
+    let migrating_v1 = user_version == 0 && is_v1_layout(&transaction)?;
+    if migrating_v1 {
+        move_v1_tables_aside(&transaction)?;
+    } else if user_version != SCHEMA_VERSION {
+        transaction.execute_batch(
             "DROP TABLE IF EXISTS item_change;
              DROP TABLE IF EXISTS item_build;
              DROP TABLE IF EXISTS item_prefill;
@@ -1426,7 +1527,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS search_content_state;",
         )?;
     }
-    conn.execute_batch(
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS item (
            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
            item_key TEXT NOT NULL UNIQUE,
@@ -1516,13 +1617,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          );
          PRAGMA user_version = 2;",
     )?;
+    if migrating_v1 {
+        copy_v1_rows_into_v2(&transaction)?;
+    }
     let store_id = *uuid::Uuid::new_v4().as_bytes();
-    conn.execute(
+    transaction.execute(
         "INSERT OR IGNORE INTO search_content_state (singleton, store_id)
          VALUES (1, ?1)",
         [store_id.as_slice()],
     )?;
-    Ok(())
+    transaction.commit()
 }
 
 #[cfg(test)]
@@ -1544,6 +1648,240 @@ mod tests {
             height: 80,
             format: 1,
         }
+    }
+
+    /// Step 5 より前の店を作る。移行が「同じ値を運べたか」を問えるように、DDL は当時のまま
+    /// 書き写す。ここを現在の定義から生成すると、移行が壊れても気付けない。
+    ///
+    /// `PRAGMA user_version` を**設定しない**のが要点。旧 `init_schema` は書いておらず、
+    /// 実店 (4,628,611 行) を読んでも 0 だった。世代番号で移行を選ぶと、この店は新規ファイル
+    /// と区別されずに捨てられる。
+    fn create_v1_store(path: &std::path::Path, store_id: [u8; 16]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE item (
+               item_key TEXT PRIMARY KEY,
+               kind INTEGER NOT NULL,
+               container_key TEXT,
+               page_index INTEGER,
+               mtime INTEGER NOT NULL,
+               file_size INTEGER NOT NULL,
+               hash_version INTEGER NOT NULL,
+               pdq256 BLOB NOT NULL CHECK(length(pdq256) = 32),
+               quality INTEGER NOT NULL,
+               width INTEGER NOT NULL,
+               height INTEGER NOT NULL,
+               format INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS item_container_idx ON item(container_key, page_index);
+             CREATE TABLE container (
+               container_key TEXT PRIMARY KEY,
+               kind INTEGER NOT NULL,
+               page_count INTEGER,
+               scan_state INTEGER NOT NULL,
+               generation INTEGER NOT NULL,
+               mtime INTEGER NOT NULL,
+               file_size INTEGER NOT NULL
+             );
+             CREATE TABLE search_content_state (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+               store_id BLOB NOT NULL CHECK(length(store_id) = 16),
+               generation INTEGER NOT NULL CHECK(generation >= 0)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO search_content_state (singleton, store_id, generation) VALUES (1, ?1, 7)",
+            [store_id.as_slice()],
+        )
+        .unwrap();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO item (item_key, kind, container_key, page_index, mtime, file_size,
+                                   hash_version, pdq256, quality, width, height, format)
+                 VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .unwrap();
+        for (key, marker, quality) in [("a", 0x11u8, 40i64), ("b", 0x22, 60)] {
+            insert
+                .execute(params![
+                    key,
+                    ItemKind::Image as i64,
+                    10i64,
+                    20i64,
+                    current_hash_version(),
+                    [marker; 32].as_slice(),
+                    quality,
+                    100i64,
+                    80i64,
+                    1i64
+                ])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn v1_store_keeps_its_signatures_instead_of_rehashing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let store_id = [0x5au8; 16];
+        create_v1_store(&path, store_id);
+
+        let db = SimilarDb::open_at(&path).unwrap();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+
+        // 再デコードしていたら署名は同じでも「移行できた」ことにならないので、行が残って
+        // いること自体を先に確かめる。索引ジョブはこのテストでは一度も走っていない。
+        assert_eq!(base.records.len(), 2);
+        let signatures = base
+            .records
+            .iter()
+            .map(|record| record.signature[0])
+            .collect::<Vec<_>>();
+        assert_eq!(signatures, vec![0x11, 0x22]);
+        assert_eq!(
+            base.records.iter().map(|r| r.quality).collect::<Vec<_>>(),
+            vec![40, 60]
+        );
+        // item_id は採番され、重複しない。revision は 1 から始まる。
+        assert_eq!(
+            base.records.iter().map(|r| r.item_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(base.records.iter().all(|record| record.revision == 1));
+        assert_eq!(base.store_id, store_id);
+        assert_eq!(base.applied_seq, 0);
+
+        let key_a = db.load_item("a", current_hash_version()).unwrap().unwrap();
+        assert_eq!(key_a.item.pdq256, [0x11; 32]);
+        assert_eq!(key_a.item.width, 100);
+    }
+
+    /// v2 の店を開き直したときに作り直されないこと。ここが逆になると、起動のたびに索引が
+    /// 消える。`is_v1_layout` は形で判定するので、番号の一致だけに頼らず両方を確かめる。
+    #[test]
+    fn reopening_a_v2_store_keeps_its_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        {
+            let db = SimilarDb::open_at(&path).unwrap();
+            db.upsert_loose_item(&item("kept", None, None, 9)).unwrap();
+        }
+        let db = SimilarDb::open_at(&path).unwrap();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        assert_eq!(base.records.len(), 1);
+        assert_eq!(base.records[0].signature, [9; 32]);
+    }
+
+    /// 一括移行を待てる時間が実際に設定されていること。既定の 5 秒に戻ると、移行中に別 worker
+    /// が開いた瞬間に「database is locked」で落ちる。
+    #[test]
+    fn a_bulk_migration_can_be_waited_out_by_another_opener() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        let db = SimilarDb::open_at(&path).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            timeout_ms >= 120_000,
+            "busy_timeout {timeout_ms} ms is shorter than a measured 38.9 s migration"
+        );
+    }
+
+    /// 同じ店を複数の worker が同時に開いても失敗しないこと。
+    ///
+    /// 索引 worker・配列更新 worker・パネル照会・集計はそれぞれ別の接続でこの店を開く。
+    /// どれか一つでも開けないと、その経路は結果を返せずに諦める。
+    #[test]
+    fn opening_the_same_store_from_many_workers_at_once_never_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        SimilarDb::open_at(&path).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let failures = std::sync::Arc::clone(&failures);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    match SimilarDb::open_at(&path) {
+                        Ok(db) => {
+                            db.upsert_loose_item(&item("k", None, None, 1)).unwrap();
+                        }
+                        Err(error) => {
+                            eprintln!("open failed: {error}");
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// 実店の複製に対して移行を通す手動確認。`MIV_SIMILAR_V1_COPY` に **複製の** パスを渡す。
+    /// 元の店を指さないこと。移行はその場でファイルを書き換える。
+    #[test]
+    #[ignore = "manual migration check against a caller-supplied copy of a real v1 store"]
+    fn migrate_a_real_v1_store_copy() {
+        let path = std::path::PathBuf::from(
+            std::env::var("MIV_SIMILAR_V1_COPY").expect("MIV_SIMILAR_V1_COPY"),
+        );
+        let before =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let expected_rows: i64 = before
+            .query_row("SELECT COUNT(*) FROM item", [], |row| row.get(0))
+            .unwrap();
+        let sample: (String, Vec<u8>, i64) = before
+            .query_row(
+                "SELECT item_key, pdq256, quality FROM item ORDER BY item_key LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        drop(before);
+
+        let started = std::time::Instant::now();
+        let db = SimilarDb::open_at(&path).unwrap();
+        let elapsed = started.elapsed();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        println!(
+            "migrated {expected_rows} rows in {:.1}s, {} searchable",
+            elapsed.as_secs_f64(),
+            base.records.len()
+        );
+
+        let migrated = db
+            .load_item(&sample.0, current_hash_version())
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.item.pdq256.as_slice(), sample.1.as_slice());
+        assert_eq!(migrated.item.quality as i64, sample.2);
+        assert_eq!(migrated.revision, 1);
+    }
+
+    /// 読めない世代は移行せず作り直す。v1 の移行を足したことで、この経路が消えていないこと。
+    #[test]
+    fn an_unknown_schema_generation_is_still_rebuilt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("similar.db");
+        create_v1_store(&path, [0x5a; 16]);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        drop(conn);
+
+        let db = SimilarDb::open_at(&path).unwrap();
+        let base = db.load_base_search_rows(current_hash_version()).unwrap();
+        assert!(base.records.is_empty());
     }
 
     #[test]
