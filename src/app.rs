@@ -11700,8 +11700,8 @@ pub struct App {
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
     pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
-    /// 通常動画の拡大・パン。360 と違いセッション意図は持たず、項目や表示コンテキストが
-    /// 変わるたびに `None` へ戻す。
+    /// mount 中の viewer context が所有する通常動画の拡大・パン state の投影。
+    /// 360 と違いセッション意図は持たず、項目が変わるたびに `None` へ戻す。
     pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 度パノラマビュー: フルスクリーンを閉じても持ち越すセッションの意図
     /// (backlog §1.145)。`panorama_state` は `close_fullscreen` で捨てるので、

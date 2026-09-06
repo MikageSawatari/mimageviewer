@@ -1459,6 +1459,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-07 v3.6.0 レビュー G1: 通常動画ズームを既存 viewer context 所有境界へ接続した
+（本 brief の指定する構造修正として実施。Codex は着手前に §2 を読み、静止画シークと同型の
+bundle 欠落を埋める BA-7 修正と判断。実装後の ClaudeCode 検収・実機確認は未実施）:**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `video_zoom_state: Option<VideoZoomState>` を追加。`None` 初期化、完全
+destructure、既存 mount / swap、main grid を残す分割の move 対象へ載せた。項目変更と close は
+mount 中の context の state だけを reset し、別 context の値は bundle に残る。
+[src/app.rs](../src/app.rs) の同名 field は mount 中の投影であり、独立した global owner ではない。
+
+**判断理由**: 通常動画の倍率・中心は項目固有なのに、定期更新が各 context を一時 mount して
+`poll_video` / presenter 同期を行う境界の外にあった。新しい窓種別 guard、detached 述語、待ち時間、
+repaint、bool を足さず、既に fullscreen item / player / panorama state を交換している単一の owner へ
+載せる。state と presenter command は値 snapshot であり `Arc` projection を持たないため、分割した
+context 同士も同じ可変 projection を共有しない。A/B の往復 mount、片方の項目 reset / close、元
+context の復元、分割後の値独立を production registry の回帰テストで固定する。
+
 **2026-09-06〜07 v3.6.0 レビュー F1 / F2: 静止画シークの要求とジェスチャを既存 context
 所有境界へ接続した（本 brief の指定する構造修正として実施。Codex は着手前に §2 を読み、
 隣接する交換対象からの欠落を埋める BA-7 修正と判断。実装後の ClaudeCode 検収・実機確認は未実施）:**

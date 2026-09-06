@@ -843,6 +843,9 @@ pub(in crate::app) struct ViewerContextBundle {
     )>,
     video_audio_exit_pending: Option<VideoAudioExitPending>,
     panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
+    /// context を mount した間だけ App field へ投影する。
+    video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
     /// 360 で見ているという意図 (+ 選んだ投影方式)。フルスクリーンを閉じても残る
     /// ので、App グローバルに置くと別ウィンドウの 360 が混ざる (backlog §1.145)。
     panorama_intent: crate::panorama::PanoramaSessionIntent,
@@ -1414,6 +1417,7 @@ impl ViewerContextBundle {
             video_audio_mode_entry_target: None,
             video_audio_exit_pending: None,
             panorama_state: None,
+            video_zoom_state: None,
             panorama_intent: crate::panorama::PanoramaSessionIntent::default(),
             fs_info_panel: crate::ui_helpers::FullscreenInfoPanelState::default(),
             pano_toast_shown_for_current_fs: false,
@@ -1751,6 +1755,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2000,6 +2005,7 @@ impl App {
         swap_field!(video_audio_mode_entry_target);
         swap_field!(video_audio_exit_pending);
         swap_field!(panorama_state);
+        swap_field!(video_zoom_state);
         swap_field!(panorama_intent);
         swap_field!(fs_info_panel);
         swap_field!(pano_toast_shown_for_current_fs);
@@ -2286,6 +2292,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             panorama_intent,
             fs_info_panel,
             pano_toast_shown_for_current_fs,
@@ -2501,6 +2508,7 @@ impl App {
             video_audio_mode_entry_target,
             video_audio_exit_pending,
             panorama_state,
+            video_zoom_state,
             // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、
             // その viewer がページを移ったときに復帰するのも同じ側 (backlog §1.145)。
             panorama_intent,
@@ -3368,6 +3376,150 @@ mod tests {
             layout_center_pos: center,
             page_pos_at_commit: 3,
         }
+    }
+
+    #[cfg(windows)]
+    fn video_zoom_state(
+        wheel_notches: f32,
+        drag: [f32; 2],
+    ) -> crate::video::zoom_view::VideoZoomState {
+        let source = crate::video::zoom_view::VideoZoomSourceGeometry::new(
+            1920,
+            1080,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+        );
+        let region = [1920.0, 1080.0];
+        let mut state = crate::video::zoom_view::VideoZoomState::new();
+        assert!(state.apply_wheel(
+            wheel_notches * 120.0,
+            [region[0] * 0.5, region[1] * 0.5],
+            region,
+            source,
+        ));
+        assert!(state.apply_drag(drag, region, source));
+        state
+    }
+
+    #[cfg(windows)]
+    fn two_video_zoom_contexts() -> (
+        crate::app::AppTestEnvForTest,
+        ViewerContextId,
+        ViewerContextId,
+        crate::video::zoom_view::VideoZoomState,
+        crate::video::zoom_view::VideoZoomState,
+    ) {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_b = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(711, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let b = app.build_window_context_for_test(712, |app| {
+            app.fullscreen_idx = Some(7);
+            app.video_zoom_state = Some(state_b);
+        });
+        (app, a, b, state_a, state_b)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_fresh_context_starts_empty() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let mut app = crate::app::setup_app_for_test();
+        let _a = app.build_window_context_for_test(710, |app| {
+            app.fullscreen_idx = Some(3);
+            app.video_zoom_state = Some(state_a);
+        });
+        let _b = app.build_window_context_for_test(711, |app| {
+            assert_eq!(
+                app.video_zoom_state, None,
+                "a fresh context must not inherit A's video zoom"
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_survives_exchange_and_return() {
+        let (mut app, a, b, state_a, state_b) = two_video_zoom_contexts();
+
+        for _ in 0..2 {
+            app.with_viewer_context(a, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_a));
+            })
+            .unwrap();
+            app.with_viewer_context(b, |app| {
+                assert_eq!(app.video_zoom_state, Some(state_b));
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_item_reset_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.with_viewer_context(b, |app| {
+            app.video_zoom_state = None;
+        })
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "B's item-change reset must not clear A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_close_only_changes_its_owner() {
+        let (mut app, a, b, state_a, _) = two_video_zoom_contexts();
+        app.close_and_retire_context(
+            b,
+            "video_zoom_test_close",
+            |app| {
+                app.close_fullscreen();
+            },
+            |_| (),
+        )
+        .unwrap();
+        app.with_viewer_context(a, |app| {
+            assert_eq!(
+                app.video_zoom_state,
+                Some(state_a),
+                "closing B must not reset A"
+            );
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_video_zoom_split_moves_an_independent_value() {
+        let state_a = video_zoom_state(4.0, [-240.0, 80.0]);
+        let state_main = video_zoom_state(7.0, [320.0, -120.0]);
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(3);
+        app.video_zoom_state = Some(state_a);
+
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(app.video_zoom_state, None);
+        app.video_zoom_state = Some(state_main);
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_a));
+        app.video_zoom_state = None;
+
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, Some(state_main));
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.video_zoom_state, None);
     }
 
     #[cfg(windows)]

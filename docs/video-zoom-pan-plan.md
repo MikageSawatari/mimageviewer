@@ -42,13 +42,19 @@ GPU、`App`、Win32 に依存しない `src/video/zoom_view.rs` を置く。
   中心を移す。
 - extent が source 以上の軸は常に中央へ戻す。拡大軸は source 矩形が画像から完全に外れない
   （少なくとも source の 1 pixel 幅が残る）範囲へ中心を clamp する。
+- clamp の正本は `source_rect()` とする。入力時にも同じ resolver の結果を state へ戻して端での
+  反転ヒステリシスを防ぐが、保存済み中心を信用せず、表示領域が変わるたびに矩形生成時点の extent で
+  再度 clamp する。
 
 単体テストは、wheel の固定点不変、pan clamp の両端、横・縦レターボックスの fit 矩形、
 SAR / 軸入替、scale 上下限を固定する。
 
 ## 3. App と入力の所有境界
 
-`App` に `video_zoom_state: Option<VideoZoomState>` を `panorama_state` の隣へ置く。
+`ViewerContextBundle` に `video_zoom_state: Option<VideoZoomState>` を `panorama_state` の隣へ置く。
+`App::video_zoom_state` は現在 mount 中の context の投影であり、独立した global owner ではない。
+既存 bundle の mount / swap / close と、main grid を残す分割の move 対象に含める。値型なので
+分割後の context 間で可変 projection を共有しない。
 `src/app/native_video.rs` では現在の `native_video_panorama_input_active` から
 「対象 `fs_idx` がフルスクリーン / 動画音声モードではない / 同じ項目の音楽 VST シェルではない」
 という共通 base predicate を 1 個だけ抽出する。360 と zoom の述語は、この答えに各 active

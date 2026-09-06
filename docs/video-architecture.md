@@ -51,7 +51,8 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 設計正本は [video-zoom-pan-plan.md](video-zoom-pan-plan.md)。このモードも native presenter の
 表示解像度 scaling を使い、倍率変更は swap chain resize ではなく draw 定数だけを更新する。
 
-通常動画の拡大状態は `App::video_zoom_state` が項目単位で所有し、
+通常動画の拡大状態は `ViewerContextBundle::video_zoom_state` が viewer context / 項目単位で所有する。
+`App::video_zoom_state` は mount 中の context の投影であり、
 `VideoPlayer::set_native_video_zoom_state` → `SetVideoZoomState` の typed command で render thread の
 `NativeRenderCore::video_zoom_state` へ値 snapshot を渡す。render core は frame の source 寸法、SAR、
 orientation と現在の video target 寸法から、向き補正後 source 座標の origin / extent を draw ごとに
