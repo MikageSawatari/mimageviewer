@@ -1304,6 +1304,14 @@ click だけが従来のページ着地を行う。実際の現在ページが�
 破棄して新しい `current_pos` へ戻す一方、現在ページの強調は帯の中央とは独立して常に実際の
 `fs_idx` を指すため、帯の表示範囲外なら強調セルは出ない。ページシーク行の上ドラッグは動画と
 共有する `SeekRowGesture` を引き続き使い、通常バー本体の横ドラッグによるページシークは変えない。
+
+`StillSeekGesture` 全体（進行中の操作と `StripCommitted` の確定中心）は
+`ViewerContextBundle` に属する。App 上の field は mount 中の context の投影で、
+context の交換・復帰は同じ値を退避・復元する。main grid と viewer の分割では viewer 側へ移す。
+context の pause は進行中の Track / Strip だけを中断し、確定中心を残す。
+fullscreen の close はその context の状態を Idle にし、retire は bundle ごと破棄する。
+別窓の現在ページや close によって他の context の中心を消してはならない。
+
 通常の左右カーソルキーによるページ移動は
 `fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、

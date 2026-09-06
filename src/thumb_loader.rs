@@ -48,6 +48,20 @@ pub fn thumbnail_request_in_keep(
     (idx >= keep_start && idx < keep_end) || (priority && still_seek_exact)
 }
 
+/// Read the owning context's live projection at every worker cancellation checkpoint.
+pub(crate) fn thumbnail_request_in_current_keep(
+    req: &LoadRequest,
+    still_seek_pages: Option<&std::sync::RwLock<std::collections::HashSet<usize>>>,
+    keep_start: usize,
+    keep_end: usize,
+) -> bool {
+    let exact = req.priority
+        && still_seek_pages
+            .and_then(|shared| shared.read().ok())
+            .is_some_and(|pages| pages.contains(&req.idx));
+    thumbnail_request_in_keep(req.priority, exact, req.idx, keep_start, keep_end)
+}
+
 // -----------------------------------------------------------------------
 // キャッシュキー定数 (app.rs / ベンチマーク bin から参照)
 // -----------------------------------------------------------------------
@@ -1406,11 +1420,12 @@ pub fn process_load_request(
     if needs_heavy_io {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        let still_seek_exact = req.priority
-            && still_seek_thumbnail_pages
-                .and_then(|shared| shared.read().ok())
-                .is_some_and(|pages| pages.contains(&req.idx));
-        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
+        if !thumbnail_request_in_current_keep(
+            req,
+            still_seek_thumbnail_pages.map(AsRef::as_ref),
+            ks,
+            ke,
+        ) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (after I/O resolve)  {}",
                 req.idx,
@@ -1538,11 +1553,12 @@ pub fn process_load_request(
     if req.pdf_page.is_some() && req.source_policy.allows_cache() {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
-        let still_seek_exact = req.priority
-            && still_seek_thumbnail_pages
-                .and_then(|shared| shared.read().ok())
-                .is_some_and(|pages| pages.contains(&req.idx));
-        if !thumbnail_request_in_keep(req.priority, still_seek_exact, req.idx, ks, ke) {
+        if !thumbnail_request_in_current_keep(
+            req,
+            still_seek_thumbnail_pages.map(AsRef::as_ref),
+            ks,
+            ke,
+        ) {
             crate::logger::log(format!(
                 "    idx={:>4} STALE (pdf before render)  {}",
                 req.idx,

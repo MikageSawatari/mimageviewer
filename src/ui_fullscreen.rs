@@ -3566,7 +3566,9 @@ struct StillSeekTrackInteraction {
 /// keeps one immutable press snapshot plus the live layout center, matching the video strip's
 /// drag ownership. A committed strip center remains here after release; it is discarded when the
 /// actual page changes. The response handler owns press, move, and release; page-position sync and
-/// fullscreen teardown are the only reset paths outside it.
+/// context suspension / fullscreen teardown own interruption outside it. The mounted viewer
+/// context owns this value through ViewerContextBundle; suspending that context interrupts
+/// only a live pointer gesture and retains its committed center.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) enum StillSeekGesture {
     #[default]
@@ -3585,6 +3587,13 @@ pub(crate) enum StillSeekGesture {
 }
 
 impl StillSeekGesture {
+    #[cfg(windows)]
+    pub(crate) fn interrupt(&mut self) {
+        if matches!(self, Self::Track(_) | Self::Strip { .. }) {
+            *self = Self::Idle;
+        }
+    }
+
     fn strip_layout_center(self, current_pos: usize) -> usize {
         match self {
             Self::Strip {
@@ -54087,6 +54096,234 @@ mod tests {
             gesture.update(egui::pos2(240.0, 96.0)),
             crate::video::seek_strip::SeekRowDecision::Scrub,
             "the held second frame must continue the same scrub"
+        );
+    }
+
+    // Exercise the production overlay, enqueue, landing and worker checkpoint together.
+    // The queue has no consumer thread, so we can deterministically pause a real request
+    // across the landing instead of depending on ZIP/PDF I/O timing.
+    fn prepare_still_seek_request_lifetime_app(app: &mut crate::app::App, kind: &str) {
+        app.items = (0..6_000)
+            .map(|idx| match kind {
+                "zip" => GridItem::ZipImage {
+                    zip_path: PathBuf::from("c:/seek/book.zip"),
+                    entry_name: format!("page-{idx}.png"),
+                },
+                "pdf" => GridItem::PdfPage {
+                    pdf_path: PathBuf::from("c:/seek/book.pdf"),
+                    page_num: idx as u32,
+                    content_type: None,
+                },
+                _ => GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))),
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![Some((0, 0)); app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.fullscreen_idx = Some(3);
+        app.selected = Some(3);
+        app.keep_range = (2, 8);
+        app.keep_start_shared
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        app.keep_end_shared
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        app.reload_queue = Some(std::sync::Arc::new((
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::Condvar::new(),
+        )));
+        app.settings.set_still_seek_strip_visible(true);
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Always;
+    }
+
+    fn still_seek_request_overlay_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        land: bool,
+    ) -> Option<usize> {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut target = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let current = app.fullscreen_idx.unwrap();
+                    target = app.draw_fullscreen_seek_overlay(ui, ctx, rect, current, false, false);
+                    if land && let Some(target) = target {
+                        app.land_still_page_navigation_target(
+                            ctx,
+                            current,
+                            target,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                            &mut None,
+                        );
+                    }
+                });
+            },
+        );
+        target
+    }
+
+    fn assert_still_seek_overlay_landing_request_lifetime(
+        kind: &str,
+        flow: ReadingFlow,
+        spread: SpreadMode,
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, kind);
+        app.reading_flow = flow;
+        app.spread_mode = spread;
+        let pointer = egui::pos2(480.0, 581.0);
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pointer)],
+            false,
+        );
+        let before = app.still_seek_thumbnail_pages.clone();
+        assert!(
+            before.iter().any(|idx| *idx < 8),
+            "the production strip must request nearby pages"
+        );
+        let remote = *before
+            .iter()
+            .filter(|idx| **idx > 1000)
+            .max()
+            .expect("production hover preview must request a remote page");
+        let queue = app.reload_queue.as_ref().unwrap().clone();
+        let request = {
+            let mut requests = queue.0.lock().unwrap();
+            let position = requests.iter().position(|req| req.idx == remote).unwrap();
+            requests.remove(position)
+        };
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        let worker_accepts = || {
+            crate::thumb_loader::thumbnail_request_in_current_keep(&request, Some(&shared), 2, 8)
+        };
+        assert!(worker_accepts());
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        let landed = still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        )
+        .expect("the production track click must return a landing target");
+        assert_eq!(app.fullscreen_idx, Some(landed));
+        assert_eq!(
+            app.still_seek_thumbnail_pages, before,
+            "landing must retain this frame's strip and preview requests"
+        );
+        assert!(
+            worker_accepts(),
+            "the same in-flight request must survive a post-I/O checkpoint"
+        );
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            worker_accepts(),
+            "next overlay frame must keep the current preview"
+        );
+        // Moving the pointer replaces the projection, ending only the obsolete preview.
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(250.0, 581.0))],
+            false,
+        );
+        // Hide also removes the strip pages, including the page we just landed on.
+        app.analysis_mode = true;
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            !worker_accepts(),
+            "the overlay owns the end of its requirements"
+        );
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_paged_landing() {
+        for kind in ["image", "zip", "pdf"] {
+            for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                assert_still_seek_overlay_landing_request_lifetime(
+                    kind,
+                    ReadingFlow::Paged,
+                    spread,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_continuous_landing() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for kind in ["image", "zip", "pdf"] {
+                for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                    assert_still_seek_overlay_landing_request_lifetime(kind, flow, spread);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_items_generation_change() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(480.0, 581.0))],
+            false,
+        );
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        app.bump_items_generation();
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(shared.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_container_replacement() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        app.current_folder = Some(PathBuf::from("c:/another-book"));
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/another-book/1.png"))],
+            vec![None],
+        );
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(
+            app.still_seek_thumbnail_pages_shared
+                .read()
+                .unwrap()
+                .is_empty()
         );
     }
 

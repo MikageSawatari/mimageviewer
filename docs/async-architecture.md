@@ -557,6 +557,16 @@ diffusion fallback を UI へ通知する。UI は pending が存在する間だ
 projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
 間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
 
+この集合の更新者は overlay で、各描画フレームに列と preview の要求を置換する。
+同じ items 世代内のページ着地は集合を終了しない。単ページ / 見開きの通常着地と
+縦 / 横連結読みは同じ寿命を持つ。全消去は overlay の非表示、fullscreen 終了、
+idx 空間の無効化、および `set_items_generation` での世代変更に限定する。
+コンテナ差し替えも `install_new_items` の世代更新で旧集合を失効させる。
+通常 worker の pop 後、heavy I/O 後、PDF レンダ前は、いずれも
+`thumbnail_request_in_current_keep` で実要求と現在の共有集合を照合する。
+集合と worker 可視 projection は viewer context ごとに所有し、mount では一緒に交換、
+fork では独立した `RwLock` へ複製する。別 context の置換・失効・close は兄弟の集合に届かない。
+
 **なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
 DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
 cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、

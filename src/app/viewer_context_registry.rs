@@ -918,6 +918,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     fs_vertical_scroll: f32,
     fs_seek_drag_active: bool,
+    fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
     fs_seek_overlay_visible: bool,
     fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
@@ -1283,6 +1284,12 @@ const _: () = {
 #[cfg(windows)]
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
+        if self.items_generation != items_generation {
+            self.still_seek_thumbnail_pages.clear();
+            if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+                shared.clear();
+            }
+        }
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
@@ -1461,6 +1468,7 @@ impl ViewerContextBundle {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
+            fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             continuous_page_transitions: std::collections::HashMap::new(),
@@ -1550,6 +1558,7 @@ impl App {
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_gesture.interrupt();
         self.fs_seek_overlay_visible = false;
         self.pending_auto_fs_open = false;
         self.pending_return_to_parent = false;
@@ -1796,6 +1805,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -2045,6 +2055,7 @@ impl App {
         swap_field!(fs_pan_drag_start);
         swap_field!(fs_vertical_scroll);
         swap_field!(fs_seek_drag_active);
+        swap_field!(fs_seek_gesture);
         swap_field!(fs_seek_overlay_visible);
         swap_field!(fs_vertical_cache_keep_set);
         swap_field!(continuous_page_transitions);
@@ -2329,6 +2340,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -2410,6 +2422,12 @@ impl App {
         } = parked.as_mut();
 
         // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
+        // A fork copies the requirement values, never the mutable worker projection.
+        // Otherwise the new overlay (or its generation invalidation) cancels main's work.
+        *still_seek_thumbnail_pages_shared = Arc::new(std::sync::RwLock::new(
+            self.still_seek_thumbnail_pages.clone(),
+        ));
+
         duplicate_for_parked!(
             address,
             current_folder,
@@ -2439,7 +2457,6 @@ impl App {
             keep_range,
             keep_set,
             still_seek_thumbnail_pages,
-            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_order,
             details_order_revision,
@@ -2517,6 +2534,7 @@ impl App {
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
+            fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
             continuous_page_transitions,
@@ -3343,6 +3361,170 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn still_seek_committed_center(center: usize) -> crate::ui_fullscreen::StillSeekGesture {
+        crate::ui_fullscreen::StillSeekGesture::StripCommitted {
+            layout_center_pos: center,
+            page_pos_at_commit: 3,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_centers_survive_mount_and_close() {
+        use crate::ui_fullscreen::StillSeekGesture;
+        for b_page in [3, 7] {
+            let mut app = crate::app::setup_app_for_test();
+            let a = app.build_window_context_for_test(701, |app| {
+                app.fullscreen_idx = Some(3);
+                app.fs_seek_gesture = still_seek_committed_center(120);
+            });
+            let b = app.build_window_context_for_test(702, |app| {
+                app.fullscreen_idx = Some(b_page);
+                assert_eq!(
+                    app.fs_seek_gesture,
+                    StillSeekGesture::Idle,
+                    "a fresh context must not inherit A's center"
+                );
+                app.fs_seek_gesture = StillSeekGesture::StripCommitted {
+                    layout_center_pos: 440,
+                    page_pos_at_commit: b_page,
+                };
+            });
+            for _ in 0..2 {
+                app.with_viewer_context(a, |app| {
+                    assert_eq!(app.fs_seek_gesture, still_seek_committed_center(120));
+                })
+                .unwrap();
+                app.with_viewer_context(b, |app| {
+                    assert_eq!(
+                        app.fs_seek_gesture,
+                        StillSeekGesture::StripCommitted {
+                            layout_center_pos: 440,
+                            page_pos_at_commit: b_page
+                        }
+                    );
+                })
+                .unwrap();
+            }
+            app.close_and_retire_context(
+                b,
+                "still_seek_test_close",
+                |app| {
+                    app.close_fullscreen();
+                },
+                |_| (),
+            )
+            .unwrap();
+            app.with_viewer_context(a, |app| {
+                assert_eq!(
+                    app.fs_seek_gesture,
+                    still_seek_committed_center(120),
+                    "closing B must not reset A"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_pause_ends_only_its_active_gesture() {
+        let mut app = crate::app::setup_app_for_test();
+        let a = app.build_window_context_for_test(703, |app| {
+            app.fs_seek_gesture = still_seek_committed_center(120);
+        });
+        let b = app.build_window_context_for_test(704, |app| {
+            app.fs_seek_gesture = crate::ui_fullscreen::StillSeekGesture::Strip {
+                origin_center_pos: 3,
+                origin_pointer_x: 100.0,
+                layout_center_pos: 440,
+                page_pos_at_origin: 3,
+            };
+            app.fs_seek_drag_active = true;
+            app.pause_mounted_background_work_keep_current_frame();
+            assert_eq!(
+                app.fs_seek_gesture,
+                crate::ui_fullscreen::StillSeekGesture::Idle
+            );
+            assert!(!app.fs_seek_drag_active);
+        });
+        app.with_viewer_context(a, |app| {
+            app.pause_mounted_background_work_keep_current_frame();
+            assert_eq!(app.fs_seek_gesture, still_seek_committed_center(120));
+        })
+        .unwrap();
+        app.retire_context(b, "still_seek_test_retire", |_| ())
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_split_moves_gesture_and_isolates_request_projection() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/{idx}.png"))))
+            .collect();
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[2, 3]);
+        app.fs_seek_gesture = still_seek_committed_center(7);
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(
+            app.fs_seek_gesture,
+            crate::ui_fullscreen::StillSeekGesture::Idle,
+            "the viewer gesture must move out of the main grid"
+        );
+        let main_projection = app.still_seek_thumbnail_pages_shared.clone();
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(app.fs_seek_gesture, still_seek_committed_center(7));
+        assert!(!Arc::ptr_eq(
+            &main_projection,
+            &app.still_seek_thumbnail_pages_shared
+        ));
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[8, 9]);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+        app.bump_items_generation();
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(
+            app.still_seek_thumbnail_pages_shared
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn viewer_context_still_seek_fork_request_projection_is_independent() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/{idx}.png"))))
+            .collect();
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[2, 3]);
+        let mut fork = app.split_current_context_preserving_main_grid();
+        let main_projection = app.still_seek_thumbnail_pages_shared.clone();
+        app.swap_viewer_context_bundle(&mut fork);
+        app.ensure_still_seek_thumbnail_requests(&ctx, &[8, 9]);
+        assert_eq!(
+            *main_projection.read().unwrap(),
+            [2, 3].into_iter().collect()
+        );
+    }
 
     #[cfg(windows)]
     #[test]
