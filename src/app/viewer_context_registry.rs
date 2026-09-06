@@ -704,6 +704,7 @@ pub(in crate::app) enum RetireContextError {
 pub(in crate::app) struct ViewerContextBundle {
     address: String,
     current_folder: Option<PathBuf>,
+    favorite_view_context: FavoriteViewContextState,
     navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
@@ -737,6 +738,8 @@ pub(in crate::app) struct ViewerContextBundle {
     idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
     keep_range: (usize, usize),
     keep_set: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages: std::collections::HashSet<usize>,
+    still_seek_thumbnail_pages_shared: Arc<std::sync::RwLock<std::collections::HashSet<usize>>>,
     thumbnail_eviction_generation: Option<u64>,
     details_thumb_suppression_applied: bool,
     details_hover_thumb_idx: Option<usize>,
@@ -1301,6 +1304,7 @@ impl ViewerContextBundle {
         Self {
             address: String::new(),
             current_folder: None,
+            favorite_view_context: FavoriteViewContextState::default(),
             navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
             zip_nav: None,
@@ -1330,6 +1334,10 @@ impl ViewerContextBundle {
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages_shared: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
@@ -1617,6 +1625,11 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices_preserving_facet_scope();
         }
+        let favorite_view_now = std::time::Instant::now();
+        self.capture_active_favorite_view_change_at(favorite_view_now);
+        let favorite_view_inherited =
+            crate::settings::FavoriteViewState::from_settings(&self.settings);
+        self.settings.clear_favorite_view_overlay();
         #[cfg(test)]
         panic_at_viewer_context_swap_interior_for_test();
         macro_rules! swap_field {
@@ -1628,6 +1641,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            favorite_view_context,
             navigation_scope,
             archive_source_override,
             zip_nav,
@@ -1657,6 +1671,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -1862,6 +1878,7 @@ impl App {
 
         swap_field!(address);
         swap_field!(current_folder);
+        swap_field!(favorite_view_context);
         swap_field!(navigation_scope);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
@@ -1891,6 +1908,8 @@ impl App {
         swap_field!(idle_upgrade_cache_bypass_ineligible);
         swap_field!(keep_range);
         swap_field!(keep_set);
+        swap_field!(still_seek_thumbnail_pages);
+        swap_field!(still_seek_thumbnail_pages_shared);
         swap_field!(thumbnail_eviction_generation);
         swap_field!(details_thumb_suppression_applied);
         swap_field!(details_hover_thumb_idx);
@@ -2114,6 +2133,12 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices_preserving_facet_scope();
         }
+        let favorite_path = self.effective_folder();
+        self.transition_favorite_view_for_path_with_inherited_at(
+            favorite_path.as_deref(),
+            favorite_view_now,
+            Some(favorite_view_inherited),
+        );
     }
 
     /// legacy/unbundled viewer 用に、現在 context を main と独立 viewer に分割する。
@@ -2149,6 +2174,7 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            favorite_view_context,
             navigation_scope,
             archive_source_override,
             zip_nav,
@@ -2179,6 +2205,8 @@ impl App {
             idle_upgrade_cache_bypass_ineligible,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
@@ -2385,6 +2413,7 @@ impl App {
         duplicate_for_parked!(
             address,
             current_folder,
+            favorite_view_context,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -2409,6 +2438,8 @@ impl App {
             pending_grid_scroll,
             keep_range,
             keep_set,
+            still_seek_thumbnail_pages,
+            still_seek_thumbnail_pages_shared,
             thumbnail_eviction_generation,
             details_order,
             details_order_revision,
@@ -3312,6 +3343,49 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn favorite_view_state_is_isolated_by_bundle_swap() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.thumb_px = 100;
+        let a = crate::settings::FavoriteEntry::new(
+            "a".to_owned(),
+            std::path::PathBuf::from(r"C:\favorite-a"),
+        );
+        let b = crate::settings::FavoriteEntry::new(
+            "b".to_owned(),
+            std::path::PathBuf::from(r"C:\favorite-b"),
+        );
+        let mut a_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
+        a_state.thumb_px = 160;
+        let mut b_state = a_state.clone();
+        b_state.thumb_px = 260;
+        app.favorite_view_states.insert(a.id, a_state);
+        app.favorite_view_states.insert(b.id, b_state);
+        app.settings.favorites.extend([a.clone(), b.clone()]);
+        app.current_folder = Some(a.path.clone());
+        app.transition_favorite_view_for_path(Some(&a.path));
+        app.settings.thumb_px = 170;
+
+        let mut parked = ViewerContextBundle::empty();
+        parked.current_folder = Some(b.path.clone());
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.settings.thumb_px, 260);
+        assert_eq!(app.favorite_view_states[&a.id].thumb_px, 170);
+
+        app.settings.thumb_px = 270;
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.settings.thumb_px, 170);
+        assert_eq!(app.favorite_view_states[&b.id].thumb_px, 270);
+
+        app.transition_favorite_view_for_path(Some(std::path::Path::new(r"C:\outside")));
+        assert_eq!(
+            app.settings.thumb_px, 100,
+            "共通状態はどちらの窓にも上書きされない"
+        );
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Event {

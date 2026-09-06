@@ -354,6 +354,7 @@ impl ThumbnailEngine {
             Some(&cancel),
             &keep_start,
             &keep_end,
+            None,
             context.folder_pin_db.as_ref(),
             None,
             context.adjustment_db.as_ref(),

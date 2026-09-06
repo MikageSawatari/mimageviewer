@@ -326,6 +326,22 @@ fn metadata_panel_similar_results_dark() {
 }
 
 #[test]
+fn preferences_favorite_view_state_dark() {
+    snapshot_with_theme_at_size(
+        "preferences_favorite_view_state_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(620.0, 260.0),
+        None,
+        |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.set_width(580.0);
+                mimageviewer::draw_favorite_view_state_settings_snapshot_fixture(ui);
+            });
+        },
+    );
+}
+
+#[test]
 fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
     snapshot_with_theme_at_size(
         "video_thumbnail_indicator_modes_and_dense_badges_dark",
@@ -346,6 +362,15 @@ fn still_touch_panel_handles_latched_dark() {
         |ui| {
             mimageviewer::draw_still_panel_reach_snapshot_fixture(ui, true, false, false, false);
         },
+    );
+}
+
+#[test]
+fn still_seek_strip_and_hover_preview_dark() {
+    snapshot_with_theme(
+        "still_seek_strip_and_hover_preview_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_still_seek_strip_snapshot_fixture,
     );
 }
 
@@ -868,6 +893,7 @@ fn bookmark_time_and_tag_badges_dark() {
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {
                         page_override: true,
+                        crop: true,
                         pin: true,
                         ..Default::default()
                     },

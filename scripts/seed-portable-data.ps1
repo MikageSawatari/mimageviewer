@@ -17,7 +17,7 @@
 
 [CmdletBinding()]
 param(
-    [string] $Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\portable-smoke\data'),
+    [string] $Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\portable-dev\data'),
     [switch] $IncludeFullText,
     [switch] $Force
 )

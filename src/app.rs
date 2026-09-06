@@ -9605,6 +9605,7 @@ pub(crate) struct GridEditBadges {
     pub conceal: bool,
     pub comic: bool,
     pub rotation: bool,
+    pub crop: bool,
 }
 
 /// 音楽ビューのタイムライン解析結果を保持する in-memory LRU のキー。
@@ -10693,6 +10694,12 @@ impl FsOverflowPanelState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FavoriteViewContextState {
+    /// 最近祖先のお気に入り。保存行の有無とは分け、初回継承を entry edge だけで行う。
+    pub(crate) location_favorite_id: Option<uuid::Uuid>,
+}
+
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
@@ -10895,6 +10902,13 @@ pub struct App {
     /// ★フィルタや Ctrl+F で疎になった `visible_indices` でも、非可視 idx が
     /// 先読みキューに流入しないよう、raw range ではなく set 判定に統一する。
     pub(crate) keep_set: std::collections::HashSet<usize>,
+    /// 静止画ページシークのストリップ / hover preview が現在保持する exact set。
+    /// `keep_set` には合流するが、worker の `keep_range` bounding box には合流させない。
+    pub(crate) still_seek_thumbnail_pages: std::collections::HashSet<usize>,
+    /// `still_seek_thumbnail_pages` の worker 可視な read-only projection。
+    /// pop 後や重い I/O 後にも、bbox を広げず stale な前面要求を取り消す。
+    pub(crate) still_seek_thumbnail_pages_shared:
+        Arc<std::sync::RwLock<std::collections::HashSet<usize>>>,
     /// 範囲外サムネイルを全件照合済みの `items_generation`。
     ///
     /// 同一世代の通常フレームでは、前回 keep_set から外れた少数の idx だけを退去させる。
@@ -11425,7 +11439,8 @@ pub struct App {
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
     pub(crate) preferences_right_panel_scroll_sequence: u64,
     /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
-    pub(crate) preferences_requested_page: Option<crate::ui_dialogs::preferences::PreferencesPage>,
+    pub(crate) preferences_requested_page:
+        Option<crate::ui_dialogs::preferences::PreferencesOpenRequest>,
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
     pub(crate) show_preferences_discard_confirm: bool,
@@ -12922,11 +12937,23 @@ pub struct App {
     pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
     /// 非破壊回転を持つ page_path / video key 集合 (状態フィルタの親コンテナ判定用)。
     pub(crate) rotation_page_keys: std::collections::BTreeSet<String>,
+    /// 最後段 crop を持つ page_path キー集合 (親コンテナへの「切」状態ロールアップ用)。
+    pub(crate) export_crop_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
     /// 起動時に `adjustment_db.load_all_favorite_params()` から復元。
     /// 解決は [`App::effective_params`] 参照。
     pub(crate) adjustment_favorite_params:
         std::collections::HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
+    /// お気に入り UUID ごとの表示状態。起動時に adjustment.db から全件を復元する。
+    pub(crate) favorite_view_states:
+        std::collections::HashMap<uuid::Uuid, crate::settings::FavoriteViewState>,
+    /// マウント中 viewer context のお気に入り所属。bundle swap 対象。
+    pub(crate) favorite_view_context: FavoriteViewContextState,
+    /// DB 書き込みだけをまとめる App-global debounce。表示状態のメモリ正本は即時更新する。
+    pub(crate) favorite_view_writes: crate::favorite_view_state::FavoriteViewWriteDebounce,
+    /// debounce 後の SQLite commit を UI thread 外で直列化する。初回 submit まで spawn しない。
+    pub(crate) favorite_view_store_writer:
+        Option<crate::favorite_view_state::FavoriteViewStoreWriter>,
     /// ページ個別の補正レイヤー: item_idx → LocalAdjustmentLayer 配列。
     /// フォルダロード時は `local_adjust_pages` だけを復元し、JSON 本体は
     /// フルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。表示合成は後段の
@@ -14593,6 +14620,13 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
 
         let t = std::time::Instant::now();
+        let export_crop_page_keys = export_crop_db
+            .as_ref()
+            .map(crate::export_crop::CropDb::load_all_keys)
+            .unwrap_or_default();
+        crate::perf::emit_ms("startup", "db_load_export_crop_keys", 0, t);
+
+        let t = std::time::Instant::now();
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
@@ -14754,6 +14788,10 @@ impl App {
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages: std::collections::HashSet::new(),
+            still_seek_thumbnail_pages_shared: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
             thumbnail_eviction_generation: None,
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
@@ -15479,7 +15517,12 @@ impl App {
             conceal_page_keys,
             comic_page_keys,
             rotation_page_keys,
+            export_crop_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
+            favorite_view_states: std::collections::HashMap::new(),
+            favorite_view_context: FavoriteViewContextState::default(),
+            favorite_view_writes: crate::favorite_view_state::FavoriteViewWriteDebounce::default(),
+            favorite_view_store_writer: None,
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
             export_crop_page_settings: std::collections::HashMap::new(),
@@ -19677,6 +19720,7 @@ impl App {
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.keep_start_shared.store(0, Ordering::Relaxed);
         self.keep_end_shared.store(0, Ordering::Relaxed);
         self.visible_end_shared.store(0, Ordering::Relaxed);
@@ -20140,6 +20184,18 @@ impl App {
         {
             self.reconcile_bookmark_return_target_for_folder_load(&path);
         }
+        // owner が持つ user-facing source を優先し、変換 cache の実装パスを
+        // お気に入り解決へ混ぜない。解決規則自体は adjustment 標準と同じ最長一致。
+        let favorite_path = match &owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
+                crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
+                | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
+            },
+            OpenRequestOwner::DetachedGridArchive(detached_owner) => &detached_owner.source_path,
+            OpenRequestOwner::Navigation => &path,
+        };
+        self.transition_favorite_view_for_path(Some(favorite_path));
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
@@ -22902,6 +22958,7 @@ impl App {
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
         ));
+        self.transition_favorite_view_for_path(Some(&zip_path));
 
         #[cfg(windows)]
         {
@@ -23838,6 +23895,7 @@ impl App {
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
         ));
+        self.transition_favorite_view_for_path(Some(&pdf_path));
 
         #[cfg(windows)]
         if self.should_preserve_active_detached_image_window_for_main_context_change() {
@@ -25183,6 +25241,7 @@ impl App {
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.metadata_cache.clear();
         self.exif_cache.clear();
@@ -27813,6 +27872,7 @@ impl App {
         self.checked.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.keep_start_shared.store(0, Ordering::Relaxed);
         self.keep_end_shared.store(0, Ordering::Relaxed);
@@ -28740,6 +28800,7 @@ impl App {
             &mut self.conceal_page_keys,
             &mut self.comic_page_keys,
             &mut self.rotation_page_keys,
+            &mut self.export_crop_page_keys,
         ] {
             set.retain(|key| !matches_key(key));
         }
@@ -28966,6 +29027,7 @@ impl App {
                     || self.conceal_page_keys.contains(key)
                     || self.comic_page_keys.contains(key)
                     || self.rotation_page_keys.contains(key)
+                    || self.export_crop_page_keys.contains(key)
             }) || self.adjustment_page_params.contains_key(&item_index)
                 || self.local_adjust_pages.contains(&item_index)
                 || self.export_crop_page_settings.contains_key(&item_index)
@@ -29632,6 +29694,7 @@ impl App {
         self.conceal_page_keys = snapshot.concealed;
         self.comic_page_keys = snapshot.comic;
         self.rotation_page_keys = snapshot.rotated;
+        self.export_crop_page_keys = snapshot.cropped;
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
@@ -30097,6 +30160,7 @@ impl App {
         rewrite_key_set_for_rename(&mut self.mask_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.conceal_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.comic_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.export_crop_page_keys, &old_k, &new_k);
     }
 
     /// リネームに合わせて動画再生位置の in-memory 記録キーを付け替える (DB 側は settings
@@ -32455,10 +32519,11 @@ impl App {
                 Err(e) => errors.push(format!("local_adjust: {e}")),
             }
         }
-        if let Some(db) = &self.export_crop_db
-            && let Err(e) = db.copy_entry_key(from, to)
-        {
-            errors.push(format!("crop: {e}"));
+        if let Some(db) = &self.export_crop_db {
+            match db.copy_entry_key(from, to) {
+                Ok(()) => Self::copy_page_key_presence(&mut self.export_crop_page_keys, from, to),
+                Err(e) => errors.push(format!("crop: {e}")),
+            }
         }
         if let Some(db) = &self.mask_db {
             match db.copy_entry_key(from, to) {
@@ -32516,10 +32581,11 @@ impl App {
                 Err(e) => errors.push(format!("local_adjust: {e}")),
             }
         }
-        if let Some(db) = &self.export_crop_db
-            && let Err(e) = db.move_entry_key(from, to)
-        {
-            errors.push(format!("crop: {e}"));
+        if let Some(db) = &self.export_crop_db {
+            match db.move_entry_key(from, to) {
+                Ok(()) => Self::move_page_key_presence(&mut self.export_crop_page_keys, from, to),
+                Err(e) => errors.push(format!("crop: {e}")),
+            }
         }
         if let Some(db) = &self.mask_db {
             match db.move_entry_key(from, to) {
@@ -33086,6 +33152,7 @@ impl App {
         let cache_gen_done = Arc::clone(&self.cache_gen_done);
         let keep_start_shared = Arc::clone(&self.keep_start_shared);
         let keep_end_shared = Arc::clone(&self.keep_end_shared);
+        let still_seek_thumbnail_pages_shared = Arc::clone(&self.still_seek_thumbnail_pages_shared);
         let visible_end_shared = Arc::clone(&self.visible_end_shared);
         let edit_preview_db = self.edit_preview_cache.as_ref().map(|service| service.db());
 
@@ -33107,6 +33174,7 @@ impl App {
             let stats_w = Arc::clone(&stats);
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
+            let still_seek_pages_w = Arc::clone(&still_seek_thumbnail_pages_shared);
             let ve_w = Arc::clone(&visible_end_shared);
             // pin-aware auto-pick 用に worker thread にも pin DB を共有する。
             // 内部 Mutex<Connection> で並列読みは serialize されるが、cascade lookup
@@ -33156,7 +33224,20 @@ impl App {
 
                     let ks = ks_w.load(Ordering::Relaxed);
                     let ke = ke_w.load(Ordering::Relaxed);
-                    if req.idx < ks || req.idx >= ke {
+                    let still_seek_exact = req.priority
+                        && still_seek_pages_w
+                            .read()
+                            .map(|pages| pages.contains(&req.idx))
+                            .unwrap_or(false);
+                    // Foreground requests (navigation target, still seek strip / preview)
+                    // deliberately use the exact keep_set without widening this grid bbox.
+                    if !crate::thumb_loader::thumbnail_request_in_keep(
+                        req.priority,
+                        still_seek_exact,
+                        req.idx,
+                        ks,
+                        ke,
+                    ) {
                         crate::logger::log(format!(
                             "  {tag} SKIP idx={:>4} (out of keep [{ks}..{ke}))  {}",
                             req.idx,
@@ -33233,6 +33314,7 @@ impl App {
                         Some(&cancel_w),
                         &ks_w,
                         &ke_w,
+                        Some(&still_seek_pages_w),
                         pin_db_w.as_deref(),
                         edit_preview_db_w.as_ref(),
                         adjustment_db_w.as_ref(),
@@ -33990,10 +34072,8 @@ impl App {
             return;
         }
         self.keep_set.extend(pages.iter().copied());
-        if let (Some(start), Some(end)) = (
-            self.keep_set.iter().min().copied(),
-            self.keep_set.iter().max().copied(),
-        ) {
+        if let (Some(start), Some(end)) = (pages.iter().min().copied(), pages.iter().max().copied())
+        {
             self.keep_range = (start, end.saturating_add(1));
             self.keep_start_shared.store(start, Ordering::Relaxed);
             self.keep_end_shared
@@ -34018,6 +34098,66 @@ impl App {
             self.last_promoted_visible_keys = Some(pdf_keys);
         }
         if pages.iter().any(|idx| self.requested.contains_key(idx)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    /// 静止画ページシーク UI が必要とする bounded exact set を前面要求へ載せる。
+    ///
+    /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
+    /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
+    fn clear_still_seek_thumbnail_requests(&mut self) {
+        self.still_seek_thumbnail_pages.clear();
+        if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+            shared.clear();
+        }
+    }
+
+    pub(crate) fn ensure_still_seek_thumbnail_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+    ) {
+        let next = pages
+            .iter()
+            .copied()
+            .filter(|idx| *idx < self.items.len())
+            .collect::<HashSet<_>>();
+        if self.still_seek_thumbnail_pages != next {
+            self.still_seek_thumbnail_pages = next;
+            if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
+                shared.clone_from(&self.still_seek_thumbnail_pages);
+            }
+        }
+        self.keep_set
+            .extend(self.still_seek_thumbnail_pages.iter().copied());
+        let request_pages = self
+            .still_seek_thumbnail_pages
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for idx in request_pages.iter().copied() {
+            self.enqueue_priority_thumbnail(idx);
+        }
+        let pdf_keys = request_pages
+            .iter()
+            .filter_map(|idx| match self.items.get(*idx) {
+                Some(GridItem::PdfFile(path)) => Some(crate::grid_item::pdf_page_perf_key(path, 0)),
+                Some(GridItem::PdfPage {
+                    pdf_path, page_num, ..
+                }) => Some(crate::grid_item::pdf_page_perf_key(pdf_path, *page_num)),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if !pdf_keys.is_empty() {
+            let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
+            self.promote_retry_pending = stats.not_found_keys > 0;
+            self.last_promoted_visible_keys = Some(pdf_keys);
+        }
+        if request_pages
+            .iter()
+            .any(|idx| self.requested.contains_key(idx))
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -34161,6 +34301,8 @@ impl App {
         {
             let previous_keep_set = std::mem::take(&mut self.keep_set);
             self.keep_set.extend(navigation_pages.iter().copied());
+            self.keep_set
+                .extend(self.still_seek_thumbnail_pages.iter().copied());
             let start = navigation_pages.iter().min().copied().unwrap_or(0);
             let end = navigation_pages
                 .iter()
@@ -34187,17 +34329,23 @@ impl App {
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
             if self.details_thumb_suppression_applied
                 && self.thumbnail_eviction_generation == Some(self.items_generation)
+                && self.still_seek_thumbnail_pages.is_empty()
             {
                 return;
             }
             let previous_keep_set = std::mem::take(&mut self.keep_set);
+            self.keep_set
+                .extend(self.still_seek_thumbnail_pages.iter().copied());
             self.keep_range = (0, 0);
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
-            self.thumb_pixels.clear();
+            self.thumb_pixels
+                .retain(|idx, _| self.keep_set.contains(idx));
             self.passthrough_rendition_cache.clear();
-            self.thumb_edit_preview_layers.clear();
-            self.thumb_adjust_tex.clear();
+            self.thumb_edit_preview_layers
+                .retain(|idx, _| self.keep_set.contains(idx));
+            self.thumb_adjust_tex
+                .retain(|idx, _| self.keep_set.contains(idx));
             let force_full_reconcile =
                 self.thumbnail_eviction_generation != Some(self.items_generation);
             self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
@@ -34205,18 +34353,30 @@ impl App {
             if let Some(queue_arc) = self.reload_queue.clone() {
                 let (ref mtx, _) = *queue_arc;
                 let mut q = mtx.lock().unwrap();
-                for r in q.drain(..) {
-                    self.requested.remove(&r.idx);
-                }
+                q.retain_mut(|r| {
+                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
+                    if keep {
+                        r.priority = true;
+                    } else {
+                        self.requested.remove(&r.idx);
+                    }
+                    keep
+                });
             }
             if let Some(queue_arc) = self.heavy_io_queue.clone() {
                 let (ref mtx, _) = *queue_arc;
                 let mut q = mtx.lock().unwrap();
-                for r in q.drain(..) {
-                    self.requested.remove(&r.idx);
-                }
+                q.retain_mut(|r| {
+                    let keep = self.still_seek_thumbnail_pages.contains(&r.idx);
+                    if keep {
+                        r.priority = true;
+                    } else {
+                        self.requested.remove(&r.idx);
+                    }
+                    keep
+                });
             }
-            self.details_thumb_suppression_applied = true;
+            self.details_thumb_suppression_applied = self.still_seek_thumbnail_pages.is_empty();
             return;
         }
         self.details_thumb_suppression_applied = false;
@@ -34227,6 +34387,7 @@ impl App {
             // 古い enqueue 済みリクエストが in-range 判定で処理されてしまう。
             self.keep_range = (0, 0);
             self.keep_set.clear();
+            self.clear_still_seek_thumbnail_requests();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumbnail_eviction_generation = Some(self.items_generation);
@@ -34366,8 +34527,11 @@ impl App {
             .unwrap_or(&[]);
         let previous_keep_set = std::mem::take(&mut self.keep_set);
         self.keep_set.extend(keep_slice.iter().copied());
+        self.keep_set
+            .extend(self.still_seek_thumbnail_pages.iter().copied());
 
-        // keep_range: keep_set の bounding box。worker atomic キャンセル判定で使われる。
+        // keep_range: grid keep_slice の bounding box。worker atomic キャンセル判定で使う。
+        // still seek の bounded exact set は shared set で別判定し、ここを広げない。
         // `visible_indices` は `rebuild_visible_indices` が `for i in 0..n { push(i) }` で
         // 構築するため昇順。その部分列である `keep_slice` も昇順なので、min/max は
         // 端の要素を直接参照すれば O(1)。将来 display list をソート以外の順で構築する
@@ -34602,7 +34766,8 @@ impl App {
             {
                 req.force_cache = true;
             }
-            req.priority = i >= visible_raw_start && i < visible_raw_end;
+            req.priority = (i >= visible_raw_start && i < visible_raw_end)
+                || self.still_seek_thumbnail_pages.contains(&i);
             // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
             // enqueue しない。visible (= priority=true) は常に enqueue する。
             // SourceOnly は idle upgrade 経路 (本 PR scope 外) なので素通し。
@@ -34675,6 +34840,7 @@ impl App {
             // 非可視 + !SourceOnly (= grid prefetch) は prefetch_ok=false なら prune。
             // SourceOnly は idle upgrade 経路で本 PR scope 外。
             let keep_set = &self.keep_set;
+            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34683,7 +34849,8 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let is_grid_prefetch = !now_visible && !r.source_policy.bypasses_cache();
+                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
                     pruned_regular += 1;
@@ -34692,7 +34859,8 @@ impl App {
                 true
             });
             for r in q.iter_mut() {
-                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
+                    || still_seek_thumbnail_pages.contains(&r.idx);
             }
             let _q_before = q.len();
             for r in new_regular {
@@ -34710,6 +34878,7 @@ impl App {
             let (ref mtx, ref cvar) = *hq;
             let mut q = mtx.lock().unwrap();
             let keep_set = &self.keep_set;
+            let still_seek_thumbnail_pages = &self.still_seek_thumbnail_pages;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
@@ -34718,7 +34887,8 @@ impl App {
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let is_grid_prefetch = !now_visible && !r.source_policy.bypasses_cache();
+                let foreground = now_visible || still_seek_thumbnail_pages.contains(&r.idx);
+                let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     requested.remove(&r.idx);
                     pruned_heavy += 1;
@@ -34727,7 +34897,8 @@ impl App {
                 true
             });
             for r in q.iter_mut() {
-                r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
+                    || still_seek_thumbnail_pages.contains(&r.idx);
             }
             for r in new_heavy {
                 requested.insert(r.idx, false);
@@ -45591,6 +45762,7 @@ impl App {
         self.slideshow_scroll_range_cache = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
+        self.clear_still_seek_thumbnail_requests();
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.fs_free_rotation = 0.0;
@@ -47897,6 +48069,8 @@ impl App {
             comic: self.comic_pages.contains(&idx)
                 || self.item_has_one_level_edit_key(idx, &self.comic_page_keys),
             rotation: self.item_has_one_level_rotation(idx),
+            crop: self.export_crop_pages.contains(&idx)
+                || self.item_has_one_level_edit_key(idx, &self.export_crop_page_keys),
         }
     }
 
@@ -47916,12 +48090,7 @@ impl App {
             let badges = self.grid_edit_badges(req.idx);
             // 色調補正は既存の thumb_adjust_tex が安価に再現する。永続プレビューには
             // source 解像度の edit-result + 注釈 + 最後段 crop だけを含める。
-            if badges.local_adjust
-                || badges.mask
-                || badges.conceal
-                || badges.comic
-                || self.export_crop_pages.contains(&req.idx)
-            {
+            if badges.local_adjust || badges.mask || badges.conceal || badges.comic || badges.crop {
                 req.edit_preview_key = self.page_path_key(req.idx);
             }
         }
@@ -48912,6 +49081,9 @@ impl App {
         }
         if badges.rotation {
             bits |= 1 << 5;
+        }
+        if badges.crop {
+            bits |= 1 << 6;
         }
         bits
     }
@@ -52117,6 +52289,30 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
+    /// ページ読み込みスケジューラへ渡す viewer context の識別子。
+    ///
+    /// **複数ウィンドウ (detached viewer) は Windows 専用**なので、
+    /// `viewer_contexts` レジストリと `projected_viewer_context_id` は
+    /// `#[cfg(windows)]` にある。非 Windows では context が常に 1 つしかないため、
+    /// 固定値で「同じ context」を表す。スケジューラは serial を等値比較にしか
+    /// 使わない (`supersede_waiting_for_latest_seek` の対象選別) ので、値が何かは
+    /// 問われない。
+    ///
+    /// **`projected_viewer_context_id()` を cfg なしで呼ぶと非 Windows ビルドが壊れる。**
+    /// 2026-09-06 に `scripts/check-non-windows-shadow.ps1` が実際に検出した
+    /// (CI の ubuntu ジョブと同じ種類の失敗)。呼び出しをここへ集約して、次に
+    /// スケジューラを使う人が同じ穴を掘らないようにする。
+    fn fs_page_load_context_serial(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            self.projected_viewer_context_id().serial()
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
     pub(crate) fn fs_pdf_render_context_epoch(_priority: crate::pdf_loader::JobPriority) -> u64 {
         // Fullscreen fs_load is scoped to the open viewer context, not to the main
         // grid context. fs_pending cancel tokens own its lifetime.
@@ -52466,7 +52662,7 @@ impl App {
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
         let ticket = self.fs_page_load_scheduler.request(
-            self.projected_viewer_context_id().serial(),
+            self.fs_page_load_context_serial(),
             idx,
             scheduler_priority,
             contract,
@@ -53154,7 +53350,7 @@ impl App {
             FsPageLoadPriority::Normal
         };
         let ticket = self.fs_page_load_scheduler.request(
-            self.projected_viewer_context_id().serial(),
+            self.fs_page_load_context_serial(),
             idx,
             scheduler_priority,
             FsPageLoadContract::Sequential,
@@ -53984,6 +54180,7 @@ impl App {
         self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
+        self.clear_still_seek_thumbnail_requests();
         self.fs_context_menu_idx = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
@@ -56777,6 +56974,7 @@ impl App {
             );
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, true);
             if !self.edit_store_write_succeeded("切り出し範囲", written) {
                 return;
             }
@@ -56786,6 +56984,7 @@ impl App {
                 Self::edit_store_write(self.export_crop_db.as_ref().map(|db| db.remove(&key)));
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, false);
             if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
                 return;
             }
@@ -56811,6 +57010,7 @@ impl App {
         settings: Option<crate::export_crop::CropSettings>,
         image_size: [usize; 2],
     ) {
+        let key = self.page_path_key(idx);
         let normalized = settings
             .map(|settings| {
                 crate::export_crop::CropSettings::authored(
@@ -56820,12 +57020,16 @@ impl App {
                 )
             })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
+        let present = normalized.is_some();
         if let Some(settings) = normalized {
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
         } else {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
+        }
+        if let Some(key) = key {
+            Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, present);
         }
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
@@ -59729,7 +59933,7 @@ impl App {
                 .is_some_and(|pending| pending.promote_to_high(contract));
         if contract == FsPageLoadContract::LatestSeek && !promoted_waiting {
             self.fs_page_load_scheduler
-                .supersede_waiting_for_latest_seek(self.projected_viewer_context_id().serial());
+                .supersede_waiting_for_latest_seek(self.fs_page_load_context_serial());
         }
     }
 
@@ -62285,6 +62489,7 @@ impl App {
                 || stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
                 || stats.imported_comic > 0
             {
                 self.refresh_edit_rollup_keys_from_dbs();
@@ -62292,6 +62497,7 @@ impl App {
             if stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
             {
                 // 外部更新された sidecar はページごとの旧 preview より新しい可能性がある。
                 // import 対象キーの全列挙を UI スレッドで行わず、派生キャッシュを worker で
@@ -63015,6 +63221,11 @@ impl App {
             .rotation_db
             .as_ref()
             .map(crate::rotation_db::RotationDb::load_rotated_keys)
+            .unwrap_or_default();
+        self.export_crop_page_keys = self
+            .export_crop_db
+            .as_ref()
+            .map(crate::export_crop::CropDb::load_all_keys)
             .unwrap_or_default();
     }
 
@@ -63789,6 +64000,293 @@ impl App {
                     .retain(|id, _| keep.contains(id));
             }
         }
+    }
+
+    /// 起動時にお気に入り表示状態を全件ロードし、削除済み UUID の行を掃除する。
+    pub(crate) fn hydrate_favorite_view_states(&mut self) {
+        let Some(db) = &self.adjustment_db else {
+            return;
+        };
+        self.favorite_view_states = db.load_all_favorite_view_states();
+        let keep: std::collections::HashSet<uuid::Uuid> = self
+            .settings
+            .favorites
+            .iter()
+            .map(|favorite| favorite.id)
+            .collect();
+        if let Ok(removed) = db.prune_favorite_view_states(&keep) {
+            if removed > 0 {
+                self.favorite_view_states.retain(|id, _| keep.contains(id));
+            }
+        }
+    }
+
+    fn favorite_view_owner_for_path(&self, path: &Path) -> Option<uuid::Uuid> {
+        active_favorite_default_id_for_path(path, &self.settings.favorites, None, |_| true)
+    }
+
+    fn stored_favorite_view_id_for_path(&self, path: &Path) -> Option<uuid::Uuid> {
+        active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
+            self.favorite_view_states.contains_key(&id)
+        })
+    }
+
+    /// 適用中の値との差分をメモリ正本へ即時反映し、DB 書き込みだけを debounce する。
+    fn capture_active_favorite_view_change_at(&mut self, now: std::time::Instant) {
+        if !self.settings.remember_favorite_view_state {
+            return;
+        }
+        let Some(id) = self.settings.active_favorite_view_id() else {
+            return;
+        };
+        let state = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        if self.favorite_view_states.get(&id) == Some(&state) {
+            return;
+        }
+        self.favorite_view_states.insert(id, state.clone());
+        self.favorite_view_writes.note_at(id, state, now);
+    }
+
+    /// 現在地を切り替える ownership 境界。旧 overlay の差分を確定して共通値へ戻し、
+    /// 同じ最長一致 resolver で新しい overlay を選ぶ。
+    fn transition_favorite_view_for_path_at(
+        &mut self,
+        path: Option<&Path>,
+        now: std::time::Instant,
+    ) {
+        self.transition_favorite_view_for_path_with_inherited_at(path, now, None);
+    }
+
+    fn transition_favorite_view_for_path_with_inherited_at(
+        &mut self,
+        path: Option<&Path>,
+        now: std::time::Instant,
+        inherited_override: Option<crate::settings::FavoriteViewState>,
+    ) {
+        if !self.settings.remember_favorite_view_state {
+            self.settings.clear_favorite_view_overlay();
+            self.favorite_view_context.location_favorite_id = None;
+            return;
+        }
+
+        self.capture_active_favorite_view_change_at(now);
+        let inherited = inherited_override
+            .unwrap_or_else(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
+        self.settings.clear_favorite_view_overlay();
+
+        let owner = path.and_then(|path| self.favorite_view_owner_for_path(path));
+        let entered = owner != self.favorite_view_context.location_favorite_id;
+        self.favorite_view_context.location_favorite_id = owner;
+        if entered {
+            if let Some(id) = owner {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.favorite_view_states.entry(id)
+                {
+                    entry.insert(inherited.clone());
+                    self.favorite_view_writes.note_at(id, inherited, now);
+                }
+            }
+        }
+
+        let active_id = path.and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if let Some((id, state)) = active_id.and_then(|id| {
+            self.favorite_view_states
+                .get(&id)
+                .cloned()
+                .map(|state| (id, state))
+        }) {
+            self.settings.apply_favorite_view_overlay(id, &state);
+        }
+    }
+
+    pub(crate) fn transition_favorite_view_for_path(&mut self, path: Option<&Path>) {
+        self.transition_favorite_view_for_path_at(path, std::time::Instant::now());
+    }
+
+    fn reapply_favorite_view_without_seed(&mut self) {
+        self.settings.clear_favorite_view_overlay();
+        if !self.settings.remember_favorite_view_state {
+            return;
+        }
+        let path = self.effective_folder();
+        let active_id = path
+            .as_deref()
+            .and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if let Some((id, state)) = active_id.and_then(|id| {
+            self.favorite_view_states
+                .get(&id)
+                .cloned()
+                .map(|state| (id, state))
+        }) {
+            self.settings.apply_favorite_view_overlay(id, &state);
+        }
+    }
+
+    fn reconcile_favorite_view_for_current_context_at(&mut self, now: std::time::Instant) {
+        if !self.settings.remember_favorite_view_state {
+            self.settings.clear_favorite_view_overlay();
+            self.favorite_view_context.location_favorite_id = None;
+            return;
+        }
+        let path = self.effective_folder();
+        let owner = path
+            .as_deref()
+            .and_then(|path| self.favorite_view_owner_for_path(path));
+        let active_id = path
+            .as_deref()
+            .and_then(|path| self.stored_favorite_view_id_for_path(path));
+        if owner != self.favorite_view_context.location_favorite_id
+            || active_id != self.settings.active_favorite_view_id()
+        {
+            self.transition_favorite_view_for_path_at(path.as_deref(), now);
+        } else {
+            self.capture_active_favorite_view_change_at(now);
+        }
+    }
+
+    fn submit_favorite_view_store(
+        &mut self,
+        command: crate::favorite_view_state::FavoriteViewStoreCommand,
+    ) -> Result<(), String> {
+        if self.adjustment_db.is_none() {
+            return Err("adjustment.db is unavailable".to_owned());
+        }
+        if self.favorite_view_store_writer.is_none() {
+            self.favorite_view_store_writer = Some(
+                crate::favorite_view_state::FavoriteViewStoreWriter::spawn(
+                    crate::adjustment_db::AdjustmentDb::db_path(),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        self.favorite_view_store_writer
+            .as_ref()
+            .expect("favorite view store writer initialized")
+            .submit(command)
+    }
+
+    fn submit_favorite_view_writes(
+        &mut self,
+        writes: Vec<(uuid::Uuid, crate::settings::FavoriteViewState)>,
+        retry: bool,
+    ) {
+        for (id, state) in writes {
+            let command = crate::favorite_view_state::FavoriteViewStoreCommand::Set {
+                id,
+                state: state.clone(),
+            };
+            if let Err(error) = self.submit_favorite_view_store(command) {
+                crate::logger::log(format!(
+                    "favorite view state submit failed id={id}: {error}"
+                ));
+                if retry {
+                    self.favorite_view_writes
+                        .note_at(id, state, std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    fn poll_favorite_view_writes(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let writes = self.favorite_view_writes.take_due_at(now);
+        self.submit_favorite_view_writes(writes, true);
+        let results: Vec<_> = self
+            .favorite_view_store_writer
+            .as_ref()
+            .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
+            .unwrap_or_default();
+        for outcome in results {
+            let Err(error) = outcome.result else {
+                continue;
+            };
+            crate::logger::log(format!("favorite view state store failed: {error}"));
+            match outcome.command {
+                crate::favorite_view_state::FavoriteViewStoreCommand::Set { id, state } => {
+                    // この Set より後に reset / clear / 新しい変更が入っていれば、古い
+                    // failure を再送して現在の意図を巻き戻してはならない。
+                    if self.favorite_view_states.get(&id) == Some(&state) {
+                        self.favorite_view_writes
+                            .note_at(id, state, std::time::Instant::now());
+                    }
+                }
+                crate::favorite_view_state::FavoriteViewStoreCommand::Remove { .. } => {
+                    self.show_feedback_toast(
+                        "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
+                    );
+                }
+                crate::favorite_view_state::FavoriteViewStoreCommand::Clear => {
+                    self.show_feedback_toast(
+                        "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
+                    );
+                    if let Some(state) = self.pref_state.as_mut() {
+                        state.favorite_view_state_clear_result =
+                            Some("保存データのクリアに失敗しました。".to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(delay) = self.favorite_view_writes.next_due_in_at(now) {
+            ctx.request_repaint_after(delay);
+        }
+        if self
+            .favorite_view_store_writer
+            .as_ref()
+            .is_some_and(|writer| writer.is_busy())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn flush_favorite_view_writes_for_exit(&mut self) {
+        self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        let writes = self.favorite_view_writes.take_all();
+        self.submit_favorite_view_writes(writes, false);
+    }
+
+    pub(crate) fn remove_favorite_view_state(&mut self, favorite_id: uuid::Uuid) -> bool {
+        self.favorite_view_writes.remove(favorite_id);
+        let existed = self.favorite_view_states.remove(&favorite_id).is_some();
+        if let Err(error) = self.submit_favorite_view_store(
+            crate::favorite_view_state::FavoriteViewStoreCommand::Remove { id: favorite_id },
+        ) {
+            crate::logger::log(format!(
+                "favorite view state remove submit failed id={favorite_id}: {error}"
+            ));
+            self.show_feedback_toast(
+                "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
+            );
+        }
+        if self.settings.active_favorite_view_id() == Some(favorite_id) {
+            self.reapply_favorite_view_without_seed();
+        }
+        existed
+    }
+
+    pub(crate) fn reset_favorite_view_state(&mut self, favorite_id: uuid::Uuid) {
+        if self.remove_favorite_view_state(favorite_id) {
+            self.show_feedback_toast("お気に入りの表示状態をリセットしました".to_owned());
+        }
+    }
+
+    pub(crate) fn clear_all_favorite_view_states(&mut self) -> usize {
+        let count = self.favorite_view_states.len();
+        self.favorite_view_writes.clear();
+        self.favorite_view_states.clear();
+        if let Err(error) = self
+            .submit_favorite_view_store(crate::favorite_view_state::FavoriteViewStoreCommand::Clear)
+        {
+            crate::logger::log(format!("favorite view state clear submit failed: {error}"));
+            self.show_feedback_toast(
+                "お気に入りの表示状態を保存データからクリアできませんでした".to_owned(),
+            );
+            if let Some(state) = self.pref_state.as_mut() {
+                state.favorite_view_state_clear_result =
+                    Some("保存データのクリアに失敗しました。".to_owned());
+            }
+        }
+        self.reapply_favorite_view_without_seed();
+        count
     }
 
     /// 保存スロット slot_idx のパラメータを `idx` のページに適用する。
@@ -71499,6 +71997,9 @@ impl eframe::App for App {
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         self.update_frame(ctx, frame);
+        // UI の代入箇所を列挙せず、frame 終端で有効値との差分を一括検出する。
+        self.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        self.poll_favorite_view_writes(ctx);
         // `update_frame` は native 動画 backdrop / 静止画 viewport 抑止 / embedded 保留の
         // 3 経路で早期 return する。その frame では外部ツールの modal も spawn 境界の
         // ACK も落ちるので、**早期 return では飛ばせないここ**で拾う。
@@ -73399,6 +73900,183 @@ pub(crate) mod tests;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+mod favorite_view_state_tests {
+    use super::*;
+    use crate::settings::{FavoriteEntry, FavoriteViewState, GridViewMode, SortOrder};
+
+    fn state(thumb_px: u32, sort_order: SortOrder) -> FavoriteViewState {
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = thumb_px;
+        settings.sort_order = sort_order;
+        FavoriteViewState::from_settings(&settings)
+    }
+
+    #[test]
+    fn resolves_siblings_outside_and_deepest_nested_favorite() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.thumb_px = 100;
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\library"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\library\comic"));
+        let video = FavoriteEntry::new("video".to_owned(), PathBuf::from(r"C:\video"));
+        app.favorite_view_states
+            .insert(outer.id, state(160, SortOrder::DateAsc));
+        app.favorite_view_states
+            .insert(inner.id, state(280, SortOrder::Numeric));
+        app.favorite_view_states
+            .insert(video.id, state(80, SortOrder::DateDesc));
+        app.settings.favorites.extend([outer, inner, video]);
+
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\photo")));
+        assert_eq!(app.settings.thumb_px, 160);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
+        assert_eq!(app.settings.thumb_px, 80);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
+        assert_eq!(app.settings.thumb_px, 100);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\library\comic\book")));
+        assert_eq!(app.settings.thumb_px, 280);
+        assert_eq!(app.settings.sort_order, SortOrder::Numeric);
+
+        app.settings.favorites[2].name = "moved video".to_owned();
+        app.settings.favorites[2].path = PathBuf::from(r"C:\moved-video");
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\video\clips")));
+        assert_eq!(
+            app.settings.thumb_px, 100,
+            "旧パスには UUID の記録を適用しない"
+        );
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\moved-video\clips")));
+        assert_eq!(
+            app.settings.thumb_px, 80,
+            "名称・パス変更後も UUID の記録を使う"
+        );
+    }
+
+    #[test]
+    fn first_entry_inherits_current_effective_state_and_updates_by_diff() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.thumb_px = 190;
+        app.settings.sort_order = SortOrder::DateAsc;
+        let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
+        let id = favorite.id;
+        app.settings.favorites.push(favorite);
+
+        app.transition_favorite_view_for_path_at(
+            Some(Path::new(r"C:\fav\child")),
+            std::time::Instant::now(),
+        );
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 190);
+        assert_eq!(
+            app.favorite_view_states[&id].grid_view_mode,
+            GridViewMode::Details
+        );
+
+        app.settings.thumb_px = 240;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 240);
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\outside")));
+        assert_eq!(app.settings.thumb_px, 190, "共通値へ戻る");
+    }
+
+    #[test]
+    fn preferences_standard_update_does_not_feed_back_into_the_active_favorite() {
+        let mut app = setup_app_for_test();
+        let id = uuid::Uuid::new_v4();
+        let common = state(100, SortOrder::FileName);
+        let favorite = state(180, SortOrder::DateDesc);
+        let edited_standard = state(240, SortOrder::Numeric);
+
+        app.settings.remember_favorite_view_state = true;
+        common.apply_to_settings(&mut app.settings);
+        app.favorite_view_states.insert(id, favorite.clone());
+        app.settings.apply_favorite_view_overlay(id, &favorite);
+
+        let mut edited = app.settings.preferences_snapshot();
+        edited_standard.apply_to_settings(&mut edited);
+        crate::ui_dialogs::preferences::prepare_preferences_settings_for_commit(
+            &mut edited,
+            &mut app.settings,
+        );
+        app.settings = edited;
+
+        assert_eq!(FavoriteViewState::from_settings(&app.settings), favorite);
+        assert_eq!(
+            FavoriteViewState::from_settings(&app.settings.preferences_snapshot()),
+            edited_standard
+        );
+        assert_eq!(app.favorite_view_states[&id], favorite);
+
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id], favorite);
+        assert!(
+            app.favorite_view_writes
+                .next_due_in_at(std::time::Instant::now())
+                .is_none()
+        );
+
+        app.settings.thumb_px = 260;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 260);
+        assert!(
+            app.favorite_view_writes
+                .next_due_in_at(std::time::Instant::now())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn disabled_mode_does_not_apply_or_update_but_keeps_records() {
+        let mut app = setup_app_for_test();
+        let favorite = FavoriteEntry::new("fav".to_owned(), PathBuf::from(r"C:\fav"));
+        let id = favorite.id;
+        app.settings.favorites.push(favorite);
+        app.settings.thumb_px = 100;
+        app.favorite_view_states
+            .insert(id, state(250, SortOrder::DateDesc));
+
+        app.transition_favorite_view_for_path(Some(Path::new(r"C:\fav")));
+        assert_eq!(app.settings.thumb_px, 100);
+        app.settings.thumb_px = 120;
+        app.capture_active_favorite_view_change_at(std::time::Instant::now());
+        assert_eq!(app.favorite_view_states[&id].thumb_px, 250);
+    }
+
+    #[test]
+    fn reset_falls_back_to_outer_then_common_and_clear_removes_all_rows() {
+        let mut app = setup_app_for_test();
+        app.settings.remember_favorite_view_state = true;
+        app.settings.thumb_px = 100;
+        let outer = FavoriteEntry::new("outer".to_owned(), PathBuf::from(r"C:\fav"));
+        let inner = FavoriteEntry::new("inner".to_owned(), PathBuf::from(r"C:\fav\inner"));
+        app.favorite_view_states
+            .insert(outer.id, state(160, SortOrder::DateAsc));
+        app.favorite_view_states
+            .insert(inner.id, state(260, SortOrder::DateDesc));
+        app.settings
+            .favorites
+            .extend([outer.clone(), inner.clone()]);
+        app.current_folder = Some(PathBuf::from(r"C:\fav\inner"));
+        let current = app.current_folder.clone();
+        app.transition_favorite_view_for_path(current.as_deref());
+        assert_eq!(app.settings.thumb_px, 260);
+
+        app.reset_favorite_view_state(inner.id);
+        assert_eq!(app.settings.thumb_px, 160);
+        app.reset_favorite_view_state(outer.id);
+        assert_eq!(app.settings.thumb_px, 100);
+
+        app.favorite_view_states
+            .insert(outer.id, state(170, SortOrder::Numeric));
+        app.favorite_view_states
+            .insert(inner.id, state(270, SortOrder::Numeric));
+        assert_eq!(app.clear_all_favorite_view_states(), 2);
+        assert!(app.favorite_view_states.is_empty());
+        assert_eq!(app.settings.thumb_px, 100);
+    }
+}
 
 #[cfg(test)]
 mod rated_at_details_sort_tests {

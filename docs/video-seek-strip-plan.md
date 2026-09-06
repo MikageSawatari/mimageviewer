@@ -352,8 +352,8 @@ D3 の帰結として、横軸は時間線形ではない。波形モード (時
 **モードを切り替えると同じ x が別の時刻を指す**ことは承知のうえで採用した。両モードとも
 中央 `|` の時刻は一致するので、切替時に中央は動かない。
 
-**D17 (Increment 11、2026-08-25)**: サムネイルセルの表示状態を `pending / ready / failed` の
-3 値で扱う。`pending` は従来どおり空の枠、セル単位の terminal failure は枠内に
+**D17 (Increment 11、2026-08-25、時間切れ状態は D33 で拡張)**: サムネイルセルの基本表示状態を
+`pending / ready / failed` で扱う。`pending` は従来どおり空の枠、セル単位の terminal failure は枠内に
 「表示できません」と出す。軸解決後に補助 decoder を開けず列全体が使えない場合だけ、セル列を
 「サムネイルを表示できません」という 1 個の notice に置き換える。`ThreadSpawnFailed` は軸失敗、
 `Cancelled` は close / 切替 lifecycle として既存経路で処理し、画面へ重ねて出さない。
@@ -396,10 +396,17 @@ pre-roll して再試行する。以後そのファイルでは同じ full-frame
 健全な index を TimeGrid へ落とす axis fallback ではなく、keyframe packet が単独復号できない
 ファイル向けの decode strategy fallback である。
 
-**D23 (batch follow-up、2026-08-25)**: サムネイル窓は 30 秒を上限とし、未決着セルを
+**D23 (batch follow-up、2026-08-25、D33 で置換)**: 当時はサムネイル窓を 30 秒上限とし、未決着セルを
 `WindowTimedOut { timeout_secs }` の typed failure へ確定する。failure reason は settled outcome が
 所有し、App は「生成が時間切れです」、batch は `thumbnail window timed out after 30s` として
-同じ failure surface から表示する。上限前の `pending` だけが空枠であり、上限後に無言の空枠を残さない。
+同じ failure surface から表示していた。これは一時的な遅延を terminal にするため D33 で廃止した。
+
+**D33 (§1.186、2026-09-05)**: 30 秒は **セル単位**の予算とし、窓要求時刻ではなく各セルの seek
+開始から測る。時間切れは `StripThumbnailFailure` から外し、別の `StripThumbnailRetryState` に置く。
+最初の時間切れは窓の残りを一巡した後に 1 回だけ再試行し、再度切れたら typed trigger
+(`WindowRecalculated` / `StripRedisplayed` / `UserInteraction`) まで待つ。同一窓の
+`DeliveryRecovery` は 2026-08-27 の supersede 未着セルだけを回収し、時間切れセルを再要求しない。
+UI は再試行中と trigger 待ちを terminal failure と別文言で表示する。
 
 **D24 (stage-1 follow-up、2026-08-25)**: 完全な index でも最大 raw GOP が 15.0 秒を越える素材は、
 `KeyframeIndex / TimeGrid` のどちらにも進まず `Unavailable(KeyframesTooSparse)` とする。判定は index
@@ -576,12 +583,23 @@ enum StripAxisDecision {
 - 要求は**窓** `(axis, center_index, visible_count, lookahead)`。窓が動いたら最新勝ちで差し替える。
 - **既に復号済みのフレームは窓が変わっても捨てない** (プロセス内キャッシュへ入れる)。
 - 1 窓の充填は「窓先頭のキーフレームへ 1 回シーク → `skip_frame(NonKey)` で前方復号 →
-  届いたキーフレームを順に公開」。1 枚ごとにシークし直さない。
+  届いたキーフレームを順に公開」。ただし連続 index 間の時刻差が run 上限を越えたらそこで切り、
+  次のセルへ個別にシークする。上限は軸診断の観測最大 raw GOP を基礎に 2 倍し、受理 raw GOP
+  上限 15 秒を下限、その 2 倍を上限にした **30〜60 秒**。索引なしは受理上限から **30 秒**を
+  導く。これにより 0.1〜30 秒の周辺表示は従来の run を保ち、500 秒級の全体表示はセルごとの
+  seek になる。
 - `KeyframeIndex` の cell timestamp は seek/index domain (MP4 では DTS のことがある)。要求窓内の
   key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame はその target の
   nearest-preceding を採る。許容幅は前後それぞれ隣の raw index entry までに制限する。
 - `TimeGrid` は従来どおり直前 frame を採るが、1 grid interval より古い frame は採らない。
   timestamp 不一致で 1 セルが failed になっても cursor を進め、同じ run の後続セルを処理する。
+- 復号予算は窓単位ではなく **1 セル 30 秒**。各 run の seek 開始から測り、セルが進むたびに
+  リセットする。時間切れセルだけを run から外して後続セルを続けるため、1 枚の遅延で窓全体を
+  failure にしない。
+- 時間切れは素材由来の `StripThumbnailFailure` ではなく、別所有の
+  `StripThumbnailRetryState`。最初は窓の残りを一巡した後に 1 回だけ自動再試行し、再度切れたら
+  窓再計算・帯再表示・利用者操作のいずれかまで待つ。通常の `DeliveryRecovery` は supersede で
+  未着のセルだけを拾い、同じ窓の時間切れを回し続けない。
 - 復号は本編と別の補助デコーダ (`thumbnail.rs` と同じく HW 優先 / 失敗時 SW フォールバック)。
   本編の D3D lock を奪わない。`LIVE_VIDEO_DECODE_THREADS` には数えない。
 - cancel: ストリップを閉じた / 動画が変わった / フルスクリーンを抜けた。
@@ -972,7 +990,7 @@ enum SeekRowGesture {
 
 ## 9. 実装中に確定させた値
 
-**4 件とも決着済み** (2026-08-27 にコードと突き合わせて確認)。決め方の欄ではなく、
+**6 件とも決着済み** (2026-09-05 にコードと突き合わせて確認)。決め方の欄ではなく、
 **決まった値と、それがどこにあるか**を書く。
 
 | # | 論点 | 決まったこと |
@@ -981,6 +999,8 @@ enum SeekRowGesture {
 | U3 | ストリップの高さ・セル幅・枚数 | 全体表示と高さプリセット以降は `SeekStripLayout` (`seek_strip_layout.rs`) が所有する。高さは大 104 / 中 72 / 小 48 / 最小 36pt、周辺表示のセル幅は 152 / 102 / 64 / 45pt (大は出荷済みの値を維持)。**枚数は既定値を持たない**。周辺表示は帯幅から `ceil(width / cell_width) + 2`、全体表示は高さと動画の縦横比から `round(width / (高さ x 比))` を出し、`RequestSeekStripWindow` で App へ渡す |
 | U4 | ストリップ用サムネイルの抽出幅 | `STRIP_THUMB_EXTRACT_WIDTH = 320` (`seek_strip_thumbs.rs`)。出発点のまま。22,811 件の実素材 sweep でも容量・見やすさの問題は出なかったので変えない |
 | U5 | 窓の `bin_secs` | `waveform_bin_secs(span_secs, pixel_width)` (`seek_strip_wave.rs`)。**描画 1 物理画素あたり解析 1 bin を上限**にし、ミリ秒へ丸めてキャッシュキーを安定させ、下限は解析側の 10ms。粗い全尺列だけは別で、表示密度に依らず `COARSE_BIN_SECS = 0.100` 固定 (D27) |
+| U6 | サムネイル decode run の最大間隔 | `strip_decode_run_max_forward_gap_secs` (`seek_strip_thumbs.rs`)。軸診断の観測最大 raw GOP x 2 を基礎に、受理 raw GOP 上限 15 秒を下限、その 2 倍を上限にする (30〜60 秒)。索引なしは 30 秒。独立 backward seek の最大 1 GOP 前置きと次の 1 GOP が同じ decode envelope に収まる範囲だけ前方復号を共有し、500 秒級の全体表示は run を分ける |
+| U7 | サムネイル時間切れの復帰 | `StripThumbnailRetryState` を terminal failure と別 map に置く。セルごとに 30 秒を与え、最初の時間切れは `WindowPassCompleted` で 1 回だけ自動再試行、2 回目は `AwaitingTrigger`。その後は requested cell ID 集合が変わる窓再計算、`StripRedisplayed`、`UserInteraction` だけが再開し、同じ窓の `DeliveryRecovery` は再開しない |
 ## 10. スコープ外
 
 - mIV Remote (D6)。将来出す場合は `/api/video/thumbnail` が 1 枚単位なので、窓をまとめて返す
@@ -1003,6 +1023,8 @@ enum SeekRowGesture {
   止まる truly partial index。
 - 最小間隔と GOP が等しい浮動小数点境界、および adopted cell が複数 raw entry をまたぐ可変 GOP。
 - サムネイル / 波形の段階値一覧、wheel 上下の対応、両端、旧設定由来の段階外値。
+- サムネイル decode run は周辺表示の 0.1 / 1 / 5 / 30 秒間隔で従来のまとまりを保ち、
+  全体表示の 500 秒級では連続 index でもセル単位へ分かれること。索引なしの既定上限でも同じ。
 - 空セルの扱い (先頭 / 末尾)。
 - `SeekRowGesture` の決定 (上ドラッグ / 水平ドラッグ / 斜め / 閾値未満)。
 - 1 回のドラッグ中の pointer 位置列を press-time pointer から変換すると、中心が単調に進み、
@@ -1018,9 +1040,10 @@ enum SeekRowGesture {
   選択除外と非被覆扱い、`Unavailable` の全体終了、D27 の順序付き 3 経路、bitset coverage の
   連続区間合成、chunk bin の全尺列への合成。
 - 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
-- サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
-- サムネイル窓の 30 秒境界が pending セルを typed timeout failure へ確定し、UI / batch 用の理由を
-  失わないこと。
+- サムネイルセルの `pending / ready / retrying / trigger 待ち / failed` 判定と、最新要求の
+  index-level failure の反映。再試行中 / 待機中の表示は素材由来の failure と区別する。
+- サムネイルのセル単位 30 秒境界、1 セルの時間切れ後も同じ run の後続セルを続けること、
+  最初の時間切れ後の 1 回だけの自動再試行、同じ窓で 2 回切れた後は run が増えないこと。
 - 軸解決後の `DecoderUnavailable` だけが strip 全体 notice へ置き換わり、軸失敗 / thread spawn
   failure / cancel は置き換えないこと。
 - index DTS → packet PTS の対応付け、nearest-preceding の境界内 / 境界外、1 セルの不一致が同じ
@@ -1031,6 +1054,8 @@ enum SeekRowGesture {
 ### ワーカー
 
 - 最新勝ちで窓が差し替わっても、復号済みフレームを捨てないこと。
+- 一時的に遅いセルは bounded recovery pass で最終的に ready になり、恒常的に遅いセルは
+  `AwaitingTrigger` で静止すること。素材が壊れているセルは従来どおり typed failure に留まること。
 - cancel (閉じる / 動画切替 / フルスクリーン終了) で確実に止まること。
 - 波形: pre-roll を捨てた bins が、全尺解析の同区間と一致すること (許容誤差内)。
 - 実素材の手動診断は ignored test `probe_app_thumbnail_worker_window_from_env` に

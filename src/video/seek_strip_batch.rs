@@ -16,10 +16,10 @@ use sha2::{Digest, Sha256};
 
 use super::seek_strip::{StripAxis, StripLookahead, compute_strip_window};
 use super::seek_strip_thumbs::{
-    STRIP_THUMB_WINDOW_TIMEOUT_SECS, SeekStripThumbnailWorker, StripAxisDiagnostics,
+    STRIP_THUMB_CELL_TIMEOUT_SECS, SeekStripThumbnailWorker, StripAxisDiagnostics,
     StripAxisResolution, StripAxisResolutionReason, StripThumbnailDecodeDiagnostics,
     StripThumbnailDecodePath, StripThumbnailFailure, StripThumbnailOutcome,
-    StripThumbnailWorkerStatus,
+    StripThumbnailRequestTrigger, StripThumbnailWorkerStatus,
 };
 
 const FALLBACK_MAX_CELLS: usize = 240;
@@ -94,7 +94,8 @@ impl Default for BatchOptions {
             hardware_decode: true,
             minimum_gap_secs: crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
             axis_timeout_secs: 15,
-            window_timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
+            // The production worker may make one bounded recovery pass after a cell timeout.
+            window_timeout_secs: STRIP_THUMB_CELL_TIMEOUT_SECS * 2 + 5,
         }
     }
 }
@@ -850,6 +851,7 @@ fn run_window(
         center_index,
         visible_count,
         StripLookahead::default(),
+        StripThumbnailRequestTrigger::StripRedisplayed,
     );
 
     let mut timed_out = false;
@@ -879,11 +881,7 @@ fn run_window(
     let request_failure = request_result
         .err()
         .map(|error| format!("worker request failed: {error:?}"));
-    let timeout_failure = timed_out.then(|| {
-        failure_text(&StripThumbnailFailure::WindowTimedOut {
-            timeout_secs: options.window_timeout_secs,
-        })
-    });
+    let timeout_failure = timed_out.then(|| window_timeout_text(options.window_timeout_secs));
 
     let mut cells = Vec::new();
     for index in actual_start_index..=actual_end_index {
@@ -1047,10 +1045,11 @@ fn failure_text(failure: &StripThumbnailFailure) -> String {
                 reason.tolerance_after_ms as f64 / 1000.0,
             )
         }
-        StripThumbnailFailure::WindowTimedOut { timeout_secs } => {
-            format!("thumbnail window timed out after {timeout_secs}s")
-        }
     }
+}
+
+fn window_timeout_text(timeout_secs: u64) -> String {
+    format!("thumbnail window timed out after {timeout_secs}s")
 }
 
 fn path_string(path: &Path) -> String {
@@ -1072,9 +1071,9 @@ mod tests {
     }
 
     #[test]
-    fn window_timeout_failure_text_keeps_the_worker_reason() {
+    fn window_timeout_text_keeps_the_harness_reason() {
         assert_eq!(
-            failure_text(&StripThumbnailFailure::WindowTimedOut { timeout_secs: 30 }),
+            window_timeout_text(30),
             "thumbnail window timed out after 30s"
         );
     }
@@ -1083,6 +1082,7 @@ mod tests {
     fn window_positions_anchor_the_true_first_and_final_cells() {
         let axis = StripAxis::TimeGrid {
             interval_secs: 1.0,
+            fallback_interval_secs: 1.0,
             duration_secs: 100.0,
         };
         let centers: Vec<_> = window_positions(&axis)

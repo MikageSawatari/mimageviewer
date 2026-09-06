@@ -11183,7 +11183,7 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::{App, FacetField, subfolder_expansion_synthetic_path};
+    use crate::app::{App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path};
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
     use std::path::PathBuf;
@@ -12315,6 +12315,104 @@ mod phase_c_drill_nav_tests {
             app.grid_edit_badges(7).mask,
             "内側アーカイブとして表示される ZipDir はその本全体を示す"
         );
+    }
+
+    #[test]
+    fn crop_grid_badge_tracks_pages_and_one_level_parent_containers() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let root = PathBuf::from("c:/pics");
+        let image = root.join("cropped.jpg");
+        let folder = root.join("folder");
+        let zip = root.join("book.zip");
+        app.items = vec![
+            GridItem::Image(image.clone()),
+            GridItem::Folder(folder.clone()),
+            GridItem::ZipFile(zip.clone()),
+        ];
+
+        assert!(
+            (0..app.items.len()).all(|idx| !app.grid_edit_badges(idx).crop),
+            "crop が無いページと親コンテナには「切」を出さない"
+        );
+
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(&image));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::normalize_path(
+                &folder.join("page.jpg"),
+            ));
+        app.export_crop_page_keys
+            .insert(crate::adjustment_db::zip_entry_key(&zip, "page.jpg"));
+
+        assert!(app.grid_edit_badges(0).crop, "crop 済みページ自身に出す");
+        assert!(
+            app.grid_edit_badges(1).crop,
+            "直下の crop 済みページをフォルダへ 1 段だけ集約する"
+        );
+        assert!(
+            app.grid_edit_badges(2).crop,
+            "crop 済みページを持つ ZIP へ集約する"
+        );
+    }
+
+    #[test]
+    fn crop_only_page_requests_edit_preview_through_grid_badges() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let image = PathBuf::from("c:/pics/crop-preview.jpg");
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.items = vec![GridItem::Image(image)];
+        app.export_crop_pages.clear();
+        app.export_crop_page_keys.insert(key.clone());
+        assert_eq!(
+            app.grid_edit_badges(0),
+            GridEditBadges {
+                crop: true,
+                ..GridEditBadges::default()
+            }
+        );
+
+        let mut request = crate::thumb_loader::LoadRequest {
+            idx: 0,
+            ..Default::default()
+        };
+        app.attach_edit_preview_to_request(&mut request);
+
+        assert_eq!(request.edit_preview_key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn export_crop_key_set_tracks_persistent_add_and_remove() {
+        use crate::export_crop::{CropAspectMode, CropRect, CropSettings};
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        app.settings.sidecar_backup_enabled = false;
+        let image = app.tmp.path().join("crop-key.jpg");
+        std::fs::write(&image, b"test").unwrap();
+        app.items = vec![GridItem::Image(image.clone())];
+        let key = crate::adjustment_db::normalize_path(&image);
+        let crop = CropSettings::authored(
+            CropRect {
+                min_x: 10.0,
+                min_y: 10.0,
+                max_x: 90.0,
+                max_y: 80.0,
+            },
+            CropAspectMode::Free,
+            [100, 100],
+        );
+
+        app.set_export_crop_for_idx(0, Some(crop), [100, 100]);
+        assert!(app.export_crop_page_keys.contains(&key));
+        assert!(app.grid_edit_badges(0).crop);
+
+        app.set_export_crop_for_idx(0, None, [100, 100]);
+        assert!(!app.export_crop_page_keys.contains(&key));
+        assert!(!app.grid_edit_badges(0).crop);
     }
 
     #[test]
@@ -20902,7 +21000,11 @@ mod favorite_adjustment_defaults_tests {
         use crate::settings::{Settings, SortOrder};
 
         let mut settings = Settings::default();
-        settings.sort_order = SortOrder::DateDesc;
+        settings.remember_favorite_view_state = true;
+        settings.sort_order = SortOrder::FileName;
+        let mut favorite_state = crate::settings::FavoriteViewState::from_settings(&settings);
+        favorite_state.sort_order = SortOrder::DateDesc;
+        settings.apply_favorite_view_overlay(uuid::Uuid::new_v4(), &favorite_state);
         let display_order = settings.grid_display_order.clone();
         let names_and_mtimes = [
             ("10.jpg", 100),
@@ -20937,6 +21039,40 @@ mod favorite_adjustment_defaults_tests {
             .collect();
         assert_eq!(archive_names, ["1.jpg", "2.jpg", "10.jpg", "p03.png"]);
 
+        let mut pdf_pages = vec![
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 9,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from("book.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        let mut pdf_metas = vec![Some((10, 0)), Some((20, 0))];
+        crate::grid_item::arrange_grid_items(
+            &mut pdf_pages,
+            &mut pdf_metas,
+            &display_order,
+            Some(BOOK_READING_PAGE_ORDER),
+        );
+        let pdf_page_numbers: Vec<u32> = pdf_pages
+            .iter()
+            .map(|item| match item {
+                GridItem::PdfPage { page_num, .. } => *page_num,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(pdf_page_numbers, [1, 9]);
+
+        assert_eq!(
+            folder_media_sort_order(settings.sort_order, false, true, true, true),
+            BOOK_READING_PAGE_ORDER,
+            "画像のみの本もお気に入りの一覧ソートよりページ順を優先する"
+        );
+
         let mut normal_pages: Vec<GridItem> = names_and_mtimes
             .iter()
             .map(|(name, _)| GridItem::Image(PathBuf::from(name)))
@@ -20959,6 +21095,11 @@ mod favorite_adjustment_defaults_tests {
             })
             .collect();
         assert_eq!(normal_names, ["2.jpg", "1.jpg", "p03.png", "10.jpg"]);
+        assert_eq!(
+            settings.sort_order,
+            SortOrder::DateDesc,
+            "通常フォルダではお気に入りの一覧ソートが有効"
+        );
     }
 
     #[test]
@@ -23095,6 +23236,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             None,
             None,
+            None,
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
@@ -23135,6 +23277,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -24374,6 +24517,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -48552,6 +48696,8 @@ mod still_window_mode_key_tests {
         app.adjusted_page_keys.insert(format!("{old_k}2/other.jpg"));
         app.mask_page_keys.insert(old_k.clone());
         app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
+        app.export_crop_page_keys
+            .insert(format!("{old_k}/cropped.jpg"));
         app.settings
             .video_resume_positions
             .insert(format!("{old_k}/v.mp4"), 12.0);
@@ -48575,6 +48721,14 @@ mod still_window_mode_key_tests {
         assert!(app.mask_page_keys.contains(&new_k), "exact キーも移る");
         assert!(app.comic_page_keys.contains(&format!("{new_k}::p1.jpg")));
         assert!(!app.comic_page_keys.contains(&format!("{old_k}::p1.jpg")));
+        assert!(
+            app.export_crop_page_keys
+                .contains(&format!("{new_k}/cropped.jpg"))
+        );
+        assert!(
+            !app.export_crop_page_keys
+                .contains(&format!("{old_k}/cropped.jpg"))
+        );
         assert_eq!(
             app.settings
                 .video_resume_positions
@@ -60610,6 +60764,124 @@ mod ctrl_f_structural_filter_tests {
         }
     }
 
+    fn png_with_xmp_tweet_id(tweet_id: &str) -> Vec<u8> {
+        let xml = format!(
+            r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+<rdf:Description rdf:about='' xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'>
+<xtw:TweetId>{tweet_id}</xtw:TweetId>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut payload = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        payload.extend_from_slice(xml.as_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"iTXt");
+        png.extend_from_slice(&payload);
+        png.extend_from_slice(&[0_u8; 4]);
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0_u8; 4]);
+        png
+    }
+
+    #[test]
+    fn metadata_search_parallel_pass2_deduplicates_xmp_additions_by_normalized_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("duplicate.png");
+        std::fs::write(&path, png_with_xmp_tweet_id("dedup-123")).unwrap();
+        let items = vec![GridItem::Image(path.clone()), GridItem::Image(path.clone())];
+        let tokens = crate::search_query::parse("dedup-123");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+
+        let SearchThreadResult::Done {
+            matches,
+            xmp_additions,
+        } = run_metadata_search(
+            &tokens,
+            &items,
+            &xmp,
+            None,
+            &passwords,
+            &crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::XmpTweet]),
+            crate::search_query::MatchMode::And,
+            &cancel,
+            Some(&progress),
+        );
+
+        assert_eq!(matches, std::collections::HashSet::from([0, 1]));
+        assert_eq!(
+            xmp_additions.len(),
+            1,
+            "duplicate normalized path must publish only one XMP addition"
+        );
+        assert_eq!(
+            xmp_additions[0].0,
+            crate::adjustment_db::normalize_path(&path)
+        );
+        assert_eq!(
+            progress.snapshot(),
+            SearchProgressSnapshot {
+                done: 2,
+                total: 2,
+                matched: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_search_cancel_returns_completed_parallel_matches() {
+        let items: Vec<GridItem> = (0..100_000)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("C:\\\\g\\\\hit-{idx}.jpg"))))
+            .collect();
+        let tokens = crate::search_query::parse("hit-");
+        let xmp = std::collections::HashMap::new();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_metadata_search(
+                    &tokens,
+                    &items,
+                    &xmp,
+                    None,
+                    &passwords,
+                    &target,
+                    crate::search_query::MatchMode::And,
+                    &cancel,
+                    Some(&progress),
+                )
+            });
+            while progress.snapshot().done == 0 && !worker.is_finished() {
+                std::thread::yield_now();
+            }
+            cancel.store(true, Ordering::Relaxed);
+            worker.join().unwrap()
+        });
+
+        let SearchThreadResult::Done { matches, .. } = result;
+        let snapshot = progress.snapshot();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(
+            !matches.is_empty(),
+            "matches completed before cancellation must not be discarded"
+        );
+        assert_eq!(
+            matches.len(),
+            snapshot.done,
+            "every completed filename-only item matched and must be returned"
+        );
+        assert!(snapshot.done <= snapshot.total);
+    }
+
     #[test]
     fn structural_items_filtered_by_name() {
         // §4.1: フォルダ / ZIP / 変換対象アーカイブもファイル名で一貫して絞り込む。
@@ -61280,6 +61552,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     app.conceal_page_keys.insert(key.clone());
     app.comic_page_keys.insert(key.clone());
     app.rotation_page_keys.insert(key.clone());
+    app.export_crop_page_keys.insert(key.clone());
     app.tags_cache.insert(key.clone(), vec!["old".into()]);
 
     app.apply_metadata_cleanup_result(&crate::metadata_cleanup::DeleteReport {
@@ -61294,6 +61567,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     assert!(!app.conceal_page_keys.contains(&key));
     assert!(!app.comic_page_keys.contains(&key));
     assert!(!app.rotation_page_keys.contains(&key));
+    assert!(!app.export_crop_page_keys.contains(&key));
     assert!(!app.tags_cache.contains_key(&key));
 }
 
@@ -69852,6 +70126,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarAndStrip,
             fixed_bar_gap_px: 12,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::Medium,
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
         assert_eq!(config_for(requested).bar_lock, requested);
     }
@@ -69864,6 +70140,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             bottom_lock: crate::settings::VideoBottomLock::BarOnly,
             fixed_bar_gap_px: crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX + 40,
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
+            seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };
         assert_eq!(
             config_for(requested).bar_lock.fixed_bar_gap_px,

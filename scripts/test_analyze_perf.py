@@ -21,6 +21,7 @@ from analyze_perf import (
     analyze_idle_health,
     cmd_colorize,
     cmd_idle_health,
+    cmd_metadata_search,
     cmd_page_turn,
     cmd_pre_grid,
     cmd_remote_page,
@@ -311,6 +312,34 @@ def remote_page_stage(
         "bytes": pixels * 4,
         "outcome": outcome,
     }
+
+
+class MetadataSearchReportTests(unittest.TestCase):
+    def test_reports_pass_timings_bytes_and_unmeasured_video_reads(self):
+        events = [
+            {
+                "t": 1.0,
+                "cat": "search",
+                "kind": "metadata_filter_done",
+                "pass1_ms": 2.0,
+                "pass2_ms": 8.0,
+                "total_ms": 10.0,
+                "items_scanned": 20,
+                "items_total": 20,
+                "pass2_file_reads": 12,
+                "bytes_read": 1024 * 1024,
+                "matches": 3,
+                "cancelled": False,
+                "unmeasured_video_reads": 1,
+            }
+        ]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_metadata_search(events)
+        report = out.getvalue()
+        self.assertIn("10.0", report)
+        self.assertIn("1.000 MiB", report)
+        self.assertIn("動画 read 1 件", report)
 
 
 class RemotePageReportTests(unittest.TestCase):

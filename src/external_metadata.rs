@@ -93,18 +93,41 @@ pub fn sidecar_signature(image_path: &Path) -> Option<SidecarSig> {
 /// サイズ超過・パース失敗・不正文字コードは `None` + ログ 1 行に倒す。
 /// 戻り値は **未正規化** (呼び出し側が `normalize_for_match` を適用する)。
 pub fn read_search_text(image_path: &Path) -> Option<String> {
-    let (path, md) = detect_with_meta(image_path)?;
+    read_search_text_counted(image_path).text
+}
+
+pub(crate) struct SidecarTextRead {
+    pub text: Option<String>,
+    pub bytes_read: u64,
+}
+
+pub(crate) fn read_search_text_counted(image_path: &Path) -> SidecarTextRead {
+    let Some((path, md)) = detect_with_meta(image_path) else {
+        return SidecarTextRead {
+            text: None,
+            bytes_read: 0,
+        };
+    };
     if md.len() > MAX_SIDECAR_BYTES {
         crate::logger::log(format!(
             "external_metadata: sidecar too large ({} bytes), skipping: {}",
             md.len(),
             path.display()
         ));
-        return None;
+        return SidecarTextRead {
+            text: None,
+            bytes_read: 0,
+        };
     }
-    let raw = std::fs::read(&path).ok()?;
+    let Ok(raw) = std::fs::read(&path) else {
+        return SidecarTextRead {
+            text: None,
+            bytes_read: 0,
+        };
+    };
+    let bytes_read = raw.len() as u64;
     let bytes = strip_utf8_bom(&raw);
-    if is_json_ext(&path) {
+    let text = if is_json_ext(&path) {
         match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(v) => {
                 let mut out = String::new();
@@ -124,7 +147,8 @@ pub fn read_search_text(image_path: &Path) -> Option<String> {
         let text = String::from_utf8_lossy(bytes);
         let capped = truncate_on_char_boundary(&text, MAX_TEXT_BYTES);
         (!capped.trim().is_empty()).then(|| capped.to_string())
-    }
+    };
+    SidecarTextRead { text, bytes_read }
 }
 
 /// 右パネル表示用のサイドカー内容。JSON は構造を保ったまま (key も表示する) ツリー描画し、

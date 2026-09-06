@@ -1623,6 +1623,172 @@ pub(super) fn mark_ctrl_f_progress(progress: Option<&SearchProgressShared>, matc
     }
 }
 
+const METADATA_SEARCH_PASS2_THREADS: usize = 8;
+
+struct MetadataSearchXmpRead {
+    value: Option<crate::xmp_reader::XmpTweetInfo>,
+    bytes_read: u64,
+}
+
+type MetadataSearchXmpSlots = std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::OnceLock<MetadataSearchXmpRead>>>,
+>;
+
+struct MetadataSearchItemResult {
+    idx: usize,
+    matched: bool,
+    read_key: Option<String>,
+    bytes_read: u64,
+    unmeasured_video_read: bool,
+}
+
+struct MetadataSearchPass2<'a> {
+    tokens: &'a [crate::search_query::Token],
+    xmp_snapshot: &'a std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    mode: crate::search_query::MatchMode,
+    cancel: &'a AtomicBool,
+    progress: Option<&'a SearchProgressShared>,
+    use_name: bool,
+    use_png: bool,
+    use_exif: bool,
+    use_xmp: bool,
+    use_video_meta: bool,
+    use_sidecar: bool,
+    fallback_contributes: bool,
+    xmp_slots: MetadataSearchXmpSlots,
+}
+
+impl MetadataSearchPass2<'_> {
+    fn process(&self, idx: usize, item: &GridItem) -> Option<MetadataSearchItemResult> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (path, is_image) = match item {
+            GridItem::Image(path) => (path, true),
+            GridItem::Video(path) => (path, false),
+            _ => return None,
+        };
+        if !self.fallback_contributes {
+            mark_ctrl_f_progress(self.progress, false);
+            return Some(MetadataSearchItemResult {
+                idx,
+                matched: false,
+                read_key: None,
+                bytes_read: 0,
+                unmeasured_video_read: false,
+            });
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let mut bytes_read = 0_u64;
+        let mut read_any = false;
+        let mut unmeasured_video_read = false;
+        let (meta_text, meta_origin) = if is_image && self.use_png && is_ai_metadata_path(path) {
+            let read = crate::png_metadata::build_searchable_from_path_counted(path);
+            bytes_read = bytes_read.saturating_add(read.bytes_read);
+            read_any |= read.bytes_read > 0;
+            (read.text, read.origin)
+        } else {
+            (String::new(), None)
+        };
+        let name_for_hay = if self.use_name { name.as_str() } else { "" };
+        let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
+        let matched = match crate::search_query::decide_partial_with_mode(
+            self.tokens,
+            &hay_no_xmp,
+            self.mode,
+        ) {
+            crate::search_query::PartialResult::Decided(value) => value,
+            crate::search_query::PartialResult::NeedsMore => {
+                let key = crate::adjustment_db::normalize_path(path);
+                let xmp_opt = if self.use_xmp {
+                    if let Some(cached) = self.xmp_snapshot.get(&key) {
+                        cached.clone()
+                    } else {
+                        let slot =
+                            {
+                                let mut slots = self.xmp_slots.lock().unwrap();
+                                std::sync::Arc::clone(slots.entry(key.clone()).or_insert_with(
+                                    || std::sync::Arc::new(std::sync::OnceLock::new()),
+                                ))
+                            };
+                        let read = slot.get_or_init(|| {
+                            let read = crate::xmp_reader::read_tweet_info_counted(path);
+                            MetadataSearchXmpRead {
+                                value: read.info,
+                                bytes_read: read.bytes_read,
+                            }
+                        });
+                        read_any |= read.bytes_read > 0;
+                        read.value.clone()
+                    }
+                } else {
+                    None
+                };
+
+                let mut extended_meta = meta_text;
+                if is_image && self.use_exif {
+                    let read = crate::exif_reader::read_exif_counted(path, &[]);
+                    bytes_read = bytes_read.saturating_add(read.bytes_read);
+                    read_any |= read.bytes_read > 0;
+                    if let Some(exif) = read.info {
+                        let exif_part = exif_hay(
+                            &exif,
+                            meta_origin.is_some_and(|origin| origin.suppresses_exif_user_comment()),
+                        );
+                        if !exif_part.is_empty() {
+                            if !extended_meta.is_empty() {
+                                extended_meta.push('\n');
+                            }
+                            extended_meta.push_str(&exif_part);
+                        }
+                    }
+                }
+                if !is_image && self.use_video_meta {
+                    // FFmpeg の demux I/O バイト数は取得できないが、file read 件数には含める。
+                    read_any = true;
+                    unmeasured_video_read = true;
+                    let video_meta = crate::ingest_text::build_video_metadata_text(path);
+                    if !video_meta.is_empty() {
+                        if !extended_meta.is_empty() {
+                            extended_meta.push('\n');
+                        }
+                        extended_meta.push_str(&video_meta);
+                    }
+                }
+                if is_image && self.use_sidecar {
+                    let read = crate::external_metadata::read_search_text_counted(path);
+                    bytes_read = bytes_read.saturating_add(read.bytes_read);
+                    read_any |= read.bytes_read > 0;
+                    if let Some(sidecar_text) = read.text
+                        && !sidecar_text.is_empty()
+                    {
+                        if !extended_meta.is_empty() {
+                            extended_meta.push('\n');
+                        }
+                        extended_meta.push_str(&sidecar_text);
+                    }
+                }
+                let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
+                crate::search_query::matches_with_mode(self.tokens, &hay, self.mode)
+            }
+        };
+
+        mark_ctrl_f_progress(self.progress, matched);
+        Some(MetadataSearchItemResult {
+            idx,
+            matched,
+            read_key: read_any.then(|| crate::adjustment_db::normalize_path(path)),
+            bytes_read,
+            unmeasured_video_read,
+        })
+    }
+}
+
 /// Ctrl+F メタデータ検索のワーカー本体。UI スレッドから spawn され、結果は
 /// `SearchPending.rx` で受信される。`cancel` が立ったら中断して Cancelled を返す
 /// (呼び出し側はキャンセル時に Pending をクリアするので Done のみ送る実装でも OK)。
@@ -1641,12 +1807,10 @@ pub(super) fn run_metadata_search(
     // 判定する (docs/search-container-item-redesign.md §4.1)。構造アイテム
     // (Folder / ZipFile / PdfFile / ZipImage) も「持っている次元」で一貫して
     // 絞り込む: ファイル名は全種別が持ち、PDF は document info も持つ。
+    let total_started = std::time::Instant::now();
+    let pass1_started = total_started;
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
-    let mut additions_lookup: std::collections::HashMap<
-        String,
-        Option<crate::xmp_reader::XmpTweetInfo>,
-    > = std::collections::HashMap::new();
+    let mut scanned_items = 0_usize;
 
     // §19 target フィルタ: target が含むソースだけを判定対象にする。
     let use_name = target.includes(crate::fts_index::SourceKind::Filename);
@@ -1670,10 +1834,7 @@ pub(super) fn run_metadata_search(
     // 全件非表示になる ("タグで絞ったらタグを持つアイテムだけ残る" = 正しい挙動)。
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done {
-                matches,
-                xmp_additions,
-            };
+            break;
         }
         let processed_in_pass1 = match item {
             GridItem::Folder(_)
@@ -1762,114 +1923,123 @@ pub(super) fn run_metadata_search(
             }
         };
         if processed_in_pass1 {
+            scanned_items += 1;
             mark_ctrl_f_progress(progress, matches.contains(&idx));
         }
     }
+    let pass1_ms = pass1_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Pass 2: Image / Video — cheap hay で決まらなければ XMP / 動画メタを lazy 読み取り
-    // (ファイル I/O)。target フィルタの use_* / fallback_contributes は Pass 1 の
-    // 手前で算出済み。単一ソース選択時はそのソース由来の文字列だけで hay を作る。
-    for (idx, item) in items.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return SearchThreadResult::Done {
-                matches,
-                xmp_additions,
-            };
-        }
-        let (path, is_image) = match item {
-            GridItem::Image(p) => (p, true),
-            GridItem::Video(p) => (p, false),
-            _ => continue,
-        };
-        // INDEX_VERSION=5 で fts_meta fast path は廃止 (原文は Tantivy 側 STORED)。
-        // Ctrl+F は表示中の数十〜数千件しか触らないので、毎回 on-demand 経路に回す。
-        // target が画像系ソース
-        // (Filename/PngPrompt/Exif/XmpTweet) を一つも含まないなら、fallback hay は常に
-        // 空になり matches は必ず false → file I/O もバイト走査も全て無駄。
-        if !fallback_contributes {
-            mark_ctrl_f_progress(progress, false);
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        // 最初は PNG tEXt だけ読む (cheap hay)。EXIF / XMP は NeedsMore の時だけ lazy 読み。
-        let (meta_text, meta_origin) = if is_image && use_png && is_ai_metadata_path(path) {
-            crate::png_metadata::build_searchable_from_path_with_origin(path)
-        } else {
-            (String::new(), None)
-        };
-        let name_for_hay = if use_name { name.as_str() } else { "" };
-        let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
-        match crate::search_query::decide_partial_with_mode(tokens, &hay_no_xmp, mode) {
-            crate::search_query::PartialResult::Decided(true) => {
-                matches.insert(idx);
+    // Pass 2 だけを専用 8-thread pool で実行する。Ctrl+F は利用者が完了を待つ
+    // foreground 処理なので ActivityGate には載せない。
+    let pass2_started = std::time::Instant::now();
+    let pass2 = MetadataSearchPass2 {
+        tokens,
+        xmp_snapshot,
+        mode,
+        cancel,
+        progress,
+        use_name,
+        use_png,
+        use_exif,
+        use_xmp,
+        use_video_meta,
+        use_sidecar,
+        fallback_contributes,
+        xmp_slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+    let pass2_results: Vec<MetadataSearchItemResult> = if cancel.load(Ordering::Relaxed) {
+        Vec::new()
+    } else {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(METADATA_SEARCH_PASS2_THREADS)
+            .thread_name(|idx| format!("metadata-search-pass2-{idx}"))
+            .build()
+        {
+            Ok(pool) => {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    items
+                        .par_iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| pass2.process(idx, item))
+                        .collect()
+                })
             }
-            crate::search_query::PartialResult::Decided(false) => {}
-            crate::search_query::PartialResult::NeedsMore => {
-                let key = crate::adjustment_db::normalize_path(path);
-                // XMP は target に含まれる場合のみ読む (I/O 節約)
-                let xmp_opt = if use_xmp {
-                    if let Some(cached) = xmp_snapshot.get(&key) {
-                        cached.clone()
-                    } else if let Some(added) = additions_lookup.get(&key) {
-                        added.clone()
-                    } else {
-                        let xmp = crate::xmp_reader::read_tweet_info(path);
-                        additions_lookup.insert(key.clone(), xmp.clone());
-                        xmp_additions.push((key.clone(), xmp.clone()));
-                        xmp
-                    }
-                } else {
-                    None
-                };
-                // EXIF も同じく target に含まれる時だけ
-                let mut extended_meta = meta_text.clone();
-                if is_image && use_exif {
-                    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
-                        let exif_part = exif_hay(
-                            &exif,
-                            meta_origin.is_some_and(|o| o.suppresses_exif_user_comment()),
-                        );
-                        if !exif_part.is_empty() {
-                            if !extended_meta.is_empty() {
-                                extended_meta.push('\n');
-                            }
-                            extended_meta.push_str(&exif_part);
-                        }
-                    }
-                }
-                if !is_image && use_video_meta {
-                    let video_meta = crate::ingest_text::build_video_metadata_text(path);
-                    if !video_meta.is_empty() {
-                        if !extended_meta.is_empty() {
-                            extended_meta.push('\n');
-                        }
-                        extended_meta.push_str(&video_meta);
-                    }
-                }
-                // 外部メタデータサイドカー (FS 画像のみ): 同名 JSON/TXT の値テキストを
-                // on-demand 読みして hay に載せる (docs §14-5)。matches_with_mode が hay を
-                // lowercase するので未正規化テキストのままで照合できる。
-                if is_image && use_sidecar {
-                    if let Some(sc_text) = crate::external_metadata::read_search_text(path) {
-                        if !sc_text.is_empty() {
-                            if !extended_meta.is_empty() {
-                                extended_meta.push('\n');
-                            }
-                            extended_meta.push_str(&sc_text);
-                        }
-                    }
-                }
-                let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
-                if crate::search_query::matches_with_mode(tokens, &hay, mode) {
-                    matches.insert(idx);
-                }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "metadata search: failed to build dedicated rayon pool; running sequentially: {error}"
+                ));
+                items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, item)| pass2.process(idx, item))
+                    .collect()
             }
         }
-        mark_ctrl_f_progress(progress, matches.contains(&idx));
+    };
+
+    let pass2_items = pass2_results.len();
+    scanned_items = scanned_items.saturating_add(pass2_items);
+    let mut read_keys = std::collections::HashSet::new();
+    let mut bytes_read = 0_u64;
+    let mut unmeasured_video_reads = 0_usize;
+    for result in pass2_results {
+        if result.matched {
+            matches.insert(result.idx);
+        }
+        if let Some(key) = result.read_key {
+            read_keys.insert(key);
+        }
+        bytes_read = bytes_read.saturating_add(result.bytes_read);
+        unmeasured_video_reads += usize::from(result.unmeasured_video_read);
+    }
+
+    // OnceLock を path ごとの単一 producer にするため、同じ正規化 path が items に
+    // 重複しても XMP 読みと addition は 1 回だけ。呼び出し側は key で cache へ
+    // merge するだけで順序非依存だが、診断とテストを安定させるため key 順にする。
+    let mut xmp_additions = Vec::new();
+    {
+        let slots = pass2.xmp_slots.lock().unwrap();
+        for (key, slot) in slots.iter() {
+            if let Some(read) = slot.get() {
+                bytes_read = bytes_read.saturating_add(read.bytes_read);
+                if read.bytes_read > 0 {
+                    read_keys.insert(key.clone());
+                }
+                xmp_additions.push((key.clone(), read.value.clone()));
+            }
+        }
+    }
+    xmp_additions.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let pass2_ms = pass2_started.elapsed().as_secs_f64() * 1000.0;
+    let cancelled = cancel.load(Ordering::Relaxed);
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "search",
+            "metadata_filter_done",
+            None,
+            0,
+            &[
+                ("pass1_ms", serde_json::Value::from(pass1_ms)),
+                ("pass2_ms", serde_json::Value::from(pass2_ms)),
+                (
+                    "total_ms",
+                    serde_json::Value::from(total_started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("items_total", serde_json::Value::from(items.len())),
+                ("items_scanned", serde_json::Value::from(scanned_items)),
+                ("pass2_items", serde_json::Value::from(pass2_items)),
+                ("pass2_file_reads", serde_json::Value::from(read_keys.len())),
+                ("bytes_read", serde_json::Value::from(bytes_read)),
+                ("matches", serde_json::Value::from(matches.len())),
+                ("cancelled", serde_json::Value::from(cancelled)),
+                (
+                    "unmeasured_video_reads",
+                    serde_json::Value::from(unmeasured_video_reads),
+                ),
+            ],
+        );
     }
 
     SearchThreadResult::Done {

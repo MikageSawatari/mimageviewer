@@ -424,6 +424,14 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   セル外のクリックと一覧差し替えでも対を終了する。egui の triple click は一覧の起動判定には
   使わず、テキスト欄の行選択など他 widget の動作は変更しない
 - サムネイル表示では、選択中セルの下にサムネイル情報ツールチップを表示する。既定はファイル名と画像解像度、動画・音声ではファイル名と長さ、ZIP / PDF / 画像のみフォルダ / 親 ZIP 内の子 ZIP・RAR / 直読み RAR ではページ数も表示する。表示内容は環境設定 → 表示 → サムネイルで、種類 / ページ数 / サイズ / 更新日時 / 作成日時 / 動画解像度 / コーデック / 親フォルダ名 / 場所 / 閲覧履歴の最終閲覧 / 閲覧履歴の閲覧位置を切り替えられる (長さ・コーデックは動画・音声の両方)。閲覧履歴ビューでは、ホバー tooltip に場所 / 最終閲覧日時 / 閲覧位置を表示する (複数フォルダ・ドライブの同名本を場所で判別できるようにする)。ツールチップ幅はセル幅固定ではなく最大約 2.5 セル分を使い、画面右端ではセル右端に合わせて画面内に収める。ページ数や長さなど未取得の値は選択中の 1 件だけバックグラウンドで遅延取得する。詳細表示では行のテキストツールチップを出さず、列と下部情報バーで同じ情報を確認する。ただし、プレビューアイコンへ重ねたときに別 viewport で開く大きなサムネイルプレビューは維持する
+- 環境設定「表示 → サムネイル」の「お気に入りごとに表示状態を記憶する」(既定 OFF) を
+  ON にすると、最も深く一致するお気に入りごとに、サムネイル / 詳細、サムネイルサイズ、
+  比率 / 自動比率、カテゴリ表示順、一覧ソート、単ページ / 見開き、連結方式を自動記憶・復元する。
+  初回は入った直前の有効値を継承し、変更は 500ms debounce で保存する。ツールチップ項目、
+  詳細列の順序・幅・選択列は共通のまま。ZIP / CBZ / PDF / 変換書庫と画像本のページ順には
+  お気に入りソートを適用せず、既存の本ページ順を優先する。OFF は適用・更新だけを止め、記録は
+  保持する。環境設定から対象項目を変えた場合は常に標準の値を更新し、適用中のお気に入り専用値と
+  その記録は変えない。お気に入り編集から 1 件、環境設定から全件をリセットできる
 - **仮想スクロール実装**（下記詳細参照）
 
 ---
@@ -590,8 +598,9 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   対象にする。判定は保存済み編集DBの page_path キーで行い、フィルタ時にフォルダや書庫を
   追加走査しない。変換済み RAR / 7z / LZH は、元アーカイブと有効な cache ZIP のページキーを
   どちらも親ロールアップ対象にする。`補` はページ個別補正だけを対象にし、グローバル標準・お気に入り標準は含めない。
-  サムネイル左上の編集バッジ (`補` / `レ` / `消` / `隠` / `文`) と詳細表示の状態列は、
+  サムネイル左上の編集バッジ (`補` / `レ` / `消` / `隠` / `文` / `切`) と詳細表示の状態列は、
   保存済み編集を 1 つ上の見える親にだけ表示し、子フォルダや直下書庫内ページをさらに上位フォルダへは伝播しない。
+  `切` は、書き出しに反映される切り取り範囲が保存済みであることを表す。
 - 状態フィルタの `ブックマークあり / ブックマークなし` は動画・音声・本を横断する。動画・音声は
   対象ファイルに 1 件以上あるか、本の親セルは対象コンテナに登録ページが 1 件以上あるか、開いている
   画像フォルダ / ZIP / PDF / 対応アーカイブでは現在ページの安定 identity が登録済みかで判定する。
@@ -795,6 +804,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   表示だけの設定で、境界判定、読み込み、加工、先読みの実行は変えない。表示できる画像が
   まだ 1 枚もないページ中央の「読込中...」は、設定にかかわらず表示する。
 - 静止画 / 本の下部ページシークバーはトラック下側にページ目盛りを描く。見開きではページ総数ではなく、つまみと同じ表示ユニット数を目盛りの分母に使う。目盛り位置はページ番号の 1 / 2 / 5 系へ揃えて幅に応じて間引き、右→左の実効方向では既存のつまみ座標変換を共有する
+- 静止画 / 本のページシークバーには、既定 OFF のサムネイル列を表示できる。通常画像、ZIP / CBZ、PDF、変換済みアーカイブを同じ source page 単位で扱い、現在ページを中心に表示幅ぶんと前後 2 セルだけを既存サムネイル worker の priority 要求へ載せる。見開きでは現在ユニットの 1〜2 ページを強調し、RTL では並びを反転する。セルのクリック / ドラッグと通常トラックは同じ位置解決と着地契約を通る
+- 静止画シーク位置へマウスを置くと、指している 1 ページの既存サムネイルをバー上の吹き出しへ表示する。画面端では内側へ clamp し、未ロード中は placeholder を表示する。要求は 1 枚だけの priority 要求で、新しい worker は持たない。表示方針は常時表示（既定）/ サムネイル列表示中は非表示 / 常時非表示から選び、非表示時は要求も発行しない
+- 静止画サムネイル列の高さは大 104 / 中 72 / 小 48 / 最小 36pt、セル幅は 152 / 102 / 64 / 45pt の対応を使う。下部バー固定中はサムネイル列と通常バーの解決済み合計高を media rect、左右パネル、タッチハンドル、パン帯、ページ番号の回避量へ渡す。非固定中は従来どおり overlay とする。サムネイル列表示中の通常バーは表示（既定）/ 非表示を選べ、非表示でも列の移動操作は残る
 - 静止画 / 動画 / 音楽フルスクリーンの左右パネルは「通常ホバー」と「クリック表示」を選べる。通常ホバーは左端と右端で対応するパネルだけを個別に表示し、一度開いた後は実パネルの周囲に画面幅連動の維持余白を持たせ、余白の外へ出るまで閉じない。クリック表示は左右最端の細い呼び出しバーをクリックして開き、現在ファイルでは明示的に閉じるまで維持する。タッチでは可視ハンドルから閉じている側を直接開き、開いた側のハンドルは消す。音楽ビューは同じビューポートで最初のタッチを観測した後、上下 HUD 間の既存左右余白内へハンドルを常時表示し、狭幅で余白が 24pt 未満なら表示しない。左右ともファイル移動とフルスクリーン退出で閉じ、再入場へ開状態を持ち越さない（音楽のハンドル表示条件だけは曲移動で解除しない）。左右いずれかのパネルが表示中は上バーと下バー / HUD も同時表示する (音楽は上下常時表示)。I / Tab、上部バーの i、画像リング / ゲームパッド操作は永続する表示モードの切替に使う
 - 右情報パネルのロック: タイトルバーの鍵ボタンで固定する。ロック中は画像へ重ねず、右へ
   パネル幅の領域を確保し、画像の表示領域を残りへ再解決する (`fullscreen_media_rect` が
@@ -1735,6 +1747,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 |--------|-----|---------|------|
 | `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
 | `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
+| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `thumb_px` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / PageCount / Place / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
@@ -1848,6 +1861,10 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
+| `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |
+| `still_seek_strip_height` | enum | `large` | 静止画サムネイル列の高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt |
+| `still_seek_hover_preview_mode` | enum | `always` | 静止画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never` |
+| `still_seek_bar_with_strip` | enum | `show` | 静止画サムネイル列表示中の通常シークバー。`show` / `hide` |
 | `fullscreen_top_bar_locked` | bool | false | 静止画フルスクリーンの上部情報バーを固定表示する。ON のときは上端のバー領域を画像フィット範囲から除外する |
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
@@ -1913,6 +1930,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_seek_strip_height` | enum | `large` | シークストリップの高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt。低いほど全体表示で一度に並ぶ枚数が増える |
 | `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
+| `video_seek_hover_preview_mode` | enum | `always` | 動画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never`。波形表示は thumbnail strip と数えない |
+| `video_seek_bar_with_strip` | enum | `show` | 動画の場面サムネイルストリップ表示中の通常シークバー。`show` / `hide`。波形表示には適用しない |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |

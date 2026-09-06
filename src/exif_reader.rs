@@ -3,7 +3,163 @@
 //! JPEG/TIFF 等の画像ファイルから撮影情報 (カメラ, レンズ, 露出, GPS 等) を抽出する。
 //! `rexif` crate を使用（`kamadak-exif` より寛容なパーサー）。
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// JPEG は SOS より後ろに EXIF を持てないため、そこまでの prefix だけを rexif に渡す。
+/// 壊れた marker chain が巨大領域を指しても全体読みに戻らないための上限。
+const MAX_JPEG_EXIF_PREFIX_BYTES: u64 = 16 * 1024 * 1024;
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for CountingReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+pub(crate) struct RexifPathRead {
+    pub exif: Option<rexif::ExifData>,
+    pub bytes_read: u64,
+}
+
+/// ファイル形式を先頭 magic で分けて rexif 用 bytes を読む。
+///
+/// JPEG は marker header だけ逐次読みし、segment body を seek して SOS/EOI の位置を
+/// 求めた後、その prefix だけを読む。上限超過・破損・EXIF 無しは明示的に `None`
+/// とし、`parse_file` や全体読みへ fallback しない。TIFF は任意 offset の IFD を
+/// 保てるよう従来どおり全体を読むが、JPEG fallback と混同しないよう magic で分岐する。
+pub(crate) fn read_rexif_from_path(path: &Path) -> RexifPathRead {
+    let Ok(file) = std::fs::File::open(path) else {
+        return RexifPathRead {
+            exif: None,
+            bytes_read: 0,
+        };
+    };
+    let mut reader = CountingReader::new(file);
+    let bytes = (|| -> std::io::Result<Option<Vec<u8>>> {
+        let mut magic = [0_u8; 4];
+        reader.read_exact(&mut magic)?;
+        if magic[..2] == [0xff, 0xd8] {
+            return read_jpeg_prefix(&mut reader, MAX_JPEG_EXIF_PREFIX_BYTES);
+        }
+        if magic == *b"II*\0" || magic == *b"MM\0*" {
+            reader.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            return Ok(Some(bytes));
+        }
+        Ok(None)
+    })()
+    .ok()
+    .flatten();
+    let exif = bytes.and_then(|bytes| rexif::parse_buffer(&bytes).ok());
+    RexifPathRead {
+        exif,
+        bytes_read: reader.bytes_read,
+    }
+}
+
+fn read_jpeg_prefix<R: Read + Seek>(
+    reader: &mut CountingReader<R>,
+    max_prefix_bytes: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut soi = [0_u8; 2];
+    reader.read_exact(&mut soi)?;
+    if soi != [0xff, 0xd8] {
+        return Ok(None);
+    }
+
+    let prefix_end = loop {
+        let marker_start = reader.stream_position()?;
+        if marker_start > max_prefix_bytes {
+            return Ok(None);
+        }
+
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte)?;
+        if reader.stream_position()? > max_prefix_bytes {
+            return Ok(None);
+        }
+        if byte[0] != 0xff {
+            return Ok(None);
+        }
+        // JPEG は marker 間に任意個の 0xff fill byte を許す。
+        loop {
+            reader.read_exact(&mut byte)?;
+            if reader.stream_position()? > max_prefix_bytes {
+                return Ok(None);
+            }
+            if byte[0] != 0xff {
+                break;
+            }
+        }
+        let marker = byte[0];
+        if marker == 0x00 {
+            return Ok(None);
+        }
+        match marker {
+            // Start of Scan / End of Image。EXIF は必ずこれらより前にある。
+            0xda | 0xd9 => break marker_start,
+            // SOI / restart marker / TEM は length field を持たない。
+            0xd8 | 0xd0..=0xd7 | 0x01 => continue,
+            _ => {}
+        }
+
+        let mut length_bytes = [0_u8; 2];
+        reader.read_exact(&mut length_bytes)?;
+        if reader.stream_position()? > max_prefix_bytes {
+            return Ok(None);
+        }
+        let length = u16::from_be_bytes(length_bytes);
+        if length < 2 {
+            return Ok(None);
+        }
+        let skip = u64::from(length - 2);
+        let Some(next_marker) = reader.stream_position()?.checked_add(skip) else {
+            return Ok(None);
+        };
+        if next_marker > max_prefix_bytes {
+            return Ok(None);
+        }
+        reader.seek(SeekFrom::Current(i64::from(length - 2)))?;
+    };
+
+    if prefix_end > max_prefix_bytes {
+        return Ok(None);
+    }
+    let prefix_len = usize::try_from(prefix_end).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "JPEG EXIF prefix length does not fit usize",
+        )
+    })?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut prefix = vec![0_u8; prefix_len];
+    reader.read_exact(&mut prefix)?;
+    Ok(Some(prefix))
+}
 
 /// EXIF タグの意味的グループ。
 /// メタデータパネルのセクション分けと、preferences の非表示タグ設定 UI が共有する。
@@ -58,8 +214,24 @@ pub struct ExifInfo {
 /// ファイルから EXIF 情報を読み取る。EXIF が無い場合は None。
 /// `hidden_tags` に含まれるタグ名は結果から除外する。
 pub fn read_exif(path: &Path, hidden_tags: &[String]) -> Option<ExifInfo> {
-    let exif = rexif::parse_file(path.to_str()?).ok()?;
-    build_exif_info(&exif.entries, hidden_tags)
+    read_exif_counted(path, hidden_tags).info
+}
+
+pub(crate) struct ExifRead {
+    pub info: Option<ExifInfo>,
+    pub bytes_read: u64,
+}
+
+pub(crate) fn read_exif_counted(path: &Path, hidden_tags: &[String]) -> ExifRead {
+    let parsed = read_rexif_from_path(path);
+    let info = parsed
+        .exif
+        .as_ref()
+        .and_then(|exif| build_exif_info(&exif.entries, hidden_tags));
+    ExifRead {
+        info,
+        bytes_read: parsed.bytes_read,
+    }
 }
 
 /// バイト列から EXIF 情報を読み取る（ZIP 内画像用）。
@@ -1180,6 +1352,37 @@ pub fn known_tags_in_group(group: TagGroup) -> impl Iterator<Item = &'static Tag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_prefix_cap_returns_no_exif_without_reading_the_body() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x12];
+        jpeg.extend_from_slice(&[0_u8; 16]);
+        jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x02]);
+        let mut reader = CountingReader::new(std::io::Cursor::new(&jpeg));
+
+        let prefix = read_jpeg_prefix(&mut reader, 8).unwrap();
+
+        assert!(prefix.is_none(), "over-cap JPEG must be treated as no EXIF");
+        assert!(
+            reader.bytes_read < jpeg.len() as u64,
+            "over-cap JPEG must not silently fall back to a full read"
+        );
+    }
+
+    #[test]
+    fn jpeg_fixture_prefix_matches_full_rexif_parse() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ai_metadata/jpeg_a1111_ascii.jpg");
+        let bytes = std::fs::read(&path).unwrap();
+        let prefix = read_rexif_from_path(&path);
+        let full = rexif::parse_buffer(&bytes).ok();
+
+        assert_eq!(prefix.exif, full);
+        assert!(
+            prefix.bytes_read < bytes.len() as u64,
+            "fixture should prove that entropy-coded image data is not read"
+        );
+    }
 
     #[test]
     fn read_exif_nonexistent_returns_none() {

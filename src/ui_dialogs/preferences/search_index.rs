@@ -169,6 +169,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["送る", "エクスプローラー", "Explorer", "登録"]
     ),
     entry!(
+        "thumbnail/favorite-view-state",
+        Thumbnail,
+        "お気に入りごとに表示状態を記憶する",
+        ["場所", "表示状態", "見開き", "ソート", "リセット", "クリア"]
+    ),
+    entry!(
         "thumbnail/category-order",
         Thumbnail,
         "グリッドのカテゴリ表示順",
@@ -606,6 +612,33 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["ページバー", "下部バー", "固定"]
     ),
     entry!(
+        "spread/seek-strip",
+        SpreadMode,
+        "ページシークバーにサムネイル列を表示",
+        [
+            "静止画",
+            "漫画",
+            "サムネイル",
+            "高さ",
+            "大",
+            "中",
+            "小",
+            "最小"
+        ]
+    ),
+    entry!(
+        "spread/seek-preview",
+        SpreadMode,
+        "マウスオーバーのサムネイル",
+        ["静止画", "プレビュー", "サムネイル列", "常に表示"]
+    ),
+    entry!(
+        "spread/seek-bar-with-strip",
+        SpreadMode,
+        "サムネイル列表示中の通常シークバー",
+        ["静止画", "ページシークバー", "表示しない"]
+    ),
+    entry!(
         "spread/seek-direction",
         SpreadMode,
         "ページシークバーの方向",
@@ -809,7 +842,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "固定表示",
             "鍵",
             "領域を確保",
-            "余白"
+            "余白",
+            "マウスオーバーのサムネイル",
+            "サムネイルストリップ表示中の通常シークバー"
         ]
     ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
@@ -1023,6 +1058,47 @@ mod tests {
             "索引の title `{}` が ArchiveFormat 由来の形式名 `{labels}` を含んでいません。
              形式を追加したら、設定ページの見出しと索引の title も同時に直すこと。",
             entry.title
+        );
+    }
+
+    /// `PreferencesOpenRequest` の定数は、ページと anchor を手で組にして持っている。
+    /// 項目を別ページへ移したときに定数だけ古くなると、導線が**黙って別ページへ着地する**
+    /// (押した利用者には「設定が見つからない」としか見えない)。索引を正本として組を照合する。
+    #[test]
+    fn preferences_open_request_constants_point_at_indexed_anchors() {
+        use super::super::{PreferencesOpenRequest, PreferencesPage};
+
+        for request in [
+            PreferencesOpenRequest::DUPLICATE_FILES,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
+            PreferencesOpenRequest::HIDDEN_FILES,
+        ] {
+            let Some(anchor) = request.anchor else {
+                // ページ全体が答えになる導線。ページが実在することだけ確かめる。
+                assert!(
+                    PREF_SEARCH_INDEX
+                        .iter()
+                        .any(|entry| entry.page == request.page),
+                    "{:?} に索引項目が 1 つもありません",
+                    request.page
+                );
+                continue;
+            };
+            let entry = PREF_SEARCH_INDEX
+                .iter()
+                .find(|entry| entry.anchor == anchor)
+                .unwrap_or_else(|| panic!("anchor `{anchor}` が索引にありません"));
+            assert_eq!(
+                entry.page, request.page,
+                "anchor `{anchor}` は {:?} にありますが、定数は {:?} を指しています",
+                entry.page, request.page
+            );
+        }
+
+        // 上のループが空回りしていないことの保険 (variant を消したときに気付ける)。
+        assert_eq!(
+            PreferencesOpenRequest::ARCHIVE_HANDLING.page,
+            PreferencesPage::Cache
         );
     }
 

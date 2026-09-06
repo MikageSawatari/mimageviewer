@@ -430,6 +430,7 @@ impl App {
             .extend(presence.local_adjustments);
         self.comic_page_keys.extend(presence.comics);
         self.rotation_page_keys.extend(presence.rotations);
+        self.export_crop_page_keys.extend(presence.crops);
     }
 
     /// 復元完了後の idx-keyed edit state と rating / tag cache の共通 invalidation。
@@ -681,7 +682,8 @@ mod tests {
         // Worker は App の idx maps を通らず DB と path-keyed presence report を更新する。
         let mut presence = crate::content_identity::RestorePresence::default();
         presence.local_adjustments.insert(key.clone());
-        presence.conceals.insert(key);
+        presence.conceals.insert(key.clone());
+        presence.crops.insert(key.clone());
         app.apply_content_restore_presence(presence);
         app.finish_content_identity_restore(Vec::new());
 
@@ -706,6 +708,7 @@ mod tests {
             "restore completion must make has_crop=true without a folder reload"
         );
         assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
+        assert!(app.export_crop_page_keys.contains(&key));
         assert!(
             app.local_adjust_page_layers.is_empty(),
             "large local-adjust JSON remains lazy after rehydrate"

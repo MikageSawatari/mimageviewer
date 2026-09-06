@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::adjustment::AdjustParams;
+use crate::settings::FavoriteViewState;
 
 /// 補正設定 DB ハンドル。
 pub struct AdjustmentDb {
@@ -87,11 +88,25 @@ impl AdjustmentDb {
                 params_json TEXT NOT NULL
              );",
         )?;
+        // 出荷済みテーブルには触れず、新規テーブルだけを足す。行の存在が独自状態を表す。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS favorite_view_states (
+                favorite_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL
+             );",
+        )?;
         Ok(Self { conn })
     }
 
     pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("adjustment.db")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_changes_for_test(&self) -> i64 {
+        self.conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
     }
 
     /// ページのパラメータを取得する。未登録なら None。
@@ -361,6 +376,89 @@ impl AdjustmentDb {
         Ok(removed)
     }
 
+    // ── お気に入り単位の表示状態 ─────────────────────────────────
+
+    /// 全お気に入りの表示状態を読み込む (起動時に 1 回)。
+    pub fn load_all_favorite_view_states(&self) -> HashMap<Uuid, FavoriteViewState> {
+        let mut map = HashMap::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT favorite_id, state_json FROM favorite_view_states")
+        else {
+            return map;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return map;
+        };
+        for row in rows.flatten() {
+            if let (Ok(id), Ok(state)) = (
+                Uuid::parse_str(&row.0),
+                serde_json::from_str::<FavoriteViewState>(&row.1),
+            ) {
+                map.insert(id, state);
+            }
+        }
+        map
+    }
+
+    pub fn set_favorite_view_state(
+        &self,
+        favorite_id: Uuid,
+        state: &FavoriteViewState,
+    ) -> Result<(), rusqlite::Error> {
+        let json = serde_json::to_string(state).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO favorite_view_states (favorite_id, state_json) VALUES (?1, ?2)
+             ON CONFLICT(favorite_id) DO UPDATE SET state_json = ?2",
+            rusqlite::params![favorite_id.to_string(), json],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_favorite_view_state(&self, favorite_id: Uuid) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM favorite_view_states WHERE favorite_id = ?1",
+            [favorite_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_favorite_view_states(&self) -> Result<usize, rusqlite::Error> {
+        self.conn.execute("DELETE FROM favorite_view_states", [])
+    }
+
+    /// `keep` に含まれない favorite_id の行を削除する (起動時 orphan cleanup)。
+    pub fn prune_favorite_view_states(
+        &self,
+        keep: &HashSet<Uuid>,
+    ) -> Result<usize, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT favorite_id FROM favorite_view_states")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+        let mut removed = 0usize;
+        for id_str in rows {
+            let remove = match Uuid::parse_str(&id_str) {
+                Ok(id) => !keep.contains(&id),
+                Err(_) => true,
+            };
+            if remove {
+                self.conn.execute(
+                    "DELETE FROM favorite_view_states WHERE favorite_id = ?1",
+                    [&id_str],
+                )?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// コンテナ配下の全ページ個別パラメータを一括読込する。
     /// `prefix` はコンテナパスの正規化文字列。
     pub fn load_page_params(&self, prefix: &str) -> HashMap<String, AdjustParams> {
@@ -587,5 +685,50 @@ mod tests {
         assert!(db.load_all_favorite_params().is_empty());
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn db_favorite_view_states_roundtrip_reset_clear_and_prune() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("adjustment.db");
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut a_state = FavoriteViewState::from_settings(&crate::settings::Settings::default());
+        a_state.thumb_px = 144;
+        a_state.sort_order = crate::settings::SortOrder::DateDesc;
+        let mut b_state = a_state.clone();
+        b_state.thumb_px = 288;
+
+        {
+            let db = AdjustmentDb::open_at(&path).unwrap();
+            db.set_favorite_view_state(a, &a_state).unwrap();
+            db.set_favorite_view_state(b, &b_state).unwrap();
+            let loaded = db.load_all_favorite_view_states();
+            assert_eq!(loaded.get(&a), Some(&a_state));
+            assert_eq!(loaded.get(&b), Some(&b_state));
+
+            let keep = HashSet::from([b]);
+            assert_eq!(db.prune_favorite_view_states(&keep).unwrap(), 1);
+            assert_eq!(db.load_all_favorite_view_states().len(), 1);
+            db.remove_favorite_view_state(b).unwrap();
+            assert!(db.load_all_favorite_view_states().is_empty());
+
+            db.set_favorite_view_state(a, &a_state).unwrap();
+            db.set_favorite_view_state(b, &b_state).unwrap();
+            assert_eq!(db.clear_favorite_view_states().unwrap(), 2);
+        }
+
+        // 新テーブル追加後に開き直しても、出荷済み favorite_params 行を作り直さない。
+        let mut params = AdjustParams::default();
+        params.brightness = 17.0;
+        {
+            let db = AdjustmentDb::open_at(&path).unwrap();
+            db.set_favorite_params(a, &params).unwrap();
+        }
+        let reopened = AdjustmentDb::open_at(&path).unwrap();
+        assert_eq!(
+            reopened.load_all_favorite_params()[&a].brightness,
+            params.brightness
+        );
     }
 }

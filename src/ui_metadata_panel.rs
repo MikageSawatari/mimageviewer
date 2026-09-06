@@ -183,6 +183,7 @@ impl SimilarPanelState {
                     None,
                     None,
                     None,
+                    None,
                 );
                 let image = rx.try_iter().find_map(|message| message.image);
                 let _ = result_tx.send(SimilarThumbResult { item_key, image });
@@ -497,6 +498,7 @@ impl App {
         full_rect: egui::Rect,
         chrome_enabled: bool,
         navigator_exclusion: Option<egui::Rect>,
+        seek_height: f32,
     ) {
         let pointer_pos = ctx.input(|i| {
             if self.cursor_hidden() {
@@ -510,11 +512,12 @@ impl App {
         let explicit = self.metadata_panel_click_shown();
         let hover_visible = chrome_enabled
             && hover_mode
-            && crate::ui_fullscreen::metadata_panel_hover_active_at(
+            && crate::ui_fullscreen::metadata_panel_hover_active_at_with_seek_height(
                 full_rect,
                 pointer_pos,
                 self.fs_info_panel.hover_active,
                 navigator_exclusion,
+                seek_height,
             );
         self.fs_info_panel.hover_active = !explicit && hover_visible;
     }
@@ -540,8 +543,9 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         lock_effective: bool,
+        seek_height: f32,
     ) -> bool {
-        self.draw_metadata_panel_inner(ui, ctx, full_rect, lock_effective)
+        self.draw_metadata_panel_inner(ui, ctx, full_rect, lock_effective, seek_height)
     }
 
     fn draw_metadata_panel_inner(
@@ -550,8 +554,10 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         lock_effective: bool,
+        seek_height: f32,
     ) -> bool {
-        let panel_rect = crate::ui_fullscreen::metadata_panel_rect(full_rect);
+        let panel_rect =
+            crate::ui_fullscreen::metadata_panel_rect_with_seek_height(full_rect, seek_height);
 
         // Most frames update this before image-input consumption in ui_fullscreen. Keep the draw
         // boundary idempotently current as well because capture-selection and other modal paths
@@ -562,6 +568,7 @@ impl App {
             full_rect,
             !self.still_touch_chrome_is_latched(ctx),
             navigator_exclusion,
+            seek_height,
         );
         // 表示するかの答えは `FullscreenInfoPanelState` だけが出す。ロックは実効値を使う。
         let mut panel_state = self.fs_info_panel;

@@ -53,7 +53,7 @@ const DETAILS_BEST_FIT_ROWS_PER_FRAME: usize = 192;
 const DETAILS_BEST_FIT_HORIZONTAL_PADDING: f32 = 14.0;
 const DETAILS_BEST_FIT_MAX_WIDTH: f32 = 800.0;
 const DETAILS_RATING_BEST_FIT_SEED: &str = "★★★★★";
-const DETAILS_STATE_BEST_FIT_SEED: &str = "補 レ 消 隠 文 回 ピ";
+const DETAILS_STATE_BEST_FIT_SEED: &str = "補 レ 消 隠 文 回 切 ピ";
 // ScrollArea 本体の外にある popup frame と、上下の配置余白を合わせて確保する。
 const DETAILS_COLUMN_MENU_SCREEN_MARGIN: f32 = 48.0;
 const DETAILS_COLUMN_MENU_COLUMNS_WIDTH: f32 = 240.0;
@@ -1437,7 +1437,7 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
 fn draw_omitted_entries_chip(
     ui: &mut egui::Ui,
     counts: crate::app::OmittedFolderEntryCounts,
-) -> Option<crate::ui_dialogs::preferences::PreferencesPage> {
+) -> Option<crate::ui_dialogs::preferences::PreferencesOpenRequest> {
     let Some(label) = omitted_entries_chip_label(counts) else {
         return None;
     };
@@ -1458,7 +1458,7 @@ fn draw_omitted_entries_chip(
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
             open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesPage::DuplicateFiles);
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
             ui.close();
         }
         if counts.ignored_archive > 0 {
@@ -1467,7 +1467,8 @@ fn draw_omitted_entries_chip(
                 .link(format!("「{archive_labels} の処理」を設定する"))
                 .clicked()
             {
-                open_preferences = Some(crate::ui_dialogs::preferences::PreferencesPage::Cache);
+                open_preferences =
+                    Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
                 ui.close();
             }
         }
@@ -1476,7 +1477,8 @@ fn draw_omitted_entries_chip(
                 .link("「隠しファイル・フォルダを表示する」を設定する")
                 .clicked()
         {
-            open_preferences = Some(crate::ui_dialogs::preferences::PreferencesPage::Folder);
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::HIDDEN_FILES);
             ui.close();
         }
     });
@@ -2197,7 +2199,7 @@ impl DetailsColumn {
     fn default_width(self) -> f32 {
         // `egui_kittest` で本体の既定フォント (Yu Gothic Medium) を入れ、100% scale の
         // Body text を実測した固定シード幅 + DETAILS_BEST_FIT_HORIZONTAL_PADDING の ceil。
-        // Rating: 65 + 14 = 79、State: 113 + 14 = 127。バッジ種別を増やした場合は
+        // Rating: 65 + 14 = 79、State: 130 + 14 = 144。バッジ種別を増やした場合は
         // DETAILS_STATE_BEST_FIT_SEED とこの既定幅を必ず一緒に見直す。
         match self {
             Self::Preview => 34.0,
@@ -2210,7 +2212,7 @@ impl DetailsColumn {
             Self::Place => 180.0,
             Self::Size => 92.0,
             Self::Modified | Self::Created => 138.0,
-            Self::State => 127.0,
+            Self::State => 144.0,
             Self::ImageDimensions => 108.0,
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
@@ -12204,8 +12206,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 result
             })
             .inner;
-        if let Some(page) = open_preferences {
-            self.open_preferences_page(page);
+        if let Some(request) = open_preferences {
+            self.open_preferences_request(request);
         }
         result
     }
@@ -15495,6 +15497,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if badges.rotation {
             flags.push("回");
         }
+        if badges.crop {
+            flags.push("切");
+        }
         // 代表サムネピン (ネスト ZIP では本ごとピン Model B: ルート = zip_path /
         // 本の中 = 実効 prefix の book キー + ZipEntry)。
         if let (Some(pin_container), Some(src)) = (
@@ -16129,6 +16134,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         mask: badges.mask,
                                         conceal: badges.conceal,
                                         comic: badges.comic,
+                                        crop: badges.crop,
                                         pin: has_pin,
                                     },
                                     rating,
@@ -16920,7 +16926,7 @@ mod facet_filter_bar_tests {
     fn assert_omitted_settings_link_route(
         counts: crate::app::OmittedFolderEntryCounts,
         link_label: &str,
-        expected: crate::ui_dialogs::preferences::PreferencesPage,
+        expected: crate::ui_dialogs::preferences::PreferencesOpenRequest,
     ) {
         use egui_kittest::{Harness, kittest::Queryable};
         use std::sync::{Arc, Mutex};
@@ -16932,8 +16938,8 @@ mod facet_filter_bar_tests {
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if let Some(page) = draw_omitted_entries_chip(ui, counts) {
-                        *opened_for_ui.lock().unwrap() = Some(page);
+                    if let Some(request) = draw_omitted_entries_chip(ui, counts) {
+                        *opened_for_ui.lock().unwrap() = Some(request);
                     }
                 });
             });
@@ -16948,7 +16954,7 @@ mod facet_filter_bar_tests {
 
     #[test]
     fn omitted_chip_routes_each_breakdown_link_to_its_settings_page() {
-        use crate::ui_dialogs::preferences::PreferencesPage;
+        use crate::ui_dialogs::preferences::PreferencesOpenRequest;
 
         assert_omitted_settings_link_route(
             crate::app::OmittedFolderEntryCounts {
@@ -16959,7 +16965,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             "同名ファイル設定を開く",
-            PreferencesPage::DuplicateFiles,
+            PreferencesOpenRequest::DUPLICATE_FILES,
         );
         let archive_link = format!(
             "「{} の処理」を設定する",
@@ -16974,7 +16980,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             &archive_link,
-            PreferencesPage::Cache,
+            PreferencesOpenRequest::ARCHIVE_HANDLING,
         );
         assert_omitted_settings_link_route(
             crate::app::OmittedFolderEntryCounts {
@@ -16985,7 +16991,7 @@ mod facet_filter_bar_tests {
                 system: 0,
             },
             "「隠しファイル・フォルダを表示する」を設定する",
-            PreferencesPage::Folder,
+            PreferencesOpenRequest::HIDDEN_FILES,
         );
     }
 
@@ -18394,9 +18400,18 @@ mod compute_cell_size_tests {
             conceal,
             comic,
             rotation,
+            crop,
         } = GridEditBadges::default();
-        let edit_badge_field_count =
-            [page_override, local_adjust, mask, conceal, comic, rotation].len();
+        let edit_badge_field_count = [
+            page_override,
+            local_adjust,
+            mask,
+            conceal,
+            comic,
+            rotation,
+            crop,
+        ]
+        .len();
         let pin_badge_count = 1;
 
         assert_eq!(

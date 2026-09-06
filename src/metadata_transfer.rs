@@ -155,6 +155,7 @@ pub struct ImportPageStateSnapshot {
     pub concealed: std::collections::BTreeSet<String>,
     pub comic: std::collections::BTreeSet<String>,
     pub rotated: std::collections::BTreeSet<String>,
+    pub cropped: std::collections::BTreeSet<String>,
 }
 
 /// import完了後の全体編集badge索引をworker上で再構築する。UI側は各Setの所有権を
@@ -201,6 +202,11 @@ pub fn load_import_page_state_snapshot_cancellable(
         "SELECT path FROM rotations WHERE angle != 0",
         cancel,
     )?;
+    let cropped = load_import_key_set(
+        &data_dir.join("export_crop.db"),
+        "SELECT page_path FROM export_crop_pages",
+        cancel,
+    )?;
     Ok(ImportPageStateSnapshot {
         adjusted,
         local_adjusted,
@@ -208,6 +214,7 @@ pub fn load_import_page_state_snapshot_cancellable(
         concealed,
         comic,
         rotated,
+        cropped,
     })
 }
 
