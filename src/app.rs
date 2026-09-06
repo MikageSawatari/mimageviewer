@@ -12489,14 +12489,14 @@ pub struct App {
     pub(crate) fs_vertical_scroll: f32,
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
     pub(crate) fs_seek_drag_active: bool,
-    /// 静止画ページシーク行で始まったドラッグの決着状態。動画と同じ状態機械を共有する。
+    /// 静止画ページシーク行で始まった排他的なドラッグ状態。
     ///
-    /// 通常の寿命を持つのは `handle_still_seek_track_response` だけ。生成は `drag_started`、
-    /// 破棄は `drag_stopped` で行い、fullscreen 自体の teardown だけが強制終了できる。
-    /// シークによるページ切替や overlay の描画可否 / cache miss は同じ pointer gesture の
-    /// 途中で起きるため、ここを破棄してはならない。ページ切替側でも破棄すると、egui が
-    /// `dragged=true, drag_started=false` を返す次フレームから操作を継続できなくなる。
-    pub(crate) fs_seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
+    /// トラックとサムネイル列は `StillSeekGesture` の variant で一元管理する。通常の生成 / 破棄は
+    /// 各 response handler の `drag_started` / `drag_stopped` だけが担い、fullscreen teardown
+    /// だけが強制終了できる。ページ切替や overlay の描画可否 / cache miss は同じ pointer
+    /// gesture の途中で起きるため破棄してはならない。列 variant は開始時のレイアウト中心も
+    /// 保持し、ページ切替で指の下の source page が変わらないようにする。
+    pub(crate) fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
     /// フルスクリーン下部シークバー / 混在サマリをこのフレームで表示しているか。
     /// 左下ステータスをバーの上へ逃がすために使う。
     pub(crate) fs_seek_overlay_visible: bool,
@@ -15361,7 +15361,7 @@ impl App {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
-            fs_seek_row_gesture: None,
+            fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             continuous_page_transitions: std::collections::HashMap::new(),
@@ -54091,7 +54091,7 @@ impl App {
         self.fs_middle_zoom_drag = None;
         self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
-        self.fs_seek_row_gesture = None;
+        self.fs_seek_gesture = crate::ui_fullscreen::StillSeekGesture::Idle;
         self.fs_seek_overlay_visible = false;
         self.clear_still_seek_thumbnail_requests();
         self.fs_context_menu_idx = None;

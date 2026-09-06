@@ -1294,6 +1294,11 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
+列の横ドラッグ中は `StillSeekGesture::Strip` がドラッグ開始フレームの中央 source position を保持し、
+ページ着地で `current_pos` が変わっても同じ中心から列を組み直す。同じ pointer x は離すまで同じ
+source page を指し、現在ページの強調だけは実際の `fs_idx` へ追従する。通常の生成 / 破棄は strip
+response handler の `drag_started` / `drag_stopped` が所有し、下ドラッグによる列 close と fullscreen
+teardown だけがその場で終了できる。release 後の次フレームは新しい現在ページ中心へ戻る。
 ページシーク行の上ドラッグと列の下ドラッグは動画の `SeekRowGesture` /
 `strip_drag_closes_downward` を共有し、横ドラッグ契約は変えない。
 通常の左右カーソルキーによるページ移動は

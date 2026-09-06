@@ -3560,13 +3560,44 @@ struct StillSeekTrackInteraction {
     note_seek_activity: bool,
 }
 
+/// One owner for the mutually exclusive still-image seek gestures.
+///
+/// The track variant keeps the shared vertical-vs-horizontal decision state. The strip variant
+/// latches the source position used to center the thumbnail layout, so page navigation triggered
+/// by that same drag cannot move the cells underneath a stationary pointer. Normal creation and
+/// destruction belong to the matching response handler; fullscreen teardown is the only forced
+/// reset outside those handlers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum StillSeekGesture {
+    #[default]
+    Idle,
+    Track(crate::video::seek_strip::SeekRowGesture),
+    Strip {
+        layout_center_pos: usize,
+    },
+}
+
+impl StillSeekGesture {
+    fn strip_layout_center(self, current_pos: usize) -> usize {
+        match self {
+            Self::Strip { layout_center_pos } => layout_center_pos,
+            Self::Idle | Self::Track(_) => current_pos,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
 /// Interpret one real egui response frame for the still-image seek track.
 ///
 /// Keeping the response ordering here lets handler-level tests drive the same state transition
 /// code as production instead of testing `SeekRowGesture` in isolation.
 fn handle_still_seek_track_response(
     response: &egui::Response,
-    gesture: &mut Option<crate::video::seek_strip::SeekRowGesture>,
+    gesture: &mut StillSeekGesture,
 ) -> StillSeekTrackInteraction {
     if response.drag_started()
         && let Some(pointer_pos) = response.interact_pointer_pos()
@@ -3576,7 +3607,7 @@ fn handle_still_seek_track_response(
         // is already displaced. Recover the actual press origin or the first update sees a zero
         // delta and leaves the gesture undecided until another move event happens.
         let origin = pointer_pos - response.total_drag_delta().unwrap_or_default();
-        *gesture = Some(crate::video::seek_strip::SeekRowGesture::new(origin));
+        *gesture = StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::new(origin));
     }
 
     let note_seek_activity = response.dragged() && response.interact_pointer_pos().is_some();
@@ -3585,7 +3616,11 @@ fn handle_still_seek_track_response(
     } else if response.dragged()
         && let Some(pointer_pos) = response.interact_pointer_pos()
     {
-        match gesture.as_mut().map(|gesture| gesture.update(pointer_pos)) {
+        let decision = match gesture {
+            StillSeekGesture::Track(gesture) => Some(gesture.update(pointer_pos)),
+            StillSeekGesture::Idle | StillSeekGesture::Strip { .. } => None,
+        };
+        match decision {
             Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
                 StillSeekTrackAction::OpenStrip
             }
@@ -3601,15 +3636,54 @@ fn handle_still_seek_track_response(
     if response.drag_stopped() {
         if matches!(
             gesture,
-            Some(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
         ) {
             action = StillSeekTrackAction::Seek;
         }
-        *gesture = None;
+        if matches!(gesture, StillSeekGesture::Track(_)) {
+            *gesture = StillSeekGesture::Idle;
+        }
     }
 
     StillSeekTrackInteraction {
         action,
+        note_seek_activity,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekStripInteraction {
+    closed_by_drag: bool,
+    note_seek_activity: bool,
+}
+
+/// Own the strip drag latch for one real egui response frame.
+fn handle_still_seek_strip_response(
+    response: &egui::Response,
+    layout_center_pos: usize,
+    strip_bottom: f32,
+    gesture: &mut StillSeekGesture,
+) -> StillSeekStripInteraction {
+    if response.drag_started() {
+        *gesture = StillSeekGesture::Strip { layout_center_pos };
+    }
+
+    let pointer = response.interact_pointer_pos();
+    let closed_by_drag = response.dragged()
+        && pointer.is_some_and(|pointer| {
+            let origin = pointer - response.total_drag_delta().unwrap_or_default();
+            crate::video::seek_strip::strip_drag_closes_downward(origin, pointer, strip_bottom)
+        });
+    let note_seek_activity = response.dragged() && pointer.is_some();
+
+    if closed_by_drag
+        || (response.drag_stopped() && matches!(gesture, StillSeekGesture::Strip { .. }))
+    {
+        *gesture = StillSeekGesture::Idle;
+    }
+
+    StillSeekStripInteraction {
+        closed_by_drag,
         note_seek_activity,
     }
 }
@@ -16727,11 +16801,12 @@ impl App {
             let cell_height = (strip_rect.height()
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
+            let strip_layout_center = self.fs_seek_gesture.strip_layout_center(info.current_pos);
             // 回転取得は &mut self を取るため、列が参照し得る数十件を先に既存の一括 cache
             // 経路で取り出す。レイアウト closure 内では DB / App を一切参照しない。
             let rotation_candidates = still_seek_strip_rotation_candidates(
                 &info.image_indices,
-                info.current_pos,
+                strip_layout_center,
                 strip_content.width(),
                 cell_height,
             );
@@ -16740,7 +16815,7 @@ impl App {
                 rotation_candidates.into_iter().zip(rotations).collect();
             let layout = still_seek_strip_layout(
                 &info.image_indices,
-                info.current_pos,
+                strip_layout_center,
                 strip_content,
                 cell_height,
                 strip_is_rtl,
@@ -16794,17 +16869,16 @@ impl App {
             let pointer = strip_response
                 .interact_pointer_pos()
                 .or_else(|| strip_response.hover_pos());
-            // 動画ストリップと同じ順序で、まず下方向 close を決める。close でなければ
-            // 従来どおりポインタ下のセルへ横ドラッグで移動する。
-            let strip_closed_by_drag = strip_response.dragged()
-                && pointer.is_some_and(|pointer| {
-                    let origin = pointer - strip_response.total_drag_delta().unwrap_or_default();
-                    crate::video::seek_strip::strip_drag_closes_downward(
-                        origin,
-                        pointer,
-                        strip_rect.max.y,
-                    )
-                });
+            // The response handler is the sole normal owner of the strip layout latch. It starts
+            // from the center used for this frame and ends on release or an explicit downward
+            // close; page navigation in between cannot move the cells under the pointer.
+            let strip_interaction = handle_still_seek_strip_response(
+                &strip_response,
+                strip_layout_center,
+                strip_rect.max.y,
+                &mut self.fs_seek_gesture,
+            );
+            let strip_closed_by_drag = strip_interaction.closed_by_drag;
             if strip_closed_by_drag {
                 self.set_still_seek_strip_visible(ctx, false);
             }
@@ -16832,7 +16906,7 @@ impl App {
                     StillSeekPosition::SourcePosition(source_pos),
                 )
             {
-                if strip_response.dragged() {
+                if strip_interaction.note_seek_activity {
                     self.fs_seek_drag_active = true;
                     self.note_fullscreen_seek_activity();
                 }
@@ -16996,7 +17070,7 @@ impl App {
                 }
 
                 let interaction =
-                    handle_still_seek_track_response(&response, &mut self.fs_seek_row_gesture);
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture);
                 if interaction.note_seek_activity {
                     self.fs_seek_drag_active = true;
                     self.note_fullscreen_seek_activity();
@@ -53285,6 +53359,109 @@ mod tests {
         assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, true), 1.0);
     }
 
+    /// A strip drag must keep its original layout while page navigation updates `current_pos`.
+    /// Otherwise the stationary pointer resolves one cell farther away on every frame.
+    #[test]
+    fn still_seek_strip_stationary_drag_does_not_advance_after_page_landing() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::Strip {
+                layout_center_pos: 5,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(6),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let pointer = layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 6)
+                .expect("the first drag frame must expose the adjacent page")
+                .rect
+                .center();
+            assert_eq!(
+                still_seek_source_position_at_pointer(&layout, pointer),
+                Some(6),
+                "rtl={rtl}: a stationary drag pointer must keep targeting its original page"
+            );
+
+            let moved_pointer = layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 8)
+                .expect("the fixed layout must expose a deterministic two-page move")
+                .rect
+                .center();
+            let moved_to = still_seek_source_position_at_pointer(&layout, moved_pointer).unwrap();
+            assert_f32_close(
+                (moved_pointer.x - pointer.x).abs(),
+                2.0 * (60.0 + STILL_SEEK_STRIP_CELL_GAP),
+            );
+            assert_eq!(moved_to.abs_diff(6), 2, "rtl={rtl}");
+
+            let after_release = still_seek_strip_layout(
+                &images,
+                StillSeekGesture::Idle.strip_layout_center(moved_to),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let centered = after_release
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == moved_to)
+                .unwrap();
+            assert_eq!(centered.rect.center(), row.center(), "rtl={rtl}");
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_latched_layout_keeps_actual_current_page_highlighted() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+        let current_pos = 7;
+        let highlighted_pages = HashSet::from([images[current_pos]]);
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::Strip {
+                layout_center_pos: 5,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(current_pos),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let selected = layout
+                .cells
+                .iter()
+                .filter(|cell| highlighted_pages.contains(&cell.idx))
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>();
+            assert_eq!(selected, vec![current_pos], "rtl={rtl}");
+            assert_ne!(
+                layout
+                    .cells
+                    .iter()
+                    .find(|cell| cell.source_pos == current_pos)
+                    .unwrap()
+                    .rect
+                    .center(),
+                row.center(),
+                "the highlight must move while the latched layout stays fixed"
+            );
+        }
+    }
+
     #[test]
     fn still_seek_strip_lock_stays_outside_cell_hit_testing() {
         let strip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 72.0));
@@ -53337,6 +53514,146 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug)]
+    struct StillSeekStripResponseObservation {
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        interaction: StillSeekStripInteraction,
+        gesture: StillSeekGesture,
+    }
+
+    #[derive(Default)]
+    struct StillSeekStripHarnessState {
+        gesture: StillSeekGesture,
+        observations: Vec<StillSeekStripResponseObservation>,
+    }
+
+    fn still_seek_strip_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekStripHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekStripHarnessState| {
+                    let row =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        row,
+                        ui.make_persistent_id(0x57A1_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let interaction = handle_still_seek_strip_response(
+                        &response,
+                        5,
+                        row.bottom(),
+                        &mut state.gesture,
+                    );
+                    state.observations.push(StillSeekStripResponseObservation {
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        interaction,
+                        gesture: state.gesture,
+                    });
+                },
+                StillSeekStripHarnessState::default(),
+            )
+    }
+
+    fn still_seek_strip_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekStripHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_strip_response_owns_latch_from_drag_start_through_release() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let drag = harness.state().observations.last().unwrap();
+        assert!(drag.drag_started);
+        assert!(drag.dragged);
+        assert!(!drag.drag_stopped);
+        assert!(!drag.clicked);
+        assert!(drag.interaction.note_seek_activity);
+        assert!(!drag.interaction.closed_by_drag);
+        assert_eq!(
+            drag.gesture,
+            StillSeekGesture::Strip {
+                layout_center_pos: 5
+            }
+        );
+
+        still_seek_strip_pointer_button(&mut harness, destination, false);
+        let release = harness.state().observations.last().unwrap();
+        assert!(release.drag_stopped);
+        assert_eq!(release.gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_strip_click_does_not_create_a_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let pos = egui::pos2(240.0, 96.0);
+        harness.hover_at(pos);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, pos, true);
+        still_seek_strip_pointer_button(&mut harness, pos, false);
+
+        let click = harness.state().observations.last().unwrap();
+        assert!(click.clicked);
+        assert_eq!(click.gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_strip_downward_close_ends_the_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(164.0, 132.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let close = harness.state().observations.last().unwrap();
+        assert!(close.drag_started);
+        assert!(close.dragged);
+        assert!(close.interaction.closed_by_drag);
+        assert_eq!(close.gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn fullscreen_teardown_forces_still_seek_strip_latch_idle() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_seek_gesture = StillSeekGesture::Strip {
+            layout_center_pos: 5,
+        };
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+    }
+
+    #[derive(Clone, Copy, Debug)]
     struct StillSeekTrackResponseObservation {
         primary_down: bool,
         drag_started: bool,
@@ -53349,7 +53666,7 @@ mod tests {
 
     #[derive(Default)]
     struct StillSeekTrackHarnessState {
-        gesture: Option<crate::video::seek_strip::SeekRowGesture>,
+        gesture: StillSeekGesture,
         page: usize,
         strip_open: bool,
         seek_activity_frames: usize,
@@ -53447,7 +53764,7 @@ mod tests {
         assert_eq!(drag_frame.action, StillSeekTrackAction::Seek);
 
         still_seek_track_pointer_button(&mut harness, destination, false);
-        assert!(harness.state().gesture.is_none());
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
         let release_frame = harness.state().observations.last().unwrap();
         assert!(!release_frame.primary_down);
         assert!(release_frame.drag_stopped);
@@ -53472,7 +53789,7 @@ mod tests {
 
         let mut gesture = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(80.0, 96.0));
         gesture.update(egui::pos2(160.0, 96.0));
-        app.fs_seek_row_gesture = Some(gesture);
+        app.fs_seek_gesture = StillSeekGesture::Track(gesture);
         app.fs_seek_drag_active = true;
 
         let mut perf = None;
@@ -53485,7 +53802,7 @@ mod tests {
         );
 
         assert_eq!(app.fullscreen_idx, Some(1));
-        assert!(app.fs_seek_row_gesture.is_some());
+        assert!(app.fs_seek_gesture.is_active());
         assert!(app.fs_seek_drag_active);
 
         // Neither render-suppression return may become a second gesture owner. Both can happen
@@ -53500,7 +53817,7 @@ mod tests {
                 );
             });
         });
-        assert!(app.fs_seek_row_gesture.is_some());
+        assert!(app.fs_seek_gesture.is_active());
 
         app.analysis_mode = false;
         app.settings
@@ -53516,10 +53833,9 @@ mod tests {
             });
         });
 
-        let gesture = app
-            .fs_seek_row_gesture
-            .as_mut()
-            .expect("the first scrub frame's page switch must preserve the gesture");
+        let StillSeekGesture::Track(gesture) = &mut app.fs_seek_gesture else {
+            panic!("the first scrub frame's page switch must preserve the track gesture");
+        };
         assert_eq!(
             gesture.update(egui::pos2(240.0, 96.0)),
             crate::video::seek_strip::SeekRowDecision::Scrub,
@@ -53591,7 +53907,7 @@ mod tests {
         );
 
         still_seek_track_pointer_button(&mut harness, destination, false);
-        assert!(harness.state().gesture.is_none());
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
     }
 
     #[test]
