@@ -1459,6 +1459,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-06〜07 v3.6.0 レビュー F1 / F2: 静止画シークの要求とジェスチャを既存 context
+所有境界へ接続した（本 brief の指定する構造修正として実施。Codex は着手前に §2 を読み、
+隣接する交換対象からの欠落を埋める BA-7 修正と判断。実装後の ClaudeCode 検収・実機確認は未実施）:**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` に `fs_seek_gesture: StillSeekGesture` を追加。Idle 初期化、完全 destructure、
+既存 mount / swap、main grid を残す分割の move 対象へ載せた。pause は進行中の Track / Strip
+だけを中断し、StripCommitted は保持する。close は既存の mounted teardown、retire / build abort
+は bundle の寿命で完結する。App の field は mount 中の投影であり、独立した global owner ではない。
+
+F1 は [src/app.rs](../src/app.rs) の通常ページ着地から exact 要求の全消しを撤去し、
+App / bundle の items 世代変更時に集合と worker projection を失効させる。既存の overlay 置換、
+idx 無効化、fullscreen 終了時の clear は維持する。分割で projection の Arc を共有していた点も、
+同じ値を独立 RwLock へ複製する形へ直した。[src/thumb_loader.rs](../src/thumb_loader.rs) の
+共通 checkpoint は worker の pop 後・I/O 後・PDF レンダ前で同じ実要求と共有集合を読む。
+
+**判断理由**: ページ着地と overlay の二重終了、および context 間で 1 個のジェスチャ / 可変集合を
+共有する所有境界の欠落を取り除く。別窓判定、identity guard、待ち時間、repaint、bool は追加しない。
+detached 述語、viewport lifecycle、window binding、placement、session 遷移は変更していない。
+要求寿命は単ページ / 見開き・縦 / 横連結で同一とし、確定中心は各 context の復帰時に復元する。
+
+**回帰確認**: 修正前に通常 overlay → キュー要求 → 実着地で exact set が空になること、items 世代 /
+コンテナ差し替えで集合が残ること、fork した窓の要求置換が main の共有集合を上書きすること、
+新 context への中心漏れ・pause 中断漏れ・分割時のジェスチャ移動漏れを確認した。
+連結読みは修正前から通る比較対照。A/B の同位置・異位置、往復 mount、片方の close と他方の復元を
+production registry で検証する。F3〜F8 および動画側シークストリップは対象外。
+
+自動検証は core の `cargo check`、`still_seek` 42 件、`viewer_context` 47 件、絞り込みなしの
+lib（7,444 件成功・既定 ignore 32 件）、UI snapshot 45 件、`cargo fmt --check`、
+`scripts/test-full.ps1`（workspace / egui-wgpu / eframe）すべて成功。
+
 **2026-09-05 バックログ §1.184 で、お気に入り別表示状態の現在地 owner を
 `ViewerContextBundle` に載せた (本依頼の決定事項として ClaudeCode 側から「既存の所有境界に
 載せ、detached 述語を足さない」構造が指定され、Codex も §2 の症状パッチではないと判定):**

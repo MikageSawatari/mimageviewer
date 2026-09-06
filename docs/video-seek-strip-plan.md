@@ -239,7 +239,7 @@ D15 は「離す前の再生状態を保つ」という当初の既定を置き�
   - 入口は `Settings::set_video_seek_strip_locked` 1 か所。鍵ボタンと環境設定の
     チェックボックスは両方ここを通る。
 - 永続化は既存の `video_seek_bar_locked` と未リリースの `video_seek_strip_locked` の 2 bool を
-  保つが、実行時の変更は `VideoBottomLock::{None, BarOnly, BarAndStrip}` だけを通す。
+  保つが、実行時の変更は静止画とも共有する `BottomBarLock::{None, BarOnly, BarAndStrip}` だけを通す。
   `(false, true)` は復元時に `None` へ正規化し、移行コードは置かない。
 - 領域確保でいう「ストリップが出ている」の正本は presenter に渡った
   `Option<NativeOverlaySeekStrip>` とする。`Some` のときだけ、かつ `BarAndStrip` のときだけ

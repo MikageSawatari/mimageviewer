@@ -12521,6 +12521,14 @@ pub struct App {
     pub(crate) fs_vertical_scroll: f32,
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
     pub(crate) fs_seek_drag_active: bool,
+    /// 静止画ページシーク行で始まった排他的なドラッグ状態。
+    ///
+    /// トラックとサムネイル列は `StillSeekGesture` の variant で一元管理する。通常の生成 / 破棄は
+    /// 各 response handler の `drag_started` / `drag_stopped` だけが担い、fullscreen teardown
+    /// だけが強制終了できる。ページ切替や overlay の描画可否 / cache miss は同じ pointer
+    /// gesture の途中で起きるため破棄してはならない。列 variant は開始時のレイアウト中心も
+    /// 保持し、ページ切替で指の下の source page が変わらないようにする。
+    pub(crate) fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
     /// フルスクリーン下部シークバー / 混在サマリをこのフレームで表示しているか。
     /// 左下ステータスをバーの上へ逃がすために使う。
     pub(crate) fs_seek_overlay_visible: bool,
@@ -15388,6 +15396,7 @@ impl App {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
+            fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             continuous_page_transitions: std::collections::HashMap::new(),
@@ -25941,6 +25950,10 @@ impl App {
     }
 
     fn set_items_generation(&mut self, items_generation: u64) {
+        if self.items_generation != items_generation {
+            // Exact seek indices belong to the items identity, not the current page.
+            self.clear_still_seek_thumbnail_requests();
+        }
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
@@ -33224,17 +33237,11 @@ impl App {
 
                     let ks = ks_w.load(Ordering::Relaxed);
                     let ke = ke_w.load(Ordering::Relaxed);
-                    let still_seek_exact = req.priority
-                        && still_seek_pages_w
-                            .read()
-                            .map(|pages| pages.contains(&req.idx))
-                            .unwrap_or(false);
                     // Foreground requests (navigation target, still seek strip / preview)
                     // deliberately use the exact keep_set without widening this grid bbox.
-                    if !crate::thumb_loader::thumbnail_request_in_keep(
-                        req.priority,
-                        still_seek_exact,
-                        req.idx,
+                    if !crate::thumb_loader::thumbnail_request_in_current_keep(
+                        &req,
+                        Some(&still_seek_pages_w),
                         ks,
                         ke,
                     ) {
@@ -45760,9 +45767,10 @@ impl App {
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
-        self.clear_still_seek_thumbnail_requests();
+        // The overlay owns this frame's exact strip/preview requirements. A landing
+        // within the same items generation must preserve them, as continuous seeks do.
+        // Container/idx-space changes invalidate them at the items ownership boundary.
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.fs_free_rotation = 0.0;
@@ -54179,6 +54187,7 @@ impl App {
         self.fs_middle_zoom_drag = None;
         self.mouse_middle_click_start = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_gesture = crate::ui_fullscreen::StillSeekGesture::Idle;
         self.fs_seek_overlay_visible = false;
         self.clear_still_seek_thumbnail_requests();
         self.fs_context_menu_idx = None;

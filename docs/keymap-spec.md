@@ -123,6 +123,9 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 
 `KeyContext` が異なる Action には同じ物理キーを割り当ててよい。ただし `KeyContext` は
 割り当て時の競合検査とヘルプ表示の契約であり、実行時の active context を自動判定しない。
+静止画フルスクリーンの `FsSeekStripToggle` も同じ <kbd>Shift</kbd>+<kbd>S</kbd> を既定にし、
+`still_seek_strip_visible` を切り替える。`FsImage` と `FsVideo` は同時に有効にならないため、
+動画側の `VideoSeekStripCycle` とは競合しない。
 したがって key edge を消費する call site は、**消費する前に現在の item / mode が自分の
 context かを確認し、自分の所有でない edge を残す**責務を持つ。既定 <kbd>Z</kbd> を共有する
 `FsZoomMode` (FsImage) と `VideoToggleAudioMode` (FsVideo) では、前者が Video / Audio を
@@ -479,6 +482,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | ホイールクリックに全画面ズームモードを割り当て | 短クリックでズーム状態を ON/OFF する。Z キーの押下中照準表示は出さず、現在のカーソル位置でズーム状態へ入る。ズーム状態中は中ボタン押し込み + 上下ドラッグで倍率を変えられる |
 | <kbd>Shift</kbd>+<kbd>Z</kbd> | 画像分析モード (旧 <kbd>Z</kbd>。Z を全画面ズームへ明け渡したため移動) |
 | <kbd>S</kbd> | スライドショー 再生 / 停止。ホバーバーの ▶ ボタンは停止中のみページ送り間隔・連結読みスクロール設定・末尾動作を設定するポップアップを開き、再生中の一時停止ボタンは即停止する。動画はスキップして継続。縦/横連結読み中は待機時間ごとに設定割合だけ短時間スクロールし、終端で通常の末尾動作へ合流する。フォルダ内移動 (矢印 / ホイール / クリック / Home / End) では止まらず、Ctrl+↑↓ のフォルダ移動・S・Space・Esc で止まる |
+| <kbd>Shift</kbd>+<kbd>S</kbd> | `FsSeekStripToggle`。下部のサムネイル列を表示 / 非表示にする。フィルム状ボタンと上下ドラッグも同じ `still_seek_strip_visible` を切り替える |
 | <kbd>M</kbd> | ルーペ トグル。360 度パノラマモード中とテキスト注釈モード中は表示しない。テキスト注釈モードに入ってもトグル状態は保持する |
 | <kbd>G</kbd> | ピクセルグリッド表示 ON/OFF (ユーザーズームが等倍より拡大中、かつ高倍率時のみ画像ピクセル境界を表示) |
 | <kbd>B</kbd> | `FsBookBookmark`。本として開いている画像フォルダ / 製本 / ZIP / PDF / 対応アーカイブの現在基準ページへブックマークを追加する。同じページは重複登録しない。本ではない単独画像では無効。編集サブモード中は筆ツール等の既存 `B` 操作を優先する |

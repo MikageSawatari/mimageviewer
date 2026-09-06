@@ -804,9 +804,9 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   表示だけの設定で、境界判定、読み込み、加工、先読みの実行は変えない。表示できる画像が
   まだ 1 枚もないページ中央の「読込中...」は、設定にかかわらず表示する。
 - 静止画 / 本の下部ページシークバーはトラック下側にページ目盛りを描く。見開きではページ総数ではなく、つまみと同じ表示ユニット数を目盛りの分母に使う。目盛り位置はページ番号の 1 / 2 / 5 系へ揃えて幅に応じて間引き、右→左の実効方向では既存のつまみ座標変換を共有する
-- 静止画 / 本のページシークバーには、既定 OFF のサムネイル列を表示できる。通常画像、ZIP / CBZ、PDF、変換済みアーカイブを同じ source page 単位で扱い、現在ページを中心に表示幅ぶんと前後 2 セルだけを既存サムネイル worker の priority 要求へ載せる。見開きでは現在ユニットの 1〜2 ページを強調し、RTL では並びを反転する。セルのクリック / ドラッグと通常トラックは同じ位置解決と着地契約を通る
+- 静止画 / 本のページシークバーには、既定 OFF のサムネイル列を表示できる。通常画像、ZIP / CBZ、PDF、変換済みアーカイブを同じ source page 単位で扱い、中央ページから左右へロード済みセルを 1 枚ずつ帯幅まで広げる。配置した source 範囲と両端の外側 2 ページずつを既存サムネイル worker の priority 要求へ載せる。見開きではプレビューと同じ現在表示ユニットの 1〜2 ページを強調する。列の並びとセルの当たり判定は `reading_direction` に従い、通常バーのつまみ・塗り・クリック位置は独立した `fullscreen_seek_direction` に従う。セルのクリックだけが従来どおりそのページへ着地する。列の横ドラッグは、動画と共有する `center_index_after_drag(origin_center, pointer.x - origin_pointer.x, cell_width)` の結果を整数 source position へ丸め、先頭 / 末尾で clamp して帯の中央を動かし、ページ自体は移動しない。release 後も帯は動かした中央に留まり、クリック、通常バー、キーなどで実際のページが変わったときに新しい現在ページ中心へ戻る。現在ページの強調は帯の中央と独立して実際の表示へ追従し、表示範囲外ならどのセルも強調しない。通常トラックの上ドラッグは動画と共有する `SeekRowGesture` で列を開く。列のドラッグは先に共有 `strip_drag_closes_downward` を判定し、下ドラッグなら帯を動かさず閉じる
 - 静止画シーク位置へマウスを置くと、指している 1 ページの既存サムネイルをバー上の吹き出しへ表示する。画面端では内側へ clamp し、未ロード中は placeholder を表示する。要求は 1 枚だけの priority 要求で、新しい worker は持たない。表示方針は常時表示（既定）/ サムネイル列表示中は非表示 / 常時非表示から選び、非表示時は要求も発行しない
-- 静止画サムネイル列の高さは大 104 / 中 72 / 小 48 / 最小 36pt、セル幅は 152 / 102 / 64 / 45pt の対応を使う。下部バー固定中はサムネイル列と通常バーの解決済み合計高を media rect、左右パネル、タッチハンドル、パン帯、ページ番号の回避量へ渡す。非固定中は従来どおり overlay とする。サムネイル列表示中の通常バーは表示（既定）/ 非表示を選べ、非表示でも列の移動操作は残る
+- 静止画サムネイル列の高さは大 104 / 中 72 / 小 48 / 最小 36pt を使う。セル幅は各ページ自身の回転後の縦横比 × セル高とし、セル高の 35% を下限、横長側は上限なしとする。テクスチャもフルスクリーン本体と共有する Mesh 描画で回転する。未読み込みセルは置かず、その側の成長をそこで止める。`Failed` はセル高と同じ正方形で置き、壊れた 1 ページで後続が止まらないようにする。現在セルを中央に固定して外側へ増やすため、既に置いたセルは後続のロードで動かない。下部固定は動画と共有する `BottomBarLock` の `None` / `BarOnly` / `BarAndStrip` の 3 状態とし、永続化は `fullscreen_seek_bar_locked` / `still_seek_strip_locked` の 2 bool へ射影する。`(false, true)` は読み込み時に `None` へ正規化する。`BarOnly` は通常バー高だけ、`BarAndStrip` は表示中の列と通常バーの解決済み合計高を media rect から除外し、`None` はどちらも overlay とする。列を閉じると列固定も解除し、バー固定を外すと列固定も同時に外す。左右パネル、タッチハンドル、パン帯、ページ番号の回避量には引き続き表示中 chrome の解決済み合計高を渡す。サムネイル列表示中の通常バーは表示（既定）/ 非表示を選べ、非表示でも列の移動操作は残る
 - 静止画 / 動画 / 音楽フルスクリーンの左右パネルは「通常ホバー」と「クリック表示」を選べる。通常ホバーは左端と右端で対応するパネルだけを個別に表示し、一度開いた後は実パネルの周囲に画面幅連動の維持余白を持たせ、余白の外へ出るまで閉じない。クリック表示は左右最端の細い呼び出しバーをクリックして開き、現在ファイルでは明示的に閉じるまで維持する。タッチでは可視ハンドルから閉じている側を直接開き、開いた側のハンドルは消す。音楽ビューは同じビューポートで最初のタッチを観測した後、上下 HUD 間の既存左右余白内へハンドルを常時表示し、狭幅で余白が 24pt 未満なら表示しない。左右ともファイル移動とフルスクリーン退出で閉じ、再入場へ開状態を持ち越さない（音楽のハンドル表示条件だけは曲移動で解除しない）。左右いずれかのパネルが表示中は上バーと下バー / HUD も同時表示する (音楽は上下常時表示)。I / Tab、上部バーの i、画像リング / ゲームパッド操作は永続する表示モードの切替に使う
 - 右情報パネルのロック: タイトルバーの鍵ボタンで固定する。ロック中は画像へ重ねず、右へ
   パネル幅の領域を確保し、画像の表示領域を残りへ再解決する (`fullscreen_media_rect` が
@@ -1861,6 +1861,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
+| `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
 | `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |
 | `still_seek_strip_height` | enum | `large` | 静止画サムネイル列の高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt |
 | `still_seek_hover_preview_mode` | enum | `always` | 静止画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never` |
@@ -1869,7 +1870,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
 | `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
-| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う |
+| `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う。サムネイル列の並びはこの設定ではなく `reading_direction` に従う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |
@@ -1931,7 +1932,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_seek_hover_preview_mode` | enum | `always` | 動画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never`。波形表示は thumbnail strip と数えない |
-| `video_seek_bar_with_strip` | enum | `show` | 動画の場面サムネイルストリップ表示中の通常シークバー。`show` / `hide`。波形表示には適用しない |
+| `video_seek_bar_with_strip` | enum | `show` | 動画の場面サムネイルまたは音声波形のストリップ表示中の通常シーク行。`show` / `hide`。`hide` でも再生・音量・時刻等の40ptコントロール行は残り、24ptのシーク行だけを映像領域へ返す |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |

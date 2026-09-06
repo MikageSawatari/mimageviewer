@@ -451,7 +451,7 @@ fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_sh
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeBarLockState {
     pub top_locked: bool,
-    pub bottom_lock: crate::settings::VideoBottomLock,
+    pub bottom_lock: crate::settings::BottomBarLock,
     pub fixed_bar_gap_px: u32,
     pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
     pub seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,

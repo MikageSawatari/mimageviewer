@@ -19,7 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -3175,6 +3175,8 @@ pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
 const FS_SEEK_HOVER_MARGIN: f32 = 40.0;
 const STILL_SEEK_STRIP_CELL_GAP: f32 = 4.0;
 const STILL_SEEK_STRIP_OVERSCAN_CELLS: usize = 2;
+/// 極端に縦長なページでも、操作可能なセル幅を高さの 35% は残す。
+const STILL_SEEK_STRIP_MIN_CELL_ASPECT: f32 = 0.35;
 const STILL_SEEK_PREVIEW_MAX_WIDTH: f32 = 240.0;
 /// 見開きプレビューの 2 枚の間隔。本の綴じ目に相当するので詰めておく。
 const STILL_SEEK_PREVIEW_PANE_GAP: f32 = 3.0;
@@ -3185,6 +3187,38 @@ struct StillSeekGeometry {
     bar_height: f32,
     strip_height: f32,
     total_height: f32,
+    /// `BottomBarLock` に従って画像領域から除く高さ。
+    reserved_height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekDirections {
+    strip_rtl: bool,
+    bar_rtl: bool,
+}
+
+fn resolve_still_seek_directions(
+    reading_direction: ReadingDirection,
+    bar_direction: crate::settings::FullscreenSeekDirection,
+) -> StillSeekDirections {
+    StillSeekDirections {
+        strip_rtl: reading_direction == ReadingDirection::Rtl,
+        bar_rtl: bar_direction.is_rtl(reading_direction),
+    }
+}
+
+fn draw_still_seek_strip_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    for offset in [-0.68_f32, 0.0, 0.68] {
+        painter.rect_stroke(
+            egui::Rect::from_center_size(
+                center + egui::vec2(offset * radius, 0.0),
+                egui::vec2(radius * 0.55, radius * 1.15),
+            ),
+            1.0,
+            egui::Stroke::new(1.2, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 impl StillSeekGeometry {
@@ -3192,6 +3226,7 @@ impl StillSeekGeometry {
         strip_visible: bool,
         strip_height: crate::video::seek_strip_layout::SeekStripHeight,
         bar_with_strip: crate::settings::StillSeekBarWithStrip,
+        bottom_lock: crate::settings::BottomBarLock,
     ) -> Self {
         let strip_height = if strip_visible {
             strip_height.points()
@@ -3203,10 +3238,17 @@ impl StillSeekGeometry {
         } else {
             0.0
         };
+        let total_height = bar_height + strip_height;
+        let reserved_height = match bottom_lock {
+            crate::settings::BottomBarLock::None => 0.0,
+            crate::settings::BottomBarLock::BarOnly => bar_height,
+            crate::settings::BottomBarLock::BarAndStrip => total_height,
+        };
         Self {
             bar_height,
             strip_height,
-            total_height: bar_height + strip_height,
+            total_height,
+            reserved_height,
         }
     }
 
@@ -3215,6 +3257,7 @@ impl StillSeekGeometry {
             false,
             crate::video::seek_strip_layout::SeekStripHeight::Large,
             crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarOnly,
         )
     }
 
@@ -3250,39 +3293,277 @@ impl StillSeekGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StillSeekStripWindow {
-    visible_start: usize,
-    visible_end: usize,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StillSeekStripCell {
+    /// `FullscreenSeekInfo::image_indices` 上の位置。
+    source_pos: usize,
+    /// `App::items` / `App::thumbnails` 上の位置。
+    idx: usize,
+    /// セル幅とテクスチャ描画の両方に適用するページ回転。
+    rotation: crate::rotation_db::Rotation,
+    rect: egui::Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StillSeekStripLayout {
+    /// 画面上の左から右の順。
+    cells: Vec<StillSeekStripCell>,
+    /// `FullscreenSeekInfo::image_indices` 上の半開区間。overscan を含む。
     request_start: usize,
     request_end: usize,
 }
 
-fn still_seek_strip_window(
-    total: usize,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripThumbnail {
+    Loaded(egui::Vec2, crate::rotation_db::Rotation),
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripSourceStep {
+    TowardStart,
+    TowardEnd,
+}
+
+impl StillSeekStripSourceStep {
+    fn next(self, source_pos: usize, total: usize) -> Option<usize> {
+        match self {
+            Self::TowardStart => source_pos.checked_sub(1),
+            Self::TowardEnd => source_pos.checked_add(1).filter(|next| *next < total),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekStripScreenSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StillSeekStripGrowth {
+    Active {
+        next_source_pos: usize,
+        outer_edge: f32,
+        source_step: StillSeekStripSourceStep,
+        screen_side: StillSeekStripScreenSide,
+    },
+    Stopped,
+}
+
+fn still_seek_strip_cell_geometry(
+    thumbnail: StillSeekStripThumbnail,
+    cell_height: f32,
+) -> Option<(f32, crate::rotation_db::Rotation)> {
+    match thumbnail {
+        StillSeekStripThumbnail::Loaded(size, rotation) => {
+            let size = rotated_display_size(size, rotation);
+            let aspect = if size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0
+            {
+                size.x / size.y
+            } else {
+                // TextureHandle の寸法は通常必ず正だが、終端状態を未読み込み扱いにして
+                // 列を永久停止させない。
+                1.0
+            };
+            Some((
+                (cell_height * aspect).max(cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT),
+                rotation,
+            ))
+        }
+        StillSeekStripThumbnail::Failed => Some((cell_height, crate::rotation_db::Rotation::None)),
+        StillSeekStripThumbnail::Unavailable => None,
+    }
+}
+
+fn grow_still_seek_strip_side(
+    growth: &mut StillSeekStripGrowth,
+    image_indices: &[usize],
+    row_rect: egui::Rect,
+    cell_height: f32,
+    thumbnail_for_idx: &mut impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> Option<StillSeekStripCell> {
+    let StillSeekStripGrowth::Active {
+        next_source_pos,
+        outer_edge,
+        source_step,
+        screen_side,
+    } = *growth
+    else {
+        return None;
+    };
+    let idx = image_indices[next_source_pos];
+    let Some((cell_width, rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(idx), cell_height)
+    else {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    };
+    let rect = match screen_side {
+        StillSeekStripScreenSide::Left => egui::Rect::from_min_max(
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP - cell_width,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::pos2(
+                outer_edge - STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y + cell_height * 0.5,
+            ),
+        ),
+        StillSeekStripScreenSide::Right => egui::Rect::from_min_size(
+            egui::pos2(
+                outer_edge + STILL_SEEK_STRIP_CELL_GAP,
+                row_rect.center().y - cell_height * 0.5,
+            ),
+            egui::vec2(cell_width, cell_height),
+        ),
+    };
+    let fits = match screen_side {
+        StillSeekStripScreenSide::Left => rect.left() >= row_rect.left(),
+        StillSeekStripScreenSide::Right => rect.right() <= row_rect.right(),
+    };
+    if !fits {
+        *growth = StillSeekStripGrowth::Stopped;
+        return None;
+    }
+
+    *growth = match source_step.next(next_source_pos, image_indices.len()) {
+        Some(next_source_pos) => StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: match screen_side {
+                StillSeekStripScreenSide::Left => rect.left(),
+                StillSeekStripScreenSide::Right => rect.right(),
+            },
+            source_step,
+            screen_side,
+        },
+        None => StillSeekStripGrowth::Stopped,
+    };
+    Some(StillSeekStripCell {
+        source_pos: next_source_pos,
+        idx,
+        rotation,
+        rect,
+    })
+}
+
+/// 現在ページを帯の中央へ置き、ロード済みのページだけで左右へ 1 枚ずつ成長させる。
+///
+/// セル幅・位置・表示順・要求範囲をここで一度だけ決め、描画と当たり判定は完成した
+/// `cells` を共有する。未読み込みに当たった側は止めるが、要求範囲は配置済み範囲から
+/// overscan ぶん外へ延ばすため、停止位置のページがロードされれば次フレームで成長する。
+fn still_seek_strip_layout(
+    image_indices: &[usize],
     current_pos: usize,
-    width: f32,
-    cell_width: f32,
-) -> StillSeekStripWindow {
-    if total == 0 {
-        return StillSeekStripWindow {
-            visible_start: 0,
-            visible_end: 0,
+    row_rect: egui::Rect,
+    cell_height: f32,
+    rtl: bool,
+    mut thumbnail_for_idx: impl FnMut(usize) -> StillSeekStripThumbnail,
+) -> StillSeekStripLayout {
+    if image_indices.is_empty() {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
             request_start: 0,
             request_end: 0,
         };
     }
-    let visible_count = ((width + STILL_SEEK_STRIP_CELL_GAP)
-        / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
-        .floor()
-        .max(1.0) as usize;
-    let visible_count = visible_count.min(total);
-    let desired_start = current_pos.min(total - 1).saturating_sub(visible_count / 2);
-    let visible_start = desired_start.min(total - visible_count);
-    let visible_end = visible_start + visible_count;
-    StillSeekStripWindow {
-        visible_start,
-        visible_end,
+    let total = image_indices.len();
+    let current_pos = current_pos.min(total - 1);
+    let current_idx = image_indices[current_pos];
+    let Some((current_width, current_rotation)) =
+        still_seek_strip_cell_geometry(thumbnail_for_idx(current_idx), cell_height)
+    else {
+        return StillSeekStripLayout {
+            cells: Vec::new(),
+            request_start: current_pos.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
+            request_end: current_pos
+                .saturating_add(1 + STILL_SEEK_STRIP_OVERSCAN_CELLS)
+                .min(total),
+        };
+    };
+
+    let current_rect =
+        egui::Rect::from_center_size(row_rect.center(), egui::vec2(current_width, cell_height));
+    let source_step_left = if rtl {
+        StillSeekStripSourceStep::TowardEnd
+    } else {
+        StillSeekStripSourceStep::TowardStart
+    };
+    let source_step_right = if rtl {
+        StillSeekStripSourceStep::TowardStart
+    } else {
+        StillSeekStripSourceStep::TowardEnd
+    };
+    let mut left_growth = source_step_left.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.left(),
+            source_step: source_step_left,
+            screen_side: StillSeekStripScreenSide::Left,
+        },
+    );
+    let mut right_growth = source_step_right.next(current_pos, total).map_or(
+        StillSeekStripGrowth::Stopped,
+        |next_source_pos| StillSeekStripGrowth::Active {
+            next_source_pos,
+            outer_edge: current_rect.right(),
+            source_step: source_step_right,
+            screen_side: StillSeekStripScreenSide::Right,
+        },
+    );
+    let mut left_cells = Vec::new();
+    let mut right_cells = Vec::new();
+    loop {
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut left_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            left_cells.push(cell);
+        }
+        if let Some(cell) = grow_still_seek_strip_side(
+            &mut right_growth,
+            image_indices,
+            row_rect,
+            cell_height,
+            &mut thumbnail_for_idx,
+        ) {
+            right_cells.push(cell);
+        }
+        if matches!(left_growth, StillSeekStripGrowth::Stopped)
+            && matches!(right_growth, StillSeekStripGrowth::Stopped)
+        {
+            break;
+        }
+    }
+
+    left_cells.reverse();
+    let mut cells = Vec::with_capacity(left_cells.len() + 1 + right_cells.len());
+    cells.extend(left_cells);
+    cells.push(StillSeekStripCell {
+        source_pos: current_pos,
+        idx: current_idx,
+        rotation: current_rotation,
+        rect: current_rect,
+    });
+    cells.extend(right_cells);
+    let visible_start = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .min()
+        .unwrap_or(current_pos);
+    let visible_end = cells
+        .iter()
+        .map(|cell| cell.source_pos)
+        .max()
+        .unwrap_or(current_pos)
+        .saturating_add(1);
+    StillSeekStripLayout {
+        cells,
         request_start: visible_start.saturating_sub(STILL_SEEK_STRIP_OVERSCAN_CELLS),
         request_end: visible_end
             .saturating_add(STILL_SEEK_STRIP_OVERSCAN_CELLS)
@@ -3296,6 +3577,259 @@ enum StillSeekPosition {
     SourcePosition(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekTrackAction {
+    None,
+    Seek,
+    OpenStrip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekTrackInteraction {
+    action: StillSeekTrackAction,
+    note_seek_activity: bool,
+}
+
+/// One owner for the mutually exclusive still-image seek gestures.
+///
+/// The track variant keeps the shared vertical-vs-horizontal decision state. The strip variant
+/// keeps one immutable press snapshot plus the live layout center, matching the video strip's
+/// drag ownership. A committed strip center remains here after release; it is discarded when the
+/// actual page changes. The response handler owns press, move, and release; page-position sync and
+/// context suspension / fullscreen teardown own interruption outside it. The mounted viewer
+/// context owns this value through ViewerContextBundle; suspending that context interrupts
+/// only a live pointer gesture and retains its committed center.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum StillSeekGesture {
+    #[default]
+    Idle,
+    Track(crate::video::seek_strip::SeekRowGesture),
+    Strip {
+        origin_center_pos: usize,
+        // egui no longer supplies total_drag_delta on release; retain both axes for close.
+        origin_pointer: egui::Pos2,
+        layout_center_pos: usize,
+        page_pos_at_origin: usize,
+    },
+    StripCommitted {
+        layout_center_pos: usize,
+        page_pos_at_commit: usize,
+    },
+}
+
+impl StillSeekGesture {
+    #[cfg(windows)]
+    pub(crate) fn interrupt(&mut self) {
+        if matches!(self, Self::Track(_) | Self::Strip { .. }) {
+            *self = Self::Idle;
+        }
+    }
+
+    fn strip_layout_center(self, current_pos: usize) -> usize {
+        match self {
+            Self::Strip {
+                layout_center_pos, ..
+            }
+            | Self::StripCommitted {
+                layout_center_pos, ..
+            } => layout_center_pos,
+            Self::Idle | Self::Track(_) => current_pos,
+        }
+    }
+
+    /// A moved strip is scoped to the page that was current while it was moved. Any real page
+    /// change returns the strip to the new current page, regardless of which navigation entry
+    /// point produced that change. Track dragging is intentionally preserved because the seek bar
+    /// itself changes pages while its pointer gesture remains active.
+    fn recenter_if_page_changed(&mut self, current_pos: usize) {
+        let page_changed = match *self {
+            Self::Strip {
+                page_pos_at_origin, ..
+            } => page_pos_at_origin != current_pos,
+            Self::StripCommitted {
+                page_pos_at_commit, ..
+            } => page_pos_at_commit != current_pos,
+            Self::Idle | Self::Track(_) => false,
+        };
+        if page_changed {
+            *self = Self::Idle;
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(self) -> bool {
+        matches!(self, Self::Track(_) | Self::Strip { .. })
+    }
+}
+
+/// Interpret one real egui response frame for the still-image seek track.
+///
+/// Keeping the response ordering here lets handler-level tests drive the same state transition
+/// code as production instead of testing `SeekRowGesture` in isolation.
+fn handle_still_seek_track_response(
+    response: &egui::Response,
+    gesture: &mut StillSeekGesture,
+) -> StillSeekTrackInteraction {
+    if response.drag_started()
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        // `Sense::click_and_drag` does not report `drag_started` on the press frame. It first
+        // becomes true after movement has crossed egui's drag threshold, so the current pointer
+        // is already displaced. Recover the actual press origin or the first update sees a zero
+        // delta and leaves the gesture undecided until another move event happens.
+        let origin = pointer_pos - response.total_drag_delta().unwrap_or_default();
+        *gesture = StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::new(origin));
+    }
+
+    let note_seek_activity = response.dragged() && response.interact_pointer_pos().is_some();
+    let mut action = if response.clicked() {
+        StillSeekTrackAction::Seek
+    } else if (response.dragged() || response.drag_stopped())
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        let decision = match gesture {
+            StillSeekGesture::Track(gesture) => Some(gesture.update(pointer_pos)),
+            StillSeekGesture::Idle
+            | StillSeekGesture::Strip { .. }
+            | StillSeekGesture::StripCommitted { .. } => None,
+        };
+        match decision {
+            Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
+                StillSeekTrackAction::OpenStrip
+            }
+            Some(crate::video::seek_strip::SeekRowDecision::Scrub) => StillSeekTrackAction::Seek,
+            Some(crate::video::seek_strip::SeekRowDecision::Undecided) | None => {
+                StillSeekTrackAction::None
+            }
+        }
+    } else {
+        StillSeekTrackAction::None
+    };
+
+    if response.drag_stopped() {
+        if matches!(
+            gesture,
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+        ) {
+            action = StillSeekTrackAction::Seek;
+        }
+        if matches!(gesture, StillSeekGesture::Track(_)) {
+            *gesture = StillSeekGesture::Idle;
+        }
+    }
+
+    StillSeekTrackInteraction {
+        action,
+        note_seek_activity,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekStripInteraction {
+    closed_by_drag: bool,
+    note_seek_activity: bool,
+}
+
+/// Own the strip drag latch for one real egui response frame.
+fn handle_still_seek_strip_response(
+    response: &egui::Response,
+    layout_center_pos: usize,
+    current_page_pos: usize,
+    image_count: usize,
+    cell_width: f32,
+    strip_bottom: f32,
+    // 画面上のセルの並びが元ページ順の逆かどうか。**送る向きはこれに従う。**
+    // 動画は常に左→右なので `center_index_after_drag` に向きの概念が無く、
+    // 右→左で読む本ではそのままだと指と逆へ動く (2026-09-06 利用者報告)。
+    rtl: bool,
+    gesture: &mut StillSeekGesture,
+) -> StillSeekStripInteraction {
+    if response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let origin = pointer - response.total_drag_delta().unwrap_or_default();
+        *gesture = StillSeekGesture::Strip {
+            origin_center_pos: layout_center_pos,
+            origin_pointer: origin,
+            layout_center_pos,
+            page_pos_at_origin: current_page_pos,
+        };
+    }
+
+    let pointer = response.interact_pointer_pos();
+    let closed_by_drag = (response.dragged() || response.drag_stopped())
+        && pointer.is_some_and(|pointer| match *gesture {
+            StillSeekGesture::Strip { origin_pointer, .. } => {
+                crate::video::seek_strip::strip_drag_closes_downward(
+                    origin_pointer,
+                    pointer,
+                    strip_bottom,
+                )
+            }
+            StillSeekGesture::Idle
+            | StillSeekGesture::Track(_)
+            | StillSeekGesture::StripCommitted { .. } => false,
+        });
+    let note_seek_activity = response.dragged() && pointer.is_some();
+
+    if closed_by_drag {
+        *gesture = StillSeekGesture::Idle;
+    } else if (response.dragged() || response.drag_stopped())
+        && let Some(pointer) = pointer
+        && let StillSeekGesture::Strip {
+            origin_center_pos,
+            origin_pointer,
+            page_pos_at_origin,
+            ..
+        } = *gesture
+        && let Some(center) = crate::video::seek_strip::center_index_after_drag(
+            origin_center_pos as f64,
+            // 画面上の移動量を「元ページ順での移動量」へ直してから渡す。指の下の
+            // セルが同じページを指し続ける向きは、並びが反転すれば反転する。
+            if rtl {
+                origin_pointer.x - pointer.x
+            } else {
+                pointer.x - origin_pointer.x
+            },
+            cell_width,
+        )
+    {
+        let layout_center_pos = center
+            .round()
+            .clamp(0.0, image_count.saturating_sub(1) as f64)
+            as usize;
+        if response.drag_stopped() {
+            *gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos,
+                page_pos_at_commit: current_page_pos,
+            };
+        } else {
+            *gesture = StillSeekGesture::Strip {
+                origin_center_pos,
+                origin_pointer,
+                layout_center_pos,
+                page_pos_at_origin,
+            };
+        }
+    } else if response.drag_stopped()
+        && let StillSeekGesture::Strip {
+            layout_center_pos, ..
+        } = *gesture
+    {
+        // A release normally retains `interact_pointer_pos`, but if the platform drops that
+        // final coordinate, commit the last center shown instead of leaving a dead drag owner.
+        *gesture = StillSeekGesture::StripCommitted {
+            layout_center_pos,
+            page_pos_at_commit: current_page_pos,
+        };
+    }
+
+    StillSeekStripInteraction {
+        closed_by_drag,
+        note_seek_activity,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedStillSeekTarget {
     /// プレビューに出すページ。**見開きでは着地後に表示される 1〜2 ページ全部**を、
@@ -3307,6 +3841,15 @@ struct ResolvedStillSeekTarget {
     preview_pages: Vec<usize>,
     landing_idx: usize,
     display_pos: usize,
+}
+
+/// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
+/// 強調とプレビューはこの同じ表示ユニット解決を使う。
+fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
+    units
+        .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
+        .map(|unit| unit.pages.clone())
+        .unwrap_or_else(|| vec![idx])
 }
 
 /// シーク位置から、プレビューに出すページと着地先を解く。
@@ -3324,13 +3867,6 @@ fn resolve_still_seek_target(
 ) -> Option<ResolvedStillSeekTarget> {
     if image_indices.is_empty() {
         return None;
-    }
-    /// `idx` が画面に出るとき、一緒に並ぶページ全部を元ページ順で返す。
-    fn pages_on_screen_with(idx: usize, units: Option<&[SpreadDisplayUnit]>) -> Vec<usize> {
-        units
-            .and_then(|units| units.iter().find(|unit| unit.pages.contains(&idx)))
-            .map(|unit| unit.pages.clone())
-            .unwrap_or_else(|| vec![idx])
     }
     match position {
         StillSeekPosition::TrackFraction(fraction) => {
@@ -3384,44 +3920,40 @@ fn resolve_still_seek_target(
     }
 }
 
-fn still_seek_cell_rect(
-    row_rect: egui::Rect,
-    visual_slot: usize,
-    cell_width: f32,
-    cell_height: f32,
-) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(
-            row_rect.left() + visual_slot as f32 * (cell_width + STILL_SEEK_STRIP_CELL_GAP),
-            row_rect.center().y - cell_height * 0.5,
-        ),
-        egui::vec2(cell_width, cell_height),
-    )
+fn still_seek_source_position_at_pointer(
+    layout: &StillSeekStripLayout,
+    pointer: egui::Pos2,
+) -> Option<usize> {
+    layout
+        .cells
+        .iter()
+        .find(|cell| cell.rect.contains(pointer))
+        .map(|cell| cell.source_pos)
 }
 
-fn still_seek_source_position_at_x(
-    row_rect: egui::Rect,
-    window: StillSeekStripWindow,
-    cell_width: f32,
-    pointer_x: f32,
-    rtl: bool,
-) -> Option<usize> {
-    if window.visible_start >= window.visible_end
-        || pointer_x < row_rect.left()
-        || pointer_x > row_rect.right()
-    {
-        return None;
+/// レイアウト closure が参照し得る source page だけを、中央から左右へ有界に集める。
+/// 現在セルは常に帯の中央なので、片側が読む最大数は帯幅の半分とセル幅下限から決まる。
+fn still_seek_strip_rotation_candidates(
+    image_indices: &[usize],
+    current_pos: usize,
+    row_width: f32,
+    cell_height: f32,
+) -> Vec<usize> {
+    if image_indices.is_empty() {
+        return Vec::new();
     }
-    let count = window.visible_end - window.visible_start;
-    let slot = ((pointer_x - row_rect.left()) / (cell_width + STILL_SEEK_STRIP_CELL_GAP))
-        .floor()
-        .max(0.0) as usize;
-    let slot = slot.min(count - 1);
-    Some(if rtl {
-        window.visible_end - 1 - slot
+    let current_pos = current_pos.min(image_indices.len() - 1);
+    let min_step = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT + STILL_SEEK_STRIP_CELL_GAP;
+    let per_side = if row_width.is_finite() && cell_height.is_finite() && min_step > 0.0 {
+        ((row_width.max(0.0) * 0.5 / min_step).ceil() as usize).saturating_add(2)
     } else {
-        window.visible_start + slot
-    })
+        2
+    };
+    let start = current_pos.saturating_sub(per_side);
+    let end = current_pos
+        .saturating_add(per_side + 1)
+        .min(image_indices.len());
+    image_indices[start..end].to_vec()
 }
 
 fn fit_texture_rect(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
@@ -11989,6 +12521,14 @@ pub(crate) struct FsSeekInfo {
     other_count: usize,
 }
 
+impl FsSeekInfo {
+    /// The page track/thumbnail content is available only for an all-image navigation list.
+    /// Geometry and painting must use this same decision, including on the first frame.
+    fn has_page_strip_content(&self) -> bool {
+        self.media_count == self.image_indices.len() && !self.image_indices.is_empty()
+    }
+}
+
 /// 表示順から導出する一覧と seek 情報をまとめて所有する viewer context 単位のキャッシュ。
 ///
 /// 3 つを別 field に戻すと失効点が再び分裂するため、破棄は常に単一メソッドで
@@ -12361,6 +12901,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         true,
         crate::video::seek_strip_layout::SeekStripHeight::Medium,
         crate::settings::StillSeekBarWithStrip::Show,
+        crate::settings::BottomBarLock::BarAndStrip,
     );
     let panel = geometry.panel_rect(full_rect);
     ui.painter().rect_filled(
@@ -12369,8 +12910,11 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         egui::Color32::from_rgba_unmultiplied(8, 10, 14, 244),
     );
     let strip = geometry.strip_rect(full_rect).unwrap();
-    let row = strip.shrink2(egui::vec2(18.0, 5.0));
-    let cell_width = 58.0;
+    let strip_lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+    let row = egui::Rect::from_min_max(
+        strip.min + egui::vec2(18.0, 5.0),
+        egui::pos2(strip_lock.left() - 6.0, strip.bottom() - 5.0),
+    );
     let cell_height =
         strip.height() - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
     let colors = [
@@ -12381,11 +12925,29 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         egui::Color32::from_rgb(120, 112, 70),
         egui::Color32::from_rgb(65, 105, 115),
     ];
-    let row_width =
-        colors.len() as f32 * cell_width + (colors.len() - 1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
-    let row = egui::Rect::from_center_size(row.center(), egui::vec2(row_width, row.height()));
-    for (slot, color) in colors.into_iter().enumerate() {
-        let rect = still_seek_cell_rect(row, slot, cell_width, cell_height);
+    let image_indices = [0, 1, 2, 3, 4, 5];
+    let sizes = [
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(3.0, 2.0),
+        egui::vec2(2.0, 3.0),
+        egui::vec2(2.0, 3.0),
+    ];
+    let rotations = [
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::Cw90,
+        crate::rotation_db::Rotation::None,
+        crate::rotation_db::Rotation::None,
+    ];
+    let layout = still_seek_strip_layout(&image_indices, 2, row, cell_height, false, |idx| {
+        StillSeekStripThumbnail::Loaded(sizes[idx], rotations[idx])
+    });
+    for cell in &layout.cells {
+        let rect = cell.rect;
+        let color = colors[cell.idx];
         ui.painter().rect_filled(rect, 3.0, color);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_top()],
@@ -12394,7 +12956,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            (slot + 18).to_string(),
+            (cell.source_pos + 18).to_string(),
             egui::FontId::monospace(14.0),
             egui::Color32::WHITE,
         );
@@ -12402,8 +12964,12 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
             rect,
             3.0,
             egui::Stroke::new(
-                if slot == 2 || slot == 3 { 3.0 } else { 1.0 },
-                if slot == 2 || slot == 3 {
+                if cell.source_pos == 2 || cell.source_pos == 3 {
+                    3.0
+                } else {
+                    1.0
+                },
+                if cell.source_pos == 2 || cell.source_pos == 3 {
                     egui::Color32::from_rgb(112, 174, 255)
                 } else {
                     egui::Color32::from_gray(76)
@@ -12412,6 +12978,7 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
             egui::StrokeKind::Inside,
         );
     }
+    draw_seek_strip_lock_button_visual(ui.painter(), strip_lock, false, true);
     let bar = geometry.bar_rect(full_rect).unwrap();
     let track = egui::Rect::from_center_size(
         egui::pos2(full_rect.center().x - 28.0, bar.center().y),
@@ -15789,19 +16356,40 @@ impl App {
             && !self.analysis_mode
     }
 
-    fn fullscreen_seek_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.settings.fullscreen_seek_bar_locked
-            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
-    }
-
-    fn still_seek_geometry_for_idx(&self, fs_idx: usize, is_video: bool) -> StillSeekGeometry {
+    fn still_seek_geometry_for_idx(&mut self, fs_idx: usize, is_video: bool) -> StillSeekGeometry {
+        let allowed = self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
         let strip_visible = self.settings.still_seek_strip_visible
-            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video);
+            && allowed
+            && self
+                .fullscreen_seek_info_cached(fs_idx)
+                .is_some_and(|info| info.has_page_strip_content());
+        let bottom_lock = if allowed {
+            self.settings.still_bottom_lock()
+        } else {
+            crate::settings::BottomBarLock::None
+        };
         StillSeekGeometry::resolve(
             strip_visible,
             self.settings.still_seek_strip_height,
             self.settings.still_seek_bar_with_strip,
+            bottom_lock,
         )
+    }
+
+    /// サムネイル列の全入口（ボタン、上下ドラッグ、キー）から同じ設定を更新する。
+    fn set_still_seek_strip_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        let changed = self.settings.still_seek_strip_visible != visible
+            || (!visible && self.settings.still_bottom_lock().strip_locked());
+        if !changed {
+            return;
+        }
+        self.settings.set_still_seek_strip_visible(visible);
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
+    fn toggle_still_seek_strip_visible(&mut self, ctx: &egui::Context) {
+        self.set_still_seek_strip_visible(ctx, !self.settings.still_seek_strip_visible);
     }
 
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
@@ -15866,7 +16454,7 @@ impl App {
     ///
     /// 音楽ビューだけパネルの既定幅が違う (`MUSIC_RIGHT_PANEL_WIDTH`)。ここで静止画の幅を
     /// 使うと、確保した帯とパネルの左端が食い違って隙間か重なりが出る (backlog §1.158)。
-    fn locked_info_panel_reserved_width(&self, full_rect: egui::Rect, fs_idx: usize) -> f32 {
+    fn locked_info_panel_reserved_width(&mut self, full_rect: egui::Rect, fs_idx: usize) -> f32 {
         if self.fs_music_view_active(fs_idx) {
             crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
         } else {
@@ -15884,7 +16472,7 @@ impl App {
     /// 縮んだ矩形から元の幅を逆算すると、幅がクランプに掛かる狭い窓で逆算が成り立たず、
     /// パネルがウィンドウの外へはみ出す (640pt で 55pt はみ出し。v3.5.0 レビュー F11)。
     fn locked_info_panel_reserved_width_effective(
-        &self,
+        &mut self,
         full_rect: egui::Rect,
         fs_idx: usize,
         is_video: bool,
@@ -15895,7 +16483,7 @@ impl App {
     }
 
     fn fullscreen_media_rect(
-        &self,
+        &mut self,
         full_rect: egui::Rect,
         fs_idx: usize,
         is_video: bool,
@@ -15904,8 +16492,8 @@ impl App {
         fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full_rect,
             self.fullscreen_top_bar_locked_for_idx(fs_idx, is_video),
-            self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video),
-            seek_geometry.total_height,
+            seek_geometry.reserved_height > 0.0,
+            seek_geometry.reserved_height,
             self.settings.fullscreen_fixed_bar_gap_px,
             self.locked_info_panel_reserved_width_effective(full_rect, fs_idx, is_video),
         )
@@ -16015,7 +16603,10 @@ impl App {
         if !self.settings.fullscreen_page_number_overlay || right_panel_visible {
             return;
         }
-        if self.fullscreen_seek_bar_locked_for_idx(fs_idx, false) {
+        if self.fs_seek_overlay_visible
+            && self.settings.still_bottom_lock().bar_locked()
+            && self.still_seek_geometry_for_idx(fs_idx, false).bar_height > 0.0
+        {
             return;
         }
         let Some(label) = self.fullscreen_page_number_label(fs_idx) else {
@@ -16149,16 +16740,14 @@ impl App {
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
         if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
-            self.fs_seek_drag_active = false;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         }
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
-        if !primary_down {
-            self.fs_seek_drag_active = false;
-        }
-        let locked = self.settings.fullscreen_seek_bar_locked;
+        let bottom_lock = self.settings.still_bottom_lock();
+        let locked = bottom_lock.bar_locked();
+        let strip_locked = bottom_lock.strip_locked();
         let geometry = self.still_seek_geometry_for_idx(fs_idx, false);
 
         let bottom_band = egui::Rect::from_min_max(
@@ -16195,7 +16784,6 @@ impl App {
         }
 
         let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
-            self.fs_seek_drag_active = false;
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             return None;
         };
@@ -16218,34 +16806,33 @@ impl App {
             ),
         );
 
-        let control_rect = geometry
-            .bar_rect(full_rect)
-            .or_else(|| geometry.strip_rect(full_rect))
-            .unwrap_or(panel_rect);
-        let lock_x = control_rect.right() - BAR_BUTTON_SIZE - 6.0;
-        let toggle_x = lock_x - BAR_BUTTON_SIZE - 4.0;
-        let lock_y = control_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+        let bar_rect = geometry.bar_rect(full_rect);
+        let strip_rect = geometry.strip_rect(full_rect);
+        let strip_lock_rect =
+            strip_rect.map(crate::video::seek_strip_layout::seek_strip_lock_button_rect);
+        let toggle_x = if let Some(bar_rect) = bar_rect {
+            bar_rect.right() - BAR_BUTTON_SIZE * 2.0 - 10.0
+        } else {
+            strip_lock_rect.map_or(panel_rect.right() - BAR_BUTTON_SIZE - 6.0, |lock_rect| {
+                lock_rect.left() - BAR_BUTTON_SIZE - 4.0
+            })
+        };
+        let toggle_y = bar_rect.map_or_else(
+            || {
+                strip_lock_rect.map_or(panel_rect.center().y, |rect| rect.center().y)
+                    - BAR_BUTTON_SIZE * 0.5
+            },
+            |rect| rect.center().y - BAR_BUTTON_SIZE * 0.5,
+        );
         let strip_visible = self.settings.still_seek_strip_visible;
         let strip_resp = draw_bar_button(
             ui,
             toggle_x,
-            lock_y,
+            toggle_y,
             "fullscreen_still_seek_strip",
             |hovered| bar_button_bg(hovered, strip_visible),
             strip_visible,
-            |painter, center, r| {
-                for offset in [-0.68_f32, 0.0, 0.68] {
-                    painter.rect_stroke(
-                        egui::Rect::from_center_size(
-                            center + egui::vec2(offset * r, 0.0),
-                            egui::vec2(r * 0.55, r * 1.15),
-                        ),
-                        1.0,
-                        egui::Stroke::new(1.2, egui::Color32::WHITE),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            },
+            draw_still_seek_strip_icon,
         )
         .hover_tip_dark(if strip_visible {
             "サムネイル列を隠す"
@@ -16253,40 +16840,43 @@ impl App {
             "サムネイル列を表示"
         });
         if strip_resp.clicked() {
-            self.settings.still_seek_strip_visible = !strip_visible;
-            self.settings.save();
-            ctx.request_repaint();
+            self.toggle_still_seek_strip_visible(ctx);
         }
-        let lock_resp = draw_bar_button(
-            ui,
-            lock_x,
-            lock_y,
-            "fullscreen_seek_lock",
-            |hovered| bar_button_bg(hovered, locked),
-            locked,
-            |p, c, r| draw_seek_lock_icon(p, c, r, locked),
-        );
-        let lock_resp = lock_resp.hover_tip_dark(if locked {
-            "シークバー固定を解除"
-        } else {
-            "シークバーを固定表示"
-        });
-        if lock_resp.clicked() {
-            self.settings.fullscreen_seek_bar_locked = !locked;
-            self.settings.save();
-            ctx.request_repaint();
+        if let Some(bar_rect) = bar_rect {
+            let lock_x = bar_rect.right() - BAR_BUTTON_SIZE - 6.0;
+            let lock_y = bar_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+            let lock_resp = draw_bar_button(
+                ui,
+                lock_x,
+                lock_y,
+                "fullscreen_seek_lock",
+                |hovered| bar_button_bg(hovered, locked),
+                locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+            );
+            let lock_resp = lock_resp.hover_tip_dark(if locked {
+                "シークバー固定を解除"
+            } else {
+                "シークバーを固定表示"
+            });
+            if lock_resp.clicked() {
+                self.settings.set_still_seek_bar_locked(!locked);
+                self.settings.save();
+                ctx.request_repaint();
+            }
         }
 
-        let content_right = (toggle_x - 6.0).max(panel_rect.left());
+        let bar_content_right = bar_rect.map_or(panel_rect.right(), |_| toggle_x - 6.0);
         let content_rect = egui::Rect::from_min_max(
-            geometry.bar_rect(full_rect).unwrap_or(panel_rect).min,
-            egui::pos2(content_right, panel_rect.bottom()),
+            bar_rect.unwrap_or(panel_rect).min,
+            egui::pos2(
+                bar_content_right.max(panel_rect.left()),
+                panel_rect.bottom(),
+            ),
         );
         let painter = ui.painter();
 
-        let all_nav_items_are_images =
-            info.media_count == info.image_indices.len() && !info.image_indices.is_empty();
-        if !all_nav_items_are_images {
+        if !info.has_page_strip_content() {
             self.ensure_still_seek_thumbnail_requests(ctx, &[]);
             let summary = Self::fullscreen_mixed_media_summary(&info);
             painter.text(
@@ -16300,11 +16890,14 @@ impl App {
         }
 
         let total = info.image_indices.len();
-        // レイアウト、pointer→page、fill、knob の全経路で同じ実効方向を共有する。
-        let is_rtl = self
-            .settings
-            .fullscreen_seek_direction
-            .is_rtl(self.reading_direction);
+        let directions = resolve_still_seek_directions(
+            self.reading_direction,
+            self.settings.fullscreen_seek_direction,
+        );
+        // サムネイル列のページ順とセルの pointer→page は本の読み方向に従う。
+        // 通常バーのクリック、塗り、つまみ、プレビュー位置は独立したシークバー方向設定に従う。
+        let strip_is_rtl = directions.strip_rtl;
+        let bar_is_rtl = directions.bar_rtl;
         let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
@@ -16332,47 +16925,88 @@ impl App {
                 .as_ref()
                 .map(|units| units.as_slice())
         });
-        let highlighted_pages: HashSet<usize> = spread_seek
-            .as_ref()
-            .map(|(units, unit_index)| units[*unit_index].pages.iter().copied().collect())
-            .unwrap_or_else(|| HashSet::from([fs_idx]));
+        let highlighted_pages: HashSet<usize> = pages_on_screen_with(fs_idx, preview_units)
+            .into_iter()
+            .collect();
         let mut requested_pages = Vec::new();
         let mut preview: Option<ResolvedStillSeekTarget> = None;
         let mut preview_pointer_x = None;
         let mut target = None;
         let mut strip_display_pos = None;
 
-        if let Some(strip_rect) = geometry.strip_rect(full_rect) {
+        if let Some(strip_rect) = strip_rect {
+            self.fs_seek_gesture
+                .recenter_if_page_changed(info.current_pos);
+            let strip_lock_rect = strip_lock_rect.expect("visible strip has a lock button rect");
+            let strip_content_right = if bar_rect.is_some() {
+                strip_lock_rect.left() - 6.0
+            } else {
+                toggle_x - 6.0
+            };
             let strip_content = egui::Rect::from_min_max(
                 strip_rect.min + egui::vec2(6.0, 5.0),
-                egui::pos2(content_right - 6.0, strip_rect.bottom() - 5.0),
+                egui::pos2(
+                    strip_content_right.max(strip_rect.left() + 6.0),
+                    strip_rect.bottom() - 5.0,
+                ),
             );
-            let configured_cell_width = self
-                .settings
-                .still_seek_strip_height
-                .window_cell_width_points();
-            let cell_width = configured_cell_width.min(strip_content.width().max(1.0));
             let cell_height = (strip_rect.height()
                 - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET)
                 .max(1.0);
-            let window = still_seek_strip_window(
-                total,
-                info.current_pos,
+            let strip_layout_center = self.fs_seek_gesture.strip_layout_center(info.current_pos);
+            // 回転取得は &mut self を取るため、列が参照し得る数十件を先に既存の一括 cache
+            // 経路で取り出す。レイアウト closure 内では DB / App を一切参照しない。
+            let rotation_candidates = still_seek_strip_rotation_candidates(
+                &info.image_indices,
+                strip_layout_center,
                 strip_content.width(),
-                configured_cell_width,
+                cell_height,
+            );
+            let rotations = self.get_rotations_for_indices(&rotation_candidates);
+            let strip_rotations: HashMap<usize, crate::rotation_db::Rotation> =
+                rotation_candidates.into_iter().zip(rotations).collect();
+            let layout = still_seek_strip_layout(
+                &info.image_indices,
+                strip_layout_center,
+                strip_content,
+                cell_height,
+                strip_is_rtl,
+                |idx| match self.thumbnails.get(idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => StillSeekStripThumbnail::Loaded(
+                        tex.size_vec2(),
+                        strip_rotations
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                    ),
+                    Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
+                    Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
+                        StillSeekStripThumbnail::Unavailable
+                    }
+                },
             );
             requested_pages.extend(
-                info.image_indices[window.request_start..window.request_end]
+                info.image_indices[layout.request_start..layout.request_end]
                     .iter()
                     .copied(),
             );
-            let visible_count = window.visible_end - window.visible_start;
-            let row_width = visible_count as f32 * cell_width
-                + visible_count.saturating_sub(1) as f32 * STILL_SEEK_STRIP_CELL_GAP;
-            let row_rect = egui::Rect::from_center_size(
-                strip_content.center(),
-                egui::vec2(row_width.min(strip_content.width()), strip_content.height()),
-            );
+            let row_rect = layout
+                .cells
+                .first()
+                .zip(layout.cells.last())
+                .map(|(first, last)| {
+                    egui::Rect::from_min_max(
+                        egui::pos2(first.rect.left(), strip_content.top()),
+                        egui::pos2(last.rect.right(), strip_content.bottom()),
+                    )
+                    .intersect(strip_content)
+                })
+                .unwrap_or_else(|| {
+                    egui::Rect::from_center_size(
+                        strip_content.center(),
+                        egui::vec2(0.0, strip_content.height()),
+                    )
+                });
             let strip_response = ui.interact(
                 row_rect,
                 ui.make_persistent_id("fullscreen_still_seek_strip_row"),
@@ -16387,9 +17021,31 @@ impl App {
             let pointer = strip_response
                 .interact_pointer_pos()
                 .or_else(|| strip_response.hover_pos());
-            let pointed_source_pos = pointer.and_then(|pointer| {
-                still_seek_source_position_at_x(row_rect, window, cell_width, pointer.x, is_rtl)
-            });
+            // The response handler owns the immutable press origin, live center, and release
+            // commit. The page-position sync above is the only non-close path that discards a
+            // committed center.
+            let strip_interaction = handle_still_seek_strip_response(
+                &strip_response,
+                strip_layout_center,
+                info.current_pos,
+                total,
+                self.settings
+                    .still_seek_strip_height
+                    .window_cell_width_points(),
+                // Rect::bottom is exclusive at the monitor edge. Keep the shared close
+                // predicate unchanged, but cap its boundary at the last physical pixel.
+                strip_rect
+                    .bottom()
+                    .min(full_rect.bottom() - 1.0 / ctx.pixels_per_point()),
+                strip_is_rtl,
+                &mut self.fs_seek_gesture,
+            );
+            let strip_closed_by_drag = strip_interaction.closed_by_drag;
+            if strip_closed_by_drag {
+                self.set_still_seek_strip_visible(ctx, false);
+            }
+            let pointed_source_pos =
+                pointer.and_then(|pointer| still_seek_source_position_at_pointer(&layout, pointer));
             if (strip_response.hovered() || strip_response.dragged())
                 && self.settings.still_seek_hover_preview_mode.is_visible(true)
                 && let Some(source_pos) = pointed_source_pos
@@ -16402,7 +17058,12 @@ impl App {
                 );
                 preview_pointer_x = pointer.map(|p| p.x);
             }
-            if (strip_response.clicked() || strip_response.dragged())
+            if strip_interaction.note_seek_activity {
+                self.fs_seek_drag_active = true;
+                self.note_fullscreen_seek_activity();
+            }
+            if !strip_closed_by_drag
+                && strip_response.clicked()
                 && let Some(source_pos) = pointed_source_pos
                 && let Some(resolved) = resolve_still_seek_target(
                     &info.image_indices,
@@ -16411,46 +17072,35 @@ impl App {
                     StillSeekPosition::SourcePosition(source_pos),
                 )
             {
-                if strip_response.dragged() {
-                    self.fs_seek_drag_active = true;
-                    self.note_fullscreen_seek_activity();
-                }
                 strip_display_pos = Some(resolved.display_pos);
                 if resolved.landing_idx != fs_idx || continuous_label_mode {
                     target = Some(resolved.landing_idx);
                 }
             }
 
-            for visual_slot in 0..visible_count {
-                let source_pos = if is_rtl {
-                    window.visible_end - 1 - visual_slot
-                } else {
-                    window.visible_start + visual_slot
-                };
-                let idx = info.image_indices[source_pos];
-                let cell_rect =
-                    still_seek_cell_rect(row_rect, visual_slot, cell_width, cell_height)
-                        .intersect(strip_content);
-                painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(30));
-                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(idx) {
-                    painter.image(
+            let strip_painter = painter.with_clip_rect(strip_content);
+            for cell in &layout.cells {
+                strip_painter.rect_filled(cell.rect, 3.0, egui::Color32::from_gray(30));
+                if let Some(ThumbnailState::Loaded { tex, .. }) = self.thumbnails.get(cell.idx) {
+                    let display_size = rotated_display_size(tex.size_vec2(), cell.rotation);
+                    crate::app::draw_rotated_image(
+                        &strip_painter,
                         tex.id(),
-                        fit_texture_rect(tex.size_vec2(), cell_rect.shrink(2.0)),
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        fit_texture_rect(display_size, cell.rect.shrink(2.0)),
+                        cell.rotation,
                     );
                 } else {
-                    painter.text(
-                        cell_rect.center(),
+                    strip_painter.text(
+                        cell.rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "…",
                         egui::FontId::proportional(18.0),
                         egui::Color32::from_gray(150),
                     );
                 }
-                let selected = highlighted_pages.contains(&idx);
-                painter.rect_stroke(
-                    cell_rect,
+                let selected = highlighted_pages.contains(&cell.idx);
+                strip_painter.rect_stroke(
+                    cell.rect,
                     3.0,
                     egui::Stroke::new(
                         if selected { 3.0 } else { 1.0 },
@@ -16462,6 +17112,32 @@ impl App {
                     ),
                     egui::StrokeKind::Inside,
                 );
+            }
+
+            // body より後に登録し、鍵の当たり判定をセル操作へ渡さない。位置と見た目、
+            // および 3 状態の固定モデルは動画ストリップと共有する。
+            let strip_lock_response = ui
+                .interact(
+                    strip_lock_rect,
+                    egui::Id::new("fullscreen_still_seek_strip_lock"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            draw_seek_strip_lock_button_visual(
+                painter,
+                strip_lock_rect,
+                strip_lock_response.hovered(),
+                strip_locked,
+            );
+            let strip_lock_response = strip_lock_response.hover_tip_dark(if strip_locked {
+                "サムネイル列の固定を解除"
+            } else {
+                "サムネイル列を固定表示"
+            });
+            if strip_lock_response.clicked() {
+                self.settings.set_still_seek_strip_locked(!strip_locked);
+                self.settings.save();
+                ctx.request_repaint();
             }
         }
         if geometry.bar_height > 0.0 {
@@ -16488,7 +17164,7 @@ impl App {
                 .max(64.0)
                 .min((inner.width() * 0.32).max(64.0));
             let gap = 12.0;
-            let (label_rect, track_rect) = if is_rtl {
+            let (label_rect, track_rect) = if bar_is_rtl {
                 let label_rect =
                     egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
                 let track_rect = egui::Rect::from_min_max(
@@ -16526,40 +17202,54 @@ impl App {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
 
-                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
-                if let Some(pointer_pos) = response
+                let pointer_pos = response
                     .interact_pointer_pos()
-                    .or_else(|| response.hover_pos())
-                    && (response.hovered() || response.dragged())
-                {
+                    .or_else(|| response.hover_pos());
+                let resolved_at_pointer = pointer_pos.and_then(|pointer_pos| {
                     let fraction =
-                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, is_rtl);
-                    let resolved = resolve_still_seek_target(
+                        fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, bar_is_rtl);
+                    resolve_still_seek_target(
                         &info.image_indices,
                         spread_units,
                         preview_units,
                         StillSeekPosition::TrackFraction(fraction),
-                    );
+                    )
+                });
+
+                // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
+                if (response.hovered() || response.dragged())
+                    && let (Some(pointer_pos), Some(resolved)) =
+                        (pointer_pos, resolved_at_pointer.as_ref())
+                {
                     if self
                         .settings
                         .still_seek_hover_preview_mode
                         .is_visible(strip_visible)
                     {
-                        preview = resolved.clone();
+                        preview = Some(resolved.clone());
                         preview_pointer_x = Some(pointer_pos.x);
                     }
-                    if (response.clicked() || response.dragged())
-                        && let Some(resolved) = resolved
-                    {
-                        if response.dragged() {
-                            self.fs_seek_drag_active = true;
-                            self.note_fullscreen_seek_activity();
-                        }
-                        display_pos = resolved.display_pos;
-                        if resolved.landing_idx != fs_idx || continuous_label_mode {
-                            target = Some(resolved.landing_idx);
+                }
+
+                let interaction =
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_gesture);
+                if interaction.note_seek_activity {
+                    self.fs_seek_drag_active = true;
+                    self.note_fullscreen_seek_activity();
+                }
+                match interaction.action {
+                    StillSeekTrackAction::Seek => {
+                        if let Some(resolved) = resolved_at_pointer.as_ref() {
+                            display_pos = resolved.display_pos;
+                            if resolved.landing_idx != fs_idx || continuous_label_mode {
+                                target = Some(resolved.landing_idx);
+                            }
                         }
                     }
+                    StillSeekTrackAction::OpenStrip => {
+                        self.set_still_seek_strip_visible(ctx, true);
+                    }
+                    StillSeekTrackAction::None => {}
                 }
 
                 painter.rect_filled(
@@ -16575,8 +17265,8 @@ impl App {
                 } else {
                     display_pos as f32 / (total - 1) as f32
                 };
-                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, is_rtl);
-                let filled_rect = if is_rtl {
+                let knob_x = fullscreen_seek_knob_x(track_rect, fraction, bar_is_rtl);
+                let filled_rect = if bar_is_rtl {
                     egui::Rect::from_min_max(
                         egui::pos2(knob_x, track_rect.top()),
                         track_rect.right_bottom(),
@@ -16597,7 +17287,7 @@ impl App {
                     track_rect.width(),
                     crate::seek_ruler::SEEK_RULER_MIN_SPACING,
                 ) {
-                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
+                    let x = fullscreen_seek_knob_x(track_rect, tick.fraction, bar_is_rtl);
                     let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
                     let (height, gray) = if tick.major {
                         (
@@ -16653,7 +17343,7 @@ impl App {
         if let Some(preview) = preview.as_ref() {
             // 画面上の並びに合わせる。右→左読みでは元ページ順の逆から見える。
             let mut pages = preview.preview_pages.clone();
-            if is_rtl {
+            if strip_is_rtl {
                 pages.reverse();
             }
             let textures: Vec<Option<egui::TextureHandle>> = pages
@@ -18256,12 +18946,8 @@ impl App {
                                     if self.fs_music_view_active(fs_idx) {
                                         // 音声: egui 音楽ビュー (D3、Inc 3)。通常の画像/ズーム/
                                         // 比較/回転経路はスキップする。
-                                        music_view_frame_ui = self.draw_fs_music_view(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            // 解析モード / VST3 コンパクトは `image_rect` を
-                                            // 別の規則で作るので、この帯は存在しない。
+                                        // These modes construct image_rect without a panel band.
+                                        let reserved_panel_width =
                                             if analysis_active || vst3_compact_active {
                                                 0.0
                                             } else {
@@ -18270,7 +18956,12 @@ impl App {
                                                     fs_idx,
                                                     state.is_video,
                                                 )
-                                            },
+                                            };
+                                        music_view_frame_ui = self.draw_fs_music_view(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            reserved_panel_width,
                                             fs_idx,
                                         );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
@@ -23538,6 +24229,11 @@ impl App {
         // 画像スライドショーに参加しない。
         let key_s =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_seek_strip_toggle = self.fs_context_menu_idx.is_none()
+            && self.fullscreen_seek_overlay_allowed(fs_idx, current_item_is_video)
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSeekStripToggle);
         let key_r = !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
         let key_l =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
@@ -24451,6 +25147,10 @@ impl App {
             }
         }
 
+        if key_seek_strip_toggle {
+            self.toggle_still_seek_strip_visible(ctx);
+        }
+
         // Space: スライドショー中→停止、停止中→画像をチェック。
         // 動画モードでは `current_item_is_video_for_space` で gate されているため
         // `key_space` は常に false (= ここには到達しない)。Video アームを残しておくと
@@ -25013,7 +25713,7 @@ impl App {
     /// タップ分類の除外とマウスのエッジ抑止が同じ幾何から導かれるように、
     /// パネル矩形の求め方はここ 1 か所に置く。
     pub(crate) fn fullscreen_navigator_panel_rect(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> Option<egui::Rect> {
@@ -25033,7 +25733,7 @@ impl App {
     }
 
     pub(crate) fn fullscreen_navigator_edge_exclusion(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> Option<egui::Rect> {
@@ -26280,7 +26980,7 @@ impl App {
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
-                && (self.settings.fullscreen_seek_bar_locked
+                && (self.settings.still_bottom_lock().bar_locked()
                     || self.fs_seek_drag_active
                     || touch_chrome_latched
                     || ctx.input(|i| {
@@ -29686,7 +30386,7 @@ impl App {
         self.fs_vertical_scroll += delta;
         ctx.request_repaint();
     }
-    fn continuous_reading_viewport_len_for_flow(&self, ctx: &egui::Context) -> f32 {
+    fn continuous_reading_viewport_len_for_flow(&mut self, ctx: &egui::Context) -> f32 {
         let viewport = ctx.content_rect();
         let viewport = self
             .fullscreen_idx
@@ -29702,7 +30402,7 @@ impl App {
         }
     }
 
-    fn continuous_reading_key_step_px(&self, ctx: &egui::Context) -> f32 {
+    fn continuous_reading_key_step_px(&mut self, ctx: &egui::Context) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -29711,7 +30411,7 @@ impl App {
                 / 100.0)
     }
 
-    fn continuous_reading_wheel_delta_px(&self, ctx: &egui::Context, wheel_y: f32) -> f32 {
+    fn continuous_reading_wheel_delta_px(&mut self, ctx: &egui::Context, wheel_y: f32) -> f32 {
         let notches = wheel_y / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA;
         -notches
             * self.continuous_reading_viewport_len_for_flow(ctx)
@@ -29722,7 +30422,10 @@ impl App {
                 / 100.0)
     }
 
-    pub(crate) fn continuous_reading_gamepad_speed_px_per_sec(&self, ctx: &egui::Context) -> f32 {
+    pub(crate) fn continuous_reading_gamepad_speed_px_per_sec(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -29731,7 +30434,7 @@ impl App {
                 / 100.0)
     }
 
-    fn slideshow_continuous_scroll_step_px(&self, ctx: &egui::Context) -> f32 {
+    fn slideshow_continuous_scroll_step_px(&mut self, ctx: &egui::Context) -> f32 {
         self.continuous_reading_viewport_len_for_flow(ctx)
             * (self
                 .settings
@@ -29956,11 +30659,8 @@ impl App {
         direction: f32,
         history_trigger: crate::app::HistoryTrigger,
     ) {
-        self.scroll_vertical_reading_by(
-            ctx,
-            direction * self.continuous_reading_key_step_px(ctx),
-            history_trigger,
-        );
+        let delta = direction * self.continuous_reading_key_step_px(ctx);
+        self.scroll_vertical_reading_by(ctx, delta, history_trigger);
     }
 
     pub(crate) fn persist_current_spread_mode(&self) {
@@ -34239,7 +34939,7 @@ impl App {
     /// 何も出ていない) か判定する。`true` かつアイドル時間が設定秒数を超えたら
     /// マウスカーソルを `CursorIcon::None` で非表示にする。
     fn fs_ui_is_clean(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         _is_video: bool,
@@ -52577,6 +53277,10 @@ mod tests {
         );
     }
 
+    fn loaded_still_seek_thumbnail(size: egui::Vec2) -> StillSeekStripThumbnail {
+        StillSeekStripThumbnail::Loaded(size, crate::rotation_db::Rotation::None)
+    }
+
     #[test]
     fn spread_seek_maps_two_units_to_discrete_endpoints() {
         assert_eq!(spread_seek_unit_fraction(0, 2), 0.0);
@@ -52599,40 +53303,1211 @@ mod tests {
 
     #[test]
     fn still_seek_strip_requests_are_bounded_by_view_width_for_fifty_thousand_pages() {
-        let window = still_seek_strip_window(50_000, 25_000, 1_920.0, 45.0);
-        let visible = window.visible_end - window.visible_start;
-        let requested = window.request_end - window.request_start;
-        assert!(visible <= 40);
-        assert!(requested <= visible + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2);
-        assert!(window.visible_start <= 25_000);
-        assert!(window.visible_end > 25_000);
+        let images = (0..50_000).collect::<Vec<_>>();
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_920.0, cell_height));
+        let rotation_candidates =
+            still_seek_strip_rotation_candidates(&images, 25_000, row.width(), cell_height);
+        assert!(rotation_candidates.len() <= 64);
+        let layout = still_seek_strip_layout(&images, 25_000, row, cell_height, false, |idx| {
+            assert!(rotation_candidates.contains(&idx));
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 100.0))
+        });
+        let min_cell_width = cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT;
+        let visible_bound = ((row.width() + STILL_SEEK_STRIP_CELL_GAP)
+            / (min_cell_width + STILL_SEEK_STRIP_CELL_GAP))
+            .floor() as usize;
+        assert!(layout.cells.len() <= visible_bound);
+        assert!(
+            layout.request_end - layout.request_start
+                <= layout.cells.len() + STILL_SEEK_STRIP_OVERSCAN_CELLS * 2
+        );
+        assert!(layout.cells.iter().any(|cell| cell.source_pos == 25_000));
     }
 
     #[test]
-    fn still_seek_strip_visual_order_mirrors_source_positions_for_rtl() {
-        let window = StillSeekStripWindow {
-            visible_start: 10,
-            visible_end: 14,
-            request_start: 8,
-            request_end: 16,
+    fn still_seek_cells_use_each_pages_own_aspect_with_a_lower_bound() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(3.0, 2.0)),
+            loaded_still_seek_thumbnail(egui::vec2(1.0, 10.0)),
+        ];
+        let cell_height = 94.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 2, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
         };
-        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(196.0, 40.0));
+        assert_f32_close(width(1), cell_height * 2.0 / 3.0);
+        assert_f32_close(width(3), cell_height * 3.0 / 2.0);
+        assert_f32_close(width(4), cell_height * STILL_SEEK_STRIP_MIN_CELL_ASPECT);
+    }
+
+    #[test]
+    fn still_seek_layout_swaps_width_and_height_for_quarter_turns() {
+        let images = [0, 1, 2];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Loaded(
+                egui::vec2(2.0, 3.0),
+                crate::rotation_db::Rotation::Cw90,
+            ),
+        ];
+        let cell_height = 90.0;
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, cell_height));
+        let layout =
+            still_seek_strip_layout(&images, 1, row, cell_height, false, |idx| states[idx]);
+        let width = |source_pos| {
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == source_pos)
+                .unwrap()
+                .rect
+                .width()
+        };
+        assert_f32_close(width(0), 60.0);
+        assert_f32_close(width(2), 135.0);
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 1.0, false),
-            Some(10)
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 2)
+                .unwrap()
+                .rotation,
+            crate::rotation_db::Rotation::Cw90
+        );
+    }
+
+    #[test]
+    fn still_seek_unavailable_pages_stop_growth_but_remain_in_overscan_requests() {
+        let images = [0, 1, 2, 3, 4, 5, 6];
+        let states = [
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 3, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(layout.request_start, 1);
+        assert_eq!(layout.request_end, 7);
+
+        let current_unavailable = still_seek_strip_layout(&images, 3, row, 94.0, false, |_| {
+            StillSeekStripThumbnail::Unavailable
+        });
+        assert!(current_unavailable.cells.is_empty());
+        assert_eq!(current_unavailable.request_start, 1);
+        assert_eq!(current_unavailable.request_end, 6);
+    }
+
+    #[test]
+    fn still_seek_failed_pages_are_square_and_do_not_stop_growth() {
+        let images = [0, 1, 2, 3, 4];
+        let states = [
+            StillSeekStripThumbnail::Unavailable,
+            StillSeekStripThumbnail::Unavailable,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+            StillSeekStripThumbnail::Failed,
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0)),
+        ];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 94.0));
+        let layout = still_seek_strip_layout(&images, 2, row, 94.0, false, |idx| states[idx]);
+        assert_eq!(
+            layout
+                .cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_f32_close(
+            layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == 3)
+                .unwrap()
+                .rect
+                .width(),
+            94.0,
+        );
+    }
+
+    #[test]
+    fn still_seek_placed_cells_do_not_move_when_outer_pages_load() {
+        let images = (0..9).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_000.0, 94.0));
+        let initial = still_seek_strip_layout(&images, 4, row, 94.0, false, |idx| {
+            if (2..=6).contains(&idx) {
+                loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+            } else {
+                StillSeekStripThumbnail::Unavailable
+            }
+        });
+        let grown = still_seek_strip_layout(&images, 4, row, 94.0, false, |_| {
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+        });
+        for original in &initial.cells {
+            let after = grown
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == original.source_pos)
+                .unwrap();
+            assert_eq!(after.rect, original.rect);
+        }
+        assert!(grown.cells.len() > initial.cells.len());
+    }
+
+    #[test]
+    fn still_seek_strip_and_bar_resolve_their_two_direction_axes_independently() {
+        let images = [10, 11, 12, 13];
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 40.0));
+        let loaded = |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0));
+        let cases = [
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::LeftToRight,
+                true,
+                false,
+            ),
+            (
+                ReadingDirection::Rtl,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                true,
+                true,
+            ),
+            (
+                ReadingDirection::Ltr,
+                crate::settings::FullscreenSeekDirection::FollowReading,
+                false,
+                false,
+            ),
+        ];
+        for (reading, bar_setting, expected_strip_rtl, expected_bar_rtl) in cases {
+            assert_eq!(
+                resolve_still_seek_directions(reading, bar_setting),
+                StillSeekDirections {
+                    strip_rtl: expected_strip_rtl,
+                    bar_rtl: expected_bar_rtl,
+                }
+            );
+        }
+
+        let ltr = still_seek_strip_layout(&images, 1, row, 40.0, false, loaded);
+        let rtl = still_seek_strip_layout(&images, 1, row, 40.0, true, loaded);
+        assert_eq!(
+            ltr.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
         );
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 1.0, true),
-            Some(13)
+            rtl.cells
+                .iter()
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1, 0]
+        );
+        for layout in [&ltr, &rtl] {
+            for cell in &layout.cells {
+                assert_eq!(
+                    still_seek_source_position_at_pointer(layout, cell.rect.center()),
+                    Some(cell.source_pos)
+                );
+            }
+            let gap_x = (layout.cells[0].rect.right() + layout.cells[1].rect.left()) * 0.5;
+            assert_eq!(
+                still_seek_source_position_at_pointer(
+                    layout,
+                    egui::pos2(gap_x, layout.cells[0].rect.center().y),
+                ),
+                None
+            );
+        }
+
+        let track = egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(110.0, 8.0));
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, false), 0.0);
+        assert_eq!(fullscreen_seek_fraction_from_x(track, 10.0, true), 1.0);
+    }
+
+    /// **送る向きは並びの向きに従う。**
+    ///
+    /// 右→左で読む本では、画面上のセルが元ページ順の逆に並ぶ。動画の
+    /// `center_index_after_drag` は常に左→右前提なので、画面上の移動量をそのまま
+    /// 渡すと指と逆へ動く (2026-09-06 利用者報告)。既存の RTL テストは「確定済みの
+    /// 中心が両方向のレイアウトで使われること」しか見ておらず、**送る向きは見ていなかった**。
+    #[test]
+    fn still_seek_strip_pan_follows_the_finger_in_both_reading_directions() {
+        let cell_width = 64.0_f32;
+        let start = 5_usize;
+        let drag_right = 128.0_f32;
+
+        let ltr =
+            crate::video::seek_strip::center_index_after_drag(start as f64, drag_right, cell_width)
+                .unwrap();
+        let rtl = crate::video::seek_strip::center_index_after_drag(
+            start as f64,
+            -drag_right,
+            cell_width,
+        )
+        .unwrap();
+
+        // 右へ引いたとき、左→右の本は前のページへ、右→左の本は後のページへ寄る。
+        assert!(
+            ltr < start as f64,
+            "LTR: dragging right must go back, got {ltr}"
+        );
+        assert!(
+            rtl > start as f64,
+            "RTL: dragging right must go forward, got {rtl}"
         );
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 195.0, false),
-            Some(13)
+            (start as f64 - ltr).abs(),
+            (rtl - start as f64).abs(),
+            "both directions must move the same distance"
+        );
+    }
+
+    #[test]
+    fn still_seek_strip_committed_center_is_used_for_ltr_and_rtl_layouts() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+        let expected_center = crate::video::seek_strip::center_index_after_drag(5.0, 128.0, 64.0)
+            .unwrap()
+            .round() as usize;
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos: expected_center,
+                page_pos_at_commit: 5,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(5),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let centered = layout
+                .cells
+                .iter()
+                .find(|cell| cell.source_pos == expected_center)
+                .expect("the committed center must be present")
+                .rect
+                .center();
+            assert_eq!(centered, row.center(), "rtl={rtl}");
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_recenters_when_the_actual_page_changes() {
+        let mut gesture = StillSeekGesture::StripCommitted {
+            layout_center_pos: 2,
+            page_pos_at_commit: 5,
+        };
+        gesture.recenter_if_page_changed(5);
+        assert_eq!(gesture.strip_layout_center(5), 2);
+
+        gesture.recenter_if_page_changed(6);
+        assert_eq!(gesture, StillSeekGesture::Idle);
+        assert_eq!(gesture.strip_layout_center(6), 6);
+    }
+
+    #[test]
+    fn still_seek_strip_latched_layout_keeps_actual_current_page_highlighted() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 60.0));
+        let current_pos = 7;
+        let highlighted_pages = HashSet::from([images[current_pos]]);
+
+        for rtl in [false, true] {
+            let gesture = StillSeekGesture::StripCommitted {
+                layout_center_pos: 5,
+                page_pos_at_commit: current_pos,
+            };
+            let layout = still_seek_strip_layout(
+                &images,
+                gesture.strip_layout_center(current_pos),
+                row,
+                60.0,
+                rtl,
+                |_| loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0)),
+            );
+            let selected = layout
+                .cells
+                .iter()
+                .filter(|cell| highlighted_pages.contains(&cell.idx))
+                .map(|cell| cell.source_pos)
+                .collect::<Vec<_>>();
+            assert_eq!(selected, vec![current_pos], "rtl={rtl}");
+            assert_ne!(
+                layout
+                    .cells
+                    .iter()
+                    .find(|cell| cell.source_pos == current_pos)
+                    .unwrap()
+                    .rect
+                    .center(),
+                row.center(),
+                "the highlight must move while the latched layout stays fixed"
+            );
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_has_no_highlight_when_current_page_is_outside_the_moved_window() {
+        let images = (0..12).collect::<Vec<_>>();
+        let row = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 60.0));
+        let highlighted_pages = HashSet::from([images[11]]);
+
+        for rtl in [false, true] {
+            let layout = still_seek_strip_layout(&images, 0, row, 60.0, rtl, |_| {
+                loaded_still_seek_thumbnail(egui::vec2(1.0, 1.0))
+            });
+            assert!(
+                layout
+                    .cells
+                    .iter()
+                    .all(|cell| !highlighted_pages.contains(&cell.idx)),
+                "rtl={rtl}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_seek_strip_lock_stays_outside_cell_hit_testing() {
+        let strip = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 72.0));
+        let lock = crate::video::seek_strip_layout::seek_strip_lock_button_rect(strip);
+        let row = egui::Rect::from_min_max(
+            strip.min + egui::vec2(6.0, 5.0),
+            egui::pos2(lock.left() - 6.0, strip.bottom() - 5.0),
+        );
+        let images = [0, 1, 2, 3, 4, 5];
+        let layout = still_seek_strip_layout(&images, 2, row, 62.0, false, |_| {
+            loaded_still_seek_thumbnail(egui::vec2(2.0, 3.0))
+        });
+        assert!(
+            layout
+                .cells
+                .iter()
+                .all(|cell| cell.rect.right() <= row.right())
         );
         assert_eq!(
-            still_seek_source_position_at_x(row, window, 45.0, 195.0, true),
-            Some(10)
+            still_seek_source_position_at_pointer(&layout, lock.center()),
+            None
         );
+    }
+
+    #[test]
+    fn still_seek_bar_and_strip_share_video_gesture_decisions() {
+        let mut horizontal =
+            crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            horizontal.update(egui::pos2(130.0, 104.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub
+        );
+
+        let mut upward = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(100.0, 100.0));
+        assert_eq!(
+            upward.update(egui::pos2(104.0, 70.0)),
+            crate::video::seek_strip::SeekRowDecision::OpenStrip
+        );
+
+        assert!(crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(104.0, 100.0),
+            94.0,
+        ));
+        assert!(!crate::video::seek_strip::strip_drag_closes_downward(
+            egui::pos2(100.0, 70.0),
+            egui::pos2(140.0, 100.0),
+            94.0,
+        ));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StillSeekStripResponseObservation {
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        interaction: StillSeekStripInteraction,
+        gesture: StillSeekGesture,
+    }
+
+    struct StillSeekStripHarnessState {
+        gesture: StillSeekGesture,
+        page: usize,
+        observations: Vec<StillSeekStripResponseObservation>,
+    }
+
+    impl Default for StillSeekStripHarnessState {
+        fn default() -> Self {
+            Self {
+                gesture: StillSeekGesture::Idle,
+                page: 5,
+                observations: Vec::new(),
+            }
+        }
+    }
+
+    fn still_seek_strip_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekStripHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekStripHarnessState| {
+                    let row =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        row,
+                        ui.make_persistent_id(0x57A1_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    state.gesture.recenter_if_page_changed(state.page);
+                    let layout_center_pos = state.gesture.strip_layout_center(state.page);
+                    let interaction = handle_still_seek_strip_response(
+                        &response,
+                        layout_center_pos,
+                        state.page,
+                        10,
+                        40.0,
+                        row.bottom(),
+                        false,
+                        &mut state.gesture,
+                    );
+                    if response.clicked()
+                        && let Some(pointer) = response.interact_pointer_pos()
+                    {
+                        state.page = (((pointer.x - row.left()) / row.width()) * 9.0)
+                            .round()
+                            .clamp(0.0, 9.0) as usize;
+                    }
+                    state.observations.push(StillSeekStripResponseObservation {
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        interaction,
+                        gesture: state.gesture,
+                    });
+                },
+                StillSeekStripHarnessState::default(),
+            )
+    }
+
+    fn still_seek_strip_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekStripHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_strip_drag_uses_video_formula_and_commits_on_release() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let drag = harness.state().observations.last().unwrap();
+        assert!(drag.drag_started);
+        assert!(drag.dragged);
+        assert!(!drag.drag_stopped);
+        assert!(!drag.clicked);
+        assert!(drag.interaction.note_seek_activity);
+        assert!(!drag.interaction.closed_by_drag);
+        assert_eq!(
+            drag.gesture,
+            StillSeekGesture::Strip {
+                origin_center_pos: 5,
+                origin_pointer: origin,
+                layout_center_pos: crate::video::seek_strip::center_index_after_drag(
+                    5.0,
+                    destination.x - origin.x,
+                    40.0,
+                )
+                .unwrap()
+                .round() as usize,
+                page_pos_at_origin: 5,
+            }
+        );
+        assert_eq!(harness.state().page, 5, "strip drag must not seek");
+
+        still_seek_strip_pointer_button(&mut harness, destination, false);
+        let release = harness.state().observations.last().unwrap();
+        assert!(release.drag_stopped);
+        assert_eq!(
+            release.gesture,
+            StillSeekGesture::StripCommitted {
+                layout_center_pos: 3,
+                page_pos_at_commit: 5,
+            }
+        );
+        assert_eq!(release.gesture.strip_layout_center(5), 3);
+    }
+
+    #[test]
+    fn still_seek_strip_click_does_not_create_a_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let pos = egui::pos2(320.0, 96.0);
+        harness.hover_at(pos);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, pos, true);
+        still_seek_strip_pointer_button(&mut harness, pos, false);
+
+        let click = harness.state().observations.last().unwrap();
+        assert!(click.clicked);
+        assert_eq!(click.gesture, StillSeekGesture::Idle);
+        assert_eq!(harness.state().page, 7, "strip click must still seek");
+    }
+
+    #[test]
+    fn still_seek_strip_downward_close_ends_the_drag_latch() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(164.0, 132.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        let close = harness.state().observations.last().unwrap();
+        assert!(close.drag_started);
+        assert!(close.dragged);
+        assert!(close.interaction.closed_by_drag);
+        assert_eq!(close.gesture, StillSeekGesture::Idle);
+        assert_eq!(
+            harness.state().page,
+            5,
+            "downward close must not pan or seek"
+        );
+        assert_eq!(close.gesture.strip_layout_center(5), 5);
+    }
+
+    #[test]
+    fn still_seek_strip_center_clamps_at_both_ends() {
+        let drag_to = |origin: egui::Pos2, destination: egui::Pos2| {
+            let mut harness = still_seek_strip_handler_harness();
+            harness.run();
+            harness.hover_at(origin);
+            harness.step();
+            still_seek_strip_pointer_button(&mut harness, origin, true);
+            harness.hover_at(destination);
+            harness.step();
+            harness.state().gesture.strip_layout_center(5)
+        };
+
+        assert_eq!(drag_to(egui::pos2(160.0, 96.0), egui::pos2(370.0, 96.0)), 0);
+        assert_eq!(drag_to(egui::pos2(260.0, 96.0), egui::pos2(40.0, 96.0)), 9);
+    }
+
+    #[test]
+    fn still_seek_strip_click_after_pan_seeks_then_recenters() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let dragged = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(dragged);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, dragged, false);
+        assert_eq!(harness.state().gesture.strip_layout_center(5), 3);
+
+        let click = egui::pos2(320.0, 96.0);
+        harness.hover_at(click);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, click, true);
+        still_seek_strip_pointer_button(&mut harness, click, false);
+        assert_eq!(harness.state().page, 7);
+        harness.step();
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+        assert_eq!(harness.state().gesture.strip_layout_center(7), 7);
+    }
+
+    #[test]
+    fn fullscreen_teardown_forces_still_seek_strip_latch_idle() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_seek_gesture = StillSeekGesture::Strip {
+            origin_center_pos: 5,
+            origin_pointer: egui::pos2(160.0, 96.0),
+            layout_center_pos: 5,
+            page_pos_at_origin: 5,
+        };
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StillSeekTrackResponseObservation {
+        primary_down: bool,
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        pointer: Option<egui::Pos2>,
+        action: StillSeekTrackAction,
+    }
+
+    #[derive(Default)]
+    struct StillSeekTrackHarnessState {
+        gesture: StillSeekGesture,
+        page: usize,
+        strip_open: bool,
+        seek_activity_frames: usize,
+        observations: Vec<StillSeekTrackResponseObservation>,
+    }
+
+    fn still_seek_track_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekTrackHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekTrackHarnessState| {
+                    let track =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        track,
+                        ui.make_persistent_id(0x5EE4_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let pointer = response
+                        .interact_pointer_pos()
+                        .or_else(|| response.hover_pos());
+                    let interaction =
+                        handle_still_seek_track_response(&response, &mut state.gesture);
+                    if interaction.note_seek_activity {
+                        state.seek_activity_frames += 1;
+                    }
+                    match interaction.action {
+                        StillSeekTrackAction::Seek => {
+                            if let Some(pointer) = pointer {
+                                state.page = (((pointer.x - track.left()) / track.width()) * 9.0)
+                                    .round()
+                                    .clamp(0.0, 9.0)
+                                    as usize;
+                            }
+                        }
+                        StillSeekTrackAction::OpenStrip => state.strip_open = true,
+                        StillSeekTrackAction::None => {}
+                    }
+                    state.observations.push(StillSeekTrackResponseObservation {
+                        primary_down: ui.input(|input| input.pointer.primary_down()),
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        pointer,
+                        action: interaction.action,
+                    });
+                },
+                StillSeekTrackHarnessState::default(),
+            )
+    }
+
+    fn still_seek_track_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekTrackHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_track_horizontal_drag_seeks_on_first_drag_frame() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(
+            harness.state().page,
+            7,
+            "first horizontal drag frame must seek: {:?}",
+            harness.state().observations
+        );
+        assert_eq!(harness.state().seek_activity_frames, 1);
+
+        let drag_frame = harness.state().observations.last().unwrap();
+        assert!(drag_frame.primary_down);
+        assert!(drag_frame.drag_started);
+        assert!(drag_frame.dragged);
+        assert!(!drag_frame.drag_stopped);
+        assert!(!drag_frame.clicked);
+        assert_eq!(drag_frame.pointer, Some(destination));
+        assert_eq!(drag_frame.action, StillSeekTrackAction::Seek);
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+        let release_frame = harness.state().observations.last().unwrap();
+        assert!(!release_frame.primary_down);
+        assert!(release_frame.drag_stopped);
+        assert_eq!(release_frame.action, StillSeekTrackAction::Seek);
+    }
+
+    /// The first scrub frame lands through fullscreen page navigation. That page switch must not
+    /// end the gesture, because later held frames have `dragged=true, drag_started=false`.
+    #[test]
+    fn still_seek_drag_survives_the_page_navigation_it_triggers() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.image_metas = vec![None; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.details_order = vec![0, 1, 2];
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+
+        let mut gesture = crate::video::seek_strip::SeekRowGesture::new(egui::pos2(80.0, 96.0));
+        gesture.update(egui::pos2(160.0, 96.0));
+        app.fs_seek_gesture = StillSeekGesture::Track(gesture);
+        app.fs_seek_drag_active = true;
+
+        let mut perf = None;
+        app.land_still_page_navigation_target(
+            &ctx,
+            0,
+            1,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            &mut perf,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.fs_seek_gesture.is_active());
+        assert!(app.fs_seek_drag_active);
+
+        // Neither render-suppression return may become a second gesture owner. Both can happen
+        // transiently between the first landing frame and the next held-pointer frame.
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        app.analysis_mode = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+        assert!(app.fs_seek_gesture.is_active());
+
+        app.analysis_mode = false;
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarOnly);
+        app.visible_indices = vec![0, 2];
+        app.viewer_navigation_caches.invalidate();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full_rect, 1, false, false),
+                    None
+                );
+            });
+        });
+
+        let StillSeekGesture::Track(gesture) = &mut app.fs_seek_gesture else {
+            panic!("the first scrub frame's page switch must preserve the track gesture");
+        };
+        assert_eq!(
+            gesture.update(egui::pos2(240.0, 96.0)),
+            crate::video::seek_strip::SeekRowDecision::Scrub,
+            "the held second frame must continue the same scrub"
+        );
+    }
+
+    // Exercise the production overlay, enqueue, landing and worker checkpoint together.
+    // The queue has no consumer thread, so we can deterministically pause a real request
+    // across the landing instead of depending on ZIP/PDF I/O timing.
+    fn prepare_still_seek_request_lifetime_app(app: &mut crate::app::App, kind: &str) {
+        app.items = (0..6_000)
+            .map(|idx| match kind {
+                "zip" => GridItem::ZipImage {
+                    zip_path: PathBuf::from("c:/seek/book.zip"),
+                    entry_name: format!("page-{idx}.png"),
+                },
+                "pdf" => GridItem::PdfPage {
+                    pdf_path: PathBuf::from("c:/seek/book.pdf"),
+                    page_num: idx as u32,
+                    content_type: None,
+                },
+                _ => GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))),
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![Some((0, 0)); app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.fullscreen_idx = Some(3);
+        app.selected = Some(3);
+        app.keep_range = (2, 8);
+        app.keep_start_shared
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        app.keep_end_shared
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        app.reload_queue = Some(std::sync::Arc::new((
+            std::sync::Mutex::new(Vec::new()),
+            std::sync::Condvar::new(),
+        )));
+        app.settings.set_still_seek_strip_visible(true);
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Always;
+    }
+
+    fn still_seek_request_overlay_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        land: bool,
+    ) -> Option<usize> {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut target = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let current = app.fullscreen_idx.unwrap();
+                    target = app.draw_fullscreen_seek_overlay(ui, ctx, rect, current, false, false);
+                    if land && let Some(target) = target {
+                        app.land_still_page_navigation_target(
+                            ctx,
+                            current,
+                            target,
+                            crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                            &mut None,
+                        );
+                    }
+                });
+            },
+        );
+        target
+    }
+
+    fn assert_still_seek_overlay_landing_request_lifetime(
+        kind: &str,
+        flow: ReadingFlow,
+        spread: SpreadMode,
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, kind);
+        app.reading_flow = flow;
+        app.spread_mode = spread;
+        let pointer = egui::pos2(480.0, 581.0);
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pointer)],
+            false,
+        );
+        let before = app.still_seek_thumbnail_pages.clone();
+        assert!(
+            before.iter().any(|idx| *idx < 8),
+            "the production strip must request nearby pages"
+        );
+        let remote = *before
+            .iter()
+            .filter(|idx| **idx > 1000)
+            .max()
+            .expect("production hover preview must request a remote page");
+        let queue = app.reload_queue.as_ref().unwrap().clone();
+        let request = {
+            let mut requests = queue.0.lock().unwrap();
+            let position = requests.iter().position(|req| req.idx == remote).unwrap();
+            requests.remove(position)
+        };
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        let worker_accepts = || {
+            crate::thumb_loader::thumbnail_request_in_current_keep(&request, Some(&shared), 2, 8)
+        };
+        assert!(worker_accepts());
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        );
+        let landed = still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+        )
+        .expect("the production track click must return a landing target");
+        assert_eq!(app.fullscreen_idx, Some(landed));
+        assert_eq!(
+            app.still_seek_thumbnail_pages, before,
+            "landing must retain this frame's strip and preview requests"
+        );
+        assert!(
+            worker_accepts(),
+            "the same in-flight request must survive a post-I/O checkpoint"
+        );
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            worker_accepts(),
+            "next overlay frame must keep the current preview"
+        );
+        // Moving the pointer replaces the projection, ending only the obsolete preview.
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(250.0, 581.0))],
+            false,
+        );
+        // Hide also removes the strip pages, including the page we just landed on.
+        app.analysis_mode = true;
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(
+            !worker_accepts(),
+            "the overlay owns the end of its requirements"
+        );
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_paged_landing() {
+        for kind in ["image", "zip", "pdf"] {
+            for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                assert_still_seek_overlay_landing_request_lifetime(
+                    kind,
+                    ReadingFlow::Paged,
+                    spread,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_survive_continuous_landing() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for kind in ["image", "zip", "pdf"] {
+                for spread in [SpreadMode::Single, SpreadMode::Ltr] {
+                    assert_still_seek_overlay_landing_request_lifetime(kind, flow, spread);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_items_generation_change() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(480.0, 581.0))],
+            false,
+        );
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        let shared = app.still_seek_thumbnail_pages_shared.clone();
+        app.bump_items_generation();
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(shared.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn still_seek_overlay_requests_expire_on_container_replacement() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        prepare_still_seek_request_lifetime_app(&mut app, "image");
+        still_seek_request_overlay_frame(&mut app, &ctx, vec![], false);
+        assert!(!app.still_seek_thumbnail_pages.is_empty());
+        app.current_folder = Some(PathBuf::from("c:/another-book"));
+        app.install_new_items(
+            vec![GridItem::Image(PathBuf::from("c:/another-book/1.png"))],
+            vec![None],
+        );
+        assert!(app.still_seek_thumbnail_pages.is_empty());
+        assert!(
+            app.still_seek_thumbnail_pages_shared
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// **ドラッグを続けている間ずっとシークできること。**
+    ///
+    /// 実機では「1 ページだけ進んで、その後は動かない」という形で壊れていた
+    /// (2026-09-06)。最初の 1 フレームだけを見るテストは通り続けていたので、
+    /// 継続するフレームを跨いで観測する。ジェスチャは一度 `Scrub` に決まったら
+    /// 離すまでその状態で居続けるのが契約で、途中で誰かが捨てたらここが落ちる。
+    #[test]
+    fn still_seek_track_horizontal_drag_keeps_seeking_across_frames() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+
+        let mut pages = Vec::new();
+        for x in [160.0_f32, 240.0, 320.0, 400.0] {
+            harness.hover_at(egui::pos2(x, 96.0));
+            harness.step();
+            let frame = harness.state().observations.last().unwrap();
+            assert_eq!(
+                frame.action,
+                StillSeekTrackAction::Seek,
+                "drag frame at x={x} stopped seeking: {:?}",
+                harness.state().observations
+            );
+            pages.push(harness.state().page);
+        }
+
+        still_seek_track_pointer_button(&mut harness, egui::pos2(400.0, 96.0), false);
+
+        let mut sorted = pages.clone();
+        sorted.dedup();
+        assert_eq!(
+            sorted, pages,
+            "each drag frame must land on its own page, got {pages:?}"
+        );
+        assert!(
+            pages.windows(2).all(|w| w[1] > w[0]),
+            "dragging right must keep advancing, got {pages:?}"
+        );
+    }
+
+    #[test]
+    fn still_seek_track_upward_drag_opens_strip_without_seeking() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(200.0, 96.0);
+        let destination = egui::pos2(204.0, 71.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert!(harness.state().strip_open);
+        assert_eq!(harness.state().page, 0);
+        assert_eq!(harness.state().seek_activity_frames, 1);
+        assert_eq!(
+            harness.state().observations.last().unwrap().action,
+            StillSeekTrackAction::OpenStrip
+        );
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_track_click_still_seeks_without_drag_activity() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(destination);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, destination, true);
+        still_seek_track_pointer_button(&mut harness, destination, false);
+
+        assert_eq!(harness.state().page, 7);
+        assert_eq!(harness.state().seek_activity_frames, 0);
+        assert!(!harness.state().strip_open);
+        let click_frame = harness.state().observations.last().unwrap();
+        assert!(click_frame.clicked);
+        assert!(!click_frame.dragged);
+        assert!(!click_frame.drag_stopped);
+        assert_eq!(click_frame.action, StillSeekTrackAction::Seek);
+    }
+
+    #[test]
+    fn still_seek_strip_horizontal_drag_does_not_move_page() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let origin = egui::pos2(160.0, 96.0);
+        let destination = egui::pos2(240.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_strip_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(harness.state().page, 5);
+        assert!(matches!(
+            harness.state().gesture,
+            StillSeekGesture::Strip {
+                layout_center_pos: 3,
+                ..
+            }
+        ));
+
+        still_seek_strip_pointer_button(&mut harness, destination, false);
     }
 
     #[test]
@@ -52671,6 +54546,31 @@ mod tests {
     }
 
     #[test]
+    fn still_seek_continuous_spread_highlight_and_preview_use_the_same_display_unit() {
+        let images = [4, 5, 6, 7];
+        let preview_units = vec![
+            SpreadDisplayUnit {
+                nav_start: 0,
+                pages: vec![4, 5],
+            },
+            SpreadDisplayUnit {
+                nav_start: 2,
+                pages: vec![6, 7],
+            },
+        ];
+        let highlighted = pages_on_screen_with(6, Some(&preview_units));
+        let resolved = resolve_still_seek_target(
+            &images,
+            None,
+            Some(&preview_units),
+            StillSeekPosition::SourcePosition(2),
+        )
+        .unwrap();
+        assert_eq!(highlighted, vec![6, 7]);
+        assert_eq!(highlighted, resolved.preview_pages);
+    }
+
+    #[test]
     fn single_page_reading_previews_exactly_the_page_under_the_pointer() {
         let images = [4, 5, 6, 7];
         let resolved =
@@ -52705,6 +54605,412 @@ mod tests {
         assert_eq!(resolved.landing_idx, 6);
     }
 
+    fn still_seek_edge_test_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..10)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/page-{idx}.png"))))
+            .collect();
+        // Failed thumbnails still have real cells; no decoder or file I/O is needed.
+        app.thumbnails = vec![ThumbnailState::Failed; app.items.len()];
+        app.image_metas = vec![Some((600, 900)); app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        for idx in 0..app.items.len() {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.fullscreen_idx = Some(3);
+        app.settings.set_still_seek_strip_visible(true);
+        app.settings
+            .set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        app.settings.fullscreen_page_number_overlay = true;
+        app.settings.still_seek_hover_preview_mode =
+            crate::settings::StillSeekHoverPreviewMode::Never;
+        app
+    }
+
+    struct StillSeekOverlayTestFrame {
+        target: Option<usize>,
+        track: Option<egui::Response>,
+        strip: Option<egui::Response>,
+    }
+
+    fn still_seek_edge_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        full: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> StillSeekOverlayTestFrame {
+        let mut frame = StillSeekOverlayTestFrame {
+            target: None,
+            track: None,
+            strip: None,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(full),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    frame.target = app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                    frame.track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
+                    frame.strip =
+                        ctx.read_response(ui.make_persistent_id("fullscreen_still_seek_strip_row"));
+                });
+            },
+        );
+        frame
+    }
+
+    fn still_seek_pointer_button_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn still_seek_f3_scrub_uses_final_move_on_release_in_real_overlay() {
+        let mut app = still_seek_edge_test_app();
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let track = still_seek_edge_frame(&mut app, &ctx, full, vec![])
+            .track
+            .unwrap()
+            .rect;
+        let origin = egui::pos2(track.left() + 10.0, track.center().y);
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![egui::Event::PointerMoved(origin)],
+        );
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![still_seek_pointer_button_event(origin, true)],
+        );
+        let moved = egui::pos2(track.center().x, origin.y);
+        let drag =
+            still_seek_edge_frame(&mut app, &ctx, full, vec![egui::Event::PointerMoved(moved)]);
+        assert!(drag.track.unwrap().dragged());
+        assert!(matches!(
+            app.fs_seek_gesture,
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Scrub { .. })
+        ));
+        let released = egui::pos2(track.right(), origin.y);
+        assert_ne!(moved, released);
+        let release = still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![
+                egui::Event::PointerMoved(released),
+                still_seek_pointer_button_event(released, false),
+            ],
+        );
+        let response = release.track.unwrap();
+        assert!(response.drag_stopped());
+        assert!(!response.dragged());
+        assert_eq!(
+            release.target,
+            Some(9),
+            "release must resolve the final pointer position"
+        );
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn still_seek_f3_downward_close_uses_final_move_on_release_in_real_overlay() {
+        let mut app = still_seek_edge_test_app();
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let row = still_seek_edge_frame(&mut app, &ctx, full, vec![])
+            .strip
+            .unwrap()
+            .rect;
+        let bottom = app
+            .still_seek_geometry_for_idx(3, false)
+            .strip_rect(full)
+            .unwrap()
+            .bottom();
+        let origin = row.center();
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![egui::Event::PointerMoved(origin)],
+        );
+        still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![still_seek_pointer_button_event(origin, true)],
+        );
+        let moved = egui::pos2(origin.x, bottom - 2.0);
+        still_seek_edge_frame(&mut app, &ctx, full, vec![egui::Event::PointerMoved(moved)]);
+        assert!(app.settings.still_seek_strip_visible);
+        let released = egui::pos2(origin.x, bottom + 1.0);
+        assert_ne!(moved, released);
+        let release = still_seek_edge_frame(
+            &mut app,
+            &ctx,
+            full,
+            vec![
+                egui::Event::PointerMoved(released),
+                still_seek_pointer_button_event(released, false),
+            ],
+        );
+        let response = release.strip.unwrap();
+        assert!(response.drag_stopped());
+        assert!(!response.dragged());
+        assert!(
+            !app.settings.still_seek_strip_visible,
+            "final crossing must close the strip"
+        );
+        assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+        assert_eq!(
+            app.settings.still_bottom_lock(),
+            crate::settings::BottomBarLock::BarOnly
+        );
+    }
+
+    #[test]
+    fn still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry() {
+        use crate::settings::{BottomBarLock, StillSeekBarWithStrip};
+        use crate::video::seek_strip_layout::SeekStripHeight;
+        for bar in [StillSeekBarWithStrip::Hide, StillSeekBarWithStrip::Show] {
+            for height in [
+                SeekStripHeight::Large,
+                SeekStripHeight::Medium,
+                SeekStripHeight::Small,
+                SeekStripHeight::Smallest,
+            ] {
+                for lock in [
+                    BottomBarLock::None,
+                    BottomBarLock::BarOnly,
+                    BottomBarLock::BarAndStrip,
+                ] {
+                    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                        for ppp in [1.0, 1.5, 2.0] {
+                            let mut app = still_seek_edge_test_app();
+                            app.settings.still_seek_bar_with_strip = bar;
+                            app.settings.still_seek_strip_height = height;
+                            app.settings.set_still_bottom_lock(lock);
+                            app.reading_direction = direction;
+                            let ctx = egui::Context::default();
+                            ctx.set_pixels_per_point(ppp);
+                            let full = egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1920.0, 1080.0) / ppp,
+                            );
+                            let strip = app
+                                .still_seek_geometry_for_idx(3, false)
+                                .strip_rect(full)
+                                .unwrap();
+                            // Start inside the cell near its top so even Smallest permits
+                            // the shared >24pt downward gesture before reaching the last pixel.
+                            let origin = egui::pos2(strip.center().x, strip.top() + 6.0);
+                            still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![egui::Event::PointerMoved(origin)],
+                            );
+                            still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![still_seek_pointer_button_event(origin, true)],
+                            );
+                            let last_pixel = egui::pos2(origin.x, full.bottom() - 1.0 / ppp);
+                            let drag = still_seek_edge_frame(
+                                &mut app,
+                                &ctx,
+                                full,
+                                vec![egui::Event::PointerMoved(last_pixel)],
+                            );
+                            assert!(drag.strip.unwrap().dragged());
+                            assert!(
+                                !app.settings.still_seek_strip_visible,
+                                "last pixel must close: {bar:?} {height:?} {lock:?} {direction:?} {ppp}"
+                            );
+                            assert_eq!(app.fs_seek_gesture, StillSeekGesture::Idle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_f7_mixed_media_reserves_only_the_content_it_draws() {
+        use crate::settings::StillSeekBarWithStrip;
+        for mixed in [true, false] {
+            for bar in [StillSeekBarWithStrip::Show, StillSeekBarWithStrip::Hide] {
+                let mut app = still_seek_edge_test_app();
+                app.settings.still_seek_bar_with_strip = bar;
+                if mixed {
+                    app.items[9] = GridItem::Video(PathBuf::from("c:/seek/movie.mp4"));
+                }
+                let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+                // Query real fit geometry before the first overlay frame (cold navigation cache).
+                let media = app.fullscreen_media_rect(full, 3, false);
+                let geometry = app.still_seek_geometry_for_idx(3, false);
+                let expected_strip = if mixed {
+                    0.0
+                } else {
+                    app.settings.still_seek_strip_height.points()
+                };
+                let expected_bar = if mixed || bar == StillSeekBarWithStrip::Show {
+                    FS_SEEK_BAR_HEIGHT
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    geometry.strip_height, expected_strip,
+                    "mixed={mixed}, bar={bar:?}"
+                );
+                assert_eq!(geometry.reserved_height, expected_strip + expected_bar);
+                assert_eq!(
+                    media.bottom(),
+                    full.bottom() - expected_strip - expected_bar
+                );
+                let frame =
+                    still_seek_edge_frame(&mut app, &egui::Context::default(), full, vec![]);
+                assert_eq!(frame.strip.is_some(), !mixed);
+                assert_eq!(frame.track.is_some(), !mixed && expected_bar > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_f8_page_number_is_painted_when_locked_bar_is_hidden() {
+        use crate::settings::{BottomBarLock, StillSeekBarWithStrip};
+        for bar in [StillSeekBarWithStrip::Hide, StillSeekBarWithStrip::Show] {
+            for lock in [BottomBarLock::BarOnly, BottomBarLock::BarAndStrip] {
+                let mut app = still_seek_edge_test_app();
+                app.settings.still_seek_bar_with_strip = bar;
+                app.settings.set_still_bottom_lock(lock);
+                let ctx = egui::Context::default();
+                let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+                still_seek_edge_frame(&mut app, &ctx, full, vec![]);
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(full),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                        });
+                    },
+                );
+                let labels: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    labels.contains(&"4 / 10"),
+                    bar == StillSeekBarWithStrip::Hide,
+                    "bar={bar:?}, lock={lock:?}, labels={labels:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn still_seek_real_overlay_snapshots() {
+        use crate::settings::StillSeekBarWithStrip;
+        let mut snapshots = egui_kittest::SnapshotResults::new();
+        for (name, mixed, bar) in [
+            (
+                "still_seek_real_overlay_mixed_media",
+                true,
+                StillSeekBarWithStrip::Hide,
+            ),
+            (
+                "still_seek_real_overlay_hidden_bar_page_number",
+                false,
+                StillSeekBarWithStrip::Hide,
+            ),
+            (
+                "still_seek_real_overlay_visible_bar_page_number",
+                false,
+                StillSeekBarWithStrip::Show,
+            ),
+        ] {
+            let mut app = still_seek_edge_test_app();
+            app.settings.still_seek_bar_with_strip = bar;
+            if mixed {
+                app.items[9] = GridItem::Video(PathBuf::from("c:/seek/movie.mp4"));
+            }
+            let mut texture: Option<egui::TextureHandle> = None;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(640.0, 360.0))
+                .build(|ctx| {
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if texture.is_none() {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        let mut image = egui::ColorImage::filled(
+                            [120, 180],
+                            egui::Color32::from_rgb(220, 215, 195),
+                        );
+                        for y in 12..168 {
+                            for x in 12..108 {
+                                image[(x, y)] =
+                                    egui::Color32::from_rgb(70 + x as u8, 85 + y as u8 / 2, 135);
+                            }
+                        }
+                        let tex =
+                            ctx.load_texture("seek-test-page", image, egui::TextureOptions::LINEAR);
+                        app.thumbnails = vec![
+                            ThumbnailState::Loaded {
+                                tex: tex.clone(),
+                                from_cache: false,
+                                from_edit_preview: false,
+                                rendered_at_px: 180,
+                                source_dims: Some((120, 180)),
+                                layout_dims: None,
+                            };
+                            app.items.len()
+                        ];
+                        texture = Some(tex);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let full = ctx.content_rect();
+                            let media = app.fullscreen_media_rect(full, 3, false);
+                            let tex = texture.as_ref().unwrap();
+                            ui.painter().image(
+                                tex.id(),
+                                fit_texture_rect(tex.size_vec2(), media),
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                            app.draw_fullscreen_seek_overlay(ui, ctx, full, 3, false, false);
+                            app.draw_fullscreen_page_number_overlay(ui, full, 3, false);
+                        });
+                });
+            harness.run();
+            harness.snapshot(name);
+            snapshots.extend_harness(&mut harness);
+        }
+        snapshots.unwrap();
+    }
+
     #[test]
     fn resolved_still_seek_height_drives_fixed_media_and_side_panel_bottoms() {
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
@@ -52712,21 +55018,51 @@ mod tests {
             true,
             crate::video::seek_strip_layout::SeekStripHeight::Medium,
             crate::settings::StillSeekBarWithStrip::Show,
+            crate::settings::BottomBarLock::BarAndStrip,
         );
         let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
             full,
             false,
-            true,
-            geometry.total_height,
+            geometry.reserved_height > 0.0,
+            geometry.reserved_height,
             0,
             0.0,
         );
         let left = adjustment_panel_rect_with_seek_height(full, geometry.total_height);
         let right = metadata_panel_rect_with_seek_height(full, geometry.total_height);
         assert_eq!(geometry.total_height, 110.0);
+        assert_eq!(geometry.reserved_height, 110.0);
         assert_eq!(media.bottom(), geometry.panel_rect(full).top());
         assert_eq!(left.bottom(), media.bottom());
         assert_eq!(right.bottom(), media.bottom());
+    }
+
+    #[test]
+    fn still_seek_bar_only_is_reachable_and_does_not_reserve_the_visible_strip() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for (lock, expected_reserved) in [
+            (crate::settings::BottomBarLock::None, 0.0),
+            (crate::settings::BottomBarLock::BarOnly, FS_SEEK_BAR_HEIGHT),
+            (crate::settings::BottomBarLock::BarAndStrip, 110.0),
+        ] {
+            let geometry = StillSeekGeometry::resolve(
+                true,
+                crate::video::seek_strip_layout::SeekStripHeight::Medium,
+                crate::settings::StillSeekBarWithStrip::Show,
+                lock,
+            );
+            assert_eq!(geometry.total_height, 110.0);
+            assert_eq!(geometry.reserved_height, expected_reserved);
+            let media = fullscreen_rect_excluding_fixed_bars_with_seek_height(
+                full,
+                false,
+                geometry.reserved_height > 0.0,
+                geometry.reserved_height,
+                0,
+                0.0,
+            );
+            assert_eq!(media.bottom(), full.bottom() - expected_reserved);
+        }
     }
 
     #[test]

@@ -312,6 +312,7 @@
 # FsSpreadShiftPrev = none ; 見開き表示を前のページ方向へ1ページずらす
 # FsSpreadShiftNext = none ; 見開き表示を次のページ方向へ1ページずらす
 # FsSlideshow = S ; スライドショーの再生または停止を切り替える
+# FsSeekStripToggle = Shift+S ; 画像フルスクリーンのサムネイル列表示を切り替える
 # FsSpaceCheck = Space ; 現在の画像のチェックを切り替える。スライドショー中は停止する
 # FsCapture = Ctrl+S ; 現在の表示画像をキャプチャ保存する
 # FsAddToActiveBook = Ctrl+B ; 現在のページを追加先の本へ追加する
