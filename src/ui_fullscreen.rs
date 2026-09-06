@@ -3547,6 +3547,73 @@ enum StillSeekPosition {
     SourcePosition(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StillSeekTrackAction {
+    None,
+    Seek,
+    OpenStrip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StillSeekTrackInteraction {
+    action: StillSeekTrackAction,
+    note_seek_activity: bool,
+}
+
+/// Interpret one real egui response frame for the still-image seek track.
+///
+/// Keeping the response ordering here lets handler-level tests drive the same state transition
+/// code as production instead of testing `SeekRowGesture` in isolation.
+fn handle_still_seek_track_response(
+    response: &egui::Response,
+    gesture: &mut Option<crate::video::seek_strip::SeekRowGesture>,
+) -> StillSeekTrackInteraction {
+    if response.drag_started()
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        // `Sense::click_and_drag` does not report `drag_started` on the press frame. It first
+        // becomes true after movement has crossed egui's drag threshold, so the current pointer
+        // is already displaced. Recover the actual press origin or the first update sees a zero
+        // delta and leaves the gesture undecided until another move event happens.
+        let origin = pointer_pos - response.total_drag_delta().unwrap_or_default();
+        *gesture = Some(crate::video::seek_strip::SeekRowGesture::new(origin));
+    }
+
+    let note_seek_activity = response.dragged() && response.interact_pointer_pos().is_some();
+    let mut action = if response.clicked() {
+        StillSeekTrackAction::Seek
+    } else if response.dragged()
+        && let Some(pointer_pos) = response.interact_pointer_pos()
+    {
+        match gesture.as_mut().map(|gesture| gesture.update(pointer_pos)) {
+            Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
+                StillSeekTrackAction::OpenStrip
+            }
+            Some(crate::video::seek_strip::SeekRowDecision::Scrub) => StillSeekTrackAction::Seek,
+            Some(crate::video::seek_strip::SeekRowDecision::Undecided) | None => {
+                StillSeekTrackAction::None
+            }
+        }
+    } else {
+        StillSeekTrackAction::None
+    };
+
+    if response.drag_stopped() {
+        if matches!(
+            gesture,
+            Some(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+        ) {
+            action = StillSeekTrackAction::Seek;
+        }
+        *gesture = None;
+    }
+
+    StillSeekTrackInteraction {
+        action,
+        note_seek_activity,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedStillSeekTarget {
     /// プレビューに出すページ。**見開きでは着地後に表示される 1〜2 ページ全部**を、
@@ -16932,55 +16999,25 @@ impl App {
                     }
                 }
 
-                if response.drag_started()
-                    && let Some(origin) = response.interact_pointer_pos()
-                {
-                    self.fs_seek_row_gesture =
-                        Some(crate::video::seek_strip::SeekRowGesture::new(origin));
-                }
-                if response.clicked() {
-                    if let Some(resolved) = resolved_at_pointer.as_ref() {
-                        display_pos = resolved.display_pos;
-                        if resolved.landing_idx != fs_idx || continuous_label_mode {
-                            target = Some(resolved.landing_idx);
-                        }
-                    }
-                } else if response.dragged()
-                    && let Some(pointer_pos) = response.interact_pointer_pos()
-                {
+                let interaction =
+                    handle_still_seek_track_response(&response, &mut self.fs_seek_row_gesture);
+                if interaction.note_seek_activity {
                     self.fs_seek_drag_active = true;
                     self.note_fullscreen_seek_activity();
-                    let decision = self
-                        .fs_seek_row_gesture
-                        .as_mut()
-                        .map(|gesture| gesture.update(pointer_pos));
-                    match decision {
-                        Some(crate::video::seek_strip::SeekRowDecision::OpenStrip) => {
-                            self.set_still_seek_strip_visible(ctx, true);
-                        }
-                        Some(crate::video::seek_strip::SeekRowDecision::Scrub) => {
-                            if let Some(resolved) = resolved_at_pointer.as_ref() {
-                                display_pos = resolved.display_pos;
-                                if resolved.landing_idx != fs_idx || continuous_label_mode {
-                                    target = Some(resolved.landing_idx);
-                                }
+                }
+                match interaction.action {
+                    StillSeekTrackAction::Seek => {
+                        if let Some(resolved) = resolved_at_pointer.as_ref() {
+                            display_pos = resolved.display_pos;
+                            if resolved.landing_idx != fs_idx || continuous_label_mode {
+                                target = Some(resolved.landing_idx);
                             }
                         }
-                        Some(crate::video::seek_strip::SeekRowDecision::Undecided) | None => {}
                     }
-                }
-                if response.drag_stopped() {
-                    if matches!(
-                        self.fs_seek_row_gesture,
-                        Some(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
-                    ) && let Some(resolved) = resolved_at_pointer.as_ref()
-                    {
-                        display_pos = resolved.display_pos;
-                        if resolved.landing_idx != fs_idx || continuous_label_mode {
-                            target = Some(resolved.landing_idx);
-                        }
+                    StillSeekTrackAction::OpenStrip => {
+                        self.set_still_seek_strip_visible(ctx, true);
                     }
-                    self.fs_seek_row_gesture = None;
+                    StillSeekTrackAction::None => {}
                 }
 
                 painter.rect_filled(
@@ -53304,6 +53341,220 @@ mod tests {
             egui::pos2(140.0, 100.0),
             94.0,
         ));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct StillSeekTrackResponseObservation {
+        primary_down: bool,
+        drag_started: bool,
+        dragged: bool,
+        drag_stopped: bool,
+        clicked: bool,
+        pointer: Option<egui::Pos2>,
+        action: StillSeekTrackAction,
+    }
+
+    #[derive(Default)]
+    struct StillSeekTrackHarnessState {
+        gesture: Option<crate::video::seek_strip::SeekRowGesture>,
+        page: usize,
+        strip_open: bool,
+        seek_activity_frames: usize,
+        observations: Vec<StillSeekTrackResponseObservation>,
+    }
+
+    fn still_seek_track_handler_harness()
+    -> egui_kittest::Harness<'static, StillSeekTrackHarnessState> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, state: &mut StillSeekTrackHarnessState| {
+                    let track =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 80.0), egui::pos2(380.0, 112.0));
+                    let response = ui.interact(
+                        track,
+                        ui.make_persistent_id(0x5EE4_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let pointer = response
+                        .interact_pointer_pos()
+                        .or_else(|| response.hover_pos());
+                    let interaction =
+                        handle_still_seek_track_response(&response, &mut state.gesture);
+                    if interaction.note_seek_activity {
+                        state.seek_activity_frames += 1;
+                    }
+                    match interaction.action {
+                        StillSeekTrackAction::Seek => {
+                            if let Some(pointer) = pointer {
+                                state.page = (((pointer.x - track.left()) / track.width()) * 9.0)
+                                    .round()
+                                    .clamp(0.0, 9.0)
+                                    as usize;
+                            }
+                        }
+                        StillSeekTrackAction::OpenStrip => state.strip_open = true,
+                        StillSeekTrackAction::None => {}
+                    }
+                    state.observations.push(StillSeekTrackResponseObservation {
+                        primary_down: ui.input(|input| input.pointer.primary_down()),
+                        drag_started: response.drag_started(),
+                        dragged: response.dragged(),
+                        drag_stopped: response.drag_stopped(),
+                        clicked: response.clicked(),
+                        pointer,
+                        action: interaction.action,
+                    });
+                },
+                StillSeekTrackHarnessState::default(),
+            )
+    }
+
+    fn still_seek_track_pointer_button(
+        harness: &mut egui_kittest::Harness<'static, StillSeekTrackHarnessState>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn still_seek_track_horizontal_drag_seeks_on_first_drag_frame() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(
+            harness.state().page,
+            7,
+            "first horizontal drag frame must seek: {:?}",
+            harness.state().observations
+        );
+        assert_eq!(harness.state().seek_activity_frames, 1);
+
+        let drag_frame = harness.state().observations.last().unwrap();
+        assert!(drag_frame.primary_down);
+        assert!(drag_frame.drag_started);
+        assert!(drag_frame.dragged);
+        assert!(!drag_frame.drag_stopped);
+        assert!(!drag_frame.clicked);
+        assert_eq!(drag_frame.pointer, Some(destination));
+        assert_eq!(drag_frame.action, StillSeekTrackAction::Seek);
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert!(harness.state().gesture.is_none());
+        let release_frame = harness.state().observations.last().unwrap();
+        assert!(!release_frame.primary_down);
+        assert!(release_frame.drag_stopped);
+        assert_eq!(release_frame.action, StillSeekTrackAction::None);
+    }
+
+    #[test]
+    fn still_seek_track_upward_drag_opens_strip_without_seeking() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let origin = egui::pos2(200.0, 96.0);
+        let destination = egui::pos2(204.0, 71.0);
+        harness.hover_at(origin);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, origin, true);
+        harness.hover_at(destination);
+        harness.step();
+
+        assert!(harness.state().strip_open);
+        assert_eq!(harness.state().page, 0);
+        assert_eq!(harness.state().seek_activity_frames, 1);
+        assert_eq!(
+            harness.state().observations.last().unwrap().action,
+            StillSeekTrackAction::OpenStrip
+        );
+
+        still_seek_track_pointer_button(&mut harness, destination, false);
+        assert!(harness.state().gesture.is_none());
+    }
+
+    #[test]
+    fn still_seek_track_click_still_seeks_without_drag_activity() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(destination);
+        harness.step();
+        still_seek_track_pointer_button(&mut harness, destination, true);
+        still_seek_track_pointer_button(&mut harness, destination, false);
+
+        assert_eq!(harness.state().page, 7);
+        assert_eq!(harness.state().seek_activity_frames, 0);
+        assert!(!harness.state().strip_open);
+        let click_frame = harness.state().observations.last().unwrap();
+        assert!(click_frame.clicked);
+        assert!(!click_frame.dragged);
+        assert!(!click_frame.drag_stopped);
+        assert_eq!(click_frame.action, StillSeekTrackAction::Seek);
+    }
+
+    #[test]
+    fn still_seek_strip_horizontal_drag_moves_on_first_drag_frame() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 180.0))
+            .build_ui_state(
+                |ui, page: &mut usize| {
+                    let row =
+                        egui::Rect::from_min_max(egui::pos2(40.0, 60.0), egui::pos2(380.0, 132.0));
+                    let response = ui.interact(
+                        row,
+                        ui.make_persistent_id(0x5EE5_u64),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let pointer = response
+                        .interact_pointer_pos()
+                        .or_else(|| response.hover_pos());
+                    if (response.clicked() || response.dragged())
+                        && let Some(pointer) = pointer
+                    {
+                        *page = (((pointer.x - row.left()) / row.width()) * 9.0)
+                            .round()
+                            .clamp(0.0, 9.0) as usize;
+                    }
+                },
+                0usize,
+            );
+        harness.run();
+        let origin = egui::pos2(80.0, 96.0);
+        let destination = egui::pos2(320.0, 96.0);
+        harness.hover_at(origin);
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: origin,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.hover_at(destination);
+        harness.step();
+
+        assert_eq!(*harness.state(), 7);
+
+        harness.event(egui::Event::PointerButton {
+            pos: destination,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
     }
 
     #[test]
