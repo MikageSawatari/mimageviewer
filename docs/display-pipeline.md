@@ -1294,13 +1294,16 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
-列の横ドラッグ中は `StillSeekGesture::Strip` がドラッグ開始フレームの中央 source position を保持し、
-ページ着地で `current_pos` が変わっても同じ中心から列を組み直す。同じ pointer x は離すまで同じ
-source page を指し、現在ページの強調だけは実際の `fs_idx` へ追従する。通常の生成 / 破棄は strip
-response handler の `drag_started` / `drag_stopped` が所有し、下ドラッグによる列 close と fullscreen
-teardown だけがその場で終了できる。release 後の次フレームは新しい現在ページ中心へ戻る。
-ページシーク行の上ドラッグと列の下ドラッグは動画の `SeekRowGesture` /
-`strip_drag_closes_downward` を共有し、横ドラッグ契約は変えない。
+列の横ドラッグ中は `StillSeekGesture::Strip` が押した時点の中央 source position と pointer x を
+保持する。各フレームの中央は、動画と共有する `center_index_after_drag` へ押下時点からの総 x 移動量と
+同じ高さ preset の `window_cell_width_points()` を渡し、整数 source position へ丸めて先頭 / 末尾で
+clamp する。右へ引くと中央 source position は小さくなる。判定順序も動画と同じく、まず
+`strip_drag_closes_downward` で下ドラッグ close を決め、close でない場合だけ中央を動かす。
+横ドラッグ中はページを移動せず、release は `StripCommitted` としてその中央を保持する。セルの
+click だけが従来のページ着地を行う。実際の現在ページが変わった次の描画では committed center を
+破棄して新しい `current_pos` へ戻す一方、現在ページの強調は帯の中央とは独立して常に実際の
+`fs_idx` を指すため、帯の表示範囲外なら強調セルは出ない。ページシーク行の上ドラッグは動画と
+共有する `SeekRowGesture` を引き続き使い、通常バー本体の横ドラッグによるページシークは変えない。
 通常の左右カーソルキーによるページ移動は
 `fullscreen_horizontal_cursor_direction` で、従来のページ表示方向か、このシークバー実効方向かを
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
