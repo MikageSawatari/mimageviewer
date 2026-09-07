@@ -147,10 +147,36 @@ pub enum SimilarItemTarget {
     },
 }
 
+/// ページ帯の 1 コマ。**削除判断の証拠ではなく、移動のための地図** (§9.3)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookPageState {
+    /// 対応が取れ、距離も「ほぼ同一」の帯に入る。
+    Strong,
+    /// 対応は取れたが距離が離れている (別解像度・修正あり)。
+    Weak,
+    /// 相手に対応ページが無い。
+    Unmatched,
+    /// 採点対象外。featureless か、どの本にもあるページ。**分母からも外れている**ので、
+    /// 「一致しなかった」と同じ色で塗ってはいけない。
+    Excluded,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookPageMatch {
+    pub state: BookPageState,
+    /// 相手の本での対応ページ。押すとそこへ移動する。
+    pub other_page_index: Option<u32>,
+    /// 移動先。`items` に無い場所も開けるよう、照会側で解決しておく。
+    pub other_target: Option<SimilarItemTarget>,
+    pub other_item_key: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookRelationHit {
     pub other_container_key: String,
     pub pair: dupe::book::BookPair,
+    /// 起点の本のページ順に並んだ帯。長さは起点の本のページ数と一致する。
+    pub pages: Vec<BookPageMatch>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -391,7 +417,10 @@ impl SimilarIndexManager {
         }
     }
 
-    pub fn query_book(&self, item_key: &str) -> BookQuery {
+    /// `container_key` で引く。**ページではなく本で引くこと** — ページごとに引き直すと、
+    /// 本を読み進めるあいだ 1 ページごとに数秒の照会が走る。
+    pub fn query_book(&self, container_key: &str) -> BookQuery {
+        let item_key = container_key;
         if !self.item_is_enabled(item_key) {
             return BookQuery::NotIndexed;
         }
@@ -1368,16 +1397,9 @@ fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -> BookQuery {
+fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, container_key: &str) -> BookQuery {
     let hash_version = current_hash_version();
-    let origin = match db.load_item(item_key, hash_version) {
-        Ok(Some(row)) => row,
-        Ok(None) => return BookQuery::NotIndexed,
-        Err(error) => return BookQuery::Failed(db_error(error)),
-    };
-    let Some(origin_container) = origin.item.container_key.clone() else {
-        return BookQuery::NotBook;
-    };
+    let origin_container = container_key.to_owned();
     let origin_pages = match db.load_book_pages(&origin_container, hash_version) {
         Ok(pages) => pages,
         Err(error) => return BookQuery::Failed(db_error(error)),
@@ -1463,10 +1485,14 @@ fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, item_key: &str) -
         corpus.add_context(candidate_matches);
 
         match dupe::book::classify_pair(&corpus.pages, params, BOOK_ORIGIN, BOOK_CANDIDATE) {
-            Ok(pair) => hits.push(BookRelationHit {
-                other_container_key: candidate_key,
-                pair,
-            }),
+            Ok(pair) => {
+                let strip = build_page_strip(&origin_pages, pages, &matches, &pair);
+                hits.push(BookRelationHit {
+                    other_container_key: candidate_key,
+                    pair,
+                    pages: strip,
+                })
+            }
             Err(error) => return BookQuery::Failed(error.to_string()),
         }
     }
@@ -1545,6 +1571,76 @@ impl<'a> BookCorpusBuilder<'a> {
             }
         }
     }
+}
+
+/// 起点の本のページ帯を組む。
+///
+/// 対応が取れたページは `alignment` に (起点ページ, 相手ページ) として並ぶ。距離は
+/// `alignment` に載っていないので、両方の署名から測り直して「ほぼ同一」と「別バージョン」を
+/// 分ける。単体画像の帯 (§9.5) と同じ切り方にして、2 か所で違う基準を持たない。
+fn build_page_strip(
+    origin_pages: &[crate::similar_db::SearchRow],
+    candidate_pages: &[crate::similar_db::SearchRow],
+    origin_matches: &BookMatchSet,
+    pair: &dupe::book::BookPair,
+) -> Vec<BookPageMatch> {
+    let by_origin_page = origin_pages
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, row)| row.item.page_index.map(|page| (page, slot)))
+        .collect::<HashMap<_, _>>();
+    let candidate_by_page = candidate_pages
+        .iter()
+        .filter_map(|row| row.item.page_index.map(|page| (page, row)))
+        .collect::<HashMap<_, _>>();
+
+    let mut strip = origin_pages
+        .iter()
+        .enumerate()
+        .map(|(slot, row)| {
+            let excluded = row.item.quality < BOOK_MIN_QUALITY
+                || origin_matches
+                    .pages
+                    .get(slot)
+                    .is_some_and(|page| page.origin_is_common);
+            BookPageMatch {
+                state: if excluded {
+                    BookPageState::Excluded
+                } else {
+                    BookPageState::Unmatched
+                },
+                other_page_index: None,
+                other_target: None,
+                other_item_key: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // 同じ本のページはコンテナが同じなので、移動先の解決は本の中で 1 度で足りる。
+    let mut resolved_targets: HashMap<u64, Option<SimilarItemTarget>> = HashMap::new();
+    for &(origin_page, other_page) in &pair.alignment {
+        let Some(&slot) = by_origin_page.get(&origin_page) else {
+            continue;
+        };
+        let Some(other) = candidate_by_page.get(&other_page) else {
+            continue;
+        };
+        let distance = hamming256(&origin_pages[slot].item.pdq256, &other.item.pdq256);
+        let target = resolved_targets
+            .entry(other.item_id)
+            .or_insert_with(|| resolved_target_for_item(&other.item))
+            .clone();
+        strip[slot] = BookPageMatch {
+            state: match match_band(distance) {
+                Some(MatchBand::NearlyIdentical) => BookPageState::Strong,
+                _ => BookPageState::Weak,
+            },
+            other_page_index: Some(other_page),
+            other_target: target,
+            other_item_key: Some(other.item.item_key.clone()),
+        };
+    }
+    strip
 }
 
 /// 1 ページぶんの一致。`origin_is_common` は「相手の本が多すぎて候補作りに使えない」印。
@@ -4378,7 +4474,7 @@ mod tests {
             applied_seq: base.applied_seq,
         });
 
-        let BookQuery::Ready(relations) = query_book_ready(&db, &snapshot, "book-a/0") else {
+        let BookQuery::Ready(relations) = query_book_ready(&db, &snapshot, "book-a") else {
             panic!("expected a book result");
         };
         assert_eq!(relations.len(), 1);
@@ -4387,28 +4483,37 @@ mod tests {
         assert_eq!(relations[0].pair.matched, BOOK_MIN_MATCHED_PAGES);
     }
 
-    /// 起点ページが変わっても、同じ本を見ている限り結果は同じ本の関係になる。
-    /// 起点を item ではなく container で決めていることの確認。
+    /// 本の関係はページではなく本で引く。同じ本のどのページからでも同じ照会になり、
+    /// 読み進めても引き直しが起きないこと。ページで引くと 1 ページごとに数秒待たされる。
     #[test]
-    fn any_page_of_the_same_book_gives_the_same_relations() {
-        let db = SimilarDb::open_in_memory().unwrap();
-        for container in ["book-a", "book-b"] {
-            let pages = (0..4)
-                .map(|page| book_page(container, page, page as u8))
-                .collect::<Vec<_>>();
-            publish_book(&db, container, &pages);
-        }
-        let base = db.load_base_search_rows(current_hash_version()).unwrap();
-        let snapshot = SearchSnapshot::from_base(crate::similar_search_array::BaseArray {
-            records: base.records.into_boxed_slice(),
-            store_id: base.store_id,
-            applied_seq: base.applied_seq,
-        });
+    fn every_page_of_a_book_asks_the_same_question() {
+        use crate::grid_item::GridItem;
 
-        let first = query_book_ready(&db, &snapshot, "book-a/0");
-        let last = query_book_ready(&db, &snapshot, "book-a/3");
-        assert_eq!(first, last);
-        assert!(matches!(first, BookQuery::Ready(ref hits) if hits.len() == 1));
+        let zip = PathBuf::from(r"C:\books\a.zip");
+        let first = GridItem::ZipImage {
+            zip_path: zip.clone(),
+            entry_name: "001.jpg".to_owned(),
+        };
+        let last = GridItem::ZipImage {
+            zip_path: zip.clone(),
+            entry_name: "400.jpg".to_owned(),
+        };
+        assert_eq!(
+            crate::app::similar_index_container_key(&first),
+            crate::app::similar_index_container_key(&last)
+        );
+        assert_ne!(
+            crate::app::similar_index_item_key(&first),
+            crate::app::similar_index_item_key(&last),
+            "the pages themselves stay distinct; only the book key is shared"
+        );
+
+        // 画像は親フォルダで引く。本として索引されていなければ照会側が「本ではない」と答える。
+        let page = GridItem::Image(PathBuf::from(r"C:\books\b\003.png"));
+        assert_eq!(
+            crate::app::similar_index_container_key(&page).as_deref(),
+            Some("c:/books/b")
+        );
     }
 
     /// コンテナに属さない画像は本ではない。単体画像の照会と結果を混ぜない。
@@ -4427,7 +4532,7 @@ mod tests {
             applied_seq: base.applied_seq,
         });
         assert_eq!(
-            query_book_ready(&db, &snapshot, "c:/loose.png"),
+            query_book_ready(&db, &snapshot, "c:/loose"),
             BookQuery::NotBook
         );
     }
@@ -4451,7 +4556,7 @@ mod tests {
             applied_seq: base.applied_seq,
         });
         assert_eq!(
-            query_book_ready(&db, &snapshot, "blank/0"),
+            query_book_ready(&db, &snapshot, "blank"),
             BookQuery::Featureless
         );
     }

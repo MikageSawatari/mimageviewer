@@ -319,7 +319,8 @@ fn metadata_panel_similar_results_dark() {
     snapshot_with_theme_at_size(
         "metadata_panel_similar_results_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        egui::vec2(400.0, 430.0),
+        // 本の関係とページ帯まで入る高さ。切れていると帯の退行に気付けない。
+        egui::vec2(400.0, 620.0),
         None,
         |ui| mimageviewer::draw_similar_panel_snapshot_fixture(ui, true),
     );

@@ -74,6 +74,28 @@ pub(crate) fn similar_index_item_key(item: &crate::grid_item::GridItem) -> Optio
     }
 }
 
+/// この項目が属する本のキー。
+///
+/// 本の関係はページではなく**本の性質**なので、照会もキャッシュもこれで引く。ページごとに
+/// 引き直すと、本を読み進めるあいだ 1 ページごとに数秒の照会が走る。
+///
+/// 画像の場合は親フォルダを返す。それが本として索引されているかは索引側が知っているので、
+/// ここでは判断しない (索引に無ければ照会が「本ではない」と答える)。
+pub(crate) fn similar_index_container_key(item: &crate::grid_item::GridItem) -> Option<String> {
+    match item {
+        crate::grid_item::GridItem::Image(path) => {
+            Some(crate::search_index_db::normalize_path(path.parent()?))
+        }
+        crate::grid_item::GridItem::ZipImage { zip_path, .. } => {
+            Some(crate::search_index_db::normalize_path(zip_path))
+        }
+        crate::grid_item::GridItem::PdfPage { pdf_path, .. } => {
+            Some(crate::search_index_db::normalize_path(pdf_path))
+        }
+        _ => None,
+    }
+}
+
 /// 一覧中の保持帯の基準位置。フルスクリーン中は凍結した一覧スクロール位置ではなく、
 /// 現在ページへ追従する。フィルタ変更などで現在ページが display list にない場合だけ
 /// 一覧側の位置へ戻す。
@@ -20752,8 +20774,8 @@ impl App {
     }
 
     pub(crate) fn query_similar_book(&self, item: &GridItem) -> crate::similar_index::BookQuery {
-        let Some(key) = similar_index_item_key(item) else {
-            return crate::similar_index::BookQuery::NotIndexed;
+        let Some(key) = similar_index_container_key(item) else {
+            return crate::similar_index::BookQuery::NotBook;
         };
         self.similar_index.query_book(&key)
     }

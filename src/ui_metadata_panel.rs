@@ -215,6 +215,8 @@ struct SimilarPanelActions {
     /// このフレームで「長押し表示」ボタンが押されたままの候補。押していないフレームは
     /// `None` になり、消費側が覗き見の終了を判定する。
     peek_held: Option<crate::similar_index::QueryHit>,
+    /// ページ帯から選ばれた相手の本のページ。
+    open_page: Option<(String, crate::similar_index::SimilarItemTarget)>,
 }
 
 /// 比較スロットから見た 1 件の状態。ボタンの見え方を決める。
@@ -312,7 +314,16 @@ fn similar_copy_path_text(hit: &crate::similar_index::QueryHit) -> String {
 fn similar_open_target(
     hit: &crate::similar_index::QueryHit,
 ) -> Option<(PathBuf, crate::snapshot::SnapshotTarget)> {
-    match crate::similar_index::target_for_hit(hit).cloned()? {
+    similar_open_location(crate::similar_index::target_for_hit(hit).cloned()?)
+}
+
+/// 移動先を「開く場所」と「その中のどれか」に分ける。
+///
+/// 単体画像の結果とページ帯は別の型から来るが、開き方は同じでなければならない。
+fn similar_open_location(
+    target: crate::similar_index::SimilarItemTarget,
+) -> Option<(PathBuf, crate::snapshot::SnapshotTarget)> {
+    match target {
         crate::similar_index::SimilarItemTarget::File(path) => Some((
             path.parent()?.to_path_buf(),
             crate::snapshot::SnapshotTarget::Fs(path),
@@ -469,6 +480,38 @@ impl App {
         }
         let Some((location, target)) = similar_open_target(hit) else {
             self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        };
+        if self.is_snapshot_active() {
+            let _ = self.dismiss_snapshot_without_restore();
+        }
+        self.snapshot_load_and_open(
+            location,
+            false,
+            Some(target),
+            crate::app::HistoryTrigger::UserChosen,
+        );
+    }
+
+    /// ページ帯から相手の本のページを開く。
+    ///
+    /// 単体画像の移動と同じ経路を通す。いま開いている一覧に無い場所でも開けるよう、
+    /// 解決済みの移動先を使う。
+    fn open_similar_book_page(
+        &mut self,
+        item_key: &str,
+        target: crate::similar_index::SimilarItemTarget,
+    ) {
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|item| crate::app::similar_index_item_key(item).as_deref() == Some(item_key))
+        {
+            self.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+            return;
+        }
+        let Some((location, target)) = similar_open_location(target) else {
+            self.show_feedback_toast("ページの場所を開けません".to_string());
             return;
         };
         if self.is_snapshot_active() {
@@ -949,11 +992,15 @@ impl App {
                         || std::sync::Arc::new(crate::similar_index::ItemQuery::NotIndexed),
                         |item| self.query_similar_item(item),
                     );
+                    let book = current_item
+                        .as_ref()
+                        .map(|item| self.query_similar_book(item));
                     let results_are_stale = self.similar_query_results_are_stale();
                     let model = similar_panel_model(query.as_ref());
                     draw_similar_panel(
                         ui,
                         model,
+                        book.as_ref(),
                         results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
@@ -1129,6 +1176,9 @@ impl App {
         }
         if let Some(hit) = similar_actions.open_hit {
             self.open_similar_hit(&hit);
+        }
+        if let Some((item_key, target)) = similar_actions.open_page {
+            self.open_similar_book_page(&item_key, target);
         }
 
         // ★ レーティングの後処理 (draw_rating_stars が「同★再クリック=0」を解決済み)。
@@ -2051,6 +2101,7 @@ fn draw_metadata_panel_tabs(ui: &mut egui::Ui, tab: &mut MetadataPanelTab) {
 fn draw_similar_panel(
     ui: &mut egui::Ui,
     model: SimilarPanelModel<'_>,
+    book: Option<&crate::similar_index::BookQuery>,
     results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
@@ -2232,6 +2283,239 @@ fn draw_similar_panel(
             }
         }
     }
+    if let Some(book) = book {
+        draw_book_relations(ui, book, ctx, actions);
+    }
+}
+
+/// 「この本と重なる本」。単体画像の結果の下に置く。
+///
+/// 本を開いていないときは何も出さない。`NotBook` は失敗ではなく「この画像は本のページでは
+/// ない」という状態なので、文言を出して場所を取ることはしない。
+fn draw_book_relations(
+    ui: &mut egui::Ui,
+    book: &crate::similar_index::BookQuery,
+    ctx: &egui::Context,
+    actions: &mut SimilarPanelActions,
+) {
+    use crate::similar_index::BookQuery;
+
+    if matches!(book, BookQuery::NotBook | BookQuery::NotIndexed) {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("この本と重なる本")
+            .color(egui::Color32::WHITE)
+            .size(14.0)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    match book {
+        BookQuery::NotBook | BookQuery::NotIndexed => {}
+        BookQuery::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("調べています");
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        BookQuery::Featureless => {
+            ui.label(
+                egui::RichText::new("この本は特徴の少ないページばかりで判定できません")
+                    .color(DIM_COLOR)
+                    .size(11.0),
+            );
+        }
+        BookQuery::Failed(error) => {
+            ui.label(
+                egui::RichText::new(format!("調べられませんでした: {error}"))
+                    .color(DIM_COLOR)
+                    .size(11.0),
+            );
+        }
+        BookQuery::Ready(hits) if hits.is_empty() => {
+            ui.label(
+                egui::RichText::new("重なる本は見つかりませんでした")
+                    .color(DIM_COLOR)
+                    .size(11.0),
+            );
+        }
+        BookQuery::Ready(hits) => {
+            for hit in hits {
+                ui.label(
+                    egui::RichText::new(book_relation_name(&hit.other_container_key))
+                        .color(TEXT_COLOR)
+                        .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(book_relation_line(hit))
+                        .color(DIM_COLOR)
+                        .size(10.0),
+                );
+                ui.add_space(3.0);
+                draw_page_strip(ui, hit, actions);
+                ui.add_space(8.0);
+            }
+        }
+    }
+}
+
+fn book_relation_name(container_key: &str) -> String {
+    container_key
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(container_key)
+        .to_owned()
+}
+
+/// 関係の要約。**「消してよい」とは書かない** (§0)。何ページ重なっていて、それぞれの本の
+/// どれだけを占めるかという事実だけを出す。
+fn book_relation_line(hit: &crate::similar_index::BookRelationHit) -> String {
+    let relation = match &hit.pair.relation {
+        crate::dupe::book::Relation::Same => "ほぼ同じ内容",
+        crate::dupe::book::Relation::Contains { .. } => "片方がもう片方を含む",
+        crate::dupe::book::Relation::Unrelated => "部分的に重なる",
+        crate::dupe::book::Relation::Undecidable => "判定できる材料が足りない",
+    };
+    format!(
+        "{relation} / {} ページ一致 / この本の {:.0}% ・相手の {:.0}%",
+        hit.pair.matched,
+        hit.pair.coverage_a * 100.0,
+        hit.pair.coverage_b * 100.0
+    )
+}
+
+const STRIP_HEIGHT: f32 = 16.0;
+
+fn page_state_color(state: crate::similar_index::BookPageState) -> egui::Color32 {
+    use crate::similar_index::BookPageState;
+    match state {
+        BookPageState::Strong => egui::Color32::from_rgb(86, 156, 214),
+        BookPageState::Weak => egui::Color32::from_rgb(78, 105, 130),
+        BookPageState::Unmatched => egui::Color32::from_rgb(58, 58, 58),
+        BookPageState::Excluded => egui::Color32::from_rgb(38, 38, 38),
+    }
+}
+
+/// 帯 1 本ぶんの集約結果。
+struct StripColumns {
+    /// コマごとに出す状態。ページが 1 つも入らないコマは `None`。
+    strongest: Vec<Option<crate::similar_index::BookPageState>>,
+    /// そのコマで最初に移動先を持つページ。押したときの行き先になる。
+    first_target: Vec<Option<usize>>,
+}
+
+/// ページを表示幅のコマへ畳む。
+///
+/// 1 コマに複数ページが入るときは**一番強い状態を出す**。対応が連続していれば塗りが続き、
+/// たまたま数ページ一致しただけなら細い線として残る — この見分けが判定そのものになる
+/// (§14.2)。弱い側に寄せて平均を取ると、その区別が消える。
+fn summarize_page_strip(
+    pages: &[crate::similar_index::BookPageMatch],
+    columns: usize,
+) -> StripColumns {
+    use crate::similar_index::BookPageState;
+
+    let mut strongest = vec![None::<BookPageState>; columns];
+    let mut first_target = vec![None::<usize>; columns];
+    if pages.is_empty() || columns == 0 {
+        return StripColumns {
+            strongest,
+            first_target,
+        };
+    }
+    let rank = |state: BookPageState| match state {
+        BookPageState::Strong => 3,
+        BookPageState::Weak => 2,
+        BookPageState::Unmatched => 1,
+        BookPageState::Excluded => 0,
+    };
+    // コマ側から回す。ページ数が幅より多いときは 1 コマが範囲を受け持ち、少ないときは
+    // 1 ページが複数のコマにまたがる。ページ側から回すと後者で空のコマが残り、帯が縞に
+    // なって「対応が途切れている」ように見えてしまう。
+    for column in 0..columns {
+        let start = column * pages.len() / columns;
+        let end = (((column + 1) * pages.len()) / columns)
+            .max(start + 1)
+            .min(pages.len());
+        for (page, entry) in pages.iter().enumerate().take(end).skip(start) {
+            if strongest[column].is_none_or(|current| rank(entry.state) > rank(current)) {
+                strongest[column] = Some(entry.state);
+            }
+            if entry.other_target.is_some() && first_target[column].is_none() {
+                first_target[column] = Some(page);
+            }
+        }
+    }
+    StripColumns {
+        strongest,
+        first_target,
+    }
+}
+
+/// 1 冊分のページを 1 行の帯にする。
+///
+/// 200〜600 ページを 300 px 弱に収めるので 1 ページが 1 px を切る。1 コマに複数ページが
+/// 入るときは**一番強い状態を出す**。対応が連続していれば塗りが続き、たまたま数ページ
+/// 一致しただけなら細い線として残る — この見分けが判定そのものになる (§14.2)。
+fn draw_page_strip(
+    ui: &mut egui::Ui,
+    hit: &crate::similar_index::BookRelationHit,
+    actions: &mut SimilarPanelActions,
+) {
+    use crate::similar_index::BookPageState;
+
+    if hit.pages.is_empty() {
+        return;
+    }
+    let width = ui.available_width().max(1.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, STRIP_HEIGHT), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(28, 28, 28));
+
+    let columns = width.floor().max(1.0) as usize;
+    let StripColumns {
+        strongest,
+        first_target,
+    } = summarize_page_strip(&hit.pages, columns);
+    for (column, state) in strongest.iter().enumerate() {
+        let Some(state) = state else {
+            continue;
+        };
+        let x = rect.left() + column as f32;
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(1.0, STRIP_HEIGHT)),
+            0.0,
+            page_state_color(*state),
+        );
+    }
+
+    if let Some(pos) = response.hover_pos() {
+        let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
+        if let Some(page) = first_target[column] {
+            let entry = &hit.pages[page];
+            response.clone().on_hover_text(format!(
+                "この本の {} ページ目 → 相手の {} ページ目",
+                page + 1,
+                entry.other_page_index.map_or(0, |index| index + 1)
+            ));
+            if response.clicked()
+                && let (Some(target), Some(item_key)) =
+                    (entry.other_target.clone(), entry.other_item_key.clone())
+            {
+                actions.open_page = Some((item_key, target));
+            }
+        } else {
+            response
+                .clone()
+                .on_hover_text("ここに対応するページはありません");
+        }
+    }
 }
 
 /// 「長押し表示」が 1 フレームでどう動くか。押している対象は key で見分ける。
@@ -2307,6 +2591,70 @@ fn draw_similar_hit_buttons(
 
 /// Visual fixture for the production metadata-panel tabs and similar-result rows.
 #[doc(hidden)]
+/// スナップショット用の本の関係。**連続した収録**と**散発的な一致**の両方を入れて、
+/// 帯がその区別を保っていることを目で見て確かめられるようにする。
+fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
+    use crate::similar_index::{BookPageMatch, BookPageState};
+
+    let page = |state: BookPageState, other: Option<u32>| BookPageMatch {
+        state,
+        other_page_index: other,
+        other_target: other.map(|_| {
+            crate::similar_index::SimilarItemTarget::File(PathBuf::from(r"D:\Archive\other.png"))
+        }),
+        other_item_key: other.map(|_| "d:/archive/other.png".to_string()),
+    };
+    let contiguous = (0..180u32)
+        .map(|index| match index {
+            0..=3 => page(BookPageState::Excluded, None),
+            34..=110 => page(BookPageState::Strong, Some(index - 34)),
+            111..=118 => page(BookPageState::Weak, Some(index - 34)),
+            _ => page(BookPageState::Unmatched, None),
+        })
+        .collect::<Vec<_>>();
+    let scattered = (0..180u32)
+        .map(|index| {
+            if index % 23 == 0 {
+                page(BookPageState::Strong, Some(index))
+            } else {
+                page(BookPageState::Unmatched, None)
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::similar_index::BookQuery::Ready(vec![
+        crate::similar_index::BookRelationHit {
+            other_container_key: r"E:\books\総集編.zip".to_string(),
+            pair: crate::dupe::book::BookPair {
+                a: 1,
+                b: 2,
+                matched: 85,
+                distinctive_a: 176,
+                distinctive_b: 402,
+                coverage_a: 0.483,
+                coverage_b: 0.211,
+                relation: crate::dupe::book::Relation::Contains { whole: 2 },
+                alignment: Vec::new(),
+            },
+            pages: contiguous,
+        },
+        crate::similar_index::BookRelationHit {
+            other_container_key: r"E:\books\別作品.zip".to_string(),
+            pair: crate::dupe::book::BookPair {
+                a: 1,
+                b: 3,
+                matched: 8,
+                distinctive_a: 176,
+                distinctive_b: 190,
+                coverage_a: 0.045,
+                coverage_b: 0.042,
+                relation: crate::dupe::book::Relation::Unrelated,
+                alignment: Vec::new(),
+            },
+            pages: scattered,
+        },
+    ])
+}
+
 pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: bool) {
     ui.set_width(360.0);
     apply_metadata_panel_dark_widget_style(ui);
@@ -2387,9 +2735,11 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
             }
             let mut actions = SimilarPanelActions::default();
             let ctx = ui.ctx().clone();
+            let book = book_snapshot_fixture();
             draw_similar_panel(
                 ui,
                 SimilarPanelModel::Results(&hits),
+                Some(&book),
                 true,
                 &mut state,
                 72,
@@ -3256,11 +3606,144 @@ mod similar_panel_tests {
 
     use super::{
         SimilarPanelModel, SimilarPeekTransition, decide_similar_peek, similar_copy_path_text,
-        similar_difference_line, similar_location_line, similar_panel_model,
+        similar_difference_line, similar_location_line, similar_panel_model, summarize_page_strip,
     };
     use crate::similar_db::ItemKind;
     use crate::similar_image::SimilarImageFormat;
+    use crate::similar_index::BookPageMatch;
     use crate::similar_index::{ItemQuery, MatchBand, QueryHit};
+
+    fn strip_page(state: crate::similar_index::BookPageState, other: Option<u32>) -> BookPageMatch {
+        BookPageMatch {
+            state,
+            other_page_index: other,
+            other_target: other.map(|_| {
+                crate::similar_index::SimilarItemTarget::File(PathBuf::from("c:/other.png"))
+            }),
+            other_item_key: other.map(|_| "c:/other.png".to_string()),
+        }
+    }
+
+    /// 連続した収録と、たまたま数ページ一致しただけのものが、畳んだ後も見分けられること。
+    /// ここで弱い側に寄せると「この単話は合本の 34〜77 ページに入っている」が読めなくなる。
+    #[test]
+    fn a_contiguous_run_survives_folding_and_scattered_hits_stay_thin() {
+        use crate::similar_index::BookPageState;
+
+        let contiguous = (0..100)
+            .map(|page| {
+                if (30..60).contains(&page) {
+                    strip_page(BookPageState::Strong, Some(page as u32))
+                } else {
+                    strip_page(BookPageState::Unmatched, None)
+                }
+            })
+            .collect::<Vec<_>>();
+        let folded = summarize_page_strip(&contiguous, 20);
+        let strong = folded
+            .strongest
+            .iter()
+            .filter(|state| **state == Some(BookPageState::Strong))
+            .count();
+        assert_eq!(strong, 6, "30 pages of 100 fold into 6 of 20 columns");
+
+        let scattered = (0..100)
+            .map(|page| {
+                if page % 17 == 0 {
+                    strip_page(BookPageState::Strong, Some(page as u32))
+                } else {
+                    strip_page(BookPageState::Unmatched, None)
+                }
+            })
+            .collect::<Vec<_>>();
+        let folded = summarize_page_strip(&scattered, 20);
+        let strong = folded
+            .strongest
+            .iter()
+            .filter(|state| **state == Some(BookPageState::Strong))
+            .count();
+        assert!(
+            strong <= 6,
+            "scattered hits must not fill the strip: {strong} columns"
+        );
+    }
+
+    /// 採点対象外は「一致しなかった」より弱く畳む。分母から外れているページを不一致と
+    /// 同じ色で出すと、被覆率の分母と帯の見た目が食い違う。
+    #[test]
+    fn an_excluded_page_never_outranks_a_real_state() {
+        use crate::similar_index::BookPageState;
+
+        let pages = vec![
+            strip_page(BookPageState::Excluded, None),
+            strip_page(BookPageState::Unmatched, None),
+        ];
+        let folded = summarize_page_strip(&pages, 1);
+        assert_eq!(folded.strongest[0], Some(BookPageState::Unmatched));
+
+        let pages = vec![
+            strip_page(BookPageState::Excluded, None),
+            strip_page(BookPageState::Weak, Some(3)),
+        ];
+        let folded = summarize_page_strip(&pages, 1);
+        assert_eq!(folded.strongest[0], Some(BookPageState::Weak));
+        assert_eq!(folded.first_target[0], Some(1));
+    }
+
+    /// ページ数が幅より少ないときは、1 ページが複数のコマにまたがる。**空のコマを残さない。**
+    /// 残すと帯が縞になり、対応が途切れているように見える。
+    #[test]
+    fn a_short_book_fills_the_whole_strip() {
+        use crate::similar_index::BookPageState;
+
+        let pages = (0..3)
+            .map(|page| strip_page(BookPageState::Strong, Some(page as u32)))
+            .collect::<Vec<_>>();
+        let folded = summarize_page_strip(&pages, 10);
+        assert_eq!(folded.strongest.len(), 10);
+        assert!(
+            folded
+                .strongest
+                .iter()
+                .all(|state| *state == Some(BookPageState::Strong)),
+            "a 3-page book must paint all 10 columns: {:?}",
+            folded.strongest
+        );
+        assert!(folded.first_target.iter().all(Option::is_some));
+    }
+
+    /// どのコマも、自分が受け持つページの範囲だけを見る。隣の範囲まで拾うと、収録区間の
+    /// 端が実際より広く見える。
+    #[test]
+    fn each_column_reads_only_its_own_pages() {
+        use crate::similar_index::BookPageState;
+
+        let pages = (0..100)
+            .map(|page| {
+                if page < 50 {
+                    strip_page(BookPageState::Strong, Some(page as u32))
+                } else {
+                    strip_page(BookPageState::Unmatched, None)
+                }
+            })
+            .collect::<Vec<_>>();
+        let folded = summarize_page_strip(&pages, 10);
+        assert_eq!(
+            folded.strongest,
+            vec![
+                Some(BookPageState::Strong),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Strong),
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Unmatched),
+                Some(BookPageState::Unmatched),
+            ]
+        );
+    }
 
     /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を
     /// 戻してから新しい方へ移る。ここで Switch を Continue と同じに扱うと、離しても
