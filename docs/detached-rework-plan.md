@@ -1459,6 +1459,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-09-07 §1.197 S1a: 診断feature内のwindow観測とpaint証跡（実装前の構造合意）:**
+
+利用者の明示指示による担当移行は [v3.7.0-priority-work.md](v3.7.0-priority-work.md) を参照。
+親Astraの設計判断・Solの前提検証・独立Astraの再レビューが、以下を症状パッチではなく
+既存ownerを観測する構造として合意した。通常のdetached predicate・mount/session・
+描画選択・host lifecycleを変更せず、`test-script` feature内の証跡を追加する。
+
+- registryのread-only ContextRefで窓/context/items generation/pageを列挙する。観測で
+  mountやworker drainを起こさない。Mounted↔AtRestは保存場所の移動でありidentityに含めない。
+- host lifetimeは既存`DetachedWindowManager`の`DetachedHostClaim`/incarnationを使い、
+  独自のepochやViewportIdだけの生存判定を追加しない。
+- activeの`CurrentItem`実texture描画だけを現在ページの証拠とし、Captured holdoverを除外。
+  passiveはtexture選択時にcontent/source TextureId/thumbnail由来を同時記録し、
+  Snapshot→DeferredView→実行時`shared.view()`の同じpayloadへ保持する。
+- 登録時ownerと実行時最新viewを別々に結合しない。後からcache readyを見て凍結thumbnailを
+  fullと推定しない。source TextureIdはLanczos化後も保持される既存resource APIと照合する。
+- close/recreate・context退去・page/gen変更をexact identityで拒否し、旧callbackが後着しても
+  現ownerの有効証拠を上書きしない。full/processedのpaint-command発行と、実解像度・
+  USER32配送・GPU scanoutの保証は区別する。
+
+窓snapshotの無副作用、sourceとproofの一体性、全identityのstale拒否、旧callback後着、
+thumbnail/full区別を検証する。操作対象の固定・activation・Keymap接続は次のS1bで別に
+レビューする。実装・実行結果は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) と
+作業台帳へ追記する。この合意だけで実機確認済みとは扱わない。
+
 **2026-09-07 PDF 初回 open の binding 衝突: 窓 ID の正本を registry へ一本化
 （ClaudeCode の依頼が指定する構造修正として実施。Codex は §2 を読み、production 経路の
 修正前再現で BA-7 と確認。実装後の ClaudeCode 検収・実機確認は未実施）:**
