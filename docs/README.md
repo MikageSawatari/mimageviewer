@@ -14,6 +14,8 @@
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
+| [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、native入力sinkの段階と検証範囲 |
+| [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) | **設計合意済み・未実装**。書庫の高速ページ送りが詰まる問題 (§1.174) の正本。ページ読み込みの受付・待機・実行・取消中・終了を上限つきで所有する `FsPageLoadScheduler`、ZIP 中央目次の再利用、アニメーション通知の分離 |

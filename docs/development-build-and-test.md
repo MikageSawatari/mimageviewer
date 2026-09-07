@@ -9,7 +9,8 @@
 | --- | --- | --- |
 | 型・借用・依存関係だけ早く確認 | `cargo check -p mimageviewer --bin mimageviewer-core` | 本体 core |
 | 変更したモジュールのテスト | `cargo test -p mimageviewer --lib <filter>` | 本体の指定テストだけ実行 |
-| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core だけを `dev-runtime` でビルド |
+| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
+| 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
@@ -28,7 +29,7 @@
 
 ### 実アプリの開発ビルド
 
-`build-dev.ps1` は次の条件で本体 core だけをビルドする。
+`build-dev.ps1` は次の条件で本体 core と同じprotocolのremote serviceをビルドする。
 
 - `dev-runtime` profile: `opt-level = 2`、LTO なし、codegen unit 64、incremental 有効
 - 通常 feature set（`portable` は付けない）: 設定・キャッシュ・ログの既定保存先は
@@ -36,6 +37,7 @@
 - launcher を省略して直接起動できるよう、FFmpeg DLL だけを exe の隣へ配置。他の
   DLL・worker・AI model は通常版と同じ埋め込み・展開経路を使う
 - 出力: `target\dev-runtime\mimageviewer-core.exe`
+  と `target\dev-runtime\mimageviewer-remote.exe`
 - Cargo の `dev-runtime` はビルド時間短縮用の最適化profileであり、アプリのデータprofileを
   切り替えるものではない
 
@@ -71,6 +73,18 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ```
 
 ドキュメント、テスト、build scriptだけの変更には実機確認用バイナリは不要。
+
+### エージェントによる自動操作
+
+エージェントはnormal-profileの開発・release・installed実行ファイルを起動しない。
+`prepare-portable-smoke.ps1 -TestScript`が準備した
+`target\portable-smoke\mimageviewer.exe`と、同`data`だけを使う。
+`build-portable.ps1 -SmokeTestScript`は`portable,test-script`を別targetへbuildし、
+`target\portable-smoke-package`へ配置する。通常dist・zip・署名には混ぜない。
+`-SkipBuild`でもsource/feature/exeの証跡を照合し、元packageのdataはコピーしない。
+
+シナリオの実装・検証状況は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md)。
+準備scriptが成功しただけでは、複数窓PDF・列drag・動画zoomの検証成功とは扱わない。
 
 ### 補助 bin
 

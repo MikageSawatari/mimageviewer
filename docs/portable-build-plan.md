@@ -356,6 +356,22 @@ mImageViewer_portable/
 ソフトウェア情報の LGPL 通知は core 内蔵なので変更不要。詳細は
 [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md)。
 
+### 4.8 診断用portableと使い捨てsmoke (2026-09-07)
+
+`build-portable.ps1 -SmokeTestScript`は通常配布と同じ依存copy定義を使いながら、
+`portable,test-script`を`target-portable-test-script`へbuildし、
+`target/portable-smoke-package`へ組み立てる。通常の`target-portable`・`dist`・zip・署名と
+分離し、このモードから通常profileのプロセスを停止しない。
+
+`prepare-portable-smoke.ps1 -TestScript`はこの成果物を固定の
+`target/portable-smoke`へコピーし、新しい`data`と使い捨てmarkerを作る。
+元packageが利用済みでも、その`data`はコピー対象へ含めない。置換先・祖先・配下の
+reparseを検査し、使用中のsmokeは停止せず準備を拒否する。
+
+診断の`-SkipBuild`はbuild時のfeature/profile/source fingerprint/exe hashを照合する。
+詳細と自動シナリオの到達点は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md)。
+従来portableのVST3 bridge非同梱等の制限は、この診断成果物にも適用される。
+
 ## 5. 配布物まとめ + 命名スキーム (実装後)
 
 ### 配布物一覧

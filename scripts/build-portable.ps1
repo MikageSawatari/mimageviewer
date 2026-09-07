@@ -11,15 +11,205 @@
 # Usage:
 #   PS> scripts\build-portable.ps1
 #   PS> scripts\build-portable.ps1 -SkipBuild      (re-assemble only, reuse last core build)
+#   PS> scripts\build-portable.ps1 -SmokeTestScript (diagnostic package; no dist/zip/sign)
 
 [CmdletBinding()]
 param(
     [switch] $SkipBuild,
-    [switch] $Sign
+    [switch] $Sign,
+    [switch] $SmokeTestScript
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = (Get-Location).Path
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+if ($SmokeTestScript -and $Sign) {
+    throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
+}
+
+function Get-NormalizedPath {
+    param([string] $Path)
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Assert-ExactPath {
+    param(
+        [string] $Path,
+        [string] $Expected,
+        [string] $Label
+    )
+    $actualFull = Get-NormalizedPath $Path
+    $expectedFull = Get-NormalizedPath $Expected
+    if (-not $actualFull.Equals($expectedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[$Label] refusing unexpected path: $actualFull (expected $expectedFull)"
+    }
+    return $actualFull
+}
+
+function Assert-NoReparseTree {
+    param(
+        [string] $Path,
+        [string] $Label
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $pending = New-Object System.Collections.Stack
+    $pending.Push((Get-Item -LiteralPath $Path -Force))
+    while ($pending.Count -gt 0) {
+        $item = $pending.Pop()
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "[$Label] refusing reparse point: $($item.FullName)"
+        }
+        if ($item.PSIsContainer) {
+            foreach ($child in (Get-ChildItem -LiteralPath $item.FullName -Force)) {
+                $pending.Push($child)
+            }
+        }
+    }
+}
+
+function Assert-NoReparsePath {
+    param(
+        [string] $Path,
+        [string] $StopAt,
+        [string] $Label
+    )
+    $current = Get-NormalizedPath $Path
+    $stop = Get-NormalizedPath $StopAt
+    if (-not ($current.Equals($stop, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $current.StartsWith(($stop + '\'), [System.StringComparison]::OrdinalIgnoreCase))) {
+        throw "[$Label] refusing path outside repository: $current"
+    }
+    while ($true) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "[$Label] refusing reparse point: $($item.FullName)"
+            }
+        }
+        if ($current.Equals($stop, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) {
+            throw "[$Label] could not reach repository root from $Path"
+        }
+        $current = Get-NormalizedPath $parent
+    }
+}
+
+function Get-MivSourceFingerprint {
+    param([string] $Root)
+
+    $sourcePaths = @(
+        'Cargo.toml',
+        'Cargo.lock',
+        'build.rs',
+        '.cargo',
+        'src',
+        'crates',
+        'assets',
+        'vendor/eframe',
+        'vendor/egui-wgpu',
+        'vendor/twemoji'
+    )
+    $relativeFiles = @(& git -C $Root ls-files --cached --others --exclude-standard -- $sourcePaths)
+    if ($LASTEXITCODE -ne 0) {
+        throw '[portable-smoke-build] failed to enumerate build source files'
+    }
+    # These build.rs inputs live below ignored vendor roots, so git enumeration
+    # cannot see them. Include them explicitly in the source fingerprint.
+    $explicitInputs = @(
+        (Join-Path $Root 'vendor\ffmpeg\VERSION')
+    )
+    $explicitInputs += @(Get-ChildItem -LiteralPath (Join-Path $Root 'vendor\twemoji\svg') -Filter '*.svg' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+    $explicitInputs += @(Get-ChildItem -LiteralPath (Join-Path $Root 'assets\annotation-stamps') -Filter '*.svg' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+    foreach ($absoluteInput in $explicitInputs) {
+        if (Test-Path -LiteralPath $absoluteInput -PathType Leaf) {
+            $relativeFiles += (Get-NormalizedPath $absoluteInput).Substring((Get-NormalizedPath $Root).Length + 1).Replace('\', '/')
+        }
+    }
+    $relativeFiles = @($relativeFiles | Sort-Object -Unique)
+    if ($relativeFiles.Count -eq 0) {
+        throw '[portable-smoke-build] build source file set is empty'
+    }
+
+    $records = foreach ($relative in $relativeFiles) {
+        $absolute = Join-Path $Root ($relative -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+            throw "[portable-smoke-build] source disappeared while fingerprinting: $relative"
+        }
+        $hash = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$relative`t$hash"
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($records -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Write-SmokeBuildManifest {
+    param(
+        [string] $Path,
+        [string] $SourceFingerprint,
+        [string] $CorePath,
+        [string] $RemotePath
+    )
+    $head = (& git -C $repoRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $head) {
+        throw '[portable-smoke-build] failed to read git HEAD'
+    }
+    $manifest = [ordered]@{
+        schema_version = 1
+        artifact_flavor = 'portable-test-script'
+        cargo_profile = 'release'
+        features = @('portable', 'test-script')
+        source_head = $head
+        source_fingerprint_sha256 = $SourceFingerprint
+        core_sha256 = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        remote_sha256 = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $json = $manifest | ConvertTo-Json -Depth 3
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Assert-SmokeBuildManifest {
+    param(
+        [string] $Path,
+        [string] $ExpectedSourceFingerprint,
+        [string] $CorePath,
+        [string] $RemotePath
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "[portable-smoke-build] diagnostic build manifest not found: $Path"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        throw "[portable-smoke-build] invalid diagnostic build manifest: $Path"
+    }
+    $features = @($manifest.features)
+    if ($manifest.schema_version -ne 1 -or
+        $manifest.artifact_flavor -ne 'portable-test-script' -or
+        $manifest.cargo_profile -ne 'release' -or
+        $features.Count -ne 2 -or
+        $features[0] -ne 'portable' -or
+        $features[1] -ne 'test-script') {
+        throw '[portable-smoke-build] manifest does not describe portable,test-script release artifacts'
+    }
+    if ($manifest.source_fingerprint_sha256 -ne $ExpectedSourceFingerprint) {
+        throw '[portable-smoke-build] source changed since the diagnostic artifact was built; rerun without -SkipBuild'
+    }
+    $coreHash = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $remoteHash = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash) {
+        throw '[portable-smoke-build] diagnostic artifact hash does not match its build manifest'
+    }
+}
 
 # Optional code signing (Certum / SimplySign). Assert the certificate up front
 # when -Sign is set (SimplySign Desktop must be logged in). See sign-files.ps1.
@@ -73,16 +263,18 @@ $stoppableProcessNames = @(
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
-Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $stoppableProcessNames -contains $_.Name } |
-    ForEach-Object {
-        $p = $null
-        try { $p = $_.Path } catch { $p = $null }
-        if ($p -and $p.ToLower().StartsWith($repoPrefix)) {
-            Write-Host "[portable] stopping $($_.Name) (PID=$($_.Id))"
-            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+if (-not $SmokeTestScript) {
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $stoppableProcessNames -contains $_.Name } |
+        ForEach-Object {
+            $p = $null
+            try { $p = $_.Path } catch { $p = $null }
+            if ($p -and $p.ToLower().StartsWith($repoPrefix)) {
+                Write-Host "[portable] stopping $($_.Name) (PID=$($_.Id))"
+                try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+            }
         }
-    }
+}
 
 # ---------------------------------------------------------------------------
 # Build the portable core (no launcher; native deps NOT embedded).
@@ -92,35 +284,86 @@ Get-Process -ErrorAction SilentlyContinue |
 # output path let cargo hand back a stale core of the other feature flavor
 # (0.5s "Finished", no Compiling line). target-* is already gitignored.
 # ---------------------------------------------------------------------------
-$portableTargetDir = Join-Path $repoRoot 'target-portable'
+$portableTargetName = if ($SmokeTestScript) { 'target-portable-test-script' } else { 'target-portable' }
+$portableTargetDir = Join-Path $repoRoot $portableTargetName
 $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
 $remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
+$smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
+Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
+$sourceFingerprint = $null
+if ($SmokeTestScript) {
+    $sourceFingerprint = Get-MivSourceFingerprint $repoRoot
+}
 if (-not $SkipBuild) {
+    if ($SmokeTestScript -and (Test-Path -LiteralPath $smokeBuildManifest -PathType Leaf)) {
+        Assert-NoReparsePath $smokeBuildManifest $repoRoot 'portable-smoke-build-manifest'
+        Remove-Item -LiteralPath $smokeBuildManifest -Force
+    }
     Ensure-LibclangPath
-    Write-Host "[portable] cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable"
-    & cargo build --release --bin mimageviewer-core --features portable --target-dir $portableTargetDir
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "[portable] cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable"
-    & cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetDir
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $coreFeatures = if ($SmokeTestScript) { 'portable,test-script' } else { 'portable' }
+    $cargoExit = 0
+    Push-Location $repoRoot
+    try {
+        Write-Host "[portable] cargo build --release --bin mimageviewer-core --features $coreFeatures --target-dir $portableTargetName"
+        & cargo build --release --bin mimageviewer-core --features $coreFeatures --target-dir $portableTargetDir
+        $cargoExit = $LASTEXITCODE
+        if ($cargoExit -eq 0) {
+            Write-Host "[portable] cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetName"
+            & cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetDir
+            $cargoExit = $LASTEXITCODE
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    if ($cargoExit -ne 0) { exit $cargoExit }
+    if ($SmokeTestScript) {
+        $postBuildFingerprint = Get-MivSourceFingerprint $repoRoot
+        if ($postBuildFingerprint -ne $sourceFingerprint) {
+            throw '[portable-smoke-build] build sources changed during the diagnostic build; rebuild from a stable tree'
+        }
+    }
 }
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
 if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
+Assert-NoReparsePath $coreExe $repoRoot 'portable-core'
+Assert-NoReparsePath $remoteExe $repoRoot 'portable-remote'
+if ($SmokeTestScript) {
+    if ($SkipBuild) {
+        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+    } else {
+        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Assemble the distribution folder.
 # ---------------------------------------------------------------------------
-$distRoot = Join-Path $repoRoot 'dist'
 $pkgName = "mImageViewer_portable_v$version"
-$pkgDir = Join-Path $distRoot $pkgName
-if (Test-Path $pkgDir) { Remove-Item -LiteralPath $pkgDir -Recurse -Force }
+$distRoot = Join-Path $repoRoot 'dist'
+$pkgDir = if ($SmokeTestScript) {
+    Join-Path $repoRoot 'target\portable-smoke-package'
+} else {
+    Join-Path $distRoot $pkgName
+}
+$expectedPackagePath = if ($SmokeTestScript) {
+    Join-Path $repoRoot 'target\portable-smoke-package'
+} else {
+    Join-Path $repoRoot "dist\$pkgName"
+}
+$pkgDir = Assert-ExactPath $pkgDir $expectedPackagePath 'portable-package'
+Assert-NoReparsePath (Split-Path -Parent $pkgDir) $repoRoot 'portable-package'
+if (Test-Path -LiteralPath $pkgDir) {
+    Assert-NoReparseTree $pkgDir 'portable-package'
+    Remove-Item -LiteralPath $pkgDir -Recurse -Force
+}
 New-Item -ItemType Directory -Path $pkgDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
 
 # (source relative to repo root, destination relative to pkgDir)
 $copies = @(
-    @{ src = 'target-portable\release\mimageviewer-core.exe'; dst = 'mimageviewer.exe' }
-    @{ src = 'target-portable\release\mimageviewer-remote.exe'; dst = 'mimageviewer-remote.exe' }
+    @{ src = $coreExe; dst = 'mimageviewer.exe' }
+    @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -163,10 +406,15 @@ foreach ($m in $models) {
 
 $missing = @()
 foreach ($c in $copies) {
-    $src = Join-Path $repoRoot $c.src
+    $src = if ([System.IO.Path]::IsPathRooted($c.src)) { $c.src } else { Join-Path $repoRoot $c.src }
     $dst = Join-Path $pkgDir $c.dst
     if (-not (Test-Path $src)) { $missing += $c.src; continue }
+    Assert-NoReparsePath $src $repoRoot 'portable-package-source'
     Copy-Item -LiteralPath $src -Destination $dst -Force
+}
+
+if ($SmokeTestScript) {
+    Copy-Item -LiteralPath $smokeBuildManifest -Destination (Join-Path $pkgDir '.test-script-build.json') -Force
 }
 
 if ($missing.Count -gt 0) {
@@ -211,8 +459,19 @@ if ($Sign) {
 # ---------------------------------------------------------------------------
 # Zip it.
 # ---------------------------------------------------------------------------
+if ($SmokeTestScript) {
+    Assert-NoReparseTree $pkgDir 'portable-smoke-build'
+    Write-Host ""
+    Write-Host '[portable-smoke-build] DONE'
+    Write-Host "  folder: $pkgDir"
+    Write-Host "  manifest: $(Join-Path $pkgDir '.test-script-build.json')"
+    Write-Output $pkgDir
+    exit 0
+}
+
 $zipPath = Join-Path $distRoot "$pkgName.zip"
 if (Test-Path $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+Assert-NoReparseTree $pkgDir 'portable-package'
 Compress-Archive -Path (Join-Path $pkgDir '*') -DestinationPath $zipPath -Force
 $zipSizeMb = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
 
