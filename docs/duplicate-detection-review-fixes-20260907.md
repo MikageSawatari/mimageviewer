@@ -327,8 +327,8 @@ SQL本体をprivateなConnection reader helperへ抽出し、既存wrapperとBoo
 後者では同TXの整合した結果を一度公開し、最新refreshを1件へまとめる。memory_epoch一致だけで
 完成結果を捨てると、索引更新中の数秒queryが永久に表示されないためである。
 『変更後に旧結果を採用しない』はfavorite scope等のhard identity変更を指す。
-既存BookQueryStateを実行中1件＋最新待機1件のownerへ拡張し、desired/requested/completedを束ねる。
-同一完了要求を毎frame再投入せず、既存last_ready即表示を維持する。
+workerはmanager全体で1件、desired/requested/completedと最新待機1件はlive viewerごとのBookQueryClientが所有する。
+同一完了要求を毎frame再投入せず、owner間はFIFO/round-robinで公平にdispatchする。既存last_readyはItemQuery専用であり、本の完成結果保持は新owner内の同一要求に限定して設計する。
 
 新classifier入口はcommon状態だけでなく、同TX検証済みの対応辺(index_a,index_b,distance)を受け、
 既存weighted_monotonic_alignmentと判定計算を共有する。全corpus入口は参照実装として残す。
@@ -524,3 +524,40 @@ product型のtraitを増やさず、既存perf_keyの順序付きidentity列の�
 非干渉、PresentationSwitch資源と期限解放、previous無しlegacy captureからの内部closeを確認した。
 PDF factoryはtest用local coordinatorの正規leaseを使い、UI helperは実handlerへの委譲だけとした。
 全体gate・portable build・実機確認はこの狭域成功時点では未完了である。
+### R1 本照会の公平な所有境界への訂正
+
+親がmanager-globalの「1実行＋1最新待機」案にviewer間の飢餓を懸念し、独立Astraが現経路を監査した。
+passive detachedはsnapshot描画なので、二窓を放置しただけで毎frame相互要求する経路は確認していない。
+一方、照会完了より速いA→B→Aのactivateでは要求が交錯し、共有latestで他viewerを取消す案は成立しない。
+
+workerはglobalで1件に保ち、BookQueryClientを既存bundle-owned SimilarPanelStateに保持する。
+要求ID・desired/requested/completed・取消・完成結果はclient単位。各live clientの最新待機を1件まで保持し、
+FIFO/round-robinで処理する。同一要求のpollで順番を動かさず、soft refreshは列末尾へ戻す。
+origin変更・要求撤回・retireは当該clientだけを取消し、park/swapは失効させない。
+scope/store/shutdownは共有失効境界。完了・失敗・取消をdrainしたらUI pollingを待たず次ownerをdispatchする。
+APIはquery_book(client, container_key)相当が必要で、container_keyだけでは同一本を要求する窓も分離できない。
+待機量はlive viewer数に比例して有界となる。全体の待機1件を優先して他窓の機能を落とさない。
+
+回帰はA/B交互poll、A park中完了、B dropからAへの非干渉、連続refresh下で両方完了、取消/失敗後の次要求開始。
+既存last_readyはItemQuery専用で、本の直前結果保持が既にあるという記述を訂正した。
+検索prototypeの採否評価と分け、product schedulerはこの境界を実装前に具体APIと再照合する。
+### R2 初回full gateの失敗と追随方針
+
+`target/r2-test-full.log` はworkspace終了コード1。本体libは7627成功/3失敗/38ignored、384.64秒。
+workspaceの他suiteは完走したが、scriptは失敗を返しvendor2suiteには進んでいない。
+失敗は既存の次の3件。親と独立Astraがfixture・描画/終端consumerを照合した。
+
+- fs_nav_holdover_for_draw_bridges_until_new_target_content_ready:
+  新画像選択後はprevious.takeでtextureを不可逆に破棄し、FolderNavigation(None)がterminalまで残る。
+  owner全体Noneという旧assertを修正し、再Pendingで旧画像が復活しない検証を保つ。
+  新thumbをLoadedに戻し実poll_fs_nav_lockを通して、lock/owner双方の解放まで確認する。
+- fullscreen_folder_nav_close_preserves_still_viewport_for_reopen /
+  start_loading_items_during_fullscreen_nav_keeps_viewport_reuse:
+  raw fs_nav_locked_genだけのfixtureを実capture_fs_nav_holdover(idx)producerへ追随させる。
+  viewportの表示・姿勢・世代・再生成防止の既存assertは保持する。
+
+legacyの終端はmain/detached updateからpoll_fs_nav_lockのdisplay_ready/has_failedへ到達し、
+lock/ownerをともに解放する。製品回帰を隠す期待値変更ではないことを独立確認した。
+tests.rsだけ編集を再開し、狭域・fmt・full gateを再実行する。実機・portableはまだ未実施。
+初回source checkpointはtarget/r2-portable-milestone-20260908に失敗証跡として保持し、
+修正後は別checkpointを採る。R2のindexとcommit境界は親が管理する。
