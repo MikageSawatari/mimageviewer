@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::dupe::{self, Algo, Sig};
 use crate::similar_db::{
-    CandidateIdentity, CompletedIndexStats, ContainerKind, Freshness, ItemKind, SearchRow,
-    SimilarDb, StoredItem, current_hash_version,
+    CandidateIdentity, CompletedIndexStats, ContainerKind, Freshness, ItemKind, SimilarDb,
+    StoredItem, current_hash_version,
 };
 use crate::similar_image::{
     PDF_RENDER_LONG_EDGE, ProxySource, SimilarImageFormat, proxy_from_source,
@@ -197,6 +197,9 @@ pub struct BookPageMatch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BookRelationHit {
     pub other_container_key: String,
+    /// 相手の本の総ページ数。帯は**この本**のページで引くので、相手の長さは別に示さないと
+    /// 帯が何を表しているのか読めない。
+    pub other_page_count: u32,
     pub pair: dupe::book::BookPair,
     /// 起点の本のページ順に並んだ帯。長さは起点の本のページ数と一致する。
     pub pages: Vec<BookPageMatch>,
@@ -1539,6 +1542,7 @@ fn query_book_ready(db: &SimilarDb, snapshot: &SearchSnapshot, container_key: &s
                 let strip = build_page_strip(&origin_pages, pages, &matches, &pair);
                 hits.push(BookRelationHit {
                     other_container_key: candidate_key,
+                    other_page_count: pages.len() as u32,
                     pair,
                     pages: strip,
                 })
@@ -3908,6 +3912,8 @@ mod tests {
                 .all(|container| container.page_count == Some(3))
         );
     }
+
+    use crate::similar_db::SearchRow;
 
     /// 候補が 0 件の結果。identity だけを比べるテスト用。
     fn empty_matches() -> ItemMatches {

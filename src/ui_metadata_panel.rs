@@ -17,6 +17,10 @@ const TITLE_BAR_H: f32 = 32.0;
 const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 const SIMILAR_THUMB_SIZE: f32 = 72.0;
 
+/// パネルが抱えるサムネイルの上限。1 冊分の帯とその候補が丸ごと収まる程度にする。
+/// 越えた分は古い順に落とす。
+const SIMILAR_THUMB_CACHE_LIMIT: usize = 512;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MetadataPanelTab {
     #[default]
@@ -40,6 +44,14 @@ pub(crate) struct SimilarPanelState {
     tab: MetadataPanelTab,
     origin_key: Option<String>,
     thumbnails: std::collections::HashMap<String, SimilarThumbState>,
+    /// 読み込んだ順。上限を超えた分をここから古い順に落とす。
+    thumb_order: std::collections::VecDeque<String>,
+    /// 直前に出せた結果。次の照会が返るまでこれを出し続ける。
+    ///
+    /// 本を読み進めると起点はページごとに変わり、そのたびに照会が走る。返るまでの数フレーム
+    /// を spinner に差し替えると、ページを送るたびに内容が消えて戻る。**古い内容を出したまま
+    /// 差し替える方が読める。** 出している間は「更新中」と明記する。
+    last_ready: Option<std::sync::Arc<crate::similar_index::ItemQuery>>,
     thumb_tx: std::sync::mpsc::Sender<SimilarThumbResult>,
     thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
 }
@@ -51,6 +63,8 @@ impl Default for SimilarPanelState {
             tab: MetadataPanelTab::Info,
             origin_key: None,
             thumbnails: std::collections::HashMap::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            last_ready: None,
             thumb_tx,
             thumb_rx,
         }
@@ -58,11 +72,21 @@ impl Default for SimilarPanelState {
 }
 
 impl SimilarPanelState {
+    /// 起点が変わっても**サムネイルは捨てない**。
+    ///
+    /// 本を読み進めると起点は 1 ページごとに変わるが、候補も帯のページも同じ画像を指し続ける
+    /// ことが多い。毎回捨てると、パネル全体が読み直しになって明滅する。上限を超えた分だけ
+    /// 古い順に落とす。
     fn begin_origin(&mut self, origin_key: Option<String>) {
-        if self.origin_key != origin_key {
-            self.origin_key = origin_key;
-            self.thumbnails.clear();
-            while self.thumb_rx.try_recv().is_ok() {}
+        if self.origin_key == origin_key {
+            return;
+        }
+        self.origin_key = origin_key;
+        while self.thumbnails.len() > SIMILAR_THUMB_CACHE_LIMIT {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                break;
+            };
+            self.thumbnails.remove(&oldest);
         }
     }
 
@@ -76,7 +100,13 @@ impl SimilarPanelState {
                 )),
                 None => SimilarThumbState::Failed,
             };
-            self.thumbnails.insert(result.item_key, state);
+            if self
+                .thumbnails
+                .insert(result.item_key.clone(), state)
+                .is_none()
+            {
+                self.thumb_order.push_back(result.item_key);
+            }
         }
     }
 
@@ -1264,12 +1294,26 @@ impl App {
                         .as_ref()
                         .map(|item| self.query_similar_book(item));
                     let results_are_stale = self.similar_query_results_are_stale();
-                    let model = similar_panel_model(query.as_ref());
+                    // 照会が返るまでの数フレームだけ、直前の結果を出し続ける。
+                    let showing_previous =
+                        if matches!(query.as_ref(), crate::similar_index::ItemQuery::Preparing) {
+                            self.similar_panel.last_ready.clone()
+                        } else {
+                            if matches!(query.as_ref(), crate::similar_index::ItemQuery::Ready(_)) {
+                                self.similar_panel.last_ready = Some(std::sync::Arc::clone(&query));
+                            } else {
+                                self.similar_panel.last_ready = None;
+                            }
+                            None
+                        };
+                    let shown = showing_previous.as_ref().unwrap_or(&query);
+                    let model = similar_panel_model(shown.as_ref());
                     draw_similar_panel(
                         ui,
                         model,
                         book.as_deref(),
                         origin_key.as_deref(),
+                        showing_previous.is_some(),
                         results_are_stale,
                         &mut self.similar_panel,
                         self.settings.thumb_px.max(SIMILAR_THUMB_SIZE as u32),
@@ -2373,6 +2417,7 @@ fn draw_similar_panel(
     model: SimilarPanelModel<'_>,
     book: Option<&crate::similar_index::BookQuery>,
     current_item_key: Option<&str>,
+    showing_previous: bool,
     results_are_stale: bool,
     state: &mut SimilarPanelState,
     thumb_px: u32,
@@ -2407,6 +2452,22 @@ fn draw_similar_panel(
                 .size(11.0),
         );
         ui.add_space(8.0);
+    }
+    // 本の関係を先に出す。これは本ごとに決まるので読み進めても動かない。ページの結果は
+    // 件数が変わるので、後ろに置かないと本の節が上下に動いてしまう。
+    if let Some(book) = book {
+        draw_book_relations(
+            ui,
+            book,
+            current_item_key,
+            state,
+            thumb_px,
+            thumb_quality,
+            cache_decision,
+            pdf_passwords,
+            ctx,
+            actions,
+        );
     }
     match model {
         SimilarPanelModel::NoIndex => {
@@ -2449,12 +2510,17 @@ fn draw_similar_panel(
                 pdf_passwords,
                 ctx,
             );
-            ui.label(
-                egui::RichText::new("表示中")
-                    .color(egui::Color32::WHITE)
-                    .size(14.0)
-                    .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("表示中")
+                        .color(egui::Color32::WHITE)
+                        .size(14.0)
+                        .strong(),
+                );
+                if showing_previous {
+                    ui.label(egui::RichText::new("(更新中)").color(DIM_COLOR).size(10.0));
+                }
+            });
             ui.add_space(4.0);
             draw_similar_card(
                 ui,
@@ -2517,23 +2583,9 @@ fn draw_similar_panel(
             }
         }
     }
-    if let Some(book) = book {
-        draw_book_relations(
-            ui,
-            book,
-            current_item_key,
-            state,
-            thumb_px,
-            thumb_quality,
-            cache_decision,
-            pdf_passwords,
-            ctx,
-            actions,
-        );
-    }
 }
 
-/// 「この本と重なる本」。単体画像の結果の下に置く。
+/// 「この本と重なる本」。
 ///
 /// 本を開いていないときは何も出さない。`NotBook` は失敗ではなく「この画像は本のページでは
 /// ない」という状態なので、文言を出して場所を取ることはしない。
@@ -2555,9 +2607,6 @@ fn draw_book_relations(
     if matches!(book, BookQuery::NotBook | BookQuery::NotIndexed) {
         return;
     }
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(6.0);
     ui.label(
         egui::RichText::new("この本と重なる本")
             .color(egui::Color32::WHITE)
@@ -2597,6 +2646,7 @@ fn draw_book_relations(
         }
         BookQuery::Ready(relations) => {
             draw_page_strip_legend(ui);
+
             ui.add_space(6.0);
             let current_page = current_item_key.and_then(|key| {
                 relations
@@ -2643,6 +2693,9 @@ fn draw_book_relations(
             }
         }
     }
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(8.0);
 }
 
 fn book_relation_name(container_key: &str) -> String {
@@ -2664,10 +2717,12 @@ fn book_relation_line(hit: &crate::similar_index::BookRelationHit) -> String {
         crate::dupe::book::Relation::Undecidable => "判定できる材料が足りない",
     };
     format!(
-        "{relation} / {} ページ一致 / この本の {:.0}% ・相手の {:.0}%",
+        "{relation} / {} ページ一致 / この本の {:.0}% ・相手の {:.0}%\nこの本 {} ページ ・相手 {} ページ",
         hit.pair.matched,
         hit.pair.coverage_a * 100.0,
-        hit.pair.coverage_b * 100.0
+        hit.pair.coverage_b * 100.0,
+        hit.pages.len(),
+        hit.other_page_count
     )
 }
 
@@ -2830,22 +2885,38 @@ fn draw_page_strip(
         strongest,
         first_target,
     } = summarize_page_strip(&hit.pages, columns);
-    for (column, state) in strongest.iter().enumerate() {
-        let Some(state) = state else {
-            continue;
-        };
-        let x = rect.left() + column as f32;
-        painter.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(1.0, STRIP_HEIGHT)),
-            0.0,
-            page_state_color(*state),
-        );
+    // 1 ページが 3 px 以上取れるなら、ページごとの区画として描く。ページ数を数えられ、
+    // ▼ がどの区画を指しているのかが分かる。取れないときだけ 1 px のコマへ畳む。
+    let per_page = width / hit.pages.len() as f32;
+    if per_page >= STRIP_MIN_CELL {
+        for (page, entry) in hit.pages.iter().enumerate() {
+            let left = rect.left() + strip_page_left(width, hit.pages.len(), page);
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(left, rect.top()),
+                    egui::vec2((per_page - 1.0).max(1.0), STRIP_HEIGHT),
+                ),
+                0.0,
+                page_state_color(entry.state),
+            );
+        }
+    } else {
+        for (column, state) in strongest.iter().enumerate() {
+            let Some(state) = state else {
+                continue;
+            };
+            let x = rect.left() + column as f32;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(1.0, STRIP_HEIGHT)),
+                0.0,
+                page_state_color(*state),
+            );
+        }
     }
 
     // いま見ているページの位置。これが無いと、帯のどこに自分がいるのか分からない。
     if let Some(page) = current_page {
-        let column = (page * columns / hit.pages.len().max(1)).min(columns - 1);
-        let x = rect.left() + column as f32 + 0.5;
+        let x = rect.left() + strip_page_center(width, hit.pages.len(), page);
         let tip = egui::pos2(x, rect.top() - 1.0);
         painter.add(egui::Shape::convex_polygon(
             vec![
@@ -2862,12 +2933,17 @@ fn draw_page_strip(
         return;
     };
     let column = ((pos.x - rect.left()).floor().max(0.0) as usize).min(columns - 1);
-    // ホバーしている位置に印を出す。帯は 1 px 単位なので、どこを指しているのか分からないと
-    // 押した先が予測できない。
+    // 押したときに対象になるページ範囲を、そのまま囲う。カーソル中心の固定幅にすると、
+    // 1 ページが十数 px ある帯で枠だけが細く残り、どのページを指しているのか分からない。
+    let pages = hit.pages.len();
+    let first = column * pages / columns;
+    let last = (((column + 1) * pages) / columns).max(first + 1).min(pages);
+    let left = strip_page_left(width, pages, first);
+    let right = strip_page_left(width, pages, last).max(left + STRIP_MIN_CELL);
     painter.rect_stroke(
         egui::Rect::from_min_size(
-            egui::pos2(rect.left() + column as f32 - 1.0, rect.top()),
-            egui::vec2(3.0, STRIP_HEIGHT),
+            egui::pos2(rect.left() + left, rect.top()),
+            egui::vec2(right - left, STRIP_HEIGHT),
         ),
         0.0,
         egui::Stroke::new(1.0, egui::Color32::WHITE),
@@ -2929,6 +3005,20 @@ fn draw_page_strip(
 
 /// いま見ているページを指す ▼ の高さ。帯の上に確保する。
 const STRIP_MARKER_HEIGHT: f32 = 7.0;
+
+/// ページごとの区画として描くのに要る幅。これを割ると隙間が取れず、区画が数えられない。
+const STRIP_MIN_CELL: f32 = 3.0;
+
+/// 帯の中でそのページの区画が始まる位置。
+fn strip_page_left(width: f32, pages: usize, page: usize) -> f32 {
+    width / pages.max(1) as f32 * page as f32
+}
+
+/// 帯の中でそのページが占める区画の中心。▼ はここを指す。
+fn strip_page_center(width: f32, pages: usize, page: usize) -> f32 {
+    let per_page = width / pages.max(1) as f32;
+    strip_page_left(width, pages, page) + per_page / 2.0
+}
 
 /// ホバー時に出すページの一辺。行のサムネイル (72px) より大きくして、飛ぶ前に中身が分かる
 /// 程度にする。
@@ -3046,6 +3136,7 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
         hits: vec![
             crate::similar_index::BookRelationHit {
                 other_container_key: r"E:\books\総集編.zip".to_string(),
+                other_page_count: 402,
                 pair: crate::dupe::book::BookPair {
                     a: 1,
                     b: 2,
@@ -3061,6 +3152,7 @@ fn book_snapshot_fixture() -> crate::similar_index::BookQuery {
             },
             crate::similar_index::BookRelationHit {
                 other_container_key: r"E:\books\別作品.zip".to_string(),
+                other_page_count: 190,
                 pair: crate::dupe::book::BookPair {
                     a: 1,
                     b: 3,
@@ -3181,6 +3273,7 @@ pub fn draw_similar_panel_snapshot_fixture(ui: &mut egui::Ui, similar_selected: 
                 SimilarPanelModel::Results(&matches),
                 Some(&book),
                 Some(&current_page),
+                false,
                 true,
                 &mut state,
                 72,
@@ -4201,6 +4294,7 @@ mod similar_panel_tests {
         pages[5] = strip_page(BookPageState::Strong, Some(34));
         let hit = BookRelationHit {
             other_container_key: "e:/books/anthology.zip".to_string(),
+            other_page_count: 200,
             pair: crate::dupe::book::BookPair {
                 a: 1,
                 b: 2,
@@ -4224,6 +4318,29 @@ mod similar_panel_tests {
             ..hit
         };
         assert!(super::book_open_target(&empty).is_none());
+    }
+
+    /// 区画・▼・ホバー枠が同じ換算を使うこと。ここが割れると、指している場所と開く場所が
+    /// ずれる。
+    #[test]
+    fn the_strip_places_a_page_the_same_way_everywhere() {
+        let width = 220.0;
+        let pages = 22;
+        for page in 0..pages {
+            let left = super::strip_page_left(width, pages, page);
+            let right = super::strip_page_left(width, pages, page + 1);
+            let center = super::strip_page_center(width, pages, page);
+            assert!(
+                left < center && center < right,
+                "page {page}: center {center} is outside [{left}, {right})"
+            );
+        }
+        assert_eq!(super::strip_page_left(width, pages, 0), 0.0);
+        assert!((super::strip_page_left(width, pages, pages) - width).abs() < 0.001);
+
+        // ページが 1 枚しかなくても割り算が壊れないこと。
+        assert_eq!(super::strip_page_left(width, 1, 0), 0.0);
+        assert!((super::strip_page_center(width, 1, 0) - width / 2.0).abs() < 0.001);
     }
 
     /// 押している間だけ覗き、離したら戻す。押したまま別の候補へ滑らせた場合は、前の表示を
