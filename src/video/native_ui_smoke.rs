@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -42,15 +42,14 @@ const TARGET_WAIT_POLL: Duration = Duration::from_millis(20);
 const TARGET_DIAGNOSTIC_RECORD_LIMIT: usize = 4;
 const TARGET_DIAGNOSTIC_PAIR_LIMIT: usize = 8;
 const WNDPROC_TRACE_RECORD_LIMIT: usize = 8;
-const STEP_TOKEN_PREFIX: usize = if usize::BITS >= 64 {
-    0x4d49_5653_0000_0000
-} else {
-    0x4d49_0000
-};
+const STEP_TOKEN_PREFIX: usize = 0x4d49_0000;
+const STEP_TOKEN_SERIAL_MIN: u32 = 1;
+const STEP_TOKEN_SERIAL_MAX: u32 = u16::MAX as u32;
+const STEP_TOKEN_SERIAL_EXHAUSTED: u32 = STEP_TOKEN_SERIAL_MAX + 1;
 
 static NEXT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PUBLISHER_NONCE: AtomicU64 = AtomicU64::new(1);
-static NEXT_STEP_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static NEXT_STEP_TOKEN_SERIAL: AtomicU32 = AtomicU32::new(STEP_TOKEN_SERIAL_MIN);
 static ACTIVE_STEP_TOKEN: AtomicUsize = AtomicUsize::new(0);
 // Process-lifetime count. It is intentionally not presented as belonging to any one step.
 static WNDPROC_TRACE_UNAVAILABLE_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -885,13 +884,7 @@ pub(crate) fn send_prepared_real_mouse_move(
         "send_after_os_target_validation",
     )?;
 
-    let token = allocate_step_token();
-    if ACTIVE_STEP_TOKEN
-        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("another native mouse diagnostic step is already active".into());
-    }
+    let token = begin_active_step_token_in(&NEXT_STEP_TOKEN_SERIAL, &ACTIVE_STEP_TOKEN)?;
     let _active = ActiveStepToken(token);
     begin_wndproc_trace(token);
     {
@@ -1810,14 +1803,32 @@ fn virtual_desktop_coordinate_tolerance() -> Result<[i32; 2], String> {
     Ok([tolerance(width), tolerance(height)])
 }
 
-fn allocate_step_token() -> usize {
-    let mask = if usize::BITS >= 64 {
-        0xffff_ffff
-    } else {
-        0xffff
-    };
-    let serial = NEXT_STEP_TOKEN.fetch_add(1, Ordering::Relaxed) & mask;
-    STEP_TOKEN_PREFIX | serial.max(1)
+fn allocate_step_token_in(next_serial: &AtomicU32) -> Result<usize, String> {
+    let serial = next_serial
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
+            if (STEP_TOKEN_SERIAL_MIN..STEP_TOKEN_SERIAL_MAX).contains(&serial) {
+                Some(serial + 1)
+            } else if serial == STEP_TOKEN_SERIAL_MAX {
+                Some(STEP_TOKEN_SERIAL_EXHAUSTED)
+            } else {
+                None
+            }
+        })
+        .map_err(|_| {
+            "native mouse diagnostic step token space is exhausted for this process".to_string()
+        })?;
+    Ok(STEP_TOKEN_PREFIX | serial as usize)
+}
+
+fn begin_active_step_token_in(
+    next_serial: &AtomicU32,
+    active_token: &AtomicUsize,
+) -> Result<usize, String> {
+    let token = allocate_step_token_in(next_serial)?;
+    active_token
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "another native mouse diagnostic step is already active".to_string())?;
+    Ok(token)
 }
 
 struct ActiveStepToken(usize);
@@ -2649,6 +2660,121 @@ mod tests {
                 .pending
                 .is_some()
         );
+    }
+
+    #[test]
+    fn step_token_allocator_stays_in_the_32_bit_prefix_range_and_exhausts_permanently() {
+        let first_serial = AtomicU32::new(STEP_TOKEN_SERIAL_MIN);
+        let first = allocate_step_token_in(&first_serial).unwrap();
+        assert_eq!(first, STEP_TOKEN_PREFIX | 1);
+        assert_eq!(first_serial.load(Ordering::Relaxed), 2);
+        assert_eq!(first & !(STEP_TOKEN_SERIAL_MAX as usize), STEP_TOKEN_PREFIX);
+        assert!(u32::try_from(first).is_ok());
+
+        let last_serial = AtomicU32::new(STEP_TOKEN_SERIAL_MAX);
+        let last = allocate_step_token_in(&last_serial).unwrap();
+        assert_eq!(last, STEP_TOKEN_PREFIX | STEP_TOKEN_SERIAL_MAX as usize);
+        assert_eq!(
+            last_serial.load(Ordering::Relaxed),
+            STEP_TOKEN_SERIAL_EXHAUSTED
+        );
+        let first_error = allocate_step_token_in(&last_serial).unwrap_err();
+        let second_error = allocate_step_token_in(&last_serial).unwrap_err();
+        assert!(first_error.contains("exhausted"));
+        assert_eq!(second_error, first_error);
+        assert_eq!(
+            last_serial.load(Ordering::Relaxed),
+            STEP_TOKEN_SERIAL_EXHAUSTED
+        );
+
+        let invalid_zero = AtomicU32::new(0);
+        assert!(allocate_step_token_in(&invalid_zero).is_err());
+        assert_eq!(invalid_zero.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_step_token_allocation_is_unique_and_in_range() {
+        const THREADS: usize = 8;
+        const TOKENS_PER_THREAD: usize = 128;
+        let next_serial = Arc::new(AtomicU32::new(STEP_TOKEN_SERIAL_MIN));
+        let handles = (0..THREADS)
+            .map(|_| {
+                let next_serial = Arc::clone(&next_serial);
+                std::thread::spawn(move || {
+                    (0..TOKENS_PER_THREAD)
+                        .map(|_| allocate_step_token_in(&next_serial).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut tokens = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.len(), THREADS * TOKENS_PER_THREAD);
+        assert!(tokens.iter().all(|token| {
+            *token & !(STEP_TOKEN_SERIAL_MAX as usize) == STEP_TOKEN_PREFIX
+                && (*token & STEP_TOKEN_SERIAL_MAX as usize) != 0
+                && u32::try_from(*token).is_ok()
+        }));
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), THREADS * TOKENS_PER_THREAD);
+    }
+
+    #[test]
+    fn failed_active_step_cas_burns_the_allocated_serial() {
+        let next_serial = AtomicU32::new(STEP_TOKEN_SERIAL_MIN);
+        let occupied = STEP_TOKEN_PREFIX | 99;
+        let active = AtomicUsize::new(occupied);
+
+        let error = begin_active_step_token_in(&next_serial, &active).unwrap_err();
+        assert!(error.contains("already active"));
+        assert_eq!(active.load(Ordering::Acquire), occupied);
+        assert_eq!(next_serial.load(Ordering::Relaxed), 2);
+
+        active.store(0, Ordering::Release);
+        let next = begin_active_step_token_in(&next_serial, &active).unwrap();
+        assert_eq!(next, STEP_TOKEN_PREFIX | 2);
+        assert_ne!(next, STEP_TOKEN_PREFIX | 1);
+        assert_eq!(active.load(Ordering::Acquire), next);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn truncated_low_32_bits_do_not_match_an_old_large_token() {
+        let old_large_token = 0x4d49_5653_0000_0001usize;
+        let truncated_extra_info = old_large_token as u32 as usize;
+        assert_eq!(truncated_extra_info, 1);
+        assert!(
+            message_metadata_from_values(old_large_token, truncated_extra_info, 0x200).is_none()
+        );
+    }
+
+    #[test]
+    fn an_old_packet_cannot_complete_the_next_step() {
+        let mut fixture = ReceiptFixture::new();
+        let old_token = STEP_TOKEN_PREFIX | 1;
+        let current_token = STEP_TOKEN_PREFIX | 2;
+        fixture.metadata.token = current_token;
+        fixture.begin();
+
+        let old_metadata = NativeUiSmokeMessageMetadata {
+            token: old_token,
+            receiver_hwnd: fixture.metadata.receiver_hwnd,
+        };
+        record_pump_receipt_in(&fixture.broker, old_metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, old_metadata, fixture.render);
+
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        let pending = state.pending.as_ref().unwrap();
+        assert_eq!(pending.token, current_token);
+        assert_eq!(pending.pump_actual_point, None);
+        assert_eq!(pending.render_actual_point, None);
+        assert_eq!(pending.failure, None);
+        drop(state);
+        assert_eq!(fixture.completion().unwrap(), None);
+        assert!(message_metadata_from_values(current_token, old_token, 0x200).is_none());
     }
 
     #[test]
