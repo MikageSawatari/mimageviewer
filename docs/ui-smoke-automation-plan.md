@@ -276,6 +276,24 @@ LTR/RTL、列中心とページ着地の区別、release時だけ動いた最終
 - Rhai pointerとnative wrapperは別child moduleへ置ける。親test_script.rsのmod/登録接点は
   一人ずつ統合し、同じファイルの同時編集を避ける。
 
+実hook草案の独立レビューで、さらに次を実装条件へ加えた。
+
+- pointer未使用の通常Close/F12や兄弟showで観測が欠けても、run全体を失敗にしない。
+  catalogの失効と、対象pending/held/cleanup取引の未完了義務を区別し、後者だけを
+  そのtyped ownerへ帰属させる。最終show tailの欠落を前passのtailで補わない。
+- APIのtimeout/interrupt/channel failureは、owner・transaction ID・step IDを持つ
+  cancel handleで該当取引だけを取消し、wakeする。Rhaiが例外をcatchしても、遅れて
+  配送されたDownを残さない。古いtimeoutで新しい同owner取引を取消さない。
+- 次paint待ちのrevisionと、pressに使うgeometry tokenを分ける。後者はexact owner・
+  items generation・press前page/item・widget ID・rect・pppが同じ間は維持し、
+  自然な再描画だけで失効させない。内容/幾何の変更やcatalog失効後は古いtokenを復活させない。
+  Downの実Responseと準備矩形/pppを再照合し、Move/Upはpress時の座標系を維持する。
+- ROOTのprepared frame/timeは輸送の証拠であり、childの時刻と一致すると仮定しない。
+  eframeはROOTとimmediate childでそれぞれelapsedを採る。child input_hookの実RawInput.timeを
+  配送証拠へ保持し、callbackの実InputState.timeとはそのchild時刻のbitsを照合する。
+  時刻を上書きして一致させない。show-local配送証拠のない後続showへstepを付け直さない。missing-tailなどの
+  終端失敗はUiRuntimeに確定してからtimelineをidleへ解放し、同frameのSuccessを優先させない。
+
 ## S3: native入力の継ぎ目
 
 **利用者選択 (2026-09-07): 実マウス入力を採用。テスト中に前面ウィンドウとマウスを使用し、
@@ -388,10 +406,45 @@ ClickToShowへ切り替え、端moveで描画されるcalloutをクリックす�
 `native_jump_bulk_bookmark`で空のbulk dialogを開き、実closeボタンで閉じれば、
 既存bookmarkやOSキー入力の追加を前提とせずmodal経路へ到達できる。
 これらのfixture操作では登録実行・全削除・clipboard取込を押さない。
+非表示からの開始には、通常hit-testと同じ条件・矩形を持つHoverActivationの観測を使う。
+上部barの初回表示は上端36ptであり、76ptは表示維持の範囲である。calloutも通常の
+ClickToShow等の条件を満たす24pt端帯へのhover後に描かれる。Canvas・HoverActivation・
+NamedControlを別のtyped対象とし、実hover移動の処理証拠→enabledな実Response出現→
+ボタン操作の順に進める。Canvasの内側判定を広げたり、初期表示の時間内に押せることに
+依存したりしない。strip/modal/dimmed等による抑止も実状態から判定する。
 非360動画でzoom stateが存在することを確認し、+120の1回がscale 1.0→1.2の1段だけに
 なることを検証する。単にscaleが増えた条件では二重処理も成功になる。
 panは動かせる倍率へ上げてdown→move→upを通し、center変化、scale不変、再生toggleなし、
 drag state解放を確認する。Appへの送信成功とsource epoch検査後の実適用receiptを区別する。
+
+実装前の独立調査により、setupボタンの完了境界を区別する。
+panoramaと右calloutは実ResponseからApp commandを生成する一方、左calloutと
+bulk bookmark dialogの開閉はoverlay内の状態だけを更新する。全ボタンにApp commandの
+receiptを要求する前提は採用しない。実Responseとtagged Upの対応を確認し、正常な
+render_once終了後のoverlay状態を観測する。App commandがある操作だけ、下記のApp完了も
+照合する。診断の都合で通常commandや状態変更経路を新設しない。
+今回のpanel確認は、実状態がClickToShowかつinfo_panel_locked=falseであることを
+入力前後に確認する。明示openは映像に重ねるだけで、左panel/dialogも映像の予約幅を
+変えないため、S3aのcanvas region・ppp・client extentの厳密一致は維持できる。
+ボタンやdialogが現れる/消える通常変化を含むwidget一覧のrevisionは、このcanvasの
+geometry versionとは別物であり、操作後の一覧全体一致を追加条件にしない。
+
+Appまでの証拠は、既存SequencedNativeOutputEventに診断feature限定の不変な
+token・実入力payload・output/source/placement/host identity・dispatch IDを保持して運ぶ。
+通常のlatest-slot分類・置換・sequence順序は維持し、eventを別variantで包んで分類を変えない。
+実入力から生成したcommand/rawの対応を確定した後、同じbusへ診断tailを送り、Appが
+そのtailへ到達した時点で期待dispatch全件の実処理を照合する。fresh UI barrierだけでは
+途中drainの完了を証明できない。latest-slotによる上書き、source拒否、batch途中のclose、
+tail未達を成功に補完しない。空のdispatch集合を許すのは、実renderの処理結果から
+Appへ配送しないことが確定した負例だけである。
+
+Appの観測scopeはAppを借用せず、通常のidx/parked/source gateの拒否理由と、通常handler
+復帰後のexact mounted owner/source・zoom・pointer latchのbefore/afterを記録する。
+zoom handlerのboolはgeometry不在でもtrueになるため、適用成功とは扱わない。
+未分類の早期returnは診断失敗にする。zoom stateはContextRefからMounted/AtRestを
+読み分けて観測できるが、App全体のpointer latchを任意の窓の状態として公開しない。
+同じsource epoch 0でも別outputは別物であり、prepared output/host identityも照合する。
+これらは設計合意で、実装・App統合試験は未完了である。
 
 buttonを使う段階は、runner側の入力driverがDown/UpのSendInputとtyped transactionを
 単独所有する。アプリ側はprepared target・fresh owner検査・実配送receiptを提供する。

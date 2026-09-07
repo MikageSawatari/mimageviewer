@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -38,6 +39,8 @@ use super::window_host_contract::{HostWindows, WindowEpoch};
 
 const DISPOSABLE_DATA_MARKER: &str = "mimageviewer-disposable-smoke-v1;test-script=true";
 const TARGET_WAIT_POLL: Duration = Duration::from_millis(20);
+const TARGET_DIAGNOSTIC_RECORD_LIMIT: usize = 4;
+const TARGET_DIAGNOSTIC_PAIR_LIMIT: usize = 8;
 const STEP_TOKEN_PREFIX: usize = if usize::BITS >= 64 {
     0x4d49_5653_0000_0000
 } else {
@@ -654,7 +657,10 @@ pub(crate) fn prepare_real_mouse_in_canvas(
 ) -> Result<NativeUiSmokePreparedMove, String> {
     validate_disposable_runtime()?;
     require_unexpired_deadline(deadline, "preparing native mouse input")?;
-    validate_owner_and_interrupt()?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_before_target_wait",
+    )?;
     let broker = broker();
     let target = wait_for_target(
         broker,
@@ -664,7 +670,10 @@ pub(crate) fn prepare_real_mouse_in_canvas(
         &mut validate_owner_and_interrupt,
     )?;
     validate_os_target(&target)?;
-    validate_owner_and_interrupt()?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_after_os_target_validation",
+    )?;
     require_unexpired_deadline(deadline, "returning the prepared native mouse target")?;
     Ok(NativeUiSmokePreparedMove {
         target,
@@ -680,11 +689,17 @@ pub(crate) fn send_prepared_real_mouse_move(
 ) -> Result<NativeUiSmokeMoveReceipt, String> {
     validate_disposable_runtime()?;
     require_unexpired_deadline(deadline, "sending native mouse input")?;
-    validate_owner_and_interrupt()?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "send_before_prepared_target_validation",
+    )?;
     let broker = broker();
     validate_prepared_target(broker, &prepared)?;
     validate_os_target(&prepared.target)?;
-    validate_owner_and_interrupt()?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "send_after_os_target_validation",
+    )?;
 
     let token = allocate_step_token();
     if ACTIVE_STEP_TOKEN
@@ -714,10 +729,16 @@ pub(crate) fn send_prepared_real_mouse_move(
     }
 
     run_pending_step(broker, token, || {
-        validate_owner_and_interrupt()?;
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "send_pending_before_target_validation",
+        )?;
         validate_prepared_target(broker, &prepared)?;
         validate_os_target(&prepared.target)?;
-        validate_owner_and_interrupt()?;
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "send_pending_immediately_before_send_input",
+        )?;
         validate_prepared_target(broker, &prepared)?;
         validate_os_target(&prepared.target)?;
         require_unexpired_deadline(deadline, "calling SendInput")?;
@@ -749,6 +770,14 @@ fn require_unexpired_deadline(deadline: Instant, phase: &str) -> Result<(), Stri
     } else {
         Ok(())
     }
+}
+
+fn validate_owner_for_phase(
+    validate_owner_and_interrupt: &mut impl FnMut() -> Result<(), String>,
+    phase: &str,
+) -> Result<(), String> {
+    validate_owner_and_interrupt()
+        .map_err(|error| format!("{error}; owner_validation_phase={phase}"))
 }
 
 fn run_pending_step<T>(
@@ -784,22 +813,61 @@ fn wait_for_target(
     deadline: Instant,
     validate_owner_and_interrupt: &mut impl FnMut() -> Result<(), String>,
 ) -> Result<PreparedTarget, String> {
+    let mut scan_count = 0_u64;
+    let mut owner_validation_attempts = 0_u64;
+    let mut owner_validation_completed = 0_u64;
     loop {
-        let candidate = {
+        let (candidate, candidate_count) = {
             let state = lock_broker_state(broker)?;
-            let mut candidates = coherent_targets(&state, owner_hwnd, normalized)?;
+            let mut candidates = coherent_targets(&state, owner_hwnd, normalized).map_err(|error| {
+                format!(
+                    "{error}; phase=coherent_target_scan; scan_count={}; last_scan_candidate_count=unknown; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current={}",
+                    scan_count.saturating_add(1),
+                    target_wait_diagnostic_from_state(&state, owner_hwnd, normalized)
+                )
+            })?;
+            scan_count = scan_count.saturating_add(1);
             match candidates.len() {
-                0 => None,
-                1 => Some(candidates.remove(0)),
+                0 => (None, 0),
+                1 => (Some(candidates.remove(0)), 1),
                 count => {
                     return Err(format!(
-                        "native mouse target is ambiguous: {count} live presenters use owner 0x{owner_hwnd:x}"
+                        "native mouse target is ambiguous: {count} live presenters use owner 0x{owner_hwnd:x}; phase=coherent_target_scan; scan_count={scan_count}; last_scan_candidate_count={count}; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current={}",
+                        target_wait_diagnostic_from_state(&state, owner_hwnd, normalized)
                     ));
                 }
             }
         };
-        validate_owner_and_interrupt()?;
-        require_unexpired_deadline(deadline, "waiting for the native mouse target")?;
+        owner_validation_attempts = owner_validation_attempts.saturating_add(1);
+        if let Err(error) = validate_owner_and_interrupt() {
+            return Err(target_wait_failure(
+                broker,
+                owner_hwnd,
+                normalized,
+                "after_candidate_scan",
+                scan_count,
+                candidate_count,
+                owner_validation_attempts,
+                owner_validation_completed,
+                error,
+            ));
+        }
+        owner_validation_completed = owner_validation_completed.saturating_add(1);
+        if let Err(error) =
+            require_unexpired_deadline(deadline, "waiting for the native mouse target")
+        {
+            return Err(target_wait_failure(
+                broker,
+                owner_hwnd,
+                normalized,
+                "after_owner_validation",
+                scan_count,
+                candidate_count,
+                owner_validation_attempts,
+                owner_validation_completed,
+                error,
+            ));
+        }
         if let Some(candidate) = candidate {
             return Ok(candidate);
         }
@@ -814,8 +882,305 @@ fn wait_for_target(
                 return Err("native mouse diagnostic broker state is poisoned".into());
             }
         }
-        validate_owner_and_interrupt()?;
+        owner_validation_attempts = owner_validation_attempts.saturating_add(1);
+        if let Err(error) = validate_owner_and_interrupt() {
+            return Err(target_wait_failure(
+                broker,
+                owner_hwnd,
+                normalized,
+                "after_broker_wait",
+                scan_count,
+                candidate_count,
+                owner_validation_attempts,
+                owner_validation_completed,
+                error,
+            ));
+        }
+        owner_validation_completed = owner_validation_completed.saturating_add(1);
     }
+}
+
+fn target_wait_failure(
+    broker: &Broker,
+    owner_hwnd: u64,
+    normalized: [f32; 2],
+    phase: &str,
+    scan_count: u64,
+    last_candidate_count: usize,
+    owner_validation_attempts: u64,
+    owner_validation_completed: u64,
+    error: String,
+) -> String {
+    match lock_broker_state(broker) {
+        Ok(state) => format!(
+            "{error}; phase={phase}; scan_count={scan_count}; last_scan_candidate_count={last_candidate_count}; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current={}",
+            target_wait_diagnostic_from_state(&state, owner_hwnd, normalized)
+        ),
+        Err(diagnostic_error) => format!(
+            "{error}; phase={phase}; scan_count={scan_count}; last_scan_candidate_count={last_candidate_count}; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current=unavailable({diagnostic_error})"
+        ),
+    }
+}
+
+struct TargetPairEvaluation {
+    host_owner: bool,
+    host_placement: bool,
+    presenter_only: bool,
+    output: bool,
+    generation: bool,
+    placement: bool,
+    owner: bool,
+    presenter_hwnd: bool,
+    presenter_generation: bool,
+    requested: RequestedSourceState,
+    source: Option<bool>,
+    geometry: Option<bool>,
+    point: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestedSourceState {
+    NotEvaluated,
+    Expired,
+    Value(u64),
+}
+
+impl std::fmt::Display for RequestedSourceState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEvaluated => formatter.write_str("not_evaluated"),
+            Self::Expired => formatter.write_str("expired"),
+            Self::Value(value) => write!(formatter, "value({value})"),
+        }
+    }
+}
+
+impl TargetPairEvaluation {
+    fn host_eligible(&self) -> bool {
+        self.host_owner && self.host_placement && self.presenter_only
+    }
+
+    fn render_matches_host(&self) -> bool {
+        self.output
+            && self.generation
+            && self.placement
+            && self.owner
+            && self.presenter_hwnd
+            && self.presenter_generation
+    }
+
+    fn matches_before_point(&self) -> bool {
+        self.host_eligible()
+            && self.render_matches_host()
+            && self.source == Some(true)
+            && self.geometry == Some(true)
+    }
+
+    fn coherent(&self) -> bool {
+        self.matches_before_point() && self.point == Some(true)
+    }
+}
+
+fn evaluate_target_pair(
+    host: &HostSnapshot,
+    render: &RenderSnapshot,
+    owner_hwnd: u64,
+    normalized: [f32; 2],
+) -> TargetPairEvaluation {
+    let presenter = host.windows.presenter();
+    let mut evaluation = TargetPairEvaluation {
+        host_owner: host.owner_hwnd == owner_hwnd,
+        host_placement: host.placement == NativeVideoPlacement::DetachedViewerChild,
+        presenter_only: host.windows.presenter_only(),
+        output: render.publisher.output == host.publisher.output,
+        generation: render.generation == host.epoch,
+        placement: render.placement == host.placement,
+        owner: render.owner_hwnd == host.owner_hwnd,
+        presenter_hwnd: render.presenter_hwnd == presenter.hwnd,
+        presenter_generation: presenter.generation == host.epoch,
+        requested: RequestedSourceState::NotEvaluated,
+        source: None,
+        geometry: None,
+        point: None,
+    };
+    if evaluation.host_eligible() && evaluation.render_matches_host() {
+        let requested = render
+            .requested_source_epoch
+            .upgrade()
+            .map(|value| value.load(Ordering::Acquire));
+        let geometry = render.geometry.valid();
+        evaluation.requested =
+            requested.map_or(RequestedSourceState::Expired, RequestedSourceState::Value);
+        evaluation.source = Some(requested == Some(render.actual_source_epoch));
+        evaluation.geometry = Some(geometry);
+        evaluation.point = Some(geometry && render.geometry.client_point(normalized).is_ok());
+    }
+    evaluation
+}
+
+fn target_wait_diagnostic_from_state(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    normalized: [f32; 2],
+) -> String {
+    let mut hosts: Vec<_> = state
+        .hosts
+        .values()
+        .filter(|host| host.owner_hwnd == owner_hwnd)
+        .take(TARGET_DIAGNOSTIC_RECORD_LIMIT)
+        .collect();
+    if hosts.len() < TARGET_DIAGNOSTIC_RECORD_LIMIT {
+        for host in state.hosts.values() {
+            if hosts.len() >= TARGET_DIAGNOSTIC_RECORD_LIMIT {
+                break;
+            }
+            if !hosts
+                .iter()
+                .any(|sampled| sampled.publisher == host.publisher)
+            {
+                hosts.push(host);
+            }
+        }
+    }
+    let mut renders: Vec<_> = state
+        .renders
+        .values()
+        .filter(|render| render.owner_hwnd == owner_hwnd)
+        .take(TARGET_DIAGNOSTIC_RECORD_LIMIT)
+        .collect();
+    if renders.len() < TARGET_DIAGNOSTIC_RECORD_LIMIT {
+        for render in state.renders.values() {
+            if renders.len() >= TARGET_DIAGNOSTIC_RECORD_LIMIT {
+                break;
+            }
+            if !renders
+                .iter()
+                .any(|sampled| sampled.publisher == render.publisher)
+            {
+                renders.push(render);
+            }
+        }
+    }
+
+    let pair_space = state.hosts.len().saturating_mul(state.renders.len());
+    let mut pair_details = Vec::new();
+    for host in &hosts {
+        for render in &renders {
+            if pair_details.len() >= TARGET_DIAGNOSTIC_PAIR_LIMIT {
+                break;
+            }
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, normalized);
+            pair_details.push(format!(
+                "pair[h={}:{},r={}:{}]={{host_owner={},host_placement={},presenter_only={},output={},generation={},placement={},owner={},presenter_hwnd={},presenter_generation={},requested_state={},actual={},source={:?},geometry={:?},point={:?},coherent={}}}",
+                host.publisher.output.0,
+                host.publisher.nonce,
+                render.publisher.output.0,
+                render.publisher.nonce,
+                evaluation.host_owner,
+                evaluation.host_placement,
+                evaluation.presenter_only,
+                evaluation.output,
+                evaluation.generation,
+                evaluation.placement,
+                evaluation.owner,
+                evaluation.presenter_hwnd,
+                evaluation.presenter_generation,
+                evaluation.requested,
+                render.actual_source_epoch,
+                evaluation.source,
+                evaluation.geometry,
+                evaluation.point,
+                evaluation.coherent(),
+            ));
+        }
+    }
+
+    let mut diagnostic = format!(
+        "target_snapshot={{owner=0x{owner_hwnd:x},normalized=({:.3},{:.3}),hosts={},renders={},pair_space={pair_space},pairs_sampled={}",
+        normalized[0],
+        normalized[1],
+        state.hosts.len(),
+        state.renders.len(),
+        pair_details.len(),
+    );
+    for (index, host) in hosts
+        .iter()
+        .take(TARGET_DIAGNOSTIC_RECORD_LIMIT)
+        .enumerate()
+    {
+        let presenter = host.windows.presenter();
+        let _ = write!(
+            diagnostic,
+            ",host[{index}]={{output={},nonce={},request={},epoch={},placement={},owner=0x{:x},presenter=0x{:x},presenter_generation={},presenter_only={}}}",
+            host.publisher.output.0,
+            host.publisher.nonce,
+            host.request,
+            host.epoch,
+            host.placement.label(),
+            host.owner_hwnd,
+            presenter.hwnd,
+            presenter.generation,
+            host.windows.presenter_only(),
+        );
+    }
+    for (index, render) in renders
+        .iter()
+        .take(TARGET_DIAGNOSTIC_RECORD_LIMIT)
+        .enumerate()
+    {
+        let requested = render
+            .requested_source_epoch
+            .upgrade()
+            .map(|value| value.load(Ordering::Acquire));
+        let _ = write!(
+            diagnostic,
+            ",render[{index}]={{output={},nonce={},actual={},requested_state={},generation={},placement={},owner=0x{:x},presenter=0x{:x},geometry_version={},region=({:.1},{:.1},{:.1},{:.1}),ppp={:.3},client={}x{},geometry_valid={}}}",
+            render.publisher.output.0,
+            render.publisher.nonce,
+            render.actual_source_epoch,
+            requested.map_or_else(|| "expired".to_string(), |value| format!("value({value})")),
+            render.generation,
+            render.placement.label(),
+            render.owner_hwnd,
+            render.presenter_hwnd,
+            render.geometry_version,
+            render.geometry.region.origin_points[0],
+            render.geometry.region.origin_points[1],
+            render.geometry.region.size_points[0],
+            render.geometry.region.size_points[1],
+            render.geometry.pixels_per_point,
+            render.geometry.client_width,
+            render.geometry.client_height,
+            render.geometry.valid(),
+        );
+    }
+    if state.hosts.len() > hosts.len() {
+        let _ = write!(
+            diagnostic,
+            ",hosts_omitted={}",
+            state.hosts.len() - hosts.len()
+        );
+    }
+    if state.renders.len() > renders.len() {
+        let _ = write!(
+            diagnostic,
+            ",renders_omitted={}",
+            state.renders.len() - renders.len()
+        );
+    }
+    for detail in &pair_details {
+        diagnostic.push(',');
+        diagnostic.push_str(detail);
+    }
+    if pair_space > pair_details.len() {
+        let _ = write!(
+            diagnostic,
+            ",pairs_omitted={}",
+            pair_space - pair_details.len()
+        );
+    }
+    diagnostic.push('}');
+    diagnostic
 }
 
 fn coherent_targets(
@@ -829,20 +1194,9 @@ fn coherent_targets(
             && host.placement == NativeVideoPlacement::DetachedViewerChild
             && host.windows.presenter_only()
     }) {
-        for render in state.renders.values().filter(|render| {
-            render.publisher.output == host.publisher.output
-                && render.generation == host.epoch
-                && render.placement == host.placement
-                && render.owner_hwnd == host.owner_hwnd
-                && render.presenter_hwnd == host.windows.presenter().hwnd
-                && host.windows.presenter().generation == host.epoch
-        }) {
-            let Some(requested) = render.requested_source_epoch.upgrade() else {
-                continue;
-            };
-            if requested.load(Ordering::Acquire) != render.actual_source_epoch
-                || !render.geometry.valid()
-            {
+        for render in state.renders.values() {
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, normalized);
+            if !evaluation.matches_before_point() {
                 continue;
             }
             candidates.push(PreparedTarget {
@@ -888,12 +1242,18 @@ fn wait_for_receipts(
             let state = lock_broker_state(broker)?;
             completed_actual_point(&state, token, prepared)?.is_some()
         };
-        validate_owner_and_interrupt()?;
+        validate_owner_for_phase(
+            validate_owner_and_interrupt,
+            "receipt_wait_after_state_scan",
+        )?;
         if complete {
             require_unexpired_deadline(deadline, "validating native mouse receipts")?;
             validate_os_target(&prepared.target)?;
             validate_prepared_target(broker, prepared)?;
-            validate_owner_and_interrupt()?;
+            validate_owner_for_phase(
+                validate_owner_and_interrupt,
+                "receipt_completion_after_target_validation",
+            )?;
             let state = lock_broker_state(broker)?;
             let point = completed_actual_point(&state, token, prepared)?.ok_or_else(|| {
                 "native mouse receipt completion was revoked during final validation".to_string()
@@ -1374,6 +1734,130 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn target_wait_failure_keeps_phase_counts_and_pair_predicates() {
+        let fixture = ReceiptFixture::with_source_epoch(0);
+        fixture.requested.store(1, Ordering::Release);
+        let error = match wait_for_target(
+            &fixture.broker,
+            0x100,
+            [0.5, 0.5],
+            Instant::now() + Duration::from_secs(1),
+            &mut || Err("fresh owner validation deadline".to_string()),
+        ) {
+            Ok(_) => panic!("a failed owner barrier must not return a target"),
+            Err(error) => error,
+        };
+        assert!(error.contains("phase=after_candidate_scan"));
+        assert!(error.contains("scan_count=1; last_scan_candidate_count=0"));
+        assert!(error.contains("owner_validation_attempts=1; owner_validation_completed=0"));
+        assert!(error.contains("requested_state=value(1),actual=0,source=Some(false)"));
+        assert!(error.contains("geometry=Some(true),point=Some(true),coherent=false"));
+
+        fixture.requested.store(0, Ordering::Release);
+        let error = match wait_for_target(
+            &fixture.broker,
+            0x100,
+            [0.5, 0.5],
+            Instant::now() + Duration::from_secs(1),
+            &mut || Err("fresh owner validation deadline".to_string()),
+        ) {
+            Ok(_) => panic!("a failed owner barrier must not return a target"),
+            Err(error) => error,
+        };
+        assert!(error.contains("scan_count=1; last_scan_candidate_count=1"));
+        assert!(error.contains("requested_state=value(0),actual=0,source=Some(true)"));
+        assert!(error.contains("geometry=Some(true),point=Some(true),coherent=true"));
+    }
+
+    #[test]
+    fn target_wait_diagnostic_distinguishes_unchecked_and_expired_requested_source() {
+        let fixture = ReceiptFixture::new();
+        let mut state = lock_broker_state(&fixture.broker).unwrap();
+        let host_output = state.hosts.values().next().unwrap().publisher.output;
+        let render = state.renders.values_mut().next().unwrap();
+        render.publisher.output = NativeUiSmokeOutputId(host_output.0 + 1);
+        render.requested_source_epoch = Weak::new();
+
+        let diagnostic = target_wait_diagnostic_from_state(&state, 0x100, [0.5, 0.5]);
+        assert!(diagnostic.contains("requested_state=not_evaluated"));
+        assert!(diagnostic.contains("source=None,geometry=None,point=None"));
+
+        state.renders.values_mut().next().unwrap().publisher.output = host_output;
+        let diagnostic = target_wait_diagnostic_from_state(&state, 0x100, [0.5, 0.5]);
+        assert!(diagnostic.contains("requested_state=expired"));
+        assert!(diagnostic.contains("source=Some(false),geometry=Some(true),point=Some(true)"));
+    }
+
+    #[test]
+    fn owner_validation_error_keeps_the_static_callsite_phase() {
+        let error = validate_owner_for_phase(
+            &mut || Err("fresh owner validation failed".to_string()),
+            "send_pending_immediately_before_send_input",
+        )
+        .expect_err("owner validation failure must remain terminal");
+        assert!(error.contains("fresh owner validation failed"));
+        assert!(
+            error.contains("owner_validation_phase=send_pending_immediately_before_send_input")
+        );
+    }
+
+    #[test]
+    fn target_wait_diagnostic_bounds_host_render_and_pair_details() {
+        let requested = Arc::new(AtomicU64::new(7));
+        let mut state = isolated_state();
+        for index in 0..6_u64 {
+            let output = NativeUiSmokeOutputId(index + 1);
+            let generation = index + 10;
+            let presenter_hwnd = 0x200 + index;
+            let host_key = PublisherKey {
+                output,
+                nonce: index + 20,
+            };
+            let render_key = PublisherKey {
+                output,
+                nonce: index + 30,
+            };
+            state.hosts.insert(
+                host_key,
+                HostSnapshot {
+                    publisher: host_key,
+                    request: index + 40,
+                    epoch: generation,
+                    placement: NativeVideoPlacement::DetachedViewerChild,
+                    owner_hwnd: 0x100,
+                    windows: HostWindowSet::from_contract(presenter_only(
+                        presenter_hwnd,
+                        generation,
+                    )),
+                },
+            );
+            state.renders.insert(
+                render_key,
+                RenderSnapshot {
+                    publisher: render_key,
+                    requested_source_epoch: Arc::downgrade(&requested),
+                    actual_source_epoch: 7,
+                    generation,
+                    placement: NativeVideoPlacement::DetachedViewerChild,
+                    owner_hwnd: 0x100,
+                    presenter_hwnd,
+                    geometry: geometry(),
+                    geometry_version: 1,
+                },
+            );
+        }
+
+        let diagnostic = target_wait_diagnostic_from_state(&state, 0x100, [0.5, 0.5]);
+        assert!(diagnostic.contains("hosts=6,renders=6,pair_space=36,pairs_sampled=8"));
+        assert_eq!(diagnostic.matches("host[").count(), 4);
+        assert_eq!(diagnostic.matches("render[").count(), 4);
+        assert_eq!(diagnostic.matches("pair[h=").count(), 8);
+        assert!(diagnostic.contains("hosts_omitted=2"));
+        assert!(diagnostic.contains("renders_omitted=2"));
+        assert!(diagnostic.contains("pairs_omitted=28"));
     }
 
     #[test]
