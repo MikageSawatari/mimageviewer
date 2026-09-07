@@ -12,7 +12,7 @@
 `GridItem` 1 個につき 1 つの `ThumbnailState` (grid_item.rs) を持つ:
 
 ```
-Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, from_cache, rendered_at_px,
+Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, origin, rendered_at_px,
                                                            source_dims, layout_dims }
                                                        │
                                            (keep_range 外に出ると)
@@ -21,6 +21,13 @@ Pending ──────────(ワーカーがデコード)────�
 ```
 
 Failed は単発の終端ステート。デコードエラー時のみ。
+
+`origin` はworkerの`ThumbMsg`とLoadedが共用する`ThumbLoadOrigin`で、
+`SourceGenerated { evaluated_display_px }` / `SourceIntrinsic` /
+`UpgradeableCache` / `FinalCache`を区別する。`rendered_at_px`は実際の画像長辺、
+`evaluated_display_px`はその画像の生成に使った要求サイズであり、単位は同じでも意味が違う。
+cache由来かどうかはoriginから導出し、独立した`from_cache`状態は保持しない。
+画像なしのfinalized/cancel/errorはLoaded画像のoriginを更新しない。
 
 `Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）と PDF の `layout_dims` を
 per-context の `PageDimsCache` の別 map に記録する。`source_dims` は常にピクセル座標、
@@ -45,7 +52,9 @@ fail-closed する。
    - 1 件以上キューへ投入したフレームは `update_keep_range_and_requests` 自身も repaint を要求する。
      通常は `App::update` 末尾の `requested_nonempty` と同じ役割だが、フルスクリーン中の
      early return で末尾まで到達しないフレームでも worker 結果を入力待ちにしないため。
-4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` かつ `from_edit_preview: false` の Loaded に対して `LoadSourcePolicy::SourceOnly` で再要求 → 高品質デコード。ただし、`make_load_request` が親コンテナや手動ピンを最終 target へ解決した後も `SourceOnly` を保つ要求だけを upgrade queue へ入れる。編集プレビューと、動画ピンから seed された完成済み WebP キャッシュは元画像から改善できない派生画像なので対象外。特に動画ピン要求は `apply_folder_thumb_pin` が意図的に `CacheOrSource` へ変換し、アイドル高画質化へ投入しないことでフォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定した idx は現在の Loaded サムネイル / viewer context に紐づけて記憶し、repaint ごとの pin 解決も行わない。この記憶は新しい items 世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する。`--perf-log` 時は最終判定を `thumb.idle_upgrade_enqueue` / `thumb.idle_upgrade_ineligible` として記録し、同一 key / idx / items 世代の反復をリリース前 `idle-health` 検査で拒否する
+4. **アイドル時品質アップグレード**: 入力・スクロールが500ms静止し、既存要求が完了したら、`UpgradeableCache`のLoadedを`LoadSourcePolicy::SourceOnly`で再要求する。`SourceGenerated`は実寸が`min(source_long_edge, current_display_px)`の80%未満、かつ現在の要求サイズがその画像の`evaluated_display_px`より大きい場合だけ再要求する。編集プレビュー、`FinalCache`、動画Shell等の`SourceIntrinsic`は対象外。ただし、`make_load_request`が親コンテナや手動ピンを最終targetへ解決した後も`SourceOnly`を保つ要求だけをupgrade queueへ入れる。動画ピン要求は`apply_folder_thumb_pin`が意図的に`CacheOrSource`へ変換し、フォルダ自動代表画像による上書きと無限再投入を防ぐ。対象外と確定したidxは現在のLoadedサムネイル/viewer contextに紐づけて記憶し、repaintごとのpin解決も行わない。この記憶は新しいitems世代、サムネイルの退去・再ロード、編集プレビュー更新で破棄する。`--perf-log`時は最終判定を`thumb.idle_upgrade_enqueue` / `thumb.idle_upgrade_ineligible`として記録し、同一key/idx/items世代の反復をリリース前`idle-health`検査で拒否する。
+   - **同一要求の収束 (§1.198)**: 整数寸法選択は比率精度を優先するため、884×444への374px要求が247×124になる場合がある。実寸だけで不足判定すると同じ生成を永久に繰り返す。生成に使った要求サイズを画像と共に保持し、同一/縮小要求では再投入しない。374→400pxのような拡大要求では不足を再評価する。生成画素・0.05%の比率精度契約は変更せず、「十分な実解像度」ではなく「同一生成要求の完了」を保証する。
+   - 要求サイズはworkerが実際に生成へ使った値を載せ、送信時やUI受信時の最新値に置き換えない。texture backlogもoriginをそのまま保持し、過去要求の最大値と合成しない。世代不一致・keep外で捨てた画像から完了coverageを公開しない。
    - 一覧ロード直後は `start_loading_items` が履歴スクロール復元後の位置で idle 判定をリセットし、
      親一覧へ戻った瞬間に古い idle 時刻で高品質再生成が走らないようにする。
    - **フレーム内境界レース対策 (2026-06-19)**: アップグレードの起動条件 (input/scroll が

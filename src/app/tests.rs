@@ -1088,7 +1088,9 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
             } else {
                 ThumbnailState::Loaded {
                     tex: portrait_tex.clone(),
-                    from_cache: false,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 2,
+                    },
                     from_edit_preview: false,
                     rendered_at_px: 2,
                     source_dims: Some((900, 1400)),
@@ -1159,7 +1161,9 @@ fn spread_units_rebuild_only_when_saved_rotation_changes_landscape_state() {
     app.thumbnails = (0..app.items.len())
         .map(|_| ThumbnailState::Loaded {
             tex: portrait_tex.clone(),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 2,
+            },
             from_edit_preview: false,
             rendered_at_px: 2,
             source_dims: Some((600, 900)),
@@ -3654,7 +3658,7 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
     );
     let loaded = || ThumbnailState::Loaded {
         tex: texture.clone(),
-        from_cache: true,
+        origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
         from_edit_preview: true,
         rendered_at_px: 64,
         source_dims: Some((1, 1)),
@@ -12777,7 +12781,9 @@ mod phase_c_drill_nav_tests {
             (
                 ThumbnailState::Loaded {
                     tex,
-                    from_cache: false,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 64,
+                    },
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
@@ -18773,7 +18779,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(matches!(
             app.thumbnails[0],
             ThumbnailState::Loaded {
-                from_cache: true,
+                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
                 ..
             }
         ));
@@ -18845,7 +18851,7 @@ mod favorite_adjustment_defaults_tests {
         app.image_metas.push(Some((10, 20)));
         app.thumbnails.push(ThumbnailState::Loaded {
             tex,
-            from_cache: true,
+            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
@@ -18940,7 +18946,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.thumbnails.push(ThumbnailState::Loaded {
             tex,
-            from_cache: true,
+            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((1920, 1080)),
@@ -19017,7 +19023,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.thumbnails.push(ThumbnailState::Loaded {
             tex,
-            from_cache: true,
+            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
@@ -19053,6 +19059,450 @@ mod favorite_adjustment_defaults_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn source_generated_thumbnail_does_not_repeat_same_evaluated_display_request() {
+        let mut app = setup_app();
+        let image_path = app.tmp.path().join("wide.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            884,
+            444,
+            image::Rgba([32, 64, 96, 255]),
+        ))
+        .save_with_format(&image_path, image::ImageFormat::Png)
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        let cached_texture = ctx.load_texture(
+            "wide-cache",
+            egui::ColorImage::filled([496, 249], egui::Color32::DARK_GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        app.items.push(GridItem::Image(image_path.clone()));
+        app.image_metas.push(Some((10, 20)));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: cached_texture,
+            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            from_edit_preview: false,
+            rendered_at_px: 496,
+            source_dims: Some((884, 444)),
+            layout_dims: None,
+        });
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(1, Ordering::Relaxed);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(374, Ordering::Relaxed);
+        app.requested.insert(0, true);
+
+        let request = LoadRequest {
+            idx: 0,
+            path: image_path,
+            mtime: 10,
+            file_size: 20,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            items_gen: app.items_generation,
+            ..Default::default()
+        };
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        crate::thumb_loader::process_load_request(
+            &request,
+            &cache_map,
+            &app.tx,
+            None,
+            256,
+            75,
+            374,
+            CacheDecision::without_thumbnail(),
+            &done,
+            &stats,
+            None,
+            &app.keep_start_shared,
+            &app.keep_end_shared,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+
+        assert!(matches!(
+            app.thumbnails[0],
+            ThumbnailState::Loaded {
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374
+                },
+                rendered_at_px: 247,
+                ..
+            }
+        ));
+        assert!(
+            app.requested.is_empty(),
+            "the should-save=false finalize signal must complete the source request"
+        );
+        assert!(cache_map.read().unwrap().is_empty());
+
+        app.enqueue_idle_upgrades();
+        assert!(
+            app.requested.is_empty(),
+            "the 247px result must not repeat the same evaluated 374px request"
+        );
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        app.display_px_shared.store(400, Ordering::Relaxed);
+        app.enqueue_idle_upgrades();
+        assert_eq!(app.requested.get(&0), Some(&true));
+        let next_request = {
+            let mut queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].source_policy, LoadSourcePolicy::SourceOnly);
+            queue.pop().unwrap()
+        };
+
+        crate::thumb_loader::process_load_request(
+            &next_request,
+            &cache_map,
+            &app.tx,
+            None,
+            256,
+            75,
+            400,
+            CacheDecision::without_thumbnail(),
+            &done,
+            &stats,
+            None,
+            &app.keep_start_shared,
+            &app.keep_end_shared,
+            None,
+            None,
+            None,
+            None,
+        );
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(
+            app.thumbnails[0],
+            ThumbnailState::Loaded {
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 400
+                },
+                rendered_at_px: 400,
+                ..
+            }
+        ));
+        assert!(app.requested.is_empty());
+        app.enqueue_idle_upgrades();
+        assert!(app.requested.is_empty());
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_coverage_survives_texture_backlog_finalize_and_stale_results() {
+        let mut app = setup_app();
+        let item_count = 9usize;
+        app.items = (0..item_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"c:\pics\{idx}.png"))))
+            .collect();
+        app.image_metas = vec![Some((10, 20)); item_count];
+        app.thumbnails = vec![ThumbnailState::Pending; item_count];
+        app.keep_set.extend(0..item_count);
+        app.keep_range = (0, item_count);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(item_count, Ordering::Relaxed);
+        app.requested
+            .extend((0..item_count).map(|idx| (idx, false)));
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(374, Ordering::Relaxed);
+
+        let items_gen = app.items_generation;
+        for idx in 0..8 {
+            app.tx
+                .send(crate::thumb_loader::ThumbMsg {
+                    idx,
+                    image: Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
+                    origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
+                    source_dims: Some((1, 1)),
+                    layout_dims: None,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: 0,
+                    items_gen,
+                })
+                .unwrap();
+        }
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 8,
+                image: Some(egui::ColorImage::filled(
+                    [247, 124],
+                    egui::Color32::LIGHT_BLUE,
+                )),
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374,
+                },
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((884, 444)),
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 8,
+                image: None,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: None,
+                layout_dims: None,
+                canceled: false,
+                finalized: true,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[8], ThumbnailState::Pending));
+        assert_eq!(app.texture_backlog.len(), 1);
+        assert!(matches!(
+            app.texture_backlog[0].origin,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 374
+            }
+        ));
+        assert!(app.requested.contains_key(&8));
+        assert!(
+            app.pending_finalize.contains(&8),
+            "finalize must wait until the source image leaves the texture backlog"
+        );
+
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 8,
+                image: Some(egui::ColorImage::filled(
+                    [400, 201],
+                    egui::Color32::LIGHT_RED,
+                )),
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 400,
+                },
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((884, 444)),
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen: items_gen.wrapping_add(1),
+            })
+            .unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+
+        assert!(matches!(
+            app.thumbnails[8],
+            ThumbnailState::Loaded {
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374
+                },
+                rendered_at_px: 247,
+                ..
+            }
+        ));
+        assert!(app.texture_backlog.is_empty());
+        assert!(!app.pending_finalize.contains(&8));
+        assert!(!app.requested.contains_key(&8));
+        app.enqueue_idle_upgrades();
+        assert!(app.requested.is_empty());
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn thumbnail_result_replaces_coverage_and_terminal_messages_preserve_or_clear_it() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let initial_texture = ctx.load_texture(
+            "source-coverage-400",
+            egui::ColorImage::filled([400, 201], egui::Color32::DARK_GRAY),
+            egui::TextureOptions::LINEAR,
+        );
+        app.items
+            .push(GridItem::Image(PathBuf::from(r"c:\pics\wide.png")));
+        app.image_metas.push(Some((10, 20)));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: initial_texture,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 400,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 400,
+            source_dims: Some((884, 444)),
+            layout_dims: None,
+        });
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.keep_start_shared.store(0, Ordering::Relaxed);
+        app.keep_end_shared.store(1, Ordering::Relaxed);
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.settings.thumb_idle_upgrade = true;
+        app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.display_px_shared.store(400, Ordering::Relaxed);
+        let items_gen = app.items_generation;
+
+        // A request evaluated while the cell was smaller must replace, rather than merge with,
+        // the previous 400px coverage when its image lands after the cell grows again.
+        app.requested.insert(0, true);
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: Some(egui::ColorImage::filled(
+                    [247, 124],
+                    egui::Color32::LIGHT_BLUE,
+                )),
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374,
+                },
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((884, 444)),
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: None,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: None,
+                layout_dims: None,
+                canceled: false,
+                finalized: true,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(
+            app.thumbnails[0],
+            ThumbnailState::Loaded {
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374
+                },
+                rendered_at_px: 247,
+                ..
+            }
+        ));
+        assert!(app.requested.is_empty());
+
+        app.enqueue_idle_upgrades();
+        assert_eq!(app.requested.get(&0), Some(&true));
+        {
+            let mut queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].source_policy, LoadSourcePolicy::SourceOnly);
+            queue.clear();
+        }
+
+        // Cancellation has no replacement image, so it must keep the resident coverage intact.
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: None,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: None,
+                layout_dims: None,
+                canceled: true,
+                finalized: false,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(
+            app.thumbnails[0],
+            ThumbnailState::Loaded {
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 374
+                },
+                rendered_at_px: 247,
+                ..
+            }
+        ));
+        assert!(app.requested.is_empty());
+
+        // A real load error is terminal for the resident image and therefore drops its coverage.
+        app.requested.insert(0, true);
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: 0,
+                image: None,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: None,
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen,
+            })
+            .unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Failed));
+        assert!(app.requested.is_empty());
     }
 
     /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
@@ -19841,7 +20291,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
@@ -19904,7 +20356,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
@@ -20128,7 +20582,9 @@ mod favorite_adjustment_defaults_tests {
         ) -> ThumbnailState {
             ThumbnailState::Loaded {
                 tex: ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
@@ -20239,7 +20695,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some((1600, 900)),
@@ -20292,7 +20750,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::example(),
                     Default::default(),
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some((1600, 900)),
@@ -23354,7 +23814,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.thumbnails[0] = ThumbnailState::Loaded {
             tex: texture,
-            from_cache: true,
+            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
@@ -24232,7 +24692,9 @@ mod favorite_adjustment_defaults_tests {
         );
         let loaded = || ThumbnailState::Loaded {
             tex: tex.clone(),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 1,
+            },
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: Some((1, 1)),
@@ -25939,7 +26401,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
             from_edit_preview: true,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
@@ -26597,7 +27059,9 @@ mod favorite_adjustment_defaults_tests {
         let texture_id = texture.id();
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex: texture,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
@@ -26693,7 +27157,9 @@ mod favorite_adjustment_defaults_tests {
         let second_texture_id = second_texture.id();
         app.thumbnails[first] = ThumbnailState::Loaded {
             tex: first_texture,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
@@ -26701,7 +27167,9 @@ mod favorite_adjustment_defaults_tests {
         };
         app.thumbnails[second] = ThumbnailState::Loaded {
             tex: second_texture,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
@@ -27921,6 +28389,21 @@ mod favorite_adjustment_defaults_tests {
     fn viewer_context_bundle_preserves_idle_upgrade_ineligible_memo() {
         let mut app = setup_app();
         app.idle_upgrade_cache_bypass_ineligible.insert(7);
+        let ctx = egui::Context::default();
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                "idle-quality-context",
+                egui::ColorImage::filled([247, 124], egui::Color32::LIGHT_BLUE),
+                egui::TextureOptions::LINEAR,
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 374,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 247,
+            source_dims: Some((884, 444)),
+            layout_dims: None,
+        });
 
         let original = app.stash_mounted_and_start_fresh("test_idle_upgrade_context");
         app.idle_upgrade_cache_bypass_ineligible.insert(99);
@@ -27929,6 +28412,16 @@ mod favorite_adjustment_defaults_tests {
                 mounted.idle_upgrade_cache_bypass_ineligible,
                 std::collections::HashSet::from([7])
             );
+            assert!(matches!(
+                mounted.thumbnails[0],
+                ThumbnailState::Loaded {
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 374
+                    },
+                    rendered_at_px: 247,
+                    ..
+                }
+            ));
         })
         .unwrap();
         assert_eq!(
@@ -28471,7 +28964,9 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/book/02.7z")));
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: old_tex.clone(),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
@@ -28519,7 +29014,9 @@ mod favorite_adjustment_defaults_tests {
         );
         app.thumbnails = vec![ThumbnailState::Loaded {
             tex: new_tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
@@ -28914,7 +29411,9 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: image_tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 1,
+            },
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
@@ -28924,7 +29423,7 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: video_tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
@@ -28960,7 +29459,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
@@ -28996,7 +29497,9 @@ mod favorite_adjustment_defaults_tests {
                     egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 1,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
@@ -29438,7 +29941,9 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: dummy_tex.clone(),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
@@ -30121,7 +30626,9 @@ mod favorite_adjustment_defaults_tests {
             (
                 ThumbnailState::Loaded {
                     tex,
-                    from_cache: false,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 64,
+                    },
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
@@ -31059,7 +31566,9 @@ mod pipeline_cache_refactor_tests {
         );
         app.thumbnails[3] = ThumbnailState::Loaded {
             tex: landscape,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 64,
+            },
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 1)),
@@ -35582,7 +36091,9 @@ mod pipeline_cache_refactor_tests {
         let catalog_id = catalog.id();
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex: catalog,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 2,
+            },
             from_edit_preview: false,
             rendered_at_px: 2,
             source_dims: Some((2, 2)),
@@ -35639,7 +36150,9 @@ mod pipeline_cache_refactor_tests {
         );
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex: catalog,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 8,
+            },
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
@@ -35725,7 +36238,9 @@ mod pipeline_cache_refactor_tests {
         let catalog_id = catalog.id();
         app.thumbnails[idx] = ThumbnailState::Loaded {
             tex: catalog,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 8,
+            },
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
@@ -47831,7 +48346,7 @@ mod still_window_mode_key_tests {
         app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
             idx: video,
             image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::Source,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             edit_preview_adjustment: None,
             source_dims: None,
@@ -48273,7 +48788,9 @@ mod still_window_mode_key_tests {
         );
         app.thumbnails[image] = ThumbnailState::Loaded {
             tex: img_tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 128,
+            },
             from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
@@ -48787,7 +49304,7 @@ mod still_window_mode_key_tests {
                 egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
                 egui::TextureOptions::LINEAR,
             ),
-            from_cache: true,
+            origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: Some((1, 1)),
@@ -52055,7 +52572,9 @@ mod still_window_mode_key_tests {
                 idx,
                 ThumbnailState::Loaded {
                     tex: tex.clone(),
-                    from_cache: false,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: 20,
+                    },
                     from_edit_preview: false,
                     rendered_at_px: 20,
                     source_dims: Some((20, 20)),

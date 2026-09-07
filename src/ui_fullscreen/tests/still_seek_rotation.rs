@@ -36,7 +36,9 @@ fn load_textures(app: &mut crate::app::App, ctx: &egui::Context, rotations: &[Ro
                 source_dims: Some((tex.size()[0] as u32, tex.size()[1] as u32)),
                 layout_dims: None,
                 rendered_at_px: 120,
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 120,
+                },
                 from_edit_preview: false,
                 tex,
             }

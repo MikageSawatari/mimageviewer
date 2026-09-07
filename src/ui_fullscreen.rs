@@ -44845,7 +44845,9 @@ mod tests {
                 egui::ColorImage::filled(texture_size, color),
                 egui::TextureOptions::LINEAR,
             ),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: texture_size[0].max(texture_size[1]) as u32,
+            },
             from_edit_preview: false,
             rendered_at_px: texture_size[0].max(texture_size[1]) as u32,
             source_dims: Some(source_dims),
@@ -44874,7 +44876,9 @@ mod tests {
                 egui::ColorImage::filled([24, 12], egui::Color32::LIGHT_BLUE),
                 egui::TextureOptions::LINEAR,
             ),
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 24,
+            },
             from_edit_preview: false,
             rendered_at_px: 24,
             source_dims: Some((1200, 600)),
@@ -45680,7 +45684,7 @@ mod tests {
                         pixels.as_ref().clone(),
                         egui::TextureOptions::LINEAR,
                     ),
-                    from_cache: true,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
                     from_edit_preview: false,
                     rendered_at_px: 3,
                     source_dims: Some((2, 3)),
@@ -46385,7 +46389,9 @@ mod tests {
             );
             app.thumbnails.push(ThumbnailState::Loaded {
                 tex: texture,
-                from_cache: false,
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 6,
+                },
                 from_edit_preview: false,
                 rendered_at_px: 6,
                 source_dims: Some((400, 600)),
@@ -46480,7 +46486,7 @@ mod tests {
         ))];
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Loaded {
             tex: texture,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
@@ -46819,7 +46825,9 @@ mod tests {
         );
         app.thumbnails.push(ThumbnailState::Loaded {
             tex: catalog,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 4,
+            },
             from_edit_preview: false,
             rendered_at_px: 4,
             source_dims: Some((400, 401)),
@@ -55051,7 +55059,9 @@ mod tests {
                         app.thumbnails = vec![
                             ThumbnailState::Loaded {
                                 tex: tex.clone(),
-                                from_cache: false,
+                                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                                    evaluated_display_px: 180,
+                                },
                                 from_edit_preview: false,
                                 rendered_at_px: 180,
                                 source_dims: Some((120, 180)),

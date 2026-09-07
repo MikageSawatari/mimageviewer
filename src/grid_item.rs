@@ -474,15 +474,16 @@ pub enum ThumbnailState {
     Pending,
     /// 読み込み済みで GPU テクスチャとして保持中
     ///
-    /// `from_cache = true` の場合は WebP キャッシュ (q=75) から復元した状態で、
-    /// 段階 E のアイドル時アップグレードで元画像から再デコードされる対象になる。
+    /// `origin` はキャッシュ品質か、source が評価済みの表示要求かを保持する。
+    /// upgradeable cache は段階 E のアイドル時アップグレードで元画像から再デコード
+    /// され、source 出力は同じ表示要求を重複評価しないための coverage を保持する。
     /// `rendered_at_px` は生成時の長辺ピクセル数で、現在のセルサイズと比較して
     /// 著しく小さい場合 (列数変更後など) もアップグレード対象になる。
     /// `source_dims` は元画像 / PDF raster のピクセル寸法 (旧カタログ由来は None)。
     /// `layout_dims` は PDF page box の 1/1000 point 寸法で、raster の丸めと独立する。
     Loaded {
         tex: egui::TextureHandle,
-        from_cache: bool,
+        origin: crate::thumb_loader::ThumbLoadOrigin,
         /// 非破壊編集プレビュー由来。通常の低品質 catalog cache と異なり、
         /// 元画像で上書きする idle quality-upgrade の対象にしない。
         from_edit_preview: bool,

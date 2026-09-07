@@ -33225,7 +33225,7 @@ impl App {
                         let _ = tx_w.send(crate::thumb_loader::ThumbMsg {
                             idx: req.idx,
                             image: None,
-                            origin: crate::thumb_loader::ThumbLoadOrigin::Source,
+                            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                             from_edit_preview: false,
                             edit_preview_adjustment: None,
                             source_dims: None,
@@ -33562,7 +33562,7 @@ impl App {
                 let _ = tx.send(crate::thumb_loader::ThumbMsg {
                     idx,
                     image: ci,
-                    origin: crate::thumb_loader::ThumbLoadOrigin::Source,
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
@@ -33766,7 +33766,7 @@ impl App {
                         }
                         self.thumbnails[i] = ThumbnailState::Loaded {
                             tex: handle,
-                            from_cache,
+                            origin,
                             from_edit_preview,
                             rendered_at_px,
                             source_dims,
@@ -35164,7 +35164,7 @@ impl App {
     /// - `reload_queue` が空で `requested` も空 (他の作業が全て終わっている)
     ///
     /// アップグレード対象:
-    /// 1. `Loaded { from_cache: true }` — キャッシュ (WebP q=75) 由来で画質劣化。
+    /// 1. `Loaded { origin: UpgradeableCache }` — キャッシュ (WebP q=75) 由来で画質劣化。
     ///    ただし `FinalCache` origin は対象外集合に記録される
     /// 2. `Loaded { rendered_at_px < current_display_px * 0.8 }` —
     ///    列数変更などで現在のセルサイズより 20% 以上小さい解像度で生成されている
@@ -35230,7 +35230,7 @@ impl App {
         // 現在の display_px (アイドル判定とサイズ比較に使用)
         let current_display_px = self.display_px_shared.load(Ordering::Relaxed);
 
-        // 候補集め: keep_range 内で from_cache=true or 解像度不足のものを全件
+        // 候補集め: keep_range 内で upgradeable cache または未評価の解像度不足を全件
         //
         // ※ 以前は BATCH=4 で小分け push していたが、進捗バーが「0/4 → 4/4 → 消える」
         //    を繰り返すちらつき現象が発生していた。現在は keep_range 内の全候補を
@@ -35247,7 +35247,7 @@ impl App {
             }
             let needs_upgrade = match self.thumbnails.get(i) {
                 Some(ThumbnailState::Loaded {
-                    from_cache,
+                    origin,
                     from_edit_preview,
                     rendered_at_px,
                     source_dims,
@@ -35267,8 +35267,16 @@ impl App {
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    !*from_edit_preview
-                        && (*from_cache || (*rendered_at_px as u64) * 5 < (target_px as u64) * 4)
+                    let undersized = (*rendered_at_px as u64) * 5 < (target_px as u64) * 4;
+                    let origin_needs_upgrade = match *origin {
+                        crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache => true,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                            evaluated_display_px,
+                        } => undersized && evaluated_display_px < current_display_px,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
+                        | crate::thumb_loader::ThumbLoadOrigin::FinalCache => false,
+                    };
+                    !*from_edit_preview && origin_needs_upgrade
                 }
                 _ => false,
             };

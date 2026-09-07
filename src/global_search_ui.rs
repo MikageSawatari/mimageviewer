@@ -3477,7 +3477,7 @@ mod tests {
         );
         ThumbnailState::Loaded {
             tex,
-            from_cache: false,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
