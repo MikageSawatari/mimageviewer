@@ -537,12 +537,25 @@ PS5.1/PS7互換のCreateNamedPipeW→SafePipeHandle→NamedPipeServerStreamを�
 Windowsから認証できないため、アプリ側のfresh barrierとreceipt後照合を維持する。
 Down後・返信前のアプリ終了、EOF、runner timeoutとの競合、挿入0件、Up失敗、
 期限切れ・重複要求・異PID・解放後の重複cleanupを回帰対象とする。
-この構成は親と独立Astraの実装前レビュー済みで、実装・OS検証はまだ行っていない。
+この構成は親と独立Astraの実装前レビュー済みで、実OS入力への統合・検証はまだ行っていない。
+外部helperのignored草案は、bounded wire/current-SID local pipe/固定process handle/
+単独owner/非blocking返信とpure reducerを接続し、PS5.1/7各16群のfake・自process pipe試験を
+独立レビューした。queue飢餓、app death後のcleanup期限停止、最後の肯定証拠で終了検査を
+飛ばす3経路を修正済み。実SendInput・OS observer・Rust/runner接続はこの承認範囲に含まない。
 期限/owner変更/元HWND退去でも
 この義務を捨てず、通常操作とは別の短いcleanup期限で移動なしのglobal LeftUpを試みる。
 cleanupで元の失敗を成功へ変換せず、AppのZoomPanを診断コードで直接resetしない。
 正常完了は実Up配送・pump側のcapture解放・UI handler後のZoomPan解放を揃える。
 workerのGetCapture/ReleaseCaptureは別threadのcapture確認/解放の代用にならない。
+
+通常操作の現在target検証と、既に挿入したDownのcleanup解放証明は型で分ける。
+cleanupの権限は保存済みのtagged/validated Downとown Up挿入から取り、元HWND消失後も
+別windowへtargetを付け替えない。現在のhelper-thread input desktop/accessとphysical Upを
+改めて検証できる場合だけ解放証拠を作り、現在foregroundはアクセス確認の文脈に限る。
+旧target生存・現在captureNoneをcleanup証明の必須条件にはせず、未知のaccessやdesktop変化は
+Unconfirmedとする。historical validated Downなしの0値やSendInput成功だけでは証明しない。
+初期observerはswap=trueをMappingUnsupportedとして送信前に止める。SendInputのswap時の
+物理対応は未実証であり、これは診断fixtureの範囲制約で、通常アプリの操作仕様は変更しない。
 
 開始時は既存mouse buttonとmodifierの非押下を確認し、実modifierを補正するkey-upは送らない。
 観測した介入や前提不一致は環境不成立とする。ただしOSのglobal button状態に「テスト分だけ」を
@@ -563,6 +576,10 @@ workerのGetCapture/ReleaseCaptureは別threadのcapture確認/解放の代用�
 更新すると、draw_native_seek_stripは最後のpointerだけを使うため、先のstrip wheelを
 消費できない可能性がある。panelにも最終hoverへの集約が及ぶ。親もコード経路を照合した。
 これは既存360/通常navigationにも及ぶ別の根因であり、Zoom variant追加で解消するものではない。
+最小classifier修正の再レビューでは、同batch内mode一定の下で、全wheelにcanvas semanticか
+egui/local ownerがあり、App rawだけが正当な処理先になる兄弟がないことを確認した。
+今回の追加判定はpending egui入力を削除しないため、新たな正当入力の消失は見つからなかった。
+これは既存のegui最終pointer問題が解消したという判断ではない。
 S3の各stepは一入力ごとにreceiptを待つ。混在batchの領域操作を保証したとは表明せず、
 追加調査を [next-release-backlog.md](next-release-backlog.md) §1.199へ分離する。
 frame全体のany-commandは個々のtokenの処理理由ではなく、
